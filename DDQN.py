@@ -15,6 +15,11 @@ Implementation of Double DQN for gym environments with discrete action space.
 
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
+
+def _bellman_target(immediate_value, next_value, not_done, discount):
+    return immediate_value + not_done * discount * next_value
+
+
 """
 The Q-Network has as input a state s and outputs the state-action values q(s,a_1), ..., q(s,a_n) for all n actions.
 """
@@ -139,7 +144,7 @@ class DDQN:
 
     def train(self, replay_buffer, batch_size=64):
 
-        state, action, next_state, reward, cost, dones = replay_buffer.sample(batch_size)
+        state, action, next_state, reward, cost, not_done = replay_buffer.sample(batch_size)
 
         q_values = self.q_network(state)
         q_values = q_values.gather(1, action.unsqueeze(1)).squeeze(1)
@@ -149,7 +154,9 @@ class DDQN:
             next_actions = torch.argmax(next_q_online, dim=1, keepdim=True)
             target_q_values = self.target_q_network(next_state)
             next_q_target = target_q_values.gather(1, next_actions).squeeze(1)
-            target_q = reward.squeeze(1) + self.gamma * next_q_target * (1 - dones.squeeze())
+            target_q = _bellman_target(
+                reward.squeeze(1), next_q_target, not_done.squeeze(1), self.gamma
+            )
         
         # print("next_actions.shape =", next_actions.shape)
         loss = F.mse_loss(q_values, target_q)
@@ -167,7 +174,9 @@ class DDQN:
             next_actions_c = torch.argmax(next_c_online, dim=1, keepdim=True)
             next_c_target = self.target_cost_network(next_state)
             next_c_target = next_c_target.gather(1, next_actions_c).squeeze(1)
-            target_c = cost.squeeze(1) + self.gamma * next_c_target * (1 - dones.squeeze())
+            target_c = _bellman_target(
+                cost.squeeze(1), next_c_target, not_done.squeeze(1), self.gamma
+            )
 
         cost_loss = F.mse_loss(c_values, target_c)
         self.cost_optimizer.zero_grad()

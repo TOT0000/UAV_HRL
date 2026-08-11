@@ -10,6 +10,12 @@ print(device)
 print("CUDA available:", torch.cuda.is_available())
 for i in range(torch.cuda.device_count()):
     print(f"Device {i}: {torch.cuda.get_device_name(i)}")
+
+
+def _bellman_target(immediate_value, next_value, not_done, discount):
+    return immediate_value + not_done * discount * next_value
+
+
 class Actor(nn.Module):
 	def __init__(self, state_dim, action_dim, max_action):
 		super(Actor, self).__init__()
@@ -152,7 +158,7 @@ class TD3():
         action = y.to(device)
         next_state = u.to(device)
         reward = r.to(device)
-        done = d.to(device)
+        not_done = d.to(device)
         num_gt = ng.to(device)
         # cost = c.to(device)
 
@@ -167,7 +173,7 @@ class TD3():
         target_Q1 = self.critic_1_target(next_state, next_action)
         target_Q2 = self.critic_2_target(next_state, next_action)
         target_Q = torch.min(target_Q1, target_Q2)
-        target_Q = reward + ((1 - done) * self.gamma * target_Q).detach()
+        target_Q = _bellman_target(reward, target_Q, not_done, self.gamma).detach()
 
         # Optimize Critic 1:
         current_Q1 = self.critic_1(state, action)
