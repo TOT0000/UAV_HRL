@@ -186,7 +186,8 @@ class DDQN:
     def _safe_targets(self, next_state, reward, cost, not_done):
         next_q_online = self.q_network(next_state)
         next_c_online = self.cost_network(next_state)
-        safe_scores = next_q_online - self.eta * next_c_online
+        next_c_eff = torch.clamp(next_c_online, min=0.0)
+        safe_scores = next_q_online - self.eta * next_c_eff
 
         action_mask = self._routing_action_mask(next_state)
         safe_scores = safe_scores.masked_fill(~action_mask, float("-inf"))

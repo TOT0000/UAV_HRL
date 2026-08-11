@@ -18,6 +18,45 @@ class FixedNetwork(nn.Module):
 
 
 class SafeDDQNTargetTest(unittest.TestCase):
+    def test_negative_cost_gets_no_bonus_and_matches_execution_scoring(self):
+        model = DDQN.__new__(DDQN)
+        model.action_dim = 3
+        model.gamma = 0.9
+        model.eta = 1.0
+
+        model.q_network = FixedNetwork([[0.0, 1.0, 2.0]])
+        model.cost_network = FixedNetwork([[0.0, -10.0, 0.0]])
+        model.target_q_network = FixedNetwork([[10.0, 20.0, 30.0]])
+        model.target_cost_network = FixedNetwork([[40.0, 50.0, 60.0]])
+
+        next_state = torch.zeros((1, 38), dtype=torch.float32)
+        next_state[0, 0] = 1.0
+        next_state[0, 10:13] = torch.tensor([0.0, 1.0, 1.0])
+
+        execution_action = model.select_action(
+            next_state[0].numpy(),
+            uav_id=0,
+            mask=np.array([False, True, True]),
+            epsilon=0.0,
+            logits_noise_std=0.0,
+        )
+        target_q, target_c, target_actions = model._safe_targets(
+            next_state,
+            reward=torch.tensor([[2.0]]),
+            cost=torch.tensor([[-4.0]]),
+            not_done=torch.tensor([[0.0]]),
+        )
+
+        # Without clamping, action 1 would receive a +10 bonus from negative cost.
+        raw_cost_scores = torch.tensor([0.0, 1.0, 2.0]) - torch.tensor(
+            [0.0, -10.0, 0.0]
+        )
+        self.assertEqual(raw_cost_scores.argmax().item(), 1)
+        self.assertEqual(execution_action, 2)
+        self.assertEqual(target_actions.item(), 2)
+        self.assertEqual(target_q.item(), 2.0)
+        self.assertEqual(target_c.item(), -4.0)
+
     def test_masked_online_selection_is_shared_by_both_targets(self):
         model = DDQN.__new__(DDQN)
         model.action_dim = 3
