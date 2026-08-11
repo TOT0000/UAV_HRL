@@ -164,8 +164,8 @@ def train():
                             # 本 step 有人達標就先暫存（OR 聚合）
                             env._pending_search_done |= bool(search_done)
                         elif task_type == "FOV":
-                            raw_action = Model_TD3_search.select_action(state, uav_id)
-                            movement_action = Model_TD3_search.decode_action(raw_action)
+                            raw_action = Model_TD3_fov.select_action(state, uav_id)
+                            movement_action = Model_TD3_fov.decode_action(raw_action)
                             dx, dy, dz = movement_action
                             E_mob = uav.apply_movement(dx, dy, dz, energy_model=env.energy_model, step_time=1.0, mobility_params=env.mobility_params)
                             fov_reward, _, current_fov = env.calculate_fov_reward(uav_id, lambda_EE, E_mob)
