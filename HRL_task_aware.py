@@ -12,6 +12,48 @@ from collections import defaultdict
 import time
 import json
 
+
+MOVEMENT_CONTROL_INTERVAL = 4
+
+
+def _is_movement_decision(slot, interval=MOVEMENT_CONTROL_INTERVAL):
+    return slot % interval == 0
+
+
+def _is_last_movement_decision(
+    slot, total_slots, interval=MOVEMENT_CONTROL_INTERVAL
+):
+    return _is_movement_decision(slot, interval) and slot + interval >= total_slots
+
+
+def _is_episode_end(slot, total_slots):
+    return slot == total_slots - 1
+
+
+def _search_transition_done(search_done, movement_episode_end):
+    return bool(search_done or movement_episode_end)
+
+
+def _create_active_replay_buffers(state_dim, routing_dim, max_size=int(2e5)):
+    # These shared buffers receive multiple UAVs' transitions in sequence. Until
+    # trajectory-specific or joint replay exists, one-step returns prevent data
+    # from different UAVs or episodes being stitched into one n-step trajectory.
+    routing_buffer = utils_update_v2.ReplayBufferDiscrete(
+        state_dim,
+        action_dim=routing_dim,
+        max_size=max_size,
+        n_step=1,
+        gamma=0.99,
+    )
+    movement_buffer_search = utils_update_v2.ReplayBufferContinuous(
+        state_dim, action_dim=3, max_size=max_size, n_step=1, gamma=0.99
+    )
+    movement_buffer_fov = utils_update_v2.ReplayBufferContinuous(
+        state_dim, action_dim=3, max_size=max_size, n_step=1, gamma=0.99
+    )
+    return routing_buffer, movement_buffer_search, movement_buffer_fov
+
+
 def train():
     print("✅ 累狗!")
     env = Simulator(num_UAV=16)
@@ -24,9 +66,9 @@ def train():
     Model_TD3_search = TD3(state_dim, moving_dim, max_action )
     Model_TD3_fov = TD3(state_dim, moving_dim, max_action )
     Model_DDQN = DDQN(state_dim, routing_dim)
-    routing_buffer = utils_update_v2.ReplayBufferDiscrete(state_dim, action_dim=routing_dim, max_size=int(2e5), n_step=3, gamma=0.99)
-    movement_buffer_search = utils_update_v2.ReplayBufferContinuous(state_dim, action_dim=3, max_size=int(2e5), n_step=3, gamma=0.99)
-    movement_buffer_fov = utils_update_v2.ReplayBufferContinuous(state_dim, action_dim=3, max_size=int(2e5), n_step=3, gamma=0.99)
+    routing_buffer, movement_buffer_search, movement_buffer_fov = (
+        _create_active_replay_buffers(state_dim, routing_dim)
+    )
     T_sec = 60
     total_episodes = 6
     warmup_episodes = 0
@@ -110,6 +152,8 @@ def train():
         EPS = 1e-4
         
         for t in range(T_slot):
+            episode_end = _is_episode_end(t, T_slot)
+            movement_episode_end = _is_last_movement_decision(t, T_slot)
             slot_r = defaultdict(float)
             slot_c = defaultdict(float)
             env.begin_step()   
@@ -121,13 +165,13 @@ def train():
             uavs_with_pkts = [u for u, b in backlog_bits.items() if b > 0]
             uavs_with_pkts = [uid for uid in uavs_with_pkts if uid != env.GS_ID]
             active_uav_ids = list(range(env.num_UAV)) 
-            if (t == 0) or (t % 4 == 0):
+            if _is_movement_decision(t):
                 state_cache = {uid: rout.get_state_ta(env, uid, backlog_bits=backlog_bits) for uid in active_uav_ids}
             if getattr(env, "need_reassign", False):
                 env.assign_tasks()
                 env.need_reassign = False
             # 每4個time step移動一次
-            if t% 4 == 0:
+            if _is_movement_decision(t):
                 for uav_id in active_uav_ids:
                     task_list = env.multi_tasks.get(uav_id, [])
                     if not task_list:
@@ -160,7 +204,17 @@ def train():
                             next_state = rout.get_state_ta(env, uav_id, backlog_bits=backlog_bits)
                             global_cov = float(env.visited_bitmap.mean())
                             search_done = (global_cov >= SEARCH_COVERAGE_TH- EPS) 
-                            movement_buffer_search.add(state, raw_action, next_state, search_reward, done=search_done, tag_gt=env.num_GT)
+                            transition_done = _search_transition_done(
+                                search_done, movement_episode_end
+                            )
+                            movement_buffer_search.add(
+                                state,
+                                raw_action,
+                                next_state,
+                                search_reward,
+                                done=transition_done,
+                                tag_gt=env.num_GT,
+                            )
                             # 本 step 有人達標就先暫存（OR 聚合）
                             env._pending_search_done |= bool(search_done)
                         elif task_type == "FOV":
@@ -173,7 +227,14 @@ def train():
                             episode_fov_reward += fov_reward
                             episode_total_reward+= fov_reward
                             next_state = rout.get_state_ta(env, uav_id, backlog_bits=backlog_bits)
-                            movement_buffer_fov.add(state, raw_action, next_state, fov_reward, done=False, tag_gt=env.num_GT)
+                            movement_buffer_fov.add(
+                                state,
+                                raw_action,
+                                next_state,
+                                fov_reward,
+                                done=movement_episode_end,
+                                tag_gt=env.num_GT,
+                            )
                             fov_accum += current_fov
                             fov_count += 1
                         elif task_type == "Hovering":
@@ -194,7 +255,7 @@ def train():
             next_hop_by_uav.clear()
             routing_mask_cache.clear()
             # if env.source_uavs:
-            if t % 4 == 0:   # 每 1 秒更新一次 (0.25 × 4)
+            if _is_movement_decision(t):   # 每 1 秒更新一次 (0.25 × 4)
                 env.update_u2u_channels()
                 env.update_u2g_channels()
                 cap_ok = (env.Capacity_matrix > 0.1)
@@ -323,7 +384,7 @@ def train():
                 reward = float(slot_r[uid])  
                 cost   = float(slot_c[uid])  
 
-                done_flag = False  # 你目前每 slot 都 False；若你有 episode 終止條件再改
+                done_flag = episode_end
                 add_buf(state, action, next_state, reward, cost, done_flag, tag_gt=env.num_GT)
                     
                 
