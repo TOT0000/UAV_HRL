@@ -1,0 +1,87 @@
+import unittest
+
+import numpy as np
+import torch
+from torch import nn
+
+from DDQN import DDQN
+from utils_update_v2 import ReplayBufferDiscrete
+
+
+class FixedNetwork(nn.Module):
+    def __init__(self, values):
+        super().__init__()
+        self.register_buffer("values", torch.tensor(values, dtype=torch.float32))
+
+    def forward(self, inputs):
+        return self.values[: inputs.shape[0]]
+
+
+class SafeDDQNTargetTest(unittest.TestCase):
+    def test_masked_online_selection_is_shared_by_both_targets(self):
+        model = DDQN.__new__(DDQN)
+        model.action_dim = 3
+        model.gamma = 0.9
+        model.eta = 1.0
+
+        model.q_network = FixedNetwork([[1.0, 100.0, 8.0], [1.0, 100.0, 8.0]])
+        model.cost_network = FixedNetwork([[0.0, 1.0, 1.0], [0.0, 1.0, 1.0]])
+        model.target_q_network = FixedNetwork(
+            [[10.0, 20.0, 30.0], [10.0, 20.0, 30.0]]
+        )
+        model.target_cost_network = FixedNetwork(
+            [[40.0, 99.0, 60.0], [40.0, 99.0, 60.0]]
+        )
+
+        # Task-aware state layout: 6N + 26, with N=2 and mask starting at N+8.
+        next_state = torch.zeros((2, 38), dtype=torch.float32)
+        next_state[0, 0] = 1.0
+        next_state[1, 1] = 1.0
+        next_state[:, 10:13] = torch.tensor([1.0, 0.0, 1.0])
+
+        reward = torch.tensor([[2.0], [2.0]])
+        cost = torch.tensor([[3.0], [3.0]])
+        not_done = torch.tensor([[1.0], [0.0]])
+
+        target_q, target_c, next_actions = model._safe_targets(
+            next_state, reward, cost, not_done
+        )
+
+        # Action 1 has the highest safe score but is illegal, so action 2 is shared.
+        self.assertEqual(next_actions.tolist(), [[2], [2]])
+        self.assertTrue(torch.allclose(target_q, torch.tensor([29.0, 2.0])))
+        self.assertTrue(torch.allclose(target_c, torch.tensor([57.0, 3.0])))
+
+    def test_existing_empty_mask_fallback_excludes_current_uav(self):
+        model = DDQN.__new__(DDQN)
+        model.action_dim = 3
+
+        for state_dim in (30, 38):
+            with self.subTest(state_dim=state_dim):
+                next_state = torch.zeros((1, state_dim), dtype=torch.float32)
+                next_state[0, 1] = 1.0
+
+                action_mask = model._routing_action_mask(next_state)
+
+                self.assertEqual(action_mask.tolist(), [[True, False, True]])
+
+    def test_single_training_step_smoke(self):
+        model = DDQN(state_dim=38, action_dim=3, hidden_dim=8)
+        replay = ReplayBufferDiscrete(
+            state_dim=38, action_dim=3, max_size=4, n_step=1
+        )
+
+        state = np.zeros(38, dtype=np.float32)
+        state[0] = 1.0
+        next_state = state.copy()
+        next_state[10:13] = np.array([1.0, 0.0, 1.0], dtype=np.float32)
+        replay.add(state, 0, next_state, reward=1.0, cost=0.5, done=False)
+
+        model.train(replay, batch_size=1)
+
+        self.assertEqual(len(model.loss_log), 1)
+        self.assertEqual(len(model.cost_loss_log), 1)
+
+
+if __name__ == "__main__":
+    unittest.main()

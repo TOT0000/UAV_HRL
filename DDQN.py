@@ -66,7 +66,16 @@ class QNetworkCNN(nn.Module):
 
 
 class DDQN:
-    def __init__(self, state_dim, action_dim, hidden_dim=128, gamma=0.99, tau=0.005, lr=1e-3):
+    def __init__(
+        self,
+        state_dim,
+        action_dim,
+        hidden_dim=128,
+        gamma=0.99,
+        tau=0.005,
+        lr=1e-3,
+        eta=0.1,
+    ):
         self.q_network = QNetwork(action_dim, state_dim, hidden_dim).to(device)
         self.target_q_network = copy.deepcopy(self.q_network)
         self.optimizer = torch.optim.Adam(self.q_network.parameters(), lr=lr)
@@ -79,10 +88,13 @@ class DDQN:
         self.gamma = gamma
         self.tau = tau
         self.action_dim = action_dim
+        self.eta = eta
 
         self.loss_log = []
         self.cost_loss_log = []
-    def select_action(self, state, uav_id, mask=None, visited_nodes=None, epsilon=0.5, logits_noise_std=0.5, eta=0.1):
+    def select_action(self, state, uav_id, mask=None, visited_nodes=None, epsilon=0.5, logits_noise_std=0.5, eta=None):
+        if eta is None:
+            eta = self.eta
         state_t = torch.FloatTensor(state.reshape(1, -1)).to(device)
         with torch.no_grad():
             q_r = self.q_network(state_t).cpu().numpy().flatten()      # reward Q
@@ -142,6 +154,59 @@ class DDQN:
 
         return action
 
+    def _routing_action_mask(self, next_state):
+        num_uav = self.action_dim - 1
+        state_dim = next_state.shape[1]
+
+        if state_dim == 5 * num_uav + 20:
+            mask_start = num_uav + 7
+        elif state_dim == 6 * num_uav + 26:
+            mask_start = num_uav + 8
+        else:
+            raise ValueError(
+                f"Unsupported routing state layout: state_dim={state_dim}, "
+                f"action_dim={self.action_dim}"
+            )
+
+        action_mask = next_state[
+            :, mask_start : mask_start + self.action_dim
+        ].bool()
+
+        # Preserve select_action()'s existing empty-mask fallback.
+        empty_rows = ~action_mask.any(dim=1)
+        if empty_rows.any():
+            action_mask = action_mask.clone()
+            action_mask[empty_rows] = True
+            uav_ids = next_state[empty_rows, :num_uav].argmax(dim=1)
+            action_mask[empty_rows, uav_ids] = False
+
+        return action_mask
+
+    @torch.no_grad()
+    def _safe_targets(self, next_state, reward, cost, not_done):
+        next_q_online = self.q_network(next_state)
+        next_c_online = self.cost_network(next_state)
+        safe_scores = next_q_online - self.eta * next_c_online
+
+        action_mask = self._routing_action_mask(next_state)
+        safe_scores = safe_scores.masked_fill(~action_mask, float("-inf"))
+        next_actions = safe_scores.argmax(dim=1, keepdim=True)
+
+        next_q_target = self.target_q_network(next_state).gather(
+            1, next_actions
+        ).squeeze(1)
+        next_c_target = self.target_cost_network(next_state).gather(
+            1, next_actions
+        ).squeeze(1)
+
+        target_q = _bellman_target(
+            reward.squeeze(1), next_q_target, not_done.squeeze(1), self.gamma
+        )
+        target_c = _bellman_target(
+            cost.squeeze(1), next_c_target, not_done.squeeze(1), self.gamma
+        )
+        return target_q, target_c, next_actions
+
     def train(self, replay_buffer, batch_size=64):
 
         state, action, next_state, reward, cost, not_done = replay_buffer.sample(batch_size)
@@ -149,16 +214,10 @@ class DDQN:
         q_values = self.q_network(state)
         q_values = q_values.gather(1, action.unsqueeze(1)).squeeze(1)
 
-        with torch.no_grad():
-            next_q_online = self.q_network(next_state)
-            next_actions = torch.argmax(next_q_online, dim=1, keepdim=True)
-            target_q_values = self.target_q_network(next_state)
-            next_q_target = target_q_values.gather(1, next_actions).squeeze(1)
-            target_q = _bellman_target(
-                reward.squeeze(1), next_q_target, not_done.squeeze(1), self.gamma
-            )
+        target_q, target_c, _ = self._safe_targets(
+            next_state, reward, cost, not_done
+        )
         
-        # print("next_actions.shape =", next_actions.shape)
         loss = F.mse_loss(q_values, target_q)
         self.optimizer.zero_grad()
         loss.backward()
@@ -168,15 +227,6 @@ class DDQN:
         # === cost critic 訓練 ===
         c_values = self.cost_network(state)
         c_values = c_values.gather(1, action.unsqueeze(1)).squeeze(1)
-
-        with torch.no_grad():
-            next_c_online = self.cost_network(next_state)
-            next_actions_c = torch.argmax(next_c_online, dim=1, keepdim=True)
-            next_c_target = self.target_cost_network(next_state)
-            next_c_target = next_c_target.gather(1, next_actions_c).squeeze(1)
-            target_c = _bellman_target(
-                cost.squeeze(1), next_c_target, not_done.squeeze(1), self.gamma
-            )
 
         cost_loss = F.mse_loss(c_values, target_c)
         self.cost_optimizer.zero_grad()
