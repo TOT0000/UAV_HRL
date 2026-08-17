@@ -1,5 +1,5 @@
 import math
-from collections import defaultdict
+from collections import defaultdict, deque
 from Energy_model import EnergyConsumptionModel
 from Fov_model_phase import FovModel
 from Channel_model import ChannelModel
@@ -11,6 +11,10 @@ def final_hop_delivered_bits(to_target, gs_id, bits_tx_used):
     if int(to_target) != int(gs_id):
         return 0.0
     return max(float(bits_tx_used), 0.0)
+
+
+MAX_PACKET_HOPS = 20
+PACKET_EPS = 1e-9
 
 
 
@@ -25,6 +29,10 @@ class PacketEngine:
         self.packet_pool = []
         self.inject_buffer = defaultdict(float)
         self.source_buffer = defaultdict(float)
+
+        # The global pool is only a lifecycle/statistics index. Forwarding order
+        # is owned by one aggregate FIFO per UAV and may mix FOV and COM packets.
+        self.uav_queues = {uav_id: deque() for uav_id in range(num_uav)}
 
         # === Dual-Queue backlog tracking (no weights) ===
         # backlog_bits_by_task[node_id][task] stores SUM of remaining bits at that node for that task.
@@ -56,6 +64,7 @@ class PacketEngine:
         self.com_delivered = 0
         self.fov_violated = 0
         self.com_violated = 0
+        self.partial_transmissions = 0
 
         self.bp_skip_inject_steps = 0
         # self.max_packets = 3000
@@ -77,6 +86,175 @@ class PacketEngine:
             for uav_id in range(self.num_UAV + 1)              # ★ 用 self.num_UAV
         }
         self.source_uavs = set(self.packet_buffer.keys())
+
+    def _sync_backlog(self, uav_id):
+        if not (0 <= int(uav_id) < self.num_UAV):
+            return 0.0
+        queue = self.uav_queues[int(uav_id)]
+        total = sum(
+            max(float(pkt.get("rem_bits", 0.0)), 0.0)
+            for pkt in queue
+            if pkt is not None and not pkt.get("done", False)
+        )
+        self.backlog_bits[int(uav_id)] = max(float(total), 0.0)
+        return self.backlog_bits[int(uav_id)]
+
+    def _remove_from_queue(self, pkt, uav_id=None):
+        candidate_ids = (
+            [int(uav_id)] if uav_id is not None else range(self.num_UAV)
+        )
+        removed = False
+        for node_id in candidate_ids:
+            if not (0 <= node_id < self.num_UAV):
+                continue
+            queue = self.uav_queues[node_id]
+            try:
+                queue.remove(pkt)
+                removed = True
+            except ValueError:
+                pass
+            self._sync_backlog(node_id)
+            if removed:
+                break
+        return removed
+
+    def enqueue_packet(self, pkt, uav_id, queue_enter_time):
+        """Append a fully arrived packet to a UAV's aggregate FIFO."""
+
+        uav_id = int(uav_id)
+        if not (0 <= uav_id < self.num_UAV):
+            raise ValueError(f"invalid UAV queue id: {uav_id}")
+        pkt["current"] = uav_id
+        pkt["queue_enter_time"] = float(queue_enter_time)
+        self.uav_queues[uav_id].append(pkt)
+        self._sync_backlog(uav_id)
+
+    def create_packet(self, source, task_type, size_bits, generation_time):
+        """Create and enqueue one packet; shared by injection and unit tests."""
+
+        source = int(source)
+        task_type = self._task_norm(task_type)
+        size_bits = float(size_bits)
+        generation_time = float(generation_time)
+        pool_idx = len(self.packet_pool)
+        pkt = {
+            "id": self._next_pkt_id,
+            "_pool_idx": pool_idx,
+            "source": source,
+            "current": source,
+            "arrival_time": generation_time,
+            "generation_time": generation_time,
+            "queue_enter_time": generation_time,
+            "deadline": 8,
+            "done": False,
+            "hops": 0,
+            "task_type": task_type,
+            "size_bits": size_bits,
+            "rem_bits": size_bits,
+            "path": [source],
+            "e2e_delay_ms": 0.0,
+            "bn_path_mbps": float("inf"),
+            "bn_final_mbps": None,
+            "bn_counted": False,
+            "hop_receiver": None,
+            "hop_bits_sent": 0.0,
+        }
+        self.packet_pool.append(pkt)
+        self._active_idx.append(pool_idx)
+        self.enqueue_packet(pkt, source, generation_time)
+        self._next_pkt_id += 1
+        return pkt
+
+    def get_queue_packets(self, uav_id):
+        return [
+            pkt
+            for pkt in self.uav_queues[int(uav_id)]
+            if pkt is not None and not pkt.get("done", False)
+        ]
+
+    def get_hol_packet(self, uav_id):
+        queue = self.uav_queues[int(uav_id)]
+        while queue and (queue[0] is None or queue[0].get("done", False)):
+            queue.popleft()
+        self._sync_backlog(int(uav_id))
+        return queue[0] if queue else None
+
+    def nonempty_uav_ids(self):
+        return [
+            uav_id
+            for uav_id in range(self.num_UAV)
+            if self.get_hol_packet(uav_id) is not None
+        ]
+
+    def record_hop_transmission(self, pkt, sender, receiver, bits):
+        """Apply partial hop service while keeping the packet at its sender."""
+
+        sender = int(sender)
+        receiver = int(receiver)
+        bits = max(float(bits), 0.0)
+        if pkt is not self.get_hol_packet(sender):
+            raise AssertionError("only the aggregate FIFO HOL packet may transmit")
+        locked_receiver = pkt.get("hop_receiver")
+        if locked_receiver is not None and int(locked_receiver) != receiver:
+            raise AssertionError(
+                f"packet {pkt['id']} hop is locked to {locked_receiver}, not {receiver}"
+            )
+        if bits <= 0.0:
+            return False
+        if locked_receiver is None:
+            pkt["hop_receiver"] = receiver
+        remaining = max(float(pkt["rem_bits"]), 0.0)
+        used = min(bits, remaining)
+        pkt["rem_bits"] = max(remaining - used, 0.0)
+        pkt["hop_bits_sent"] = float(pkt.get("hop_bits_sent", 0.0)) + used
+        if pkt["rem_bits"] > PACKET_EPS:
+            self.partial_transmissions += 1
+        self._sync_backlog(sender)
+        return pkt["rem_bits"] <= PACKET_EPS
+
+    def detach_completed_hop(self, pkt, sender, receiver, completion_time):
+        """Remove a full hop from the sender and return a pending relay arrival."""
+
+        sender = int(sender)
+        receiver = int(receiver)
+        locked_receiver = pkt.get("hop_receiver")
+        if locked_receiver is None or int(locked_receiver) != receiver:
+            raise AssertionError("completed hop does not match the receiver lock")
+        if float(pkt.get("rem_bits", 0.0)) > PACKET_EPS:
+            raise AssertionError("cannot detach an incomplete hop")
+        if not self._remove_from_queue(pkt, sender):
+            raise AssertionError("completed packet was not in the sender FIFO")
+        pkt["hops"] = int(pkt.get("hops", 0)) + 1
+        pkt.setdefault("path", []).append(receiver)
+        pkt["current"] = receiver
+        pkt["hop_receiver"] = None
+        pkt["hop_bits_sent"] = 0.0
+        return {
+            "packet": pkt,
+            "receiver": receiver,
+            "completion_time": float(completion_time),
+            "sender": sender,
+            "packet_id": int(pkt["id"]),
+        }
+
+    def enqueue_relay_arrivals(self, arrivals):
+        """Append full relay arrivals deterministically after slot service ends."""
+
+        ordered = sorted(
+            arrivals,
+            key=lambda item: (
+                float(item["completion_time"]),
+                int(item["sender"]),
+                int(item["packet_id"]),
+            ),
+        )
+        for arrival in ordered:
+            pkt = arrival["packet"]
+            pkt["rem_bits"] = float(pkt["size_bits"])
+            self.enqueue_packet(
+                pkt, arrival["receiver"], arrival["completion_time"]
+            )
+        return ordered
 
     def inject_packets(self, env, delay_bound_steps, current_time, step_time=0.25,
                        base_fov_rate=5, base_ctrl_rate=50):
@@ -144,34 +322,9 @@ class PacketEngine:
                     pkt_bits = 256
 
                 for _ in range(num_packets):
-                    # ★ 先決定將要插入的位置（pool 索引）
-                    pool_idx = len(self.packet_pool)
-                    pkt = {
-                        "id": self._next_pkt_id,          # 流水號
-                        "_pool_idx": pool_idx,            # 明確保存 list 索引
-                        "source": uav_id,
-                        "current": uav_id,
-                        "arrival_time": current_time,
-                        "deadline": 8,
-                        "done": False,
-                        "hops": 0,
-                        "task_type": task_type,
-                        "size_bits": float(pkt_bits),   # 封包固定大小
-                        "rem_bits":  float(pkt_bits),
-                        "path": [uav_id],                 
-                        "e2e_delay_ms": 0.0 ,
-                        "bn_path_mbps": float("inf"),     # 封包沿路的capacity
-                        "bn_final_mbps": None, 
-                        "bn_counted": False,              # 避免重複計算
-
-                    }
-                    self.packet_pool.append(pkt)
-                    self._active_idx.append(pool_idx)     # 活躍索引對應 pool_idx
-
-                    # Dual-Queue backlog update: injected packet belongs to its source/current node
-                    self.backlog_bits[uav_id] += pkt_bits
-
-                    self._next_pkt_id += 1
+                    self.create_packet(
+                        uav_id, task_type, pkt_bits, current_time
+                    )
                     # self.total_injected_packets += 1
                     # if self.total_injected_packets >= self.target_total_packets:
                     #     print(f"✅ Packet quota reached: {self.total_injected_packets}")
@@ -203,12 +356,8 @@ class PacketEngine:
         if current_time is not None:
             pkt["finish_time"] = current_time
 
-        # 2) backlog final cleanup (avoid leftover)
-        try:
-            cur = int(pkt.get("current", -1))
-        except Exception:
-            cur = -1
-        rem = float(pkt.get("rem_bits", 0.0))
+        # 2) remove the packet from whichever per-UAV FIFO currently owns it.
+        self._remove_from_queue(pkt)
 
         # 3) remove from active indices
         pi = pkt.get("_pool_idx", None)
@@ -237,7 +386,6 @@ class PacketEngine:
         Drop packets that are expired by deadline or exceed max hops.
         Safe against: packet_pool entries being None, active_idx changing, etc.
         """
-        MAX_HOPS = 20
         dropped = 0
 
         for idx in list(self._active_idx):
@@ -264,10 +412,6 @@ class PacketEngine:
                     pass
                 continue
 
-            # --- 取共用欄位 ---
-            cur = int(pkt.get("current", -1))
-            rem_bits = float(pkt.get("rem_bits", 0.0))
-
             # =========================
             # (A) DEADLINE EXPIRED DROP
             # =========================
@@ -288,16 +432,10 @@ class PacketEngine:
             # (B) MAX HOPS DROP
             # =========================
             hops = int(pkt.get("hops", 0))
-            if hops >= MAX_HOPS:
-                # backlog 扣掉
-                if cur >= 0 and rem_bits > 0:
-                    self.backlog_bits[cur] = max(0.0, self.backlog_bits[cur] - rem_bits)
-
-                try:
-                    self._active_idx.remove(idx)
-                except ValueError:
-                    pass
-                self.packet_pool[idx] = None
+            if hops >= MAX_PACKET_HOPS:
+                self.mark_packet_done(
+                    pkt, current_time=current_time, reason="max_hops"
+                )
                 dropped += 1
                 continue
 
@@ -344,6 +482,9 @@ class PacketEngine:
         self.source_buffer.clear()
         # Dual-Queue backlog tracking
         self.backlog_bits.clear()
+        self.uav_queues = {
+            uav_id: deque() for uav_id in range(self.num_UAV)
+        }
         # 其他快取
         self.buffer_info = {}
         self.actual_backlog = {}
@@ -352,6 +493,7 @@ class PacketEngine:
         self.total_violated = 0
         self.fov_delivered= 0
         self.com_delivered= 0
+        self.partial_transmissions = 0
         self.delay_log = []  # 每跳記錄
         self.type_delay_accum = {
             "FOV": {"sum_queue": 0.0, "sum_tx": 0.0, "sum_total": 0.0, "count": 0},
