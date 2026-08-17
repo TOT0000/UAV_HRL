@@ -47,7 +47,7 @@ class CentralizedMovementStateTest(unittest.TestCase):
         self.env.reset_environment()
         self.packet_engine = PacketEngine(num_uav=16, step_time=0.25)
 
-    def test_state_is_532_finite_side_effect_free_and_routing_stays_122(self):
+    def test_state_is_532_finite_side_effect_free_and_routing_is_126(self):
         positions_before = [uav.get_position() for uav in self.env.UAVs]
         tasks_before = {
             uid: [dict(task) for task in tasks]
@@ -78,7 +78,7 @@ class CentralizedMovementStateTest(unittest.TestCase):
         routing_state = self.packet_engine.get_state_ta(
             self.env, 0, backlog_bits=self.packet_engine.backlog_bits
         )
-        self.assertEqual(routing_state.shape, (122,))
+        self.assertEqual(routing_state.shape, (126,))
 
     def test_search_potential_is_full_boolean_map_mean(self):
         self.env.visited_bitmap[:] = False

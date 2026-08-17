@@ -10,7 +10,7 @@ import pandas as pd
 import torch
 
 from DDQN import DDQN
-from Packet_scheduler_v1 import PacketEngine, final_hop_delivered_bits
+from Packet_scheduler_v1 import PacketEngine
 from Simulator import Simulator
 from centralized_movement import (
     JOINT_ACTION_DIM,
@@ -190,26 +190,28 @@ def _run_routing_slot(
 ):
     step_time = float(packet_engine.step_time)
     env.current_time = float(current_time)
-    packet_engine.drop_expired_packets(env.current_time)
+    # Source generation precedes cleanup by contract. Prior-slot expirations are
+    # normally already gone; this makes the boundary explicit and idempotent.
     packet_engine.inject_packets(
         env, delay_bound_steps, env.current_time, step_time=step_time
     )
-    active_packets = packet_engine.get_active_packets()
+    packet_engine.expire_packets(env.current_time, inclusive=True)
+    packet_engine.drop_expired_packets(env.current_time)
     backlog_before = _active_backlog(packet_engine)
-    uavs_with_packets = sorted(
-        uid
-        for uid, bits in backlog_before.items()
-        if uid != env.GS_ID and bits > 0.0
-    )
+    uavs_with_packets = packet_engine.nonempty_uav_ids()
+    effective_masks = {
+        uid: packet_engine.get_effective_action_mask(
+            env, uid, routing_masks[uid]
+        )
+        for uid in uavs_with_packets
+    }
 
     states = {
         uid: packet_engine.get_state_ta(
             env,
             uid,
             backlog_bits=backlog_before,
-            action_mask=packet_engine.get_effective_action_mask(
-                env, uid, routing_masks[uid]
-            ),
+            action_mask=effective_masks[uid],
         )
         for uid in uavs_with_packets
     }
@@ -221,77 +223,31 @@ def _run_routing_slot(
             )
 
     next_hops = _select_routing_actions(
-        ddqn, states, routing_masks, epsilon=epsilon
+        ddqn, states, effective_masks, epsilon=epsilon
     )
 
-    slot_reward = defaultdict(float)
-    slot_cost = defaultdict(float)
-    delivered_bits = 0.0
-    for packet in active_packets:
-        if packet.get("done", False):
+    proposed_links = {
+        sender: receiver
+        for sender, receiver in next_hops.items()
+        if receiver != sender and packet_engine.get_hol_packet(sender) is not None
+    }
+    active_capacities, _ = env.allocate_active_link_capacities(
+        proposed_links
+    )
+    slot_result = packet_engine.serve_active_links(
+        env,
+        next_hops,
+        active_capacities,
+        current_time=env.current_time,
+    )
+    env.current_time = float(current_time) + step_time
+    for outcome in slot_result["outcomes"]:
+        task_type = outcome["task_type"]
+        if task_type not in violation_stats:
             continue
-        from_uav = int(packet["current"])
-        if from_uav == env.GS_ID:
-            continue
-        to_target = int(next_hops.get(from_uav, env.GS_ID))
-        if to_target == env.GS_ID:
-            capacity_mbps = float(env.gs_capacity[from_uav])
-        else:
-            capacity_mbps = float(env.Capacity_matrix[from_uav, to_target])
-        if capacity_mbps <= 0.0:
-            continue
-
-        packet_bits = float(packet.get("rem_bits", packet.get("size_bits", 0.0)))
-        node_backlog = float(packet_engine.backlog_bits.get(from_uav, 0.0))
-        queue_bits_without_packet = max(node_backlog - packet_bits, 0.0)
-        if to_target == env.GS_ID:
-            outgoing_links = 1
-        else:
-            outgoing_links = max(int(env.k_u_u2u[from_uav]), 1)
-        effective_queue_bits = queue_bits_without_packet / outgoing_links
-        predicted_bits = min(
-            capacity_mbps * 1e6 * step_time, packet_bits
-        )
-        hop_delay_ms = packet_engine.log_hop_delay(
-            env,
-            packet,
-            current_node=from_uav,
-            next_hop=to_target,
-            link_capacity_mbps=capacity_mbps,
-            current_time=env.current_time,
-            pkt_bits=predicted_bits,
-            backlog_bits=effective_queue_bits,
-        )
-        (
-            task_type,
-            route_reward,
-            packet_done,
-            _,
-            violated,
-            cost,
-            bits_used,
-            _,
-            _,
-        ) = packet_engine.calculate_packet_reward_fast(
-            env,
-            packet,
-            hop_delay_ms,
-            from_uav=from_uav,
-            to_target=to_target,
-            t=env.current_time,
-            backlog=queue_bits_without_packet,
-            mode="uav",
-            channel_capacity=capacity_mbps,
-        )
-        delivered_bits += final_hop_delivered_bits(
-            to_target, env.GS_ID, bits_used
-        )
-        slot_reward[from_uav] += float(route_reward)
-        slot_cost[from_uav] += float(cost)
-        if packet_done and task_type in violation_stats:
-            violation_stats[task_type]["delivered"] += 1
-            if violated:
-                violation_stats[task_type]["violated"] += 1
+        violation_stats[task_type]["delivered"] += 1
+        if outcome["violated"]:
+            violation_stats[task_type]["violated"] += 1
 
     backlog_after = _active_backlog(packet_engine)
     next_states = {
@@ -310,14 +266,14 @@ def _run_routing_slot(
             states[uid],
             int(next_hops.get(uid, uid)),
             next_states.get(uid, states[uid]),
-            float(slot_reward[uid]),
-            float(slot_cost[uid]),
+            float(slot_result["reward_by_sender"][uid]),
+            float(slot_result["cost_by_sender"][uid]),
             bool(done),
             tag_gt=env.num_GT,
         )
     return (
-        delivered_bits,
-        float(sum(slot_reward.values())),
+        float(slot_result["timely_goodput_bits"]),
+        float(sum(slot_result["reward_by_sender"].values())),
         len(next_hops),
     )
 
@@ -721,6 +677,10 @@ def train(config=None):
             f"reward={episode_reward:.6f} delivered={episode_delivered_mbits:.6f} Mbit "
             f"energy={episode_energy:.6f} J lambda={lambda_ee:.9f} "
             f"routing_reward={episode_routing_reward:.6f} "
+            f"raw_final_bits={packet_engine.raw_final_hop_bits:.0f} "
+            f"timely_bits={packet_engine.timely_goodput_bits:.0f} "
+            f"wait={packet_engine.wait_actions} partial={packet_engine.partial_transmissions} "
+            f"deadline_drops={packet_engine.deadline_drops} "
             f"critic_updates={centralized_td3.num_critic_update_iteration} "
             f"actor_updates={centralized_td3.num_actor_update_iteration}"
         )
@@ -862,6 +822,12 @@ def train(config=None):
         "ddqn_training_updates": ddqn.num_training,
         "td3_noise_log": td3_noise_log,
         "routing_epsilon_log": routing_epsilon_log,
+        "raw_final_hop_bits": packet_engine.raw_final_hop_bits,
+        "timely_goodput_bits": packet_engine.timely_goodput_bits,
+        "routing_wait_actions": packet_engine.wait_actions,
+        "partial_transmissions": packet_engine.partial_transmissions,
+        "deadline_drops": packet_engine.deadline_drops,
+        "link_slot_budget_violations": packet_engine.link_slot_budget_violations,
         "reward_log": reward_log,
         "delivered_log": delivered_log,
         "energy_log": energy_log,

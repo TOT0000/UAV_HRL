@@ -61,6 +61,13 @@ class RoutingWaitAndHolStateTest(unittest.TestCase):
 
         self.assertEqual(state.shape, (126,))
         np.testing.assert_allclose(state[-4:], [0.0, 1.0, 0.5, 1.0])
+        self.engine.get_state_ta(
+            self.env,
+            5,
+            backlog_bits=self.engine.backlog_bits,
+            action_mask=self.env.get_routing_action_mask(5),
+        )
+        self.assertEqual(packet["e2e_delay_ms"], 0.0)
 
         packet["rem_bits"] = 50.0
         self.engine._sync_backlog(5)

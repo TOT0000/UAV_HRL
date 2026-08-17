@@ -16,6 +16,7 @@ def final_hop_delivered_bits(to_target, gs_id, bits_tx_used):
 MAX_PACKET_HOPS = 20
 PACKET_EPS = 1e-9
 TASK_DEADLINE_SECONDS = {"FOV": 1.5, "COM": 1.0}
+EPISODE_INJECTION_CUTOFF_SECONDS = 58.5
 
 
 
@@ -66,6 +67,11 @@ class PacketEngine:
         self.fov_violated = 0
         self.com_violated = 0
         self.partial_transmissions = 0
+        self.raw_final_hop_bits = 0.0
+        self.timely_goodput_bits = 0.0
+        self.wait_actions = 0
+        self.deadline_drops = 0
+        self.link_slot_budget_violations = 0
 
         self.bp_skip_inject_steps = 0
         # self.max_packets = 3000
@@ -146,7 +152,9 @@ class PacketEngine:
             "arrival_time": generation_time,
             "generation_time": generation_time,
             "queue_enter_time": generation_time,
-            "deadline": 8,
+            "deadline": TASK_DEADLINE_SECONDS[task_type],
+            "deadline_abs": generation_time
+            + TASK_DEADLINE_SECONDS[task_type],
             "done": False,
             "hops": 0,
             "task_type": task_type,
@@ -159,6 +167,11 @@ class PacketEngine:
             "bn_counted": False,
             "hop_receiver": None,
             "hop_bits_sent": 0.0,
+            "hop_service_start_time": None,
+            "hop_queue_delay_s": 0.0,
+            "final_hop_accum_bits": 0.0,
+            "timely_goodput_counted": False,
+            "violation_counted": False,
         }
         self.packet_pool.append(pkt)
         self._active_idx.append(pool_idx)
@@ -254,6 +267,8 @@ class PacketEngine:
         pkt["current"] = receiver
         pkt["hop_receiver"] = None
         pkt["hop_bits_sent"] = 0.0
+        pkt["hop_service_start_time"] = None
+        pkt["hop_queue_delay_s"] = 0.0
         return {
             "packet": pkt,
             "receiver": receiver,
@@ -281,8 +296,276 @@ class PacketEngine:
             )
         return ordered
 
+    def _mark_deadline_violation(self, pkt, current_time, sender=None):
+        if pkt.get("violation_counted", False):
+            return None
+        pkt["violation_counted"] = True
+        task_type = self._task_norm(pkt.get("task_type", "COM"))
+        self.total_violated += 1
+        self.deadline_drops += 1
+        if task_type == "FOV":
+            self.fov_violated += 1
+        else:
+            self.com_violated += 1
+        owner = int(pkt.get("current", -1) if sender is None else sender)
+        self.mark_packet_done(
+            pkt, current_time=float(current_time), reason="deadline"
+        )
+        return {"sender": owner, "task_type": task_type, "packet": pkt}
+
+    def expire_packets(self, current_time, inclusive=True):
+        """Drop unfinished packets at an absolute deadline, exactly once."""
+
+        current_time = float(current_time)
+        violations = []
+        for pkt in list(self.get_active_packets()):
+            deadline_abs = pkt.get("deadline_abs")
+            if deadline_abs is None:
+                continue
+            deadline_abs = float(deadline_abs)
+            expired = (
+                current_time >= deadline_abs - PACKET_EPS
+                if inclusive
+                else current_time > deadline_abs + PACKET_EPS
+            )
+            if expired:
+                event = self._mark_deadline_violation(pkt, current_time)
+                if event is not None:
+                    violations.append(event)
+        return violations
+
+    def _routing_transmission_reward(
+        self, env, from_uav, to_target, timely_delivery=False
+    ):
+        uav_from = env.uav_dict[int(from_uav)]
+        gx, gy, _ = getattr(env, "GS_pos", (0.0, 0.0, 0.0))
+        previous_distance = math.hypot(uav_from.x_u - gx, uav_from.y_u - gy)
+        if int(to_target) == int(env.GS_ID):
+            new_distance = 0.0
+            next_backlog = 0.0
+        else:
+            uav_to = env.uav_dict[int(to_target)]
+            new_distance = math.hypot(uav_to.x_u - gx, uav_to.y_u - gy)
+            next_backlog = float(self.backlog_bits.get(int(to_target), 0.0))
+        progress = previous_distance - new_distance
+        congestion_penalty = math.log1p(next_backlog / 1e5)
+        reward = 0.02 * progress - 0.01 * congestion_penalty
+        if timely_delivery:
+            reward += 1.0
+        return float(reward)
+
+    def serve_active_links(self, env, actions, capacities, current_time):
+        """Serve each sender FIFO with one shared bit budget for its active link."""
+
+        current_time = float(current_time)
+        slot_end = current_time + float(self.step_time)
+        eligible_packet_ids = {
+            int(sender): {int(pkt["id"]) for pkt in self.get_queue_packets(sender)}
+            for sender in actions
+        }
+        result = {
+            "reward_by_sender": defaultdict(float),
+            "cost_by_sender": defaultdict(float),
+            "timely_goodput_bits": 0.0,
+            "raw_final_hop_bits": 0.0,
+            "transmitted_bits_by_link": {},
+            "relay_arrivals": [],
+            "outcomes": [],
+        }
+        pending_relay_arrivals = []
+
+        for sender in sorted(actions):
+            sender = int(sender)
+            receiver = int(actions[sender])
+            if receiver == sender:
+                self.wait_actions += 1
+                continue
+            link = (sender, receiver)
+            capacity_mbps = float(capacities.get(link, 0.0))
+            if not np.isfinite(capacity_mbps) or capacity_mbps <= 0.0:
+                continue
+            capacity_bps = capacity_mbps * 1e6
+            initial_budget = capacity_bps * float(self.step_time)
+            remaining_budget = initial_budget
+            transmitted_on_link = 0.0
+
+            while remaining_budget > PACKET_EPS:
+                pkt = self.get_hol_packet(sender)
+                if pkt is None or int(pkt["id"]) not in eligible_packet_ids[sender]:
+                    break
+                locked_receiver = pkt.get("hop_receiver")
+                if (
+                    locked_receiver is not None
+                    and int(locked_receiver) != receiver
+                ):
+                    raise AssertionError(
+                        "selected action violates the HOL partial-hop receiver lock"
+                    )
+
+                remaining_before = float(pkt.get("rem_bits", 0.0))
+                bits_used = min(remaining_budget, remaining_before)
+                if bits_used <= PACKET_EPS:
+                    break
+                if float(pkt.get("hop_bits_sent", 0.0)) <= PACKET_EPS:
+                    service_start = current_time + (
+                        transmitted_on_link / capacity_bps
+                    )
+                    pkt["hop_service_start_time"] = service_start
+                    pkt["hop_queue_delay_s"] = max(
+                        service_start
+                        - float(pkt.get("queue_enter_time", service_start)),
+                        0.0,
+                    )
+                completed_hop = self.record_hop_transmission(
+                    pkt, sender, receiver, bits_used
+                )
+                remaining_budget = max(remaining_budget - bits_used, 0.0)
+                transmitted_on_link += bits_used
+                if receiver == env.GS_ID:
+                    pkt["final_hop_accum_bits"] = float(
+                        pkt.get("final_hop_accum_bits", 0.0)
+                    ) + bits_used
+                    self.raw_final_hop_bits += bits_used
+                    result["raw_final_hop_bits"] += bits_used
+
+                timely_delivery = False
+                if completed_hop:
+                    completion_time = current_time + (
+                        transmitted_on_link / capacity_bps
+                    )
+                    queue_delay_s = float(pkt.get("hop_queue_delay_s", 0.0))
+                    service_start = float(
+                        pkt.get("hop_service_start_time", completion_time)
+                    )
+                    tx_elapsed_s = max(completion_time - service_start, 0.0)
+                    total_hop_s = queue_delay_s + tx_elapsed_s
+                    task_type = self._task_norm(pkt.get("task_type", "COM"))
+                    pkt.setdefault("per_hop", []).append(
+                        {
+                            "from": sender,
+                            "to": receiver,
+                            "queue_s": queue_delay_s,
+                            "tx_s": tx_elapsed_s,
+                            "delay_ms": total_hop_s * 1e3,
+                        }
+                    )
+                    delay_accum = self.type_delay_accum[task_type]
+                    delay_accum["sum_queue"] += queue_delay_s
+                    delay_accum["sum_tx"] += tx_elapsed_s
+                    delay_accum["sum_total"] += total_hop_s
+                    delay_accum["count"] += 1
+                    arrival = self.detach_completed_hop(
+                        pkt, sender, receiver, completion_time
+                    )
+                    deadline_abs = float(
+                        pkt.get("deadline_abs", float("inf"))
+                    )
+                    if receiver == env.GS_ID:
+                        pkt["e2e_delay_ms"] = max(
+                            completion_time
+                            - float(pkt.get("generation_time", completion_time)),
+                            0.0,
+                        ) * 1e3
+                        timely_delivery = completion_time <= (
+                            deadline_abs + PACKET_EPS
+                        )
+                        if timely_delivery:
+                            if not pkt.get("timely_goodput_counted", False):
+                                timely_bits = float(pkt["size_bits"])
+                                pkt["timely_goodput_counted"] = True
+                                self.timely_goodput_bits += timely_bits
+                                result["timely_goodput_bits"] += timely_bits
+                            self.total_delivered += 1
+                            task_type = self._task_norm(pkt["task_type"])
+                            if task_type == "FOV":
+                                self.fov_delivered += 1
+                            else:
+                                self.com_delivered += 1
+                            self.mark_packet_done(
+                                pkt,
+                                current_time=completion_time,
+                                reason="delivered",
+                            )
+                            result["outcomes"].append(
+                                {
+                                    "task_type": task_type,
+                                    "violated": False,
+                                    "packet": pkt,
+                                }
+                            )
+                        else:
+                            violation = self._mark_deadline_violation(
+                                pkt, completion_time, sender=sender
+                            )
+                            if violation is not None:
+                                result["cost_by_sender"][sender] += 1.0
+                                result["outcomes"].append(
+                                    {
+                                        "task_type": violation["task_type"],
+                                        "violated": True,
+                                        "packet": pkt,
+                                    }
+                                )
+                    elif completion_time + PACKET_EPS < deadline_abs:
+                        if int(pkt.get("hops", 0)) >= MAX_PACKET_HOPS:
+                            self.mark_packet_done(
+                                pkt,
+                                current_time=completion_time,
+                                reason="max_hops",
+                            )
+                        else:
+                            pending_relay_arrivals.append(arrival)
+                    else:
+                        violation = self._mark_deadline_violation(
+                            pkt, completion_time, sender=sender
+                        )
+                        if violation is not None:
+                            result["cost_by_sender"][sender] += 1.0
+                            result["outcomes"].append(
+                                {
+                                    "task_type": violation["task_type"],
+                                    "violated": True,
+                                    "packet": pkt,
+                                }
+                            )
+
+                result["reward_by_sender"][sender] += (
+                    self._routing_transmission_reward(
+                        env, sender, receiver, timely_delivery
+                    )
+                )
+                if not completed_hop:
+                    break
+
+            transmitted = initial_budget - remaining_budget
+            result["transmitted_bits_by_link"][link] = transmitted
+            if transmitted > initial_budget + PACKET_EPS:
+                self.link_slot_budget_violations += 1
+                raise AssertionError(
+                    f"link {link} transmitted {transmitted} bits beyond "
+                    f"slot budget {initial_budget}"
+                )
+
+        result["relay_arrivals"] = self.enqueue_relay_arrivals(
+            pending_relay_arrivals
+        )
+        for violation in self.expire_packets(slot_end, inclusive=True):
+            sender = int(violation["sender"])
+            if sender in actions:
+                result["cost_by_sender"][sender] += 1.0
+            result["outcomes"].append(
+                {
+                    "task_type": violation["task_type"],
+                    "violated": True,
+                    "packet": violation["packet"],
+                }
+            )
+        return result
+
     def inject_packets(self, env, delay_bound_steps, current_time, step_time=0.25,
                        base_fov_rate=5, base_ctrl_rate=50):
+        if float(current_time) >= EPISODE_INJECTION_CUTOFF_SECONDS:
+            return 0
         # if self.target_total_packets is not None and self.total_injected_packets >= self.target_total_packets:
         #     return
         # 這些屬性在 __init__ 都建好了，以下保守檢查可留可去
@@ -519,6 +802,11 @@ class PacketEngine:
         self.fov_delivered= 0
         self.com_delivered= 0
         self.partial_transmissions = 0
+        self.raw_final_hop_bits = 0.0
+        self.timely_goodput_bits = 0.0
+        self.wait_actions = 0
+        self.deadline_drops = 0
+        self.link_slot_budget_violations = 0
         self.delay_log = []  # 每跳記錄
         self.type_delay_accum = {
             "FOV": {"sum_queue": 0.0, "sum_tx": 0.0, "sum_total": 0.0, "count": 0},
@@ -540,7 +828,7 @@ class PacketEngine:
         tx_delay_s = (pkt_bits / service_bps) if pkt_bits > 0.0 else 0.0
         # 總延遲時間
         hop_delay_ms = (queue_delay_s + tx_delay_s)*1e3 
-        pkt["e2e_delay_ms"] = pkt.get("e2e_delay_ms", 0.0) + hop_delay_ms
+        pkt["estimated_hop_delay_ms"] = hop_delay_ms
         pkt.setdefault("per_hop", []).append({
         "from": current_node, "to": next_hop,
         "queue_s": queue_delay_s, "tx_s": tx_delay_s, "delay_ms": hop_delay_ms
@@ -1282,23 +1570,18 @@ class PacketEngine:
         # log makes it smooth and scale-invariant
         cong_pen = math.log1p(nh_backlog / 1e5)
 
-        # (C) deadline-risk penalty: if we are close to tau, penalize extra hop delay more
         pkt_e2e_ms = float(pkt.get("e2e_delay_ms", 0.0))
         if task_type == "FOV":
             tau_ms = float(getattr(env, "tau_FOV_ms", getattr(env, "tau_D_ms", 15.0)))
         else:
             tau_ms = float(getattr(env, "tau_COM_ms", getattr(env, "tau_D_ms", 10.0)))
 
-        # risk in [0,1], becomes large when e2e approaches tau
-        risk = min(1.0, max(0.0, pkt_e2e_ms / max(tau_ms, 1e-6)))
-
         # ---- final dense reward (stable) ----
         # weights: start small to avoid exploding TD-targets
         w_prog = 0.02
         w_cong = 0.01
-        w_risk = 0.02
 
-        reward_step = (w_prog * progress) - (w_cong * cong_pen) - (w_risk * risk * hop_delay_ms)
+        reward_step = (w_prog * progress) - (w_cong * cong_pen)
         # -----------------------
         # Cost: per-packet violation (stationary!)
         # -----------------------
