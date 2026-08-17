@@ -67,6 +67,10 @@ class ChannelModel:
 
     @staticmethod
     def PL_ug(distances_ug, f_c):
+        """Return UAV-to-ground path loss in dB.
+
+        ``distances_ug`` is measured in metres and ``f_c`` is measured in GHz.
+        """
 
         distances_ug = np.asarray(distances_ug, dtype=float)
         f_c = np.asarray(f_c, dtype=float)
@@ -76,6 +80,8 @@ class ChannelModel:
 
     @staticmethod
     def SNR_ug(P_u, sigma_sq, PL_ug_t, B_ug):
+        """Return UAV-to-ground SNR as a linear ratio (not dB)."""
+
         PL_ug_t = np.asarray(PL_ug_t)
         signal_linear = 10 ** ((P_u - PL_ug_t) / 10)
         noise_linear = 10 ** ((sigma_sq + 10 * np.log10(B_ug)) / 10)
@@ -83,6 +89,8 @@ class ChannelModel:
 
     @staticmethod
     def C_ug(B_ug, SNR_ug_t):
+        """Return UAV-to-ground Shannon capacity in Mbps."""
+
         SNR_ug_t = np.asarray(SNR_ug_t)
         SNR_ug_t = np.maximum(SNR_ug_t, 0)
         C = B_ug * np.log2(1.0 + SNR_ug_t)

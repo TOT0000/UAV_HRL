@@ -11,6 +11,14 @@ from object import UAV, SRTeam, GroundTarget
 
 
 class Simulator:
+    SR_UAV_CARRIER_GHZ = 2.0
+    SR_UAV_BANDWIDTH_HZ = 2e6
+    SR_UAV_TX_POWER_DBM = 23.0
+    SR_UAV_NOISE_DBM_PER_HZ = -169.0
+    SR_UAV_MAX_RANGE_M = 200.0
+    SR_UAV_LOS_EXCESS_DB = 2.0
+    SR_UAV_NLOS_EXCESS_DB = 2.4
+
     def __init__(self, num_UAV, p_u = 30): #初始化
         self.dt = 0.25
         self.sr_update_interval = int(1.0 / self.dt)
@@ -349,37 +357,23 @@ class Simulator:
         return unexplored / total if total > 0 else 0.0
 
     #=====================通訊如何======================== 
-    def get_snr(self, uav_id, sr_id):
-
+    def _get_sr_uav_link_metrics(self, uav_id, sr_id):
         uav = self.uav_dict[uav_id]
         sr = self.SR_teams[sr_id]
-
-        d_A2G = 200.0          # A2G 通訊半徑 (m)
-        sigma_sq = -169        # dBm/Hz
-        B_su = 2e6             # Hz
-        P_s = 23          # dBm
-        f_c = 2e9
-        eta_LoS = 2
-        eta_NLoS = 2.4
 
         # 位置
         uav_pos = np.array([uav.x_u, uav.y_u, uav.z_u])
         sr_pos = np.array([sr.x, sr.y, sr.z])
         vec = uav_pos - sr_pos
-        dx = vec[0]
-        dy = vec[1]
-        dz = vec[2]
-
-        # d_2d = float(np.sqrt(dx*dx + dy*dy))   # 水平距離
-        d_3d = float(np.sqrt(dx*dx + dy*dy + dz*dz))
+        d_3d = float(np.linalg.norm(vec))
         
         # 距離與高度
         d_safe = max(d_3d, 1e-3)
         H_u = float(abs(vec[2]))                      # 垂直距離（基本上就是 UAV 高度）
 
-        # 通訊半徑：超出半徑 → 幾乎沒有訊號
-        if d_safe > d_A2G:
-            return -1e9
+        # 通訊半徑：超出半徑時 SNR 與容量皆為零。
+        if d_safe > self.SR_UAV_MAX_RANGE_M:
+            return 0.0, 0.0
 
         # 仰角
         ratio = np.clip(H_u / d_safe, -1.0, 1.0)
@@ -389,14 +383,39 @@ class Simulator:
         LoS_prob = 1.0 / (1.0 + 4.88 * np.exp(-0.429 * (elevation_angle - 4.88)))
 
         # ===== Path Loss（向量化） =====
-        FSPL = ChannelModel.PL_ug(d_safe, f_c)
+        FSPL = ChannelModel.PL_ug(d_safe, self.SR_UAV_CARRIER_GHZ)
 
-        expected_pl = FSPL + LoS_prob * eta_LoS + (1-LoS_prob) * eta_NLoS
+        expected_pl = (
+            FSPL
+            + LoS_prob * self.SR_UAV_LOS_EXCESS_DB
+            + (1 - LoS_prob) * self.SR_UAV_NLOS_EXCESS_DB
+        )
 
         # ===== SNR + Capacity =====
-        SNR_us = ChannelModel.SNR_ug(P_s, sigma_sq, expected_pl, B_su)
+        snr_us = float(
+            ChannelModel.SNR_ug(
+                self.SR_UAV_TX_POWER_DBM,
+                self.SR_UAV_NOISE_DBM_PER_HZ,
+                expected_pl,
+                self.SR_UAV_BANDWIDTH_HZ,
+            )
+        )
+        capacity_mbps = float(
+            ChannelModel.C_ug(self.SR_UAV_BANDWIDTH_HZ, snr_us)
+        )
+        return snr_us, capacity_mbps
 
-        return SNR_us
+    def get_snr(self, uav_id, sr_id):
+        """Return the SR-UAV link SNR as a linear ratio."""
+
+        snr_us, _ = self._get_sr_uav_link_metrics(uav_id, sr_id)
+        return snr_us
+
+    def get_sr_uav_capacity_mbps(self, uav_id, sr_id):
+        """Return the canonical SR-UAV link capacity in Mbps."""
+
+        _, capacity_mbps = self._get_sr_uav_link_metrics(uav_id, sr_id)
+        return capacity_mbps
 
     # =====================U2U channel model================================
     def update_u2u_channels(self):

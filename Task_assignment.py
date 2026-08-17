@@ -2,7 +2,6 @@ from scipy.optimize import linear_sum_assignment
 import numpy as np
 import random
 from Fov_model_phase import FovModel
-from Channel_model import ChannelModel
 
 class UAVAssigner:
     def __init__(self, env):
@@ -79,11 +78,10 @@ class UAVAssigner:
                     if not sr.active:
                         # Cap_matrix[i, j] = 0  
                         continue
-                    # 計算 Capacity
-                    SNR = self.env.get_snr(uav_id, sr_id)     # SNR (dB)
-                    # print(SNR)
-                    capacity = ChannelModel.C_ug(B_ug=10e6, SNR_ug_t=SNR)
-                    Cap_matrix[i, j] = capacity / 1e6            # 換算為 Mbps
+                    # Canonical helper already returns Mbps.
+                    Cap_matrix[i, j] = self.env.get_sr_uav_capacity_mbps(
+                        uav_id, sr_id
+                    )
                 elif task.task_type == "Hovering":
                     # 分數直接給一個固定值（例如鼓勵保持原地懸停）
                     FOV_matrix[i, j] = 0.1

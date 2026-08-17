@@ -2,6 +2,7 @@ import unittest
 
 import numpy as np
 
+from Channel_model import ChannelModel
 from Packet_scheduler_v1 import PacketEngine, final_hop_delivered_bits
 from Simulator import Simulator
 from centralized_movement import (
@@ -102,9 +103,38 @@ class ComStateCalibrationAndDeliveryTest(unittest.TestCase):
         second = calibrate_com_capacity(self.env, seed=1234, sample_count=1000)
         self.assertEqual(first, second)
         self.assertEqual(first["capacity_unit"], "Mbps")
-        self.assertGreater(first["c_ref_com"], 0.0)
+        self.assertTrue(first["feasible_only"])
+        self.assertEqual(first["carrier_frequency_ghz"], 2.0)
+        self.assertEqual(first["bandwidth_hz"], 2e6)
+        self.assertGreaterEqual(first["c_ref_com"], 0.1)
+        self.assertLessEqual(first["c_ref_com"], 1000.0)
+        self.assertLessEqual(
+            first["sampled_distance_range_m"][1],
+            self.env.SR_UAV_MAX_RANGE_M,
+        )
         self.assertEqual(self.env.uav_dict[0].get_position(), original_uav)
         self.assertEqual(self.env.SR_teams[0].get_position(), original_sr)
+
+    def test_canonical_sr_uav_capacity_uses_declared_units_and_range(self):
+        uav = self.env.uav_dict[0]
+        sr = self.env.SR_teams[0]
+        sr.x, sr.y, sr.z = 100.0, 100.0, 0.0
+        uav.x_u, uav.y_u, uav.z_u = 100.0, 100.0, 100.0
+
+        snr = self.env.get_snr(0, 0)
+        capacity = self.env.get_sr_uav_capacity_mbps(0, 0)
+        expected = float(
+            ChannelModel.C_ug(self.env.SR_UAV_BANDWIDTH_HZ, snr)
+        )
+        self.assertGreater(snr, 0.0)
+        self.assertAlmostEqual(capacity, expected)
+        self.assertGreater(capacity, 0.1)
+
+        uav.x_u = sr.x + self.env.SR_UAV_MAX_RANGE_M + 1.0
+        uav.y_u = sr.y
+        uav.z_u = sr.z
+        self.assertEqual(self.env.get_snr(0, 0), 0.0)
+        self.assertEqual(self.env.get_sr_uav_capacity_mbps(0, 0), 0.0)
 
     def test_delivered_bits_only_count_final_gs_hop(self):
         self.assertEqual(final_hop_delivered_bits(3, 16, 123.0), 0.0)

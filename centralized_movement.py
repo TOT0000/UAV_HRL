@@ -4,7 +4,6 @@ import numpy as np
 import torch
 from scipy.integrate import quad
 
-from Channel_model import ChannelModel
 from Fov_model_phase import FovModel
 
 
@@ -80,8 +79,7 @@ def _target_object_id(task, task_type):
 
 def _com_capacity_mbps(env, uav_id, task):
     sr_id = _target_object_id(task, "COM")
-    snr = float(env.get_snr(uav_id, sr_id))
-    capacity = float(ChannelModel.C_ug(B_ug=10e6, SNR_ug_t=snr))
+    capacity = float(env.get_sr_uav_capacity_mbps(uav_id, sr_id))
     if not math.isfinite(capacity):
         return 0.0
     return max(capacity, 0.0)
