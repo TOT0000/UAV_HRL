@@ -33,6 +33,10 @@ class Simulator:
         self.SNR_uu_t= np.zeros( (self.num_UAV , self.num_UAV))
         self.Capacity_matrix = np.zeros( (self.num_UAV , self.num_UAV))
         self.gs_capacity = np.zeros(self.num_UAV+1)
+        self.u2u_nominal_capacity = self.Capacity_matrix.copy()
+        self.u2g_nominal_capacity = self.gs_capacity.copy()
+        self.active_link_capacities = {}
+        self.active_link_bandwidths = {}
         self.GS_pos = (0, 0, 0)
         self.GS_ID = self.num_UAV
         self.num_GT = None
@@ -477,15 +481,11 @@ class Simulator:
         k_bar = float(k_u.mean())
         # 存到 env
         self.k_bar_u2u = k_bar
-        k_u_safe = np.maximum(k_u, 1)               # 避免除 0
-        self.B_eff_u2u = self.B_tot / k_u_safe      # shape
-        # 把 FDMA 反映到 capacity
-        capacity_fdma = capacity / k_u_safe[:, None]
-        # 保持原本的遮罩一致性（安全起見，再做一次）
-        np.fill_diagonal(capacity_fdma, 0.0)
-        capacity_fdma[~in_range] = 0.0
-
-        self.Capacity_matrix = capacity_fdma
+        # Candidate actions use nominal full-pool quality. Actual slot capacity
+        # is computed only after all proposed links are known.
+        self.B_eff_u2u = np.full(N, self.B_tot, dtype=float)
+        self.u2u_nominal_capacity = np.array(capacity, dtype=float)
+        self.Capacity_matrix = self.u2u_nominal_capacity.copy()
 
     # ==========================U2G channel model============================
     # 無人機與地面站
@@ -529,6 +529,7 @@ class Simulator:
         FSPL = ChannelModel.PL_ug(d_safe, f_c)
 
         self.Expected_PL = FSPL + LoS_prob * eta_LoS + (1-LoS_prob) * eta_NLoS
+        self.PL_ug_cache = np.array(self.Expected_PL, dtype=float)
 
         # ===== SNR + Capacity =====
         SNR_ug = ChannelModel.SNR_ug(P_u, sigma_sq, self.Expected_PL,  B_ug)
@@ -537,8 +538,51 @@ class Simulator:
         # 半徑外的 UAV 容量設為 0
         C_mix[~in_range] = 0.0
 
-        self.gs_capacity = C_mix
+        self.u2g_nominal_capacity = np.array(C_mix, dtype=float)
+        self.gs_capacity = self.u2g_nominal_capacity.copy()
         # print(self.gs_capacity)
+
+    def allocate_active_link_capacities(self, proposed_links):
+        """Allocate independent 10 MHz pools across actual U2U/U2G links."""
+
+        active_links = [
+            (int(sender), int(receiver))
+            for sender, receiver in sorted(proposed_links.items())
+            if int(receiver) != int(sender)
+        ]
+        u2u_links = [link for link in active_links if link[1] < self.num_UAV]
+        u2g_links = [link for link in active_links if link[1] == self.GS_ID]
+        u2u_bandwidth = self.B_tot / len(u2u_links) if u2u_links else 0.0
+        u2g_bandwidth = self.B_tot / len(u2g_links) if u2g_links else 0.0
+
+        capacities = {}
+        bandwidths = {}
+        for sender, receiver in u2u_links:
+            bandwidths[(sender, receiver)] = float(u2u_bandwidth)
+            snr = ChannelModel.SNR_uu(
+                float(self.p_u[sender]),
+                -169.0,
+                float(self.PL_uu_cache[sender, receiver]),
+                u2u_bandwidth,
+            )
+            capacities[(sender, receiver)] = float(
+                ChannelModel.C_uu(u2u_bandwidth, snr)
+            )
+        for sender, receiver in u2g_links:
+            bandwidths[(sender, receiver)] = float(u2g_bandwidth)
+            snr = ChannelModel.SNR_ug(
+                float(self.p_u[sender]),
+                -169.0,
+                float(self.PL_ug_cache[sender]),
+                u2g_bandwidth,
+            )
+            capacities[(sender, receiver)] = float(
+                ChannelModel.C_ug(u2g_bandwidth, snr)
+            )
+
+        self.active_link_capacities = capacities
+        self.active_link_bandwidths = bandwidths
+        return capacities, bandwidths
 
     #===========回傳不可選擇的節點======================== 
     def get_routing_action_mask(self, from_uav_id, cap_eps=0.1):
