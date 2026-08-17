@@ -214,6 +214,10 @@ class PacketEngine:
             )
         mask[uav_id] = True
         hol = self.get_hol_packet(uav_id)
+        if hol is None:
+            mask[:] = False
+            mask[uav_id] = True
+            return mask
         locked_receiver = hol.get("hop_receiver") if hol is not None else None
         if locked_receiver is not None:
             locked_receiver = int(locked_receiver)
@@ -1286,6 +1290,12 @@ class PacketEngine:
             env, uav_id, action_mask
         )
         link_valid_mask[:] = effective_mask.astype(float)
+        hol = self.get_hol_packet(uav_id)
+        hol_rem_bits = (
+            max(float(hol.get("rem_bits", 0.0)), 0.0)
+            if hol is not None
+            else 0.0
+        )
 
         # Nominal full-pool qualities describe candidate links. Slot-specific
         # allocated capacities are deliberately kept out of the next state.
@@ -1294,6 +1304,9 @@ class PacketEngine:
                 continue
             cap = float(env.Capacity_matrix[uav_id, nh])
             link_capacity_norm[nh] = min(max(cap, 0.0), C_MAX) / C_MAX
+            if effective_mask[nh] and cap > 0.0 and hol_rem_bits > 0.0:
+                tx_delay_s = hol_rem_bits / (cap * 1e6)
+                link_delay_norm[nh] = np.clip(tx_delay_s / D_MAX, 0.0, 1.0)
             if backlog_bits is None:
                 nh_bits = self.backlog_bits.get(nh, 0.0)
             else:
@@ -1311,13 +1324,9 @@ class PacketEngine:
         if hasattr(env, "gs_capacity"):
             cap_gs = float(env.gs_capacity[uav_id])
             link_capacity_norm[GS] = min(max(cap_gs, 0.0), C_MAX) / C_MAX
-            if cap_gs > 0.0:
-                d_gs = (
-                    float(env.gs_delay[uav_id])
-                    if hasattr(env, "gs_delay")
-                    else D_MAX
-                )
-                link_delay_norm[GS] = min(max(d_gs, 0.0), D_MAX) / D_MAX
+            if effective_mask[GS] and cap_gs > 0.0 and hol_rem_bits > 0.0:
+                tx_delay_s = hol_rem_bits / (cap_gs * 1e6)
+                link_delay_norm[GS] = np.clip(tx_delay_s / D_MAX, 0.0, 1.0)
 
         # ---------- 幾何/回傳緊迫度 ----------
         # 取得 GS 座標（請依你的環境擇一實作）
@@ -1346,7 +1355,6 @@ class PacketEngine:
         uav_id_one_hot = np.zeros(N, dtype=float)
         uav_id_one_hot[uav_id] = 1.0
 
-        hol = self.get_hol_packet(uav_id)
         hol_context = np.zeros(4, dtype=float)
         if hol is not None:
             hol_task = self._task_norm(hol.get("task_type", "COM"))

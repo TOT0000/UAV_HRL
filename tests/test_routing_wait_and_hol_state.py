@@ -41,6 +41,46 @@ class RoutingWaitAndHolStateTest(unittest.TestCase):
         )
         self.assertEqual(np.flatnonzero(mask).tolist(), [0])
 
+    def test_empty_queue_effective_mask_contains_only_wait(self):
+        physical = np.ones(17, dtype=bool)
+
+        mask = self.engine.get_effective_action_mask(self.env, 4, physical)
+
+        self.assertEqual(np.flatnonzero(mask).tolist(), [4])
+
+    def test_candidate_link_delays_use_hol_bits_and_nominal_capacity(self):
+        packet = self.engine.create_packet(0, "COM", 6e6, 0.0)
+        self.env.Capacity_matrix[0, 1] = 2.0
+        self.env.Capacity_matrix[0, 2] = 4.0
+        self.env.gs_capacity[0] = 3.0
+        physical = np.zeros(17, dtype=bool)
+        physical[[0, 1, 2, self.env.GS_ID]] = True
+
+        before_e2e = packet["e2e_delay_ms"]
+        state = self.engine.get_state_ta(
+            self.env,
+            0,
+            backlog_bits=self.engine.backlog_bits,
+            action_mask=physical,
+        )
+        delay_start = 16 + 8 + 17
+        delays = state[delay_start:delay_start + 17]
+
+        self.assertEqual(state.shape, (126,))
+        self.assertAlmostEqual(delays[1], 1.0)
+        self.assertAlmostEqual(delays[2], 0.5)
+        self.assertAlmostEqual(delays[self.env.GS_ID], 2.0 / 3.0)
+        self.assertEqual(delays[0], 0.0)
+        self.assertEqual(delays[3], 0.0)
+
+        self.engine.get_state_ta(
+            self.env,
+            0,
+            backlog_bits=self.engine.backlog_bits,
+            action_mask=physical,
+        )
+        self.assertEqual(packet["e2e_delay_ms"], before_e2e)
+
     def test_relay_hol_context_uses_packet_identity(self):
         packet = self.engine.create_packet(0, "COM", 100.0, 0.0)
         packet["deadline_abs"] = 1.0

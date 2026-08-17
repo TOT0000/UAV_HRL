@@ -176,6 +176,12 @@ def _active_backlog(packet_engine):
     return defaultdict(float, packet_engine.backlog_bits)
 
 
+def _routing_transition_done(episode_done, next_hol):
+    """Cut DDQN bootstrap when this UAV has no next routing decision."""
+
+    return bool(episode_done or next_hol is None)
+
+
 def _run_routing_slot(
     env,
     packet_engine,
@@ -262,13 +268,15 @@ def _run_routing_slot(
         for uid in uavs_with_packets
     }
     for uid in uavs_with_packets:
+        next_hol = packet_engine.get_hol_packet(uid)
+        transition_done = _routing_transition_done(done, next_hol)
         routing_buffer.add(
             states[uid],
             int(next_hops.get(uid, uid)),
             next_states.get(uid, states[uid]),
             float(slot_result["reward_by_sender"][uid]),
             float(slot_result["cost_by_sender"][uid]),
-            bool(done),
+            transition_done,
             tag_gt=env.num_GT,
         )
     return (
