@@ -674,6 +674,13 @@ class PacketEngine:
         #     # print(f"超過3000")
         #     return
         load_factor = getattr(env, "load_factor", 1.0)
+        traffic_primitives = getattr(env, "traffic_primitives", {})
+        base_fov_rate = float(
+            traffic_primitives.get("base_fov_packets_per_second", base_fov_rate)
+        )
+        base_ctrl_rate = float(
+            traffic_primitives.get("base_com_packets_per_second", base_ctrl_rate)
+        )
         base_fov_rate  = base_fov_rate  * load_factor
         base_ctrl_rate = base_ctrl_rate * load_factor
 

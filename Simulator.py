@@ -313,7 +313,11 @@ class Simulator:
             sr = self.SR_teams[nearest_sr_idx]
             start = (sr.x, sr.y)
             goal = (gt.x, gt.y)
-            sr.path = list(UAVTask.move_towards_target(start, goal, v_max=1.0))
+            sr.path = list(
+                UAVTask.move_towards_target(
+                    start, goal, v_max=float(getattr(self, "sr_speed_mps", 1.0))
+                )
+            )
             # print(sr.path)
             # print(sr.x, sr.y)
             sr.active= True
@@ -1000,7 +1004,25 @@ class Simulator:
         ]
 
     # ================隨機GT版本=============================
-    def reset_environment(self):
+    def reset_environment(self, scenario_entry=None):
+        if scenario_entry is not None:
+            from scenario_manifest import validate_scenario_entry
+
+            validate_scenario_entry(scenario_entry)
+            self.num_GT = int(scenario_entry["num_GT"])
+            self.active_scenario_id = str(scenario_entry["scenario_id"])
+            self.active_scenario_seed = int(scenario_entry["scenario_seed"])
+            self.traffic_primitives = dict(scenario_entry["traffic_primitives"])
+        else:
+            self.active_scenario_id = None
+            self.active_scenario_seed = None
+            self.traffic_primitives = {
+                "load_factor": 1.0,
+                "base_fov_packets_per_second": 5.0,
+                "base_com_packets_per_second": 50.0,
+                "generation_model": "task-and-fov-gated-rate-accumulator-v1",
+            }
+        self.load_factor = float(self.traffic_primitives["load_factor"])
         self.need_reassign = True   
         self.UAVs.clear()
         self.current_time = 0
@@ -1023,38 +1045,35 @@ class Simulator:
         self.UAVs = []           # UAV list（順序）
         self.uav_dict = {}       # id → UAV 的查表 dict
         self.uav_tasks = {}      # 任務查表（維持原本）
-        uav_positions = [
-            (100, 100),   
-            (300, 100),   
-            (500, 100),   
-            (700, 100),   
-
-            (100, 300),   
-            (300, 300),   
-            (500, 300),   
-            (700, 300),   
-
-            (100, 500),  
-            (300, 500),   
-            (500, 500),   
-            (700, 500),   
-
-            (100, 700),   
-            (300, 700),   
-            (500, 700),   
-            (700, 700),   
-        ]
-        for i, (x_u, y_u) in enumerate(uav_positions):
-            z_u = random.uniform(80, 120)
+        if scenario_entry is None:
+            uav_initial_data = [
+                {
+                    "uav_id": index,
+                    "position": [x_u, y_u, random.uniform(80, 120)],
+                    "energy_j": self.E_max,
+                }
+                for index, (x_u, y_u) in enumerate(
+                    (x, y)
+                    for y in (100, 300, 500, 700)
+                    for x in (100, 300, 500, 700)
+                )
+            ]
+        else:
+            uav_initial_data = sorted(
+                scenario_entry["uavs"], key=lambda item: int(item["uav_id"])
+            )
+        for initial in uav_initial_data:
+            i = int(initial["uav_id"])
+            x_u, y_u, z_u = map(float, initial["position"])
             uav = UAV(id=i, x=x_u, y=y_u, z=z_u)
-            uav.energy = self.E_max
+            uav.energy = float(initial["energy_j"])
             self.UAVs.append(uav)
-            uav.last_energy = self.E_max
+            uav.last_energy = uav.energy
             uav.update_battery(uav.energy, self.E_max)
             self.uav_dict[uav.id] = uav
-            self.uav_paths = {i: [] for i in range(self.num_UAV)}
-            for uav in self.UAVs:
-                self.uav_paths[uav.id].append([uav.x_u, uav.y_u, uav.z_u])
+        self.uav_paths = {i: [] for i in range(self.num_UAV)}
+        for uav in self.UAVs:
+            self.uav_paths[uav.id].append([uav.x_u, uav.y_u, uav.z_u])
         # ============= 初始化 Ground Target =============
         # ============= 初始化 Ground Target（不重疊） =============
         self.gts = []
@@ -1066,49 +1085,82 @@ class Simulator:
         max_tries_per_point = 200   # 單點嘗試上限
         relax_ratio = 0.9           # 若太擠，逐步放寬 d_min（避免死循環）
 
-        pts, tries = [], 0
-        gs_x, gs_y = 0.0, 0.0  # 或 env.gs_pos
-
-        while len(pts) < self.num_GT:
-            if tries > max_tries_per_point:
-                d_min = max(int(d_min * relax_ratio), radius)
-                tries = 0
-
-            x = random.uniform(radius, W - radius)
-            y = random.uniform(radius, H - radius)
-
-            # 【這一段就加在這裡】
-            if (x - gs_x)**2 + (y - gs_y)**2 < 200**2:
-                tries += 1
-                continue
-
-            ok = True
-            for (px, py) in pts:
-                dx, dy = x - px, y - py
-                if (dx*dx + dy*dy) ** 0.5 < d_min:
-                    ok = False
-                    break
-            if ok:
+        if scenario_entry is None:
+            pts, tries = [], 0
+            gs_x, gs_y = 0.0, 0.0
+            while len(pts) < self.num_GT:
+                if tries > max_tries_per_point:
+                    d_min = max(int(d_min * relax_ratio), radius)
+                    tries = 0
+                x = random.uniform(radius, W - radius)
+                y = random.uniform(radius, H - radius)
+                if (x - gs_x) ** 2 + (y - gs_y) ** 2 < 200**2:
+                    tries += 1
+                    continue
+                if any(
+                    ((x - px) ** 2 + (y - py) ** 2) ** 0.5 < d_min
+                    for px, py in pts
+                ):
+                    tries += 1
+                    continue
                 pts.append((x, y))
                 tries = 0
-            else:
-                tries += 1
+            gt_initial_data = [
+                {
+                    "gt_id": index,
+                    "position": [x, y, 0.0],
+                    "radius_m": radius,
+                }
+                for index, (x, y) in enumerate(pts)
+            ]
+        else:
+            gt_initial_data = sorted(
+                scenario_entry["ground_targets"],
+                key=lambda item: int(item["gt_id"]),
+            )
 
         self.gts = []
-        for i, (x, y) in enumerate(pts):
-            gt = GroundTarget(id=i, x=x, y=y, z=0, radius=radius)
+        for initial in gt_initial_data:
+            i = int(initial["gt_id"])
+            x, y, z = map(float, initial["position"])
+            gt = GroundTarget(
+                id=i,
+                x=x,
+                y=y,
+                z=z,
+                radius=float(initial["radius_m"]),
+            )
             gt.is_found = False
             gt.found_by = None
             self.gts.append(gt)
         # print(f"Generated {len(self.gts)}")
         # =============== SR team 初始位置 =====================
         self.SR_teams = []
-        start_points = self.fixed_boundary_points(self.env_width, self.env_height)
-
-        for i in range(self.num_GT):
-            x, y = start_points[i % 4]
+        if scenario_entry is None:
+            start_points = self.fixed_boundary_points(
+                self.env_width, self.env_height
+            )
+            sr_initial_data = [
+                {
+                    "sr_id": index,
+                    "position": [*start_points[index % 4], 0.0],
+                    "movement_primitive": {"speed_mps": 1.0},
+                }
+                for index in range(self.num_GT)
+            ]
+        else:
+            sr_initial_data = sorted(
+                scenario_entry["sr_teams"],
+                key=lambda item: int(item["sr_id"]),
+            )
+        self.sr_speed_mps = float(
+            sr_initial_data[0]["movement_primitive"]["speed_mps"]
+        )
+        for initial in sr_initial_data:
+            i = int(initial["sr_id"])
+            x, y, z = map(float, initial["position"])
             sr = SRTeam(id=i)
-            sr.x, sr.y, sr.z = x, y, 0
+            sr.x, sr.y, sr.z = x, y, z
             sr.assigned_gt_id = None
             sr.path = []
             sr.active = False
@@ -1132,6 +1184,78 @@ class Simulator:
             )
             self.task_list.append(task)
         self.assign_tasks()
+
+    def generate_scenario_entry(self, split, manifest_seed, episode_index):
+        """Generate exogenous episode data without consuming global RNG state."""
+
+        from scenario_manifest import generate_scenario_entry
+
+        return generate_scenario_entry(split, manifest_seed, episode_index)
+
+    def apply_scenario_entry(self, scenario_entry):
+        """Reset the corrected environment from one manifest episode entry."""
+
+        if self.num_UAV != 16:
+            raise RuntimeError(
+                "scenario manifest requires the corrected 16-UAV environment"
+            )
+        self.reset_environment(scenario_entry=scenario_entry)
+        self.validate_applied_scenario(scenario_entry)
+
+    def validate_applied_scenario(self, scenario_entry):
+        """Fail fast if applied exogenous state differs from the manifest."""
+
+        from scenario_manifest import validate_scenario_entry
+
+        validate_scenario_entry(scenario_entry)
+        if self.active_scenario_id != str(scenario_entry["scenario_id"]):
+            raise RuntimeError("applied scenario identity mismatch")
+        if self.num_GT != int(scenario_entry["num_GT"]):
+            raise RuntimeError("applied scenario num_GT mismatch")
+        actual_uavs = [
+            [uav.x_u, uav.y_u, uav.z_u, uav.energy]
+            for uav in sorted(self.UAVs, key=lambda item: item.id)
+        ]
+        expected_uavs = [
+            [*map(float, item["position"]), float(item["energy_j"])]
+            for item in sorted(
+                scenario_entry["uavs"], key=lambda item: int(item["uav_id"])
+            )
+        ]
+        actual_gts = [
+            [gt.x, gt.y, gt.z, gt.radius]
+            for gt in sorted(self.gts, key=lambda item: item.id)
+        ]
+        expected_gts = [
+            [*map(float, item["position"]), float(item["radius_m"])]
+            for item in sorted(
+                scenario_entry["ground_targets"],
+                key=lambda item: int(item["gt_id"]),
+            )
+        ]
+        actual_sr = [
+            [sr.x, sr.y, sr.z]
+            for sr in sorted(self.SR_teams, key=lambda item: item.id)
+        ]
+        expected_sr = [
+            list(map(float, item["position"]))
+            for item in sorted(
+                scenario_entry["sr_teams"],
+                key=lambda item: int(item["sr_id"]),
+            )
+        ]
+        if not np.allclose(actual_uavs, expected_uavs):
+            raise RuntimeError("applied UAV initial state mismatch")
+        if not np.allclose(actual_gts, expected_gts):
+            raise RuntimeError("applied GT/RoI initial state mismatch")
+        if not np.allclose(actual_sr, expected_sr):
+            raise RuntimeError("applied SR initial state mismatch")
+        if not np.isclose(
+            self.load_factor,
+            float(scenario_entry["traffic_primitives"]["load_factor"]),
+        ):
+            raise RuntimeError("applied traffic primitive mismatch")
+        return True
     
     
 
