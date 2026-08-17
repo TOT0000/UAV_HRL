@@ -12,6 +12,11 @@ from statistics import fmean, stdev
 from scipy.stats import t as student_t
 
 from experiment_config import FORMAL_EXPERIMENT_DEFAULTS
+from experiment_paths import (
+    evaluation_run_directory,
+    evaluation_run_identity,
+    prepare_run_directory,
+)
 from scenario_manifest import ScenarioManifest
 
 
@@ -384,6 +389,13 @@ def run_evaluation_command(args):
         raise ValueError(
             f"manifest split mismatch: manifest={manifest.split}, requested={args.split}"
         )
+    identity = evaluation_run_identity(
+        args.method, manifest, args.training_seed
+    )
+    run_dir = evaluation_run_directory(
+        args.output_dir, args.method, manifest, args.training_seed
+    )
+    run_dir = prepare_run_directory(run_dir, identity)
     episode_count = (
         int(args.episodes)
         if args.episodes is not None
@@ -423,9 +435,11 @@ def run_evaluation_command(args):
         **result["run_metadata"],
         "checkpoint": str(Path(args.checkpoint).resolve()),
         "evaluation_invariants": result["evaluation_invariants"],
+        "run_directory": str(run_dir),
+        "run_identity": identity,
     }
     paths = write_evaluation_outputs(
-        args.output_dir, result["episode_metrics"], metadata
+        run_dir, result["episode_metrics"], metadata
     )
     print(
         json.dumps(

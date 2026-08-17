@@ -8,6 +8,11 @@ import json
 from pathlib import Path
 
 from experiment_config import FORMAL_EXPERIMENT_DEFAULTS, MethodSpec
+from experiment_paths import (
+    prepare_run_directory,
+    training_run_directory,
+    training_run_identity,
+)
 from HRL_task_aware import formal_training_config, smoke_training_config, train
 from scenario_manifest import ScenarioManifest, generate_manifest
 
@@ -101,22 +106,33 @@ def command_smoke(args):
 def command_train(args):
     method = args.method
     manifest = _load_manifest(args.manifest, expected_split=args.split)
+    if args.checkpoint is not None:
+        raise ValueError(
+            "training checkpoint output is managed under the canonical run "
+            "directory; do not pass --checkpoint"
+        )
+    identity = training_run_identity(method, manifest, args.training_seed)
+    run_dir = training_run_directory(
+        args.output_dir, method, manifest, args.training_seed
+    )
+    run_dir = prepare_run_directory(
+        run_dir, identity, resume_checkpoint=args.resume
+    )
     config = formal_training_config(
         args.episodes,
         random_seed=args.training_seed,
         resume_dir=args.resume,
-        checkpoint_root=str(
-            Path(args.checkpoint)
-            if args.checkpoint
-            else Path(args.output_dir) / "checkpoints"
-        ),
+        checkpoint_root=str(run_dir / "checkpoints"),
         enable_plots=False,
         enable_csv=False,
     )
     result = train(
         config, scenario_manifest=manifest, method_spec=method
     )
-    _write_run_metadata(args.output_dir, result)
+    result["run_metadata"].update(
+        {"run_directory": str(run_dir), "run_identity": identity}
+    )
+    _write_run_metadata(run_dir, result)
     return 0
 
 
@@ -171,7 +187,7 @@ def build_parser():
         default=FORMAL_EXPERIMENT_DEFAULTS["training_episodes_per_seed"],
     )
     train_parser.add_argument("--checkpoint")
-    train_parser.add_argument("--output-dir", default=str(DEFAULT_OUTPUT_DIR / "train"))
+    train_parser.add_argument("--output-dir", default=str(DEFAULT_OUTPUT_DIR))
     train_parser.add_argument("--resume")
     train_parser.set_defaults(handler=command_train)
 
@@ -182,7 +198,7 @@ def build_parser():
     evaluate.add_argument("--training-seed", type=int, required=True)
     evaluate.add_argument("--episodes", type=int)
     evaluate.add_argument("--checkpoint", required=True)
-    evaluate.add_argument("--output-dir", default=str(DEFAULT_OUTPUT_DIR / "evaluate"))
+    evaluate.add_argument("--output-dir", default=str(DEFAULT_OUTPUT_DIR))
     evaluate.add_argument("--resume")
     evaluate.set_defaults(handler=command_evaluate)
 
