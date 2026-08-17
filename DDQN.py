@@ -92,6 +92,7 @@ class DDQN:
 
         self.loss_log = []
         self.cost_loss_log = []
+        self.num_training = 0
     def select_action(self, state, uav_id, mask=None, visited_nodes=None, epsilon=0.5, logits_noise_std=0.5, eta=None):
         if eta is None:
             eta = self.eta
@@ -234,6 +235,7 @@ class DDQN:
         cost_loss.backward()
         self.cost_optimizer.step()
         self.cost_loss_log.append(cost_loss.item())
+        self.num_training += 1
         # print("q_values.shape =", q_values.shape)
         # print("target_q.shape =", target_q.shape)
 

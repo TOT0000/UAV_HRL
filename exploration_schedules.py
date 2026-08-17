@@ -36,6 +36,14 @@ def ddqn_epsilon(global_routing_slot, decay_steps, evaluation=False):
     )
 
 
+def evaluation_exploration_settings():
+    return {
+        "td3_behavior_noise": 0.0,
+        "ddqn_epsilon": 0.0,
+        "ddqn_logits_noise_std": 0.0,
+    }
+
+
 def td3_decay_steps(total_episodes, episode_seconds, warmup_transitions):
     total_transitions = int(total_episodes) * int(episode_seconds)
     post_warmup = max(total_transitions - int(warmup_transitions), 0)

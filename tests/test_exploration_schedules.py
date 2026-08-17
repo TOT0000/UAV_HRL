@@ -7,6 +7,7 @@ from HRL_task_aware import _select_routing_actions
 from exploration_schedules import (
     ddqn_decay_steps,
     ddqn_epsilon,
+    evaluation_exploration_settings,
     td3_behavior_noise,
     td3_decay_steps,
 )
@@ -79,6 +80,16 @@ class ExplorationScheduleTest(unittest.TestCase):
             logits_noise_std=0.0,
         )
         self.assertEqual(first, second)
+
+    def test_evaluation_settings_disable_all_behavior_exploration(self):
+        self.assertEqual(
+            evaluation_exploration_settings(),
+            {
+                "td3_behavior_noise": 0.0,
+                "ddqn_epsilon": 0.0,
+                "ddqn_logits_noise_std": 0.0,
+            },
+        )
 
 
 if __name__ == "__main__":

@@ -1,6 +1,11 @@
 import inspect
+import json
 import math
+import tempfile
 import unittest
+from pathlib import Path
+
+import torch
 
 from HRL_task_aware import (
     MOVEMENT_CONTROL_INTERVAL,
@@ -11,6 +16,8 @@ from HRL_task_aware import (
     TrainingConfig,
     _dinkelbach_update,
     _interval_reward,
+    formal_training_config,
+    smoke_training_config,
     train,
 )
 
@@ -24,7 +31,8 @@ class CentralizedTrainingFlowTest(unittest.TestCase):
                 episode_seconds=2,
                 warmup_joint_transitions=0,
                 batch_size=1,
-                enable_checkpoints=False,
+                enable_model_checkpoints=False,
+                enable_full_resume=False,
                 enable_plots=False,
                 enable_csv=False,
                 random_seed=2026,
@@ -32,7 +40,7 @@ class CentralizedTrainingFlowTest(unittest.TestCase):
         )
 
     def test_production_defaults_and_state_separation(self):
-        defaults = TrainingConfig(total_episodes=6)
+        defaults = formal_training_config(total_episodes=10)
         self.assertEqual(defaults.episode_seconds, 60)
         self.assertEqual(defaults.warmup_joint_transitions, PRODUCTION_WARMUP_TRANSITIONS)
         self.assertEqual(defaults.batch_size, PRODUCTION_BATCH_SIZE)
@@ -43,6 +51,25 @@ class CentralizedTrainingFlowTest(unittest.TestCase):
         self.assertEqual(self.result["joint_action_dim"], 48)
         self.assertEqual(self.result["centralized_td3_gamma"], 1.0)
         self.assertEqual(self.result["routing_ddqn_gamma"], 0.99)
+
+    def test_smoke_and_formal_configs_are_explicitly_separate(self):
+        smoke = smoke_training_config()
+        self.assertEqual(smoke.mode, "smoke")
+        self.assertEqual(smoke.total_episodes, 1)
+        self.assertEqual(smoke.episode_seconds, 60)
+        self.assertEqual(smoke.warmup_joint_transitions, 0)
+        self.assertEqual(smoke.batch_size, 1)
+        self.assertFalse(smoke.enable_model_checkpoints)
+        self.assertFalse(smoke.enable_full_resume)
+        self.assertFalse(smoke.enable_csv)
+        self.assertFalse(smoke.enable_plots)
+
+        formal = formal_training_config(100)
+        self.assertEqual(formal.mode, "train")
+        self.assertEqual(formal.total_episodes, 100)
+        self.assertEqual(formal.warmup_joint_transitions, 1000)
+        self.assertEqual(formal.batch_size, 64)
+        self.assertEqual(formal.policy_delay, 2)
 
     def test_one_actor_call_and_one_transition_per_interval(self):
         self.assertEqual(self.result["environment_actor_calls"], 2)
@@ -91,6 +118,38 @@ class CentralizedTrainingFlowTest(unittest.TestCase):
             config=config,
         )
         self.assertAlmostEqual(reward, 0.9)
+
+    def test_normal_training_end_writes_episode_boundary_full_checkpoint(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            result = train(
+                TrainingConfig(
+                    total_episodes=1,
+                    mode="custom",
+                    episode_seconds=1,
+                    warmup_joint_transitions=0,
+                    batch_size=1,
+                    checkpoint_root=temp_dir,
+                    enable_model_checkpoints=False,
+                    enable_full_resume=True,
+                    enable_plots=False,
+                    enable_csv=False,
+                    random_seed=2027,
+                )
+            )
+            checkpoint_dir = Path(temp_dir) / "full" / "final_ep_0001"
+            metadata = json.loads(
+                (checkpoint_dir / "metadata.json").read_text(encoding="utf-8")
+            )
+            state = torch.load(
+                checkpoint_dir / "training_state.pt",
+                map_location="cpu",
+                weights_only=False,
+            )["training_state"]
+
+        self.assertEqual(result["terminal_joint_transitions"], 1)
+        self.assertEqual(metadata["checkpoint_type"], "full-resume")
+        self.assertEqual(state["completed_episode_index"], 0)
+        self.assertEqual(state["next_episode_index"], 1)
 
 
 if __name__ == "__main__":

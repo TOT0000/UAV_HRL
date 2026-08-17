@@ -1,3 +1,4 @@
+import inspect
 import unittest
 from unittest.mock import patch
 
@@ -6,6 +7,7 @@ import numpy as np
 from Channel_model import ChannelModel
 from Packet_scheduler_v1 import PacketEngine, final_hop_delivered_bits
 from Simulator import Simulator
+from Task_assignment import Task, UAVAssigner
 from centralized_movement import (
     JOINT_ACTION_DIM,
     LOCAL_MOVEMENT_DIM,
@@ -62,6 +64,23 @@ class VisualSensingPacketGateTest(unittest.TestCase):
         )
         self.assertEqual(self.packet_engine.active_count(), 1)
         self.assertIs(self.packet_engine.get_active_packets()[0], old_packet)
+
+        # The validity gate affects only new source generation. An existing VS
+        # packet remains eligible for the normal forwarding path.
+        result = self.packet_engine.calculate_packet_reward_fast(
+            self.env,
+            old_packet,
+            hop_delay_ms=1.0,
+            from_uav=0,
+            to_target=self.env.GS_ID,
+            t=0.25,
+            backlog=0.0,
+            mode="uav",
+            channel_capacity=100.0,
+        )
+        self.assertGreater(result[6], 0.0)
+        self.assertTrue(old_packet["done"])
+        self.assertEqual(old_packet["current"], self.env.GS_ID)
 
     def test_vs_potential_is_continuous_and_positive_for_full_coverage(self):
         _, phi_vs, _ = calculate_movement_potentials(self.env, c_ref_com=1.0)
@@ -168,6 +187,64 @@ class ComStateCalibrationAndDeliveryTest(unittest.TestCase):
         uav.z_u = sr.z
         self.assertEqual(self.env.get_snr(0, 0), 0.0)
         self.assertEqual(self.env.get_sr_uav_capacity_mbps(0, 0), 0.0)
+
+    def test_nearer_feasible_link_capacity_is_not_lower(self):
+        uav = self.env.uav_dict[0]
+        sr = self.env.SR_teams[0]
+        sr.x, sr.y, sr.z = 500.0, 500.0, 0.0
+        uav.x_u, uav.y_u, uav.z_u = 500.0, 500.0, 50.0
+        near = self.env.get_sr_uav_capacity_mbps(0, 0)
+        uav.x_u = 500.0 + np.sqrt(199.0 ** 2 - 50.0 ** 2)
+        far = self.env.get_sr_uav_capacity_mbps(0, 0)
+        self.assertGreaterEqual(near, far)
+        self.assertGreater(far, 0.0)
+
+    def test_state_potential_and_assignment_share_helper_mbps_scale(self):
+        uav = self.env.uav_dict[0]
+        sr = self.env.SR_teams[0]
+        sr.active = True
+        task_dict = {
+            "task_type": "COM",
+            "target_id": 0,
+            "target_obj_id": 0,
+            "target_pos": sr.get_position(),
+        }
+        self.env.multi_tasks = {uid: [] for uid in range(16)}
+        self.env.multi_tasks[0] = [task_dict]
+        packet_engine = PacketEngine(num_uav=16, step_time=0.25)
+        with patch.object(
+            self.env, "get_sr_uav_capacity_mbps", return_value=12.0
+        ) as capacity_helper:
+            state = get_global_movement_state(
+                self.env,
+                packet_engine,
+                packet_engine.backlog_bits,
+                c_ref_com=24.0,
+                remaining_time=1.0,
+            )
+            _, _, phi_com = calculate_movement_potentials(
+                self.env, c_ref_com=24.0
+            )
+            assignment = UAVAssigner(self.env).assign_uav_tasks_k_times(
+                [0],
+                [
+                    Task(
+                        task_id=0,
+                        task_type="COM",
+                        target_obj=sr,
+                        target_obj_id=0,
+                    )
+                ],
+                K=1,
+            )
+
+        com_capacity_index = LOCAL_MOVEMENT_DIM - 1
+        self.assertEqual(state[com_capacity_index], 0.5)
+        self.assertEqual(phi_com, 0.5)
+        self.assertEqual(assignment[0][0][2], 12.0)
+        self.assertGreaterEqual(capacity_helper.call_count, 3)
+        source = inspect.getsource(UAVAssigner.assign_uav_tasks_k_times)
+        self.assertNotIn("capacity / 1e6", source)
 
     def test_delivered_bits_only_count_final_gs_hop(self):
         self.assertEqual(final_hop_delivered_bits(3, 16, 123.0), 0.0)

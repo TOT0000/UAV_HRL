@@ -1,6 +1,6 @@
+import argparse
 from collections import defaultdict
-from dataclasses import dataclass
-import json
+from dataclasses import asdict, dataclass
 import os
 import random
 
@@ -28,6 +28,11 @@ from exploration_schedules import (
     td3_decay_steps,
 )
 from td3 import TD3
+from training_checkpoint import (
+    load_full_resume_checkpoint,
+    save_full_resume_checkpoint,
+    save_model_checkpoint,
+)
 import utils_update_v2
 
 
@@ -36,6 +41,7 @@ ROUTING_STATE_DIM = 122
 PRODUCTION_WARMUP_TRANSITIONS = 1000
 PRODUCTION_BATCH_SIZE = 64
 PRODUCTION_POLICY_DELAY = 2
+SMOKE_RANDOM_SEED = 20260817
 
 
 def _is_movement_decision(slot, interval=MOVEMENT_CONTROL_INTERVAL):
@@ -54,6 +60,10 @@ def _is_episode_end(slot, total_slots):
 
 def _search_transition_done(search_done, movement_episode_end):
     return bool(search_done or movement_episode_end)
+
+
+def _uses_warmup_random_action(total_joint_transitions, warmup_transitions):
+    return int(total_joint_transitions) < int(warmup_transitions)
 
 
 def _create_active_replay_buffers(state_dim, routing_dim, max_size=int(2e5)):
@@ -76,7 +86,8 @@ def _create_active_replay_buffers(state_dim, routing_dim, max_size=int(2e5)):
 
 @dataclass
 class TrainingConfig:
-    total_episodes: int = 6
+    total_episodes: int
+    mode: str = "train"
     episode_seconds: int = 60
     routing_slot_seconds: float = 0.25
     warmup_joint_transitions: int = PRODUCTION_WARMUP_TRANSITIONS
@@ -87,15 +98,19 @@ class TrainingConfig:
     beta_vs: float = 1.0
     beta_com: float = 1.0
     search_coverage_threshold: float = 0.99
-    checkpoint_every: int = 2
+    model_checkpoint_every: int = 2
+    full_resume_every: int = 50
     checkpoint_root: str = "checkpoints_centralized_td3"
     resume_dir: str | None = None
-    enable_checkpoints: bool = True
+    enable_model_checkpoints: bool = True
+    enable_full_resume: bool = True
     enable_plots: bool = True
     enable_csv: bool = True
     random_seed: int | None = None
 
     def __post_init__(self):
+        if self.mode not in {"smoke", "train", "custom"}:
+            raise ValueError(f"unsupported training mode: {self.mode}")
         slots = 1.0 / float(self.routing_slot_seconds)
         if not np.isclose(slots, MOVEMENT_CONTROL_INTERVAL):
             raise ValueError("movement interval must contain exactly four routing slots")
@@ -103,6 +118,39 @@ class TrainingConfig:
             raise ValueError("episode_seconds and total_episodes must be positive")
         if self.warmup_joint_transitions < 0 or self.batch_size <= 0:
             raise ValueError("warmup must be non-negative and batch_size positive")
+
+
+def smoke_training_config():
+    return TrainingConfig(
+        total_episodes=1,
+        mode="smoke",
+        episode_seconds=60,
+        routing_slot_seconds=0.25,
+        warmup_joint_transitions=0,
+        batch_size=1,
+        policy_delay=2,
+        enable_model_checkpoints=False,
+        enable_full_resume=False,
+        enable_plots=False,
+        enable_csv=False,
+        random_seed=SMOKE_RANDOM_SEED,
+    )
+
+
+def formal_training_config(total_episodes, **overrides):
+    if total_episodes is None:
+        raise ValueError("formal training requires an explicit total_episodes value")
+    values = {
+        "total_episodes": int(total_episodes),
+        "mode": "train",
+        "episode_seconds": 60,
+        "routing_slot_seconds": 0.25,
+        "warmup_joint_transitions": PRODUCTION_WARMUP_TRANSITIONS,
+        "batch_size": PRODUCTION_BATCH_SIZE,
+        "policy_delay": PRODUCTION_POLICY_DELAY,
+    }
+    values.update(overrides)
+    return TrainingConfig(**values)
 
 
 def _routing_masks(env):
@@ -255,7 +303,11 @@ def _run_routing_slot(
             bool(done),
             tag_gt=env.num_GT,
         )
-    return delivered_bits, float(sum(slot_reward.values()))
+    return (
+        delivered_bits,
+        float(sum(slot_reward.values())),
+        len(next_hops),
+    )
 
 
 def _select_routing_actions(ddqn, states, routing_masks, epsilon):
@@ -314,8 +366,72 @@ def _interval_reward(
     return float(delivered_mbits - current_lambda * energy + shaping)
 
 
+_RESUME_CONFIG_FIELDS = (
+    "mode",
+    "total_episodes",
+    "episode_seconds",
+    "routing_slot_seconds",
+    "warmup_joint_transitions",
+    "batch_size",
+    "policy_delay",
+    "replay_max_size",
+    "beta_search",
+    "beta_vs",
+    "beta_com",
+    "search_coverage_threshold",
+)
+
+
+def _validate_resume_config(stored_config, current_config):
+    current = asdict(current_config)
+    mismatches = {
+        key: (stored_config.get(key), current.get(key))
+        for key in _RESUME_CONFIG_FIELDS
+        if stored_config.get(key) != current.get(key)
+    }
+    if mismatches:
+        raise RuntimeError(f"formal training config is incompatible: {mismatches}")
+
+
+def _full_training_state(
+    *,
+    episode,
+    lambda_ee,
+    reward_log,
+    delivered_log,
+    energy_log,
+    lambda_log,
+    total_joint_transitions,
+    routing_slots_executed,
+    td3_noise_log,
+    routing_epsilon_log,
+    warmup_joint_transitions,
+):
+    return {
+        "completed_episode_index": int(episode),
+        "next_episode_index": int(episode) + 1,
+        "lambda_EE_global": float(lambda_ee),
+        "reward_log": list(reward_log),
+        "delivered_log": list(delivered_log),
+        "energy_log": list(energy_log),
+        "lambda_log": list(lambda_log),
+        "total_joint_transitions": int(total_joint_transitions),
+        "global_routing_slot": int(routing_slots_executed),
+        "td3_post_warmup_transition": max(
+            int(total_joint_transitions) - int(warmup_joint_transitions), 0
+        ),
+        "ddqn_schedule_slot": int(routing_slots_executed),
+        "td3_noise_log": list(td3_noise_log),
+        "routing_epsilon_log": list(routing_epsilon_log),
+    }
+
+
 def train(config=None):
-    config = TrainingConfig() if config is None else config
+    if config is None:
+        raise ValueError(
+            "training config is required; use smoke_training_config() or "
+            "formal_training_config(total_episodes)"
+        )
     if config.random_seed is not None:
         np.random.seed(config.random_seed)
         random.seed(config.random_seed)
@@ -346,36 +462,54 @@ def train(config=None):
 
     lambda_ee = 0.1
     start_episode = 0
-    if config.resume_dir is not None:
-        if not os.path.isdir(config.resume_dir):
-            raise FileNotFoundError(f"centralized checkpoint not found: {config.resume_dir}")
-        meta_path = os.path.join(config.resume_dir, "meta.json")
-        with open(meta_path, "r", encoding="utf-8") as handle:
-            metadata = json.load(handle)
-        if metadata.get("movement_state_dim") != MOVEMENT_STATE_DIM or metadata.get(
-            "joint_action_dim"
-        ) != JOINT_ACTION_DIM:
-            raise RuntimeError(
-                "checkpoint is not compatible with the 531-D/48-D centralized TD3"
-            )
-        centralized_td3.load(os.path.join(config.resume_dir, "centralized_td3"))
-        ddqn.load(os.path.join(config.resume_dir, "uav_ddqn"))
-        lambda_ee = float(metadata["lambda_EE_global"])
-        start_episode = int(metadata["episode"]) + 1
-
     reward_log = []
     delivered_log = []
     energy_log = []
     lambda_log = []
     total_joint_transitions = 0
+    routing_slots_executed = 0
+    td3_noise_log = []
+    routing_epsilon_log = []
+    if config.resume_dir is not None:
+        if not os.path.isdir(config.resume_dir):
+            raise FileNotFoundError(f"centralized checkpoint not found: {config.resume_dir}")
+        restored = load_full_resume_checkpoint(
+            config.resume_dir,
+            td3=centralized_td3,
+            ddqn=ddqn,
+            joint_replay=joint_replay,
+            routing_replay=routing_replay,
+            movement_state_dim=MOVEMENT_STATE_DIM,
+            joint_action_dim=JOINT_ACTION_DIM,
+            routing_state_dim=ROUTING_STATE_DIM,
+            calibration=calibration,
+        )
+        _validate_resume_config(restored["formal_config"], config)
+        training_state = restored["training_state"]
+        lambda_ee = float(training_state["lambda_EE_global"])
+        start_episode = int(training_state["next_episode_index"])
+        reward_log = list(training_state["reward_log"])
+        delivered_log = list(training_state["delivered_log"])
+        energy_log = list(training_state["energy_log"])
+        lambda_log = list(training_state["lambda_log"])
+        total_joint_transitions = int(training_state["total_joint_transitions"])
+        routing_slots_executed = int(training_state["global_routing_slot"])
+        td3_noise_log = list(training_state["td3_noise_log"])
+        routing_epsilon_log = list(training_state["routing_epsilon_log"])
+        expected_post_warmup = max(
+            total_joint_transitions - config.warmup_joint_transitions, 0
+        )
+        if int(training_state["td3_post_warmup_transition"]) != expected_post_warmup:
+            raise RuntimeError("TD3 exploration counter is inconsistent with replay history")
+        if int(training_state["ddqn_schedule_slot"]) != routing_slots_executed:
+            raise RuntimeError("DDQN exploration counter is inconsistent with slot history")
+
+    initial_log_length = len(reward_log)
     duplicate_target_assertions = 0
     environment_actor_calls = 0
     proposal_batches = 0
     energy_evaluations = 0
     terminal_joint_transitions = 0
-    routing_slots_executed = 0
-    td3_noise_log = []
-    routing_epsilon_log = []
     td3_schedule_decay = td3_decay_steps(
         config.total_episodes,
         config.episode_seconds,
@@ -388,7 +522,9 @@ def train(config=None):
     )
     delay_bound_steps = int(5.0 / config.routing_slot_seconds)
 
-    for episode in range(start_episode, start_episode + config.total_episodes):
+    last_completed_episode = start_episode - 1
+    ddqn_action_selections = 0
+    for episode in range(start_episode, config.total_episodes):
         env.num_GT = int(np.random.randint(2, 10))
         env.reset_environment()
         packet_engine.reset_packet_state()
@@ -428,7 +564,9 @@ def train(config=None):
                     duplicate_target_assertions += 1
                 raise
 
-            if total_joint_transitions < config.warmup_joint_transitions:
+            if _uses_warmup_random_action(
+                total_joint_transitions, config.warmup_joint_transitions
+            ):
                 raw_joint_action = np.random.uniform(
                     -1.0, 1.0, size=JOINT_ACTION_DIM
                 ).astype(np.float32)
@@ -482,7 +620,7 @@ def train(config=None):
                     interval == config.episode_seconds - 1
                     and routing_slot == MOVEMENT_CONTROL_INTERVAL - 1
                 )
-                delivered_bits, routing_reward = _run_routing_slot(
+                delivered_bits, routing_reward, action_selections = _run_routing_slot(
                     env,
                     packet_engine,
                     ddqn,
@@ -494,6 +632,7 @@ def train(config=None):
                     violation_stats=violation_stats,
                     epsilon=slot_epsilon,
                 )
+                ddqn_action_selections += action_selections
                 interval_delivered_bits += delivered_bits
                 episode_routing_reward += routing_reward
 
@@ -565,6 +704,7 @@ def train(config=None):
         delivered_log.append(episode_delivered_mbits)
         energy_log.append(episode_energy)
         lambda_log.append(lambda_ee)
+        last_completed_episode = episode
         print(
             f"[Episode {episode + 1}] joint_transitions={config.episode_seconds} "
             f"reward={episode_reward:.6f} delivered={episode_delivered_mbits:.6f} Mbit "
@@ -575,39 +715,107 @@ def train(config=None):
         )
 
         if (
-            config.enable_checkpoints
-            and config.checkpoint_every > 0
-            and (episode + 1) % config.checkpoint_every == 0
+            config.enable_model_checkpoints
+            and config.model_checkpoint_every > 0
+            and (episode + 1) % config.model_checkpoint_every == 0
         ):
-            save_dir = os.path.join(config.checkpoint_root, f"ep_{episode + 1:04d}")
-            os.makedirs(save_dir, exist_ok=True)
-            centralized_td3.save(os.path.join(save_dir, "centralized_td3"))
-            ddqn.save(os.path.join(save_dir, "uav_ddqn"))
-            with open(os.path.join(save_dir, "meta.json"), "w", encoding="utf-8") as handle:
-                json.dump(
-                    {
-                        "episode": episode,
-                        "lambda_EE_global": lambda_ee,
-                        "movement_state_dim": MOVEMENT_STATE_DIM,
-                        "routing_state_dim": ROUTING_STATE_DIM,
-                        "joint_action_dim": JOINT_ACTION_DIM,
-                        "c_ref_com": c_ref_com,
-                    },
-                    handle,
-                    indent=2,
-                )
+            save_model_checkpoint(
+                os.path.join(
+                    config.checkpoint_root, "models", f"ep_{episode + 1:04d}"
+                ),
+                episode=episode,
+                td3=centralized_td3,
+                ddqn=ddqn,
+                movement_state_dim=MOVEMENT_STATE_DIM,
+                joint_action_dim=JOINT_ACTION_DIM,
+                routing_state_dim=ROUTING_STATE_DIM,
+                calibration=calibration,
+            )
+        if (
+            config.enable_full_resume
+            and config.full_resume_every > 0
+            and (episode + 1) % config.full_resume_every == 0
+        ):
+            save_full_resume_checkpoint(
+                os.path.join(
+                    config.checkpoint_root, "full", f"ep_{episode + 1:04d}"
+                ),
+                episode=episode,
+                td3=centralized_td3,
+                ddqn=ddqn,
+                joint_replay=joint_replay,
+                routing_replay=routing_replay,
+                training_state=_full_training_state(
+                    episode=episode,
+                    lambda_ee=lambda_ee,
+                    reward_log=reward_log,
+                    delivered_log=delivered_log,
+                    energy_log=energy_log,
+                    lambda_log=lambda_log,
+                    total_joint_transitions=total_joint_transitions,
+                    routing_slots_executed=routing_slots_executed,
+                    td3_noise_log=td3_noise_log,
+                    routing_epsilon_log=routing_epsilon_log,
+                    warmup_joint_transitions=config.warmup_joint_transitions,
+                ),
+                formal_config=asdict(config),
+                movement_state_dim=MOVEMENT_STATE_DIM,
+                joint_action_dim=JOINT_ACTION_DIM,
+                routing_state_dim=ROUTING_STATE_DIM,
+                calibration=calibration,
+            )
+
+    if config.enable_full_resume and last_completed_episode >= 0:
+        save_full_resume_checkpoint(
+            os.path.join(
+                config.checkpoint_root,
+                "full",
+                f"final_ep_{last_completed_episode + 1:04d}",
+            ),
+            episode=last_completed_episode,
+            td3=centralized_td3,
+            ddqn=ddqn,
+            joint_replay=joint_replay,
+            routing_replay=routing_replay,
+            training_state=_full_training_state(
+                episode=last_completed_episode,
+                lambda_ee=lambda_ee,
+                reward_log=reward_log,
+                delivered_log=delivered_log,
+                energy_log=energy_log,
+                lambda_log=lambda_log,
+                total_joint_transitions=total_joint_transitions,
+                routing_slots_executed=routing_slots_executed,
+                td3_noise_log=td3_noise_log,
+                routing_epsilon_log=routing_epsilon_log,
+                warmup_joint_transitions=config.warmup_joint_transitions,
+            ),
+            formal_config=asdict(config),
+            movement_state_dim=MOVEMENT_STATE_DIM,
+            joint_action_dim=JOINT_ACTION_DIM,
+            routing_state_dim=ROUTING_STATE_DIM,
+            calibration=calibration,
+        )
 
     if config.enable_csv:
         os.makedirs("results", exist_ok=True)
-        pd.DataFrame(
+        csv_frame = pd.DataFrame(
             {
-                "episode": np.arange(len(reward_log)),
-                "reward": reward_log,
-                "delivered_mbits": delivered_log,
-                "mobility_energy": energy_log,
-                "lambda": lambda_log,
+                "episode": np.arange(initial_log_length, len(reward_log)),
+                "reward": reward_log[initial_log_length:],
+                "delivered_mbits": delivered_log[initial_log_length:],
+                "mobility_energy": energy_log[initial_log_length:],
+                "lambda": lambda_log[initial_log_length:],
             }
-        ).to_csv("results/centralized_td3_training.csv", index=False)
+        )
+        csv_path = "results/centralized_td3_training.csv"
+        append = config.resume_dir is not None and os.path.isfile(csv_path)
+        csv_frame.to_csv(
+            csv_path,
+            mode="a" if append else "w",
+            header=not append,
+            index=False,
+        )
     if config.enable_plots:
         plt.figure(figsize=(8, 6))
         plt.plot(reward_log, label="Centralized TD3 reward")
@@ -619,7 +827,8 @@ def train(config=None):
         plt.show()
 
     return {
-        "episodes": config.total_episodes,
+        "episodes": len(reward_log),
+        "episodes_run": len(reward_log) - initial_log_length,
         "joint_transitions": total_joint_transitions,
         "critic_updates": centralized_td3.num_critic_update_iteration,
         "actor_updates": centralized_td3.num_actor_update_iteration,
@@ -638,6 +847,8 @@ def train(config=None):
         "energy_evaluations": energy_evaluations,
         "terminal_joint_transitions": terminal_joint_transitions,
         "routing_slots_executed": routing_slots_executed,
+        "ddqn_action_selections": ddqn_action_selections,
+        "ddqn_training_updates": ddqn.num_training,
         "td3_noise_log": td3_noise_log,
         "routing_epsilon_log": routing_epsilon_log,
         "reward_log": reward_log,
@@ -646,5 +857,35 @@ def train(config=None):
     }
 
 
+def parse_training_config(argv=None):
+    parser = argparse.ArgumentParser(
+        description="Corrected no-LLM centralized TD3 training"
+    )
+    parser.add_argument("--mode", required=True, choices=("smoke", "train"))
+    parser.add_argument("--episodes", type=int)
+    parser.add_argument("--resume-dir")
+    parser.add_argument(
+        "--checkpoint-root", default="checkpoints_centralized_td3"
+    )
+    args = parser.parse_args(argv)
+    if args.mode == "smoke":
+        if args.episodes is not None:
+            parser.error("smoke mode fixes --episodes to 1; do not pass --episodes")
+        if args.resume_dir is not None:
+            parser.error("smoke mode does not support full resume")
+        return smoke_training_config()
+    if args.episodes is None:
+        parser.error("formal train mode requires --episodes")
+    return formal_training_config(
+        args.episodes,
+        resume_dir=args.resume_dir,
+        checkpoint_root=args.checkpoint_root,
+    )
+
+
+def main(argv=None):
+    return train(parse_training_config(argv))
+
+
 if __name__ == "__main__":
-    train()
+    main()
