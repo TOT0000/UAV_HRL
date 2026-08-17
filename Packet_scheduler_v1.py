@@ -85,6 +85,9 @@ class PacketEngine:
             "FOV": {"sum_queue": 0.0, "sum_tx": 0.0, "sum_total": 0.0, "count": 0},
             "COM": {"sum_queue": 0.0, "sum_tx": 0.0, "sum_total": 0.0, "count": 0},
         }
+        # Routing-observation history is episode-scoped. It must not leak from
+        # one manifest scenario into the next when this engine is reused.
+        self.fov_ema = {}
     # （可選）若要用到才保留；否則刪掉它避免 self.num_UAV 未定義
     def initialize_packet_buffer(self, num_pkt):
         self.packet_buffer = {
@@ -906,6 +909,7 @@ class PacketEngine:
             "FOV": {"sum_queue": 0.0, "sum_tx": 0.0, "sum_total": 0.0, "count": 0},
             "COM": {"sum_queue": 0.0, "sum_tx": 0.0, "sum_total": 0.0, "count": 0},
         }
+        self.fov_ema = {}
 
         # 總延遲時間
     def log_hop_delay(self, env, pkt, current_node, next_hop, link_capacity_mbps, current_time, pkt_bits, backlog_bits):
