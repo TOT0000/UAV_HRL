@@ -2,6 +2,9 @@ import hashlib
 import json
 import random
 from pathlib import Path
+import re
+import shutil
+import uuid
 
 import numpy as np
 import torch
@@ -60,6 +63,58 @@ def calibration_fingerprint(calibration):
 
 def checkpoint_metadata_fingerprint(metadata):
     return calibration_fingerprint(metadata)
+
+
+def checkpoint_episode_schedule(total_episodes, every):
+    """Return periodic episodes plus a non-duplicate normal-completion save."""
+
+    total_episodes = int(total_episodes)
+    every = int(every)
+    if total_episodes <= 0 or every <= 0:
+        return []
+    episodes = list(range(every, total_episodes + 1, every))
+    if not episodes or episodes[-1] != total_episodes:
+        episodes.append(total_episodes)
+    return episodes
+
+
+def _atomic_checkpoint_write(checkpoint_dir, writer):
+    checkpoint_dir = Path(checkpoint_dir)
+    checkpoint_dir.parent.mkdir(parents=True, exist_ok=True)
+    if checkpoint_dir.exists():
+        raise FileExistsError(f"checkpoint already exists: {checkpoint_dir}")
+    temporary = checkpoint_dir.parent / (
+        f".{checkpoint_dir.name}.tmp-{uuid.uuid4().hex}"
+    )
+    temporary.mkdir()
+    try:
+        writer(temporary)
+        temporary.replace(checkpoint_dir)
+    except BaseException:
+        if temporary.exists():
+            shutil.rmtree(temporary)
+        raise
+    return checkpoint_dir
+
+
+def prune_full_resume_checkpoints(full_root, keep_last):
+    full_root = Path(full_root).resolve()
+    keep_last = int(keep_last)
+    if keep_last <= 0:
+        raise ValueError("full-resume retention must keep at least one checkpoint")
+    if not full_root.is_dir():
+        return []
+    checkpoints = []
+    for candidate in full_root.iterdir():
+        match = re.fullmatch(r"ep_(\d+)", candidate.name)
+        if match and candidate.is_dir() and candidate.resolve().parent == full_root:
+            checkpoints.append((int(match.group(1)), candidate.resolve()))
+    checkpoints.sort()
+    removed = []
+    for _, checkpoint in checkpoints[:-keep_last]:
+        shutil.rmtree(checkpoint)
+        removed.append(checkpoint)
+    return removed
 
 
 def _network_states(td3, ddqn):
@@ -137,7 +192,6 @@ def save_model_checkpoint(
     experiment_metadata=None,
 ):
     checkpoint_dir = Path(checkpoint_dir)
-    checkpoint_dir.mkdir(parents=True, exist_ok=True)
     metadata = _base_metadata(
         MODEL_CHECKPOINT_TYPE,
         episode,
@@ -149,11 +203,13 @@ def save_model_checkpoint(
         calibration,
         experiment_metadata,
     )
-    torch.save(_network_states(td3, ddqn), checkpoint_dir / "models.pt")
-    (checkpoint_dir / "metadata.json").write_text(
-        json.dumps(metadata, indent=2) + "\n", encoding="utf-8"
-    )
-    return checkpoint_dir
+    def write(temporary):
+        torch.save(_network_states(td3, ddqn), temporary / "models.pt")
+        (temporary / "metadata.json").write_text(
+            json.dumps(metadata, indent=2) + "\n", encoding="utf-8"
+        )
+
+    return _atomic_checkpoint_write(checkpoint_dir, write)
 
 
 def _metadata_value_matches(actual, expected):
@@ -364,9 +420,9 @@ def save_full_resume_checkpoint(
     routing_state_dim,
     calibration,
     experiment_metadata=None,
+    keep_last=None,
 ):
     checkpoint_dir = Path(checkpoint_dir)
-    checkpoint_dir.mkdir(parents=True, exist_ok=True)
     metadata = _base_metadata(
         FULL_CHECKPOINT_TYPE,
         episode,
@@ -378,58 +434,63 @@ def save_full_resume_checkpoint(
         calibration,
         experiment_metadata,
     )
-    replay_metadata = {
-        "joint": _save_replay(
-            checkpoint_dir / "joint_replay.npz", joint_replay, JOINT_REPLAY_FIELDS
-        ),
-        "routing": _save_replay(
-            checkpoint_dir / "routing_replay.npz",
-            routing_replay,
-            ROUTING_REPLAY_FIELDS,
-        ),
-    }
-    payload = {
-        "networks": _network_states(td3, ddqn),
-        "td3_optimizers": {
-            "actor": td3.actor_optimizer.state_dict(),
-            "critic_1": td3.critic_1_optimizer.state_dict(),
-            "critic_2": td3.critic_2_optimizer.state_dict(),
-        },
-        "td3_counters": {
-            "critic_updates": int(td3.num_critic_update_iteration),
-            "actor_updates": int(td3.num_actor_update_iteration),
-            "training_updates": int(td3.num_training),
-        },
-        "td3_hyperparameters": {
-            "gamma": float(td3.gamma),
-            "tau": float(td3.tau),
-            "policy_delay": int(td3.policy_delay),
-            "policy_noise": float(td3.policy_noise),
-            "noise_clip": float(td3.noise_clip),
-            "max_action": float(td3.max_action),
-        },
-        "ddqn_optimizers": {
-            "reward": ddqn.optimizer.state_dict(),
-            "cost": ddqn.cost_optimizer.state_dict(),
-        },
-        "ddqn_state": {
-            "eta": float(ddqn.eta),
-            "tau": float(ddqn.tau),
-            "gamma": float(ddqn.gamma),
-            "training_updates": int(ddqn.num_training),
-            "loss_log": list(ddqn.loss_log),
-            "cost_loss_log": list(ddqn.cost_loss_log),
-        },
-        "training_state": dict(training_state),
-        "formal_config": dict(formal_config),
-        "replay_metadata": replay_metadata,
-        "rng_state": _rng_state(),
-    }
-    torch.save(payload, checkpoint_dir / "training_state.pt")
-    (checkpoint_dir / "metadata.json").write_text(
-        json.dumps(metadata, indent=2) + "\n", encoding="utf-8"
-    )
-    return checkpoint_dir
+    def write(temporary):
+        replay_metadata = {
+            "joint": _save_replay(
+                temporary / "joint_replay.npz", joint_replay, JOINT_REPLAY_FIELDS
+            ),
+            "routing": _save_replay(
+                temporary / "routing_replay.npz",
+                routing_replay,
+                ROUTING_REPLAY_FIELDS,
+            ),
+        }
+        payload = {
+            "networks": _network_states(td3, ddqn),
+            "td3_optimizers": {
+                "actor": td3.actor_optimizer.state_dict(),
+                "critic_1": td3.critic_1_optimizer.state_dict(),
+                "critic_2": td3.critic_2_optimizer.state_dict(),
+            },
+            "td3_counters": {
+                "critic_updates": int(td3.num_critic_update_iteration),
+                "actor_updates": int(td3.num_actor_update_iteration),
+                "training_updates": int(td3.num_training),
+            },
+            "td3_hyperparameters": {
+                "gamma": float(td3.gamma),
+                "tau": float(td3.tau),
+                "policy_delay": int(td3.policy_delay),
+                "policy_noise": float(td3.policy_noise),
+                "noise_clip": float(td3.noise_clip),
+                "max_action": float(td3.max_action),
+            },
+            "ddqn_optimizers": {
+                "reward": ddqn.optimizer.state_dict(),
+                "cost": ddqn.cost_optimizer.state_dict(),
+            },
+            "ddqn_state": {
+                "eta": float(ddqn.eta),
+                "tau": float(ddqn.tau),
+                "gamma": float(ddqn.gamma),
+                "training_updates": int(ddqn.num_training),
+                "loss_log": list(ddqn.loss_log),
+                "cost_loss_log": list(ddqn.cost_loss_log),
+            },
+            "training_state": dict(training_state),
+            "formal_config": dict(formal_config),
+            "replay_metadata": replay_metadata,
+            "rng_state": _rng_state(),
+        }
+        torch.save(payload, temporary / "training_state.pt")
+        (temporary / "metadata.json").write_text(
+            json.dumps(metadata, indent=2) + "\n", encoding="utf-8"
+        )
+
+    saved = _atomic_checkpoint_write(checkpoint_dir, write)
+    if keep_last is not None:
+        prune_full_resume_checkpoints(saved.parent, keep_last)
+    return saved
 
 
 def _validate_full_metadata(

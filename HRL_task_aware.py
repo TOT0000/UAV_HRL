@@ -33,6 +33,7 @@ from evaluation_metrics import safe_energy_efficiency
 from experiment_config import MethodSpec
 from td3 import TD3
 from training_checkpoint import (
+    checkpoint_episode_schedule,
     checkpoint_metadata_fingerprint,
     load_full_resume_checkpoint,
     load_model_checkpoint,
@@ -115,8 +116,10 @@ class TrainingConfig:
     beta_vs: float = 1.0
     beta_com: float = 1.0
     search_coverage_threshold: float = 0.99
-    model_checkpoint_every: int = 2
+    model_checkpoint_every: int = 50
     full_resume_every: int = 50
+    full_resume_keep_last: int = 2
+    formal_evaluation_episode: int = 1500
     checkpoint_root: str = "checkpoints_centralized_td3"
     resume_dir: str | None = None
     enable_model_checkpoints: bool = True
@@ -135,6 +138,10 @@ class TrainingConfig:
             raise ValueError("episode_seconds and total_episodes must be positive")
         if self.warmup_joint_transitions < 0 or self.batch_size <= 0:
             raise ValueError("warmup must be non-negative and batch_size positive")
+        if self.full_resume_keep_last <= 0:
+            raise ValueError("full_resume_keep_last must be positive")
+        if self.formal_evaluation_episode <= 0:
+            raise ValueError("formal_evaluation_episode must be positive")
 
 
 def smoke_training_config():
@@ -165,6 +172,10 @@ def formal_training_config(total_episodes, **overrides):
         "warmup_joint_transitions": PRODUCTION_WARMUP_TRANSITIONS,
         "batch_size": PRODUCTION_BATCH_SIZE,
         "policy_delay": PRODUCTION_POLICY_DELAY,
+        "model_checkpoint_every": 50,
+        "full_resume_every": 50,
+        "full_resume_keep_last": 2,
+        "formal_evaluation_episode": 1500,
     }
     values.update(overrides)
     return TrainingConfig(**values)
@@ -372,8 +383,18 @@ _RESUME_CONFIG_FIELDS = (
     "beta_vs",
     "beta_com",
     "search_coverage_threshold",
+    "model_checkpoint_every",
+    "full_resume_every",
+    "full_resume_keep_last",
+    "formal_evaluation_episode",
     "random_seed",
 )
+
+
+def _is_checkpoint_episode(completed_episode, total_episodes, every):
+    return int(completed_episode) in checkpoint_episode_schedule(
+        total_episodes, every
+    )
 
 
 def _validate_resume_config(stored_config, current_config):
@@ -721,7 +742,6 @@ def train(
     )
     delay_bound_steps = int(5.0 / config.routing_slot_seconds)
 
-    last_completed_episode = start_episode - 1
     ddqn_action_selections = 0
     executed_scenario_ids = []
     for episode in range(start_episode, config.total_episodes):
@@ -930,7 +950,6 @@ def train(
         delivered_log.append(episode_delivered_mbits)
         energy_log.append(episode_energy)
         lambda_log.append(lambda_ee)
-        last_completed_episode = episode
         coverage = float(env.visited_bitmap.mean())
         found_gt_ratio = (
             float(env.count_found_targets()) / float(env.num_GT)
@@ -1013,8 +1032,11 @@ def train(
             not evaluation
             and
             config.enable_model_checkpoints
-            and config.model_checkpoint_every > 0
-            and (episode + 1) % config.model_checkpoint_every == 0
+            and _is_checkpoint_episode(
+                episode + 1,
+                config.total_episodes,
+                config.model_checkpoint_every,
+            )
         ):
             save_model_checkpoint(
                 os.path.join(
@@ -1037,8 +1059,11 @@ def train(
             not evaluation
             and
             config.enable_full_resume
-            and config.full_resume_every > 0
-            and (episode + 1) % config.full_resume_every == 0
+            and _is_checkpoint_episode(
+                episode + 1,
+                config.total_episodes,
+                config.full_resume_every,
+            )
         ):
             save_full_resume_checkpoint(
                 os.path.join(
@@ -1072,48 +1097,8 @@ def train(
                     "lambda_ee": float(lambda_ee),
                     "formal_config": asdict(config),
                 },
+                keep_last=config.full_resume_keep_last,
             )
-
-    if (
-        not evaluation
-        and config.enable_full_resume
-        and last_completed_episode >= 0
-    ):
-        save_full_resume_checkpoint(
-            os.path.join(
-                config.checkpoint_root,
-                "full",
-                f"final_ep_{last_completed_episode + 1:04d}",
-            ),
-            episode=last_completed_episode,
-            td3=centralized_td3,
-            ddqn=ddqn,
-            joint_replay=joint_replay,
-            routing_replay=routing_replay,
-            training_state=_full_training_state(
-                episode=last_completed_episode,
-                lambda_ee=lambda_ee,
-                reward_log=reward_log,
-                delivered_log=delivered_log,
-                energy_log=energy_log,
-                lambda_log=lambda_log,
-                total_joint_transitions=total_joint_transitions,
-                routing_slots_executed=routing_slots_executed,
-                td3_noise_log=td3_noise_log,
-                routing_epsilon_log=routing_epsilon_log,
-                warmup_joint_transitions=config.warmup_joint_transitions,
-            ),
-            formal_config=asdict(config),
-            movement_state_dim=MOVEMENT_STATE_DIM,
-            joint_action_dim=JOINT_ACTION_DIM,
-            routing_state_dim=ROUTING_STATE_DIM,
-            calibration=calibration,
-            experiment_metadata={
-                **experiment_identity,
-                "lambda_ee": float(lambda_ee),
-                "formal_config": asdict(config),
-            },
-        )
 
     if config.enable_csv:
         os.makedirs("results", exist_ok=True)

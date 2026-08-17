@@ -130,14 +130,15 @@ class CentralizedTrainingFlowTest(unittest.TestCase):
                     warmup_joint_transitions=0,
                     batch_size=1,
                     checkpoint_root=temp_dir,
-                    enable_model_checkpoints=False,
+                    enable_model_checkpoints=True,
                     enable_full_resume=True,
                     enable_plots=False,
                     enable_csv=False,
                     random_seed=2027,
                 )
             )
-            checkpoint_dir = Path(temp_dir) / "full" / "final_ep_0001"
+            checkpoint_dir = Path(temp_dir) / "full" / "ep_0001"
+            model_dir = Path(temp_dir) / "models" / "ep_0001"
             metadata = json.loads(
                 (checkpoint_dir / "metadata.json").read_text(encoding="utf-8")
             )
@@ -146,6 +147,11 @@ class CentralizedTrainingFlowTest(unittest.TestCase):
                 map_location="cpu",
                 weights_only=False,
             )["training_state"]
+            self.assertTrue((model_dir / "models.pt").is_file())
+            self.assertEqual(
+                [path.name for path in (Path(temp_dir) / "full").iterdir()],
+                ["ep_0001"],
+            )
 
         self.assertEqual(result["terminal_joint_transitions"], 1)
         self.assertEqual(metadata["checkpoint_type"], "full-resume")

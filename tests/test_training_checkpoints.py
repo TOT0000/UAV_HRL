@@ -476,8 +476,10 @@ class TrainingCliTest(unittest.TestCase):
         self.assertEqual(formal.total_episodes, 1500)
         self.assertEqual(formal.random_seed, 20260817)
         self.assertEqual(formal.warmup_joint_transitions, 1000)
-        self.assertEqual(formal.model_checkpoint_every, 2)
+        self.assertEqual(formal.model_checkpoint_every, 50)
         self.assertEqual(formal.full_resume_every, 50)
+        self.assertEqual(formal.full_resume_keep_last, 2)
+        self.assertEqual(formal.formal_evaluation_episode, 1500)
 
     def test_smoke_mode_rejects_seed_override(self):
         stderr = io.StringIO()
