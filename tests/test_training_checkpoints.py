@@ -12,7 +12,9 @@ import torch
 from DDQN import DDQN
 from HRL_task_aware import (
     _seed_training_rng,
+    _validate_resume_config,
     _uses_warmup_random_action,
+    formal_training_config,
     parse_training_config,
 )
 from centralized_movement import JOINT_ACTION_DIM, MOVEMENT_STATE_DIM
@@ -437,19 +439,67 @@ class FullResumeCheckpointTest(unittest.TestCase):
 
 class TrainingCliTest(unittest.TestCase):
     def test_formal_mode_requires_explicit_episodes(self):
-        with contextlib.redirect_stderr(io.StringIO()):
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
             with self.assertRaises(SystemExit):
-                parse_training_config(["--mode", "train"])
+                parse_training_config(
+                    ["--mode", "train", "--seed", "20260817"]
+                )
+        self.assertIn("formal train mode requires --episodes", stderr.getvalue())
+
+    def test_formal_mode_requires_explicit_seed(self):
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            with self.assertRaises(SystemExit):
+                parse_training_config(
+                    ["--mode", "train", "--episodes", "1500"]
+                )
+        self.assertIn("formal train mode requires --seed", stderr.getvalue())
 
     def test_cli_builds_smoke_and_formal_configs(self):
         smoke = parse_training_config(["--mode", "smoke"])
         self.assertEqual(smoke.total_episodes, 1)
+        self.assertEqual(smoke.random_seed, 20260817)
         self.assertFalse(smoke.enable_full_resume)
-        formal = parse_training_config(["--mode", "train", "--episodes", "25"])
-        self.assertEqual(formal.total_episodes, 25)
+        formal = parse_training_config(
+            [
+                "--mode",
+                "train",
+                "--episodes",
+                "1500",
+                "--seed",
+                "20260817",
+            ]
+        )
+        self.assertEqual(formal.mode, "train")
+        self.assertEqual(formal.total_episodes, 1500)
+        self.assertEqual(formal.random_seed, 20260817)
         self.assertEqual(formal.warmup_joint_transitions, 1000)
         self.assertEqual(formal.model_checkpoint_every, 2)
         self.assertEqual(formal.full_resume_every, 50)
+
+    def test_smoke_mode_rejects_seed_override(self):
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            with self.assertRaises(SystemExit):
+                parse_training_config(
+                    ["--mode", "smoke", "--seed", "123"]
+                )
+        self.assertIn(
+            "smoke mode fixes --seed to 20260817; do not pass --seed",
+            stderr.getvalue(),
+        )
+
+    def test_resume_config_requires_matching_seed(self):
+        stored = vars(
+            formal_training_config(1500, random_seed=20260817)
+        ).copy()
+        matching = formal_training_config(1500, random_seed=20260817)
+        _validate_resume_config(stored, matching)
+
+        different = formal_training_config(1500, random_seed=123)
+        with self.assertRaisesRegex(RuntimeError, "random_seed"):
+            _validate_resume_config(stored, different)
 
     def test_checkpoint_schema_is_explicit(self):
         self.assertEqual(CHECKPOINT_SCHEMA_VERSION, 1)

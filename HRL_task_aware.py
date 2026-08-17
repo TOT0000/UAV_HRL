@@ -391,6 +391,7 @@ _RESUME_CONFIG_FIELDS = (
     "beta_vs",
     "beta_com",
     "search_coverage_threshold",
+    "random_seed",
 )
 
 
@@ -873,6 +874,7 @@ def parse_training_config(argv=None):
     )
     parser.add_argument("--mode", required=True, choices=("smoke", "train"))
     parser.add_argument("--episodes", type=int)
+    parser.add_argument("--seed", type=int)
     parser.add_argument("--resume-dir")
     parser.add_argument(
         "--checkpoint-root", default="checkpoints_centralized_td3"
@@ -881,13 +883,20 @@ def parse_training_config(argv=None):
     if args.mode == "smoke":
         if args.episodes is not None:
             parser.error("smoke mode fixes --episodes to 1; do not pass --episodes")
+        if args.seed is not None:
+            parser.error(
+                "smoke mode fixes --seed to 20260817; do not pass --seed"
+            )
         if args.resume_dir is not None:
             parser.error("smoke mode does not support full resume")
         return smoke_training_config()
     if args.episodes is None:
         parser.error("formal train mode requires --episodes")
+    if args.seed is None:
+        parser.error("formal train mode requires --seed")
     return formal_training_config(
         args.episodes,
+        random_seed=args.seed,
         resume_dir=args.resume_dir,
         checkpoint_root=args.checkpoint_root,
     )
