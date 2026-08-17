@@ -1,0 +1,21 @@
+{
+  "seed": 20260817,
+  "sample_count": 20000,
+  "capacity_unit": "Mbps",
+  "bandwidth_hz": 10000000.0,
+  "x_range_m": [
+    0.0,
+    1000.0
+  ],
+  "y_range_m": [
+    0.0,
+    1000.0
+  ],
+  "uav_altitude_range_m": [
+    50.0,
+    150.0
+  ],
+  "sr_altitude_m": 0.0,
+  "percentile": 95.0,
+  "c_ref_com": 3.6198719493108113e-13
+}

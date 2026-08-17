@@ -3,7 +3,14 @@ from collections import defaultdict
 from Energy_model import EnergyConsumptionModel
 from Fov_model_phase import FovModel
 from Channel_model import ChannelModel
+from centralized_movement import vs_data_valid
 import numpy as np
+
+
+def final_hop_delivered_bits(to_target, gs_id, bits_tx_used):
+    if int(to_target) != int(gs_id):
+        return 0.0
+    return max(float(bits_tx_used), 0.0)
 
 
 
@@ -95,6 +102,10 @@ class PacketEngine:
                 task_type = task["task_type"]
                 if task_type not in ["FOV", "COM"]:
                     continue
+                if task_type == "FOV" and not vs_data_valid(env, uav_id, task):
+                    # Existing queued/relayed VS packets remain untouched; only new
+                    # source generation is gated by current geometry and full ROI coverage.
+                    continue
                 rate = (base_fov_rate if task_type == "FOV" else base_ctrl_rate)
                 
                 # === 基於速率積分的封包計數 ===
@@ -115,8 +126,7 @@ class PacketEngine:
 
                 if task_type == "FOV":
                     uav = env.uav_dict[uav_id]
-                    # 目標座標：沿用你現有的任務/目標記錄（或從 uav.target_position）
-                    x_tgt, y_tgt, z_tgt = getattr(uav, "target_position", (uav.x_u, uav.y_u, 0.0))
+                    x_tgt, y_tgt, z_tgt = task["target_pos"]
                     # 確保有 FovModel
                     if not hasattr(self, "FovModel"):
                         self.FovModel = FovModel(f=0.004, wl=0.008, i_l=0.012, z_u=uav.z_u, gamma_g=80)

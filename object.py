@@ -32,11 +32,101 @@ class UAV:
     # ========== 移動與位置 ==========
     def get_position(self):
         return self.x_u, self.y_u, self.z_u
-    def move_to(self, x_new, y_new, z_new):
-        self.x_u = min(max(x_new, 0), 800)
-        self.y_u = min(max(y_new, 0), 800)
+    def move_to(self, x_new, y_new, z_new, env_width=1000.0, env_height=1000.0):
+        self.x_u = min(max(x_new, 0), float(env_width))
+        self.y_u = min(max(y_new, 0), float(env_height))
         self.z_u = np.clip(z_new, self.min_AGL, self.max_AGL)
         # print(f"[MOVE DEBUG] UAV {self.id} actual object id: {id(self)}")
+
+    def propose_movement(
+        self,
+        dx,
+        dy,
+        dz,
+        step_time=1.0,
+        mobility_params=None,
+        env_width=1000.0,
+        env_height=1000.0,
+        v_max_phys=10.0,
+        max_step_ratio=0.60,
+        dz_cap=10.0,
+    ):
+        """Build a deterministic movement proposal without mutating the UAV."""
+        step_time = float(step_time)
+        dx_m = float(dx) * step_time
+        dy_m = float(dy) * step_time
+        dz_m = float(np.clip(float(dz) * step_time, -dz_cap, dz_cap))
+
+        fov_model = FovModel(
+            f=0.004, wl=0.008, i_l=0.012, z_u=self.z_u, gamma_g=80
+        )
+        fov_w, _ = fov_model.get_ground_fov_size(self.z_u)
+        horizontal_cap = min(max_step_ratio * fov_w, v_max_phys * step_time)
+        horizontal_distance = float(np.hypot(dx_m, dy_m))
+        if horizontal_distance > horizontal_cap > 0:
+            scale = horizontal_cap / horizontal_distance
+            dx_m *= scale
+            dy_m *= scale
+
+        raw_x = float(self.x_u) + dx_m
+        raw_y = float(self.y_u) + dy_m
+        raw_z = float(self.z_u) + dz_m
+
+        comm_safe = mobility_params.get("comm_safety", {}) if mobility_params else {}
+        only_ids = comm_safe.get("only_uav_ids", [0])
+        apply_safe = comm_safe.get("enable", False) and self.id in only_ids
+        is_stationary = bool(
+            np.isclose(dx_m, 0.0) and np.isclose(dy_m, 0.0) and np.isclose(dz_m, 0.0)
+        )
+        if apply_safe and not is_stationary:
+            raw_x, raw_y, raw_z = self._project_to_comm_safe_region(
+                raw_x, raw_y, raw_z, mobility_params
+            )
+
+        new_x = float(np.clip(raw_x, 0.0, float(env_width)))
+        new_y = float(np.clip(raw_y, 0.0, float(env_height)))
+        new_z = float(np.clip(raw_z, self.min_AGL, self.max_AGL))
+        return {
+            "old_position": (float(self.x_u), float(self.y_u), float(self.z_u)),
+            "new_position": (new_x, new_y, new_z),
+            "env_width": float(env_width),
+            "env_height": float(env_height),
+        }
+
+    def apply_movement_proposal(self, proposal, energy_model, step_time=1.0):
+        """Apply a precomputed proposal and charge energy from actual displacement."""
+        old_x, old_y, old_z = map(float, proposal["old_position"])
+        if not np.allclose((self.x_u, self.y_u, self.z_u), (old_x, old_y, old_z)):
+            raise RuntimeError(
+                f"UAV {self.id} changed after its movement proposal was created"
+            )
+
+        new_x, new_y, new_z = map(float, proposal["new_position"])
+        step_time = float(step_time)
+        self.last_position = (old_x, old_y, old_z)
+        self.move_to(
+            new_x,
+            new_y,
+            new_z,
+            env_width=proposal["env_width"],
+            env_height=proposal["env_height"],
+        )
+
+        actual_dx = float(self.x_u) - old_x
+        actual_dy = float(self.y_u) - old_y
+        actual_dz = float(self.z_u) - old_z
+        v_h = float(np.hypot(actual_dx, actual_dy) / max(step_time, 1e-9))
+        v_v = float(actual_dz / max(step_time, 1e-9))
+        energy = float(
+            energy_model.compute_mobility_energy(
+                uav_idx=self.id, v_h=v_h, v_v=v_v, t=step_time
+            )
+        )
+        self.last_energy = self.energy
+        self.energy = max(self.energy - energy, 0.0)
+        self.move_energy_step = energy
+        self.update_battery(self.energy, energy_model.E_max)
+        return energy
     # ==============無人機移動限制模型===========================
     def apply_movement(self, dx, dy, dz, speed=20, terrain_func=None, energy_model=None,
                    step_time=1, mobility_params=None, 

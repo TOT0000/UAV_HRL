@@ -142,6 +142,28 @@ class Simulator:
                                     target_obj_id = sr.id)
                                     )
                 self.need_reassign = True
+
+    def mark_search_coverage(self, uav_id):
+        """Mark the boolean camera footprint for centralized Search coverage."""
+        uav = self.uav_dict[uav_id]
+        model = FovModel(
+            f=0.004, wl=0.008, i_l=0.012, z_u=uav.z_u, gamma_g=80
+        )
+        fov_w, fov_h = model.get_ground_fov_size(uav.z_u)
+        bx_min, bx_max, by_min, by_max, _, _ = self.fov_to_indices_and_patch(
+            uav.x_u,
+            uav.y_u,
+            fov_w,
+            fov_h,
+            self.env_width,
+            self.env_height,
+            self.bit_resolution,
+            self.visited_bitmap,
+        )
+        if bx_max < bx_min or by_max < by_min:
+            return
+        self.visited_bitmap[bx_min : bx_max + 1, by_min : by_max + 1] = True
+        uav.last_box_idx = (bx_min, bx_max, by_min, by_max)
         
         # if (not self.search_completed) and self.is_search_done(cov_th=0.8, min_found=4):
         #     self.search_completed = True
@@ -242,6 +264,7 @@ class Simulator:
                     new_tasks.append({
                         "task_type": "Hovering",
                         "target_id": task["target_id"],
+                        "target_obj_id": uid,
                         "target_pos": uav.get_position()
                     })
                 else:
@@ -368,10 +391,10 @@ class Simulator:
         # ===== Path Loss（向量化） =====
         FSPL = ChannelModel.PL_ug(d_safe, f_c)
 
-        self.Expected_PL = FSPL + LoS_prob * eta_LoS + (1-LoS_prob) * eta_NLoS
+        expected_pl = FSPL + LoS_prob * eta_LoS + (1-LoS_prob) * eta_NLoS
 
         # ===== SNR + Capacity =====
-        SNR_us = ChannelModel.SNR_ug(P_s, sigma_sq, self.Expected_PL,  B_su)
+        SNR_us = ChannelModel.SNR_ug(P_s, sigma_sq, expected_pl, B_su)
 
         return SNR_us
 

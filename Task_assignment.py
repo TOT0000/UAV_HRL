@@ -176,6 +176,7 @@ class UAVAssigner:
                 task_entries.append({
                     "task_type": task_type,
                     "target_id": task_id,
+                    "target_obj_id": task.target_obj_id,
                     "target_pos": (x_tgt, y_tgt, z_tgt)
                 })
 
