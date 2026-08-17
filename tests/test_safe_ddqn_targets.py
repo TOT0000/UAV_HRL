@@ -29,7 +29,7 @@ class SafeDDQNTargetTest(unittest.TestCase):
         model.target_q_network = FixedNetwork([[10.0, 20.0, 30.0]])
         model.target_cost_network = FixedNetwork([[40.0, 50.0, 60.0]])
 
-        next_state = torch.zeros((1, 38), dtype=torch.float32)
+        next_state = torch.zeros((1, 42), dtype=torch.float32)
         next_state[0, 0] = 1.0
         next_state[0, 10:13] = torch.tensor([0.0, 1.0, 1.0])
 
@@ -72,8 +72,8 @@ class SafeDDQNTargetTest(unittest.TestCase):
             [[40.0, 99.0, 60.0], [40.0, 99.0, 60.0]]
         )
 
-        # Task-aware state layout: 6N + 26, with N=2 and mask starting at N+8.
-        next_state = torch.zeros((2, 38), dtype=torch.float32)
+        # Task-aware state layout: 6N + 30, with N=2 and mask starting at N+8.
+        next_state = torch.zeros((2, 42), dtype=torch.float32)
         next_state[0, 0] = 1.0
         next_state[1, 1] = 1.0
         next_state[:, 10:13] = torch.tensor([1.0, 0.0, 1.0])
@@ -91,26 +91,50 @@ class SafeDDQNTargetTest(unittest.TestCase):
         self.assertTrue(torch.allclose(target_q, torch.tensor([29.0, 2.0])))
         self.assertTrue(torch.allclose(target_c, torch.tensor([57.0, 3.0])))
 
-    def test_existing_empty_mask_fallback_excludes_current_uav(self):
+    def test_wait_is_legal_and_empty_target_mask_is_rejected(self):
         model = DDQN.__new__(DDQN)
         model.action_dim = 3
+        model.gamma = 0.9
+        model.eta = 1.0
+        model.q_network = FixedNetwork([[100.0, 1.0, 200.0]])
+        model.cost_network = FixedNetwork([[0.0, 0.0, 0.0]])
+        model.target_q_network = FixedNetwork([[10.0, 20.0, 30.0]])
+        model.target_cost_network = FixedNetwork([[40.0, 50.0, 60.0]])
 
-        for state_dim in (30, 38):
-            with self.subTest(state_dim=state_dim):
-                next_state = torch.zeros((1, state_dim), dtype=torch.float32)
-                next_state[0, 1] = 1.0
+        next_state = torch.zeros((1, 42), dtype=torch.float32)
+        next_state[0, 1] = 1.0
+        next_state[0, 10:13] = torch.tensor([0.0, 1.0, 0.0])
+        action_mask = model._routing_action_mask(next_state)
+        self.assertEqual(action_mask.tolist(), [[False, True, False]])
+        self.assertEqual(
+            model.select_action(
+                next_state[0].numpy(),
+                uav_id=1,
+                mask=np.array([False, True, False]),
+                epsilon=0.0,
+                logits_noise_std=0.0,
+            ),
+            1,
+        )
+        _, _, next_actions = model._safe_targets(
+            next_state,
+            reward=torch.zeros((1, 1)),
+            cost=torch.zeros((1, 1)),
+            not_done=torch.ones((1, 1)),
+        )
+        self.assertEqual(next_actions.item(), 1)
 
-                action_mask = model._routing_action_mask(next_state)
-
-                self.assertEqual(action_mask.tolist(), [[True, False, True]])
+        next_state[0, 10:13] = 0.0
+        with self.assertRaisesRegex(ValueError, "no legal action"):
+            model._routing_action_mask(next_state)
 
     def test_single_training_step_smoke(self):
-        model = DDQN(state_dim=38, action_dim=3, hidden_dim=8)
+        model = DDQN(state_dim=42, action_dim=3, hidden_dim=8)
         replay = ReplayBufferDiscrete(
-            state_dim=38, action_dim=3, max_size=4, n_step=1
+            state_dim=42, action_dim=3, max_size=4, n_step=1
         )
 
-        state = np.zeros(38, dtype=np.float32)
+        state = np.zeros(42, dtype=np.float32)
         state[0] = 1.0
         next_state = state.copy()
         next_state[10:13] = np.array([1.0, 0.0, 1.0], dtype=np.float32)

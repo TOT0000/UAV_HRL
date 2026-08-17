@@ -29,7 +29,7 @@ from training_checkpoint import (
 from utils_update_v2 import ReplayBufferDiscrete, ReplayBufferJoint
 
 
-ROUTING_STATE_DIM = 122
+ROUTING_STATE_DIM = 126
 ROUTING_ACTION_DIM = 17
 
 
@@ -410,6 +410,7 @@ class FullResumeCheckpointTest(unittest.TestCase):
             for field, value in (
                 ("movement_state_dim", 531),
                 ("joint_action_dim", JOINT_ACTION_DIM - 1),
+                ("routing_state_dim", 122),
             ):
                 with self.subTest(field=field), self.assertRaisesRegex(
                     RuntimeError, field

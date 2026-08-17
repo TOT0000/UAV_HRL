@@ -15,6 +15,7 @@ def final_hop_delivered_bits(to_target, gs_id, bits_tx_used):
 
 MAX_PACKET_HOPS = 20
 PACKET_EPS = 1e-9
+TASK_DEADLINE_SECONDS = {"FOV": 1.5, "COM": 1.0}
 
 
 
@@ -185,6 +186,30 @@ class PacketEngine:
             for uav_id in range(self.num_UAV)
             if self.get_hol_packet(uav_id) is not None
         ]
+
+    def get_effective_action_mask(self, env, uav_id, physical_mask=None):
+        """Return physical legal links plus Wait, restricted by a hop lock."""
+
+        uav_id = int(uav_id)
+        if physical_mask is None:
+            physical_mask = env.get_routing_action_mask(uav_id)
+        mask = np.asarray(physical_mask, dtype=bool).copy()
+        if mask.shape != (self.num_UAV + 1,):
+            raise ValueError(
+                f"routing mask has shape {mask.shape}, expected "
+                f"({self.num_UAV + 1},)"
+            )
+        mask[uav_id] = True
+        hol = self.get_hol_packet(uav_id)
+        locked_receiver = hol.get("hop_receiver") if hol is not None else None
+        if locked_receiver is not None:
+            locked_receiver = int(locked_receiver)
+            locked_is_physical = bool(mask[locked_receiver])
+            mask[:] = False
+            mask[uav_id] = True
+            if locked_is_physical:
+                mask[locked_receiver] = True
+        return mask
 
     def record_hop_transmission(self, pkt, sender, receiver, bits):
         """Apply partial hop service while keeping the packet at its sender."""
@@ -626,11 +651,10 @@ class PacketEngine:
 
     def get_state(self, env, uav_id, visited_nodes=None, backlog_bits=None):
         """
-        State v2 (維度 = 5N + 19, N=num_UAV, L=N+1(含GS)):
-        A 個體/任務: [uav_one_hot(N), energy(1), my_backlog(1), task_flags(4), fov_task_flag(1)]
-        B 通訊(逐鏈路; 含GS): [link_valid_mask(L), link_delay_norm(L), link_capacity_norm(L), next_hop_backlog_log_norm(L)]
-        C 幾何/回傳緊迫度: [uav_position(3), dist_to_GS_norm(1), eta_to_GS_slots_norm(1)]
-        D FOV 探索(EMA): [overlap_ema(1), unvisited_ema(1), frontier_ema(1)]
+        Task-aware routing state with dimension 6N+30 (N=16 gives 126).
+
+        The original 6N+26 fields keep their order. Four HOL packet fields
+        [is_FOV, is_COM, normalized_slack, normalized_remaining] are appended.
         """
         
 
@@ -813,7 +837,14 @@ class PacketEngine:
         # self.debug_print_state_v2(uav_id, state, env)
         return state
 
-    def get_state_ta(self, env, uav_id, visited_nodes=None, backlog_bits=None):
+    def get_state_ta(
+        self,
+        env,
+        uav_id,
+        visited_nodes=None,
+        backlog_bits=None,
+        action_mask=None,
+    ):
         """
         State v2 (維度 = 5N + 19, N=num_UAV, L=N+1(含GS)):
         A 個體/任務: [uav_one_hot(N), energy(1), my_backlog(1), task_flags(4), fov_task_flag(1)]
@@ -963,42 +994,41 @@ class PacketEngine:
         link_capacity_norm        = np.zeros(L, dtype=float)
         next_hop_backlog_log_norm = np.zeros(L, dtype=float)
         next_hop_is_fov = np.zeros(L, dtype=float)
+        effective_mask = self.get_effective_action_mask(
+            env, uav_id, action_mask
+        )
+        link_valid_mask[:] = effective_mask.astype(float)
 
-        # 逐鏈路（UAV->UAV），使用 buffer_info
-        for link_info in self.buffer_info.get(uav_id, []):
-            nh = int(link_info["next_hop"])
-            if nh == uav_id:   # 禁止自連結
+        # Nominal full-pool qualities describe candidate links. Slot-specific
+        # allocated capacities are deliberately kept out of the next state.
+        for nh in range(N):
+            if nh == uav_id:
                 continue
-            delay = float(link_info["delay"])
-            cap   = float(link_info["channel_capacity"])  # Mbps
+            cap = float(env.Capacity_matrix[uav_id, nh])
+            link_capacity_norm[nh] = min(max(cap, 0.0), C_MAX) / C_MAX
+            if backlog_bits is None:
+                nh_bits = self.backlog_bits.get(nh, 0.0)
+            else:
+                nh_bits = backlog_bits.get(nh, 0.0)
+            next_hop_backlog_log_norm[nh] = (
+                np.log1p(float(nh_bits)) / np.log1p(B_MAX)
+            )
+            is_fov = any(
+                task["task_type"] == "FOV"
+                for task in env.multi_tasks.get(nh, [])
+            )
+            next_hop_is_fov[nh] = 1.0 if is_fov else 0.0
 
-            link_valid_mask[nh]    = 1.0
-            link_delay_norm[nh]    = min(max(delay, 0.0), D_MAX) / D_MAX
-            link_capacity_norm[nh] = min(max(cap,   0.0), C_MAX) / C_MAX
-
-            if nh < N:
-                if backlog_bits is None:
-                    nh_bits = sum(pkt["rem_bits"] for pkt in self.packet_pool if pkt["current"] == nh and not pkt.get("done", False))
-                else:
-                    nh_bits = backlog_bits.get(nh, 0)
-
-                next_hop_backlog_log_norm[nh] = np.log1p(float(nh_bits)) / np.log1p(B_MAX)
-                is_fov = any(t["task_type"] == "FOV" for t in env.multi_tasks.get(nh, []))
-                next_hop_is_fov[nh] = 1.0 if is_fov else 0.0
-
-
-        # GS（單一節點）
-        GS = env.GS_ID  # 請確保 GS 索引固定為 N
+        GS = env.GS_ID
         if hasattr(env, "gs_capacity"):
             cap_gs = float(env.gs_capacity[uav_id])
-            if cap_gs > 0:
-                link_valid_mask[GS]    = 1.0
-                link_capacity_norm[GS] = min(cap_gs, C_MAX) / C_MAX
-                # 若沒有明確的GS延遲估計，給一個保守上限（不偏好也不懲罰）
-                if hasattr(env, "gs_delay"):
-                    d_gs = float(env.gs_delay[uav_id])
-                else:
-                    d_gs = D_MAX
+            link_capacity_norm[GS] = min(max(cap_gs, 0.0), C_MAX) / C_MAX
+            if cap_gs > 0.0:
+                d_gs = (
+                    float(env.gs_delay[uav_id])
+                    if hasattr(env, "gs_delay")
+                    else D_MAX
+                )
                 link_delay_norm[GS] = min(max(d_gs, 0.0), D_MAX) / D_MAX
 
         # ---------- 幾何/回傳緊迫度 ----------
@@ -1028,6 +1058,28 @@ class PacketEngine:
         uav_id_one_hot = np.zeros(N, dtype=float)
         uav_id_one_hot[uav_id] = 1.0
 
+        hol = self.get_hol_packet(uav_id)
+        hol_context = np.zeros(4, dtype=float)
+        if hol is not None:
+            hol_task = self._task_norm(hol.get("task_type", "COM"))
+            hol_context[0] = 1.0 if hol_task == "FOV" else 0.0
+            hol_context[1] = 1.0 if hol_task == "COM" else 0.0
+            deadline_abs = hol.get("deadline_abs")
+            if deadline_abs is not None:
+                deadline_window = TASK_DEADLINE_SECONDS[hol_task]
+                hol_context[2] = np.clip(
+                    (float(deadline_abs) - float(getattr(env, "current_time", 0.0)))
+                    / deadline_window,
+                    0.0,
+                    1.0,
+                )
+            hol_context[3] = np.clip(
+                float(hol.get("rem_bits", 0.0))
+                / max(float(hol.get("size_bits", 0.0)), PACKET_EPS),
+                0.0,
+                1.0,
+            )
+
         # ---------- 最終 state 串接 ----------
         state = np.concatenate([
             uav_id_one_hot,                                    # N
@@ -1048,11 +1100,11 @@ class PacketEngine:
             np.array([dist_to_GS_norm, eta_to_GS_slots_norm]), # 2       => C: 5
             np.array([lambda_norm], dtype=float),
 
-            np.array([overlap_ema, unvisited_ema, frontier_ema])  # 3     => D: 3
+            np.array([overlap_ema, unvisited_ema, frontier_ema]), # 3     => D: 3
+            hol_context,                                        # 4
         ], dtype=float)
 
-        # 維度檢查：6N + 20
-        expected = 6 * N + 26
+        expected = 6 * N + 30
         assert state.shape[0] == expected, f"State dim mismatch: got {state.shape[0]}, expect {expected}"
         # self.debug_print_state_v2(uav_id, state, env)
         return state

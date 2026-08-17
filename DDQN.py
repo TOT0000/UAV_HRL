@@ -118,22 +118,13 @@ class DDQN:
         else:
             final_mask = np.array(mask, dtype=bool)
 
-        # 2. 排除自己
-        if 0 <= uav_id < len(final_mask):
-            final_mask[uav_id] = False
-
-        # 3. 排除已走過的無人機
-        if visited_nodes:
-            for node in visited_nodes:
-                if 0 <= node < len(final_mask):
-                    final_mask[node] = False
-
-        # 4. 確保至少還有一個動作（避免全 False）
+        if final_mask.shape != q_values.shape:
+            raise ValueError(
+                f"routing mask shape {final_mask.shape} does not match "
+                f"action values {q_values.shape}"
+            )
         if not final_mask.any():
-            # fallback：如果真的全不能選，先恢復成全 True 再排除自己
-            final_mask[:] = True
-            if 0 <= uav_id < len(final_mask):
-                final_mask[uav_id] = False
+            raise ValueError("routing action mask has no legal action")
 
         # ---------- 套用 mask 到 Q 值 ----------
         # 非法動作的 Q 值設成極小
@@ -161,7 +152,7 @@ class DDQN:
 
         if state_dim == 5 * num_uav + 20:
             mask_start = num_uav + 7
-        elif state_dim == 6 * num_uav + 26:
+        elif state_dim == 6 * num_uav + 30:
             mask_start = num_uav + 8
         else:
             raise ValueError(
@@ -173,13 +164,8 @@ class DDQN:
             :, mask_start : mask_start + self.action_dim
         ].bool()
 
-        # Preserve select_action()'s existing empty-mask fallback.
-        empty_rows = ~action_mask.any(dim=1)
-        if empty_rows.any():
-            action_mask = action_mask.clone()
-            action_mask[empty_rows] = True
-            uav_ids = next_state[empty_rows, :num_uav].argmax(dim=1)
-            action_mask[empty_rows, uav_ids] = False
+        if (~action_mask.any(dim=1)).any():
+            raise ValueError("routing target state has no legal action")
 
         return action_mask
 

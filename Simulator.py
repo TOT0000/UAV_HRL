@@ -590,6 +590,8 @@ class Simulator:
         num_uav = self.num_UAV
         num_actions = num_uav + 1
         mask = np.zeros(num_actions, dtype=np.float32)
+        # The sender's own index is the explicit Wait action.
+        mask[from_uav_id] = 1.0
 
         # UAV → UAV link
         if self.Capacity_matrix is not None:
@@ -605,10 +607,6 @@ class Simulator:
             cap_gs = float(self.gs_capacity[from_uav_id])
             if cap_gs > cap_eps:
                 mask[num_uav] = 1.0
-
-        # 避免全部 0（可視需求保留一個 fallback）
-        if mask.sum() == 0:
-            mask[num_uav] = 1.0  # 例如：允許直接向 GS 嘗試一次
 
         return mask
 

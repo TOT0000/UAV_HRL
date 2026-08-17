@@ -38,7 +38,7 @@ import utils_update_v2
 
 
 MOVEMENT_CONTROL_INTERVAL = 4
-ROUTING_STATE_DIM = 122
+ROUTING_STATE_DIM = 126
 PRODUCTION_WARMUP_TRANSITIONS = 1000
 PRODUCTION_BATCH_SIZE = 64
 PRODUCTION_POLICY_DELAY = 2
@@ -166,21 +166,10 @@ def formal_training_config(total_episodes, **overrides):
 
 
 def _routing_masks(env):
-    num_uav = env.num_UAV
-    capacity_ok = env.Capacity_matrix > 0.1
-    np.fill_diagonal(capacity_ok, False)
-    gs_ok = (
-        env.gs_capacity > 0.1
-        if env.gs_capacity is not None
-        else np.zeros(num_uav, dtype=bool)
-    )
-    masks = {}
-    for uav_id in range(num_uav):
-        mask = np.zeros(num_uav + 1, dtype=bool)
-        mask[:num_uav] = capacity_ok[uav_id]
-        mask[env.GS_ID] = bool(gs_ok[uav_id])
-        masks[uav_id] = mask
-    return masks
+    return {
+        uav_id: env.get_routing_action_mask(uav_id).astype(bool)
+        for uav_id in range(env.num_UAV)
+    }
 
 
 def _active_backlog(packet_engine):
@@ -215,14 +204,20 @@ def _run_routing_slot(
 
     states = {
         uid: packet_engine.get_state_ta(
-            env, uid, backlog_bits=backlog_before
+            env,
+            uid,
+            backlog_bits=backlog_before,
+            action_mask=packet_engine.get_effective_action_mask(
+                env, uid, routing_masks[uid]
+            ),
         )
         for uid in uavs_with_packets
     }
     for uid, state in states.items():
         if state.shape != (ROUTING_STATE_DIM,):
             raise AssertionError(
-                f"routing state for UAV {uid} has shape {state.shape}, expected (122,)"
+                f"routing state for UAV {uid} has shape {state.shape}, "
+                f"expected ({ROUTING_STATE_DIM},)"
             )
 
     next_hops = _select_routing_actions(
@@ -301,7 +296,12 @@ def _run_routing_slot(
     backlog_after = _active_backlog(packet_engine)
     next_states = {
         uid: packet_engine.get_state_ta(
-            env, uid, backlog_bits=backlog_after
+            env,
+            uid,
+            backlog_bits=backlog_after,
+            action_mask=packet_engine.get_effective_action_mask(
+                env, uid, routing_masks[uid]
+            ),
         )
         for uid in uavs_with_packets
     }
