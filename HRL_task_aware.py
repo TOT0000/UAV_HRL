@@ -942,11 +942,31 @@ def train(
                     if config.random_seed is not None
                     else None
                 ),
+                "evaluation_split": (
+                    scenario_manifest.split
+                    if evaluation and scenario_manifest is not None
+                    else None
+                ),
                 "scenario_id": scenario_id,
-                "manifest_hash": (
+                "evaluation_manifest_hash": (
                     scenario_manifest.content_hash
                     if scenario_manifest is not None
                     else None
+                ),
+                "training_manifest_hash": (
+                    checkpoint_provenance.get("training_manifest_hash")
+                    if evaluation
+                    else (
+                        scenario_manifest.content_hash
+                        if scenario_manifest is not None
+                        else None
+                    )
+                ),
+                "checkpoint_completed_episodes": checkpoint_provenance.get(
+                    "checkpoint_completed_episodes"
+                ),
+                "checkpoint_metadata_fingerprint": checkpoint_provenance.get(
+                    "checkpoint_metadata_fingerprint"
                 ),
                 "num_GT": int(env.num_GT),
                 "timely_goodput_mbits": timely_goodput_mbits,

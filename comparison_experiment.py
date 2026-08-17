@@ -179,6 +179,18 @@ def build_parser():
     aggregate.add_argument("--output-dir", default=str(DEFAULT_OUTPUT_DIR / "aggregate"))
     aggregate.add_argument("--resume")
     aggregate.add_argument("--input-dir", required=True)
+    aggregate.add_argument(
+        "--expected-seed-count",
+        type=int,
+        default=FORMAL_EXPERIMENT_DEFAULTS["training_seed_count"],
+    )
+    aggregate.add_argument(
+        "--expected-episodes-per-seed",
+        type=int,
+        default=FORMAL_EXPERIMENT_DEFAULTS[
+            "evaluation_episodes_per_trained_seed"
+        ],
+    )
     aggregate.set_defaults(handler=command_aggregate)
     return parser
 

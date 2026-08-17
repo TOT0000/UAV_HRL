@@ -20,8 +20,12 @@ class EvaluationMetricTest(unittest.TestCase):
         row = {
             "method_id": MethodSpec().method_id,
             "training_seed": training_seed,
+            "evaluation_split": "test",
             "scenario_id": scenario_id,
-            "manifest_hash": "manifest-hash",
+            "evaluation_manifest_hash": "evaluation-manifest-hash",
+            "training_manifest_hash": "training-manifest-hash",
+            "checkpoint_completed_episodes": 1500,
+            "checkpoint_metadata_fingerprint": f"checkpoint-{training_seed}",
         }
         row.update({metric: float(value) for metric in METRIC_COLUMNS})
         return row
@@ -33,12 +37,14 @@ class EvaluationMetricTest(unittest.TestCase):
         self.assertTrue(math.isfinite(value))
 
     def test_aggregation_uses_seed_means_for_uncertainty(self):
-        episodes = [
-            self._row(11, "a", 1.0),
-            self._row(11, "b", 3.0),
-            self._row(22, "a", 3.0),
-            self._row(22, "b", 5.0),
-        ]
+        episodes = []
+        for training_seed, value in enumerate(range(1, 6), start=11):
+            episodes.extend(
+                (
+                    self._row(training_seed, "a", value),
+                    self._row(training_seed, "b", value),
+                )
+            )
 
         seed_summaries = summarize_training_seeds(episodes)
         aggregate = aggregate_seed_means(seed_summaries)
@@ -48,11 +54,15 @@ class EvaluationMetricTest(unittest.TestCase):
             if row["metric"] == "energy_efficiency_mbit_per_j"
         )
 
-        self.assertEqual(len(seed_summaries), 2)
-        self.assertEqual(ee["training_seed_count"], 2)
+        self.assertEqual(len(seed_summaries), 5)
+        self.assertEqual(ee["training_seed_count"], 5)
         self.assertAlmostEqual(ee["mean"], 3.0)
-        self.assertAlmostEqual(ee["sample_stddev"], math.sqrt(2.0))
-        self.assertAlmostEqual(ee["ci95_half_width"], 1.96)
+        self.assertAlmostEqual(ee["sample_stddev"], math.sqrt(2.5))
+        self.assertAlmostEqual(ee["t_critical_975"], 2.7764451051977987)
+        self.assertAlmostEqual(
+            ee["ci95_half_width"],
+            ee["t_critical_975"] * math.sqrt(2.5) / math.sqrt(5),
+        )
 
     def test_evaluation_outputs_are_structured_and_finite(self):
         rows = [self._row(11, "a", 0.0)]

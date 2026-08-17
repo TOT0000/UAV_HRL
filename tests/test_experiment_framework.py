@@ -27,6 +27,14 @@ class ExperimentFrameworkTest(unittest.TestCase):
         with self.assertRaises(SystemExit):
             parser.parse_args(["smoke", "--method", "ddpg"])
 
+    def test_aggregate_cli_uses_formal_completeness_defaults(self):
+        args = build_parser().parse_args(
+            ["aggregate", "--input-dir", "evaluation-results"]
+        )
+
+        self.assertEqual(args.expected_seed_count, 5)
+        self.assertEqual(args.expected_episodes_per_seed, 100)
+
     def test_checkpoint_identity_mismatch_fails_fast(self):
         metadata = {
             "experiment": {

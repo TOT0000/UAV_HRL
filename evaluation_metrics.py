@@ -9,15 +9,24 @@ import math
 from pathlib import Path
 from statistics import fmean, stdev
 
+from scipy.stats import t as student_t
+
 from experiment_config import FORMAL_EXPERIMENT_DEFAULTS
 from scenario_manifest import ScenarioManifest
 
 
-EPISODE_COLUMNS = (
+IDENTITY_COLUMNS = (
     "method_id",
     "training_seed",
+    "evaluation_split",
     "scenario_id",
-    "manifest_hash",
+    "evaluation_manifest_hash",
+    "training_manifest_hash",
+    "checkpoint_completed_episodes",
+    "checkpoint_metadata_fingerprint",
+)
+
+METRIC_COLUMNS = (
     "num_GT",
     "timely_goodput_mbits",
     "raw_final_hop_mbits",
@@ -35,15 +44,37 @@ EPISODE_COLUMNS = (
     "slot_budget_violation_count",
 )
 
-METRIC_COLUMNS = EPISODE_COLUMNS[4:]
+EPISODE_COLUMNS = (*IDENTITY_COLUMNS, *METRIC_COLUMNS)
 
-AGGREGATION_METADATA = {
-    "evaluation_unit": "episode",
-    "uncertainty_unit": "trained-policy seed mean",
-    "standard_deviation": "sample (n-1)",
-    "confidence_interval": "mean +/- 1.96 * sample_stddev / sqrt(seed_count)",
-    "pooled_episode_inference": False,
-}
+SEED_SUMMARY_IDENTITY_COLUMNS = (
+    "method_id",
+    "evaluation_split",
+    "evaluation_manifest_hash",
+    "training_manifest_hash",
+    "training_seed",
+    "checkpoint_completed_episodes",
+    "checkpoint_metadata_fingerprint",
+    "evaluation_episode_count",
+)
+
+
+def aggregation_metadata(seed_count):
+    degrees_of_freedom = max(int(seed_count) - 1, 0)
+    critical = (
+        float(student_t.ppf(0.975, df=degrees_of_freedom))
+        if degrees_of_freedom > 0
+        else 0.0
+    )
+    return {
+        "evaluation_unit": "episode",
+        "uncertainty_unit": "trained-policy seed mean",
+        "standard_deviation": "sample (n-1)",
+        "confidence_interval": "Student-t",
+        "confidence_level": 0.95,
+        "degrees_of_freedom": degrees_of_freedom,
+        "t_critical_975": critical,
+        "pooled_episode_inference": False,
+    }
 
 
 def safe_energy_efficiency(timely_goodput_mbits, mobility_energy_j):
@@ -73,17 +104,34 @@ def summarize_training_seeds(episode_rows):
     for row in episode_rows:
         key = (
             str(row["method_id"]),
-            str(row["manifest_hash"]),
+            str(row["evaluation_split"]),
+            str(row["evaluation_manifest_hash"]),
+            str(row["training_manifest_hash"]),
             int(row["training_seed"]),
+            int(row["checkpoint_completed_episodes"]),
+            str(row["checkpoint_metadata_fingerprint"]),
         )
         grouped.setdefault(key, []).append(row)
 
     summaries = []
-    for (method_id, manifest_hash, training_seed), rows in sorted(grouped.items()):
+    for key, rows in sorted(grouped.items()):
+        (
+            method_id,
+            evaluation_split,
+            evaluation_manifest_hash,
+            training_manifest_hash,
+            training_seed,
+            checkpoint_completed_episodes,
+            checkpoint_metadata_fingerprint,
+        ) = key
         summary = {
             "method_id": method_id,
-            "manifest_hash": manifest_hash,
+            "evaluation_split": evaluation_split,
+            "evaluation_manifest_hash": evaluation_manifest_hash,
+            "training_manifest_hash": training_manifest_hash,
             "training_seed": training_seed,
+            "checkpoint_completed_episodes": checkpoint_completed_episodes,
+            "checkpoint_metadata_fingerprint": checkpoint_metadata_fingerprint,
             "evaluation_episode_count": len(rows),
         }
         for metric in METRIC_COLUMNS:
@@ -97,22 +145,50 @@ def aggregate_seed_means(seed_summaries):
 
     grouped = {}
     for row in seed_summaries:
-        key = (str(row["method_id"]), str(row["manifest_hash"]))
+        key = (
+            str(row["method_id"]),
+            str(row["evaluation_split"]),
+            str(row["evaluation_manifest_hash"]),
+            str(row["training_manifest_hash"]),
+            int(row["checkpoint_completed_episodes"]),
+        )
         grouped.setdefault(key, []).append(row)
 
     aggregates = []
-    for (method_id, manifest_hash), rows in sorted(grouped.items()):
+    for key, rows in sorted(grouped.items()):
+        (
+            method_id,
+            evaluation_split,
+            evaluation_manifest_hash,
+            training_manifest_hash,
+            checkpoint_completed_episodes,
+        ) = key
         for metric in METRIC_COLUMNS:
             values = [float(row[metric]) for row in rows]
             mean_value = fmean(values)
             sample_stddev = stdev(values) if len(values) > 1 else 0.0
-            ci95_half_width = 1.96 * sample_stddev / math.sqrt(len(values))
+            degrees_of_freedom = max(len(values) - 1, 0)
+            t_critical = (
+                float(student_t.ppf(0.975, df=degrees_of_freedom))
+                if degrees_of_freedom > 0
+                else 0.0
+            )
+            ci95_half_width = (
+                t_critical * sample_stddev / math.sqrt(len(values))
+            )
             aggregates.append(
                 {
                     "method_id": method_id,
-                    "manifest_hash": manifest_hash,
+                    "evaluation_split": evaluation_split,
+                    "evaluation_manifest_hash": evaluation_manifest_hash,
+                    "training_manifest_hash": training_manifest_hash,
+                    "checkpoint_completed_episodes": (
+                        checkpoint_completed_episodes
+                    ),
                     "metric": metric,
                     "training_seed_count": len(values),
+                    "degrees_of_freedom": degrees_of_freedom,
+                    "t_critical_975": t_critical,
                     "mean": mean_value,
                     "sample_stddev": sample_stddev,
                     "ci95_half_width": ci95_half_width,
@@ -123,6 +199,109 @@ def aggregate_seed_means(seed_summaries):
     return aggregates
 
 
+def validate_formal_aggregation_rows(
+    episode_rows,
+    *,
+    expected_method_id,
+    expected_split,
+    expected_seed_count=5,
+    expected_episodes_per_seed=100,
+    expected_completed_episodes=1500,
+):
+    if int(expected_seed_count) <= 0 or int(expected_episodes_per_seed) <= 0:
+        raise ValueError("expected seed and episode counts must be positive")
+    missing = [
+        column
+        for column in EPISODE_COLUMNS
+        if any(column not in row for row in episode_rows)
+    ]
+    if missing:
+        raise ValueError(f"evaluation rows are missing columns: {sorted(missing)}")
+
+    methods = {str(row["method_id"]) for row in episode_rows}
+    if methods != {str(expected_method_id)}:
+        raise ValueError(f"aggregation requires one expected method_id: {methods}")
+    splits = {str(row["evaluation_split"]) for row in episode_rows}
+    if splits != {str(expected_split)} or str(expected_split) not in {
+        "validation",
+        "test",
+    }:
+        raise ValueError(f"aggregation evaluation split mismatch: {splits}")
+
+    evaluation_hashes = {
+        str(row["evaluation_manifest_hash"]) for row in episode_rows
+    }
+    if len(evaluation_hashes) != 1 or "" in evaluation_hashes:
+        raise ValueError(
+            "aggregation requires exactly one evaluation manifest hash"
+        )
+    training_hashes = {
+        str(row["training_manifest_hash"]) for row in episode_rows
+    }
+    if len(training_hashes) != 1 or "" in training_hashes:
+        raise ValueError("aggregation requires exactly one training manifest hash")
+
+    for row in episode_rows:
+        for metric in METRIC_COLUMNS:
+            try:
+                value = float(row[metric])
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"metric {metric} is not numeric") from exc
+            if not math.isfinite(value):
+                raise ValueError(f"metric {metric} must be finite")
+
+    identities = [
+        (
+            str(row["method_id"]),
+            int(row["training_seed"]),
+            str(row["evaluation_manifest_hash"]),
+            str(row["scenario_id"]),
+        )
+        for row in episode_rows
+    ]
+    if len(identities) != len(set(identities)):
+        raise ValueError("duplicate evaluation row or seed rerun detected")
+
+    by_seed = {}
+    for row in episode_rows:
+        seed = int(row["training_seed"])
+        by_seed.setdefault(seed, []).append(row)
+    if len(by_seed) != int(expected_seed_count):
+        raise ValueError(
+            "training seed count mismatch: "
+            f"found={len(by_seed)}, expected={int(expected_seed_count)}"
+        )
+
+    reference_scenarios = None
+    for seed, rows in sorted(by_seed.items()):
+        if len(rows) != int(expected_episodes_per_seed):
+            raise ValueError(
+                f"evaluation episode count mismatch for seed {seed}: "
+                f"found={len(rows)}, expected={int(expected_episodes_per_seed)}"
+            )
+        scenarios = {str(row["scenario_id"]) for row in rows}
+        if len(scenarios) != len(rows):
+            raise ValueError(f"scenario IDs are not unique for seed {seed}")
+        if reference_scenarios is None:
+            reference_scenarios = scenarios
+        elif scenarios != reference_scenarios:
+            raise ValueError("training seeds do not share the same scenario ID set")
+
+        completed = {int(row["checkpoint_completed_episodes"]) for row in rows}
+        if completed != {int(expected_completed_episodes)}:
+            raise ValueError(
+                f"checkpoint completed episodes mismatch for seed {seed}: {completed}"
+            )
+        checkpoint_fingerprints = {
+            str(row["checkpoint_metadata_fingerprint"]) for row in rows
+        }
+        if len(checkpoint_fingerprints) != 1 or "" in checkpoint_fingerprints:
+            raise ValueError(
+                f"seed {seed} must use exactly one checkpoint fingerprint"
+            )
+    return episode_rows
+
+
 def write_evaluation_outputs(output_dir, episode_rows, run_metadata):
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -131,13 +310,7 @@ def write_evaluation_outputs(output_dir, episode_rows, run_metadata):
         for row in episode_rows
     ]
     seed_summaries = summarize_training_seeds(normalized_rows)
-    seed_fields = (
-        "method_id",
-        "manifest_hash",
-        "training_seed",
-        "evaluation_episode_count",
-        *METRIC_COLUMNS,
-    )
+    seed_fields = (*SEED_SUMMARY_IDENTITY_COLUMNS, *METRIC_COLUMNS)
 
     per_episode_csv = _write_csv(
         output_dir / "per_episode.csv", normalized_rows, EPISODE_COLUMNS
@@ -251,21 +424,31 @@ def run_evaluation_command(args):
 def run_aggregate_command(args):
     episode_rows = _read_episode_csvs(args.input_dir)
     method_id = args.method.method_id
-    episode_rows = [row for row in episode_rows if row["method_id"] == method_id]
-    if not episode_rows:
-        raise ValueError(f"no evaluation rows found for method {method_id}")
+    validate_formal_aggregation_rows(
+        episode_rows,
+        expected_method_id=method_id,
+        expected_split=args.split,
+        expected_seed_count=args.expected_seed_count,
+        expected_episodes_per_seed=args.expected_episodes_per_seed,
+        expected_completed_episodes=FORMAL_EXPERIMENT_DEFAULTS[
+            "training_episodes_per_seed"
+        ],
+    )
+    if args.manifest is not None:
+        manifest = ScenarioManifest.load(args.manifest)
+        evaluation_hashes = {
+            str(row["evaluation_manifest_hash"]) for row in episode_rows
+        }
+        if manifest.split != args.split or evaluation_hashes != {
+            manifest.content_hash
+        }:
+            raise ValueError("aggregate manifest does not match evaluation rows")
     seed_summaries = summarize_training_seeds(episode_rows)
     aggregate_rows = aggregate_seed_means(seed_summaries)
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    seed_fields = (
-        "method_id",
-        "manifest_hash",
-        "training_seed",
-        "evaluation_episode_count",
-        *METRIC_COLUMNS,
-    )
+    seed_fields = (*SEED_SUMMARY_IDENTITY_COLUMNS, *METRIC_COLUMNS)
     aggregate_fields = tuple(aggregate_rows[0].keys())
     _write_csv(output_dir / "per_training_seed_summary.csv", seed_summaries, seed_fields)
     _write_csv(output_dir / "cross_seed_summary.csv", aggregate_rows, aggregate_fields)
@@ -276,7 +459,7 @@ def run_aggregate_command(args):
     )
     (output_dir / "aggregation_metadata.json").write_text(
         json.dumps(
-            AGGREGATION_METADATA,
+            aggregation_metadata(args.expected_seed_count),
             indent=2,
             ensure_ascii=False,
             allow_nan=False,
