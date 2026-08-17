@@ -3,18 +3,34 @@
 from __future__ import annotations
 
 import argparse
-from dataclasses import replace
+from dataclasses import asdict, replace
+from functools import partial
 import json
 from pathlib import Path
 
+from com_capacity_calibration import load_com_capacity_reference
+from centralized_movement import JOINT_ACTION_DIM, MOVEMENT_STATE_DIM
 from experiment_config import FORMAL_EXPERIMENT_DEFAULTS, MethodSpec
 from experiment_paths import (
     prepare_run_directory,
     training_run_directory,
     training_run_identity,
 )
-from HRL_task_aware import formal_training_config, smoke_training_config, train
+from HRL_task_aware import (
+    ROUTING_STATE_DIM,
+    formal_training_config,
+    smoke_training_config,
+    train,
+)
+from resume_recovery import (
+    execute_resume_reconciliation,
+    plan_resume_reconciliation,
+)
 from scenario_manifest import ScenarioManifest, generate_manifest
+from training_checkpoint import (
+    inspect_full_resume_checkpoint,
+    inspect_model_checkpoint,
+)
 
 
 DEFAULT_OUTPUT_DIR = Path("runs") / "comparison"
@@ -115,9 +131,6 @@ def command_train(args):
     run_dir = training_run_directory(
         args.output_dir, method, manifest, args.training_seed
     )
-    run_dir = prepare_run_directory(
-        run_dir, identity, resume_checkpoint=args.resume
-    )
     config = formal_training_config(
         args.episodes,
         random_seed=args.training_seed,
@@ -127,12 +140,60 @@ def command_train(args):
         enable_csv=False,
         run_directory=str(run_dir),
     )
+    reconciliation_plan = None
+    if args.resume is not None:
+        _, calibration = load_com_capacity_reference()
+        expected_experiment = {
+            "method_spec_fingerprint": method.fingerprint,
+            "manifest_hash": manifest.content_hash,
+            "training_seed": int(args.training_seed),
+        }
+        inspect_full = partial(
+            inspect_full_resume_checkpoint,
+            movement_state_dim=MOVEMENT_STATE_DIM,
+            joint_action_dim=JOINT_ACTION_DIM,
+            routing_state_dim=ROUTING_STATE_DIM,
+            td3_gamma=1.0,
+            ddqn_gamma=0.99,
+            calibration=calibration,
+            expected_experiment_metadata=expected_experiment,
+            expected_formal_config=asdict(config),
+            require_episode_directory=True,
+        )
+        inspect_model = partial(
+            inspect_model_checkpoint,
+            movement_state_dim=MOVEMENT_STATE_DIM,
+            joint_action_dim=JOINT_ACTION_DIM,
+            routing_state_dim=ROUTING_STATE_DIM,
+            td3_gamma=1.0,
+            ddqn_gamma=0.99,
+            calibration=calibration,
+            expected_experiment_metadata=expected_experiment,
+            expected_formal_config=asdict(config),
+            require_episode_directory=True,
+        )
+        reconciliation_plan = plan_resume_reconciliation(
+            run_dir,
+            args.resume,
+            inspect_full=inspect_full,
+            inspect_model=inspect_model,
+        )
+    run_dir = prepare_run_directory(
+        run_dir, identity, resume_checkpoint=args.resume
+    )
+    reconciliation = (
+        execute_resume_reconciliation(reconciliation_plan)
+        if reconciliation_plan is not None
+        else None
+    )
     result = train(
         config, scenario_manifest=manifest, method_spec=method
     )
     result["run_metadata"].update(
         {"run_directory": str(run_dir), "run_identity": identity}
     )
+    if reconciliation is not None:
+        result["run_metadata"]["resume_reconciliation"] = reconciliation
     _write_run_metadata(run_dir, result)
     return 0
 

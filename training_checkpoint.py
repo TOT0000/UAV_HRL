@@ -53,6 +53,15 @@ FORMAL_CORE_CONFIG_FIELDS = (
     "replay_max_size",
 )
 
+FULL_RESUME_CONFIG_FIELDS = (
+    *FORMAL_CORE_CONFIG_FIELDS,
+    "model_checkpoint_every",
+    "full_resume_every",
+    "full_resume_keep_last",
+    "formal_evaluation_episode",
+    "random_seed",
+)
+
 
 def calibration_fingerprint(calibration):
     canonical = json.dumps(
@@ -221,6 +230,41 @@ def _metadata_value_matches(actual, expected):
     return actual == expected
 
 
+def _checkpoint_directory_episode(checkpoint_dir, metadata):
+    match = re.fullmatch(r"ep_(\d+)", Path(checkpoint_dir).name)
+    if match is None:
+        raise RuntimeError(
+            f"checkpoint directory is not an episode checkpoint: {checkpoint_dir}"
+        )
+    try:
+        metadata_episode = int(metadata["episode"]) + 1
+    except (KeyError, TypeError, ValueError) as exc:
+        raise RuntimeError("checkpoint episode metadata is invalid") from exc
+    directory_episode = int(match.group(1))
+    if directory_episode != metadata_episode:
+        raise RuntimeError(
+            "checkpoint directory episode is incompatible with metadata: "
+            f"directory={directory_episode}, metadata={metadata_episode}"
+        )
+    return directory_episode
+
+
+def _validate_formal_config(actual_config, expected_config, fields):
+    if not isinstance(actual_config, dict):
+        raise RuntimeError("checkpoint has no formal training configuration")
+    mismatches = {
+        key: (actual_config.get(key), expected_config.get(key))
+        for key in fields
+        if not _metadata_value_matches(
+            actual_config.get(key), expected_config.get(key)
+        )
+    }
+    if mismatches:
+        raise RuntimeError(
+            f"checkpoint formal training config is incompatible: {mismatches}"
+        )
+
+
 def validate_model_checkpoint_metadata(
     metadata,
     *,
@@ -282,21 +326,60 @@ def validate_model_checkpoint_metadata(
 
     if expected_formal_config is not None:
         experiment = metadata.get("experiment") or {}
-        actual_config = experiment.get("formal_config")
-        if not isinstance(actual_config, dict):
-            raise RuntimeError("checkpoint has no formal training configuration")
-        mismatches = {
-            key: (actual_config.get(key), expected_formal_config.get(key))
-            for key in FORMAL_CORE_CONFIG_FIELDS
-            if not _metadata_value_matches(
-                actual_config.get(key), expected_formal_config.get(key)
-            )
-        }
-        if mismatches:
-            raise RuntimeError(
-                f"checkpoint formal core config is incompatible: {mismatches}"
-            )
+        _validate_formal_config(
+            experiment.get("formal_config"),
+            expected_formal_config,
+            FORMAL_CORE_CONFIG_FIELDS,
+        )
     return metadata
+
+
+def inspect_model_checkpoint(
+    checkpoint_dir,
+    *,
+    movement_state_dim=None,
+    joint_action_dim=None,
+    routing_state_dim=None,
+    td3_gamma=None,
+    ddqn_gamma=None,
+    calibration=None,
+    expected_experiment_metadata=None,
+    expected_completed_episodes=None,
+    expected_formal_config=None,
+    require_episode_directory=False,
+):
+    """Validate model metadata and required files without loading weights."""
+
+    checkpoint_dir = Path(checkpoint_dir).resolve()
+    metadata_path = checkpoint_dir / "metadata.json"
+    models_path = checkpoint_dir / "models.pt"
+    if not metadata_path.is_file():
+        raise FileNotFoundError(f"checkpoint metadata is missing: {metadata_path}")
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    validate_model_checkpoint_metadata(
+        metadata,
+        movement_state_dim=movement_state_dim,
+        joint_action_dim=joint_action_dim,
+        routing_state_dim=routing_state_dim,
+        td3_gamma=td3_gamma,
+        ddqn_gamma=ddqn_gamma,
+        calibration=calibration,
+        expected_experiment_metadata=expected_experiment_metadata,
+        expected_completed_episodes=expected_completed_episodes,
+        expected_formal_config=expected_formal_config,
+    )
+    if not models_path.is_file():
+        raise RuntimeError(f"checkpoint model payload is missing: {models_path}")
+    completed_episode = (
+        _checkpoint_directory_episode(checkpoint_dir, metadata)
+        if require_episode_directory
+        else int(metadata["episode"]) + 1
+    )
+    return {
+        "checkpoint_dir": checkpoint_dir,
+        "completed_episode": completed_episode,
+        "metadata": metadata,
+    }
 
 
 def load_model_checkpoint(
@@ -312,12 +395,9 @@ def load_model_checkpoint(
     expected_completed_episodes=None,
     expected_formal_config=None,
 ):
-    checkpoint_dir = Path(checkpoint_dir)
-    metadata = json.loads(
-        (checkpoint_dir / "metadata.json").read_text(encoding="utf-8")
-    )
-    validate_model_checkpoint_metadata(
-        metadata,
+    checkpoint_dir = Path(checkpoint_dir).resolve()
+    inspected = inspect_model_checkpoint(
+        checkpoint_dir,
         movement_state_dim=movement_state_dim,
         joint_action_dim=joint_action_dim,
         routing_state_dim=routing_state_dim,
@@ -328,6 +408,7 @@ def load_model_checkpoint(
         expected_completed_episodes=expected_completed_episodes,
         expected_formal_config=expected_formal_config,
     )
+    metadata = inspected["metadata"]
     payload = torch.load(
         checkpoint_dir / "models.pt", map_location="cpu", weights_only=False
     )
@@ -556,20 +637,22 @@ def validate_checkpoint_experiment_metadata(metadata, expected):
         )
 
 
-def load_full_resume_checkpoint(
+def inspect_full_resume_checkpoint(
     checkpoint_dir,
     *,
-    td3,
-    ddqn,
-    joint_replay,
-    routing_replay,
     movement_state_dim,
     joint_action_dim,
     routing_state_dim,
+    td3_gamma,
+    ddqn_gamma,
     calibration,
     expected_experiment_metadata=None,
+    expected_formal_config=None,
+    require_episode_directory=False,
 ):
-    checkpoint_dir = Path(checkpoint_dir)
+    """Validate an exact-resume checkpoint without mutating training state."""
+
+    checkpoint_dir = Path(checkpoint_dir).resolve()
     metadata_path = checkpoint_dir / "metadata.json"
     if not metadata_path.is_file():
         legacy_metadata_path = checkpoint_dir / "meta.json"
@@ -588,17 +671,90 @@ def load_full_resume_checkpoint(
         movement_state_dim=movement_state_dim,
         joint_action_dim=joint_action_dim,
         routing_state_dim=routing_state_dim,
+        td3_gamma=td3_gamma,
+        ddqn_gamma=ddqn_gamma,
+        calibration=calibration,
+        expected_experiment_metadata=expected_experiment_metadata,
+    )
+    completed_episode = (
+        _checkpoint_directory_episode(checkpoint_dir, metadata)
+        if require_episode_directory
+        else int(metadata["episode"]) + 1
+    )
+    required_paths = (
+        checkpoint_dir / "training_state.pt",
+        checkpoint_dir / "joint_replay.npz",
+        checkpoint_dir / "routing_replay.npz",
+    )
+    missing = [str(path) for path in required_paths if not path.is_file()]
+    if missing:
+        raise RuntimeError(
+            f"checkpoint has incomplete full-resume state; missing={missing}"
+        )
+    payload = torch.load(
+        checkpoint_dir / "training_state.pt",
+        map_location="cpu",
+        weights_only=False,
+    )
+    if not isinstance(payload, dict):
+        raise RuntimeError("checkpoint full-resume payload is invalid")
+    training_state = payload.get("training_state")
+    formal_config = payload.get("formal_config")
+    if not isinstance(training_state, dict):
+        raise RuntimeError("checkpoint training state is invalid")
+    try:
+        state_completed = int(training_state["completed_episode_index"]) + 1
+        state_next = int(training_state["next_episode_index"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise RuntimeError("checkpoint training episode state is invalid") from exc
+    if state_completed != completed_episode or state_next != completed_episode:
+        raise RuntimeError(
+            "checkpoint training episode state is incompatible with metadata: "
+            f"completed={state_completed}, next={state_next}, "
+            f"metadata={completed_episode}"
+        )
+    if expected_formal_config is not None:
+        _validate_formal_config(
+            formal_config,
+            expected_formal_config,
+            FULL_RESUME_CONFIG_FIELDS,
+        )
+    return {
+        "checkpoint_dir": checkpoint_dir,
+        "completed_episode": completed_episode,
+        "metadata": metadata,
+        "training_state": training_state,
+        "formal_config": formal_config,
+        "payload": payload,
+    }
+
+
+def load_full_resume_checkpoint(
+    checkpoint_dir,
+    *,
+    td3,
+    ddqn,
+    joint_replay,
+    routing_replay,
+    movement_state_dim,
+    joint_action_dim,
+    routing_state_dim,
+    calibration,
+    expected_experiment_metadata=None,
+):
+    checkpoint_dir = Path(checkpoint_dir).resolve()
+    inspected = inspect_full_resume_checkpoint(
+        checkpoint_dir,
+        movement_state_dim=movement_state_dim,
+        joint_action_dim=joint_action_dim,
+        routing_state_dim=routing_state_dim,
         td3_gamma=td3.gamma,
         ddqn_gamma=ddqn.gamma,
         calibration=calibration,
         expected_experiment_metadata=expected_experiment_metadata,
     )
-    state_path = checkpoint_dir / "training_state.pt"
-    if not state_path.is_file():
-        raise RuntimeError(
-            "checkpoint has no full-resume state; it can only be used for evaluation"
-        )
-    payload = torch.load(state_path, map_location="cpu", weights_only=False)
+    metadata = inspected["metadata"]
+    payload = inspected["payload"]
     _load_network_states(payload["networks"], td3, ddqn)
     td3.actor_optimizer.load_state_dict(payload["td3_optimizers"]["actor"])
     td3.critic_1_optimizer.load_state_dict(payload["td3_optimizers"]["critic_1"])
