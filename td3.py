@@ -5,6 +5,8 @@ import torch.optim as optim
 import numpy as np
 import os
 
+from centralized_movement import project_joint_action
+
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 print(device)
 print("CUDA available:", torch.cuda.is_available())
@@ -230,6 +232,94 @@ class TD3():
 
         self.num_critic_update_iteration += 1
         self.num_training += 1
+
+    def update_joint(
+        self,
+        replay_memory,
+        current_lambda,
+        batch_size=64,
+        beta_search=1.0,
+        beta_vs=1.0,
+        beta_com=1.0,
+    ):
+        state, action, next_state, reward, not_done = replay_memory.sample(
+            batch_size=batch_size,
+            current_lambda=current_lambda,
+            gamma=self.gamma,
+            beta_search=beta_search,
+            beta_vs=beta_vs,
+            beta_com=beta_com,
+        )
+        state = state.to(device)
+        action = action.to(device)
+        next_state = next_state.to(device)
+        reward = reward.to(device)
+        not_done = not_done.to(device)
+
+        with torch.no_grad():
+            target_actor_action = project_joint_action(
+                self.actor_target(next_state), next_state
+            )
+            noise = torch.randn_like(action) * self.policy_noise
+            noise = noise.clamp(-self.noise_clip, self.noise_clip)
+            smoothed_action = (target_actor_action + noise).clamp(
+                -self.max_action, self.max_action
+            )
+            next_action = project_joint_action(smoothed_action, next_state)
+            target_q = torch.min(
+                self.critic_1_target(next_state, next_action),
+                self.critic_2_target(next_state, next_action),
+            )
+            target_q = _bellman_target(
+                reward, target_q, not_done, self.gamma
+            )
+
+        current_q1 = self.critic_1(state, action)
+        current_q2 = self.critic_2(state, action)
+        critic_1_loss = F.mse_loss(current_q1, target_q)
+        critic_2_loss = F.mse_loss(current_q2, target_q)
+
+        self.critic_1_optimizer.zero_grad(set_to_none=True)
+        critic_1_loss.backward()
+        self.critic_1_optimizer.step()
+        self.critic_2_optimizer.zero_grad(set_to_none=True)
+        critic_2_loss.backward()
+        self.critic_2_optimizer.step()
+
+        self.num_critic_update_iteration += 1
+        self.num_training += 1
+        actor_updated = False
+        actor_action = None
+        actor_loss_value = None
+        if self.num_critic_update_iteration % self.policy_delay == 0:
+            actor_action = project_joint_action(self.actor(state), state)
+            actor_loss = -self.critic_1(state, actor_action).mean()
+            self.actor_optimizer.zero_grad(set_to_none=True)
+            actor_loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.actor.parameters(), 5.0)
+            self.actor_optimizer.step()
+            actor_loss_value = float(actor_loss.detach().cpu())
+            actor_updated = True
+
+            with torch.no_grad():
+                for param, target_param in zip(self.actor.parameters(), self.actor_target.parameters()):
+                    target_param.data.mul_(1.0 - self.tau).add_(self.tau * param.data)
+                for param, target_param in zip(self.critic_1.parameters(), self.critic_1_target.parameters()):
+                    target_param.data.mul_(1.0 - self.tau).add_(self.tau * param.data)
+                for param, target_param in zip(self.critic_2.parameters(), self.critic_2_target.parameters()):
+                    target_param.data.mul_(1.0 - self.tau).add_(self.tau * param.data)
+
+            self.num_actor_update_iteration += 1
+
+        self.last_joint_update = {
+            "target_actor_action": target_actor_action.detach().cpu(),
+            "target_smoothed_action": next_action.detach().cpu(),
+            "actor_action": None if actor_action is None else actor_action.detach().cpu(),
+            "critic_1_loss": float(critic_1_loss.detach().cpu()),
+            "critic_2_loss": float(critic_2_loss.detach().cpu()),
+            "actor_loss": actor_loss_value,
+        }
+        return actor_updated
 
     def save(self, save_dir="param"):
         os.makedirs(save_dir, exist_ok=True) #建立資料夾

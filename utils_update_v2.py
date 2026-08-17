@@ -151,6 +151,113 @@ class ReplayBufferContinuous:
         ng = torch.from_numpy(self.tag_gt[ind]).to(self.device)
         
         return s, a, ns, r, nd, ng
+
+
+class ReplayBufferJoint:
+    """One-step joint replay with rewards reconstructed from current lambda."""
+
+    def __init__(self, state_dim, action_dim, max_size=int(2e5)):
+        self.max_size = int(max_size)
+        self.ptr = 0
+        self.size = 0
+        self.n_step = 1
+        self.state = np.zeros((self.max_size, state_dim), dtype=np.float32)
+        self.action = np.zeros((self.max_size, action_dim), dtype=np.float32)
+        self.next_state = np.zeros((self.max_size, state_dim), dtype=np.float32)
+        self.not_done = np.zeros((self.max_size, 1), dtype=np.float32)
+        self.delivered_mbits = np.zeros((self.max_size, 1), dtype=np.float32)
+        self.total_mobility_energy = np.zeros((self.max_size, 1), dtype=np.float32)
+        self.phi_search_t = np.zeros((self.max_size, 1), dtype=np.float32)
+        self.phi_search_t1 = np.zeros((self.max_size, 1), dtype=np.float32)
+        self.phi_vs_t = np.zeros((self.max_size, 1), dtype=np.float32)
+        self.phi_vs_t1 = np.zeros((self.max_size, 1), dtype=np.float32)
+        self.phi_com_t = np.zeros((self.max_size, 1), dtype=np.float32)
+        self.phi_com_t1 = np.zeros((self.max_size, 1), dtype=np.float32)
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    @torch.no_grad()
+    def add(
+        self,
+        state,
+        action,
+        next_state,
+        done,
+        delivered_mbits,
+        total_mobility_energy,
+        phi_search_t,
+        phi_search_t1,
+        phi_vs_t,
+        phi_vs_t1,
+        phi_com_t,
+        phi_com_t1,
+    ):
+        index = self.ptr
+        self.state[index] = _to_np_float32(state)
+        self.action[index] = _to_np_float32(action)
+        self.next_state[index] = _to_np_float32(next_state)
+        self.not_done[index, 0] = 1.0 - float(bool(done))
+        self.delivered_mbits[index, 0] = float(delivered_mbits)
+        self.total_mobility_energy[index, 0] = float(total_mobility_energy)
+        self.phi_search_t[index, 0] = float(phi_search_t)
+        self.phi_search_t1[index, 0] = float(phi_search_t1)
+        self.phi_vs_t[index, 0] = float(phi_vs_t)
+        self.phi_vs_t1[index, 0] = float(phi_vs_t1)
+        self.phi_com_t[index, 0] = float(phi_com_t)
+        self.phi_com_t1[index, 0] = float(phi_com_t1)
+        self.ptr = (self.ptr + 1) % self.max_size
+        self.size = min(self.size + 1, self.max_size)
+
+    def _reward_numpy(
+        self,
+        indices,
+        current_lambda,
+        gamma,
+        beta_search=1.0,
+        beta_vs=1.0,
+        beta_com=1.0,
+    ):
+        not_done = self.not_done[indices]
+        reward = (
+            self.delivered_mbits[indices]
+            - float(current_lambda) * self.total_mobility_energy[indices]
+            + float(beta_search)
+            * (float(gamma) * not_done * self.phi_search_t1[indices] - self.phi_search_t[indices])
+            + float(beta_vs)
+            * (float(gamma) * not_done * self.phi_vs_t1[indices] - self.phi_vs_t[indices])
+            + float(beta_com)
+            * (float(gamma) * not_done * self.phi_com_t1[indices] - self.phi_com_t[indices])
+        )
+        return reward.astype(np.float32, copy=False)
+
+    def sample(
+        self,
+        batch_size,
+        current_lambda,
+        gamma,
+        beta_search=1.0,
+        beta_vs=1.0,
+        beta_com=1.0,
+    ):
+        if self.size <= 0:
+            raise ValueError("Replay buffer is empty")
+        indices = np.random.randint(0, self.size, size=int(batch_size))
+        reward = self._reward_numpy(
+            indices,
+            current_lambda=current_lambda,
+            gamma=gamma,
+            beta_search=beta_search,
+            beta_vs=beta_vs,
+            beta_com=beta_com,
+        )
+        return (
+            torch.from_numpy(self.state[indices]).to(self.device),
+            torch.from_numpy(self.action[indices]).to(self.device),
+            torch.from_numpy(self.next_state[indices]).to(self.device),
+            torch.from_numpy(reward).to(self.device),
+            torch.from_numpy(self.not_done[indices]).to(self.device),
+        )
+
+
 class ReplayBufferDiscrete:
     def __init__(self, state_dim, action_dim, max_size=int(2e5), n_step=3, gamma=0.99):
         self.max_size = int(max_size)
