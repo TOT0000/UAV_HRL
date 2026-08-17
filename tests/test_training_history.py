@@ -1,4 +1,5 @@
 import csv
+import hashlib
 import json
 import math
 import shutil
@@ -10,8 +11,12 @@ from experiment_config import MethodSpec
 from HRL_task_aware import TrainingConfig, train
 from scenario_manifest import generate_manifest
 from training_history import (
+    TRAINING_HISTORY_COMMIT,
+    TrainingHistoryConsistencyError,
+    TrainingHistoryIdentityError,
     build_training_history_row,
     prepare_training_history,
+    read_committed_training_history,
     training_history_identity,
     write_training_history,
 )
@@ -45,10 +50,26 @@ class TrainingHistoryPersistenceTest(unittest.TestCase):
                     Path(temp_dir) / "training_history.jsonl"
                 ).read_text(encoding="utf-8").splitlines()
             ]
+            commit = json.loads(
+                (Path(temp_dir) / TRAINING_HISTORY_COMMIT).read_text(
+                    encoding="utf-8"
+                )
+            )
+            csv_sha256 = hashlib.sha256(
+                (Path(temp_dir) / "training_history.csv").read_bytes()
+            ).hexdigest()
+            jsonl_sha256 = hashlib.sha256(
+                (Path(temp_dir) / "training_history.jsonl").read_bytes()
+            ).hexdigest()
 
         self.assertEqual(len(csv_rows), len(json_rows), 2)
         self.assertEqual([int(row["episode"]) for row in csv_rows], [1, 2])
         self.assertEqual(json_rows, written)
+        self.assertEqual(commit["row_count"], 2)
+        self.assertEqual(commit["last_episode"], 2)
+        self.assertEqual(commit["csv_sha256"], csv_sha256)
+        self.assertEqual(commit["jsonl_sha256"], jsonl_sha256)
+        self.assertEqual(commit["method_id"], self.identity["method_id"])
         self.assertEqual(json_rows[1]["energy_efficiency_mbit_per_j"], 0.0)
         for row in json_rows:
             self.assertTrue(
@@ -113,6 +134,122 @@ class TrainingHistoryPersistenceTest(unittest.TestCase):
                     self.identity,
                     checkpoint_rows=checkpoint_rows[:1],
                 )
+
+    def test_crash_after_jsonl_replace_is_detected_and_exact_resume_repairs(self):
+        checkpoint_rows = [self._row(1)]
+        with tempfile.TemporaryDirectory() as temp_dir:
+            write_training_history(temp_dir, checkpoint_rows, self.identity)
+
+            def fail(stage):
+                if stage == "after_jsonl_replace":
+                    raise RuntimeError("injected crash")
+
+            with self.assertRaisesRegex(RuntimeError, "injected crash"):
+                write_training_history(
+                    temp_dir,
+                    [*checkpoint_rows, self._row(2)],
+                    self.identity,
+                    _fault_inject=fail,
+                )
+            with self.assertRaisesRegex(
+                TrainingHistoryConsistencyError, "JSONL hash"
+            ):
+                read_committed_training_history(temp_dir, self.identity)
+
+            first_repair = prepare_training_history(
+                temp_dir, self.identity, checkpoint_rows=checkpoint_rows
+            )
+            second_repair = prepare_training_history(
+                temp_dir, self.identity, checkpoint_rows=checkpoint_rows
+            )
+
+            self.assertEqual(first_repair, checkpoint_rows)
+            self.assertEqual(second_repair, checkpoint_rows)
+            self.assertEqual(
+                read_committed_training_history(temp_dir, self.identity),
+                checkpoint_rows,
+            )
+
+    def test_crash_after_csv_replace_before_commit_is_detected_and_repaired(self):
+        checkpoint_rows = [self._row(1)]
+        with tempfile.TemporaryDirectory() as temp_dir:
+            write_training_history(temp_dir, checkpoint_rows, self.identity)
+
+            def fail(stage):
+                if stage == "after_csv_replace":
+                    raise RuntimeError("injected crash")
+
+            with self.assertRaisesRegex(RuntimeError, "injected crash"):
+                write_training_history(
+                    temp_dir,
+                    [*checkpoint_rows, self._row(2)],
+                    self.identity,
+                    _fault_inject=fail,
+                )
+            with self.assertRaisesRegex(
+                TrainingHistoryConsistencyError, "hash"
+            ):
+                read_committed_training_history(temp_dir, self.identity)
+
+            repaired = prepare_training_history(
+                temp_dir, self.identity, checkpoint_rows=checkpoint_rows
+            )
+            self.assertEqual(repaired, checkpoint_rows)
+            self.assertEqual(
+                read_committed_training_history(temp_dir, self.identity),
+                checkpoint_rows,
+            )
+
+    def test_commit_identity_and_hash_mismatches_are_rejected(self):
+        rows = [self._row(1)]
+        with tempfile.TemporaryDirectory() as temp_dir:
+            write_training_history(temp_dir, rows, self.identity)
+            commit_path = Path(temp_dir) / TRAINING_HISTORY_COMMIT
+            commit = json.loads(commit_path.read_text(encoding="utf-8"))
+            commit["training_seed"] = 999
+            commit_path.write_text(json.dumps(commit), encoding="utf-8")
+
+            with self.assertRaisesRegex(
+                TrainingHistoryIdentityError, "identity mismatch"
+            ):
+                read_committed_training_history(temp_dir, self.identity)
+            with self.assertRaisesRegex(
+                TrainingHistoryIdentityError, "identity mismatch"
+            ):
+                prepare_training_history(
+                    temp_dir, self.identity, checkpoint_rows=rows
+                )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            write_training_history(temp_dir, rows, self.identity)
+            commit_path = Path(temp_dir) / TRAINING_HISTORY_COMMIT
+            commit = json.loads(commit_path.read_text(encoding="utf-8"))
+            commit["jsonl_sha256"] = "0" * 64
+            commit_path.write_text(json.dumps(commit), encoding="utf-8")
+
+            with self.assertRaisesRegex(
+                TrainingHistoryConsistencyError, "JSONL hash"
+            ):
+                read_committed_training_history(temp_dir, self.identity)
+
+    def test_fresh_run_rejects_partial_commit_but_ignores_temp_transaction(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temporary = Path(temp_dir) / ".training-history-txn-abandoned"
+            temporary.mkdir()
+            (temporary / "training_history.jsonl").write_text(
+                "not committed\n", encoding="utf-8"
+            )
+            self.assertEqual(
+                prepare_training_history(temp_dir, self.identity), []
+            )
+
+            (Path(temp_dir) / "training_history.jsonl").write_text(
+                json.dumps(self._row(1)) + "\n", encoding="utf-8"
+            )
+            with self.assertRaisesRegex(
+                TrainingHistoryConsistencyError, "incomplete"
+            ):
+                prepare_training_history(temp_dir, self.identity)
 
 
 class TrainingHistoryResumeIntegrationTest(unittest.TestCase):

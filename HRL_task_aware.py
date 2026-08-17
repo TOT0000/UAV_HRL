@@ -41,6 +41,9 @@ from training_checkpoint import (
     save_model_checkpoint,
 )
 from training_history import (
+    TRAINING_HISTORY_COMMIT,
+    TRAINING_HISTORY_CSV,
+    TRAINING_HISTORY_JSONL,
     build_training_history_row,
     prepare_training_history,
     training_history_identity,
@@ -1270,6 +1273,10 @@ def train(
                         else 0
                     ),
                     "identity": history_identity,
+                    "canonical_format": "jsonl",
+                    "jsonl_file": TRAINING_HISTORY_JSONL,
+                    "csv_file": TRAINING_HISTORY_CSV,
+                    "commit_file": TRAINING_HISTORY_COMMIT,
                 }
                 if history_identity is not None
                 else None

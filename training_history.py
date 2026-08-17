@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import io
 import json
 import math
+import os
 from pathlib import Path
+import shutil
 import uuid
 
 from evaluation_metrics import safe_energy_efficiency
@@ -31,6 +34,23 @@ FLOAT_COLUMNS = (
     "energy_efficiency_mbit_per_j",
     "dinkelbach_lambda",
 )
+
+TRAINING_HISTORY_SCHEMA_VERSION = 1
+TRAINING_HISTORY_CSV = "training_history.csv"
+TRAINING_HISTORY_JSONL = "training_history.jsonl"
+TRAINING_HISTORY_COMMIT = "training_history_commit.json"
+
+
+class TrainingHistoryError(RuntimeError):
+    pass
+
+
+class TrainingHistoryIdentityError(TrainingHistoryError):
+    pass
+
+
+class TrainingHistoryConsistencyError(TrainingHistoryError):
+    pass
 
 
 def training_history_identity(method_id, training_seed, training_manifest_hash):
@@ -92,7 +112,7 @@ def validate_training_history(rows, identity):
     for row in normalized:
         for key, expected in identity.items():
             if row[key] != expected:
-                raise RuntimeError(
+                raise TrainingHistoryIdentityError(
                     f"training history identity mismatch for {key}: "
                     f"row={row[key]}, expected={expected}"
                 )
@@ -102,31 +122,101 @@ def validate_training_history(rows, identity):
     return normalized
 
 
-def _atomic_write_text(path, text):
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.parent / f".{path.name}.tmp-{uuid.uuid4().hex}"
-    try:
-        temporary.write_text(text, encoding="utf-8")
-        temporary.replace(path)
-    finally:
-        if temporary.exists():
-            temporary.unlink()
-
-
-def write_training_history(run_directory, rows, identity):
-    run_directory = Path(run_directory)
-    normalized = validate_training_history(rows, identity)
+def _history_bytes(normalized):
     csv_buffer = io.StringIO(newline="")
     writer = csv.DictWriter(csv_buffer, fieldnames=TRAINING_HISTORY_COLUMNS)
     writer.writeheader()
     writer.writerows(normalized)
     jsonl = "".join(
-        json.dumps(row, ensure_ascii=False, allow_nan=False) + "\n"
+        json.dumps(
+            row,
+            ensure_ascii=False,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        + "\n"
         for row in normalized
     )
-    _atomic_write_text(run_directory / "training_history.csv", csv_buffer.getvalue())
-    _atomic_write_text(run_directory / "training_history.jsonl", jsonl)
+    return csv_buffer.getvalue().encode("utf-8"), jsonl.encode("utf-8")
+
+
+def _write_fsynced(path, payload):
+    with Path(path).open("wb") as handle:
+        handle.write(payload)
+        handle.flush()
+        os.fsync(handle.fileno())
+
+
+def _sha256(payload):
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _commit_metadata(identity, normalized, csv_bytes, jsonl_bytes, transaction_id):
+    return {
+        "schema_version": TRAINING_HISTORY_SCHEMA_VERSION,
+        **identity,
+        "row_count": len(normalized),
+        "last_episode": normalized[-1]["episode"] if normalized else 0,
+        "csv_sha256": _sha256(csv_bytes),
+        "jsonl_sha256": _sha256(jsonl_bytes),
+        "transaction_id": str(transaction_id),
+    }
+
+
+def write_training_history(
+    run_directory,
+    rows,
+    identity,
+    *,
+    transaction_id=None,
+    _fault_inject=None,
+):
+    """Commit JSONL, its CSV projection, then commit metadata last."""
+
+    run_directory = Path(run_directory)
+    run_directory.mkdir(parents=True, exist_ok=True)
+    normalized = validate_training_history(rows, identity)
+    csv_bytes, jsonl_bytes = _history_bytes(normalized)
+    transaction_id = str(transaction_id or uuid.uuid4().hex)
+    if (
+        not transaction_id
+        or transaction_id != Path(transaction_id).name
+        or "/" in transaction_id
+        or "\\" in transaction_id
+    ):
+        raise ValueError("training history transaction id is not filesystem-safe")
+    transaction_directory = (
+        run_directory / f".training-history-txn-{transaction_id}"
+    )
+    transaction_directory.mkdir()
+    jsonl_temporary = transaction_directory / TRAINING_HISTORY_JSONL
+    csv_temporary = transaction_directory / TRAINING_HISTORY_CSV
+    commit_temporary = transaction_directory / TRAINING_HISTORY_COMMIT
+    commit = _commit_metadata(
+        identity, normalized, csv_bytes, jsonl_bytes, transaction_id
+    )
+    commit_bytes = (
+        json.dumps(commit, indent=2, sort_keys=True, allow_nan=False) + "\n"
+    ).encode("utf-8")
+    try:
+        _write_fsynced(jsonl_temporary, jsonl_bytes)
+        _write_fsynced(csv_temporary, csv_bytes)
+        _write_fsynced(commit_temporary, commit_bytes)
+        jsonl_temporary.replace(run_directory / TRAINING_HISTORY_JSONL)
+        if _fault_inject is not None:
+            _fault_inject("after_jsonl_replace")
+        csv_temporary.replace(run_directory / TRAINING_HISTORY_CSV)
+        if _fault_inject is not None:
+            _fault_inject("after_csv_replace")
+        commit_temporary.replace(run_directory / TRAINING_HISTORY_COMMIT)
+    finally:
+        if transaction_directory.exists():
+            try:
+                shutil.rmtree(transaction_directory)
+            except OSError:
+                # Abandoned transaction directories are intentionally ignored.
+                pass
     return normalized
 
 
@@ -144,6 +234,92 @@ def _same_rows(left, right):
     return left == right
 
 
+def _history_paths(run_directory):
+    run_directory = Path(run_directory)
+    return {
+        "csv": run_directory / TRAINING_HISTORY_CSV,
+        "jsonl": run_directory / TRAINING_HISTORY_JSONL,
+        "commit": run_directory / TRAINING_HISTORY_COMMIT,
+    }
+
+
+def _validate_commit_identity(commit, identity):
+    if commit.get("schema_version") != TRAINING_HISTORY_SCHEMA_VERSION:
+        raise TrainingHistoryConsistencyError(
+            "training history commit schema is incompatible"
+        )
+    mismatches = {
+        key: (commit.get(key), expected)
+        for key, expected in identity.items()
+        if commit.get(key) != expected
+    }
+    if mismatches:
+        raise TrainingHistoryIdentityError(
+            f"training history commit identity mismatch: {mismatches}"
+        )
+
+
+def read_committed_training_history(run_directory, identity):
+    """Read history only when JSONL, CSV, and commit metadata agree."""
+
+    paths = _history_paths(run_directory)
+    present = {name: path.is_file() for name, path in paths.items()}
+    if not any(present.values()):
+        return []
+    if not all(present.values()):
+        raise TrainingHistoryConsistencyError(
+            f"training history transaction is incomplete: {present}"
+        )
+    try:
+        commit = json.loads(paths["commit"].read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError) as exc:
+        raise TrainingHistoryConsistencyError(
+            "training history commit metadata is invalid"
+        ) from exc
+    _validate_commit_identity(commit, identity)
+
+    csv_bytes = paths["csv"].read_bytes()
+    jsonl_bytes = paths["jsonl"].read_bytes()
+    if _sha256(csv_bytes) != commit.get("csv_sha256"):
+        raise TrainingHistoryConsistencyError(
+            "training history CSV hash does not match its commit"
+        )
+    if _sha256(jsonl_bytes) != commit.get("jsonl_sha256"):
+        raise TrainingHistoryConsistencyError(
+            "training history JSONL hash does not match its commit"
+        )
+    try:
+        canonical = validate_training_history(_read_jsonl(paths["jsonl"]), identity)
+        csv_rows = validate_training_history(_read_csv(paths["csv"]), identity)
+    except TrainingHistoryIdentityError:
+        raise
+    except (ValueError, KeyError, json.JSONDecodeError) as exc:
+        raise TrainingHistoryConsistencyError(
+            "training history committed rows are invalid"
+        ) from exc
+    if not _same_rows(csv_rows, canonical):
+        raise TrainingHistoryConsistencyError(
+            "training history CSV is not the JSONL canonical projection"
+        )
+    expected_row_count = len(canonical)
+    expected_last_episode = canonical[-1]["episode"] if canonical else 0
+    if commit.get("row_count") != expected_row_count:
+        raise TrainingHistoryConsistencyError(
+            "training history row count does not match its commit"
+        )
+    if commit.get("last_episode") != expected_last_episode:
+        raise TrainingHistoryConsistencyError(
+            "training history last episode does not match its commit"
+        )
+    if not isinstance(commit.get("transaction_id"), str) or not commit[
+        "transaction_id"
+    ]:
+        raise TrainingHistoryConsistencyError(
+            "training history transaction id is invalid"
+        )
+    return canonical
+
+
 def prepare_training_history(
     run_directory,
     identity,
@@ -153,24 +329,29 @@ def prepare_training_history(
     """Initialize fresh history or reconcile disk state to an exact checkpoint."""
 
     run_directory = Path(run_directory)
-    csv_path = run_directory / "training_history.csv"
-    jsonl_path = run_directory / "training_history.jsonl"
-    existing_sets = []
-    if csv_path.is_file():
-        existing_sets.append(validate_training_history(_read_csv(csv_path), identity))
-    if jsonl_path.is_file():
-        existing_sets.append(
-            validate_training_history(_read_jsonl(jsonl_path), identity)
-        )
+    paths = _history_paths(run_directory)
+    any_history_artifact = any(path.is_file() for path in paths.values())
 
     if checkpoint_rows is None:
-        if existing_sets:
+        if any_history_artifact:
+            read_committed_training_history(run_directory, identity)
             raise FileExistsError(
                 "fresh training run already has training history; use exact resume"
             )
         return []
 
     canonical = validate_training_history(checkpoint_rows, identity)
+    existing_sets = []
+    if any_history_artifact:
+        try:
+            existing_sets.append(
+                read_committed_training_history(run_directory, identity)
+            )
+        except TrainingHistoryIdentityError:
+            raise
+        except TrainingHistoryConsistencyError:
+            # An exact-resume checkpoint is the canonical repair source.
+            existing_sets = []
     for existing in existing_sets:
         prefix_length = min(len(existing), len(canonical))
         if not _same_rows(existing[:prefix_length], canonical[:prefix_length]):
