@@ -59,6 +59,7 @@ class CentralizedTrainingFlowTest(unittest.TestCase):
         self.assertEqual(smoke.episode_seconds, 60)
         self.assertEqual(smoke.warmup_joint_transitions, 0)
         self.assertEqual(smoke.batch_size, 1)
+        self.assertEqual(smoke.random_seed, 20260817)
         self.assertFalse(smoke.enable_model_checkpoints)
         self.assertFalse(smoke.enable_full_resume)
         self.assertFalse(smoke.enable_csv)

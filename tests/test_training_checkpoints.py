@@ -10,7 +10,11 @@ import numpy as np
 import torch
 
 from DDQN import DDQN
-from HRL_task_aware import _uses_warmup_random_action, parse_training_config
+from HRL_task_aware import (
+    _seed_training_rng,
+    _uses_warmup_random_action,
+    parse_training_config,
+)
 from centralized_movement import JOINT_ACTION_DIM, MOVEMENT_STATE_DIM
 from td3 import TD3
 from training_checkpoint import (
@@ -33,6 +37,69 @@ def _assert_module_equal(testcase, expected, actual):
     testcase.assertEqual(expected_state.keys(), actual_state.keys())
     for key in expected_state:
         testcase.assertTrue(torch.equal(expected_state[key], actual_state[key]), key)
+
+
+class TrainingSeedTest(unittest.TestCase):
+    def _models(self):
+        return (
+            TD3(
+                MOVEMENT_STATE_DIM,
+                JOINT_ACTION_DIM,
+                max_action=1.0,
+                gamma=1.0,
+                policy_delay=2,
+            ),
+            DDQN(ROUTING_STATE_DIM, ROUTING_ACTION_DIM),
+        )
+
+    def test_same_seed_reproduces_all_td3_and_ddqn_networks(self):
+        _seed_training_rng(20260817)
+        first_td3, first_ddqn = self._models()
+        _seed_training_rng(20260817)
+        second_td3, second_ddqn = self._models()
+
+        for name in (
+            "actor",
+            "actor_target",
+            "critic_1",
+            "critic_1_target",
+            "critic_2",
+            "critic_2_target",
+        ):
+            _assert_module_equal(
+                self, getattr(first_td3, name), getattr(second_td3, name)
+            )
+        for name in (
+            "q_network",
+            "target_q_network",
+            "cost_network",
+            "target_cost_network",
+        ):
+            _assert_module_equal(
+                self, getattr(first_ddqn, name), getattr(second_ddqn, name)
+            )
+
+    def test_same_seed_reproduces_python_numpy_torch_and_cuda_rng(self):
+        def draw_values():
+            values = {
+                "python": random.random(),
+                "numpy": np.random.random(),
+                "torch_cpu": torch.rand(4),
+            }
+            if torch.cuda.is_available():
+                values["torch_cuda"] = torch.rand(4, device="cuda")
+            return values
+
+        _seed_training_rng(20260817)
+        first = draw_values()
+        _seed_training_rng(20260817)
+        second = draw_values()
+
+        self.assertEqual(first["python"], second["python"])
+        self.assertEqual(first["numpy"], second["numpy"])
+        self.assertTrue(torch.equal(first["torch_cpu"], second["torch_cpu"]))
+        if torch.cuda.is_available():
+            self.assertTrue(torch.equal(first["torch_cuda"], second["torch_cuda"]))
 
 
 class FullResumeCheckpointTest(unittest.TestCase):

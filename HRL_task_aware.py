@@ -7,6 +7,7 @@ import random
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+import torch
 
 from DDQN import DDQN
 from Packet_scheduler_v1 import PacketEngine, final_hop_delivered_bits
@@ -42,6 +43,17 @@ PRODUCTION_WARMUP_TRANSITIONS = 1000
 PRODUCTION_BATCH_SIZE = 64
 PRODUCTION_POLICY_DELAY = 2
 SMOKE_RANDOM_SEED = 20260817
+
+
+def _seed_training_rng(seed):
+    if seed is None:
+        return
+    seed = int(seed)
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
 
 def _is_movement_decision(slot, interval=MOVEMENT_CONTROL_INTERVAL):
@@ -432,9 +444,7 @@ def train(config=None):
             "training config is required; use smoke_training_config() or "
             "formal_training_config(total_episodes)"
         )
-    if config.random_seed is not None:
-        np.random.seed(config.random_seed)
-        random.seed(config.random_seed)
+    _seed_training_rng(config.random_seed)
 
     c_ref_com, calibration = load_com_capacity_reference()
     env = Simulator(num_UAV=16)
