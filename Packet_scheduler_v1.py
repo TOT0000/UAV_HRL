@@ -25,7 +25,7 @@ class PacketEngine:
         self.step_time = step_time
         self.num_UAV = num_uav                                 # ★ 存起來，避免外部依賴
         self._next_pkt_id = 0
-        self._active_idx = []
+        self._active_idx = set()
 
         # PacketManager
         self.packet_pool = []
@@ -94,7 +94,9 @@ class PacketEngine:
         }
         self.source_uavs = set(self.packet_buffer.keys())
 
-    def _sync_backlog(self, uav_id):
+    def recompute_backlog_for_assertion(self, uav_id):
+        """Recompute one queue's backlog for tests and debug assertions only."""
+
         if not (0 <= int(uav_id) < self.num_UAV):
             return 0.0
         queue = self.uav_queues[int(uav_id)]
@@ -103,26 +105,42 @@ class PacketEngine:
             for pkt in queue
             if pkt is not None and not pkt.get("done", False)
         )
-        self.backlog_bits[int(uav_id)] = max(float(total), 0.0)
-        return self.backlog_bits[int(uav_id)]
+        return max(float(total), 0.0)
+
+    def _sync_backlog(self, uav_id):
+        """Test-only compatibility helper; never call from the training hot path."""
+
+        uav_id = int(uav_id)
+        total = self.recompute_backlog_for_assertion(uav_id)
+        if 0 <= uav_id < self.num_UAV:
+            self.backlog_bits[uav_id] = total
+        return total
+
+    def _decrease_backlog(self, uav_id, bits):
+        uav_id = int(uav_id)
+        self.backlog_bits[uav_id] = max(
+            float(self.backlog_bits.get(uav_id, 0.0))
+            - max(float(bits), 0.0),
+            0.0,
+        )
 
     def _remove_from_queue(self, pkt, uav_id=None):
-        candidate_ids = (
-            [int(uav_id)] if uav_id is not None else range(self.num_UAV)
-        )
-        removed = False
-        for node_id in candidate_ids:
-            if not (0 <= node_id < self.num_UAV):
-                continue
-            queue = self.uav_queues[node_id]
-            try:
-                queue.remove(pkt)
-                removed = True
-            except ValueError:
-                pass
-            self._sync_backlog(node_id)
+        node_id = pkt.get("_queued_uav") if uav_id is None else uav_id
+        if node_id is None or not (0 <= int(node_id) < self.num_UAV):
+            return False
+        node_id = int(node_id)
+        queue = self.uav_queues[node_id]
+        if queue and queue[0] is pkt:
+            queue.popleft()
+            removed = True
+        else:
+            filtered = deque(item for item in queue if item is not pkt)
+            removed = len(filtered) != len(queue)
             if removed:
-                break
+                self.uav_queues[node_id] = filtered
+        if removed:
+            self._decrease_backlog(node_id, pkt.get("rem_bits", 0.0))
+            pkt["_queued_uav"] = None
         return removed
 
     def enqueue_packet(self, pkt, uav_id, queue_enter_time):
@@ -131,10 +149,13 @@ class PacketEngine:
         uav_id = int(uav_id)
         if not (0 <= uav_id < self.num_UAV):
             raise ValueError(f"invalid UAV queue id: {uav_id}")
+        if pkt.get("_queued_uav") is not None:
+            raise AssertionError("packet is already owned by a UAV queue")
         pkt["current"] = uav_id
         pkt["queue_enter_time"] = float(queue_enter_time)
+        pkt["_queued_uav"] = uav_id
         self.uav_queues[uav_id].append(pkt)
-        self._sync_backlog(uav_id)
+        self.backlog_bits[uav_id] += max(float(pkt.get("rem_bits", 0.0)), 0.0)
 
     def create_packet(self, source, task_type, size_bits, generation_time):
         """Create and enqueue one packet; shared by injection and unit tests."""
@@ -147,6 +168,7 @@ class PacketEngine:
         pkt = {
             "id": self._next_pkt_id,
             "_pool_idx": pool_idx,
+            "_queued_uav": None,
             "source": source,
             "current": source,
             "arrival_time": generation_time,
@@ -174,7 +196,7 @@ class PacketEngine:
             "violation_counted": False,
         }
         self.packet_pool.append(pkt)
-        self._active_idx.append(pool_idx)
+        self._active_idx.add(pool_idx)
         self.enqueue_packet(pkt, source, generation_time)
         self._next_pkt_id += 1
         return pkt
@@ -189,8 +211,12 @@ class PacketEngine:
     def get_hol_packet(self, uav_id):
         queue = self.uav_queues[int(uav_id)]
         while queue and (queue[0] is None or queue[0].get("done", False)):
-            queue.popleft()
-        self._sync_backlog(int(uav_id))
+            stale = queue.popleft()
+            if stale is not None and stale.get("_queued_uav") == int(uav_id):
+                self._decrease_backlog(
+                    int(uav_id), stale.get("rem_bits", 0.0)
+                )
+                stale["_queued_uav"] = None
         return queue[0] if queue else None
 
     def nonempty_uav_ids(self):
@@ -249,9 +275,9 @@ class PacketEngine:
         used = min(bits, remaining)
         pkt["rem_bits"] = max(remaining - used, 0.0)
         pkt["hop_bits_sent"] = float(pkt.get("hop_bits_sent", 0.0)) + used
+        self._decrease_backlog(sender, used)
         if pkt["rem_bits"] > PACKET_EPS:
             self.partial_transmissions += 1
-        self._sync_backlog(sender)
         return pkt["rem_bits"] <= PACKET_EPS
 
     def detach_completed_hop(self, pkt, sender, receiver, completion_time):
@@ -264,8 +290,11 @@ class PacketEngine:
             raise AssertionError("completed hop does not match the receiver lock")
         if float(pkt.get("rem_bits", 0.0)) > PACKET_EPS:
             raise AssertionError("cannot detach an incomplete hop")
-        if not self._remove_from_queue(pkt, sender):
+        queue = self.uav_queues[sender]
+        if not queue or queue[0] is not pkt:
             raise AssertionError("completed packet was not in the sender FIFO")
+        queue.popleft()
+        pkt["_queued_uav"] = None
         pkt["hops"] = int(pkt.get("hops", 0)) + 1
         pkt.setdefault("path", []).append(receiver)
         pkt["current"] = receiver
@@ -300,7 +329,9 @@ class PacketEngine:
             )
         return ordered
 
-    def _mark_deadline_violation(self, pkt, current_time, sender=None):
+    def _mark_deadline_violation(
+        self, pkt, current_time, sender=None, remove_from_queue=True
+    ):
         if pkt.get("violation_counted", False):
             return None
         pkt["violation_counted"] = True
@@ -313,7 +344,10 @@ class PacketEngine:
             self.com_violated += 1
         owner = int(pkt.get("current", -1) if sender is None else sender)
         self.mark_packet_done(
-            pkt, current_time=float(current_time), reason="deadline"
+            pkt,
+            current_time=float(current_time),
+            reason="deadline",
+            remove_from_queue=remove_from_queue,
         )
         return {
             "attributed_sender": owner,
@@ -328,18 +362,58 @@ class PacketEngine:
 
         current_time = float(current_time)
         violations = []
-        for pkt in list(self.get_active_packets()):
+        queued_indices = set()
+
+        def is_expired(pkt):
             deadline_abs = pkt.get("deadline_abs")
             if deadline_abs is None:
-                continue
+                return False
             deadline_abs = float(deadline_abs)
-            expired = (
+            return (
                 current_time >= deadline_abs - PACKET_EPS
                 if inclusive
                 else current_time > deadline_abs + PACKET_EPS
             )
-            if expired:
-                event = self._mark_deadline_violation(pkt, current_time)
+
+        for uav_id in range(self.num_UAV):
+            kept = deque()
+            expired_bits = 0.0
+            for pkt in self.uav_queues[uav_id]:
+                if pkt is None:
+                    continue
+                pool_idx = int(pkt.get("_pool_idx", -1))
+                if pool_idx >= 0:
+                    queued_indices.add(pool_idx)
+                if pkt.get("done", False):
+                    pkt["_queued_uav"] = None
+                    expired_bits += max(float(pkt.get("rem_bits", 0.0)), 0.0)
+                    continue
+                if is_expired(pkt):
+                    expired_bits += max(float(pkt.get("rem_bits", 0.0)), 0.0)
+                    pkt["_queued_uav"] = None
+                    event = self._mark_deadline_violation(
+                        pkt,
+                        current_time,
+                        sender=uav_id,
+                        remove_from_queue=False,
+                    )
+                    if event is not None:
+                        violations.append(event)
+                else:
+                    kept.append(pkt)
+            self.uav_queues[uav_id] = kept
+            self._decrease_backlog(uav_id, expired_bits)
+
+        detached_indices = set(self._active_idx).difference(queued_indices)
+        for pool_idx in sorted(detached_indices):
+            if not (0 <= pool_idx < len(self.packet_pool)):
+                self._active_idx.discard(pool_idx)
+                continue
+            pkt = self.packet_pool[pool_idx]
+            if pkt is not None and not pkt.get("done", False) and is_expired(pkt):
+                event = self._mark_deadline_violation(
+                    pkt, current_time, remove_from_queue=False
+                )
                 if event is not None:
                     violations.append(event)
         return violations
@@ -595,7 +669,7 @@ class PacketEngine:
         if not hasattr(self, "packet_pool"):
             self.packet_pool = []
         if not hasattr(self, "_active_idx"):
-            self._active_idx = []
+            self._active_idx = set()
         # if len(self.packet_pool) >= getattr(self, "max_packets", 3000):
         #     # print(f"超過3000")
         #     return
@@ -659,11 +733,13 @@ class PacketEngine:
                     #     print(f"✅ Packet quota reached: {self.total_injected_packets}")
                     #     return
 
-    def mark_packet_done(self, pkt, current_time=None, reason=None):
+    def mark_packet_done(
+        self, pkt, current_time=None, reason=None, remove_from_queue=True
+    ):
         """
         ✅ Confirmed for your current engine structure:
         - self.packet_pool: list (pool index -> pkt or None)
-        - self._active_idx: list of pool indices (ints)
+        - self._active_idx: set of pool indices (ints)
         - pkt contains "_pool_idx"
         - remaining bits is pkt["rem_bits"]
 
@@ -686,7 +762,8 @@ class PacketEngine:
             pkt["finish_time"] = current_time
 
         # 2) remove the packet from whichever per-UAV FIFO currently owns it.
-        self._remove_from_queue(pkt)
+        if remove_from_queue:
+            self._remove_from_queue(pkt)
 
         # 3) remove from active indices
         pi = pkt.get("_pool_idx", None)
@@ -697,12 +774,7 @@ class PacketEngine:
         except Exception:
             return
 
-        # try fast remove once; fallback remove-all (safer if duplicates ever exist)
-        try:
-            self._active_idx.remove(pi)
-        except ValueError:
-            # remove-all fallback
-            self._active_idx = [x for x in self._active_idx if x != pi]
+        self._active_idx.discard(pi)
 
         # 4) clear pool slot
         if 0 <= pi < len(self.packet_pool):
@@ -711,67 +783,54 @@ class PacketEngine:
 
 
     def drop_expired_packets(self, current_time):
-        """
-        Drop packets that are expired by deadline or exceed max hops.
-        Safe against: packet_pool entries being None, active_idx changing, etc.
-        """
+        """Drop max-hop packets with one filtering pass per UAV queue."""
+
         dropped = 0
+        queued_indices = set()
+        for uav_id in range(self.num_UAV):
+            kept = deque()
+            dropped_bits = 0.0
+            for pkt in self.uav_queues[uav_id]:
+                if pkt is None:
+                    continue
+                pool_idx = int(pkt.get("_pool_idx", -1))
+                if pool_idx >= 0:
+                    queued_indices.add(pool_idx)
+                if pkt.get("done", False):
+                    pkt["_queued_uav"] = None
+                    dropped_bits += max(float(pkt.get("rem_bits", 0.0)), 0.0)
+                    continue
+                if int(pkt.get("hops", 0)) >= MAX_PACKET_HOPS:
+                    dropped_bits += max(float(pkt.get("rem_bits", 0.0)), 0.0)
+                    pkt["_queued_uav"] = None
+                    self.mark_packet_done(
+                        pkt,
+                        current_time=current_time,
+                        reason="max_hops",
+                        remove_from_queue=False,
+                    )
+                    dropped += 1
+                else:
+                    kept.append(pkt)
+            self.uav_queues[uav_id] = kept
+            self._decrease_backlog(uav_id, dropped_bits)
 
-        for idx in list(self._active_idx):
-            # --- 安全檢查：索引合法性 ---
-            if idx is None or idx < 0 or idx >= len(self.packet_pool):
-                try:
-                    self._active_idx.remove(idx)
-                except ValueError:
-                    pass
+        detached_indices = set(self._active_idx).difference(queued_indices)
+        for pool_idx in sorted(detached_indices):
+            if not (0 <= pool_idx < len(self.packet_pool)):
+                self._active_idx.discard(pool_idx)
                 continue
-
-            pkt = self.packet_pool[idx]
-            if pkt is None:
-                try:
-                    self._active_idx.remove(idx)
-                except ValueError:
-                    pass
-                continue
-
-            if pkt.get("done", False):
-                try:
-                    self._active_idx.remove(idx)
-                except ValueError:
-                    pass
-                continue
-
-            # =========================
-            # (A) DEADLINE EXPIRED DROP
-            # =========================
-            # if current_time > pkt.get("deadline", float("inf")):
-            #     # backlog 扣掉（避免 backlog 虛胖）
-            #     if cur >= 0 and rem_bits > 0:
-            #         self.backlog_bits[cur] = max(0.0, self.backlog_bits[cur] - rem_bits)
-            #     # 清掉 active / pool
-            #     try:
-            #         self._active_idx.remove(idx)
-            #     except ValueError:
-            #         pass
-            #     self.packet_pool[idx] = None
-            #     dropped += 1
-            #     continue
-
-            # =========================
-            # (B) MAX HOPS DROP
-            # =========================
-            hops = int(pkt.get("hops", 0))
-            if hops >= MAX_PACKET_HOPS:
+            pkt = self.packet_pool[pool_idx]
+            if pkt is not None and int(pkt.get("hops", 0)) >= MAX_PACKET_HOPS:
                 self.mark_packet_done(
-                    pkt, current_time=current_time, reason="max_hops"
+                    pkt,
+                    current_time=current_time,
+                    reason="max_hops",
+                    remove_from_queue=False,
                 )
                 dropped += 1
-                continue
-
         return dropped
 
-
-    
     # ===== Dual-Queue helpers (no weights) =====
     def _task_norm(self, task_type) -> str:
         t = str(task_type).upper()
@@ -791,19 +850,24 @@ class PacketEngine:
     def get_active_packets(self):
         # ★ 安全檢查：邊界 + None（若未來釋放記憶體改成 None 也可）
         pool = self.packet_pool
-        idxs = self._active_idx
-        safe_idxs = [i for i in idxs if 0 <= i < len(pool) and pool[i] is not None]
+        safe_idxs = {
+            i
+            for i in self._active_idx
+            if 0 <= i < len(pool)
+            and pool[i] is not None
+            and not pool[i].get("done", False)
+        }
         # 若出現壞索引，順手同步修正 _active_idx
-        if len(safe_idxs) != len(idxs):
+        if safe_idxs != self._active_idx:
             self._active_idx = safe_idxs
         # 過濾 done
-        return [pool[i] for i in safe_idxs if not pool[i]["done"]]
+        return [pool[i] for i in sorted(safe_idxs)]
 
     def reset_packet_state(self):
         # 封包本體
         self.packet_pool = []
         # 活躍索引
-        self._active_idx = []
+        self._active_idx = set()
         # 流水號歸零（或保留原值也行）
         self._next_pkt_id = 0
         # 速率積分緩衝清空
@@ -822,6 +886,8 @@ class PacketEngine:
         self.total_violated = 0
         self.fov_delivered= 0
         self.com_delivered= 0
+        self.fov_violated = 0
+        self.com_violated = 0
         self.partial_transmissions = 0
         self.raw_final_hop_bits = 0.0
         self.timely_goodput_bits = 0.0
@@ -996,10 +1062,7 @@ class PacketEngine:
         max_bits_norm = 5e7
         if backlog_bits is None:
             # 兼容舊寫法：若沒傳，才退回掃描（但訓練時我們會傳，避免走到這裡）
-            my_bits_raw = sum(
-                pkt["rem_bits"] for pkt in self.packet_pool
-                if pkt["current"] == uav_id and not pkt.get("done", False)
-            )
+            my_bits_raw = self.backlog_bits.get(uav_id, 0.0)
         else:
             my_bits_raw = backlog_bits.get(uav_id, 0)
         my_bits = min(my_bits_raw / max_bits_norm, 1.0)
@@ -1075,7 +1138,7 @@ class PacketEngine:
 
             if nh < N:
                 if backlog_bits is None:
-                    nh_bits = sum(pkt["rem_bits"] for pkt in self.packet_pool if pkt["current"] == nh and not pkt.get("done", False))
+                    nh_bits = self.backlog_bits.get(nh, 0.0)
                 else:
                     nh_bits = backlog_bits.get(nh, 0)
                     
@@ -1232,10 +1295,7 @@ class PacketEngine:
         max_bits_norm = 5e7
         if backlog_bits is None:
             # 兼容舊寫法：若沒傳，才退回掃描（但訓練時我們會傳，避免走到這裡）
-            my_bits_raw = sum(
-                pkt["rem_bits"] for pkt in self.packet_pool
-                if pkt["current"] == uav_id and not pkt.get("done", False)
-            )
+            my_bits_raw = self.backlog_bits.get(uav_id, 0.0)
         else:
             my_bits_raw = backlog_bits.get(uav_id, 0)
 

@@ -246,6 +246,15 @@ def _run_routing_slot(
         active_capacities,
         current_time=env.current_time,
     )
+    violation_count = sum(
+        bool(outcome["violated"]) for outcome in slot_result["outcomes"]
+    )
+    attributed_cost = float(sum(slot_result["cost_by_sender"].values()))
+    if not np.isclose(attributed_cost, float(violation_count)):
+        raise AssertionError(
+            "deadline violation cost attribution mismatch: "
+            f"violations={violation_count}, cost={attributed_cost}"
+        )
     env.current_time = float(current_time) + step_time
     for outcome in slot_result["outcomes"]:
         task_type = outcome["task_type"]
@@ -812,6 +821,30 @@ def train(config=None):
         plt.tight_layout()
         plt.show()
 
+    backlog_invariant_passed = None
+    deadline_counter_consistent = None
+    if config.mode == "smoke":
+        backlog_invariant_passed = all(
+            np.isclose(
+                float(packet_engine.backlog_bits.get(uav_id, 0.0)),
+                packet_engine.recompute_backlog_for_assertion(uav_id),
+            )
+            for uav_id in range(env.num_UAV)
+        )
+        deadline_counter_consistent = (
+            packet_engine.total_violated == packet_engine.deadline_drops
+            == packet_engine.fov_violated + packet_engine.com_violated
+        )
+        if not backlog_invariant_passed:
+            raise AssertionError("incremental backlog invariant failed")
+        if not deadline_counter_consistent:
+            raise AssertionError("deadline counters are inconsistent")
+        print(
+            "[Smoke checks] "
+            f"backlog_invariant={backlog_invariant_passed} "
+            f"deadline_counters={deadline_counter_consistent}"
+        )
+
     return {
         "episodes": len(reward_log),
         "episodes_run": len(reward_log) - initial_log_length,
@@ -845,6 +878,8 @@ def train(config=None):
         "partial_transmissions": packet_engine.partial_transmissions,
         "deadline_drops": packet_engine.deadline_drops,
         "link_slot_budget_violations": packet_engine.link_slot_budget_violations,
+        "backlog_invariant_passed": backlog_invariant_passed,
+        "deadline_counter_consistent": deadline_counter_consistent,
         "reward_log": reward_log,
         "delivered_log": delivered_log,
         "energy_log": energy_log,
