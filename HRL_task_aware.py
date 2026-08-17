@@ -21,6 +21,12 @@ from centralized_movement import (
     project_joint_action,
 )
 from com_capacity_calibration import load_com_capacity_reference
+from exploration_schedules import (
+    ddqn_decay_steps,
+    ddqn_epsilon,
+    td3_behavior_noise,
+    td3_decay_steps,
+)
 from td3 import TD3
 import utils_update_v2
 
@@ -131,6 +137,7 @@ def _run_routing_slot(
     done,
     delay_bound_steps,
     violation_stats,
+    epsilon,
 ):
     step_time = float(packet_engine.step_time)
     env.current_time = float(current_time)
@@ -158,13 +165,9 @@ def _run_routing_slot(
                 f"routing state for UAV {uid} has shape {state.shape}, expected (122,)"
             )
 
-    next_hops = {}
-    for uid in uavs_with_packets:
-        next_hops[uid] = int(
-            ddqn.select_action(
-                states[uid], uid, routing_masks[uid], visited_nodes=None
-            )
-        )
+    next_hops = _select_routing_actions(
+        ddqn, states, routing_masks, epsilon=epsilon
+    )
 
     slot_reward = defaultdict(float)
     slot_cost = defaultdict(float)
@@ -253,6 +256,24 @@ def _run_routing_slot(
             tag_gt=env.num_GT,
         )
     return delivered_bits, float(sum(slot_reward.values()))
+
+
+def _select_routing_actions(ddqn, states, routing_masks, epsilon):
+    """Select all routing actions with one shared slot-level epsilon."""
+
+    return {
+        uid: int(
+            ddqn.select_action(
+                states[uid],
+                uid,
+                routing_masks[uid],
+                visited_nodes=None,
+                epsilon=epsilon,
+                logits_noise_std=0.0,
+            )
+        )
+        for uid in sorted(states)
+    }
 
 
 def _mark_search_observations(env):
@@ -353,6 +374,18 @@ def train(config=None):
     energy_evaluations = 0
     terminal_joint_transitions = 0
     routing_slots_executed = 0
+    td3_noise_log = []
+    routing_epsilon_log = []
+    td3_schedule_decay = td3_decay_steps(
+        config.total_episodes,
+        config.episode_seconds,
+        config.warmup_joint_transitions,
+    )
+    ddqn_schedule_decay = ddqn_decay_steps(
+        config.total_episodes,
+        config.episode_seconds,
+        MOVEMENT_CONTROL_INTERVAL,
+    )
     delay_bound_steps = int(5.0 / config.routing_slot_seconds)
 
     for episode in range(start_episode, start_episode + config.total_episodes):
@@ -400,9 +433,14 @@ def train(config=None):
                     -1.0, 1.0, size=JOINT_ACTION_DIM
                 ).astype(np.float32)
             else:
-                raw_joint_action = centralized_td3.select_action(
-                    state, episode=episode, add_noise=True
+                behavior_noise = td3_behavior_noise(
+                    total_joint_transitions - config.warmup_joint_transitions,
+                    td3_schedule_decay,
                 )
+                raw_joint_action = centralized_td3.select_action(
+                    state, add_noise=True, noise_std=behavior_noise
+                )
+                td3_noise_log.append(behavior_noise)
                 environment_actor_calls += 1
             projected_action = project_joint_action(raw_joint_action, state)
 
@@ -434,6 +472,10 @@ def train(config=None):
 
             interval_delivered_bits = 0.0
             for routing_slot in range(MOVEMENT_CONTROL_INTERVAL):
+                slot_epsilon = ddqn_epsilon(
+                    routing_slots_executed, ddqn_schedule_decay
+                )
+                routing_epsilon_log.append(slot_epsilon)
                 routing_slots_executed += 1
                 absolute_slot = interval * MOVEMENT_CONTROL_INTERVAL + routing_slot
                 final_slot = (
@@ -450,6 +492,7 @@ def train(config=None):
                     done=final_slot,
                     delay_bound_steps=delay_bound_steps,
                     violation_stats=violation_stats,
+                    epsilon=slot_epsilon,
                 )
                 interval_delivered_bits += delivered_bits
                 episode_routing_reward += routing_reward
@@ -595,6 +638,8 @@ def train(config=None):
         "energy_evaluations": energy_evaluations,
         "terminal_joint_transitions": terminal_joint_transitions,
         "routing_slots_executed": routing_slots_executed,
+        "td3_noise_log": td3_noise_log,
+        "routing_epsilon_log": routing_epsilon_log,
         "reward_log": reward_log,
         "delivered_log": delivered_log,
         "energy_log": energy_log,

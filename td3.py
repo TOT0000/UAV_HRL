@@ -110,13 +110,20 @@ class TD3():
         self.num_actor_update_iteration = 0
         self.num_training = 0
 
-    def select_action(self, state, episode=0, add_noise=True):
+    def select_action(
+        self, state, episode=0, add_noise=True, noise_std=None
+    ):
         state = torch.FloatTensor(state.reshape(1, -1)).to(device)
         with torch.no_grad():
             raw_action = self.actor(state).cpu().numpy().flatten()
 
         if add_noise:
-            noise_std = max(0.1, 0.5 * (1 - episode / 4000))
+            # Active centralized training supplies an explicit transition-based
+            # schedule. Retain the legacy fallback for inactive entry points.
+            if noise_std is None:
+                noise_std = max(0.1, 0.5 * (1 - episode / 4000))
+            if float(noise_std) < 0.0:
+                raise ValueError(f"noise_std must be non-negative, got {noise_std}")
             noise = np.random.normal(0, noise_std, size=raw_action.shape)
             raw_action = raw_action + noise
 
