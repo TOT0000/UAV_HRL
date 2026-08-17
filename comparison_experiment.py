@@ -125,6 +125,7 @@ def command_train(args):
         checkpoint_root=str(run_dir / "checkpoints"),
         enable_plots=False,
         enable_csv=False,
+        run_directory=str(run_dir),
     )
     result = train(
         config, scenario_manifest=manifest, method_spec=method

@@ -40,6 +40,12 @@ from training_checkpoint import (
     save_full_resume_checkpoint,
     save_model_checkpoint,
 )
+from training_history import (
+    build_training_history_row,
+    prepare_training_history,
+    training_history_identity,
+    write_training_history,
+)
 import utils_update_v2
 
 
@@ -127,6 +133,7 @@ class TrainingConfig:
     enable_plots: bool = True
     enable_csv: bool = True
     random_seed: int | None = None
+    run_directory: str | None = None
 
     def __post_init__(self):
         if self.mode not in {"smoke", "train", "custom"}:
@@ -421,6 +428,7 @@ def _full_training_state(
     td3_noise_log,
     routing_epsilon_log,
     warmup_joint_transitions,
+    training_history_rows,
 ):
     return {
         "completed_episode_index": int(episode),
@@ -438,6 +446,7 @@ def _full_training_state(
         "ddqn_schedule_slot": int(routing_slots_executed),
         "td3_noise_log": list(td3_noise_log),
         "routing_epsilon_log": list(routing_epsilon_log),
+        "training_history_rows": list(training_history_rows),
     }
 
 
@@ -615,6 +624,18 @@ def train(
     experiment_identity = _experiment_identity(
         method_spec, scenario_manifest, config.random_seed
     )
+    history_identity = None
+    training_history_rows = []
+    if config.run_directory is not None:
+        if scenario_manifest is None or config.random_seed is None:
+            raise ValueError(
+                "persistent training history requires a manifest and training seed"
+            )
+        history_identity = training_history_identity(
+            method_spec.method_id,
+            config.random_seed,
+            scenario_manifest.content_hash,
+        )
     loaded_checkpoint_metadata = None
     checkpoint_provenance = {}
     if evaluation:
@@ -708,6 +729,16 @@ def train(
         routing_slots_executed = int(training_state["global_routing_slot"])
         td3_noise_log = list(training_state["td3_noise_log"])
         routing_epsilon_log = list(training_state["routing_epsilon_log"])
+        if history_identity is not None:
+            if "training_history_rows" not in training_state:
+                raise RuntimeError(
+                    "exact-resume checkpoint has no persistent training history"
+                )
+            training_history_rows = prepare_training_history(
+                config.run_directory,
+                history_identity,
+                checkpoint_rows=training_state["training_history_rows"],
+            )
         expected_post_warmup = max(
             total_joint_transitions - config.warmup_joint_transitions, 0
         )
@@ -715,6 +746,10 @@ def train(
             raise RuntimeError("TD3 exploration counter is inconsistent with replay history")
         if int(training_state["ddqn_schedule_slot"]) != routing_slots_executed:
             raise RuntimeError("DDQN exploration counter is inconsistent with slot history")
+    elif history_identity is not None:
+        training_history_rows = prepare_training_history(
+            config.run_directory, history_identity
+        )
 
     evaluation_state_before = (
         _evaluation_state_snapshot(
@@ -1015,6 +1050,22 @@ def train(
                 ),
             }
         )
+        if history_identity is not None:
+            training_history_rows.append(
+                build_training_history_row(
+                    history_identity,
+                    episode=episode + 1,
+                    reward=episode_reward,
+                    timely_goodput_mbits=timely_goodput_mbits,
+                    mobility_energy_j=episode_energy,
+                    dinkelbach_lambda=lambda_ee,
+                )
+            )
+            training_history_rows = write_training_history(
+                config.run_directory,
+                training_history_rows,
+                history_identity,
+            )
         print(
             f"[Episode {episode + 1}] joint_transitions={config.episode_seconds} "
             f"reward={episode_reward:.6f} delivered={episode_delivered_mbits:.6f} Mbit "
@@ -1086,6 +1137,7 @@ def train(
                     td3_noise_log=td3_noise_log,
                     routing_epsilon_log=routing_epsilon_log,
                     warmup_joint_transitions=config.warmup_joint_transitions,
+                    training_history_rows=training_history_rows,
                 ),
                 formal_config=asdict(config),
                 movement_state_dim=MOVEMENT_STATE_DIM,
@@ -1209,7 +1261,21 @@ def train(
             **checkpoint_provenance,
             "formal_config": asdict(config),
             "evaluation": bool(evaluation),
+            "training_history": (
+                {
+                    "row_count": len(training_history_rows),
+                    "last_episode": (
+                        training_history_rows[-1]["episode"]
+                        if training_history_rows
+                        else 0
+                    ),
+                    "identity": history_identity,
+                }
+                if history_identity is not None
+                else None
+            ),
         },
+        "training_history_rows": training_history_rows,
         "reward_log": reward_log,
         "delivered_log": delivered_log,
         "energy_log": energy_log,

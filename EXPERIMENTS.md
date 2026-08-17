@@ -20,6 +20,8 @@ DQN, KM/random assignment, fixed lambda, or an LLM agent.
 - 100 evaluation episodes per trained seed
 - TD3 noise, DDQN epsilon, and DDQN logits noise disabled in evaluation
 - no network, optimizer, target-network, replay, or Dinkelbach update in evaluation
+- model-only checkpoint every 50 episodes, including exactly one final checkpoint
+- full-resume checkpoint every 50 episodes, retaining only the latest two
 
 Run one method and one training seed per training/evaluation job. Uncertainty is
 computed from the five trained-policy seed means. Evaluation episodes are
@@ -79,11 +81,30 @@ Run the 60-second manifest smoke:
 python -X utf8 comparison_experiment.py smoke --training-seed 1 --output-dir runs/comparison/smoke
 ```
 
-Train one formal seed and evaluate its model-only checkpoint:
+`--output-dir` is an output root. Train/evaluate commands derive collision-safe
+run directories from method, manifest, split, and seed:
+
+```text
+<root>/<method>/train/<training-manifest-hash-8>/seed-<seed>/
+<root>/<method>/evaluate/<split>/<evaluation-manifest-hash-8>/seed-<seed>/
+```
+
+An existing non-empty run directory is never overwritten. Training may reuse it
+only with `--resume` pointing to a compatible checkpoint inside that exact run.
+Evaluation reruns must use a different identity/root or explicitly archive the
+old runtime output first.
+
+Train one formal seed and evaluate its episode-1500 model-only checkpoint:
 
 ```powershell
-python -X utf8 comparison_experiment.py train --manifest runs/comparison/manifests/train.json --training-seed 1 --episodes 1500 --output-dir runs/comparison/seed-1
-python -X utf8 comparison_experiment.py evaluate --split test --manifest runs/comparison/manifests/test.json --training-seed 1 --episodes 100 --checkpoint runs/comparison/seed-1/checkpoints/models/ep_1500 --output-dir runs/comparison/evaluation/seed-1
+python -X utf8 comparison_experiment.py train --manifest runs/comparison/manifests/train.json --training-seed 1 --episodes 1500 --output-dir runs/comparison
+python -X utf8 comparison_experiment.py evaluate --split test --manifest runs/comparison/manifests/test.json --training-seed 1 --episodes 100 --checkpoint runs/comparison/<method>/train/<train-hash-8>/seed-1/checkpoints/models/ep_1500 --output-dir runs/comparison
+```
+
+Resume uses a retained full checkpoint from the same canonical run:
+
+```powershell
+python -X utf8 comparison_experiment.py train --manifest runs/comparison/manifests/train.json --training-seed 1 --episodes 1500 --resume runs/comparison/<method>/train/<train-hash-8>/seed-1/checkpoints/full/ep_1450 --output-dir runs/comparison
 ```
 
 Aggregate all seed directories below an evaluation root:
@@ -99,6 +120,15 @@ core configuration, and exactly 1,500 completed training episodes before
 loading weights. A distinct validation/test manifest is expected; output
 metadata records both training/evaluation manifest hashes and checkpoint
 provenance.
+
+Checkpoint directories are written through a same-parent temporary directory
+and atomically renamed only after every file succeeds. A 1,500-episode run has
+30 model-only checkpoints (`ep_0050` through `ep_1500`). Full-resume saves use
+the same 50-episode schedule but retain only the latest two directories. If a
+custom run ends off schedule—for example at episode 75—it saves episodes 50 and
+75 exactly once. Retention never removes model-only checkpoints or files outside
+that run's `checkpoints/full` directory. Formal evaluation always uses
+`ep_1500`; test performance is not used to select a checkpoint.
 
 ## Metrics and artifacts
 
@@ -119,6 +149,15 @@ rejects duplicate reruns or non-finite values. For smaller deterministic tests,
 override `--expected-seed-count` and `--expected-episodes-per-seed` explicitly.
 Aggregation writes `cross_seed_summary.csv`, JSON, and Student-t methodology in
 `aggregation_metadata.json`.
+
+Every canonical training run also writes `training_history.csv` and
+`training_history.jsonl`. They contain one identical, finite row per completed
+episode with method/seed/training-manifest identity, reward, timely goodput,
+mobility energy, per-episode EE, and the updated Dinkelbach lambda. The full
+checkpoint embeds these rows. Exact resume validates the on-disk identity and
+checkpoint prefix, truncates only valid rows beyond the checkpoint episode, and
+then continues without duplicate episodes. `run_metadata.json` records the
+history row count, last episode, and identity.
 
 The legacy `HRL_task_aware.py --mode smoke` and explicit
 `--mode train --episodes N` interfaces remain available.
