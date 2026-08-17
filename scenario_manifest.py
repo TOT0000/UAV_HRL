@@ -12,7 +12,8 @@ from typing import Any, Iterable
 import numpy as np
 
 
-SCENARIO_SCHEMA_VERSION = "uav-hrl-scenario-v1"
+SCENARIO_SCHEMA_VERSION = "uav-hrl-scenario-v2"
+OBSOLETE_SCHEMA_VERSION = "uav-hrl-scenario-v1"
 SUPPORTED_SPLITS = frozenset({"train", "validation", "test"})
 POLICY_DEPENDENT_KEYS = frozenset(
     {
@@ -66,10 +67,45 @@ def environment_config_fingerprint(config: dict[str, Any] | None = None) -> str:
     return sha256_json(config or current_environment_config())
 
 
-def _split_seed(split: str, manifest_seed: int, episode_index: int) -> int:
+def build_generation_profile(num_gt: int | None = None) -> dict[str, Any]:
+    if num_gt is None:
+        return {
+            "num_gt_mode": "mixed",
+            "fixed_num_gt": None,
+            "mixed_num_gt_min": 2,
+            "mixed_num_gt_max": 9,
+        }
+    if isinstance(num_gt, bool) or int(num_gt) != num_gt:
+        raise ValueError("fixed num_GT must be an integer from 2 through 9")
+    fixed_num_gt = int(num_gt)
+    if not 2 <= fixed_num_gt <= 9:
+        raise ValueError("fixed num_GT must be in the inclusive range [2, 9]")
+    return {
+        "num_gt_mode": "fixed",
+        "fixed_num_gt": fixed_num_gt,
+        "mixed_num_gt_min": 2,
+        "mixed_num_gt_max": 9,
+    }
+
+
+def _profile_id(profile: dict[str, Any]) -> str:
+    if profile["num_gt_mode"] == "fixed":
+        return f"fixed-{int(profile['fixed_num_gt'])}"
+    return (
+        f"mixed-{int(profile['mixed_num_gt_min'])}-"
+        f"{int(profile['mixed_num_gt_max'])}"
+    )
+
+
+def _split_seed(
+    split: str,
+    manifest_seed: int,
+    episode_index: int,
+    generation_profile: dict[str, Any],
+) -> int:
     material = (
         f"{SCENARIO_SCHEMA_VERSION}:{split}:{int(manifest_seed)}:"
-        f"{int(episode_index)}"
+        f"{_profile_id(generation_profile)}:{int(episode_index)}"
     ).encode("utf-8")
     return int.from_bytes(hashlib.sha256(material).digest()[:8], "big")
 
@@ -146,24 +182,37 @@ def _sr_initial_data(num_gt: int) -> list[dict[str, Any]]:
 
 
 def generate_scenario_entry(
-    split: str, manifest_seed: int, episode_index: int
+    split: str,
+    manifest_seed: int,
+    episode_index: int,
+    num_gt: int | None = None,
 ) -> dict[str, Any]:
     if split not in SUPPORTED_SPLITS:
         raise ValueError(f"unsupported scenario split: {split}")
-    scenario_seed = _split_seed(split, manifest_seed, episode_index)
+    generation_profile = build_generation_profile(num_gt)
+    profile_id = _profile_id(generation_profile)
+    scenario_seed = _split_seed(
+        split, manifest_seed, episode_index, generation_profile
+    )
     np_rng = np.random.default_rng(scenario_seed)
     py_rng = random.Random(scenario_seed)
-    num_gt = int(np_rng.integers(2, 10))
+    episode_num_gt = (
+        int(np_rng.integers(2, 10))
+        if generation_profile["num_gt_mode"] == "mixed"
+        else int(generation_profile["fixed_num_gt"])
+    )
     entry = {
         "scenario_id": (
-            f"{split}:{SCENARIO_SCHEMA_VERSION}:{int(manifest_seed)}:"
+            f"{split}:{SCENARIO_SCHEMA_VERSION}:{profile_id}:"
+            f"{int(manifest_seed)}:"
             f"{int(episode_index):06d}"
         ),
         "scenario_seed": scenario_seed,
-        "num_GT": num_gt,
-        "ground_targets": _gt_initial_data(py_rng, num_gt),
+        "generation_profile_id": profile_id,
+        "num_GT": episode_num_gt,
+        "ground_targets": _gt_initial_data(py_rng, episode_num_gt),
         "uavs": _uav_initial_data(py_rng),
-        "sr_teams": _sr_initial_data(num_gt),
+        "sr_teams": _sr_initial_data(episode_num_gt),
         "traffic_primitives": {
             "load_factor": 1.0,
             "base_fov_packets_per_second": 5.0,
@@ -184,6 +233,7 @@ def validate_scenario_entry(entry: dict[str, Any]) -> None:
     required = {
         "scenario_id",
         "scenario_seed",
+        "generation_profile_id",
         "num_GT",
         "ground_targets",
         "uavs",
@@ -214,6 +264,7 @@ class ScenarioManifest:
     manifest_seed: int
     episode_count: int
     episodes: tuple[dict[str, Any], ...]
+    generation_profile: dict[str, Any]
     generator_config: dict[str, Any]
     config_fingerprint: str
     content_hash: str
@@ -225,6 +276,7 @@ class ScenarioManifest:
             "manifest_seed": int(self.manifest_seed),
             "episode_count": int(self.episode_count),
             "episodes": list(self.episodes),
+            "generation_profile": self.generation_profile,
             "generator_config": self.generator_config,
             "config_fingerprint": self.config_fingerprint,
         }
@@ -245,6 +297,10 @@ class ScenarioManifest:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "ScenarioManifest":
+        if data.get("schema_version") == OBSOLETE_SCHEMA_VERSION:
+            raise ValueError(
+                "scenario schema v1 is obsolete; regenerate the manifest with v2"
+            )
         if data.get("schema_version") != SCENARIO_SCHEMA_VERSION:
             raise ValueError(
                 f"unsupported scenario schema: {data.get('schema_version')}"
@@ -255,8 +311,25 @@ class ScenarioManifest:
         episodes = tuple(data.get("episodes", ()))
         if int(data.get("episode_count", -1)) != len(episodes):
             raise ValueError("manifest episode_count does not match entries")
+        generation_profile = dict(data.get("generation_profile") or {})
+        expected_profile = build_generation_profile(
+            generation_profile.get("fixed_num_gt")
+            if generation_profile.get("num_gt_mode") == "fixed"
+            else None
+        )
+        if generation_profile != expected_profile:
+            raise ValueError("manifest generation profile is invalid")
+        profile_id = _profile_id(generation_profile)
         for entry in episodes:
             validate_scenario_entry(entry)
+            if entry["generation_profile_id"] != profile_id:
+                raise ValueError("scenario generation profile identity mismatch")
+            num_gt = int(entry["num_GT"])
+            if generation_profile["num_gt_mode"] == "fixed":
+                if num_gt != int(generation_profile["fixed_num_gt"]):
+                    raise ValueError("fixed num_GT manifest contains a mixed entry")
+            elif not 2 <= num_gt <= 9:
+                raise ValueError("mixed num_GT entry is outside [2, 9]")
         unsigned = {key: value for key, value in data.items() if key != "content_hash"}
         expected_hash = sha256_json(unsigned)
         if data.get("content_hash") != expected_hash:
@@ -270,6 +343,7 @@ class ScenarioManifest:
             manifest_seed=int(data["manifest_seed"]),
             episode_count=len(episodes),
             episodes=episodes,
+            generation_profile=generation_profile,
             generator_config=dict(data["generator_config"]),
             config_fingerprint=str(data["config_fingerprint"]),
             content_hash=str(data["content_hash"]),
@@ -281,10 +355,14 @@ class ScenarioManifest:
 
 
 def generate_manifest(
-    split: str, manifest_seed: int, episode_count: int
+    split: str,
+    manifest_seed: int,
+    episode_count: int,
+    num_gt: int | None = None,
 ) -> ScenarioManifest:
     if int(episode_count) <= 0:
         raise ValueError("episode_count must be positive")
+    generation_profile = build_generation_profile(num_gt)
     unsigned = {
         "schema_version": SCENARIO_SCHEMA_VERSION,
         "split": split,
@@ -292,8 +370,13 @@ def generate_manifest(
         "episode_count": int(episode_count),
         "episodes": [
             generate_scenario_entry(split, manifest_seed, index)
+            if num_gt is None
+            else generate_scenario_entry(
+                split, manifest_seed, index, num_gt=num_gt
+            )
             for index in range(int(episode_count))
         ],
+        "generation_profile": generation_profile,
         "generator_config": {
             "generator": "local-python-and-numpy-rng-v1",
             "numpy_bit_generator": "PCG64",
@@ -309,11 +392,7 @@ def generate_manifest(
 def validate_disjoint_manifests(manifests: Iterable[ScenarioManifest]) -> None:
     seen_ids: set[str] = set()
     seen_seeds: set[int] = set()
-    seen_splits: set[str] = set()
     for manifest in manifests:
-        if manifest.split in seen_splits:
-            raise ValueError(f"duplicate manifest split: {manifest.split}")
-        seen_splits.add(manifest.split)
         ids = {str(entry["scenario_id"]) for entry in manifest.episodes}
         seeds = {int(entry["scenario_seed"]) for entry in manifest.episodes}
         if seen_ids.intersection(ids) or seen_seeds.intersection(seeds):

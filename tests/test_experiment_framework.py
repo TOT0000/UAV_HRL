@@ -35,6 +35,39 @@ class ExperimentFrameworkTest(unittest.TestCase):
         self.assertEqual(args.expected_seed_count, 5)
         self.assertEqual(args.expected_episodes_per_seed, 100)
 
+    def test_manifest_cli_accepts_only_supported_fixed_num_gt(self):
+        parser = build_parser()
+        args = parser.parse_args(
+            [
+                "generate-manifest",
+                "--split",
+                "test",
+                "--manifest-seed",
+                "3",
+                "--episodes",
+                "5",
+                "--num-gt",
+                "4",
+            ]
+        )
+        self.assertEqual(args.num_gt, 4)
+
+        for value in ("1", "10"):
+            with self.subTest(value=value), self.assertRaises(SystemExit):
+                parser.parse_args(
+                    [
+                        "generate-manifest",
+                        "--split",
+                        "test",
+                        "--manifest-seed",
+                        "3",
+                        "--episodes",
+                        "5",
+                        "--num-gt",
+                        value,
+                    ]
+                )
+
     def test_checkpoint_identity_mismatch_fails_fast(self):
         metadata = {
             "experiment": {

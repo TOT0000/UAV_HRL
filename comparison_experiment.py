@@ -22,6 +22,16 @@ def _method(value):
         raise argparse.ArgumentTypeError(str(exc)) from exc
 
 
+def _num_gt(value):
+    try:
+        number = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("num_GT must be an integer") from exc
+    if not 2 <= number <= 9:
+        raise argparse.ArgumentTypeError("num_GT must be in [2, 9]")
+    return number
+
+
 def _load_manifest(path, expected_split=None):
     if path is None:
         raise ValueError("this command requires --manifest")
@@ -47,10 +57,16 @@ def _write_run_metadata(output_dir, result):
 
 def command_generate_manifest(args):
     manifest = generate_manifest(
-        args.split, args.manifest_seed, args.episodes
+        args.split, args.manifest_seed, args.episodes, num_gt=args.num_gt
     )
     path = Path(args.manifest) if args.manifest else (
-        Path(args.output_dir) / "manifests" / f"{args.split}.json"
+        Path(args.output_dir)
+        / "manifests"
+        / (
+            f"{args.split}.json"
+            if args.num_gt is None
+            else f"{args.split}-num-gt-{args.num_gt}.json"
+        )
     )
     manifest.save(path)
     print(
@@ -129,6 +145,7 @@ def build_parser():
     generate.add_argument("--manifest")
     generate.add_argument("--manifest-seed", type=int, required=True)
     generate.add_argument("--episodes", type=int, required=True)
+    generate.add_argument("--num-gt", type=_num_gt)
     generate.add_argument("--output-dir", default=str(DEFAULT_OUTPUT_DIR))
     generate.set_defaults(handler=command_generate_manifest)
 

@@ -217,6 +217,20 @@ def validate_formal_aggregation_rows(
     ]
     if missing:
         raise ValueError(f"evaluation rows are missing columns: {sorted(missing)}")
+    required_text_columns = (
+        "method_id",
+        "evaluation_split",
+        "scenario_id",
+        "evaluation_manifest_hash",
+        "training_manifest_hash",
+        "checkpoint_metadata_fingerprint",
+    )
+    for column in required_text_columns:
+        if any(
+            row[column] is None or not str(row[column]).strip()
+            for row in episode_rows
+        ):
+            raise ValueError(f"identity column {column} must be non-empty")
 
     methods = {str(row["method_id"]) for row in episode_rows}
     if methods != {str(expected_method_id)}:

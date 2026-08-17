@@ -8,7 +8,9 @@ import numpy as np
 
 from Simulator import Simulator
 from scenario_manifest import (
+    OBSOLETE_SCHEMA_VERSION,
     POLICY_DEPENDENT_KEYS,
+    SCENARIO_SCHEMA_VERSION,
     ScenarioManifest,
     generate_manifest,
     sha256_json,
@@ -127,6 +129,80 @@ class ScenarioManifestTest(unittest.TestCase):
         data["content_hash"] = sha256_json(unsigned)
 
         with self.assertRaisesRegex(ValueError, "configuration is incompatible"):
+            ScenarioManifest.from_dict(data)
+
+    def test_mixed_profile_uses_full_supported_num_gt_range(self):
+        manifest = generate_manifest("test", 909, 128)
+        values = {int(entry["num_GT"]) for entry in manifest.episodes}
+
+        self.assertEqual(manifest.schema_version, SCENARIO_SCHEMA_VERSION)
+        self.assertEqual(manifest.generation_profile["num_gt_mode"], "mixed")
+        self.assertEqual(values, set(range(2, 10)))
+
+    def test_fixed_num_gt_profile_applies_to_every_episode_and_environment(self):
+        manifest = generate_manifest("test", 910, 5, num_gt=4)
+
+        self.assertEqual(
+            manifest.generation_profile,
+            {
+                "num_gt_mode": "fixed",
+                "fixed_num_gt": 4,
+                "mixed_num_gt_min": 2,
+                "mixed_num_gt_max": 9,
+            },
+        )
+        self.assertEqual({entry["num_GT"] for entry in manifest.episodes}, {4})
+        env = Simulator(num_UAV=16)
+        env.apply_scenario_entry(manifest.episodes[0])
+        self.assertEqual(env.num_GT, 4)
+        self.assertEqual(len(env.gts), 4)
+        self.assertEqual(len(env.SR_teams), 4)
+
+    def test_fixed_num_gt_boundaries_and_invalid_values(self):
+        self.assertEqual(
+            {entry["num_GT"] for entry in generate_manifest("test", 1, 2, num_gt=2).episodes},
+            {2},
+        )
+        self.assertEqual(
+            {entry["num_GT"] for entry in generate_manifest("test", 1, 2, num_gt=9).episodes},
+            {9},
+        )
+        for value in (1, 10):
+            with self.subTest(value=value), self.assertRaisesRegex(
+                ValueError, r"\[2, 9\]"
+            ):
+                generate_manifest("test", 1, 1, num_gt=value)
+
+    def test_generation_profiles_have_disjoint_ids_and_seeds(self):
+        manifests = [
+            generate_manifest("test", 911, 4),
+            generate_manifest("test", 911, 4, num_gt=4),
+            generate_manifest("test", 911, 4, num_gt=6),
+        ]
+
+        validate_disjoint_manifests(manifests)
+        for left in range(len(manifests)):
+            for right in range(left + 1, len(manifests)):
+                left_ids = {
+                    entry["scenario_id"] for entry in manifests[left].episodes
+                }
+                right_ids = {
+                    entry["scenario_id"] for entry in manifests[right].episodes
+                }
+                left_seeds = {
+                    entry["scenario_seed"] for entry in manifests[left].episodes
+                }
+                right_seeds = {
+                    entry["scenario_seed"] for entry in manifests[right].episodes
+                }
+                self.assertTrue(left_ids.isdisjoint(right_ids))
+                self.assertTrue(left_seeds.isdisjoint(right_seeds))
+
+    def test_v1_manifest_is_explicitly_obsolete(self):
+        data = generate_manifest("test", 912, 1).to_dict()
+        data["schema_version"] = OBSOLETE_SCHEMA_VERSION
+
+        with self.assertRaisesRegex(ValueError, "v1 is obsolete"):
             ScenarioManifest.from_dict(data)
 
 

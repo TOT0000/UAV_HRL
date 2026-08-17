@@ -433,6 +433,11 @@ def _experiment_identity(method_spec, scenario_manifest, training_seed):
         "manifest_split": (
             scenario_manifest.split if scenario_manifest is not None else None
         ),
+        "manifest_generation_profile": (
+            scenario_manifest.generation_profile
+            if scenario_manifest is not None
+            else None
+        ),
         "training_seed": (
             int(training_seed) if training_seed is not None else None
         ),
