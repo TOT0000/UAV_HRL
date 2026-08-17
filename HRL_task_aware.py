@@ -306,6 +306,7 @@ def train(config=None):
         MOVEMENT_STATE_DIM,
         JOINT_ACTION_DIM,
         max_action=1.0,
+        gamma=1.0,
         policy_delay=config.policy_delay,
     )
     ddqn = DDQN(ROUTING_STATE_DIM, env.num_UAV + 1)
@@ -381,7 +382,12 @@ def train(config=None):
             backlog_before = _active_backlog(packet_engine)
             try:
                 state = get_global_movement_state(
-                    env, packet_engine, backlog_before, c_ref_com
+                    env,
+                    packet_engine,
+                    backlog_before,
+                    c_ref_com,
+                    remaining_time=(config.episode_seconds - interval)
+                    / config.episode_seconds,
                 )
                 potentials_t = calculate_movement_potentials(env, c_ref_com)
             except ValueError as exc:
@@ -455,7 +461,12 @@ def train(config=None):
             backlog_after = _active_backlog(packet_engine)
             potentials_t1 = calculate_movement_potentials(env, c_ref_com)
             next_state = get_global_movement_state(
-                env, packet_engine, backlog_after, c_ref_com
+                env,
+                packet_engine,
+                backlog_after,
+                c_ref_com,
+                remaining_time=(config.episode_seconds - (interval + 1))
+                / config.episode_seconds,
             )
             terminal_joint_transitions += int(done)
             joint_replay.add(
@@ -572,6 +583,8 @@ def train(config=None):
         "routing_state_dim": ROUTING_STATE_DIM,
         "movement_state_dim": MOVEMENT_STATE_DIM,
         "joint_action_dim": JOINT_ACTION_DIM,
+        "centralized_td3_gamma": centralized_td3.gamma,
+        "routing_ddqn_gamma": ddqn.gamma,
         "joint_replay_size": joint_replay.size,
         "routing_replay_size": routing_replay.size,
         "lambda": lambda_ee,

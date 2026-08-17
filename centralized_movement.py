@@ -10,7 +10,7 @@ from Fov_model_phase import FovModel
 NUM_UAV = 16
 TASK_TYPES = ("Search", "FOV", "COM", "Hovering")
 LOCAL_MOVEMENT_DIM = 17
-MOVEMENT_STATE_DIM = 531
+MOVEMENT_STATE_DIM = 532
 JOINT_ACTION_DIM = NUM_UAV * 3
 BACKLOG_NORM_REF_BITS = 5e7
 GT_COUNT_MAX = 10
@@ -85,7 +85,9 @@ def _com_capacity_mbps(env, uav_id, task):
     return max(capacity, 0.0)
 
 
-def get_global_movement_state(env, packet_engine, backlog_bits, c_ref_com):
+def get_global_movement_state(
+    env, packet_engine, backlog_bits, c_ref_com, remaining_time
+):
     if env.num_UAV != NUM_UAV:
         raise ValueError(f"centralized movement requires {NUM_UAV} UAVs, got {env.num_UAV}")
     if float(c_ref_com) <= 0 or not math.isfinite(float(c_ref_com)):
@@ -173,11 +175,17 @@ def get_global_movement_state(env, packet_engine, backlog_bits, c_ref_com):
     compressed_map = aggregate_coverage_map(env.visited_bitmap)
     num_gt = int(getattr(env, "num_GT", len(getattr(env, "gts", []))) or 0)
     found_count = int(env.count_found_targets()) if num_gt > 0 else 0
+    remaining_time = float(remaining_time)
+    if not math.isfinite(remaining_time) or not 0.0 <= remaining_time <= 1.0:
+        raise ValueError(
+            f"remaining_time must be finite and within [0, 1], got {remaining_time}"
+        )
     global_scalars = np.asarray(
         [
             float(np.asarray(env.visited_bitmap, dtype=bool).mean()),
             float(found_count / num_gt) if num_gt > 0 else 0.0,
             float(np.clip(num_gt / GT_COUNT_MAX, 0.0, 1.0)),
+            remaining_time,
         ],
         dtype=np.float32,
     )
@@ -294,8 +302,16 @@ def fov_task_metrics(env, uav_id, task):
 
 
 def vs_data_valid(env, uav_id, task):
-    coverage_ratio, _, geometry_valid = fov_task_metrics(env, uav_id, task)
-    return bool(geometry_valid and coverage_ratio >= 1.0 - VS_COVERAGE_EPS)
+    coverage_ratio, image_score, geometry_valid = fov_task_metrics(
+        env, uav_id, task
+    )
+    return bool(
+        geometry_valid
+        and math.isfinite(coverage_ratio)
+        and math.isfinite(image_score)
+        and coverage_ratio >= 1.0 - VS_COVERAGE_EPS
+        and 0.0 < image_score <= 1.0 + VS_COVERAGE_EPS
+    )
 
 
 def calculate_movement_potentials(env, c_ref_com):

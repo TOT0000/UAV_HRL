@@ -1,4 +1,5 @@
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 
@@ -67,6 +68,34 @@ class VisualSensingPacketGateTest(unittest.TestCase):
         self.assertGreater(phi_vs, 0.0)
         self.assertLessEqual(phi_vs, 1.0)
 
+    def test_full_coverage_still_requires_finite_bounded_image_score(self):
+        for image_score in (0.0, -0.1, 1.01, float("nan"), float("inf")):
+            with self.subTest(image_score=image_score), patch(
+                "centralized_movement.fov_task_metrics",
+                return_value=(1.0, image_score, True),
+            ):
+                self.assertFalse(vs_data_valid(self.env, 0, self.task))
+
+        with patch(
+            "centralized_movement.fov_task_metrics",
+            return_value=(float("nan"), 0.5, True),
+        ):
+            self.assertFalse(vs_data_valid(self.env, 0, self.task))
+
+    def test_invalid_image_score_does_not_inject_a_new_packet(self):
+        with patch(
+            "centralized_movement.fov_task_metrics",
+            return_value=(1.0, 1.5, True),
+        ):
+            self.packet_engine.inject_packets(
+                self.env,
+                delay_bound_steps=20,
+                current_time=0.0,
+                step_time=0.25,
+                base_fov_rate=4,
+            )
+        self.assertEqual(self.packet_engine.active_count(), 0)
+
 
 class ComStateCalibrationAndDeliveryTest(unittest.TestCase):
     def setUp(self):
@@ -87,7 +116,11 @@ class ComStateCalibrationAndDeliveryTest(unittest.TestCase):
         ]
         packet_engine = PacketEngine(num_uav=16, step_time=0.25)
         state = get_global_movement_state(
-            self.env, packet_engine, packet_engine.backlog_bits, c_ref_com=1.0
+            self.env,
+            packet_engine,
+            packet_engine.backlog_bits,
+            c_ref_com=1.0,
+            remaining_time=0.5,
         )
         com_flag_index = 5 * LOCAL_MOVEMENT_DIM + 2
         self.assertEqual(state[com_flag_index], 1.0)

@@ -47,7 +47,7 @@ class CentralizedMovementStateTest(unittest.TestCase):
         self.env.reset_environment()
         self.packet_engine = PacketEngine(num_uav=16, step_time=0.25)
 
-    def test_state_is_531_finite_side_effect_free_and_routing_stays_122(self):
+    def test_state_is_532_finite_side_effect_free_and_routing_stays_122(self):
         positions_before = [uav.get_position() for uav in self.env.UAVs]
         tasks_before = {
             uid: [dict(task) for task in tasks]
@@ -57,11 +57,16 @@ class CentralizedMovementStateTest(unittest.TestCase):
         random_before = np.random.get_state()
 
         state = get_global_movement_state(
-            self.env, self.packet_engine, self.packet_engine.backlog_bits, 1.0
+            self.env,
+            self.packet_engine,
+            self.packet_engine.backlog_bits,
+            1.0,
+            remaining_time=0.75,
         )
 
         self.assertEqual(state.shape, (MOVEMENT_STATE_DIM,))
         self.assertTrue(np.isfinite(state).all())
+        self.assertEqual(state[531], 0.75)
         self.assertEqual(positions_before, [uav.get_position() for uav in self.env.UAVs])
         self.assertEqual(tasks_before, self.env.multi_tasks)
         np.testing.assert_array_equal(bitmap_before, self.env.visited_bitmap)
@@ -104,7 +109,34 @@ class CentralizedMovementStateTest(unittest.TestCase):
                         self.packet_engine,
                         self.packet_engine.backlog_bits,
                         1.0,
+                        remaining_time=1.0,
                     )
+
+    def test_remaining_time_is_explicit_and_terminal_state_is_zero(self):
+        start = get_global_movement_state(
+            self.env,
+            self.packet_engine,
+            self.packet_engine.backlog_bits,
+            1.0,
+            remaining_time=1.0,
+        )
+        terminal = get_global_movement_state(
+            self.env,
+            self.packet_engine,
+            self.packet_engine.backlog_bits,
+            1.0,
+            remaining_time=0.0,
+        )
+        self.assertEqual(start[531], 1.0)
+        self.assertEqual(terminal[531], 0.0)
+        with self.assertRaisesRegex(ValueError, "remaining_time"):
+            get_global_movement_state(
+                self.env,
+                self.packet_engine,
+                self.packet_engine.backlog_bits,
+                1.0,
+                remaining_time=1.01,
+            )
 
 
 if __name__ == "__main__":
