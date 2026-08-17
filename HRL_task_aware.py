@@ -1,5 +1,6 @@
 import argparse
 from collections import defaultdict
+import copy
 from dataclasses import asdict, dataclass
 import os
 import random
@@ -28,11 +29,15 @@ from exploration_schedules import (
     td3_behavior_noise,
     td3_decay_steps,
 )
+from evaluation_metrics import safe_energy_efficiency
+from experiment_config import MethodSpec
 from td3 import TD3
 from training_checkpoint import (
     load_full_resume_checkpoint,
+    load_model_checkpoint,
     save_full_resume_checkpoint,
     save_model_checkpoint,
+    validate_checkpoint_experiment_metadata,
 )
 import utils_update_v2
 
@@ -193,6 +198,7 @@ def _run_routing_slot(
     delay_bound_steps,
     violation_stats,
     epsilon,
+    write_replay=True,
 ):
     step_time = float(packet_engine.step_time)
     env.current_time = float(current_time)
@@ -277,18 +283,19 @@ def _run_routing_slot(
         )
         for uid in uavs_with_packets
     }
-    for uid in uavs_with_packets:
-        next_hol = packet_engine.get_hol_packet(uid)
-        transition_done = _routing_transition_done(done, next_hol)
-        routing_buffer.add(
-            states[uid],
-            int(next_hops.get(uid, uid)),
-            next_states.get(uid, states[uid]),
-            float(slot_result["reward_by_sender"][uid]),
-            float(slot_result["cost_by_sender"][uid]),
-            transition_done,
-            tag_gt=env.num_GT,
-        )
+    if write_replay:
+        for uid in uavs_with_packets:
+            next_hol = packet_engine.get_hol_packet(uid)
+            transition_done = _routing_transition_done(done, next_hol)
+            routing_buffer.add(
+                states[uid],
+                int(next_hops.get(uid, uid)),
+                next_states.get(uid, states[uid]),
+                float(slot_result["reward_by_sender"][uid]),
+                float(slot_result["cost_by_sender"][uid]),
+                transition_done,
+                tag_gt=env.num_GT,
+            )
     return (
         float(slot_result["timely_goodput_bits"]),
         float(sum(slot_result["reward_by_sender"].values())),
@@ -413,12 +420,142 @@ def _full_training_state(
     }
 
 
-def train(config=None):
+def _experiment_identity(method_spec, scenario_manifest, training_seed):
+    return {
+        "method_id": method_spec.method_id,
+        "method_spec": method_spec.to_dict(),
+        "method_spec_fingerprint": method_spec.fingerprint,
+        "manifest_hash": (
+            scenario_manifest.content_hash
+            if scenario_manifest is not None
+            else None
+        ),
+        "manifest_split": (
+            scenario_manifest.split if scenario_manifest is not None else None
+        ),
+        "training_seed": (
+            int(training_seed) if training_seed is not None else None
+        ),
+    }
+
+
+def _evaluation_state_snapshot(td3, ddqn, joint_replay, routing_replay, lambda_ee):
+    """Copy all learning state that evaluation is forbidden to mutate."""
+
+    return {
+        "online_networks": copy.deepcopy(
+            {
+                "actor": td3.actor.state_dict(),
+                "critic_1": td3.critic_1.state_dict(),
+                "critic_2": td3.critic_2.state_dict(),
+                "q_network": ddqn.q_network.state_dict(),
+                "cost_network": ddqn.cost_network.state_dict(),
+            }
+        ),
+        "target_networks": copy.deepcopy(
+            {
+                "actor_target": td3.actor_target.state_dict(),
+                "critic_1_target": td3.critic_1_target.state_dict(),
+                "critic_2_target": td3.critic_2_target.state_dict(),
+                "target_q_network": ddqn.target_q_network.state_dict(),
+                "target_cost_network": ddqn.target_cost_network.state_dict(),
+            }
+        ),
+        "optimizers": copy.deepcopy(
+            {
+                "actor": td3.actor_optimizer.state_dict(),
+                "critic_1": td3.critic_1_optimizer.state_dict(),
+                "critic_2": td3.critic_2_optimizer.state_dict(),
+                "ddqn_reward": ddqn.optimizer.state_dict(),
+                "ddqn_cost": ddqn.cost_optimizer.state_dict(),
+            }
+        ),
+        "joint_replay_size": int(joint_replay.size),
+        "routing_replay_size": int(routing_replay.size),
+        "lambda_ee": float(lambda_ee),
+    }
+
+
+def _nested_state_equal(left, right):
+    if isinstance(left, torch.Tensor):
+        return isinstance(right, torch.Tensor) and torch.equal(left, right)
+    if isinstance(left, np.ndarray):
+        return isinstance(right, np.ndarray) and np.array_equal(left, right)
+    if isinstance(left, dict):
+        return (
+            isinstance(right, dict)
+            and left.keys() == right.keys()
+            and all(_nested_state_equal(left[key], right[key]) for key in left)
+        )
+    if isinstance(left, (list, tuple)):
+        return (
+            isinstance(right, type(left))
+            and len(left) == len(right)
+            and all(_nested_state_equal(a, b) for a, b in zip(left, right))
+        )
+    return left == right
+
+
+def _evaluation_invariants(before, after, routing_epsilon_log, td3_noise_log):
+    checks = {
+        "online_networks_unchanged": _nested_state_equal(
+            before["online_networks"], after["online_networks"]
+        ),
+        "target_networks_unchanged": _nested_state_equal(
+            before["target_networks"], after["target_networks"]
+        ),
+        "optimizer_states_unchanged": _nested_state_equal(
+            before["optimizers"], after["optimizers"]
+        ),
+        "replay_sizes_unchanged": (
+            before["joint_replay_size"] == after["joint_replay_size"]
+            and before["routing_replay_size"] == after["routing_replay_size"]
+        ),
+        "lambda_unchanged": before["lambda_ee"] == after["lambda_ee"],
+        "exploration_disabled": (
+            not td3_noise_log
+            and all(float(epsilon) == 0.0 for epsilon in routing_epsilon_log)
+        ),
+    }
+    if not all(checks.values()):
+        failed = sorted(name for name, passed in checks.items() if not passed)
+        raise AssertionError(f"evaluation mutated learning state: {failed}")
+    return checks
+
+
+def train(
+    config=None,
+    *,
+    scenario_manifest=None,
+    method_spec=None,
+    evaluation=False,
+    checkpoint_dir=None,
+):
     if config is None:
         raise ValueError(
             "training config is required; use smoke_training_config() or "
             "formal_training_config(total_episodes)"
         )
+    method_spec = method_spec or MethodSpec()
+    # Reconstructing validates even subclasses or deserialized specifications.
+    MethodSpec(**{
+        key: value
+        for key, value in method_spec.to_dict().items()
+        if key != "method_id"
+    })
+    if scenario_manifest is not None:
+        if scenario_manifest.episode_count < config.total_episodes:
+            raise ValueError(
+                "scenario manifest has fewer entries than requested episodes"
+            )
+        if config.mode == "train" and scenario_manifest.split != "train":
+            raise ValueError("formal training requires a train scenario manifest")
+        if evaluation and scenario_manifest.split not in {"validation", "test"}:
+            raise ValueError("evaluation requires validation or test scenarios")
+    if evaluation and checkpoint_dir is None:
+        raise ValueError("evaluation requires a model checkpoint")
+    if evaluation and config.resume_dir is not None:
+        raise ValueError("evaluation cannot load a full-resume training state")
     _seed_training_rng(config.random_seed)
 
     c_ref_com, calibration = load_com_capacity_reference()
@@ -445,7 +582,27 @@ def train(config=None):
         gamma=0.99,
     )
 
+    experiment_identity = _experiment_identity(
+        method_spec, scenario_manifest, config.random_seed
+    )
+    loaded_checkpoint_metadata = None
+    if evaluation:
+        loaded_checkpoint_metadata = load_model_checkpoint(
+            checkpoint_dir, centralized_td3, ddqn
+        )
+        validate_checkpoint_experiment_metadata(
+            loaded_checkpoint_metadata,
+            {
+                "method_spec_fingerprint": method_spec.fingerprint,
+                "training_seed": int(config.random_seed),
+            },
+        )
+
     lambda_ee = 0.1
+    if loaded_checkpoint_metadata is not None:
+        lambda_ee = float(
+            loaded_checkpoint_metadata["experiment"].get("lambda_ee", lambda_ee)
+        )
     start_episode = 0
     reward_log = []
     delivered_log = []
@@ -455,6 +612,7 @@ def train(config=None):
     routing_slots_executed = 0
     td3_noise_log = []
     routing_epsilon_log = []
+    episode_metrics = []
     if config.resume_dir is not None:
         if not os.path.isdir(config.resume_dir):
             raise FileNotFoundError(f"centralized checkpoint not found: {config.resume_dir}")
@@ -468,6 +626,15 @@ def train(config=None):
             joint_action_dim=JOINT_ACTION_DIM,
             routing_state_dim=ROUTING_STATE_DIM,
             calibration=calibration,
+            expected_experiment_metadata=(
+                {
+                    "method_spec_fingerprint": method_spec.fingerprint,
+                    "manifest_hash": scenario_manifest.content_hash,
+                    "training_seed": int(config.random_seed),
+                }
+                if scenario_manifest is not None
+                else None
+            ),
         )
         _validate_resume_config(restored["formal_config"], config)
         training_state = restored["training_state"]
@@ -489,6 +656,14 @@ def train(config=None):
         if int(training_state["ddqn_schedule_slot"]) != routing_slots_executed:
             raise RuntimeError("DDQN exploration counter is inconsistent with slot history")
 
+    evaluation_state_before = (
+        _evaluation_state_snapshot(
+            centralized_td3, ddqn, joint_replay, routing_replay, lambda_ee
+        )
+        if evaluation
+        else None
+    )
+
     initial_log_length = len(reward_log)
     duplicate_target_assertions = 0
     environment_actor_calls = 0
@@ -509,9 +684,17 @@ def train(config=None):
 
     last_completed_episode = start_episode - 1
     ddqn_action_selections = 0
+    executed_scenario_ids = []
     for episode in range(start_episode, config.total_episodes):
-        env.num_GT = int(np.random.randint(2, 10))
-        env.reset_environment()
+        if scenario_manifest is None:
+            env.num_GT = int(np.random.randint(2, 10))
+            env.reset_environment()
+            scenario_id = None
+        else:
+            scenario_entry = scenario_manifest.episodes[episode]
+            env.apply_scenario_entry(scenario_entry)
+            scenario_id = str(scenario_entry["scenario_id"])
+        executed_scenario_ids.append(scenario_id)
         packet_engine.reset_packet_state()
         env.lambda_EE_global = float(lambda_ee)
         episode_lambda = float(lambda_ee)
@@ -555,7 +738,11 @@ def train(config=None):
                     duplicate_target_assertions += 1
                 raise
 
-            if _uses_warmup_random_action(
+            if evaluation:
+                raw_joint_action = centralized_td3.select_action(
+                    state, add_noise=False, noise_std=0.0
+                )
+            elif _uses_warmup_random_action(
                 total_joint_transitions, config.warmup_joint_transitions
             ):
                 raw_joint_action = np.random.uniform(
@@ -601,8 +788,12 @@ def train(config=None):
 
             interval_delivered_bits = 0.0
             for routing_slot in range(MOVEMENT_CONTROL_INTERVAL):
-                slot_epsilon = ddqn_epsilon(
-                    routing_slots_executed, ddqn_schedule_decay
+                slot_epsilon = (
+                    0.0
+                    if evaluation
+                    else ddqn_epsilon(
+                        routing_slots_executed, ddqn_schedule_decay
+                    )
                 )
                 routing_epsilon_log.append(slot_epsilon)
                 routing_slots_executed += 1
@@ -622,6 +813,7 @@ def train(config=None):
                     delay_bound_steps=delay_bound_steps,
                     violation_stats=violation_stats,
                     epsilon=slot_epsilon,
+                    write_replay=not evaluation,
                 )
                 ddqn_action_selections += action_selections
                 interval_delivered_bits += delivered_bits
@@ -642,20 +834,21 @@ def train(config=None):
                 / config.episode_seconds,
             )
             terminal_joint_transitions += int(done)
-            joint_replay.add(
-                state,
-                projected_action,
-                next_state,
-                done=done,
-                delivered_mbits=interval_delivered_mbits,
-                total_mobility_energy=interval_energy,
-                phi_search_t=potentials_t[0],
-                phi_search_t1=potentials_t1[0],
-                phi_vs_t=potentials_t[1],
-                phi_vs_t1=potentials_t1[1],
-                phi_com_t=potentials_t[2],
-                phi_com_t1=potentials_t1[2],
-            )
+            if not evaluation:
+                joint_replay.add(
+                    state,
+                    projected_action,
+                    next_state,
+                    done=done,
+                    delivered_mbits=interval_delivered_mbits,
+                    total_mobility_energy=interval_energy,
+                    phi_search_t=potentials_t[0],
+                    phi_search_t1=potentials_t1[0],
+                    phi_vs_t=potentials_t[1],
+                    phi_vs_t1=potentials_t1[1],
+                    phi_com_t=potentials_t[2],
+                    phi_com_t1=potentials_t1[2],
+                )
             total_joint_transitions += 1
             episode_delivered_mbits += interval_delivered_mbits
             episode_energy += interval_energy
@@ -671,7 +864,8 @@ def train(config=None):
             )
 
             if (
-                total_joint_transitions >= config.warmup_joint_transitions
+                not evaluation
+                and total_joint_transitions >= config.warmup_joint_transitions
                 and joint_replay.size >= config.batch_size
             ):
                 centralized_td3.update_joint(
@@ -683,19 +877,66 @@ def train(config=None):
                     beta_com=config.beta_com,
                 )
 
-        lambda_ee = _dinkelbach_update(
-            episode_delivered_mbits, episode_energy, lambda_ee
-        )
+        if not evaluation:
+            lambda_ee = _dinkelbach_update(
+                episode_delivered_mbits, episode_energy, lambda_ee
+            )
         env.lambda_EE_global = lambda_ee
-        if routing_replay.size >= config.batch_size:
+        if not evaluation and routing_replay.size >= config.batch_size:
             ddqn.train(routing_replay, config.batch_size)
-        ddqn.update_target()
+        if not evaluation:
+            ddqn.update_target()
 
         reward_log.append(episode_reward)
         delivered_log.append(episode_delivered_mbits)
         energy_log.append(episode_energy)
         lambda_log.append(lambda_ee)
         last_completed_episode = episode
+        coverage = float(env.visited_bitmap.mean())
+        found_gt_ratio = (
+            float(env.count_found_targets()) / float(env.num_GT)
+            if int(env.num_GT) > 0
+            else 0.0
+        )
+        timely_goodput_mbits = float(packet_engine.timely_goodput_bits) / 1e6
+        raw_final_hop_mbits = float(packet_engine.raw_final_hop_bits) / 1e6
+        episode_metrics.append(
+            {
+                "method_id": method_spec.method_id,
+                "training_seed": (
+                    int(config.random_seed)
+                    if config.random_seed is not None
+                    else None
+                ),
+                "scenario_id": scenario_id,
+                "manifest_hash": (
+                    scenario_manifest.content_hash
+                    if scenario_manifest is not None
+                    else None
+                ),
+                "num_GT": int(env.num_GT),
+                "timely_goodput_mbits": timely_goodput_mbits,
+                "raw_final_hop_mbits": raw_final_hop_mbits,
+                "total_mobility_energy_j": float(episode_energy),
+                "energy_efficiency_mbit_per_j": safe_energy_efficiency(
+                    timely_goodput_mbits, episode_energy
+                ),
+                "fov_timely_delivered_packets": int(packet_engine.fov_delivered),
+                "com_timely_delivered_packets": int(packet_engine.com_delivered),
+                "fov_deadline_violations": int(packet_engine.fov_violated),
+                "com_deadline_violations": int(packet_engine.com_violated),
+                "total_deadline_violations": int(packet_engine.total_violated),
+                "coverage": coverage,
+                "found_GT_ratio": found_gt_ratio,
+                "routing_wait_count": int(packet_engine.wait_actions),
+                "partial_transmission_count": int(
+                    packet_engine.partial_transmissions
+                ),
+                "slot_budget_violation_count": int(
+                    packet_engine.link_slot_budget_violations
+                ),
+            }
+        )
         print(
             f"[Episode {episode + 1}] joint_transitions={config.episode_seconds} "
             f"reward={episode_reward:.6f} delivered={episode_delivered_mbits:.6f} Mbit "
@@ -710,6 +951,8 @@ def train(config=None):
         )
 
         if (
+            not evaluation
+            and
             config.enable_model_checkpoints
             and config.model_checkpoint_every > 0
             and (episode + 1) % config.model_checkpoint_every == 0
@@ -725,8 +968,15 @@ def train(config=None):
                 joint_action_dim=JOINT_ACTION_DIM,
                 routing_state_dim=ROUTING_STATE_DIM,
                 calibration=calibration,
+                experiment_metadata={
+                    **experiment_identity,
+                    "lambda_ee": float(lambda_ee),
+                    "formal_config": asdict(config),
+                },
             )
         if (
+            not evaluation
+            and
             config.enable_full_resume
             and config.full_resume_every > 0
             and (episode + 1) % config.full_resume_every == 0
@@ -758,9 +1008,18 @@ def train(config=None):
                 joint_action_dim=JOINT_ACTION_DIM,
                 routing_state_dim=ROUTING_STATE_DIM,
                 calibration=calibration,
+                experiment_metadata={
+                    **experiment_identity,
+                    "lambda_ee": float(lambda_ee),
+                    "formal_config": asdict(config),
+                },
             )
 
-    if config.enable_full_resume and last_completed_episode >= 0:
+    if (
+        not evaluation
+        and config.enable_full_resume
+        and last_completed_episode >= 0
+    ):
         save_full_resume_checkpoint(
             os.path.join(
                 config.checkpoint_root,
@@ -790,6 +1049,11 @@ def train(config=None):
             joint_action_dim=JOINT_ACTION_DIM,
             routing_state_dim=ROUTING_STATE_DIM,
             calibration=calibration,
+            experiment_metadata={
+                **experiment_identity,
+                "lambda_ee": float(lambda_ee),
+                "formal_config": asdict(config),
+            },
         )
 
     if config.enable_csv:
@@ -820,6 +1084,18 @@ def train(config=None):
         plt.legend()
         plt.tight_layout()
         plt.show()
+
+    evaluation_invariants = None
+    if evaluation:
+        evaluation_state_after = _evaluation_state_snapshot(
+            centralized_td3, ddqn, joint_replay, routing_replay, lambda_ee
+        )
+        evaluation_invariants = _evaluation_invariants(
+            evaluation_state_before,
+            evaluation_state_after,
+            routing_epsilon_log,
+            td3_noise_log,
+        )
 
     backlog_invariant_passed = None
     deadline_counter_consistent = None
@@ -880,6 +1156,15 @@ def train(config=None):
         "link_slot_budget_violations": packet_engine.link_slot_budget_violations,
         "backlog_invariant_passed": backlog_invariant_passed,
         "deadline_counter_consistent": deadline_counter_consistent,
+        "evaluation": bool(evaluation),
+        "evaluation_invariants": evaluation_invariants,
+        "scenario_ids": executed_scenario_ids,
+        "episode_metrics": episode_metrics,
+        "run_metadata": {
+            **experiment_identity,
+            "formal_config": asdict(config),
+            "evaluation": bool(evaluation),
+        },
         "reward_log": reward_log,
         "delivered_log": delivered_log,
         "energy_log": energy_log,

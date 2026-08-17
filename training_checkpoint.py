@@ -87,8 +87,9 @@ def _base_metadata(
     td3,
     ddqn,
     calibration,
+    experiment_metadata=None,
 ):
-    return {
+    metadata = {
         "checkpoint_schema_version": CHECKPOINT_SCHEMA_VERSION,
         "checkpoint_type": checkpoint_type,
         "episode": int(episode),
@@ -99,6 +100,9 @@ def _base_metadata(
         "routing_ddqn_gamma": float(ddqn.gamma),
         "com_calibration_fingerprint": calibration_fingerprint(calibration),
     }
+    if experiment_metadata is not None:
+        metadata["experiment"] = dict(experiment_metadata)
+    return metadata
 
 
 def save_model_checkpoint(
@@ -111,6 +115,7 @@ def save_model_checkpoint(
     joint_action_dim,
     routing_state_dim,
     calibration,
+    experiment_metadata=None,
 ):
     checkpoint_dir = Path(checkpoint_dir)
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
@@ -123,6 +128,7 @@ def save_model_checkpoint(
         td3,
         ddqn,
         calibration,
+        experiment_metadata,
     )
     torch.save(_network_states(td3, ddqn), checkpoint_dir / "models.pt")
     (checkpoint_dir / "metadata.json").write_text(
@@ -227,6 +233,7 @@ def save_full_resume_checkpoint(
     joint_action_dim,
     routing_state_dim,
     calibration,
+    experiment_metadata=None,
 ):
     checkpoint_dir = Path(checkpoint_dir)
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
@@ -239,6 +246,7 @@ def save_full_resume_checkpoint(
         td3,
         ddqn,
         calibration,
+        experiment_metadata,
     )
     replay_metadata = {
         "joint": _save_replay(
@@ -303,6 +311,7 @@ def _validate_full_metadata(
     td3_gamma,
     ddqn_gamma,
     calibration,
+    expected_experiment_metadata=None,
 ):
     if metadata.get("checkpoint_type") != FULL_CHECKPOINT_TYPE:
         raise RuntimeError(
@@ -333,6 +342,27 @@ def _validate_full_metadata(
     expected_fingerprint = calibration_fingerprint(calibration)
     if metadata.get("com_calibration_fingerprint") != expected_fingerprint:
         raise RuntimeError("checkpoint COM calibration fingerprint is incompatible")
+    if expected_experiment_metadata is not None:
+        validate_checkpoint_experiment_metadata(
+            metadata, expected_experiment_metadata
+        )
+
+
+def validate_checkpoint_experiment_metadata(metadata, expected):
+    """Validate only requested experiment identity fields for compatibility."""
+
+    actual = metadata.get("experiment")
+    if actual is None:
+        raise RuntimeError("checkpoint has no experiment identity metadata")
+    mismatches = {
+        key: (actual.get(key), value)
+        for key, value in expected.items()
+        if actual.get(key) != value
+    }
+    if mismatches:
+        raise RuntimeError(
+            f"checkpoint experiment metadata is incompatible: {mismatches}"
+        )
 
 
 def load_full_resume_checkpoint(
@@ -346,6 +376,7 @@ def load_full_resume_checkpoint(
     joint_action_dim,
     routing_state_dim,
     calibration,
+    expected_experiment_metadata=None,
 ):
     checkpoint_dir = Path(checkpoint_dir)
     metadata_path = checkpoint_dir / "metadata.json"
@@ -369,6 +400,7 @@ def load_full_resume_checkpoint(
         td3_gamma=td3.gamma,
         ddqn_gamma=ddqn.gamma,
         calibration=calibration,
+        expected_experiment_metadata=expected_experiment_metadata,
     )
     state_path = checkpoint_dir / "training_state.pt"
     if not state_path.is_file():
