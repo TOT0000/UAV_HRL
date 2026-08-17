@@ -142,6 +142,8 @@ def load_model_checkpoint(checkpoint_dir, td3, ddqn):
     metadata = json.loads(
         (checkpoint_dir / "metadata.json").read_text(encoding="utf-8")
     )
+    if metadata.get("checkpoint_type") != MODEL_CHECKPOINT_TYPE:
+        raise RuntimeError("evaluation requires a model-only checkpoint")
     payload = torch.load(
         checkpoint_dir / "models.pt", map_location="cpu", weights_only=False
     )

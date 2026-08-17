@@ -36,6 +36,14 @@ EPISODE_COLUMNS = (
 
 METRIC_COLUMNS = EPISODE_COLUMNS[4:]
 
+AGGREGATION_METADATA = {
+    "evaluation_unit": "episode",
+    "uncertainty_unit": "trained-policy seed mean",
+    "standard_deviation": "sample (n-1)",
+    "confidence_interval": "mean +/- 1.96 * sample_stddev / sqrt(seed_count)",
+    "pooled_episode_inference": False,
+}
+
 
 def safe_energy_efficiency(timely_goodput_mbits, mobility_energy_j):
     numerator = float(timely_goodput_mbits)
@@ -181,6 +189,8 @@ def _read_episode_csvs(input_dir):
 def run_evaluation_command(args):
     from HRL_task_aware import TrainingConfig, train
 
+    if args.resume is not None:
+        raise ValueError("evaluation accepts --checkpoint, not --resume")
     manifest = ScenarioManifest.load(args.manifest)
     if manifest.split != args.split:
         raise ValueError(
@@ -250,6 +260,16 @@ def run_aggregate_command(args):
     _write_csv(output_dir / "cross_seed_summary.csv", aggregate_rows, aggregate_fields)
     (output_dir / "cross_seed_summary.json").write_text(
         json.dumps(aggregate_rows, indent=2, ensure_ascii=False, allow_nan=False)
+        + "\n",
+        encoding="utf-8",
+    )
+    (output_dir / "aggregation_metadata.json").write_text(
+        json.dumps(
+            AGGREGATION_METADATA,
+            indent=2,
+            ensure_ascii=False,
+            allow_nan=False,
+        )
         + "\n",
         encoding="utf-8",
     )

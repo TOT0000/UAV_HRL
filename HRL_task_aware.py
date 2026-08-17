@@ -554,6 +554,8 @@ def train(
             raise ValueError("evaluation requires validation or test scenarios")
     if evaluation and checkpoint_dir is None:
         raise ValueError("evaluation requires a model checkpoint")
+    if evaluation and config.random_seed is None:
+        raise ValueError("evaluation requires the checkpoint training seed")
     if evaluation and config.resume_dir is not None:
         raise ValueError("evaluation cannot load a full-resume training state")
     _seed_training_rng(config.random_seed)
