@@ -714,6 +714,12 @@ def inspect_full_resume_checkpoint(
             f"metadata={completed_episode}"
         )
     if expected_formal_config is not None:
+        experiment = metadata.get("experiment") or {}
+        _validate_formal_config(
+            experiment.get("formal_config"),
+            expected_formal_config,
+            FULL_RESUME_CONFIG_FIELDS,
+        )
         _validate_formal_config(
             formal_config,
             expected_formal_config,

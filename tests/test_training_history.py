@@ -251,6 +251,19 @@ class TrainingHistoryPersistenceTest(unittest.TestCase):
             ):
                 prepare_training_history(temp_dir, self.identity)
 
+    def test_transaction_work_files_fit_a_long_canonical_run_path(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            run_dir = Path(temp_dir) / ("method-" + "m" * 72) / ("seed-" + "s" * 62)
+            written = write_training_history(
+                run_dir, [self._row(1)], self.identity
+            )
+
+            self.assertEqual(written, [self._row(1)])
+            self.assertEqual(
+                read_committed_training_history(run_dir, self.identity),
+                written,
+            )
+
 
 class TrainingHistoryResumeIntegrationTest(unittest.TestCase):
     def test_short_exact_resume_reconciles_history_without_duplicate_rows(self):

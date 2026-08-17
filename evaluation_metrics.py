@@ -11,13 +11,18 @@ from statistics import fmean, stdev
 
 from scipy.stats import t as student_t
 
-from experiment_config import FORMAL_EXPERIMENT_DEFAULTS
+from centralized_movement import JOINT_ACTION_DIM, MOVEMENT_STATE_DIM
+from com_capacity_calibration import load_com_capacity_reference
+from experiment_config import FORMAL_EXPERIMENT_DEFAULTS, MethodSpec
 from experiment_paths import (
     evaluation_run_directory,
     evaluation_run_identity,
     prepare_run_directory,
+    validate_run_directory_preflight,
+    write_run_status,
 )
 from scenario_manifest import ScenarioManifest
+from training_checkpoint import inspect_model_checkpoint
 
 
 IDENTITY_COLUMNS = (
@@ -380,26 +385,87 @@ def _read_episode_csvs(input_dir):
 
 
 def run_evaluation_command(args):
-    from HRL_task_aware import TrainingConfig, formal_training_config, train
+    preflight = _evaluation_preflight(args)
+    run_dir = prepare_run_directory(
+        preflight["run_directory"], preflight["identity"]
+    )
+    try:
+        write_run_status(run_dir, "RUNNING")
+        result = preflight["train"](
+            preflight["config"],
+            scenario_manifest=preflight["manifest"],
+            method_spec=preflight["method"],
+            evaluation=True,
+            checkpoint_dir=args.checkpoint,
+            expected_checkpoint_episodes=FORMAL_EXPERIMENT_DEFAULTS[
+                "training_episodes_per_seed"
+            ],
+            expected_checkpoint_formal_config=preflight[
+                "expected_training_config"
+            ],
+        )
+        metadata = {
+            **result["run_metadata"],
+            "checkpoint": str(Path(args.checkpoint).resolve()),
+            "evaluation_invariants": result["evaluation_invariants"],
+            "run_directory": str(run_dir),
+            "run_identity": preflight["identity"],
+            "run_status_file": str(run_dir / "run_status.json"),
+        }
+        paths = write_evaluation_outputs(
+            run_dir, result["episode_metrics"], metadata
+        )
+        write_run_status(run_dir, "COMPLETED")
+        print(
+            json.dumps(
+                {name: str(path) for name, path in paths.items()},
+                ensure_ascii=False,
+            )
+        )
+    except BaseException as exc:
+        try:
+            write_run_status(run_dir, "FAILED", exception=exc)
+        except BaseException:
+            pass
+        raise
+    return 0
+
+
+def _evaluation_preflight(args):
+    """Validate evaluation inputs and checkpoint metadata without weights."""
+
+    from HRL_task_aware import (
+        ROUTING_STATE_DIM,
+        TrainingConfig,
+        formal_training_config,
+        train,
+    )
 
     if args.resume is not None:
         raise ValueError("evaluation accepts --checkpoint, not --resume")
+    method = args.method
+    MethodSpec(**{
+        key: value
+        for key, value in method.to_dict().items()
+        if key != "method_id"
+    })
     manifest = ScenarioManifest.load(args.manifest)
     if manifest.split != args.split:
         raise ValueError(
             f"manifest split mismatch: manifest={manifest.split}, requested={args.split}"
         )
-    identity = evaluation_run_identity(
-        args.method, manifest, args.training_seed
-    )
-    run_dir = evaluation_run_directory(
-        args.output_dir, args.method, manifest, args.training_seed
-    )
-    run_dir = prepare_run_directory(run_dir, identity)
     episode_count = (
         int(args.episodes)
         if args.episodes is not None
         else FORMAL_EXPERIMENT_DEFAULTS["evaluation_episodes_per_trained_seed"]
+    )
+    if manifest.episode_count < episode_count:
+        raise ValueError(
+            "scenario manifest has fewer entries than requested episodes"
+        )
+    identity = evaluation_run_identity(method, manifest, args.training_seed)
+    run_dir = evaluation_run_directory(
+        args.output_dir, method, manifest, args.training_seed
     )
     config = TrainingConfig(
         total_episodes=episode_count,
@@ -420,33 +486,35 @@ def run_evaluation_command(args):
             random_seed=args.training_seed,
         )
     )
-    result = train(
-        config,
-        scenario_manifest=manifest,
-        method_spec=args.method,
-        evaluation=True,
-        checkpoint_dir=args.checkpoint,
-        expected_checkpoint_episodes=FORMAL_EXPERIMENT_DEFAULTS[
+    _, calibration = load_com_capacity_reference()
+    inspect_model_checkpoint(
+        args.checkpoint,
+        movement_state_dim=MOVEMENT_STATE_DIM,
+        joint_action_dim=JOINT_ACTION_DIM,
+        routing_state_dim=ROUTING_STATE_DIM,
+        td3_gamma=1.0,
+        ddqn_gamma=0.99,
+        calibration=calibration,
+        expected_experiment_metadata={
+            "method_spec_fingerprint": method.fingerprint,
+            "training_seed": int(args.training_seed),
+        },
+        expected_completed_episodes=FORMAL_EXPERIMENT_DEFAULTS[
             "training_episodes_per_seed"
         ],
-        expected_checkpoint_formal_config=expected_training_config,
+        expected_formal_config=expected_training_config,
+        require_episode_directory=True,
     )
-    metadata = {
-        **result["run_metadata"],
-        "checkpoint": str(Path(args.checkpoint).resolve()),
-        "evaluation_invariants": result["evaluation_invariants"],
-        "run_directory": str(run_dir),
-        "run_identity": identity,
+    validate_run_directory_preflight(run_dir, identity)
+    return {
+        "method": method,
+        "manifest": manifest,
+        "identity": identity,
+        "run_directory": Path(run_dir).resolve(),
+        "config": config,
+        "expected_training_config": expected_training_config,
+        "train": train,
     }
-    paths = write_evaluation_outputs(
-        run_dir, result["episode_metrics"], metadata
-    )
-    print(
-        json.dumps(
-            {name: str(path) for name, path in paths.items()}, ensure_ascii=False
-        )
-    )
-    return 0
 
 
 def run_aggregate_command(args):

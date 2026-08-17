@@ -186,13 +186,12 @@ def write_training_history(
         or "\\" in transaction_id
     ):
         raise ValueError("training history transaction id is not filesystem-safe")
-    transaction_directory = (
-        run_directory / f".training-history-txn-{transaction_id}"
-    )
+    transaction_slug = hashlib.sha256(transaction_id.encode("utf-8")).hexdigest()[:16]
+    transaction_directory = run_directory / f".th-{transaction_slug}"
     transaction_directory.mkdir()
-    jsonl_temporary = transaction_directory / TRAINING_HISTORY_JSONL
-    csv_temporary = transaction_directory / TRAINING_HISTORY_CSV
-    commit_temporary = transaction_directory / TRAINING_HISTORY_COMMIT
+    jsonl_temporary = transaction_directory / "j.tmp"
+    csv_temporary = transaction_directory / "c.tmp"
+    commit_temporary = transaction_directory / "m.tmp"
     commit = _commit_metadata(
         identity, normalized, csv_bytes, jsonl_bytes, transaction_id
     )
@@ -341,6 +340,16 @@ def prepare_training_history(
         return []
 
     canonical = validate_training_history(checkpoint_rows, identity)
+    _validate_resume_history_on_disk(run_directory, identity, canonical)
+    write_training_history(run_directory, canonical, identity)
+    return canonical
+
+
+def _validate_resume_history_on_disk(run_directory, identity, canonical):
+    """Validate committed history/prefix without repairing or writing it."""
+
+    paths = _history_paths(run_directory)
+    any_history_artifact = any(path.is_file() for path in paths.values())
     existing_sets = []
     if any_history_artifact:
         try:
@@ -358,5 +367,14 @@ def prepare_training_history(
             raise RuntimeError(
                 "training history does not match the exact-resume checkpoint prefix"
             )
-    write_training_history(run_directory, canonical, identity)
+    return canonical
+
+
+def preflight_resume_training_history(
+    run_directory, identity, *, checkpoint_rows
+):
+    """Check whether checkpoint rows can safely repair/continue disk history."""
+
+    canonical = validate_training_history(checkpoint_rows, identity)
+    _validate_resume_history_on_disk(run_directory, identity, canonical)
     return canonical

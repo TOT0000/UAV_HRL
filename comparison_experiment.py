@@ -15,6 +15,8 @@ from experiment_paths import (
     prepare_run_directory,
     training_run_directory,
     training_run_identity,
+    validate_run_directory_preflight,
+    write_run_status,
 )
 from HRL_task_aware import (
     ROUTING_STATE_DIM,
@@ -30,6 +32,10 @@ from scenario_manifest import ScenarioManifest, generate_manifest
 from training_checkpoint import (
     inspect_full_resume_checkpoint,
     inspect_model_checkpoint,
+)
+from training_history import (
+    preflight_resume_training_history,
+    training_history_identity,
 )
 
 
@@ -120,12 +126,66 @@ def command_smoke(args):
 
 
 def command_train(args):
+    preflight = _training_preflight(args)
+    method = preflight["method"]
+    manifest = preflight["manifest"]
+    identity = preflight["identity"]
+    run_dir = prepare_run_directory(
+        preflight["run_directory"],
+        identity,
+        resume_checkpoint=args.resume,
+    )
+    try:
+        reconciliation_plan = preflight["reconciliation_plan"]
+        reconciliation = (
+            execute_resume_reconciliation(reconciliation_plan)
+            if reconciliation_plan is not None
+            else None
+        )
+        write_run_status(run_dir, "RUNNING")
+        result = train(
+            preflight["config"],
+            scenario_manifest=manifest,
+            method_spec=method,
+        )
+        result["run_metadata"].update(
+            {
+                "run_directory": str(run_dir),
+                "run_identity": identity,
+                "run_status_file": str(run_dir / "run_status.json"),
+            }
+        )
+        if reconciliation is not None:
+            result["run_metadata"]["resume_reconciliation"] = reconciliation
+        _write_run_metadata(run_dir, result)
+        write_run_status(run_dir, "COMPLETED")
+    except BaseException as exc:
+        try:
+            write_run_status(run_dir, "FAILED", exception=exc)
+        except BaseException:
+            pass
+        raise
+    return 0
+
+
+def _training_preflight(args):
+    """Validate every formal training input before canonical run creation."""
+
     method = args.method
+    MethodSpec(**{
+        key: value
+        for key, value in method.to_dict().items()
+        if key != "method_id"
+    })
     manifest = _load_manifest(args.manifest, expected_split=args.split)
     if args.checkpoint is not None:
         raise ValueError(
             "training checkpoint output is managed under the canonical run "
             "directory; do not pass --checkpoint"
+        )
+    if manifest.episode_count < int(args.episodes):
+        raise ValueError(
+            "scenario manifest has fewer entries than requested episodes"
         )
     identity = training_run_identity(method, manifest, args.training_seed)
     run_dir = training_run_directory(
@@ -140,9 +200,12 @@ def command_train(args):
         enable_csv=False,
         run_directory=str(run_dir),
     )
+    _, calibration = load_com_capacity_reference()
+    validate_run_directory_preflight(
+        run_dir, identity, resume_checkpoint=args.resume
+    )
     reconciliation_plan = None
     if args.resume is not None:
-        _, calibration = load_com_capacity_reference()
         expected_experiment = {
             "method_spec_fingerprint": method.fingerprint,
             "manifest_hash": manifest.content_hash,
@@ -178,24 +241,49 @@ def command_train(args):
             inspect_full=inspect_full,
             inspect_model=inspect_model,
         )
-    run_dir = prepare_run_directory(
-        run_dir, identity, resume_checkpoint=args.resume
-    )
-    reconciliation = (
-        execute_resume_reconciliation(reconciliation_plan)
-        if reconciliation_plan is not None
-        else None
-    )
-    result = train(
-        config, scenario_manifest=manifest, method_spec=method
-    )
-    result["run_metadata"].update(
-        {"run_directory": str(run_dir), "run_identity": identity}
-    )
-    if reconciliation is not None:
-        result["run_metadata"]["resume_reconciliation"] = reconciliation
-    _write_run_metadata(run_dir, result)
-    return 0
+        training_state = reconciliation_plan.resume_training_state
+        required_training_state = {
+            "lambda_EE_global",
+            "reward_log",
+            "delivered_log",
+            "energy_log",
+            "lambda_log",
+            "total_joint_transitions",
+            "global_routing_slot",
+            "td3_post_warmup_transition",
+            "ddqn_schedule_slot",
+            "td3_noise_log",
+            "routing_epsilon_log",
+            "training_history_rows",
+        }
+        missing = required_training_state.difference(training_state)
+        if missing:
+            raise RuntimeError(
+                "exact-resume checkpoint training state is incomplete: "
+                f"{sorted(missing)}"
+            )
+        history_rows = preflight_resume_training_history(
+            run_dir,
+            training_history_identity(
+                method.method_id, args.training_seed, manifest.content_hash
+            ),
+            checkpoint_rows=training_state["training_history_rows"],
+        )
+        if len(history_rows) != reconciliation_plan.resume_episode:
+            raise RuntimeError(
+                "exact-resume checkpoint history length does not match its "
+                f"episode: rows={len(history_rows)}, "
+                f"episode={reconciliation_plan.resume_episode}"
+            )
+    return {
+        "method": method,
+        "manifest": manifest,
+        "identity": identity,
+        "run_directory": Path(run_dir).resolve(),
+        "config": config,
+        "calibration": calibration,
+        "reconciliation_plan": reconciliation_plan,
+    }
 
 
 def command_evaluate(args):

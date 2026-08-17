@@ -94,6 +94,21 @@ only with `--resume` pointing to a compatible checkpoint inside that exact run.
 Evaluation reruns must use a different identity/root or explicitly archive the
 old runtime output first.
 
+Train and evaluate commands complete a read-only preflight before creating the
+canonical run directory. The preflight validates the method, manifest
+schema/hash/split/count, requested episode count, formal configuration, COM
+calibration, canonical identity, and applicable checkpoint metadata. Evaluation
+checks the model-only checkpoint metadata before loading weights. A failed
+preflight creates no run directory, identity marker, history, or checkpoint and
+does not initialize the simulator.
+
+After preflight, `run_status.json` records atomic lifecycle transitions. Fresh
+runs move through `PREPARING`, `RUNNING`, and `COMPLETED`. An execution exception
+records `FAILED` with concise exception metadata; a fresh rerun remains blocked.
+A matching exact resume of an interrupted/failed training run records
+`RESUMING`, then `RUNNING` and `COMPLETED`. Completed evaluation directories
+remain collision protected.
+
 Train one formal seed and evaluate its episode-1500 model-only checkpoint:
 
 ```powershell
@@ -106,6 +121,18 @@ Resume uses a retained full checkpoint from the same canonical run:
 ```powershell
 python -X utf8 comparison_experiment.py train --manifest runs/comparison/manifests/train.json --training-seed 1 --episodes 1500 --resume runs/comparison/<method>/train/<train-hash-8>/seed-1/checkpoints/full/ep_1450 --output-dir runs/comparison
 ```
+
+Exact resume must select the latest valid full-resume checkpoint in the
+canonical run. Requesting an older checkpoint is rejected if a newer valid full
+checkpoint exists. If no newer valid full checkpoint exists, valid model-only
+directories newer than the resume boundary can be artifacts of a previously
+interrupted full save. They are moved, never deleted, to
+`recovery/resume-from-ep_NNNN-<transaction-id>/models/`; the accompanying
+`recovery_manifest.json` records source/destination paths, checkpoint metadata,
+resume provenance, timestamp, and transaction ID. Reconciliation scans only
+direct canonical `checkpoints/models/ep_N` children. Hidden, temporary,
+incomplete, invalid, other-run, other-seed, history, and full-resume artifacts
+are not quarantined.
 
 Aggregate all seed directories below an evaluation root:
 
@@ -150,14 +177,20 @@ override `--expected-seed-count` and `--expected-episodes-per-seed` explicitly.
 Aggregation writes `cross_seed_summary.csv`, JSON, and Student-t methodology in
 `aggregation_metadata.json`.
 
-Every canonical training run also writes `training_history.csv` and
-`training_history.jsonl`. They contain one identical, finite row per completed
-episode with method/seed/training-manifest identity, reward, timely goodput,
-mobility energy, per-episode EE, and the updated Dinkelbach lambda. The full
-checkpoint embeds these rows. Exact resume validates the on-disk identity and
-checkpoint prefix, truncates only valid rows beyond the checkpoint episode, and
-then continues without duplicate episodes. `run_metadata.json` records the
-history row count, last episode, and identity.
+Every canonical training run writes canonical `training_history.jsonl`, its
+derived tabular projection `training_history.csv`, and
+`training_history_commit.json`. They contain one identical, finite row per
+completed episode with method/seed/training-manifest identity, reward, timely
+goodput, mobility energy, per-episode EE, and the updated Dinkelbach lambda. The
+commit file records identity, row count, last episode, both SHA-256 hashes, and
+a transaction ID. JSONL and CSV are replaced from one normalized row set, and
+the commit marker is replaced last; readers reject partial or hash-inconsistent
+transactions. The full checkpoint embeds the canonical rows. Exact resume can
+repair an interrupted dual-format transaction from those checkpoint rows,
+validates any committed prefix, truncates to the checkpoint boundary, and then
+continues without duplicate episodes. A fresh run never silently accepts
+partial history. `run_metadata.json` records the history files, canonical
+format, row count, last episode, and identity.
 
 The legacy `HRL_task_aware.py --mode smoke` and explicit
 `--mode train --episodes N` interfaces remain available.

@@ -26,6 +26,8 @@ class ResumeReconciliationPlan:
     run_directory: Path
     resume_checkpoint: Path
     resume_episode: int
+    resume_checkpoint_metadata: dict
+    resume_training_state: dict
     stale_models: tuple[StaleModelArtifact, ...]
     transaction_id: str
     timestamp: str
@@ -102,6 +104,8 @@ def plan_resume_reconciliation(
         run_directory=run_directory,
         resume_checkpoint=resume_checkpoint,
         resume_episode=resume_episode,
+        resume_checkpoint_metadata=dict(selected["metadata"]),
+        resume_training_state=dict(selected["training_state"]),
         stale_models=tuple(stale_models),
         transaction_id=transaction_id or uuid.uuid4().hex,
         timestamp=timestamp or datetime.now(timezone.utc).isoformat(),
@@ -110,7 +114,7 @@ def plan_resume_reconciliation(
 
 def _atomic_write_json(path, payload):
     path = Path(path)
-    temporary = path.with_name(f".{path.name}.tmp-{uuid.uuid4().hex}")
+    temporary = path.parent / f".tmp-{uuid.uuid4().hex[:16]}"
     try:
         with temporary.open("w", encoding="utf-8", newline="\n") as handle:
             json.dump(payload, handle, indent=2, sort_keys=True, allow_nan=False)
