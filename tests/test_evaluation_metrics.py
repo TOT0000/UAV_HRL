@@ -127,6 +127,21 @@ class EvaluationModeIntegrationTest(unittest.TestCase):
             result["episode_metrics"][0]["scenario_id"],
             evaluation_manifest.episodes[0]["scenario_id"],
         )
+        metadata = result["run_metadata"]
+        self.assertEqual(
+            metadata["training_manifest_hash"], train_manifest.content_hash
+        )
+        self.assertEqual(
+            metadata["evaluation_manifest_hash"],
+            evaluation_manifest.content_hash,
+        )
+        self.assertEqual(metadata["checkpoint_completed_episodes"], 1)
+        self.assertEqual(metadata["checkpoint_training_seed"], training_seed)
+        self.assertEqual(
+            metadata["checkpoint_method_spec_fingerprint"], method.fingerprint
+        )
+        self.assertTrue(metadata["checkpoint_metadata_path"].endswith("metadata.json"))
+        self.assertEqual(len(metadata["checkpoint_metadata_fingerprint"]), 64)
 
 
 if __name__ == "__main__":

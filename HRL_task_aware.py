@@ -33,11 +33,11 @@ from evaluation_metrics import safe_energy_efficiency
 from experiment_config import MethodSpec
 from td3 import TD3
 from training_checkpoint import (
+    checkpoint_metadata_fingerprint,
     load_full_resume_checkpoint,
     load_model_checkpoint,
     save_full_resume_checkpoint,
     save_model_checkpoint,
-    validate_checkpoint_experiment_metadata,
 )
 import utils_update_v2
 
@@ -530,6 +530,8 @@ def train(
     method_spec=None,
     evaluation=False,
     checkpoint_dir=None,
+    expected_checkpoint_episodes=None,
+    expected_checkpoint_formal_config=None,
 ):
     if config is None:
         raise ValueError(
@@ -588,17 +590,47 @@ def train(
         method_spec, scenario_manifest, config.random_seed
     )
     loaded_checkpoint_metadata = None
+    checkpoint_provenance = {}
     if evaluation:
         loaded_checkpoint_metadata = load_model_checkpoint(
-            checkpoint_dir, centralized_td3, ddqn
-        )
-        validate_checkpoint_experiment_metadata(
-            loaded_checkpoint_metadata,
-            {
+            checkpoint_dir,
+            centralized_td3,
+            ddqn,
+            movement_state_dim=MOVEMENT_STATE_DIM,
+            joint_action_dim=JOINT_ACTION_DIM,
+            routing_state_dim=ROUTING_STATE_DIM,
+            calibration=calibration,
+            expected_experiment_metadata={
                 "method_spec_fingerprint": method_spec.fingerprint,
                 "training_seed": int(config.random_seed),
             },
+            expected_completed_episodes=expected_checkpoint_episodes,
+            expected_formal_config=expected_checkpoint_formal_config,
         )
+        checkpoint_experiment = loaded_checkpoint_metadata["experiment"]
+        checkpoint_provenance = {
+            "training_manifest_hash": checkpoint_experiment.get("manifest_hash"),
+            "evaluation_manifest_hash": (
+                scenario_manifest.content_hash
+                if scenario_manifest is not None
+                else None
+            ),
+            "checkpoint_completed_episodes": (
+                int(loaded_checkpoint_metadata["episode"]) + 1
+            ),
+            "checkpoint_training_seed": checkpoint_experiment.get(
+                "training_seed"
+            ),
+            "checkpoint_method_spec_fingerprint": checkpoint_experiment.get(
+                "method_spec_fingerprint"
+            ),
+            "checkpoint_metadata_path": os.path.abspath(
+                os.path.join(checkpoint_dir, "metadata.json")
+            ),
+            "checkpoint_metadata_fingerprint": (
+                checkpoint_metadata_fingerprint(loaded_checkpoint_metadata)
+            ),
+        }
 
     lambda_ee = 0.1
     if loaded_checkpoint_metadata is not None:
@@ -1164,6 +1196,7 @@ def train(
         "episode_metrics": episode_metrics,
         "run_metadata": {
             **experiment_identity,
+            **checkpoint_provenance,
             "formal_config": asdict(config),
             "evaluation": bool(evaluation),
         },

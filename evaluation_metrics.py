@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import csv
+from dataclasses import asdict
 import json
 import math
 from pathlib import Path
@@ -187,7 +188,7 @@ def _read_episode_csvs(input_dir):
 
 
 def run_evaluation_command(args):
-    from HRL_task_aware import TrainingConfig, train
+    from HRL_task_aware import TrainingConfig, formal_training_config, train
 
     if args.resume is not None:
         raise ValueError("evaluation accepts --checkpoint, not --resume")
@@ -214,12 +215,22 @@ def run_evaluation_command(args):
         enable_csv=False,
         random_seed=args.training_seed,
     )
+    expected_training_config = asdict(
+        formal_training_config(
+            FORMAL_EXPERIMENT_DEFAULTS["training_episodes_per_seed"],
+            random_seed=args.training_seed,
+        )
+    )
     result = train(
         config,
         scenario_manifest=manifest,
         method_spec=args.method,
         evaluation=True,
         checkpoint_dir=args.checkpoint,
+        expected_checkpoint_episodes=FORMAL_EXPERIMENT_DEFAULTS[
+            "training_episodes_per_seed"
+        ],
+        expected_checkpoint_formal_config=expected_training_config,
     )
     metadata = {
         **result["run_metadata"],

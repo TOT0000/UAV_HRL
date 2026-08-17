@@ -35,12 +35,31 @@ ROUTING_REPLAY_FIELDS = (
     "tag_gt",
 )
 
+FORMAL_CORE_CONFIG_FIELDS = (
+    "mode",
+    "total_episodes",
+    "episode_seconds",
+    "routing_slot_seconds",
+    "warmup_joint_transitions",
+    "batch_size",
+    "policy_delay",
+    "beta_search",
+    "beta_vs",
+    "beta_com",
+    "search_coverage_threshold",
+    "replay_max_size",
+)
+
 
 def calibration_fingerprint(calibration):
     canonical = json.dumps(
         calibration, sort_keys=True, separators=(",", ":"), allow_nan=False
     ).encode("utf-8")
     return hashlib.sha256(canonical).hexdigest()
+
+
+def checkpoint_metadata_fingerprint(metadata):
+    return calibration_fingerprint(metadata)
 
 
 def _network_states(td3, ddqn):
@@ -137,13 +156,122 @@ def save_model_checkpoint(
     return checkpoint_dir
 
 
-def load_model_checkpoint(checkpoint_dir, td3, ddqn):
+def _metadata_value_matches(actual, expected):
+    if isinstance(expected, (int, float)) and not isinstance(expected, bool):
+        try:
+            return bool(np.isclose(float(actual), float(expected)))
+        except (TypeError, ValueError):
+            return False
+    return actual == expected
+
+
+def validate_model_checkpoint_metadata(
+    metadata,
+    *,
+    movement_state_dim=None,
+    joint_action_dim=None,
+    routing_state_dim=None,
+    td3_gamma=None,
+    ddqn_gamma=None,
+    calibration=None,
+    expected_experiment_metadata=None,
+    expected_completed_episodes=None,
+    expected_formal_config=None,
+):
+    """Validate evaluation provenance before any model payload is loaded."""
+
+    checks = {
+        "checkpoint_schema_version": CHECKPOINT_SCHEMA_VERSION,
+        "checkpoint_type": MODEL_CHECKPOINT_TYPE,
+    }
+    optional_checks = {
+        "movement_state_dim": movement_state_dim,
+        "joint_action_dim": joint_action_dim,
+        "routing_state_dim": routing_state_dim,
+        "centralized_td3_gamma": td3_gamma,
+        "routing_ddqn_gamma": ddqn_gamma,
+    }
+    checks.update(
+        {key: value for key, value in optional_checks.items() if value is not None}
+    )
+    for key, expected in checks.items():
+        actual = metadata.get(key)
+        if not _metadata_value_matches(actual, expected):
+            raise RuntimeError(
+                f"checkpoint {key} is incompatible: "
+                f"checkpoint={actual}, expected={expected}"
+            )
+
+    if calibration is not None:
+        expected_calibration = calibration_fingerprint(calibration)
+        if metadata.get("com_calibration_fingerprint") != expected_calibration:
+            raise RuntimeError("checkpoint COM calibration fingerprint is incompatible")
+
+    if expected_experiment_metadata is not None:
+        validate_checkpoint_experiment_metadata(
+            metadata, expected_experiment_metadata
+        )
+
+    if expected_completed_episodes is not None:
+        try:
+            completed_episodes = int(metadata["episode"]) + 1
+        except (KeyError, TypeError, ValueError) as exc:
+            raise RuntimeError("checkpoint episode metadata is invalid") from exc
+        if completed_episodes != int(expected_completed_episodes):
+            raise RuntimeError(
+                "checkpoint completed training episodes is incompatible: "
+                f"checkpoint={completed_episodes}, "
+                f"expected={int(expected_completed_episodes)}"
+            )
+
+    if expected_formal_config is not None:
+        experiment = metadata.get("experiment") or {}
+        actual_config = experiment.get("formal_config")
+        if not isinstance(actual_config, dict):
+            raise RuntimeError("checkpoint has no formal training configuration")
+        mismatches = {
+            key: (actual_config.get(key), expected_formal_config.get(key))
+            for key in FORMAL_CORE_CONFIG_FIELDS
+            if not _metadata_value_matches(
+                actual_config.get(key), expected_formal_config.get(key)
+            )
+        }
+        if mismatches:
+            raise RuntimeError(
+                f"checkpoint formal core config is incompatible: {mismatches}"
+            )
+    return metadata
+
+
+def load_model_checkpoint(
+    checkpoint_dir,
+    td3,
+    ddqn,
+    *,
+    movement_state_dim=None,
+    joint_action_dim=None,
+    routing_state_dim=None,
+    calibration=None,
+    expected_experiment_metadata=None,
+    expected_completed_episodes=None,
+    expected_formal_config=None,
+):
     checkpoint_dir = Path(checkpoint_dir)
     metadata = json.loads(
         (checkpoint_dir / "metadata.json").read_text(encoding="utf-8")
     )
-    if metadata.get("checkpoint_type") != MODEL_CHECKPOINT_TYPE:
-        raise RuntimeError("evaluation requires a model-only checkpoint")
+    validate_model_checkpoint_metadata(
+        metadata,
+        movement_state_dim=movement_state_dim,
+        joint_action_dim=joint_action_dim,
+        routing_state_dim=routing_state_dim,
+        td3_gamma=td3.gamma,
+        ddqn_gamma=ddqn.gamma,
+        calibration=calibration,
+        expected_experiment_metadata=expected_experiment_metadata,
+        expected_completed_episodes=expected_completed_episodes,
+        expected_formal_config=expected_formal_config,
+    )
     payload = torch.load(
         checkpoint_dir / "models.pt", map_location="cpu", weights_only=False
     )
