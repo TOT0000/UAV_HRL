@@ -251,9 +251,10 @@ def _run_routing_slot(
         task_type = outcome["task_type"]
         if task_type not in violation_stats:
             continue
-        violation_stats[task_type]["delivered"] += 1
         if outcome["violated"]:
-            violation_stats[task_type]["violated"] += 1
+            violation_stats[task_type]["deadline_violated_packets"] += 1
+        else:
+            violation_stats[task_type]["timely_delivered_packets"] += 1
 
     backlog_after = _active_backlog(packet_engine)
     next_states = {
@@ -510,8 +511,14 @@ def train(config=None):
         episode_reward = 0.0
         episode_routing_reward = 0.0
         violation_stats = {
-            "FOV": {"delivered": 0, "violated": 0},
-            "COM": {"delivered": 0, "violated": 0},
+            "FOV": {
+                "timely_delivered_packets": 0,
+                "deadline_violated_packets": 0,
+            },
+            "COM": {
+                "timely_delivered_packets": 0,
+                "deadline_violated_packets": 0,
+            },
         }
 
         for interval in range(config.episode_seconds):
@@ -832,6 +839,8 @@ def train(config=None):
         "routing_epsilon_log": routing_epsilon_log,
         "raw_final_hop_bits": packet_engine.raw_final_hop_bits,
         "timely_goodput_bits": packet_engine.timely_goodput_bits,
+        "timely_delivered_packets": packet_engine.total_delivered,
+        "deadline_violated_packets": packet_engine.total_violated,
         "routing_wait_actions": packet_engine.wait_actions,
         "partial_transmissions": packet_engine.partial_transmissions,
         "deadline_drops": packet_engine.deadline_drops,

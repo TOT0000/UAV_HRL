@@ -315,7 +315,13 @@ class PacketEngine:
         self.mark_packet_done(
             pkt, current_time=float(current_time), reason="deadline"
         )
-        return {"sender": owner, "task_type": task_type, "packet": pkt}
+        return {
+            "attributed_sender": owner,
+            "sender": owner,
+            "task_type": task_type,
+            "packet_id": int(pkt["id"]),
+            "packet": pkt,
+        }
 
     def expire_packets(self, current_time, inclusive=True):
         """Drop unfinished packets at an absolute deadline, exactly once."""
@@ -492,7 +498,9 @@ class PacketEngine:
                             )
                             result["outcomes"].append(
                                 {
+                                    "attributed_sender": sender,
                                     "task_type": task_type,
+                                    "packet_id": int(pkt["id"]),
                                     "violated": False,
                                     "packet": pkt,
                                 }
@@ -505,12 +513,17 @@ class PacketEngine:
                                 result["cost_by_sender"][sender] += 1.0
                                 result["outcomes"].append(
                                     {
+                                        "attributed_sender": sender,
                                         "task_type": violation["task_type"],
+                                        "packet_id": violation["packet_id"],
                                         "violated": True,
                                         "packet": pkt,
                                     }
                                 )
-                    elif completion_time + PACKET_EPS < deadline_abs:
+                    elif (
+                        completion_time + PACKET_EPS < deadline_abs
+                        and deadline_abs > slot_end + PACKET_EPS
+                    ):
                         if int(pkt.get("hops", 0)) >= MAX_PACKET_HOPS:
                             self.mark_packet_done(
                                 pkt,
@@ -527,7 +540,9 @@ class PacketEngine:
                             result["cost_by_sender"][sender] += 1.0
                             result["outcomes"].append(
                                 {
+                                    "attributed_sender": sender,
                                     "task_type": violation["task_type"],
+                                    "packet_id": violation["packet_id"],
                                     "violated": True,
                                     "packet": pkt,
                                 }
@@ -554,12 +569,14 @@ class PacketEngine:
             pending_relay_arrivals
         )
         for violation in self.expire_packets(slot_end, inclusive=True):
-            sender = int(violation["sender"])
+            sender = int(violation["attributed_sender"])
             if sender in actions:
                 result["cost_by_sender"][sender] += 1.0
             result["outcomes"].append(
                 {
+                    "attributed_sender": sender,
                     "task_type": violation["task_type"],
+                    "packet_id": violation["packet_id"],
                     "violated": True,
                     "packet": violation["packet"],
                 }

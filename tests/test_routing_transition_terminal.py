@@ -30,8 +30,14 @@ class RoutingTransitionTerminalTest(unittest.TestCase):
             uid: np.ones(17, dtype=bool) for uid in range(16)
         }
         self.stats = {
-            "FOV": {"delivered": 0, "violated": 0},
-            "COM": {"delivered": 0, "violated": 0},
+            "FOV": {
+                "timely_delivered_packets": 0,
+                "deadline_violated_packets": 0,
+            },
+            "COM": {
+                "timely_delivered_packets": 0,
+                "deadline_violated_packets": 0,
+            },
         }
 
     def run_slot(self, actions, capacities, episode_done=False):
@@ -68,6 +74,20 @@ class RoutingTransitionTerminalTest(unittest.TestCase):
 
         self.assertEqual(replay.size, 1)
         self.assertEqual(replay.not_done[0, 0], 0.0)
+        self.assertEqual(self.stats["COM"]["timely_delivered_packets"], 1)
+        self.assertEqual(self.stats["COM"]["deadline_violated_packets"], 0)
+
+    def test_deadline_outcome_only_increments_violation_stat(self):
+        packet = self.engine.create_packet(0, "COM", 100.0, 0.0)
+        packet["deadline_abs"] = 0.25
+
+        replay = self.run_slot(
+            {0: 1}, {(0, 1): 0.001}
+        )
+
+        self.assertEqual(replay.cost[0, 0], 1.0)
+        self.assertEqual(self.stats["COM"]["timely_delivered_packets"], 0)
+        self.assertEqual(self.stats["COM"]["deadline_violated_packets"], 1)
 
     def test_partial_packet_and_next_queued_packet_keep_bootstrap(self):
         with self.subTest(case="partial"):

@@ -219,6 +219,99 @@ class PacketQosFlowTest(unittest.TestCase):
         self.assertEqual(packet["current"], 2)
         self.assertFalse(packet["done"])
 
+    def test_relay_that_cannot_wait_until_next_slot_is_charged_to_sender(self):
+        env = routing_env()
+        engine = PacketEngine(num_uav=3, step_time=0.25)
+        packet = engine.create_packet(0, "COM", 100.0, 0.0)
+
+        result = engine.serve_active_links(
+            env,
+            actions={0: 2},
+            capacities={(0, 2): 0.001},
+            current_time=0.75,
+        )
+
+        self.assertIsNone(engine.get_hol_packet(2))
+        self.assertTrue(packet["done"])
+        self.assertEqual(packet["reason"], "deadline")
+        self.assertEqual(result["cost_by_sender"][0], 1.0)
+        self.assertEqual(result["cost_by_sender"][2], 0.0)
+        self.assertEqual(engine.total_violated, 1)
+        self.assertEqual(engine.com_violated, 1)
+        self.assertEqual(engine.deadline_drops, 1)
+        self.assertEqual(len(result["outcomes"]), 1)
+        self.assertEqual(result["outcomes"][0]["attributed_sender"], 0)
+        self.assertEqual(result["outcomes"][0]["packet_id"], packet["id"])
+
+    def test_relay_violation_is_not_charged_to_receivers_own_action(self):
+        env = routing_env()
+        engine = PacketEngine(num_uav=3, step_time=0.25)
+        incoming = engine.create_packet(0, "COM", 100.0, 0.0)
+        resident = engine.create_packet(2, "FOV", 100.0, 0.75)
+
+        result = engine.serve_active_links(
+            env,
+            actions={0: 2, 2: 2},
+            capacities={(0, 2): 0.001},
+            current_time=0.75,
+        )
+
+        self.assertTrue(incoming["done"])
+        self.assertIs(engine.get_hol_packet(2), resident)
+        self.assertEqual(result["cost_by_sender"][0], 1.0)
+        self.assertEqual(result["cost_by_sender"][2], 0.0)
+
+    def test_resident_packet_expiration_is_charged_to_its_sender_action(self):
+        env = routing_env()
+        engine = PacketEngine(num_uav=3, step_time=0.25)
+        resident = engine.create_packet(2, "COM", 100.0, 0.0)
+
+        result = engine.serve_active_links(
+            env, actions={2: 2}, capacities={}, current_time=0.75
+        )
+
+        self.assertTrue(resident["done"])
+        self.assertEqual(resident["reason"], "deadline")
+        self.assertEqual(result["cost_by_sender"][2], 1.0)
+        self.assertEqual(result["outcomes"][0]["attributed_sender"], 2)
+
+    def test_timely_relay_arrival_enters_receiver_queue(self):
+        env = routing_env()
+        engine = PacketEngine(num_uav=3, step_time=0.25)
+        packet = engine.create_packet(0, "COM", 100.0, 0.0)
+
+        result = engine.serve_active_links(
+            env,
+            actions={0: 2},
+            capacities={(0, 2): 0.001},
+            current_time=0.0,
+        )
+
+        self.assertIs(engine.get_hol_packet(2), packet)
+        self.assertFalse(packet["done"])
+        self.assertEqual(result["cost_by_sender"][0], 0.0)
+        self.assertEqual(engine.total_violated, 0)
+
+    def test_deadline_outcome_is_not_counted_as_delivery(self):
+        env = routing_env()
+        engine = PacketEngine(num_uav=3, step_time=0.25)
+        packet = engine.create_packet(0, "COM", 100.0, 0.0)
+
+        result = engine.serve_active_links(
+            env,
+            actions={0: 2},
+            capacities={(0, 2): 0.001},
+            current_time=0.75,
+        )
+
+        delivered = sum(not outcome["violated"] for outcome in result["outcomes"])
+        violated = sum(outcome["violated"] for outcome in result["outcomes"])
+        self.assertEqual(delivered, 0)
+        self.assertEqual(violated, 1)
+        self.assertEqual(engine.total_delivered, 0)
+        self.assertEqual(engine.total_violated, 1)
+        self.assertEqual(packet["reason"], "deadline")
+
 
 if __name__ == "__main__":
     unittest.main()
