@@ -1,3 +1,4 @@
+import json
 import math
 import tempfile
 import unittest
@@ -105,6 +106,12 @@ class EvaluationModeIntegrationTest(unittest.TestCase):
                 method_spec=method,
             )
             checkpoint_dir = checkpoint_root / "models" / "ep_0001"
+            checkpoint_metadata = json.loads(
+                (checkpoint_dir / "metadata.json").read_text(encoding="utf-8")
+            )
+            checkpoint_dinkelbach_state = checkpoint_metadata["experiment"][
+                "dinkelbach_state"
+            ]
 
             evaluation_config = TrainingConfig(
                 total_episodes=1,
@@ -132,6 +139,8 @@ class EvaluationModeIntegrationTest(unittest.TestCase):
         self.assertEqual(result["routing_epsilon_log"], [0.0] * 4)
         self.assertEqual(result["joint_replay_size"], 0)
         self.assertEqual(result["routing_replay_size"], 0)
+        self.assertEqual(result["dinkelbach_update_count"], 0)
+        self.assertEqual(result["dinkelbach_state"], checkpoint_dinkelbach_state)
         self.assertEqual(len(result["episode_metrics"]), 1)
         self.assertEqual(
             result["episode_metrics"][0]["scenario_id"],

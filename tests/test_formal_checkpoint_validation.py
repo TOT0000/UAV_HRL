@@ -9,6 +9,7 @@ from unittest import mock
 import torch
 
 from DDQN import DDQN
+from dinkelbach_blocks import DinkelbachBlockState, dinkelbach_config_metadata
 from HRL_task_aware import formal_training_config
 from centralized_movement import JOINT_ACTION_DIM, MOVEMENT_STATE_DIM
 from com_capacity_calibration import load_com_capacity_reference
@@ -38,6 +39,9 @@ class FormalCheckpointMetadataTest(unittest.TestCase):
         self.formal_config = asdict(
             formal_training_config(1500, random_seed=self.training_seed)
         )
+        dinkelbach_state = DinkelbachBlockState.from_config(self.formal_config)
+        for _ in range(1500):
+            dinkelbach_state.record_episode(1.0, 2.0)
         self.metadata = {
             "checkpoint_schema_version": CHECKPOINT_SCHEMA_VERSION,
             "checkpoint_type": MODEL_CHECKPOINT_TYPE,
@@ -55,6 +59,9 @@ class FormalCheckpointMetadataTest(unittest.TestCase):
                 "training_seed": self.training_seed,
                 "manifest_hash": "training-manifest",
                 "formal_config": self.formal_config,
+                **dinkelbach_config_metadata(self.formal_config),
+                "lambda_ee": dinkelbach_state.current_lambda,
+                "dinkelbach_state": dinkelbach_state.training_state(),
             },
         }
 
@@ -123,6 +130,30 @@ class FormalCheckpointMetadataTest(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "batch_size"):
             self._validate(wrong_config)
 
+    def test_dinkelbach_state_and_provenance_mismatches_fail(self):
+        missing_state = deepcopy(self.metadata)
+        del missing_state["experiment"]["dinkelbach_state"]
+        with self.assertRaisesRegex(RuntimeError, "missing Dinkelbach block state"):
+            self._validate(missing_state)
+
+        wrong_lambda = deepcopy(self.metadata)
+        wrong_lambda["experiment"]["lambda_ee"] = 123.0
+        with self.assertRaisesRegex(RuntimeError, "lambda metadata"):
+            self._validate(wrong_lambda)
+
+        wrong_provenance = deepcopy(self.metadata)
+        wrong_provenance["experiment"][
+            "dinkelbach_update_interval_episodes"
+        ] = 25
+        with self.assertRaisesRegex(RuntimeError, "provenance"):
+            self._validate(wrong_provenance)
+
+    def test_old_checkpoint_schema_is_rejected(self):
+        old = deepcopy(self.metadata)
+        old["checkpoint_schema_version"] = 1
+        with self.assertRaisesRegex(RuntimeError, "checkpoint_schema_version"):
+            self._validate(old)
+
 
 class FormalCheckpointLoadOrderTest(unittest.TestCase):
     def _models(self):
@@ -176,6 +207,8 @@ class FormalCheckpointLoadOrderTest(unittest.TestCase):
         formal_config = asdict(
             formal_training_config(1500, random_seed=training_seed)
         )
+        dinkelbach_state = DinkelbachBlockState.from_config(formal_config)
+        dinkelbach_state.record_episode(1.0, 2.0)
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             checkpoint_dir = root / "checkpoint"
@@ -193,6 +226,9 @@ class FormalCheckpointLoadOrderTest(unittest.TestCase):
                     "training_seed": training_seed,
                     "manifest_hash": "training-manifest",
                     "formal_config": formal_config,
+                    **dinkelbach_config_metadata(formal_config),
+                    "lambda_ee": dinkelbach_state.current_lambda,
+                    "dinkelbach_state": dinkelbach_state.training_state(),
                 },
             )
             manifest_path = root / "validation.json"

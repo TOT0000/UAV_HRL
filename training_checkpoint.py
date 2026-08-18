@@ -9,8 +9,13 @@ import uuid
 import numpy as np
 import torch
 
+from dinkelbach_blocks import (
+    DINKELBACH_CONFIG_FIELDS,
+    DinkelbachBlockState,
+    dinkelbach_config_metadata,
+)
 
-CHECKPOINT_SCHEMA_VERSION = 1
+CHECKPOINT_SCHEMA_VERSION = 2
 MODEL_CHECKPOINT_TYPE = "model-only"
 FULL_CHECKPOINT_TYPE = "full-resume"
 
@@ -270,6 +275,55 @@ def _validate_formal_config(actual_config, expected_config, fields):
         )
 
 
+def _validate_dinkelbach_checkpoint_metadata(metadata, expected_formal_config):
+    experiment = metadata.get("experiment") or {}
+    actual_formal_config = experiment.get("formal_config")
+    if not isinstance(actual_formal_config, dict):
+        raise RuntimeError("checkpoint has no formal training configuration")
+    config = expected_formal_config or actual_formal_config
+    try:
+        expected_config = dinkelbach_config_metadata(config)
+        actual_config = dinkelbach_config_metadata(actual_formal_config)
+    except (KeyError, TypeError, ValueError) as exc:
+        raise RuntimeError(
+            "checkpoint Dinkelbach configuration is incomplete"
+        ) from exc
+    if actual_config != expected_config:
+        raise RuntimeError(
+            "checkpoint Dinkelbach configuration is incompatible: "
+            f"checkpoint={actual_config}, expected={expected_config}"
+        )
+    provenance_mismatches = {
+        field: (experiment.get(field), actual_config[field])
+        for field in DINKELBACH_CONFIG_FIELDS
+        if experiment.get(field) != actual_config[field]
+    }
+    if provenance_mismatches:
+        raise RuntimeError(
+            "checkpoint Dinkelbach provenance is incompatible: "
+            f"{provenance_mismatches}"
+        )
+    try:
+        completed_episodes = int(metadata["episode"]) + 1
+        state = DinkelbachBlockState.from_training_state(
+            experiment.get("dinkelbach_state", {}),
+            actual_formal_config,
+            expected_completed_episodes=completed_episodes,
+        )
+        stored_lambda = float(experiment["lambda_ee"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise RuntimeError(
+            "checkpoint Dinkelbach metadata is incomplete"
+        ) from exc
+    if not np.isfinite(stored_lambda) or not np.isclose(
+        stored_lambda, state.current_lambda
+    ):
+        raise RuntimeError(
+            "checkpoint Dinkelbach lambda metadata is incompatible with block state"
+        )
+    return state
+
+
 def validate_model_checkpoint_metadata(
     metadata,
     *,
@@ -335,6 +389,9 @@ def validate_model_checkpoint_metadata(
             experiment.get("formal_config"),
             expected_formal_config,
             FORMAL_CORE_CONFIG_FIELDS,
+        )
+        _validate_dinkelbach_checkpoint_metadata(
+            metadata, expected_formal_config
         )
     return metadata
 
@@ -730,6 +787,16 @@ def inspect_full_resume_checkpoint(
             expected_formal_config,
             FULL_RESUME_CONFIG_FIELDS,
         )
+        _validate_dinkelbach_checkpoint_metadata(
+            metadata, expected_formal_config
+        )
+    if not isinstance(formal_config, dict):
+        raise RuntimeError("checkpoint formal training configuration is invalid")
+    DinkelbachBlockState.from_training_state(
+        training_state,
+        formal_config,
+        expected_completed_episodes=completed_episode,
+    )
     return {
         "checkpoint_dir": checkpoint_dir,
         "completed_episode": completed_episode,

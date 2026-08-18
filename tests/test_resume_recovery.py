@@ -7,6 +7,7 @@ from pathlib import Path
 
 import torch
 
+from dinkelbach_blocks import DinkelbachBlockState, dinkelbach_config_metadata
 from HRL_task_aware import formal_training_config
 from experiment_config import MethodSpec
 from resume_recovery import (
@@ -36,7 +37,14 @@ class ResumeRecoveryTest(unittest.TestCase):
             "manifest_hash": "a" * 64,
             "training_seed": 101,
             "formal_config": self.formal_config,
+            **dinkelbach_config_metadata(self.formal_config),
         }
+
+    def _dinkelbach_state(self, completed_episode):
+        state = DinkelbachBlockState.from_config(self.formal_config)
+        for _ in range(completed_episode):
+            state.record_episode(1.0, 2.0)
+        return state.training_state()
 
     def _metadata(self, checkpoint_type, completed_episode):
         return {
@@ -51,7 +59,13 @@ class ResumeRecoveryTest(unittest.TestCase):
             "com_calibration_fingerprint": calibration_fingerprint(
                 self.calibration
             ),
-            "experiment": self.experiment,
+            "experiment": {
+                **self.experiment,
+                "lambda_ee": self._dinkelbach_state(completed_episode)[
+                    "current_dinkelbach_lambda"
+                ],
+                "dinkelbach_state": self._dinkelbach_state(completed_episode),
+            },
         }
 
     def _full(self, run_dir, completed_episode, *, complete=True):
@@ -72,6 +86,7 @@ class ResumeRecoveryTest(unittest.TestCase):
                     "training_state": {
                         "completed_episode_index": completed_episode - 1,
                         "next_episode_index": completed_episode,
+                        **self._dinkelbach_state(completed_episode),
                     },
                     "formal_config": self.formal_config,
                 },

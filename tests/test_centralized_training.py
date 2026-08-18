@@ -71,6 +71,15 @@ class CentralizedTrainingFlowTest(unittest.TestCase):
         self.assertEqual(formal.warmup_joint_transitions, 1000)
         self.assertEqual(formal.batch_size, 64)
         self.assertEqual(formal.policy_delay, 2)
+        self.assertEqual(formal.dinkelbach_initial_lambda, 0.0)
+        self.assertEqual(formal.dinkelbach_update_interval_episodes, 50)
+        self.assertEqual(formal.dinkelbach_update_rule, "ratio_of_block_sums")
+        self.assertEqual(
+            formal.dinkelbach_numerator_unit, "timely_delivered_mbits"
+        )
+        self.assertEqual(
+            formal.dinkelbach_denominator_unit, "mobility_energy_joules"
+        )
 
     def test_one_actor_call_and_one_transition_per_interval(self):
         self.assertEqual(self.result["environment_actor_calls"], 2)
@@ -89,6 +98,7 @@ class CentralizedTrainingFlowTest(unittest.TestCase):
         self.assertEqual(self.result["actor_updates"], 1)
         self.assertGreater(self.result["energy_log"][0], 0.0)
         self.assertEqual(self.result["duplicate_target_assertions"], 0)
+        self.assertEqual(self.result["dinkelbach_update_count"], 0)
 
     def test_smoke_outputs_are_finite(self):
         for key in ("lambda",):
@@ -104,6 +114,7 @@ class CentralizedTrainingFlowTest(unittest.TestCase):
 
     def test_zero_energy_dinkelbach_protection_and_unclipped_ratio(self):
         self.assertEqual(_dinkelbach_update(10.0, 0.0, 0.25), 0.25)
+        self.assertEqual(_dinkelbach_update(10.0, float("nan"), 0.25), 0.25)
         self.assertEqual(_dinkelbach_update(10.0, 2.0, 0.25), 5.0)
 
     def test_finite_horizon_potential_shaping_uses_unit_discount(self):

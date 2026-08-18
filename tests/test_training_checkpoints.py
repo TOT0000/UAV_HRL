@@ -1,4 +1,5 @@
 import contextlib
+from dataclasses import asdict
 import io
 import json
 import random
@@ -10,6 +11,7 @@ import numpy as np
 import torch
 
 from DDQN import DDQN
+from dinkelbach_blocks import DinkelbachBlockState
 from HRL_task_aware import (
     _seed_training_rng,
     _validate_resume_config,
@@ -180,7 +182,6 @@ class FullResumeCheckpointTest(unittest.TestCase):
         training_state = {
             "completed_episode_index": 6,
             "next_episode_index": 7,
-            "lambda_EE_global": 0.123,
             "reward_log": [1.0, 2.0],
             "delivered_log": [3.0, 4.0],
             "energy_log": [5.0, 6.0],
@@ -192,12 +193,11 @@ class FullResumeCheckpointTest(unittest.TestCase):
             "td3_noise_log": [0.2],
             "routing_epsilon_log": [1.0, 0.99],
         }
-        formal_config = {
-            "mode": "train",
-            "total_episodes": 100,
-            "episode_seconds": 60,
-            "warmup_joint_transitions": 1000,
-        }
+        formal_config = asdict(formal_training_config(100, random_seed=123))
+        dinkelbach_state = DinkelbachBlockState.from_config(formal_config)
+        for _ in range(7):
+            dinkelbach_state.record_episode(1.0, 2.0)
+        training_state.update(dinkelbach_state.training_state())
 
         random.seed(123)
         np.random.seed(456)
@@ -376,9 +376,11 @@ class FullResumeCheckpointTest(unittest.TestCase):
         td3, ddqn, joint, routing = self._components()
         calibration = {"seed": 1, "c_ref_com": 10.0}
         training_state = {
+            "completed_episode_index": 0,
             "next_episode_index": 1,
             "total_joint_transitions": 0,
         }
+        formal_config = asdict(formal_training_config(1, random_seed=1))
         with tempfile.TemporaryDirectory() as temp_dir:
             checkpoint_dir = Path(temp_dir) / "full"
             save_full_resume_checkpoint(
@@ -389,7 +391,7 @@ class FullResumeCheckpointTest(unittest.TestCase):
                 joint_replay=joint,
                 routing_replay=routing,
                 training_state=training_state,
-                formal_config={"mode": "train"},
+                formal_config=formal_config,
                 movement_state_dim=MOVEMENT_STATE_DIM,
                 joint_action_dim=JOINT_ACTION_DIM,
                 routing_state_dim=ROUTING_STATE_DIM,
@@ -429,6 +431,10 @@ class FullResumeCheckpointTest(unittest.TestCase):
                 load_full_resume_checkpoint(
                     **(common | {"calibration": {"different": True}})
                 )
+            with self.assertRaisesRegex(
+                RuntimeError, "missing Dinkelbach block state"
+            ):
+                load_full_resume_checkpoint(**common)
 
             metadata_path = checkpoint_dir / "metadata.json"
             metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
@@ -480,6 +486,9 @@ class TrainingCliTest(unittest.TestCase):
         self.assertEqual(formal.full_resume_every, 50)
         self.assertEqual(formal.full_resume_keep_last, 2)
         self.assertEqual(formal.formal_evaluation_episode, 1500)
+        self.assertEqual(formal.dinkelbach_initial_lambda, 0.0)
+        self.assertEqual(formal.dinkelbach_update_interval_episodes, 50)
+        self.assertEqual(formal.dinkelbach_update_rule, "ratio_of_block_sums")
 
     def test_smoke_mode_rejects_seed_override(self):
         stderr = io.StringIO()
@@ -504,8 +513,26 @@ class TrainingCliTest(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "random_seed"):
             _validate_resume_config(stored, different)
 
+        wrong_interval = formal_training_config(
+            1500,
+            random_seed=20260817,
+            dinkelbach_update_interval_episodes=25,
+        )
+        with self.assertRaisesRegex(
+            RuntimeError, "dinkelbach_update_interval_episodes"
+        ):
+            _validate_resume_config(stored, wrong_interval)
+
+        wrong_initial = formal_training_config(
+            1500,
+            random_seed=20260817,
+            dinkelbach_initial_lambda=0.1,
+        )
+        with self.assertRaisesRegex(RuntimeError, "dinkelbach_initial_lambda"):
+            _validate_resume_config(stored, wrong_initial)
+
     def test_checkpoint_schema_is_explicit(self):
-        self.assertEqual(CHECKPOINT_SCHEMA_VERSION, 1)
+        self.assertEqual(CHECKPOINT_SCHEMA_VERSION, 2)
 
 
 if __name__ == "__main__":

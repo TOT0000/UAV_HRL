@@ -10,6 +10,7 @@ from pathlib import Path
 
 from com_capacity_calibration import load_com_capacity_reference
 from centralized_movement import JOINT_ACTION_DIM, MOVEMENT_STATE_DIM
+from dinkelbach_blocks import DINKELBACH_TRAINING_STATE_FIELDS
 from experiment_config import FORMAL_EXPERIMENT_DEFAULTS, MethodSpec
 from experiment_paths import (
     prepare_run_directory,
@@ -243,7 +244,6 @@ def _training_preflight(args):
         )
         training_state = reconciliation_plan.resume_training_state
         required_training_state = {
-            "lambda_EE_global",
             "reward_log",
             "delivered_log",
             "energy_log",
@@ -255,7 +255,7 @@ def _training_preflight(args):
             "td3_noise_log",
             "routing_epsilon_log",
             "training_history_rows",
-        }
+        } | set(DINKELBACH_TRAINING_STATE_FIELDS)
         missing = required_training_state.difference(training_state)
         if missing:
             raise RuntimeError(

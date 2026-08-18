@@ -5,18 +5,25 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+import torch
+
 from HRL_task_aware import formal_training_config
 from com_capacity_calibration import load_com_capacity_reference
 from comparison_experiment import main as comparison_main
+from dinkelbach_blocks import DinkelbachBlockState, dinkelbach_config_metadata
 from experiment_config import MethodSpec
 from experiment_paths import (
     evaluation_run_directory,
+    prepare_run_directory,
     read_run_status,
     training_run_directory,
+    training_run_identity,
+    write_run_status,
 )
 from scenario_manifest import generate_manifest
 from training_checkpoint import (
     CHECKPOINT_SCHEMA_VERSION,
+    FULL_CHECKPOINT_TYPE,
     MODEL_CHECKPOINT_TYPE,
     calibration_fingerprint,
 )
@@ -47,6 +54,9 @@ class ExperimentPreflightTest(unittest.TestCase):
         formal_config = asdict(
             formal_training_config(1500, random_seed=training_seed)
         )
+        dinkelbach_state = DinkelbachBlockState.from_config(formal_config)
+        for _ in range(1500):
+            dinkelbach_state.record_episode(1.0, 2.0)
         metadata = {
             "checkpoint_schema_version": CHECKPOINT_SCHEMA_VERSION,
             "checkpoint_type": MODEL_CHECKPOINT_TYPE,
@@ -62,6 +72,9 @@ class ExperimentPreflightTest(unittest.TestCase):
                 "training_seed": training_seed,
                 "manifest_hash": "training-manifest",
                 "formal_config": formal_config,
+                **dinkelbach_config_metadata(formal_config),
+                "lambda_ee": dinkelbach_state.current_lambda,
+                "dinkelbach_state": dinkelbach_state.training_state(),
             },
         }
         if mutate is not None:
@@ -200,13 +213,15 @@ class ExperimentPreflightTest(unittest.TestCase):
             }
             training_state.update(
                 {
-                    "lambda_EE_global": 0.1,
                     "total_joint_transitions": 0,
                     "global_routing_slot": 0,
                     "td3_post_warmup_transition": 0,
                     "ddqn_schedule_slot": 0,
                 }
             )
+            mock_dinkelbach_state = DinkelbachBlockState()
+            mock_dinkelbach_state.record_episode(0.0, 1.0)
+            training_state.update(mock_dinkelbach_state.training_state())
             plan = mock.Mock(
                 resume_training_state=training_state,
                 resume_episode=1,
@@ -249,6 +264,83 @@ class ExperimentPreflightTest(unittest.TestCase):
                 (run_dir / "run_identity.json").read_text(encoding="utf-8")
             )
             self.assertEqual(identity["training_seed"], 17)
+
+    def test_old_resume_state_fails_before_simulator_or_run_mutation(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            output = root / "output"
+            manifest = generate_manifest("train", 7012, 1)
+            manifest_path = root / "train.json"
+            manifest.save(manifest_path)
+            run_dir = training_run_directory(output, self.method, manifest, 17)
+            identity = training_run_identity(self.method, manifest, 17)
+            prepare_run_directory(run_dir, identity)
+            write_run_status(run_dir, "FAILED", exception=RuntimeError("stopped"))
+            status_before = read_run_status(run_dir)
+
+            resume = run_dir / "checkpoints" / "full" / "ep_0001"
+            resume.mkdir(parents=True)
+            _, calibration = load_com_capacity_reference()
+            formal_config = asdict(
+                formal_training_config(1, random_seed=17)
+            )
+            metadata_state = DinkelbachBlockState.from_config(formal_config)
+            metadata_state.record_episode(0.0, 1.0)
+            metadata = {
+                "checkpoint_schema_version": CHECKPOINT_SCHEMA_VERSION,
+                "checkpoint_type": FULL_CHECKPOINT_TYPE,
+                "episode": 0,
+                "movement_state_dim": 532,
+                "joint_action_dim": 48,
+                "routing_state_dim": 126,
+                "centralized_td3_gamma": 1.0,
+                "routing_ddqn_gamma": 0.99,
+                "com_calibration_fingerprint": calibration_fingerprint(
+                    calibration
+                ),
+                "experiment": {
+                    "method_spec_fingerprint": self.method.fingerprint,
+                    "manifest_hash": manifest.content_hash,
+                    "training_seed": 17,
+                    "formal_config": formal_config,
+                    **dinkelbach_config_metadata(formal_config),
+                    "lambda_ee": metadata_state.current_lambda,
+                    "dinkelbach_state": metadata_state.training_state(),
+                },
+            }
+            (resume / "metadata.json").write_text(
+                json.dumps(metadata), encoding="utf-8"
+            )
+            torch.save(
+                {
+                    "training_state": {
+                        "completed_episode_index": 0,
+                        "next_episode_index": 1,
+                    },
+                    "formal_config": formal_config,
+                },
+                resume / "training_state.pt",
+            )
+            (resume / "joint_replay.npz").write_bytes(b"joint")
+            (resume / "routing_replay.npz").write_bytes(b"routing")
+
+            with (
+                mock.patch("HRL_task_aware.Simulator") as simulator,
+                mock.patch("training_checkpoint._load_network_states") as load_weights,
+            ):
+                with self.assertRaisesRegex(
+                    RuntimeError, "missing Dinkelbach block state"
+                ):
+                    comparison_main(
+                        self._train_args(
+                            manifest_path, output, resume=resume
+                        )
+                    )
+                simulator.assert_not_called()
+                load_weights.assert_not_called()
+
+            self.assertEqual(read_run_status(run_dir), status_before)
+            self.assertFalse((run_dir / "recovery").exists())
 
     def test_invalid_evaluation_checkpoint_preflight_loads_no_weights_or_simulator(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -316,6 +408,13 @@ class ExperimentPreflightTest(unittest.TestCase):
                     {"batch_size": 32}
                 ),
                 "batch_size",
+            ),
+            (
+                "dinkelbach-interval",
+                lambda metadata: metadata["experiment"]["formal_config"].update(
+                    {"dinkelbach_update_interval_episodes": 25}
+                ),
+                "dinkelbach_update_interval_episodes",
             ),
         )
         for name, mutate, message in cases:
