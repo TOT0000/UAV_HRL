@@ -43,6 +43,7 @@ from evaluation_metrics import safe_energy_efficiency
 from experiment_config import MethodSpec
 from td3 import TD3
 from training_checkpoint import (
+    FULL_RESUME_LOGGING_SCHEMA_VERSION,
     checkpoint_episode_schedule,
     checkpoint_metadata_fingerprint,
     load_full_resume_checkpoint,
@@ -452,6 +453,49 @@ def _validate_resume_config(stored_config, current_config):
         raise RuntimeError(f"formal training config is incompatible: {mismatches}")
 
 
+def _append_lambda_history(
+    lambda_used_log,
+    lambda_after_episode_log,
+    *,
+    lambda_used,
+    lambda_after_episode,
+):
+    lambda_used_log.append(float(lambda_used))
+    lambda_after_episode_log.append(float(lambda_after_episode))
+
+
+def _legacy_training_frame(
+    *,
+    initial_log_length,
+    reward_log,
+    delivered_log,
+    energy_log,
+    lambda_used_log,
+    lambda_after_episode_log,
+):
+    lengths = {
+        len(reward_log),
+        len(delivered_log),
+        len(energy_log),
+        len(lambda_used_log),
+        len(lambda_after_episode_log),
+    }
+    if len(lengths) != 1:
+        raise RuntimeError("legacy training logs have inconsistent lengths")
+    return pd.DataFrame(
+        {
+            "episode": np.arange(initial_log_length, len(reward_log)),
+            "reward": reward_log[initial_log_length:],
+            "delivered_mbits": delivered_log[initial_log_length:],
+            "mobility_energy": energy_log[initial_log_length:],
+            "lambda_used": lambda_used_log[initial_log_length:],
+            "lambda_after_episode": lambda_after_episode_log[
+                initial_log_length:
+            ],
+        }
+    )
+
+
 def _full_training_state(
     *,
     episode,
@@ -459,7 +503,8 @@ def _full_training_state(
     reward_log,
     delivered_log,
     energy_log,
-    lambda_log,
+    lambda_used_log,
+    lambda_after_episode_log,
     total_joint_transitions,
     routing_slots_executed,
     td3_noise_log,
@@ -470,11 +515,15 @@ def _full_training_state(
     return {
         "completed_episode_index": int(episode),
         "next_episode_index": int(episode) + 1,
+        "full_resume_logging_schema_version": (
+            FULL_RESUME_LOGGING_SCHEMA_VERSION
+        ),
         **dinkelbach_state.training_state(),
         "reward_log": list(reward_log),
         "delivered_log": list(delivered_log),
         "energy_log": list(energy_log),
-        "lambda_log": list(lambda_log),
+        "lambda_used_log": list(lambda_used_log),
+        "lambda_after_episode_log": list(lambda_after_episode_log),
         "total_joint_transitions": int(total_joint_transitions),
         "global_routing_slot": int(routing_slots_executed),
         "td3_post_warmup_transition": max(
@@ -743,7 +792,8 @@ def train(
     reward_log = []
     delivered_log = []
     energy_log = []
-    lambda_log = []
+    lambda_used_log = []
+    lambda_after_episode_log = []
     total_joint_transitions = 0
     routing_slots_executed = 0
     td3_noise_log = []
@@ -784,7 +834,10 @@ def train(
         reward_log = list(training_state["reward_log"])
         delivered_log = list(training_state["delivered_log"])
         energy_log = list(training_state["energy_log"])
-        lambda_log = list(training_state["lambda_log"])
+        lambda_used_log = list(training_state["lambda_used_log"])
+        lambda_after_episode_log = list(
+            training_state["lambda_after_episode_log"]
+        )
         total_joint_transitions = int(training_state["total_joint_transitions"])
         routing_slots_executed = int(training_state["global_routing_slot"])
         td3_noise_log = list(training_state["td3_noise_log"])
@@ -1053,7 +1106,12 @@ def train(
         reward_log.append(episode_reward)
         delivered_log.append(episode_delivered_mbits)
         energy_log.append(episode_energy)
-        lambda_log.append(lambda_ee)
+        _append_lambda_history(
+            lambda_used_log,
+            lambda_after_episode_log,
+            lambda_used=episode_lambda,
+            lambda_after_episode=lambda_ee,
+        )
         coverage = float(env.visited_bitmap.mean())
         found_gt_ratio = (
             float(env.count_found_targets()) / float(env.num_GT)
@@ -1221,7 +1279,8 @@ def train(
                     reward_log=reward_log,
                     delivered_log=delivered_log,
                     energy_log=energy_log,
-                    lambda_log=lambda_log,
+                    lambda_used_log=lambda_used_log,
+                    lambda_after_episode_log=lambda_after_episode_log,
                     total_joint_transitions=total_joint_transitions,
                     routing_slots_executed=routing_slots_executed,
                     td3_noise_log=td3_noise_log,
@@ -1245,14 +1304,13 @@ def train(
 
     if config.enable_csv:
         os.makedirs("results", exist_ok=True)
-        csv_frame = pd.DataFrame(
-            {
-                "episode": np.arange(initial_log_length, len(reward_log)),
-                "reward": reward_log[initial_log_length:],
-                "delivered_mbits": delivered_log[initial_log_length:],
-                "mobility_energy": energy_log[initial_log_length:],
-                "lambda": lambda_log[initial_log_length:],
-            }
+        csv_frame = _legacy_training_frame(
+            initial_log_length=initial_log_length,
+            reward_log=reward_log,
+            delivered_log=delivered_log,
+            energy_log=energy_log,
+            lambda_used_log=lambda_used_log,
+            lambda_after_episode_log=lambda_after_episode_log,
         )
         csv_path = "results/centralized_td3_training.csv"
         append = config.resume_dir is not None and os.path.isfile(csv_path)
@@ -1382,6 +1440,8 @@ def train(
         "reward_log": reward_log,
         "delivered_log": delivered_log,
         "energy_log": energy_log,
+        "lambda_used_log": lambda_used_log,
+        "lambda_after_episode_log": lambda_after_episode_log,
     }
 
 

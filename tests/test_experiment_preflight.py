@@ -24,6 +24,7 @@ from scenario_manifest import generate_manifest
 from training_checkpoint import (
     CHECKPOINT_SCHEMA_VERSION,
     FULL_CHECKPOINT_TYPE,
+    FULL_RESUME_LOGGING_SCHEMA_VERSION,
     MODEL_CHECKPOINT_TYPE,
     calibration_fingerprint,
 )
@@ -200,19 +201,30 @@ class ExperimentPreflightTest(unittest.TestCase):
             resume.mkdir(parents=True)
             resumed_result = {"run_metadata": {}}
             training_state = {
-                key: []
+                key: [0.0]
                 for key in (
                     "reward_log",
                     "delivered_log",
                     "energy_log",
-                    "lambda_log",
-                    "td3_noise_log",
-                    "routing_epsilon_log",
-                    "training_history_rows",
+                    "lambda_used_log",
+                    "lambda_after_episode_log",
                 )
             }
             training_state.update(
                 {
+                    key: []
+                    for key in (
+                    "td3_noise_log",
+                    "routing_epsilon_log",
+                    "training_history_rows",
+                )
+                }
+            )
+            training_state.update(
+                {
+                    "full_resume_logging_schema_version": (
+                        FULL_RESUME_LOGGING_SCHEMA_VERSION
+                    ),
                     "total_joint_transitions": 0,
                     "global_routing_slot": 0,
                     "td3_post_warmup_transition": 0,
@@ -329,7 +341,7 @@ class ExperimentPreflightTest(unittest.TestCase):
                 mock.patch("training_checkpoint._load_network_states") as load_weights,
             ):
                 with self.assertRaisesRegex(
-                    RuntimeError, "missing Dinkelbach block state"
+                    RuntimeError, "full-resume logging schema"
                 ):
                     comparison_main(
                         self._train_args(

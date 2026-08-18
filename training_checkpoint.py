@@ -18,6 +18,16 @@ from dinkelbach_blocks import (
 CHECKPOINT_SCHEMA_VERSION = 2
 MODEL_CHECKPOINT_TYPE = "model-only"
 FULL_CHECKPOINT_TYPE = "full-resume"
+FULL_RESUME_LOGGING_SCHEMA_VERSION = 1
+
+FULL_RESUME_LOGGING_STATE_FIELDS = (
+    "full_resume_logging_schema_version",
+    "reward_log",
+    "delivered_log",
+    "energy_log",
+    "lambda_used_log",
+    "lambda_after_episode_log",
+)
 
 JOINT_REPLAY_FIELDS = (
     "state",
@@ -566,6 +576,7 @@ def save_full_resume_checkpoint(
     keep_last=None,
 ):
     checkpoint_dir = Path(checkpoint_dir)
+    _validate_full_resume_logging_state(training_state, int(episode) + 1)
     metadata = _base_metadata(
         FULL_CHECKPOINT_TYPE,
         episode,
@@ -634,6 +645,38 @@ def save_full_resume_checkpoint(
     if keep_last is not None:
         prune_full_resume_checkpoints(saved.parent, keep_last)
     return saved
+
+
+def _validate_full_resume_logging_state(training_state, completed_episode):
+    if not isinstance(training_state, dict):
+        raise RuntimeError("checkpoint training state is invalid")
+    schema_version = training_state.get("full_resume_logging_schema_version")
+    if schema_version != FULL_RESUME_LOGGING_SCHEMA_VERSION:
+        raise RuntimeError(
+            "checkpoint full-resume logging schema is incompatible: "
+            f"checkpoint={schema_version}, "
+            f"expected={FULL_RESUME_LOGGING_SCHEMA_VERSION}"
+        )
+    expected_length = int(completed_episode)
+    for field in FULL_RESUME_LOGGING_STATE_FIELDS[1:]:
+        values = training_state.get(field)
+        if not isinstance(values, (list, tuple)):
+            raise RuntimeError(
+                f"checkpoint full-resume logging state is incomplete: {field}"
+            )
+        if len(values) != expected_length:
+            raise RuntimeError(
+                "checkpoint full-resume logging length is incompatible: "
+                f"{field}={len(values)}, completed_episodes={expected_length}"
+            )
+        try:
+            finite = all(np.isfinite(float(value)) for value in values)
+        except (TypeError, ValueError):
+            finite = False
+        if not finite:
+            raise RuntimeError(
+                f"checkpoint full-resume logging state is non-finite: {field}"
+            )
 
 
 def _validate_full_metadata(
@@ -792,11 +835,20 @@ def inspect_full_resume_checkpoint(
         )
     if not isinstance(formal_config, dict):
         raise RuntimeError("checkpoint formal training configuration is invalid")
-    DinkelbachBlockState.from_training_state(
+    _validate_full_resume_logging_state(training_state, completed_episode)
+    dinkelbach_state = DinkelbachBlockState.from_training_state(
         training_state,
         formal_config,
         expected_completed_episodes=completed_episode,
     )
+    if completed_episode > 0 and not np.isclose(
+        float(training_state["lambda_after_episode_log"][-1]),
+        dinkelbach_state.current_lambda,
+    ):
+        raise RuntimeError(
+            "checkpoint lambda-after-episode log is incompatible with "
+            "Dinkelbach block state"
+        )
     return {
         "checkpoint_dir": checkpoint_dir,
         "completed_episode": completed_episode,

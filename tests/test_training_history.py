@@ -349,6 +349,20 @@ class TrainingHistoryResumeIntegrationTest(unittest.TestCase):
         self.assertEqual([row["episode"] for row in persisted], [1, 2])
         self.assertEqual(resumed["dinkelbach_update_count"], 0)
         self.assertEqual(resumed["dinkelbach_state"], first["dinkelbach_state"])
+        self.assertEqual(resumed["lambda_used_log"], first["lambda_used_log"])
+        self.assertEqual(
+            resumed["lambda_after_episode_log"],
+            first["lambda_after_episode_log"],
+        )
+        self.assertEqual(len(resumed["lambda_used_log"]), 2)
+        self.assertEqual(
+            resumed["lambda_used_log"],
+            [row["dinkelbach_lambda_used"] for row in persisted],
+        )
+        self.assertEqual(
+            resumed["lambda_after_episode_log"],
+            [row["dinkelbach_lambda_after_episode"] for row in persisted],
+        )
         self.assertEqual(
             [row["dinkelbach_block_episode"] for row in persisted], [1, 2]
         )

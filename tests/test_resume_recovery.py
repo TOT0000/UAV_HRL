@@ -17,6 +17,7 @@ from resume_recovery import (
 from training_checkpoint import (
     CHECKPOINT_SCHEMA_VERSION,
     FULL_CHECKPOINT_TYPE,
+    FULL_RESUME_LOGGING_SCHEMA_VERSION,
     MODEL_CHECKPOINT_TYPE,
     _atomic_checkpoint_write,
     calibration_fingerprint,
@@ -45,6 +46,30 @@ class ResumeRecoveryTest(unittest.TestCase):
         for _ in range(completed_episode):
             state.record_episode(1.0, 2.0)
         return state.training_state()
+
+    def _training_state(self, completed_episode):
+        state = DinkelbachBlockState.from_config(self.formal_config)
+        lambda_used_log = []
+        lambda_after_episode_log = []
+        for _ in range(completed_episode):
+            event = state.record_episode(1.0, 2.0)
+            lambda_used_log.append(event["dinkelbach_lambda_used"])
+            lambda_after_episode_log.append(
+                event["dinkelbach_lambda_after_episode"]
+            )
+        return {
+            "completed_episode_index": completed_episode - 1,
+            "next_episode_index": completed_episode,
+            "full_resume_logging_schema_version": (
+                FULL_RESUME_LOGGING_SCHEMA_VERSION
+            ),
+            "reward_log": [0.0] * completed_episode,
+            "delivered_log": [1.0] * completed_episode,
+            "energy_log": [2.0] * completed_episode,
+            "lambda_used_log": lambda_used_log,
+            "lambda_after_episode_log": lambda_after_episode_log,
+            **state.training_state(),
+        }
 
     def _metadata(self, checkpoint_type, completed_episode):
         return {
@@ -83,11 +108,7 @@ class ResumeRecoveryTest(unittest.TestCase):
         if complete:
             torch.save(
                 {
-                    "training_state": {
-                        "completed_episode_index": completed_episode - 1,
-                        "next_episode_index": completed_episode,
-                        **self._dinkelbach_state(completed_episode),
-                    },
+                    "training_state": self._training_state(completed_episode),
                     "formal_config": self.formal_config,
                 },
                 path / "training_state.pt",

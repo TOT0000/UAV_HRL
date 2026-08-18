@@ -152,7 +152,10 @@ Checkpoint schema v2 is required; older checkpoints without the block state are
 explicitly incompatible. A partial block is persisted exactly and resumes with
 the same lambda, completed-episode count, numerator sum, denominator sum, block
 index, input-validity status, and successful-update count. An incomplete final
-block never triggers a forced update. Formal evaluation validates model-only type, schema,
+block never triggers a forced update. Full-resume logging schema v1 separately
+persists `lambda_used_log` and `lambda_after_episode_log`; a legacy ambiguous
+single-lambda log is rejected for exact resume without changing model-only
+checkpoint compatibility. Formal evaluation validates model-only type, schema,
 532/48/126 dimensions, TD3/DDQN gamma, COM calibration, method/seed, the formal
 core configuration, and exactly 1,500 completed training episodes before
 loading weights. A distinct validation/test manifest is expected; output
@@ -211,4 +214,6 @@ partial history. `run_metadata.json` records the history files, canonical
 format, row count, last episode, and identity.
 
 The legacy `HRL_task_aware.py --mode smoke` and explicit
-`--mode train --episodes N` interfaces remain available.
+`--mode train --episodes N` interfaces remain available. Its optional legacy
+training CSV names the corresponding columns `lambda_used` and
+`lambda_after_episode`; it no longer emits an ambiguous `lambda` column.

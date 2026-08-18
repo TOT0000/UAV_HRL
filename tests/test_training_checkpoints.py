@@ -6,6 +6,7 @@ import random
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import numpy as np
 import torch
@@ -23,6 +24,7 @@ from centralized_movement import JOINT_ACTION_DIM, MOVEMENT_STATE_DIM
 from td3 import TD3
 from training_checkpoint import (
     CHECKPOINT_SCHEMA_VERSION,
+    FULL_RESUME_LOGGING_SCHEMA_VERSION,
     load_full_resume_checkpoint,
     load_model_checkpoint,
     save_full_resume_checkpoint,
@@ -182,10 +184,14 @@ class FullResumeCheckpointTest(unittest.TestCase):
         training_state = {
             "completed_episode_index": 6,
             "next_episode_index": 7,
-            "reward_log": [1.0, 2.0],
-            "delivered_log": [3.0, 4.0],
-            "energy_log": [5.0, 6.0],
-            "lambda_log": [0.2, 0.123],
+            "full_resume_logging_schema_version": (
+                FULL_RESUME_LOGGING_SCHEMA_VERSION
+            ),
+            "reward_log": [float(index) for index in range(7)],
+            "delivered_log": [1.0] * 7,
+            "energy_log": [2.0] * 7,
+            "lambda_used_log": [0.0] * 7,
+            "lambda_after_episode_log": [0.0] * 7,
             "total_joint_transitions": 37,
             "global_routing_slot": 148,
             "td3_post_warmup_transition": 0,
@@ -372,12 +378,84 @@ class FullResumeCheckpointTest(unittest.TestCase):
                     calibration=calibration,
                 )
 
+    def test_legacy_single_lambda_log_is_rejected_before_network_restore(self):
+        td3, ddqn, joint, routing = self._components()
+        calibration = {"seed": 1, "c_ref_com": 10.0}
+        formal_config = asdict(formal_training_config(1, random_seed=1))
+        dinkelbach_state = DinkelbachBlockState.from_config(formal_config)
+        event = dinkelbach_state.record_episode(0.0, 1.0)
+        training_state = {
+            "completed_episode_index": 0,
+            "next_episode_index": 1,
+            "full_resume_logging_schema_version": (
+                FULL_RESUME_LOGGING_SCHEMA_VERSION
+            ),
+            "reward_log": [0.0],
+            "delivered_log": [0.0],
+            "energy_log": [1.0],
+            "lambda_used_log": [event["dinkelbach_lambda_used"]],
+            "lambda_after_episode_log": [
+                event["dinkelbach_lambda_after_episode"]
+            ],
+            **dinkelbach_state.training_state(),
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            checkpoint_dir = Path(temp_dir) / "full"
+            save_full_resume_checkpoint(
+                checkpoint_dir,
+                episode=0,
+                td3=td3,
+                ddqn=ddqn,
+                joint_replay=joint,
+                routing_replay=routing,
+                training_state=training_state,
+                formal_config=formal_config,
+                movement_state_dim=MOVEMENT_STATE_DIM,
+                joint_action_dim=JOINT_ACTION_DIM,
+                routing_state_dim=ROUTING_STATE_DIM,
+                calibration=calibration,
+            )
+            payload_path = checkpoint_dir / "training_state.pt"
+            payload = torch.load(payload_path, map_location="cpu", weights_only=False)
+            legacy_state = payload["training_state"]
+            legacy_state.pop("full_resume_logging_schema_version")
+            legacy_state["lambda_log"] = legacy_state.pop("lambda_after_episode_log")
+            legacy_state.pop("lambda_used_log")
+            torch.save(payload, payload_path)
+
+            with mock.patch(
+                "training_checkpoint._load_network_states"
+            ) as load_networks:
+                with self.assertRaisesRegex(
+                    RuntimeError, "full-resume logging schema"
+                ):
+                    load_full_resume_checkpoint(
+                        checkpoint_dir,
+                        td3=td3,
+                        ddqn=ddqn,
+                        joint_replay=joint,
+                        routing_replay=routing,
+                        movement_state_dim=MOVEMENT_STATE_DIM,
+                        joint_action_dim=JOINT_ACTION_DIM,
+                        routing_state_dim=ROUTING_STATE_DIM,
+                        calibration=calibration,
+                    )
+                load_networks.assert_not_called()
+
     def test_full_resume_rejects_dimension_gamma_schema_and_calibration_mismatch(self):
         td3, ddqn, joint, routing = self._components()
         calibration = {"seed": 1, "c_ref_com": 10.0}
         training_state = {
             "completed_episode_index": 0,
             "next_episode_index": 1,
+            "full_resume_logging_schema_version": (
+                FULL_RESUME_LOGGING_SCHEMA_VERSION
+            ),
+            "reward_log": [0.0],
+            "delivered_log": [0.0],
+            "energy_log": [1.0],
+            "lambda_used_log": [0.0],
+            "lambda_after_episode_log": [0.0],
             "total_joint_transitions": 0,
         }
         formal_config = asdict(formal_training_config(1, random_seed=1))

@@ -7,6 +7,7 @@ from pathlib import Path
 
 import torch
 
+from dinkelbach_blocks import DinkelbachBlockState
 from HRL_task_aware import (
     MOVEMENT_CONTROL_INTERVAL,
     PRODUCTION_BATCH_SIZE,
@@ -14,12 +15,15 @@ from HRL_task_aware import (
     PRODUCTION_WARMUP_TRANSITIONS,
     ROUTING_STATE_DIM,
     TrainingConfig,
+    _append_lambda_history,
     _dinkelbach_update,
     _interval_reward,
+    _legacy_training_frame,
     formal_training_config,
     smoke_training_config,
     train,
 )
+from training_history import build_training_history_row, training_history_identity
 
 
 class CentralizedTrainingFlowTest(unittest.TestCase):
@@ -117,6 +121,84 @@ class CentralizedTrainingFlowTest(unittest.TestCase):
         self.assertEqual(_dinkelbach_update(10.0, float("nan"), 0.25), 0.25)
         self.assertEqual(_dinkelbach_update(10.0, 2.0, 0.25), 5.0)
 
+    def test_legacy_lambda_logs_match_reward_and_canonical_history_semantics(self):
+        config = TrainingConfig(
+            total_episodes=51,
+            beta_search=0.0,
+            beta_vs=0.0,
+            beta_com=0.0,
+        )
+        state = DinkelbachBlockState.from_config(config)
+        rewards = []
+        lambda_used_log = []
+        lambda_after_episode_log = []
+        events = []
+        for _ in range(51):
+            lambda_used = state.current_lambda
+            rewards.append(
+                _interval_reward(
+                    delivered_mbits=2.0,
+                    energy=4.0,
+                    current_lambda=lambda_used,
+                    gamma=1.0,
+                    potentials_t=(0.0, 0.0, 0.0),
+                    potentials_t1=(0.0, 0.0, 0.0),
+                    done=False,
+                    config=config,
+                )
+            )
+            event = state.record_episode(2.0, 4.0)
+            events.append(event)
+            _append_lambda_history(
+                lambda_used_log,
+                lambda_after_episode_log,
+                lambda_used=lambda_used,
+                lambda_after_episode=state.current_lambda,
+            )
+
+        self.assertEqual(lambda_used_log[48], lambda_after_episode_log[48])
+        self.assertEqual(rewards[49], 2.0)
+        self.assertEqual(lambda_used_log[49], 0.0)
+        self.assertEqual(lambda_after_episode_log[49], 0.5)
+        self.assertEqual(lambda_used_log[50], 0.5)
+
+        frame = _legacy_training_frame(
+            initial_log_length=0,
+            reward_log=rewards,
+            delivered_log=[2.0] * 51,
+            energy_log=[4.0] * 51,
+            lambda_used_log=lambda_used_log,
+            lambda_after_episode_log=lambda_after_episode_log,
+        )
+        canonical = build_training_history_row(
+            training_history_identity("method", 1, "manifest"),
+            episode=50,
+            reward=rewards[49],
+            timely_goodput_mbits=2.0,
+            mobility_energy_j=4.0,
+            **events[49],
+        )
+        self.assertEqual(
+            list(frame.columns),
+            [
+                "episode",
+                "reward",
+                "delivered_mbits",
+                "mobility_energy",
+                "lambda_used",
+                "lambda_after_episode",
+            ],
+        )
+        self.assertNotIn("lambda", frame.columns)
+        self.assertEqual(
+            frame.iloc[49]["lambda_used"],
+            canonical["dinkelbach_lambda_used"],
+        )
+        self.assertEqual(
+            frame.iloc[49]["lambda_after_episode"],
+            canonical["dinkelbach_lambda_after_episode"],
+        )
+
     def test_finite_horizon_potential_shaping_uses_unit_discount(self):
         config = TrainingConfig(total_episodes=1)
         reward = _interval_reward(
@@ -168,6 +250,12 @@ class CentralizedTrainingFlowTest(unittest.TestCase):
         self.assertEqual(metadata["checkpoint_type"], "full-resume")
         self.assertEqual(state["completed_episode_index"], 0)
         self.assertEqual(state["next_episode_index"], 1)
+        self.assertEqual(state["full_resume_logging_schema_version"], 1)
+        self.assertEqual(state["lambda_used_log"], result["lambda_used_log"])
+        self.assertEqual(
+            state["lambda_after_episode_log"],
+            result["lambda_after_episode_log"],
+        )
 
 
 if __name__ == "__main__":

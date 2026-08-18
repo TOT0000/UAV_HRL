@@ -31,6 +31,7 @@ from resume_recovery import (
 )
 from scenario_manifest import ScenarioManifest, generate_manifest
 from training_checkpoint import (
+    FULL_RESUME_LOGGING_STATE_FIELDS,
     inspect_full_resume_checkpoint,
     inspect_model_checkpoint,
 )
@@ -244,10 +245,6 @@ def _training_preflight(args):
         )
         training_state = reconciliation_plan.resume_training_state
         required_training_state = {
-            "reward_log",
-            "delivered_log",
-            "energy_log",
-            "lambda_log",
             "total_joint_transitions",
             "global_routing_slot",
             "td3_post_warmup_transition",
@@ -255,7 +252,9 @@ def _training_preflight(args):
             "td3_noise_log",
             "routing_epsilon_log",
             "training_history_rows",
-        } | set(DINKELBACH_TRAINING_STATE_FIELDS)
+        } | set(DINKELBACH_TRAINING_STATE_FIELDS) | set(
+            FULL_RESUME_LOGGING_STATE_FIELDS
+        )
         missing = required_training_state.difference(training_state)
         if missing:
             raise RuntimeError(
