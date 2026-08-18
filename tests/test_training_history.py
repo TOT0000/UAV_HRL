@@ -33,7 +33,16 @@ class TrainingHistoryPersistenceTest(unittest.TestCase):
             reward=float(episode if reward is None else reward),
             timely_goodput_mbits=float(episode),
             mobility_energy_j=energy,
-            dinkelbach_lambda=0.1 * episode,
+            dinkelbach_lambda_used=0.0,
+            dinkelbach_lambda_after_episode=0.0,
+            dinkelbach_lambda_updated=False,
+            dinkelbach_update_status="accumulating",
+            dinkelbach_block_index=1,
+            dinkelbach_block_episode=episode,
+            dinkelbach_block_timely_mbits_so_far=(
+                episode * (episode + 1) / 2
+            ),
+            dinkelbach_block_energy_joules_so_far=episode * energy,
         )
 
     def test_csv_and_jsonl_contain_the_same_finite_episode_rows(self):
@@ -80,7 +89,10 @@ class TrainingHistoryPersistenceTest(unittest.TestCase):
                         "timely_goodput_mbits",
                         "mobility_energy_j",
                         "energy_efficiency_mbit_per_j",
-                        "dinkelbach_lambda",
+                        "dinkelbach_lambda_used",
+                        "dinkelbach_lambda_after_episode",
+                        "dinkelbach_block_timely_mbits_so_far",
+                        "dinkelbach_block_energy_joules_so_far",
                     )
                 )
             )
@@ -124,7 +136,14 @@ class TrainingHistoryPersistenceTest(unittest.TestCase):
                     reward=1.0,
                     timely_goodput_mbits=1.0,
                     mobility_energy_j=1.0,
-                    dinkelbach_lambda=0.1,
+                    dinkelbach_lambda_used=0.0,
+                    dinkelbach_lambda_after_episode=0.0,
+                    dinkelbach_lambda_updated=False,
+                    dinkelbach_update_status="accumulating",
+                    dinkelbach_block_index=1,
+                    dinkelbach_block_episode=1,
+                    dinkelbach_block_timely_mbits_so_far=1.0,
+                    dinkelbach_block_energy_joules_so_far=1.0,
                 )
             ]
             write_training_history(temp_dir, other_rows, other_identity)

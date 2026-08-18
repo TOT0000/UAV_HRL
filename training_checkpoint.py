@@ -51,6 +51,11 @@ FORMAL_CORE_CONFIG_FIELDS = (
     "beta_com",
     "search_coverage_threshold",
     "replay_max_size",
+    "dinkelbach_initial_lambda",
+    "dinkelbach_update_interval_episodes",
+    "dinkelbach_update_rule",
+    "dinkelbach_numerator_unit",
+    "dinkelbach_denominator_unit",
 )
 
 FULL_RESUME_CONFIG_FIELDS = (

@@ -9,6 +9,8 @@ import re
 from datetime import datetime, timezone
 import uuid
 
+from dinkelbach_blocks import dinkelbach_config_metadata
+
 
 RUN_IDENTITY_FILENAME = "run_identity.json"
 RUN_STATUS_FILENAME = "run_status.json"
@@ -41,6 +43,7 @@ def training_run_identity(method, manifest, training_seed) -> dict:
         "training_seed": int(training_seed),
         "training_manifest_hash": manifest.content_hash,
         "manifest_split": manifest.split,
+        **dinkelbach_config_metadata(),
     }
 
 
@@ -52,6 +55,7 @@ def evaluation_run_identity(method, manifest, training_seed) -> dict:
         "training_seed": int(training_seed),
         "evaluation_split": manifest.split,
         "evaluation_manifest_hash": manifest.content_hash,
+        **dinkelbach_config_metadata(),
     }
 
 

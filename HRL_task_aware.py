@@ -11,6 +11,16 @@ import pandas as pd
 import torch
 
 from DDQN import DDQN
+from dinkelbach_blocks import (
+    DINKELBACH_DENOMINATOR_UNIT,
+    DINKELBACH_INITIAL_LAMBDA,
+    DINKELBACH_NUMERATOR_UNIT,
+    DINKELBACH_UPDATE_INTERVAL_EPISODES,
+    DINKELBACH_UPDATE_RULE,
+    DinkelbachBlockState,
+    dinkelbach_config_metadata,
+    validate_dinkelbach_config,
+)
 from Packet_scheduler_v1 import PacketEngine
 from Simulator import Simulator
 from centralized_movement import (
@@ -125,6 +135,11 @@ class TrainingConfig:
     beta_vs: float = 1.0
     beta_com: float = 1.0
     search_coverage_threshold: float = 0.99
+    dinkelbach_initial_lambda: float = DINKELBACH_INITIAL_LAMBDA
+    dinkelbach_update_interval_episodes: int = DINKELBACH_UPDATE_INTERVAL_EPISODES
+    dinkelbach_update_rule: str = DINKELBACH_UPDATE_RULE
+    dinkelbach_numerator_unit: str = DINKELBACH_NUMERATOR_UNIT
+    dinkelbach_denominator_unit: str = DINKELBACH_DENOMINATOR_UNIT
     model_checkpoint_every: int = 50
     full_resume_every: int = 50
     full_resume_keep_last: int = 2
@@ -152,6 +167,7 @@ class TrainingConfig:
             raise ValueError("full_resume_keep_last must be positive")
         if self.formal_evaluation_episode <= 0:
             raise ValueError("formal_evaluation_episode must be positive")
+        validate_dinkelbach_config(self)
 
 
 def smoke_training_config():
@@ -182,6 +198,11 @@ def formal_training_config(total_episodes, **overrides):
         "warmup_joint_transitions": PRODUCTION_WARMUP_TRANSITIONS,
         "batch_size": PRODUCTION_BATCH_SIZE,
         "policy_delay": PRODUCTION_POLICY_DELAY,
+        "dinkelbach_initial_lambda": DINKELBACH_INITIAL_LAMBDA,
+        "dinkelbach_update_interval_episodes": DINKELBACH_UPDATE_INTERVAL_EPISODES,
+        "dinkelbach_update_rule": DINKELBACH_UPDATE_RULE,
+        "dinkelbach_numerator_unit": DINKELBACH_NUMERATOR_UNIT,
+        "dinkelbach_denominator_unit": DINKELBACH_DENOMINATOR_UNIT,
         "model_checkpoint_every": 50,
         "full_resume_every": 50,
         "full_resume_keep_last": 2,
@@ -356,9 +377,17 @@ def _mark_search_observations(env):
 
 
 def _dinkelbach_update(delivered_mbits, total_energy, previous_lambda):
-    if total_energy <= 1e-12:
+    delivered_mbits = float(delivered_mbits)
+    total_energy = float(total_energy)
+    previous_lambda = float(previous_lambda)
+    if (
+        not np.isfinite(delivered_mbits)
+        or not np.isfinite(total_energy)
+        or total_energy <= 0.0
+    ):
         return float(previous_lambda)
-    return float(delivered_mbits / total_energy)
+    ratio = delivered_mbits / total_energy
+    return float(ratio) if np.isfinite(ratio) else float(previous_lambda)
 
 
 def _interval_reward(
@@ -393,6 +422,11 @@ _RESUME_CONFIG_FIELDS = (
     "beta_vs",
     "beta_com",
     "search_coverage_threshold",
+    "dinkelbach_initial_lambda",
+    "dinkelbach_update_interval_episodes",
+    "dinkelbach_update_rule",
+    "dinkelbach_numerator_unit",
+    "dinkelbach_denominator_unit",
     "model_checkpoint_every",
     "full_resume_every",
     "full_resume_keep_last",
@@ -421,7 +455,7 @@ def _validate_resume_config(stored_config, current_config):
 def _full_training_state(
     *,
     episode,
-    lambda_ee,
+    dinkelbach_state,
     reward_log,
     delivered_log,
     energy_log,
@@ -436,7 +470,7 @@ def _full_training_state(
     return {
         "completed_episode_index": int(episode),
         "next_episode_index": int(episode) + 1,
-        "lambda_EE_global": float(lambda_ee),
+        **dinkelbach_state.training_state(),
         "reward_log": list(reward_log),
         "delivered_log": list(delivered_log),
         "energy_log": list(energy_log),
@@ -453,7 +487,7 @@ def _full_training_state(
     }
 
 
-def _experiment_identity(method_spec, scenario_manifest, training_seed):
+def _experiment_identity(method_spec, scenario_manifest, training_seed, config):
     return {
         "method_id": method_spec.method_id,
         "method_spec": method_spec.to_dict(),
@@ -474,10 +508,13 @@ def _experiment_identity(method_spec, scenario_manifest, training_seed):
         "training_seed": (
             int(training_seed) if training_seed is not None else None
         ),
+        **dinkelbach_config_metadata(config),
     }
 
 
-def _evaluation_state_snapshot(td3, ddqn, joint_replay, routing_replay, lambda_ee):
+def _evaluation_state_snapshot(
+    td3, ddqn, joint_replay, routing_replay, dinkelbach_state
+):
     """Copy all learning state that evaluation is forbidden to mutate."""
 
     return {
@@ -510,7 +547,7 @@ def _evaluation_state_snapshot(td3, ddqn, joint_replay, routing_replay, lambda_e
         ),
         "joint_replay_size": int(joint_replay.size),
         "routing_replay_size": int(routing_replay.size),
-        "lambda_ee": float(lambda_ee),
+        "dinkelbach_state": copy.deepcopy(dinkelbach_state.training_state()),
     }
 
 
@@ -549,7 +586,9 @@ def _evaluation_invariants(before, after, routing_epsilon_log, td3_noise_log):
             before["joint_replay_size"] == after["joint_replay_size"]
             and before["routing_replay_size"] == after["routing_replay_size"]
         ),
-        "lambda_unchanged": before["lambda_ee"] == after["lambda_ee"],
+        "dinkelbach_state_unchanged": _nested_state_equal(
+            before["dinkelbach_state"], after["dinkelbach_state"]
+        ),
         "exploration_disabled": (
             not td3_noise_log
             and all(float(epsilon) == 0.0 for epsilon in routing_epsilon_log)
@@ -625,7 +664,7 @@ def train(
     )
 
     experiment_identity = _experiment_identity(
-        method_spec, scenario_manifest, config.random_seed
+        method_spec, scenario_manifest, config.random_seed, config
     )
     history_identity = None
     training_history_rows = []
@@ -680,13 +719,26 @@ def train(
             "checkpoint_metadata_fingerprint": (
                 checkpoint_metadata_fingerprint(loaded_checkpoint_metadata)
             ),
+            "checkpoint_dinkelbach_config": dinkelbach_config_metadata(
+                checkpoint_experiment["formal_config"]
+            ),
+            "checkpoint_dinkelbach_state": dict(
+                checkpoint_experiment["dinkelbach_state"]
+            ),
         }
 
-    lambda_ee = 0.1
+    dinkelbach_state = DinkelbachBlockState.from_config(config)
+    lambda_ee = float(dinkelbach_state.current_lambda)
     if loaded_checkpoint_metadata is not None:
-        lambda_ee = float(
-            loaded_checkpoint_metadata["experiment"].get("lambda_ee", lambda_ee)
+        checkpoint_experiment = loaded_checkpoint_metadata["experiment"]
+        dinkelbach_state = DinkelbachBlockState.from_training_state(
+            checkpoint_experiment.get("dinkelbach_state", {}),
+            checkpoint_experiment.get("formal_config", {}),
+            expected_completed_episodes=(
+                int(loaded_checkpoint_metadata["episode"]) + 1
+            ),
         )
+        lambda_ee = float(dinkelbach_state.current_lambda)
     start_episode = 0
     reward_log = []
     delivered_log = []
@@ -722,8 +774,13 @@ def train(
         )
         _validate_resume_config(restored["formal_config"], config)
         training_state = restored["training_state"]
-        lambda_ee = float(training_state["lambda_EE_global"])
         start_episode = int(training_state["next_episode_index"])
+        dinkelbach_state = DinkelbachBlockState.from_training_state(
+            training_state,
+            config,
+            expected_completed_episodes=start_episode,
+        )
+        lambda_ee = float(dinkelbach_state.current_lambda)
         reward_log = list(training_state["reward_log"])
         delivered_log = list(training_state["delivered_log"])
         energy_log = list(training_state["energy_log"])
@@ -756,7 +813,11 @@ def train(
 
     evaluation_state_before = (
         _evaluation_state_snapshot(
-            centralized_td3, ddqn, joint_replay, routing_replay, lambda_ee
+            centralized_td3,
+            ddqn,
+            joint_replay,
+            routing_replay,
+            dinkelbach_state,
         )
         if evaluation
         else None
@@ -967,23 +1028,28 @@ def train(
             ):
                 centralized_td3.update_joint(
                     joint_replay,
-                    current_lambda=lambda_ee,
+                    current_lambda=episode_lambda,
                     batch_size=config.batch_size,
                     beta_search=config.beta_search,
                     beta_vs=config.beta_vs,
                     beta_com=config.beta_com,
                 )
 
-        if not evaluation:
-            lambda_ee = _dinkelbach_update(
-                episode_delivered_mbits, episode_energy, lambda_ee
-            )
-        env.lambda_EE_global = lambda_ee
         if not evaluation and routing_replay.size >= config.batch_size:
             ddqn.train(routing_replay, config.batch_size)
         if not evaluation:
             ddqn.update_target()
 
+        timely_goodput_mbits = float(packet_engine.timely_goodput_bits) / 1e6
+        raw_final_hop_mbits = float(packet_engine.raw_final_hop_bits) / 1e6
+        dinkelbach_event = None
+        if not evaluation:
+            dinkelbach_event = dinkelbach_state.record_episode(
+                timely_goodput_mbits,
+                episode_energy,
+            )
+            lambda_ee = float(dinkelbach_state.current_lambda)
+        env.lambda_EE_global = lambda_ee
         reward_log.append(episode_reward)
         delivered_log.append(episode_delivered_mbits)
         energy_log.append(episode_energy)
@@ -994,8 +1060,6 @@ def train(
             if int(env.num_GT) > 0
             else 0.0
         )
-        timely_goodput_mbits = float(packet_engine.timely_goodput_bits) / 1e6
-        raw_final_hop_mbits = float(packet_engine.raw_final_hop_bits) / 1e6
         episode_metrics.append(
             {
                 "method_id": method_spec.method_id,
@@ -1061,7 +1125,7 @@ def train(
                     reward=episode_reward,
                     timely_goodput_mbits=timely_goodput_mbits,
                     mobility_energy_j=episode_energy,
-                    dinkelbach_lambda=lambda_ee,
+                    **dinkelbach_event,
                 )
             )
             training_history_rows = write_training_history(
@@ -1072,7 +1136,8 @@ def train(
         print(
             f"[Episode {episode + 1}] joint_transitions={config.episode_seconds} "
             f"reward={episode_reward:.6f} delivered={episode_delivered_mbits:.6f} Mbit "
-            f"energy={episode_energy:.6f} J lambda={lambda_ee:.9f} "
+            f"energy={episode_energy:.6f} J lambda_used={episode_lambda:.9f} "
+            f"lambda_after={lambda_ee:.9f} "
             f"routing_reward={episode_routing_reward:.6f} "
             f"raw_final_bits={packet_engine.raw_final_hop_bits:.0f} "
             f"timely_bits={packet_engine.timely_goodput_bits:.0f} "
@@ -1081,6 +1146,27 @@ def train(
             f"critic_updates={centralized_td3.num_critic_update_iteration} "
             f"actor_updates={centralized_td3.num_actor_update_iteration}"
         )
+        if dinkelbach_event is not None and dinkelbach_event[
+            "dinkelbach_block_completed"
+        ]:
+            first_episode = (
+                (dinkelbach_event["dinkelbach_block_index"] - 1)
+                * config.dinkelbach_update_interval_episodes
+                + 1
+            )
+            print(
+                f"[Dinkelbach block "
+                f"{dinkelbach_event['dinkelbach_block_index']}]\n"
+                f"episodes={first_episode}-{episode + 1}\n"
+                f"timely_mbits="
+                f"{dinkelbach_event['dinkelbach_block_timely_mbits_so_far']:.9f}\n"
+                f"mobility_energy_j="
+                f"{dinkelbach_event['dinkelbach_block_energy_joules_so_far']:.9f}\n"
+                f"lambda_old={dinkelbach_event['dinkelbach_lambda_used']:.12g}\n"
+                f"lambda_new="
+                f"{dinkelbach_event['dinkelbach_lambda_after_episode']:.12g}\n"
+                f"status={dinkelbach_event['dinkelbach_update_status']}"
+            )
 
         if (
             not evaluation
@@ -1106,6 +1192,7 @@ def train(
                 experiment_metadata={
                     **experiment_identity,
                     "lambda_ee": float(lambda_ee),
+                    "dinkelbach_state": dinkelbach_state.training_state(),
                     "formal_config": asdict(config),
                 },
             )
@@ -1130,7 +1217,7 @@ def train(
                 routing_replay=routing_replay,
                 training_state=_full_training_state(
                     episode=episode,
-                    lambda_ee=lambda_ee,
+                    dinkelbach_state=dinkelbach_state,
                     reward_log=reward_log,
                     delivered_log=delivered_log,
                     energy_log=energy_log,
@@ -1150,6 +1237,7 @@ def train(
                 experiment_metadata={
                     **experiment_identity,
                     "lambda_ee": float(lambda_ee),
+                    "dinkelbach_state": dinkelbach_state.training_state(),
                     "formal_config": asdict(config),
                 },
                 keep_last=config.full_resume_keep_last,
@@ -1187,7 +1275,11 @@ def train(
     evaluation_invariants = None
     if evaluation:
         evaluation_state_after = _evaluation_state_snapshot(
-            centralized_td3, ddqn, joint_replay, routing_replay, lambda_ee
+            centralized_td3,
+            ddqn,
+            joint_replay,
+            routing_replay,
+            dinkelbach_state,
         )
         evaluation_invariants = _evaluation_invariants(
             evaluation_state_before,
@@ -1234,6 +1326,8 @@ def train(
         "joint_replay_size": joint_replay.size,
         "routing_replay_size": routing_replay.size,
         "lambda": lambda_ee,
+        "dinkelbach_update_count": int(dinkelbach_state.update_count),
+        "dinkelbach_state": dinkelbach_state.training_state(),
         "calibration": calibration,
         "duplicate_target_assertions": duplicate_target_assertions,
         "environment_actor_calls": environment_actor_calls,
@@ -1263,6 +1357,8 @@ def train(
             **experiment_identity,
             **checkpoint_provenance,
             "formal_config": asdict(config),
+            "dinkelbach_config": dinkelbach_config_metadata(config),
+            "dinkelbach_state": dinkelbach_state.training_state(),
             "evaluation": bool(evaluation),
             "training_history": (
                 {
