@@ -87,6 +87,25 @@ Run the 60-second manifest smoke:
 python -X utf8 comparison_experiment.py smoke --training-seed 1 --output-dir runs/comparison/smoke
 ```
 
+Collect deterministic centralized joint transitions for offline LLM design
+analysis with the explicit, evaluation-only collector:
+
+```powershell
+python -X utf8 comparison_experiment.py collect-design-dataset --split validation --manifest runs/comparison/manifests/validation.json --training-seed 1 --episodes 100 --checkpoint runs/comparison/<method>/train/<train-hash-8>/seed-1/checkpoints/models/ep_1500 --output-dir runs/design --reference-per-episode runs/comparison/<method>/evaluate/validation/<validation-hash-8>/seed-1/per_episode.csv
+```
+
+The collector writes to an isolated
+`<root>/<method>/design/<split>/<manifest-hash-8>/seed-<seed>/` directory. It
+uses the ordinary deterministic evaluation dataflow with no exploration or
+action perturbation and never updates learning or Dinkelbach state. Its atomic
+artifacts are `design_transitions.npz`, `design_dataset_metadata.json`, and a
+design-local `per_episode.csv`/`per_episode.jsonl`. The NPZ stores each complete
+532-D state, projected 48-D raw actor action, 532-D next state, terminal flags,
+delivery/energy and potential reward components, checkpoint lambda, and
+episode/step/scenario identity. Metadata records the authoritative state/action
+schema from `centralized_movement.py`; it deliberately does not select
+Lipschitz hyperparameters or compute a Lipschitz constant.
+
 `--output-dir` is an output root. Train/evaluate commands derive collision-safe
 run directories from method, manifest, split, and seed:
 
