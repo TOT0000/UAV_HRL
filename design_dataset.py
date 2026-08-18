@@ -340,13 +340,27 @@ def validate_reference_identity(
     training_manifest_hash,
     checkpoint_completed_episodes,
     checkpoint_fingerprint,
-    episode_count,
+    expected_scenario_ids,
 ):
-    if len(rows) != int(episode_count):
+    by_scenario = {}
+    for row in rows:
+        scenario_id = row["scenario_id"]
+        if scenario_id in by_scenario:
+            raise RuntimeError(
+                f"reference contains duplicate scenario_id: {scenario_id}"
+            )
+        by_scenario[scenario_id] = row
+    missing_scenarios = [
+        scenario_id
+        for scenario_id in expected_scenario_ids
+        if scenario_id not in by_scenario
+    ]
+    if missing_scenarios:
         raise RuntimeError(
-            "reference episode count is incompatible: "
-            f"{len(rows)} != {int(episode_count)}"
+            "reference is missing requested scenarios: "
+            f"{missing_scenarios[:3]}"
         )
+    selected = [by_scenario[scenario_id] for scenario_id in expected_scenario_ids]
     expected = {
         "method_id": str(method_id),
         "training_seed": int(training_seed),
@@ -356,7 +370,7 @@ def validate_reference_identity(
         "checkpoint_completed_episodes": int(checkpoint_completed_episodes),
         "checkpoint_metadata_fingerprint": str(checkpoint_fingerprint),
     }
-    for index, row in enumerate(rows):
+    for index, row in enumerate(selected):
         for field, value in expected.items():
             if row[field] != value:
                 raise RuntimeError(
@@ -364,6 +378,7 @@ def validate_reference_identity(
                     f"{index}, field {field}: reference={row[field]!r}, "
                     f"expected={value!r}"
                 )
+    return selected
 
 
 def validate_reference_metrics(reference_rows, collected_rows):
@@ -615,7 +630,7 @@ def design_dataset_preflight(args):
     )
     if reference_rows is not None:
         experiment = checkpoint["metadata"]["experiment"]
-        validate_reference_identity(
+        reference_rows = validate_reference_identity(
             reference_rows,
             method_id=method.method_id,
             training_seed=args.training_seed,
@@ -624,7 +639,10 @@ def design_dataset_preflight(args):
             training_manifest_hash=experiment["manifest_hash"],
             checkpoint_completed_episodes=checkpoint["completed_episode"],
             checkpoint_fingerprint=checkpoint_fingerprint,
-            episode_count=episode_count,
+            expected_scenario_ids=[
+                str(entry["scenario_id"])
+                for entry in manifest.episodes[:episode_count]
+            ],
         )
     config = TrainingConfig(
         total_episodes=episode_count,

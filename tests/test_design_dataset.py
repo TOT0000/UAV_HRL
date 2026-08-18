@@ -25,6 +25,7 @@ from design_dataset import (
     read_reference_episode_csv,
     reconstruct_reward,
     validate_reference_metrics,
+    validate_reference_identity,
 )
 from dinkelbach_blocks import DinkelbachBlockState, dinkelbach_config_metadata
 from evaluation_metrics import EPISODE_COLUMNS, write_evaluation_outputs
@@ -252,6 +253,22 @@ class DesignDatasetIntegrationTest(unittest.TestCase):
         reference[0]["coverage"] += 0.01
         with self.assertRaisesRegex(RuntimeError, "field=coverage"):
             validate_reference_metrics(reference, self.ordinary["episode_metrics"])
+
+    def test_partial_collection_selects_requested_reference_scenarios(self):
+        reference = read_reference_episode_csv(self.reference_csv)
+        duplicated_full_reference = [*reference, {**reference[1], "scenario_id": "extra"}]
+        selected = validate_reference_identity(
+            duplicated_full_reference,
+            method_id=self.method.method_id,
+            training_seed=self.training_seed,
+            split="validation",
+            evaluation_manifest_hash=self.manifest.content_hash,
+            training_manifest_hash="a" * 64,
+            checkpoint_completed_episodes=1500,
+            checkpoint_fingerprint=reference[0]["checkpoint_metadata_fingerprint"],
+            expected_scenario_ids=[reference[0]["scenario_id"]],
+        )
+        self.assertEqual(selected, reference[:1])
 
     def test_output_lifecycle_and_collision_protection(self):
         self.assertEqual(read_run_status(self.run_one)["state"], "COMPLETED")
