@@ -59,6 +59,23 @@ def evaluation_run_identity(method, manifest, training_seed) -> dict:
     }
 
 
+def design_run_identity(
+    method, manifest, training_seed, checkpoint_metadata_fingerprint
+) -> dict:
+    return {
+        "run_kind": "design-dataset",
+        "method_id": method.method_id,
+        "method_slug": filesystem_slug(method.method_id),
+        "training_seed": int(training_seed),
+        "design_split": manifest.split,
+        "design_manifest_hash": manifest.content_hash,
+        "checkpoint_metadata_fingerprint": str(
+            checkpoint_metadata_fingerprint
+        ),
+        **dinkelbach_config_metadata(),
+    }
+
+
 def training_run_directory(output_root, method, manifest, training_seed) -> Path:
     return (
         Path(output_root)
@@ -74,6 +91,17 @@ def evaluation_run_directory(output_root, method, manifest, training_seed) -> Pa
         Path(output_root)
         / filesystem_slug(method.method_id)
         / "evaluate"
+        / manifest.split
+        / manifest_short_hash(manifest.content_hash)
+        / f"seed-{int(training_seed)}"
+    )
+
+
+def design_run_directory(output_root, method, manifest, training_seed) -> Path:
+    return (
+        Path(output_root)
+        / filesystem_slug(method.method_id)
+        / "design"
         / manifest.split
         / manifest_short_hash(manifest.content_hash)
         / f"seed-{int(training_seed)}"

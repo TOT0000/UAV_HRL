@@ -291,6 +291,12 @@ def command_evaluate(args):
     return run_evaluation_command(args)
 
 
+def command_collect_design_dataset(args):
+    from design_dataset import run_design_dataset_command
+
+    return run_design_dataset_command(args)
+
+
 def command_aggregate(args):
     from evaluation_metrics import run_aggregate_command
 
@@ -350,6 +356,25 @@ def build_parser():
     evaluate.add_argument("--output-dir", default=str(DEFAULT_OUTPUT_DIR))
     evaluate.add_argument("--resume")
     evaluate.set_defaults(handler=command_evaluate)
+
+    design = subparsers.add_parser("collect-design-dataset")
+    design.add_argument("--method", type=_method, default=MethodSpec())
+    design.add_argument(
+        "--split", default="validation", choices=("validation", "test")
+    )
+    design.add_argument("--manifest", required=True)
+    design.add_argument("--training-seed", type=int, required=True)
+    design.add_argument(
+        "--episodes",
+        type=int,
+        default=FORMAL_EXPERIMENT_DEFAULTS[
+            "evaluation_episodes_per_trained_seed"
+        ],
+    )
+    design.add_argument("--checkpoint", required=True)
+    design.add_argument("--output-dir", required=True)
+    design.add_argument("--reference-per-episode")
+    design.set_defaults(handler=command_collect_design_dataset)
 
     aggregate = subparsers.add_parser("aggregate")
     aggregate.add_argument("--method", type=_method, default=MethodSpec())

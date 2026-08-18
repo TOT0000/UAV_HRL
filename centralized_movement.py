@@ -17,6 +17,149 @@ GT_COUNT_MAX = 10
 COVERAGE_GRID_SIZE = 16
 VS_COVERAGE_EPS = 1e-6
 HOVER_ACTION = (-1.0, 0.0, 0.0)
+MOVEMENT_FEATURE_SCHEMA_VERSION = 1
+
+LOCAL_MOVEMENT_FEATURES = (
+    ("task_search", "binary", 0.0, 1.0, "Search task is active"),
+    ("task_fov", "binary", 0.0, 1.0, "FOV task is active"),
+    ("task_com", "binary", 0.0, 1.0, "COM task is active"),
+    ("task_hovering", "binary", 0.0, 1.0, "Hovering task is active"),
+    ("position_x", "continuous", 0.0, 1.0, "x / environment width"),
+    ("position_y", "continuous", 0.0, 1.0, "y / environment height"),
+    (
+        "position_z",
+        "continuous",
+        0.0,
+        1.0,
+        "(z - UAV min AGL) / (UAV max AGL - UAV min AGL)",
+    ),
+    ("energy", "continuous", 0.0, 1.0, "remaining energy / E_max"),
+    (
+        "backlog",
+        "continuous",
+        0.0,
+        1.0,
+        "log1p(non-negative backlog bits) / log1p(5e7 bits)",
+    ),
+    (
+        "fov_error",
+        "continuous",
+        -1.0,
+        1.0,
+        "clip((FOV image score - 1) / 3, -1, 1); zero without FOV task",
+    ),
+    ("fov_target_x", "continuous", 0.0, 1.0, "FOV target x / width"),
+    ("fov_target_y", "continuous", 0.0, 1.0, "FOV target y / height"),
+    ("fov_target_z", "continuous", 0.0, 1.0, "FOV target z / UAV max AGL"),
+    ("com_target_x", "continuous", 0.0, 1.0, "COM target x / width"),
+    ("com_target_y", "continuous", 0.0, 1.0, "COM target y / height"),
+    ("com_target_z", "continuous", 0.0, 1.0, "COM target z / UAV max AGL"),
+    (
+        "com_capacity",
+        "continuous",
+        0.0,
+        1.0,
+        "non-negative COM capacity Mbps / calibrated c_ref_com",
+    ),
+)
+
+
+def movement_state_feature_schema():
+    """Return the authoritative fixed ordering used by get_global_movement_state."""
+
+    features = []
+    for uav_id in range(NUM_UAV):
+        base = uav_id * LOCAL_MOVEMENT_DIM
+        for local_offset, (name, kind, minimum, maximum, normalization) in enumerate(
+            LOCAL_MOVEMENT_FEATURES
+        ):
+            features.append(
+                {
+                    "index": base + local_offset,
+                    "name": f"uav_{uav_id}.{name}",
+                    "kind": kind,
+                    "minimum": minimum,
+                    "maximum": maximum,
+                    "normalization": normalization,
+                }
+            )
+    coverage_base = NUM_UAV * LOCAL_MOVEMENT_DIM
+    for row in range(COVERAGE_GRID_SIZE):
+        for column in range(COVERAGE_GRID_SIZE):
+            features.append(
+                {
+                    "index": coverage_base + row * COVERAGE_GRID_SIZE + column,
+                    "name": f"coverage_macro[{row},{column}]",
+                    "kind": "continuous",
+                    "minimum": 0.0,
+                    "maximum": 1.0,
+                    "normalization": "mean of boolean visited cells in macro grid cell",
+                }
+            )
+    for offset, (name, normalization) in enumerate(
+        (
+            ("global_coverage", "mean of boolean visited bitmap"),
+            ("found_gt_ratio", "found GT count / current GT count"),
+            ("num_gt", "clip(current GT count / 10, 0, 1)"),
+            ("remaining_time", "remaining movement intervals / episode duration"),
+        )
+    ):
+        features.append(
+            {
+                "index": coverage_base + COVERAGE_GRID_SIZE**2 + offset,
+                "name": name,
+                "kind": "continuous",
+                "minimum": 0.0,
+                "maximum": 1.0,
+                "normalization": normalization,
+            }
+        )
+    if len(features) != MOVEMENT_STATE_DIM:
+        raise AssertionError("movement feature schema does not cover 532 dimensions")
+    continuous = [item["index"] for item in features if item["kind"] == "continuous"]
+    discrete = [item["index"] for item in features if item["kind"] == "binary"]
+    return {
+        "schema_version": MOVEMENT_FEATURE_SCHEMA_VERSION,
+        "dimension": MOVEMENT_STATE_DIM,
+        "ordering": "16 UAV blocks x 17, 16x16 coverage macro map row-major, 4 globals",
+        "features": features,
+        "continuous_indices": continuous,
+        "discrete_indices": discrete,
+    }
+
+
+def projected_joint_action_schema():
+    """Return the authoritative 16-by-3 projected raw actor-action ordering."""
+
+    components = (
+        ("speed_scalar", "decoded to horizontal speed in [0, 10] m/s"),
+        ("heading_scalar", "decoded to heading in [-pi, pi] radians"),
+        ("vertical_scalar", "decoded to vertical speed in [-2, 2] m/s"),
+    )
+    features = []
+    for uav_id in range(NUM_UAV):
+        for local_offset, (name, semantics) in enumerate(components):
+            features.append(
+                {
+                    "index": uav_id * 3 + local_offset,
+                    "name": f"uav_{uav_id}.{name}",
+                    "kind": "continuous",
+                    "minimum": -1.0,
+                    "maximum": 1.0,
+                    "semantics": semantics,
+                }
+            )
+    return {
+        "dimension": JOINT_ACTION_DIM,
+        "ordering": "UAV id ascending; speed, heading, vertical scalar",
+        "range": [-1.0, 1.0],
+        "projection": (
+            "task-inactive UAV blocks are replaced by hover raw action [-1, 0, 0]"
+        ),
+        "features": features,
+        "continuous_indices": list(range(JOINT_ACTION_DIM)),
+        "discrete_indices": [],
+    }
 
 
 def aggregate_coverage_map(visited_bitmap):

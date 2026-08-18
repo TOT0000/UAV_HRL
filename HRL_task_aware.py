@@ -2,6 +2,7 @@ import argparse
 from collections import defaultdict
 import copy
 from dataclasses import asdict, dataclass
+import hashlib
 import os
 import random
 
@@ -529,6 +530,20 @@ def _evaluation_state_snapshot(
 ):
     """Copy all learning state that evaluation is forbidden to mutate."""
 
+    def replay_snapshot(replay, fields):
+        size = int(replay.size)
+        snapshot = {
+            "size": size,
+            "ptr": int(replay.ptr),
+            "fields": {
+                field: np.asarray(getattr(replay, field))[:size].copy()
+                for field in fields
+            },
+        }
+        if hasattr(replay, "n_step_buffer"):
+            snapshot["n_step_buffer"] = copy.deepcopy(replay.n_step_buffer)
+        return snapshot
+
     return {
         "online_networks": copy.deepcopy(
             {
@@ -557,10 +572,70 @@ def _evaluation_state_snapshot(
                 "ddqn_cost": ddqn.cost_optimizer.state_dict(),
             }
         ),
-        "joint_replay_size": int(joint_replay.size),
-        "routing_replay_size": int(routing_replay.size),
+        "replays": {
+            "joint": replay_snapshot(
+                joint_replay,
+                (
+                    "state",
+                    "action",
+                    "next_state",
+                    "not_done",
+                    "delivered_mbits",
+                    "total_mobility_energy",
+                    "phi_search_t",
+                    "phi_search_t1",
+                    "phi_vs_t",
+                    "phi_vs_t1",
+                    "phi_com_t",
+                    "phi_com_t1",
+                ),
+            ),
+            "routing": replay_snapshot(
+                routing_replay,
+                ("state", "action", "next_state", "reward", "cost", "not_done", "tag_gt"),
+            ),
+        },
+        "update_counters": {
+            "td3_critic": int(td3.num_critic_update_iteration),
+            "td3_actor": int(td3.num_actor_update_iteration),
+            "td3_training": int(td3.num_training),
+            "ddqn_training": int(ddqn.num_training),
+            "ddqn_loss_log": list(ddqn.loss_log),
+            "ddqn_cost_loss_log": list(ddqn.cost_loss_log),
+        },
         "dinkelbach_state": copy.deepcopy(dinkelbach_state.training_state()),
     }
+
+
+def _learning_state_fingerprint(value):
+    digest = hashlib.sha256()
+
+    def update(item):
+        if isinstance(item, torch.Tensor):
+            array = item.detach().cpu().contiguous().numpy()
+            digest.update(b"tensor")
+            update(array)
+        elif isinstance(item, np.ndarray):
+            contiguous = np.ascontiguousarray(item)
+            digest.update(b"array")
+            digest.update(contiguous.dtype.str.encode("ascii"))
+            digest.update(repr(contiguous.shape).encode("ascii"))
+            digest.update(contiguous.tobytes(order="C"))
+        elif isinstance(item, dict):
+            digest.update(b"dict")
+            for key in sorted(item, key=str):
+                update(str(key))
+                update(item[key])
+        elif isinstance(item, (list, tuple)):
+            digest.update(type(item).__name__.encode("ascii"))
+            for child in item:
+                update(child)
+        else:
+            digest.update(type(item).__name__.encode("ascii"))
+            digest.update(repr(item).encode("utf-8"))
+
+    update(value)
+    return digest.hexdigest()
 
 
 def _nested_state_equal(left, right):
@@ -594,9 +669,11 @@ def _evaluation_invariants(before, after, routing_epsilon_log, td3_noise_log):
         "optimizer_states_unchanged": _nested_state_equal(
             before["optimizers"], after["optimizers"]
         ),
-        "replay_sizes_unchanged": (
-            before["joint_replay_size"] == after["joint_replay_size"]
-            and before["routing_replay_size"] == after["routing_replay_size"]
+        "replay_state_unchanged": _nested_state_equal(
+            before["replays"], after["replays"]
+        ),
+        "update_counters_unchanged": _nested_state_equal(
+            before["update_counters"], after["update_counters"]
         ),
         "dinkelbach_state_unchanged": _nested_state_equal(
             before["dinkelbach_state"], after["dinkelbach_state"]
@@ -621,6 +698,7 @@ def train(
     checkpoint_dir=None,
     expected_checkpoint_episodes=None,
     expected_checkpoint_formal_config=None,
+    transition_observer=None,
 ):
     if config is None:
         raise ValueError(
@@ -649,6 +727,8 @@ def train(
         raise ValueError("evaluation requires the checkpoint training seed")
     if evaluation and config.resume_dir is not None:
         raise ValueError("evaluation cannot load a full-resume training state")
+    if transition_observer is not None and not evaluation:
+        raise ValueError("transition collection is available only in evaluation")
     _seed_training_rng(config.random_seed)
 
     c_ref_com, calibration = load_com_capacity_reference()
@@ -920,6 +1000,7 @@ def train(
                 raw_joint_action = centralized_td3.select_action(
                     state, add_noise=False, noise_std=0.0
                 )
+                environment_actor_calls += 1
             elif _uses_warmup_random_action(
                 total_joint_transitions, config.warmup_joint_transitions
             ):
@@ -1027,10 +1108,11 @@ def train(
                     phi_com_t=potentials_t[2],
                     phi_com_t1=potentials_t1[2],
                 )
+            global_transition_index = total_joint_transitions
             total_joint_transitions += 1
             episode_delivered_mbits += interval_delivered_mbits
             episode_energy += interval_energy
-            episode_reward += _interval_reward(
+            interval_reward = _interval_reward(
                 interval_delivered_mbits,
                 interval_energy,
                 episode_lambda,
@@ -1040,6 +1122,35 @@ def train(
                 done,
                 config,
             )
+            episode_reward += interval_reward
+            if transition_observer is not None:
+                effective_potentials_t1 = (
+                    (0.0, 0.0, 0.0) if done else potentials_t1
+                )
+                transition_observer(
+                    {
+                        "state": state.copy(),
+                        "projected_joint_action": projected_action.copy(),
+                        "next_state": next_state.copy(),
+                        "done": done,
+                        "not_done": 1.0 - float(done),
+                        "delivered_mbits": interval_delivered_mbits,
+                        "total_mobility_energy_j": interval_energy,
+                        "phi_search_t": potentials_t[0],
+                        "phi_search_t1": effective_potentials_t1[0],
+                        "phi_vs_t": potentials_t[1],
+                        "phi_vs_t1": effective_potentials_t1[1],
+                        "phi_com_t": potentials_t[2],
+                        "phi_com_t1": effective_potentials_t1[2],
+                        "reward_at_checkpoint_lambda": interval_reward,
+                        "checkpoint_lambda": episode_lambda,
+                        "episode_index": episode,
+                        "movement_step": interval,
+                        "global_transition_index": global_transition_index,
+                        "scenario_index": episode,
+                        "scenario_id": scenario_id,
+                    }
+                )
 
             if (
                 not evaluation
@@ -1298,6 +1409,7 @@ def train(
         plt.show()
 
     evaluation_invariants = None
+    evaluation_state_fingerprints = None
     if evaluation:
         evaluation_state_after = _evaluation_state_snapshot(
             centralized_td3,
@@ -1312,6 +1424,15 @@ def train(
             routing_epsilon_log,
             td3_noise_log,
         )
+        evaluation_state_fingerprints = {
+            "before": _learning_state_fingerprint(evaluation_state_before),
+            "after": _learning_state_fingerprint(evaluation_state_after),
+        }
+        if (
+            evaluation_state_fingerprints["before"]
+            != evaluation_state_fingerprints["after"]
+        ):
+            raise AssertionError("evaluation learning-state fingerprint changed")
 
     backlog_invariant_passed = None
     deadline_counter_consistent = None
@@ -1376,6 +1497,7 @@ def train(
         "deadline_counter_consistent": deadline_counter_consistent,
         "evaluation": bool(evaluation),
         "evaluation_invariants": evaluation_invariants,
+        "evaluation_state_fingerprints": evaluation_state_fingerprints,
         "scenario_ids": executed_scenario_ids,
         "episode_metrics": episode_metrics,
         "run_metadata": {
