@@ -20,6 +20,12 @@ DQN, KM/random assignment, fixed lambda, or an LLM agent.
 - 100 evaluation episodes per trained seed
 - TD3 noise, DDQN epsilon, and DDQN logits noise disabled in evaluation
 - no network, optimizer, target-network, replay, or Dinkelbach update in evaluation
+- Dinkelbach lambda starts at `0.0` and is fixed within each non-overlapping
+  50-episode outer block
+- after every complete block, lambda becomes
+  `sum(timely delivered Mbit) / sum(all-UAV mobility energy J)`; no scaling,
+  clipping, or moving average is applied (1,500 episodes contain 30 complete
+  block updates)
 - model-only checkpoint every 50 episodes, including exactly one final checkpoint
 - full-resume checkpoint every 50 episodes, retaining only the latest two
 
@@ -141,12 +147,18 @@ python -X utf8 comparison_experiment.py aggregate --input-dir runs/comparison/ev
 ```
 
 Exact-resume checkpoints validate the method fingerprint, training-manifest
-hash, and training seed. Formal evaluation validates model-only type, schema,
+hash, training seed, the complete Dinkelbach block state, and its configuration.
+Checkpoint schema v2 is required; older checkpoints without the block state are
+explicitly incompatible. A partial block is persisted exactly and resumes with
+the same lambda, completed-episode count, numerator sum, denominator sum, block
+index, input-validity status, and successful-update count. An incomplete final
+block never triggers a forced update. Formal evaluation validates model-only type, schema,
 532/48/126 dimensions, TD3/DDQN gamma, COM calibration, method/seed, the formal
 core configuration, and exactly 1,500 completed training episodes before
 loading weights. A distinct validation/test manifest is expected; output
 metadata records both training/evaluation manifest hashes and checkpoint
-provenance.
+provenance, including the fixed Dinkelbach configuration and state. Evaluation
+does not mutate that state.
 
 Checkpoint directories are written through a same-parent temporary directory
 and atomically renamed only after every file succeeds. A 1,500-episode run has
@@ -181,9 +193,15 @@ Every canonical training run writes canonical `training_history.jsonl`, its
 derived tabular projection `training_history.csv`, and
 `training_history_commit.json`. They contain one identical, finite row per
 completed episode with method/seed/training-manifest identity, reward, timely
-goodput, mobility energy, per-episode EE, and the updated Dinkelbach lambda. The
-commit file records identity, row count, last episode, both SHA-256 hashes, and
-a transaction ID. JSONL and CSV are replaced from one normalized row set, and
+goodput, mobility energy, per-episode EE, the lambda used during that episode,
+the lambda after the episode, whether an update occurred, update status, block
+index/position, and the block numerator/denominator sums so far. Boundary rows
+record the completed block's sums and resulting lambda; the following episode
+uses that new value. Invalid or non-finite block input, or a non-positive
+denominator, records an explicit status and preserves the old finite lambda
+while still completing the block. The commit file records identity, row count,
+last episode, both SHA-256 hashes, and a transaction ID. JSONL and CSV are
+replaced from one normalized row set, and
 the commit marker is replaced last; readers reject partial or hash-inconsistent
 transactions. The full checkpoint embeds the canonical rows. Exact resume can
 repair an interrupted dual-format transaction from those checkpoint rows,

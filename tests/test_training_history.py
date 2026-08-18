@@ -12,6 +12,7 @@ from HRL_task_aware import TrainingConfig, train
 from scenario_manifest import generate_manifest
 from training_history import (
     TRAINING_HISTORY_COMMIT,
+    TRAINING_HISTORY_COLUMNS,
     TrainingHistoryConsistencyError,
     TrainingHistoryIdentityError,
     build_training_history_row,
@@ -52,7 +53,9 @@ class TrainingHistoryPersistenceTest(unittest.TestCase):
             with (Path(temp_dir) / "training_history.csv").open(
                 "r", encoding="utf-8", newline=""
             ) as handle:
-                csv_rows = list(csv.DictReader(handle))
+                reader = csv.DictReader(handle)
+                csv_rows = list(reader)
+                csv_columns = tuple(reader.fieldnames or ())
             json_rows = [
                 json.loads(line)
                 for line in (
@@ -72,6 +75,8 @@ class TrainingHistoryPersistenceTest(unittest.TestCase):
             ).hexdigest()
 
         self.assertEqual(len(csv_rows), len(json_rows), 2)
+        self.assertEqual(csv_columns, TRAINING_HISTORY_COLUMNS)
+        self.assertEqual(set(json_rows[0]), set(TRAINING_HISTORY_COLUMNS))
         self.assertEqual([int(row["episode"]) for row in csv_rows], [1, 2])
         self.assertEqual(json_rows, written)
         self.assertEqual(commit["row_count"], 2)
@@ -80,6 +85,12 @@ class TrainingHistoryPersistenceTest(unittest.TestCase):
         self.assertEqual(commit["jsonl_sha256"], jsonl_sha256)
         self.assertEqual(commit["method_id"], self.identity["method_id"])
         self.assertEqual(json_rows[1]["energy_efficiency_mbit_per_j"], 0.0)
+        self.assertEqual(json_rows[0]["dinkelbach_lambda_used"], 0.0)
+        self.assertEqual(json_rows[0]["dinkelbach_lambda_after_episode"], 0.0)
+        self.assertFalse(json_rows[0]["dinkelbach_lambda_updated"])
+        self.assertEqual(json_rows[0]["dinkelbach_update_status"], "accumulating")
+        self.assertEqual(json_rows[0]["dinkelbach_block_index"], 1)
+        self.assertEqual(json_rows[0]["dinkelbach_block_episode"], 1)
         for row in json_rows:
             self.assertTrue(
                 all(

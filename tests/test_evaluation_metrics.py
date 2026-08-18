@@ -159,6 +159,17 @@ class EvaluationModeIntegrationTest(unittest.TestCase):
         self.assertEqual(
             metadata["checkpoint_method_spec_fingerprint"], method.fingerprint
         )
+        self.assertEqual(
+            metadata["checkpoint_dinkelbach_config"],
+            {
+                field: checkpoint_metadata["experiment"]["formal_config"][field]
+                for field in metadata["checkpoint_dinkelbach_config"]
+            },
+        )
+        self.assertEqual(
+            metadata["checkpoint_dinkelbach_state"],
+            checkpoint_dinkelbach_state,
+        )
         self.assertTrue(metadata["checkpoint_metadata_path"].endswith("metadata.json"))
         self.assertEqual(len(metadata["checkpoint_metadata_fingerprint"]), 64)
 

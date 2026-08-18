@@ -2,6 +2,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from dinkelbach_blocks import dinkelbach_config_metadata
 from experiment_config import MethodSpec
 from experiment_paths import (
     evaluation_run_directory,
@@ -48,6 +49,21 @@ class ExperimentPathTest(unittest.TestCase):
         self.assertEqual(first.name, "seed-11")
         self.assertEqual(first.parent.name, self.train_manifest.content_hash[:8])
         self.assertEqual(first.parent.parent.name, "train")
+
+    def test_run_identities_include_the_formal_dinkelbach_block_config(self):
+        expected = dinkelbach_config_metadata()
+
+        training = training_run_identity(
+            self.method, self.train_manifest, 11
+        )
+        evaluation = evaluation_run_identity(
+            self.method, self.test_manifest, 11
+        )
+
+        for identity in (training, evaluation):
+            self.assertEqual(
+                {field: identity[field] for field in expected}, expected
+            )
 
     def test_evaluation_paths_isolate_validation_and_test(self):
         with tempfile.TemporaryDirectory() as temp_dir:
