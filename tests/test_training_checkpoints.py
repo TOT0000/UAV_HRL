@@ -12,10 +12,9 @@ import numpy as np
 import torch
 
 from DDQN import DDQN
-from dinkelbach_blocks import DinkelbachBlockState
+from dinkelbach_blocks import DinkelbachBlockState, dinkelbach_config_metadata
 from HRL_task_aware import (
     _seed_training_rng,
-    _validate_resume_config,
     _uses_warmup_random_action,
     formal_training_config,
     parse_training_config,
@@ -226,6 +225,12 @@ class FullResumeCheckpointTest(unittest.TestCase):
                 joint_action_dim=JOINT_ACTION_DIM,
                 routing_state_dim=ROUTING_STATE_DIM,
                 calibration=calibration,
+                experiment_metadata={
+                    "formal_config": formal_config,
+                    **dinkelbach_config_metadata(formal_config),
+                    "lambda_ee": dinkelbach_state.current_lambda,
+                    "dinkelbach_state": dinkelbach_state.training_state(),
+                },
             )
 
             with np.load(checkpoint_dir / "joint_replay.npz") as saved_joint:
@@ -253,6 +258,7 @@ class FullResumeCheckpointTest(unittest.TestCase):
                 joint_action_dim=JOINT_ACTION_DIM,
                 routing_state_dim=ROUTING_STATE_DIM,
                 calibration=calibration,
+                expected_formal_config=formal_config,
             )
 
             self.assertEqual(random.random(), expected_python)
@@ -442,6 +448,83 @@ class FullResumeCheckpointTest(unittest.TestCase):
                     )
                 load_networks.assert_not_called()
 
+    def test_formal_config_mismatch_preflight_mutates_no_checkpoint_state(self):
+        td3, ddqn, joint, routing = self._components()
+        calibration = {"seed": 1, "c_ref_com": 10.0}
+        formal_config = asdict(formal_training_config(1, random_seed=1))
+        dinkelbach_state = DinkelbachBlockState.from_config(formal_config)
+        event = dinkelbach_state.record_episode(0.0, 1.0)
+        training_state = {
+            "completed_episode_index": 0,
+            "next_episode_index": 1,
+            "full_resume_logging_schema_version": (
+                FULL_RESUME_LOGGING_SCHEMA_VERSION
+            ),
+            "reward_log": [0.0],
+            "delivered_log": [0.0],
+            "energy_log": [1.0],
+            "lambda_used_log": [event["dinkelbach_lambda_used"]],
+            "lambda_after_episode_log": [
+                event["dinkelbach_lambda_after_episode"]
+            ],
+            **dinkelbach_state.training_state(),
+        }
+        experiment_metadata = {
+            "formal_config": formal_config,
+            **dinkelbach_config_metadata(formal_config),
+            "lambda_ee": dinkelbach_state.current_lambda,
+            "dinkelbach_state": dinkelbach_state.training_state(),
+        }
+        incompatible = dict(formal_config)
+        incompatible["batch_size"] = int(formal_config["batch_size"]) + 1
+        with tempfile.TemporaryDirectory() as temp_dir:
+            checkpoint_dir = Path(temp_dir) / "full"
+            save_full_resume_checkpoint(
+                checkpoint_dir,
+                episode=0,
+                td3=td3,
+                ddqn=ddqn,
+                joint_replay=joint,
+                routing_replay=routing,
+                training_state=training_state,
+                formal_config=formal_config,
+                movement_state_dim=MOVEMENT_STATE_DIM,
+                joint_action_dim=JOINT_ACTION_DIM,
+                routing_state_dim=ROUTING_STATE_DIM,
+                calibration=calibration,
+                experiment_metadata=experiment_metadata,
+            )
+
+            with (
+                mock.patch("training_checkpoint._load_network_states") as networks,
+                mock.patch.object(
+                    td3.actor_optimizer, "load_state_dict"
+                ) as actor_optimizer,
+                mock.patch.object(
+                    ddqn.optimizer, "load_state_dict"
+                ) as ddqn_optimizer,
+                mock.patch("training_checkpoint._load_replay") as replay,
+                mock.patch("training_checkpoint._restore_rng_state") as rng,
+            ):
+                with self.assertRaisesRegex(RuntimeError, "batch_size"):
+                    load_full_resume_checkpoint(
+                        checkpoint_dir,
+                        td3=td3,
+                        ddqn=ddqn,
+                        joint_replay=joint,
+                        routing_replay=routing,
+                        movement_state_dim=MOVEMENT_STATE_DIM,
+                        joint_action_dim=JOINT_ACTION_DIM,
+                        routing_state_dim=ROUTING_STATE_DIM,
+                        calibration=calibration,
+                        expected_formal_config=incompatible,
+                    )
+                networks.assert_not_called()
+                actor_optimizer.assert_not_called()
+                ddqn_optimizer.assert_not_called()
+                replay.assert_not_called()
+                rng.assert_not_called()
+
     def test_full_resume_rejects_dimension_gamma_schema_and_calibration_mismatch(self):
         td3, ddqn, joint, routing = self._components()
         calibration = {"seed": 1, "c_ref_com": 10.0}
@@ -579,35 +662,6 @@ class TrainingCliTest(unittest.TestCase):
             "smoke mode fixes --seed to 20260817; do not pass --seed",
             stderr.getvalue(),
         )
-
-    def test_resume_config_requires_matching_seed(self):
-        stored = vars(
-            formal_training_config(1500, random_seed=20260817)
-        ).copy()
-        matching = formal_training_config(1500, random_seed=20260817)
-        _validate_resume_config(stored, matching)
-
-        different = formal_training_config(1500, random_seed=123)
-        with self.assertRaisesRegex(RuntimeError, "random_seed"):
-            _validate_resume_config(stored, different)
-
-        wrong_interval = formal_training_config(
-            1500,
-            random_seed=20260817,
-            dinkelbach_update_interval_episodes=25,
-        )
-        with self.assertRaisesRegex(
-            RuntimeError, "dinkelbach_update_interval_episodes"
-        ):
-            _validate_resume_config(stored, wrong_interval)
-
-        wrong_initial = formal_training_config(
-            1500,
-            random_seed=20260817,
-            dinkelbach_initial_lambda=0.1,
-        )
-        with self.assertRaisesRegex(RuntimeError, "dinkelbach_initial_lambda"):
-            _validate_resume_config(stored, wrong_initial)
 
     def test_checkpoint_schema_is_explicit(self):
         self.assertEqual(CHECKPOINT_SCHEMA_VERSION, 2)

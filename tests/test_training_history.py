@@ -6,6 +6,7 @@ import shutil
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from experiment_config import MethodSpec
 from HRL_task_aware import TrainingConfig, train
@@ -329,6 +330,33 @@ class TrainingHistoryResumeIntegrationTest(unittest.TestCase):
             checkpoint_one = checkpoint_root / "full" / "ep_0001"
             checkpoint_two = checkpoint_root / "full" / "ep_0002"
             shutil.rmtree(checkpoint_two)
+
+            with (
+                mock.patch(
+                    "training_checkpoint._load_network_states"
+                ) as load_networks,
+                mock.patch("training_checkpoint._load_replay") as load_replay,
+                mock.patch(
+                    "training_checkpoint._restore_rng_state"
+                ) as restore_rng,
+            ):
+                with self.assertRaisesRegex(RuntimeError, "batch_size"):
+                    train(
+                        TrainingConfig(
+                            **(
+                                base
+                                | {
+                                    "batch_size": 2,
+                                    "resume_dir": str(checkpoint_one),
+                                }
+                            )
+                        ),
+                        scenario_manifest=manifest,
+                        method_spec=method,
+                    )
+                load_networks.assert_not_called()
+                load_replay.assert_not_called()
+                restore_rng.assert_not_called()
 
             resumed = train(
                 TrainingConfig(**(base | {"resume_dir": str(checkpoint_one)})),

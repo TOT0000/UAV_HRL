@@ -410,47 +410,10 @@ def _interval_reward(
     return float(delivered_mbits - current_lambda * energy + shaping)
 
 
-_RESUME_CONFIG_FIELDS = (
-    "mode",
-    "total_episodes",
-    "episode_seconds",
-    "routing_slot_seconds",
-    "warmup_joint_transitions",
-    "batch_size",
-    "policy_delay",
-    "replay_max_size",
-    "beta_search",
-    "beta_vs",
-    "beta_com",
-    "search_coverage_threshold",
-    "dinkelbach_initial_lambda",
-    "dinkelbach_update_interval_episodes",
-    "dinkelbach_update_rule",
-    "dinkelbach_numerator_unit",
-    "dinkelbach_denominator_unit",
-    "model_checkpoint_every",
-    "full_resume_every",
-    "full_resume_keep_last",
-    "formal_evaluation_episode",
-    "random_seed",
-)
-
-
 def _is_checkpoint_episode(completed_episode, total_episodes, every):
     return int(completed_episode) in checkpoint_episode_schedule(
         total_episodes, every
     )
-
-
-def _validate_resume_config(stored_config, current_config):
-    current = asdict(current_config)
-    mismatches = {
-        key: (stored_config.get(key), current.get(key))
-        for key in _RESUME_CONFIG_FIELDS
-        if stored_config.get(key) != current.get(key)
-    }
-    if mismatches:
-        raise RuntimeError(f"formal training config is incompatible: {mismatches}")
 
 
 def _append_lambda_history(
@@ -812,17 +775,21 @@ def train(
             joint_action_dim=JOINT_ACTION_DIM,
             routing_state_dim=ROUTING_STATE_DIM,
             calibration=calibration,
-            expected_experiment_metadata=(
-                {
-                    "method_spec_fingerprint": method_spec.fingerprint,
-                    "manifest_hash": scenario_manifest.content_hash,
-                    "training_seed": int(config.random_seed),
-                }
-                if scenario_manifest is not None
-                else None
-            ),
+            expected_experiment_metadata={
+                "method_spec_fingerprint": method_spec.fingerprint,
+                "training_seed": (
+                    int(config.random_seed)
+                    if config.random_seed is not None
+                    else None
+                ),
+                **(
+                    {"manifest_hash": scenario_manifest.content_hash}
+                    if scenario_manifest is not None
+                    else {}
+                ),
+            },
+            expected_formal_config=asdict(config),
         )
-        _validate_resume_config(restored["formal_config"], config)
         training_state = restored["training_state"]
         start_episode = int(training_state["next_episode_index"])
         dinkelbach_state = DinkelbachBlockState.from_training_state(

@@ -871,6 +871,7 @@ def load_full_resume_checkpoint(
     routing_state_dim,
     calibration,
     expected_experiment_metadata=None,
+    expected_formal_config=None,
 ):
     checkpoint_dir = Path(checkpoint_dir).resolve()
     inspected = inspect_full_resume_checkpoint(
@@ -882,6 +883,7 @@ def load_full_resume_checkpoint(
         ddqn_gamma=ddqn.gamma,
         calibration=calibration,
         expected_experiment_metadata=expected_experiment_metadata,
+        expected_formal_config=expected_formal_config,
     )
     metadata = inspected["metadata"]
     payload = inspected["payload"]
