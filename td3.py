@@ -255,7 +255,15 @@ class TD3():
         reward_mode="dinkelbach",
         task_potential_enabled=True,
     ):
-        state, action, next_state, reward, not_done = replay_memory.sample(
+        (
+            state,
+            action,
+            next_state,
+            reward,
+            not_done,
+            current_movement_mask,
+            next_movement_mask,
+        ) = replay_memory.sample(
             batch_size=batch_size,
             current_lambda=current_lambda,
             gamma=self.gamma,
@@ -264,23 +272,29 @@ class TD3():
             beta_com=beta_com,
             reward_mode=reward_mode,
             task_potential_enabled=task_potential_enabled,
+            include_movement_masks=True,
         )
         state = state.to(device)
         action = action.to(device)
         next_state = next_state.to(device)
         reward = reward.to(device)
         not_done = not_done.to(device)
+        current_movement_mask = current_movement_mask.to(device)
+        next_movement_mask = next_movement_mask.to(device)
 
         with torch.no_grad():
             target_actor_action = project_joint_action(
-                self.actor_target(next_state), next_state
+                self.actor_target(next_state),
+                movement_mask=next_movement_mask,
             )
             noise = torch.randn_like(action) * self.policy_noise
             noise = noise.clamp(-self.noise_clip, self.noise_clip)
             smoothed_action = (target_actor_action + noise).clamp(
                 -self.max_action, self.max_action
             )
-            next_action = project_joint_action(smoothed_action, next_state)
+            next_action = project_joint_action(
+                smoothed_action, movement_mask=next_movement_mask
+            )
             target_q = torch.min(
                 self.critic_1_target(next_state, next_action),
                 self.critic_2_target(next_state, next_action),
@@ -307,7 +321,9 @@ class TD3():
         actor_action = None
         actor_loss_value = None
         if self.num_critic_update_iteration % self.policy_delay == 0:
-            actor_action = project_joint_action(self.actor(state), state)
+            actor_action = project_joint_action(
+                self.actor(state), movement_mask=current_movement_mask
+            )
             actor_loss = -self.critic_1(state, actor_action).mean()
             self.actor_optimizer.zero_grad(set_to_none=True)
             actor_loss.backward()
@@ -327,12 +343,16 @@ class TD3():
             self.num_actor_update_iteration += 1
 
         self.last_joint_update = {
+            "state": state.detach().cpu(),
+            "next_state": next_state.detach().cpu(),
             "target_actor_action": target_actor_action.detach().cpu(),
             "target_smoothed_action": next_action.detach().cpu(),
             "actor_action": None if actor_action is None else actor_action.detach().cpu(),
             "critic_1_loss": float(critic_1_loss.detach().cpu()),
             "critic_2_loss": float(critic_2_loss.detach().cpu()),
             "actor_loss": actor_loss_value,
+            "current_movement_mask": current_movement_mask.detach().cpu(),
+            "next_movement_mask": next_movement_mask.detach().cpu(),
         }
         return actor_updated
 

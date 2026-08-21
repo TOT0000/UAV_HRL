@@ -5,6 +5,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+import numpy as np
 import torch
 
 from HRL_task_aware import formal_training_config
@@ -333,7 +334,12 @@ class ExperimentPreflightTest(unittest.TestCase):
                 },
                 resume / "training_state.pt",
             )
-            (resume / "joint_replay.npz").write_bytes(b"joint")
+            np.savez_compressed(
+                resume / "joint_replay.npz",
+                current_movement_mask=np.zeros((0, 16), dtype=bool),
+                next_movement_mask=np.zeros((0, 16), dtype=bool),
+                movement_mask_valid=np.zeros((0, 1), dtype=bool),
+            )
             (resume / "routing_replay.npz").write_bytes(b"routing")
 
             with (

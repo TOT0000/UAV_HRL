@@ -5,6 +5,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import numpy as np
 import torch
 
 from dinkelbach_blocks import DinkelbachBlockState, dinkelbach_config_metadata
@@ -113,7 +114,12 @@ class ResumeRecoveryTest(unittest.TestCase):
                 },
                 path / "training_state.pt",
             )
-            (path / "joint_replay.npz").write_bytes(b"joint")
+            np.savez_compressed(
+                path / "joint_replay.npz",
+                current_movement_mask=np.zeros((0, 16), dtype=bool),
+                next_movement_mask=np.zeros((0, 16), dtype=bool),
+                movement_mask_valid=np.zeros((0, 1), dtype=bool),
+            )
             (path / "routing_replay.npz").write_bytes(b"routing")
         return path
 

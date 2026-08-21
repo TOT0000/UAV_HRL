@@ -7,11 +7,66 @@ from unittest import mock
 import numpy as np
 import torch
 
+from observation_strategy import MOVEMENT_TASK_ASSIGNMENT_INDICES
 from run_experiment import main
 from Simulator import Simulator
 
 
 class SimpleRunnerLifecycleIntegrationTest(unittest.TestCase):
+    def test_masked_td3_exact_resume_preserves_true_projection_masks(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output = Path(temp_dir) / "results"
+            command = [
+                "td3_dinkelbach_wo_ta",
+                "--episodes", "2",
+                "--episode-seconds", "1",
+                "--checkpoint-interval", "1",
+                "--roi-count", "2",
+                "--output-root", str(output),
+            ]
+            original_apply = Simulator.apply_scenario_entry
+            calls = []
+
+            def interrupt(simulator, scenario_entry):
+                calls.append(str(scenario_entry["scenario_id"]))
+                if len(calls) == 2:
+                    raise RuntimeError("masked TD3 interruption")
+                return original_apply(simulator, scenario_entry)
+
+            with mock.patch.object(Simulator, "apply_scenario_entry", new=interrupt):
+                with self.assertRaisesRegex(RuntimeError, "masked TD3 interruption"):
+                    main(command)
+
+            run_dir = next((output / "td3_dinkelbach_wo_ta").iterdir())
+            first = run_dir / "checkpoints" / "full" / "ep_0001"
+            with np.load(first / "joint_replay.npz", allow_pickle=False) as replay:
+                self.assertEqual(replay["current_movement_mask"].shape, (1, 16))
+                self.assertTrue(replay["movement_mask_valid"].all())
+                np.testing.assert_array_equal(
+                    replay["state"][:, list(MOVEMENT_TASK_ASSIGNMENT_INDICES)],
+                    0.0,
+                )
+
+            self.assertEqual(main(["resume", str(run_dir)]), 0)
+            final = run_dir / "checkpoints" / "full" / "ep_0002"
+            with np.load(final / "joint_replay.npz", allow_pickle=False) as replay:
+                self.assertEqual(replay["current_movement_mask"].shape, (2, 16))
+                self.assertEqual(replay["next_movement_mask"].shape, (2, 16))
+                self.assertTrue(replay["movement_mask_valid"].all())
+                self.assertTrue(replay["current_movement_mask"].any())
+                np.testing.assert_array_equal(
+                    replay["state"][:, list(MOVEMENT_TASK_ASSIGNMENT_INDICES)],
+                    0.0,
+                )
+            history = [
+                json.loads(line)
+                for line in (run_dir / "training_history.jsonl")
+                .read_text(encoding="utf-8")
+                .splitlines()
+                if line
+            ]
+            self.assertEqual([row["episode"] for row in history], [1, 2])
+
     def test_td3_ratio_partial_resume_runs_remaining_episodes_exactly_once(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             output = Path(temp_dir) / "results"

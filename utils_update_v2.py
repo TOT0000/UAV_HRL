@@ -1,6 +1,14 @@
 import numpy as np
 import torch
 
+from centralized_movement import (
+    MOVEMENT_STATE_DIM,
+    NUM_UAV,
+    movement_mask_from_state,
+    validate_movement_mask,
+)
+
+
 def _to_np_float32(x):
     if isinstance(x, torch.Tensor):
         x = x.detach().cpu().numpy()
@@ -157,6 +165,7 @@ class ReplayBufferJoint:
     """One-step joint replay supporting Dinkelbach reward reconstruction and stored terminal ratio objectives."""
 
     def __init__(self, state_dim, action_dim, max_size=int(2e5)):
+        self.state_dim = int(state_dim)
         self.max_size = int(max_size)
         self.ptr = 0
         self.size = 0
@@ -164,6 +173,13 @@ class ReplayBufferJoint:
         self.state = np.zeros((self.max_size, state_dim), dtype=np.float32)
         self.action = np.zeros((self.max_size, action_dim), dtype=np.float32)
         self.next_state = np.zeros((self.max_size, state_dim), dtype=np.float32)
+        self.current_movement_mask = np.zeros(
+            (self.max_size, NUM_UAV), dtype=bool
+        )
+        self.next_movement_mask = np.zeros(
+            (self.max_size, NUM_UAV), dtype=bool
+        )
+        self.movement_mask_valid = np.zeros((self.max_size, 1), dtype=bool)
         self.not_done = np.zeros((self.max_size, 1), dtype=np.float32)
         self.delivered_mbits = np.zeros((self.max_size, 1), dtype=np.float32)
         self.total_mobility_energy = np.zeros((self.max_size, 1), dtype=np.float32)
@@ -194,11 +210,34 @@ class ReplayBufferJoint:
         phi_com_t,
         phi_com_t1,
         ratio_objective_reward=0.0,
+        current_movement_mask=None,
+        next_movement_mask=None,
     ):
         index = self.ptr
-        self.state[index] = _to_np_float32(state)
+        state_array = _to_np_float32(state)
+        next_state_array = _to_np_float32(next_state)
+        self.state[index] = state_array
         self.action[index] = _to_np_float32(action)
-        self.next_state[index] = _to_np_float32(next_state)
+        self.next_state[index] = next_state_array
+        if (current_movement_mask is None) != (next_movement_mask is None):
+            raise ValueError(
+                "current_movement_mask and next_movement_mask must be provided together"
+            )
+        if current_movement_mask is None and self.state_dim == MOVEMENT_STATE_DIM:
+            current_movement_mask = movement_mask_from_state(state_array)
+            next_movement_mask = movement_mask_from_state(next_state_array)
+        if current_movement_mask is not None:
+            current_mask = validate_movement_mask(current_movement_mask)
+            next_mask = validate_movement_mask(next_movement_mask)
+            if current_mask.ndim != 1 or next_mask.ndim != 1:
+                raise ValueError("one replay transition requires unbatched movement masks")
+            self.current_movement_mask[index] = np.asarray(current_mask, dtype=bool)
+            self.next_movement_mask[index] = np.asarray(next_mask, dtype=bool)
+            self.movement_mask_valid[index, 0] = True
+        else:
+            self.current_movement_mask[index] = False
+            self.next_movement_mask[index] = False
+            self.movement_mask_valid[index, 0] = False
         self.not_done[index, 0] = 1.0 - float(bool(done))
         self.delivered_mbits[index, 0] = float(delivered_mbits)
         self.total_mobility_energy[index, 0] = float(total_mobility_energy)
@@ -254,6 +293,7 @@ class ReplayBufferJoint:
         beta_com=1.0,
         reward_mode="dinkelbach",
         task_potential_enabled=True,
+        include_movement_masks=False,
     ):
         if self.size <= 0:
             raise ValueError("Replay buffer is empty")
@@ -268,12 +308,22 @@ class ReplayBufferJoint:
             reward_mode=reward_mode,
             task_potential_enabled=task_potential_enabled,
         )
-        return (
+        batch = (
             torch.from_numpy(self.state[indices]).to(self.device),
             torch.from_numpy(self.action[indices]).to(self.device),
             torch.from_numpy(self.next_state[indices]).to(self.device),
             torch.from_numpy(reward).to(self.device),
             torch.from_numpy(self.not_done[indices]).to(self.device),
+        )
+        if not include_movement_masks:
+            return batch
+        if not self.movement_mask_valid[indices].all():
+            raise RuntimeError(
+                "sampled joint replay transitions lack authoritative movement projection masks"
+            )
+        return batch + (
+            torch.from_numpy(self.current_movement_mask[indices]).to(self.device),
+            torch.from_numpy(self.next_movement_mask[indices]).to(self.device),
         )
 
 

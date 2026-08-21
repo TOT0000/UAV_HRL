@@ -7,6 +7,7 @@ from unittest import mock
 import numpy as np
 import torch
 from torch import nn
+import td3 as td3_module
 
 from centralized_ddpg import RandomMovementController
 from centralized_movement import (
@@ -25,7 +26,7 @@ from HRL_task_aware import (
     formal_training_config,
     train,
 )
-from movement_agents import sample_random_joint_action
+from movement_agents import create_movement_agent, sample_random_joint_action
 from observation_strategy import (
     MOVEMENT_TASK_ASSIGNMENT_INDICES,
     ROUTING_TASK_ASSIGNMENT_INDICES,
@@ -80,12 +81,6 @@ class MaskedTaskObservationTest(unittest.TestCase):
     def test_production_replays_are_masked_but_projection_sees_true_assignment(self):
         method = MethodSpec.parse("td3_dinkelbach_wo_ta")
         manifest = generate_manifest("train", 20260817, 1, num_gt=2)
-        original_projection = project_joint_action
-        projection_states = []
-
-        def record_projection(action, physical_state):
-            projection_states.append(np.asarray(physical_state).copy())
-            return original_projection(action, physical_state)
 
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir) / "checkpoints"
@@ -104,11 +99,7 @@ class MaskedTaskObservationTest(unittest.TestCase):
                 enable_csv=False,
                 random_seed=20260817,
             )
-            with mock.patch(
-                "HRL_task_aware.project_joint_action",
-                side_effect=record_projection,
-            ):
-                train(config, scenario_manifest=manifest, method_spec=method)
+            train(config, scenario_manifest=manifest, method_spec=method)
             checkpoint = root / "full" / "ep_0001"
             with np.load(checkpoint / "joint_replay.npz", allow_pickle=False) as replay:
                 self.assertEqual(replay["state"].shape, (1, 532))
@@ -118,6 +109,10 @@ class MaskedTaskObservationTest(unittest.TestCase):
                 np.testing.assert_array_equal(
                     replay["next_state"][:, list(MOVEMENT_TASK_ASSIGNMENT_INDICES)], 0.0
                 )
+                self.assertEqual(replay["current_movement_mask"].shape, (1, 16))
+                self.assertEqual(replay["next_movement_mask"].shape, (1, 16))
+                self.assertTrue(replay["movement_mask_valid"].all())
+                self.assertTrue(replay["current_movement_mask"].any())
             with np.load(checkpoint / "routing_replay.npz", allow_pickle=False) as replay:
                 self.assertGreater(replay["state"].shape[0], 0)
                 np.testing.assert_array_equal(
@@ -143,14 +138,83 @@ class MaskedTaskObservationTest(unittest.TestCase):
                     },
                 )
 
-        self.assertEqual(len(projection_states), 1)
+    def test_two_transition_smoke_really_updates_actor_with_true_masks(self):
+        method = MethodSpec.parse("td3_dinkelbach_wo_ta")
+        manifest = generate_manifest("train", 20260817, 1, num_gt=2)
+        config = TrainingConfig(
+            total_episodes=1,
+            mode="smoke",
+            episode_seconds=2,
+            warmup_joint_transitions=0,
+            batch_size=1,
+            enable_model_checkpoints=False,
+            enable_full_resume=False,
+            enable_plots=False,
+            enable_csv=False,
+            random_seed=20260817,
+        )
+        agent = create_movement_agent(
+            method, MOVEMENT_STATE_DIM, JOINT_ACTION_DIM, config
+        )
+        actor_before = [
+            parameter.detach().clone() for parameter in agent.actor.parameters()
+        ]
+        environment_masks = []
+        training_masks = []
+        original_projection = project_joint_action
+
+        def environment_projection(raw_action, movement_state=None, *, movement_mask=None):
+            self.assertIsNone(movement_state)
+            environment_masks.append(np.asarray(movement_mask, dtype=bool).copy())
+            return original_projection(raw_action, movement_mask=movement_mask)
+
+        def training_projection(raw_action, movement_state=None, *, movement_mask=None):
+            self.assertIsNone(movement_state)
+            training_masks.append(movement_mask.detach().cpu().numpy().copy())
+            return original_projection(raw_action, movement_mask=movement_mask)
+
+        with (
+            mock.patch("HRL_task_aware.create_movement_agent", return_value=agent),
+            mock.patch(
+                "HRL_task_aware.project_joint_action",
+                side_effect=environment_projection,
+            ),
+            mock.patch.object(
+                td3_module,
+                "project_joint_action",
+                side_effect=training_projection,
+            ),
+        ):
+            result = train(config, scenario_manifest=manifest, method_spec=method)
+
+        self.assertEqual(result["critic_updates"], 2)
+        self.assertEqual(result["actor_updates"], 1)
+        self.assertEqual(len(environment_masks), 2)
+        self.assertGreaterEqual(len(training_masks), 5)
         self.assertTrue(
-            np.any(
-                projection_states[0][list(MOVEMENT_TASK_ASSIGNMENT_INDICES)]
-                != 0.0
+            any(
+                not torch.equal(previous, current)
+                for previous, current in zip(actor_before, agent.actor.parameters())
             )
         )
-
+        gradient_total = sum(
+            float(parameter.grad.abs().sum())
+            for parameter in agent.actor.parameters()
+            if parameter.grad is not None
+        )
+        self.assertGreater(gradient_total, 0.0)
+        update = agent.last_joint_update
+        np.testing.assert_array_equal(
+            update["state"][:, list(MOVEMENT_TASK_ASSIGNMENT_INDICES)], 0.0
+        )
+        sampled_current = update["current_movement_mask"][0].numpy()
+        sampled_next = update["next_movement_mask"][0].numpy()
+        self.assertTrue(
+            any(np.array_equal(sampled_current, mask) for mask in environment_masks)
+        )
+        self.assertTrue(
+            any(np.array_equal(sampled_next, mask[0]) for mask in training_masks)
+        )
 
 class ControlledDQNTest(unittest.TestCase):
     def test_effective_mask_is_recomputed_in_every_routing_slot(self):

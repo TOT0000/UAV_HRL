@@ -85,7 +85,15 @@ class CentralizedDDPG:
         reward_mode="dinkelbach",
         task_potential_enabled=True,
     ):
-        state, action, next_state, reward, not_done = replay_memory.sample(
+        (
+            state,
+            action,
+            next_state,
+            reward,
+            not_done,
+            current_movement_mask,
+            next_movement_mask,
+        ) = replay_memory.sample(
             batch_size=batch_size,
             current_lambda=current_lambda,
             gamma=self.gamma,
@@ -94,16 +102,19 @@ class CentralizedDDPG:
             beta_com=beta_com,
             reward_mode=reward_mode,
             task_potential_enabled=task_potential_enabled,
+            include_movement_masks=True,
         )
         state = state.to(device)
         action = action.to(device)
         next_state = next_state.to(device)
         reward = reward.to(device)
         not_done = not_done.to(device)
+        current_movement_mask = current_movement_mask.to(device)
+        next_movement_mask = next_movement_mask.to(device)
 
         with torch.no_grad():
             next_action = project_joint_action(
-                self.actor_target(next_state), next_state
+                self.actor_target(next_state), movement_mask=next_movement_mask
             )
             target_q = reward + not_done * self.gamma * self.critic_target(
                 next_state, next_action
@@ -114,7 +125,9 @@ class CentralizedDDPG:
         critic_loss.backward()
         self.critic_optimizer.step()
 
-        actor_action = project_joint_action(self.actor(state), state)
+        actor_action = project_joint_action(
+            self.actor(state), movement_mask=current_movement_mask
+        )
         actor_loss = -self.critic(state, actor_action).mean()
         self.actor_optimizer.zero_grad(set_to_none=True)
         actor_loss.backward()
@@ -135,9 +148,14 @@ class CentralizedDDPG:
         self.num_actor_update_iteration += 1
         self.num_training += 1
         self.last_joint_update = {
+            "state": state.detach().cpu(),
+            "next_state": next_state.detach().cpu(),
             "critic_loss": float(critic_loss.detach().cpu()),
             "actor_loss": float(actor_loss.detach().cpu()),
             "actor_action": actor_action.detach().cpu(),
+            "target_actor_action": next_action.detach().cpu(),
+            "current_movement_mask": current_movement_mask.detach().cpu(),
+            "next_movement_mask": next_movement_mask.detach().cpu(),
         }
         return True
 

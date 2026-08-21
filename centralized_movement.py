@@ -364,11 +364,78 @@ def movement_mask_from_state(state):
     return np.max(local[..., :3], axis=-1) > 0.5
 
 
-def project_joint_action(raw_action, movement_state):
-    movable = movement_mask_from_state(movement_state)
+def validate_movement_mask(movement_mask):
+    """Validate an explicit per-UAV projection mask without shape inference."""
+
+    if torch.is_tensor(movement_mask):
+        if movement_mask.ndim not in (1, 2) or movement_mask.shape[-1] != NUM_UAV:
+            raise ValueError(
+                f"movement mask must have shape ({NUM_UAV},) or (batch, {NUM_UAV})"
+            )
+        if movement_mask.dtype == torch.bool:
+            return movement_mask
+        if not (
+            torch.is_floating_point(movement_mask)
+            or movement_mask.dtype
+            in {
+                torch.uint8,
+                torch.int8,
+                torch.int16,
+                torch.int32,
+                torch.int64,
+            }
+        ):
+            raise TypeError("movement mask must be Boolean or numeric 0/1 values")
+        if not torch.isfinite(movement_mask).all():
+            raise ValueError("movement mask contains NaN or Inf")
+        if not torch.logical_or(movement_mask == 0, movement_mask == 1).all():
+            raise ValueError("movement mask numeric values must be exactly 0 or 1")
+        return movement_mask.bool()
+
+    mask = np.asarray(movement_mask)
+    if mask.ndim not in (1, 2) or mask.shape[-1] != NUM_UAV:
+        raise ValueError(
+            f"movement mask must have shape ({NUM_UAV},) or (batch, {NUM_UAV})"
+        )
+    if mask.dtype == np.bool_:
+        return mask
+    if not np.issubdtype(mask.dtype, np.number):
+        raise TypeError("movement mask must be Boolean or numeric 0/1 values")
+    if not np.isfinite(mask).all():
+        raise ValueError("movement mask contains NaN or Inf")
+    if not np.logical_or(mask == 0, mask == 1).all():
+        raise ValueError("movement mask numeric values must be exactly 0 or 1")
+    return mask.astype(bool, copy=False)
+
+
+def project_joint_action(raw_action, movement_state=None, *, movement_mask=None):
+    """Apply the authoritative task constraint to raw joint movement actions.
+
+    Existing callers may provide an unmasked 532-D ``movement_state``. Training
+    callers should provide the explicit 16-D true ``movement_mask`` stored with
+    the transition. Exactly one control source is required.
+    """
+
+    if (movement_state is None) == (movement_mask is None):
+        raise ValueError(
+            "provide exactly one of movement_state or explicit movement_mask"
+        )
+    movable = (
+        movement_mask_from_state(movement_state)
+        if movement_mask is None
+        else validate_movement_mask(movement_mask)
+    )
     if torch.is_tensor(raw_action):
         if raw_action.shape[-1] != JOINT_ACTION_DIM:
             raise ValueError(f"joint action must end in {JOINT_ACTION_DIM} values")
+        if not torch.is_tensor(movable):
+            movable = torch.as_tensor(movable, device=raw_action.device)
+        else:
+            movable = movable.to(device=raw_action.device)
+        if raw_action.shape[:-1] != movable.shape[:-1]:
+            raise ValueError(
+                "joint action batch dimensions must match movement mask batch dimensions"
+            )
         action_blocks = raw_action.reshape(*raw_action.shape[:-1], NUM_UAV, 3)
         mask = movable.to(dtype=raw_action.dtype).unsqueeze(-1)
         hover = raw_action.new_tensor(HOVER_ACTION)
@@ -378,6 +445,13 @@ def project_joint_action(raw_action, movement_state):
     action_array = np.asarray(raw_action, dtype=np.float32)
     if action_array.shape[-1] != JOINT_ACTION_DIM:
         raise ValueError(f"joint action must end in {JOINT_ACTION_DIM} values")
+    if torch.is_tensor(movable):
+        movable = movable.detach().cpu().numpy()
+    movable = np.asarray(movable, dtype=bool)
+    if action_array.shape[:-1] != movable.shape[:-1]:
+        raise ValueError(
+            "joint action batch dimensions must match movement mask batch dimensions"
+        )
     blocks = action_array.reshape(*action_array.shape[:-1], NUM_UAV, 3).copy()
     blocks[~movable] = np.asarray(HOVER_ACTION, dtype=np.float32)
     return blocks.reshape(action_array.shape)

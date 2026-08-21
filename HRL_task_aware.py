@@ -30,6 +30,7 @@ from centralized_movement import (
     build_joint_movement_proposals,
     calculate_movement_potentials,
     get_global_movement_state,
+    movement_mask_from_state,
     project_joint_action,
 )
 from com_capacity_calibration import load_com_capacity_reference
@@ -700,6 +701,9 @@ def _evaluation_state_snapshot(
                     "state",
                     "action",
                     "next_state",
+                    "current_movement_mask",
+                    "next_movement_mask",
+                    "movement_mask_valid",
                     "not_done",
                     "delivered_mbits",
                     "total_mobility_energy",
@@ -1135,6 +1139,7 @@ def train(
                     "movement",
                 )
                 potentials_t = calculate_movement_potentials(env, c_ref_com)
+                current_movement_mask = movement_mask_from_state(physical_state)
             except ValueError as exc:
                 if "duplicate" in str(exc):
                     duplicate_target_assertions += 1
@@ -1164,7 +1169,7 @@ def train(
                 td3_noise_log.append(behavior_noise)
                 environment_actor_calls += 1
             projected_action = project_joint_action(
-                raw_joint_action, physical_state
+                raw_joint_action, movement_mask=current_movement_mask
             )
 
             # Phase 1 is read-only: all sixteen proposals are built from one snapshot.
@@ -1246,6 +1251,7 @@ def train(
                 method_spec.task_observation,
                 "movement",
             )
+            next_movement_mask = movement_mask_from_state(physical_next_state)
             terminal_joint_transitions += int(done)
             episode_delivered_mbits += interval_delivered_mbits
             episode_energy += interval_energy
@@ -1270,6 +1276,8 @@ def train(
                     phi_vs_t1=potentials_t1[1],
                     phi_com_t=potentials_t[2],
                     phi_com_t1=potentials_t1[2],
+                    current_movement_mask=current_movement_mask,
+                    next_movement_mask=next_movement_mask,
                 )
             global_transition_index = total_joint_transitions
             total_joint_transitions += 1

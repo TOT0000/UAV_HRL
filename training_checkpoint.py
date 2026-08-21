@@ -9,13 +9,16 @@ import uuid
 import numpy as np
 import torch
 
+from centralized_movement import MOVEMENT_STATE_DIM, movement_mask_from_state
+
 from dinkelbach_blocks import (
     DINKELBACH_CONFIG_FIELDS,
     DinkelbachBlockState,
     dinkelbach_config_metadata,
 )
 
-CHECKPOINT_SCHEMA_VERSION = 3
+CHECKPOINT_SCHEMA_VERSION = 4
+PRE_MOVEMENT_MASK_CHECKPOINT_SCHEMA_VERSION = 3
 LEGACY_DINKELBACH_CHECKPOINT_SCHEMA_VERSION = 2
 MODEL_CHECKPOINT_TYPE = "model-only"
 FULL_CHECKPOINT_TYPE = "full-resume"
@@ -44,9 +47,15 @@ LEGACY_JOINT_REPLAY_FIELDS = (
     "phi_com_t",
     "phi_com_t1",
 )
-JOINT_REPLAY_FIELDS = (
+PRE_MOVEMENT_MASK_JOINT_REPLAY_FIELDS = (
     *LEGACY_JOINT_REPLAY_FIELDS,
     "ratio_objective_reward",
+)
+JOINT_REPLAY_FIELDS = (
+    *PRE_MOVEMENT_MASK_JOINT_REPLAY_FIELDS,
+    "current_movement_mask",
+    "next_movement_mask",
+    "movement_mask_valid",
 )
 ROUTING_REPLAY_FIELDS = (
     "state",
@@ -485,10 +494,16 @@ def _checkpoint_uses_dinkelbach(metadata):
 
 def _validate_checkpoint_schema(metadata):
     schema = metadata.get("checkpoint_schema_version")
-    if schema == CHECKPOINT_SCHEMA_VERSION:
+    if schema in {
+        CHECKPOINT_SCHEMA_VERSION,
+        PRE_MOVEMENT_MASK_CHECKPOINT_SCHEMA_VERSION,
+    }:
         return int(schema)
     try:
-        legacy_schema = schema is None or int(schema) < CHECKPOINT_SCHEMA_VERSION
+        legacy_schema = (
+            schema is None
+            or int(schema) < PRE_MOVEMENT_MASK_CHECKPOINT_SCHEMA_VERSION
+        )
     except (TypeError, ValueError):
         legacy_schema = False
     if (
@@ -539,7 +554,7 @@ def _movement_gamma_key(metadata, schema):
         return "centralized_td3_gamma"
     return (
         "movement_agent_gamma"
-        if schema >= CHECKPOINT_SCHEMA_VERSION
+        if schema >= PRE_MOVEMENT_MASK_CHECKPOINT_SCHEMA_VERSION
         else "centralized_td3_gamma"
     )
 
@@ -645,7 +660,10 @@ def validate_model_checkpoint_metadata(
                 metadata, expected_formal_config
             )
     experiment = metadata.get("experiment") or {}
-    if schema >= CHECKPOINT_SCHEMA_VERSION and "formal_config" in experiment:
+    if (
+        schema >= PRE_MOVEMENT_MASK_CHECKPOINT_SCHEMA_VERSION
+        and "formal_config" in experiment
+    ):
         _validate_effective_formal_movement_config(
             experiment["formal_config"], metadata.get("movement_agent_kind", "td3"), metadata
         )
@@ -786,6 +804,76 @@ def _load_replay(path, replay, fields, metadata):
     replay.size = size
     replay.ptr = ptr
     replay.n_step_buffer = list(metadata.get("n_step_buffer", []))
+
+
+def _checkpoint_task_observation_mode(metadata):
+    experiment = metadata.get("experiment") or {}
+    method_spec = experiment.get("method_spec") or {}
+    formal_config = experiment.get("formal_config") or {}
+    return str(
+        method_spec.get(
+            "task_observation",
+            formal_config.get("task_observation_mode", "full"),
+        )
+    )
+
+
+def _validate_joint_replay_projection_masks(checkpoint_dir, metadata):
+    """Validate mask availability before exact-resume state can be mutated."""
+
+    schema = int(metadata["checkpoint_schema_version"])
+    observation_mode = _checkpoint_task_observation_mode(metadata)
+    if schema < CHECKPOINT_SCHEMA_VERSION:
+        if observation_mode == "masked":
+            raise RuntimeError(
+                "legacy masked-observation full-resume checkpoint lacks true "
+                "movement projection masks and cannot be resumed safely"
+            )
+        return
+
+    replay_path = Path(checkpoint_dir) / "joint_replay.npz"
+    required = {
+        "current_movement_mask",
+        "next_movement_mask",
+        "movement_mask_valid",
+    }
+    with np.load(replay_path, allow_pickle=False) as arrays:
+        missing = sorted(required.difference(arrays.files))
+        if missing:
+            raise RuntimeError(
+                "full-resume checkpoint is missing movement projection mask "
+                f"fields: {missing}"
+            )
+        if int(metadata.get("movement_state_dim", -1)) == MOVEMENT_STATE_DIM:
+            validity = np.asarray(arrays["movement_mask_valid"], dtype=bool)
+            if not validity.all():
+                raise RuntimeError(
+                    "full-resume checkpoint contains joint transitions without "
+                    "authoritative movement projection masks"
+                )
+
+
+def _reconstruct_legacy_full_observation_masks(replay, metadata):
+    """Migrate pre-mask full-observation replay without guessing assignments."""
+
+    if _checkpoint_task_observation_mode(metadata) != "full":
+        raise RuntimeError(
+            "legacy masked-observation full-resume checkpoint lacks true "
+            "movement projection masks and cannot be resumed safely"
+        )
+    if replay.state.shape[1] != MOVEMENT_STATE_DIM:
+        raise RuntimeError(
+            "legacy full-observation replay cannot reconstruct movement masks "
+            f"from state dimension {replay.state.shape[1]}"
+        )
+    size = int(replay.size)
+    replay.current_movement_mask[:size] = movement_mask_from_state(
+        replay.state[:size]
+    )
+    replay.next_movement_mask[:size] = movement_mask_from_state(
+        replay.next_state[:size]
+    )
+    replay.movement_mask_valid[:size] = True
 
 
 def _rng_state():
@@ -1187,6 +1275,7 @@ def inspect_full_resume_checkpoint(
         raise RuntimeError(
             f"checkpoint has incomplete full-resume state; missing={missing}"
         )
+    _validate_joint_replay_projection_masks(checkpoint_dir, metadata)
     payload = torch.load(
         checkpoint_dir / "training_state.pt",
         map_location="cpu",
@@ -1231,7 +1320,10 @@ def inspect_full_resume_checkpoint(
             )
     if not isinstance(formal_config, dict):
         raise RuntimeError("checkpoint formal training configuration is invalid")
-    if metadata["checkpoint_schema_version"] >= CHECKPOINT_SCHEMA_VERSION:
+    if (
+        metadata["checkpoint_schema_version"]
+        >= PRE_MOVEMENT_MASK_CHECKPOINT_SCHEMA_VERSION
+    ):
         kind = metadata.get("movement_agent_kind", "td3")
         experiment = metadata.get("experiment") or {}
         _validate_effective_formal_movement_config(formal_config, kind, metadata)
@@ -1304,10 +1396,17 @@ def load_full_resume_checkpoint(
         (
             JOINT_REPLAY_FIELDS
             if metadata["checkpoint_schema_version"] >= CHECKPOINT_SCHEMA_VERSION
-            else LEGACY_JOINT_REPLAY_FIELDS
+            else (
+                PRE_MOVEMENT_MASK_JOINT_REPLAY_FIELDS
+                if metadata["checkpoint_schema_version"]
+                >= PRE_MOVEMENT_MASK_CHECKPOINT_SCHEMA_VERSION
+                else LEGACY_JOINT_REPLAY_FIELDS
+            )
         ),
         replay_metadata["joint"],
     )
+    if metadata["checkpoint_schema_version"] < CHECKPOINT_SCHEMA_VERSION:
+        _reconstruct_legacy_full_observation_masks(joint_replay, metadata)
     _load_replay(
         checkpoint_dir / "routing_replay.npz",
         routing_replay,

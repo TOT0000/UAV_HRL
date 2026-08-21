@@ -325,42 +325,9 @@ class Simulator:
             uav.target_position = retained[0]["target_pos"]
 
     def convert_search_to_hovering(self):
+        """Apply the guarded Search-to-Hover phase conversion exactly once."""
+
         return self._convert_search_to_hovering_phase()
-        """將所有 Search 任務轉換成 Hovering，避免 UAV 被重新分配到 FOV/COM。"""
-        # 全域 task_list 內的 Search 改為 Hovering
-        for t in self.task_list:
-            if t.task_type == "Search":
-                t.task_type = "Hovering"
-                # Hovering 的目標就設為 UAV 目前位置
-                uav = self.uav_dict[t.target_obj_id]
-                t.target_obj = uav
-                t.target_obj_id = uav.id
-
-        # 每台 UAV 的 multi_tasks 裡也同步修改
-        for uid in list(self.multi_tasks.keys()):
-            new_tasks = []
-            for task in self.multi_tasks[uid]:
-                if task["task_type"] == "Search":
-                    # 改成 Hovering，位置維持 UAV 當前位置
-                    uav = self.uav_dict[uid]
-                    new_tasks.append({
-                        "task_type": "Hovering",
-                        "target_id": task["target_id"],
-                        "target_obj_id": uid,
-                        "target_pos": uav.get_position()
-                    })
-                else:
-                    new_tasks.append(task)
-            self.multi_tasks[uid] = new_tasks
-
-        # 更新 UAV 狀態
-        for uid, uav in self.uav_dict.items():
-            tasks = self.multi_tasks.get(uid, [])
-            if tasks:
-                uav.active_task_index = uav.active_task_index % len(tasks)
-                # 如果第一個是 Hovering，就直接設定
-                uav.task_type = tasks[0]["task_type"]
-                uav.target_position = tasks[0]["target_pos"]
     # =============搜救隊出發===============================
     def SR_team_gogo(self, gt):
         """
