@@ -327,6 +327,34 @@ target UAV and phase, RoIs/detection, SR paths, GS, actual selected U2U/U2G
 links, sensing footprint geometry, requested/actual times, scenario identity,
 method configuration, checkpoint provenance, and Git SHA.
 
+Checkpoint provenance is deliberately split into three fields. The existing
+`checkpoint_metadata_fingerprint` remains the SHA-256 of the canonical
+checkpoint metadata and retains its previous schema and meaning.
+`checkpoint_models_sha256` is a streaming SHA-256 of the exact `models.pt`
+bytes after the file has passed a structural PyTorch-ZIP integrity check.
+`checkpoint_artifact_fingerprint` is the SHA-256 of this canonical JSON object
+(serialized with sorted keys and compact separators):
+
+```json
+{
+  "schema": "uav-hrl-checkpoint-artifact-v1",
+  "checkpoint_metadata_fingerprint": "<metadata sha256>",
+  "checkpoint_models_sha256": "<models.pt sha256>"
+}
+```
+
+The hash path never calls `torch.load()` and reads `models.pt` in bounded
+chunks. Missing, empty, corrupt, truncated, or replaced payloads fail closed.
+Learned paper evaluations persist all three fields in top-level metadata, each
+evaluation point, each point's `run_metadata.json`, and every trajectory
+artifact. The figure builder recomputes all three from the selected checkpoint
+and requires exact agreement in those layers, the resolved specification, the
+method-to-checkpoint map, and final figure metadata. Pure-random methods require
+the checkpoint path and all three fields to be null. Existing training
+checkpoints need no migration or retraining: evaluation derives the payload and
+combined hashes from their actual `models.pt`; newly generated paper artifacts
+without the complete provenance triplet are intentionally rejected.
+
 Each sweep point writes per-episode data plus `aggregated_plot_data.csv/json`.
 Its metadata also persists the actual manifest path and canonical hash,
 scenario IDs, evaluation count/horizon/seed, 16-UAV count, and fully resolved
@@ -335,6 +363,28 @@ Delay is pooled as total delivered E2E delay divided by total delivered packet
 count. Violation probability is pooled violations divided by generated packet
 count. A delay with no delivered packets is `null` with `missing=true`. EE
 comparison points use pooled timely Mbit divided by pooled mobility joules.
+
+Every non-trajectory point has exactly the following five canonical aggregate
+rows, keyed by `(method_id, point_id, metric, task_type)`:
+
+```text
+energy_efficiency_mbit_per_j / null
+average_e2e_delay_seconds   / FOV
+average_e2e_delay_seconds   / COM
+violation_probability       / FOV
+violation_probability       / COM
+```
+
+The shared production helper in `paper_metrics.py` both computes and validates
+these rows. Before figure-specific filtering, the builder rejects missing,
+duplicate, extra, or semantically invalid rows (including rows unused by the
+requested figure). It then requires exact canonical agreement among the
+top-level `aggregated_plot_data.json`, the union of all point-level aggregate
+files, and a fresh recomputation from every point's `per_episode.jsonl`.
+Numerator, denominator, value, unit, and missing status are all checked. Delay
+with no delivered packets and violation probability with no generated packets
+remain missing rather than becoming fake zeros; violation numerators may not
+exceed their denominators.
 
 The figure spec explicitly maps training and evaluation directories:
 
@@ -376,3 +426,15 @@ and two arrival-task charts are standalone files; deprecated family aliases
 expand to those files and never emit a composite. See
 `docs/legacy_figure_inventory.md` for Drive file IDs, content fingerprints,
 screenshot references, visual contracts, and intentional changes.
+
+Each standalone trajectory JSON uses schema
+`uav-hrl-standalone-trajectory-v1` and contains the complete scene needed for
+an independent redraw: requested/actual time and phase, scenario/manifest and
+checkpoint provenance, Git SHA, GS and ground targets, all 16 UAV snapshots and
+their assignments, every UAV path truncated at the selected actual time, SR
+snapshots and truncated paths, active links, sensing coverage, camera, axes,
+labels, and registry style. Its long-form CSV uses `record_type` values
+`uav_path`, `uav_snapshot`, `sr_path`, `sr_snapshot`, `ground_target`,
+`ground_station`, `active_link`, and `sensing_coverage`. Rendering that JSON
+does not reopen the evaluation artifact; titles use the actual time and phase,
+and FOV assignments keep the legacy display label `VS`.

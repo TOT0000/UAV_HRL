@@ -1,8 +1,11 @@
 from dataclasses import asdict
+import csv
 import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
+import zipfile
 
 from dinkelbach_blocks import DinkelbachBlockState, dinkelbach_config_metadata
 from experiment_config import (
@@ -26,12 +29,14 @@ from paper_figures import (
     causal_trailing_average,
     normalize_episode_ee,
     paper_energy_efficiency,
+    render_standalone_trajectory_source,
 )
 from scenario_manifest import generate_manifest
 from training_checkpoint import (
+    CHECKPOINT_PROVENANCE_FIELDS,
     CHECKPOINT_SCHEMA_VERSION,
     MODEL_CHECKPOINT_TYPE,
-    checkpoint_metadata_fingerprint,
+    checkpoint_artifact_provenance,
 )
 
 
@@ -147,6 +152,12 @@ class SyntheticFigureBuildTest(unittest.TestCase):
             "experiment": experiment,
         }
 
+    @staticmethod
+    def _write_synthetic_models(path, marker):
+        with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_STORED) as archive:
+            archive.writestr("archive/data.pkl", f"synthetic:{marker}".encode())
+            archive.writestr("archive/version", b"3\n")
+
     def _write_training_run(self, root, method_id, *, include_history=False):
         run_dir = root / "training" / method_id
         run_dir.mkdir(parents=True)
@@ -170,7 +181,7 @@ class SyntheticFigureBuildTest(unittest.TestCase):
         (checkpoint / "metadata.json").write_text(
             json.dumps(metadata), encoding="utf-8"
         )
-        (checkpoint / "models.pt").write_bytes(b"synthetic-not-loaded")
+        self._write_synthetic_models(checkpoint / "models.pt", method_id)
         if include_history:
             rows = [
                 {
@@ -189,26 +200,31 @@ class SyntheticFigureBuildTest(unittest.TestCase):
         return run_dir, metadata
 
     @staticmethod
-    def _aggregate_rows(method_id, suite, points):
+    def _episode_rows(method_id, point_index):
         method_offset = sum(ord(char) for char in method_id) % 7
         rows = []
-        for point_index, point in enumerate(points):
-            common = {
-                "semantic_suite": suite,
-                "method_id": method_id,
-                "point_id": point["point_id"],
-                "x_value": point.get("x_value"),
-                "x_unit": point.get("x_unit"),
-                "fixed_num_gt": point.get("fixed_num_gt"),
-                "swept_task": point.get("swept_task"),
-                "evaluation_episode_count": EVALUATION_EPISODES,
-            }
-            rows.append({**common, "metric": "energy_efficiency_mbit_per_j", "task_type": None, "display_task_type": None, "numerator": 10 + point_index, "numerator_unit": "Mbit", "denominator": 4, "denominator_unit": "J", "value": 1.0 + 0.15 * point_index + 0.05 * method_offset, "value_unit": "Mbit/J", "missing": False})
-            for task_type in ("FOV", "COM"):
-                delay = 0.004 + 0.002 * point_index + 0.0003 * method_offset + (0.003 if task_type == "COM" else 0.0)
-                probability = max(0.0005, 0.4 / (point_index + 2 + method_offset / 4))
-                rows.append({**common, "metric": "average_e2e_delay_seconds", "task_type": task_type, "display_task_type": "VS" if task_type == "FOV" else "COM", "numerator": delay * 20, "numerator_unit": "seconds", "denominator": 20, "denominator_unit": "delivered_packets", "value": delay, "value_unit": "seconds", "missing": False})
-                rows.append({**common, "metric": "violation_probability", "task_type": task_type, "display_task_type": "VS" if task_type == "FOV" else "COM", "numerator": probability * 100, "numerator_unit": "violation_packets", "denominator": 100, "denominator_unit": "generated_packets", "value": probability, "value_unit": "probability", "missing": False})
+        for episode in range(EVALUATION_EPISODES):
+            fov_delivered = 3 + episode
+            com_delivered = 2 + episode
+            fov_generated = fov_delivered + 2
+            com_generated = com_delivered + 3
+            rows.append(
+                {
+                    "episode": episode + 1,
+                    "timely_goodput_mbits": 2.0 + point_index + method_offset / 10,
+                    "total_mobility_energy_j": 4.0 + episode,
+                    "fov_delivered_packets": fov_delivered,
+                    "fov_delivered_e2e_delay_sum_seconds": fov_delivered
+                    * (0.01 + point_index / 1000),
+                    "fov_generated_packets": fov_generated,
+                    "fov_violation_packets": 1 + episode,
+                    "com_delivered_packets": com_delivered,
+                    "com_delivered_e2e_delay_sum_seconds": com_delivered
+                    * (0.02 + point_index / 1000),
+                    "com_generated_packets": com_generated,
+                    "com_violation_packets": 2 + episode,
+                }
+            )
         return rows
 
     @staticmethod
@@ -232,13 +248,36 @@ class SyntheticFigureBuildTest(unittest.TestCase):
         }
 
     @staticmethod
-    def _trajectory_artifact(manifest, checkpoint, fingerprint):
+    def _trajectory_artifact(manifest, checkpoint, provenance):
         times = (5.0, 10.0, 15.0, 25.0)
         phases = ("Search", "FOV", "FOV+COM", "Hover")
         history_times = (0.0, *times)
         uav_paths = {
             str(uid): [
-                {"actual_time_seconds": time, "x": 100 + (uid % 4) * 200 + time, "y": 100 + (uid // 4) * 200, "z": 90 + uid}
+                {
+                    "actual_time_seconds": time,
+                    "x": 100 + (uid % 4) * 200 + time,
+                    "y": 100 + (uid // 4) * 200,
+                    "z": 90 + uid,
+                    "task_phase": (
+                        "Search"
+                        if time == 0.0
+                        else phases[times.index(time)]
+                        if uid == 0
+                        else "Hover"
+                    ),
+                    "assigned_tasks": [
+                        {
+                            "task_type": (
+                                "Search"
+                                if time == 0.0
+                                else phases[times.index(time)]
+                                if uid == 0
+                                else "Hovering"
+                            )
+                        }
+                    ],
+                }
                 for time in history_times
             ]
             for uid in range(16)
@@ -257,7 +296,7 @@ class SyntheticFigureBuildTest(unittest.TestCase):
                 "actual_time_seconds": time,
                 "target_uav_id": 0,
                 "target_uav_phase": phase,
-                "uavs": [{"uav_id": uid, "x": uav_paths[str(uid)][history_times.index(time)]["x"], "y": uav_paths[str(uid)][history_times.index(time)]["y"], "z": 90 + uid, "task_phase": phase if uid == 0 else "Hover"} for uid in range(16)],
+                "uavs": [{"uav_id": uid, "x": uav_paths[str(uid)][history_times.index(time)]["x"], "y": uav_paths[str(uid)][history_times.index(time)]["y"], "z": 90 + uid, "task_phase": phase if uid == 0 else "Hover", "assigned_tasks": [{"task_type": phase if uid == 0 else "Hovering"}]} for uid in range(16)],
                 "sr_teams": [{"sr_id": uid, "x": sr_paths[str(uid)][history_times.index(time)]["x"], "y": 500, "z": 0, "active": True} for uid in range(2)],
                 "ground_targets": [{"gt_id": 0, "x": 650.0, "y": 650.0, "z": 0.0, "radius_m": 80.0, "detected": time >= 10, "detected_by_uav_id": 0 if time >= 10 else None}],
                 "ground_station": {"gs_id": 16, "x": 0.0, "y": 0.0, "z": 0.0},
@@ -270,14 +309,49 @@ class SyntheticFigureBuildTest(unittest.TestCase):
             "requested_times_seconds": list(times),
             "target_uav_id": 0,
             "snapshots": snapshots,
-            "trajectory_history": [],
+            "trajectory_history": [
+                {
+                    "actual_time_seconds": time,
+                    "uavs": [
+                        {
+                            "uav_id": uid,
+                            **{
+                                key: value
+                                for key, value in uav_paths[str(uid)][
+                                    history_times.index(time)
+                                ].items()
+                                if key != "actual_time_seconds"
+                            },
+                        }
+                        for uid in range(16)
+                    ],
+                    "sr_teams": [
+                        {
+                            "sr_id": uid,
+                            **{
+                                key: value
+                                for key, value in sr_paths[str(uid)][
+                                    history_times.index(time)
+                                ].items()
+                                if key != "actual_time_seconds"
+                            },
+                            "active": True,
+                        }
+                        for uid in range(2)
+                    ],
+                }
+                for time in history_times
+            ],
             "uav_paths": uav_paths,
             "sr_paths": sr_paths,
             "ground_targets": [],
             "initial_sr_teams": [],
             "checkpoint_path": str(checkpoint),
             "checkpoint_required": True,
-            "checkpoint_fingerprint": fingerprint,
+            "checkpoint_fingerprint": provenance[
+                "checkpoint_metadata_fingerprint"
+            ],
+            **provenance,
         }
 
     def _write_evaluation_run(self, root, suite, method_id, training_runs):
@@ -296,13 +370,16 @@ class SyntheticFigureBuildTest(unittest.TestCase):
             if checkpoint_required
             else None
         )
-        fingerprint = (
-            checkpoint_metadata_fingerprint(checkpoint_metadata)
+        provenance = (
+            checkpoint_artifact_provenance(
+                checkpoint, metadata=checkpoint_metadata
+            )
             if checkpoint_required
-            else None
+            else {field: None for field in CHECKPOINT_PROVENANCE_FIELDS}
         )
         points = list(evaluation_sweep_points(suite))
         metadata_points = []
+        all_aggregates = []
         for index, point in enumerate(points):
             point_dir = evaluation_dir / point["point_id"]
             point_dir.mkdir()
@@ -315,11 +392,40 @@ class SyntheticFigureBuildTest(unittest.TestCase):
             manifest_path = manifest.save(point_dir / "scenario_manifest.json")
             if suite == "uav_trajectory_snapshots":
                 artifact = self._trajectory_artifact(
-                    manifest, checkpoint, fingerprint
+                    manifest, checkpoint, provenance
                 )
                 (point_dir / "trajectory_artifacts.json").write_text(
                     json.dumps([artifact]), encoding="utf-8"
                 )
+            episode_rows = self._episode_rows(method_id, index)
+            per_episode_path = point_dir / "per_episode.jsonl"
+            per_episode_path.write_text(
+                "".join(json.dumps(row) + "\n" for row in episode_rows),
+                encoding="utf-8",
+            )
+            point_aggregates = aggregate_paper_point_metrics(
+                method_id, suite, point, episode_rows
+            )
+            aggregate_path = point_dir / "aggregated_plot_data.json"
+            aggregate_path.write_text(
+                json.dumps(point_aggregates), encoding="utf-8"
+            )
+            all_aggregates.extend(point_aggregates)
+            run_metadata_path = point_dir / "run_metadata.json"
+            run_metadata_path.write_text(
+                json.dumps(
+                    {
+                        "method_id": method_id,
+                        "semantic_suite": suite,
+                        "checkpoint_required": checkpoint_required,
+                        "checkpoint_path": (
+                            str(checkpoint) if checkpoint_required else None
+                        ),
+                        **provenance,
+                    }
+                ),
+                encoding="utf-8",
+            )
             metadata_points.append({
                 **point,
                 "scenario_manifest_path": str(manifest_path.resolve()),
@@ -334,12 +440,16 @@ class SyntheticFigureBuildTest(unittest.TestCase):
                 "resolved_overrides": self._resolved_overrides(suite, point),
                 "checkpoint_required": checkpoint_required,
                 "checkpoint_path": str(checkpoint) if checkpoint_required else None,
-                "checkpoint_metadata_fingerprint": fingerprint,
+                **provenance,
                 "output_directory": str(point_dir.resolve()),
+                "outputs": {
+                    "per_episode_jsonl": str(per_episode_path.resolve()),
+                    "run_metadata": str(run_metadata_path.resolve()),
+                },
+                "aggregated_plot_data": str(aggregate_path.resolve()),
             })
-        rows = self._aggregate_rows(method_id, suite, points)
         (evaluation_dir / "aggregated_plot_data.json").write_text(
-            json.dumps(rows), encoding="utf-8"
+            json.dumps(all_aggregates), encoding="utf-8"
         )
         training_resolved = (
             json.loads((training_run / "resolved_config.json").read_text(encoding="utf-8"))
@@ -354,7 +464,7 @@ class SyntheticFigureBuildTest(unittest.TestCase):
             "checkpoint_required": checkpoint_required,
             "checkpoint_episode": 2500 if checkpoint_required else None,
             "checkpoint_path": str(checkpoint) if checkpoint_required else None,
-            "checkpoint_metadata_fingerprint": fingerprint,
+            **provenance,
             "formal_training_config": training_resolved["training_config"] if checkpoint_required else None,
             "training_seed": TRAINING_SEED if checkpoint_required else None,
             "evaluation_seed": TRAINING_SEED,
@@ -419,7 +529,17 @@ class SyntheticFigureBuildTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             spec, _, _ = self._fixture(root)
-            result = build_paper_figures(spec, output_root=root / "output")
+            with mock.patch(
+                "training_checkpoint.torch.load",
+                side_effect=AssertionError("figure builder loaded model weights"),
+            ):
+                result = build_paper_figures(spec, output_root=root / "output")
+                second = build_paper_figures(
+                    spec,
+                    figure="training_ee_vs_episode",
+                    output_root=root / "output",
+                )
+            self.assertNotEqual(result["output_directory"], second["output_directory"])
             self.assertEqual(tuple(result["semantic_figures"]), tuple(FIGURE_REGISTRY))
             self.assertEqual(len(result["semantic_figures"]), 12)
             output = Path(result["output_directory"])
@@ -437,6 +557,12 @@ class SyntheticFigureBuildTest(unittest.TestCase):
                 resolved = json.loads((output / f"{stem}_resolved_spec.json").read_text(encoding="utf-8"))
                 self.assertEqual(resolved["semantic_figure_id"], figure_id)
                 self.assertEqual(resolved["render_contract"]["axes_count"], 1)
+                for provenance in resolved[
+                    "method_to_checkpoint_provenance"
+                ].values():
+                    if provenance["checkpoint_path"] is not None:
+                        for field in CHECKPOINT_PROVENANCE_FIELDS:
+                            self.assertEqual(len(provenance[field]), 64)
                 title = resolved["render_contract"]["axes_titles"][0]
                 if figure_id.startswith("uav_trajectory_t_"):
                     self.assertRegex(title, r"^t = (5|10|15|25) s: UAV in .+ mode$")
@@ -467,6 +593,76 @@ class SyntheticFigureBuildTest(unittest.TestCase):
                 ("com_task_delay_vs_arrival_rate", "vs_task_delay_vs_arrival_rate"),
             )
 
+    def test_standalone_trajectory_source_redraws_without_evaluation_artifact(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            spec, _, evaluations = self._fixture(root)
+            result = build_paper_figures(
+                spec, figure="fig3", output_root=root / "output"
+            )
+            self.assertEqual(len(result["semantic_figures"]), 4)
+            output = Path(result["output_directory"])
+            artifact_path = (
+                evaluations["uav_trajectory_snapshots"]["td3_dinkelbach"]
+                / "trajectory"
+                / "trajectory_artifacts.json"
+            )
+            artifact_path.rename(artifact_path.with_suffix(".unavailable"))
+
+            source_5 = json.loads(
+                (output / "UAV_trajectory_t_5s.json").read_text(encoding="utf-8")
+            )
+            source_10 = json.loads(
+                (output / "UAV_trajectory_t_10s.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(len(source_5["uavs"]), 16)
+            self.assertEqual(len(source_5["uav_paths"]), 16)
+            self.assertTrue(source_5["sr_paths"])
+            self.assertTrue(source_5["ground_targets"])
+            self.assertTrue(source_5["ground_station"])
+            self.assertTrue(source_5["active_links"])
+            self.assertTrue(source_5["sensing_coverage"])
+            self.assertTrue(
+                all(
+                    state["actual_time_seconds"] <= 5.0
+                    for path in source_5["uav_paths"].values()
+                    for state in path
+                )
+            )
+            self.assertEqual(source_10["actual_phase"], "FOV")
+            for field in CHECKPOINT_PROVENANCE_FIELDS:
+                self.assertEqual(len(source_10[field]), 64)
+
+            figure = render_standalone_trajectory_source(source_10)
+            try:
+                self.assertEqual(len(figure.axes), 1)
+                self.assertEqual(
+                    figure.axes[0].get_title(), "t = 10 s: UAV in VS mode"
+                )
+                self.assertNotIn("FOV", figure.axes[0].get_title())
+                self.assertGreater(len(figure.axes[0].collections), 2)
+            finally:
+                import matplotlib.pyplot as plt
+
+                plt.close(figure)
+
+            with (output / "UAV_trajectory_t_5s.csv").open(
+                "r", encoding="utf-8", newline=""
+            ) as handle:
+                record_types = {row["record_type"] for row in csv.DictReader(handle)}
+            self.assertTrue(
+                {
+                    "uav_path",
+                    "uav_snapshot",
+                    "sr_path",
+                    "sr_snapshot",
+                    "ground_target",
+                    "ground_station",
+                    "active_link",
+                    "sensing_coverage",
+                }.issubset(record_types)
+            )
+
     def test_checkpoint_paths_and_fingerprints_are_recomputed(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -486,8 +682,32 @@ class SyntheticFigureBuildTest(unittest.TestCase):
             metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
             metadata["checkpoint_path"] = str(root / "does-not-exist" / "ep_2500")
             metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
-            with self.assertRaisesRegex(IncompatiblePaperRunError, "checkpoint path"):
+            with self.assertRaisesRegex(IncompatiblePaperRunError, "checkpoint.*path"):
                 build_paper_figures(spec, figure="task_assignment_ee_vs_number_of_rois", output_root=root / "missing-checkpoint")
+
+            spec, training, _ = self._fixture(root / "mutated-models")
+            checkpoint = training[method] / "checkpoints" / "models" / "ep_2500"
+            self._write_synthetic_models(checkpoint / "models.pt", "mutated-payload")
+            with self.assertRaisesRegex(
+                IncompatiblePaperRunError, "checkpoint_models_sha256"
+            ):
+                build_paper_figures(
+                    spec,
+                    figure="task_assignment_ee_vs_number_of_rois",
+                    output_root=root / "mutated-models-out",
+                )
+
+            spec, training, _ = self._fixture(root / "missing-models")
+            checkpoint = training[method] / "checkpoints" / "models" / "ep_2500"
+            (checkpoint / "models.pt").rename(checkpoint / "models.unavailable")
+            with self.assertRaisesRegex(
+                IncompatiblePaperRunError, "model payload is missing"
+            ):
+                build_paper_figures(
+                    spec,
+                    figure="training_ee_vs_episode",
+                    output_root=root / "missing-models-out",
+                )
 
     def test_random_baseline_rejects_any_checkpoint_path(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -535,7 +755,7 @@ class SyntheticFigureBuildTest(unittest.TestCase):
                 )
             ]
             aggregate_path.write_text(json.dumps(rows), encoding="utf-8")
-            with self.assertRaisesRegex(IncompatiblePaperRunError, "Cartesian"):
+            with self.assertRaisesRegex(IncompatiblePaperRunError, "missing canonical"):
                 build_paper_figures(spec, figure="com_task_delay_vs_arrival_rate", output_root=root / "missing-row-out")
             selected = next(
                 row for row in original_rows
@@ -558,8 +778,64 @@ class SyntheticFigureBuildTest(unittest.TestCase):
                 json.dumps([*original_rows, {**selected, "metric": "invented_metric"}]),
                 encoding="utf-8",
             )
-            with self.assertRaisesRegex(IncompatiblePaperRunError, "unexpected aggregate metric"):
+            with self.assertRaisesRegex(IncompatiblePaperRunError, "unexpected canonical"):
                 build_paper_figures(spec, figure="com_task_delay_vs_arrival_rate", output_root=root / "bad-metric-out")
+
+            aggregate_path.write_text(json.dumps(original_rows), encoding="utf-8")
+            top_mutated = [dict(row) for row in original_rows]
+            top_ee = next(
+                row for row in top_mutated
+                if row["point_id"] == "com_rate_50"
+                and row["metric"] == "energy_efficiency_mbit_per_j"
+            )
+            top_ee["numerator"] += 1.0
+            top_ee["value"] = top_ee["numerator"] / top_ee["denominator"]
+            aggregate_path.write_text(json.dumps(top_mutated), encoding="utf-8")
+            with self.assertRaisesRegex(
+                IncompatiblePaperRunError, "top-level/point-level mismatch"
+            ):
+                build_paper_figures(spec, figure="com_task_delay_vs_arrival_rate", output_root=root / "top-point-mismatch")
+
+            aggregate_path.write_text(json.dumps(original_rows), encoding="utf-8")
+            point_dir = evaluation_dir / "com_rate_50"
+            point_aggregate_path = point_dir / "aggregated_plot_data.json"
+            point_rows = json.loads(point_aggregate_path.read_text(encoding="utf-8"))
+            point_ee = next(
+                row for row in point_rows
+                if row["metric"] == "energy_efficiency_mbit_per_j"
+            )
+            point_ee["numerator"] += 1.0
+            point_ee["value"] = point_ee["numerator"] / point_ee["denominator"]
+            point_aggregate_path.write_text(json.dumps(point_rows), encoding="utf-8")
+            with self.assertRaisesRegex(
+                IncompatiblePaperRunError, "point-level/per-episode mismatch"
+            ):
+                build_paper_figures(spec, figure="com_task_delay_vs_arrival_rate", output_root=root / "point-episode-mismatch")
+
+            point_aggregate_path.write_text(
+                json.dumps(
+                    [
+                        row
+                        for row in original_rows
+                        if row["point_id"] == "com_rate_50"
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            per_episode_path = point_dir / "per_episode.jsonl"
+            episode_rows = [
+                json.loads(line)
+                for line in per_episode_path.read_text(encoding="utf-8").splitlines()
+            ]
+            episode_rows[0]["timely_goodput_mbits"] += 1.0
+            per_episode_path.write_text(
+                "".join(json.dumps(row) + "\n" for row in episode_rows),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(
+                IncompatiblePaperRunError, "point-level/per-episode mismatch"
+            ):
+                build_paper_figures(spec, figure="com_task_delay_vs_arrival_rate", output_root=root / "episode-recompute-mismatch")
 
     def test_ambiguous_mapping_and_incomplete_training_are_rejected(self):
         with tempfile.TemporaryDirectory() as temp_dir:

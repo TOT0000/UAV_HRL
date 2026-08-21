@@ -23,14 +23,26 @@ from paper_figure_registry import (
     PLOT_STYLES,
     resolve_figure_ids,
 )
+from paper_metrics import (
+    aggregate_paper_point_metrics,
+    causal_trailing_average as _causal_trailing_average,
+    compare_aggregate_collections,
+    normalize_episode_ee as _normalize_episode_ee,
+    paper_energy_efficiency as _paper_energy_efficiency,
+    validate_aggregate_collection,
+    validate_canonical_aggregate_rows,
+)
+from paper_trajectory import (
+    build_standalone_trajectory_source,
+    standalone_trajectory_csv_rows,
+    validate_standalone_trajectory_source,
+)
 from scenario_manifest import ScenarioManifest, current_environment_config
 from training_checkpoint import (
-    checkpoint_metadata_fingerprint,
+    CHECKPOINT_PROVENANCE_FIELDS,
+    checkpoint_artifact_provenance,
     inspect_model_checkpoint,
 )
-
-
-PAPER_EE_EPSILON_J = 1e-12
 
 
 class PaperFigureSpecError(ValueError):
@@ -46,71 +58,18 @@ class IncompatiblePaperRunError(PaperFigureSpecError):
 
 
 def causal_trailing_average(values, window=50):
-    window = int(window)
-    if window <= 0:
-        raise ValueError("moving-average window must be positive")
-    result = []
-    running = 0.0
-    finite_values = []
-    for index, value in enumerate(values):
-        value = float(value)
-        if not math.isfinite(value):
-            raise ValueError("energy-efficiency series must be finite")
-        finite_values.append(value)
-        running += value
-        if index >= window:
-            running -= finite_values[index - window]
-        result.append(running / min(index + 1, window))
-    return result
+    return _causal_trailing_average(values, window=window)
 
 
 def paper_energy_efficiency(timely_goodput_mbits, mobility_energy_j):
-    """Strict paper adapter: Mbit/J with an explicit positive epsilon."""
-
-    numerator = float(timely_goodput_mbits)
-    denominator = float(mobility_energy_j)
-    if not math.isfinite(numerator) or numerator < 0.0:
-        raise ValueError("timely goodput must be finite and non-negative")
-    if not math.isfinite(denominator) or denominator < 0.0:
-        raise ValueError("mobility energy must be finite and non-negative")
-    value = numerator / max(denominator, PAPER_EE_EPSILON_J)
-    if not math.isfinite(value):
-        raise ValueError("paper energy efficiency is non-finite")
-    return value
+    return _paper_energy_efficiency(timely_goodput_mbits, mobility_energy_j)
 
 
 def normalize_episode_ee(method_id, history_rows, window=50):
-    ordered = sorted(history_rows, key=lambda row: int(row["episode"]))
-    episodes = [int(row["episode"]) for row in ordered]
-    if not episodes or episodes != list(range(1, len(episodes) + 1)):
-        raise PaperFigureSpecError(
-            f"{method_id} training history must contain contiguous episodes from 1"
-        )
-    raw_mbit = []
-    for row in ordered:
-        try:
-            timely_mbits = row["timely_goodput_mbits"]
-            mobility_joules = row["mobility_energy_j"]
-        except KeyError as exc:
-            raise PaperFigureSpecError(
-                f"{method_id} training history lacks production EE inputs"
-            ) from exc
-        raw_mbit.append(paper_energy_efficiency(timely_mbits, mobility_joules))
-    raw_bits = [value * 1e6 for value in raw_mbit]
-    averaged = causal_trailing_average(raw_bits, window=window)
-    return [
-        {
-            "method_id": str(method_id),
-            "episode": episode,
-            "timely_goodput_mbits": float(source["timely_goodput_mbits"]),
-            "mobility_energy_j": float(source["mobility_energy_j"]),
-            "raw_energy_efficiency_bit_per_j": raw_value,
-            "trailing_50_energy_efficiency_bit_per_j": average,
-        }
-        for episode, source, raw_value, average in zip(
-            episodes, ordered, raw_bits, averaged
-        )
-    ]
+    try:
+        return _normalize_episode_ee(method_id, history_rows, window=window)
+    except ValueError as exc:
+        raise PaperFigureSpecError(str(exc)) from exc
 
 
 def _read_json(path):
@@ -168,11 +127,13 @@ def _inspect_checkpoint(method_id, checkpoint_dir, training_seed, formal_config)
         raise IncompatiblePaperRunError(
             f"checkpoint provenance is invalid for {method_id}: {exc}"
         ) from exc
-    fingerprint = checkpoint_metadata_fingerprint(inspected["metadata"])
+    provenance = checkpoint_artifact_provenance(
+        checkpoint_dir, metadata=inspected["metadata"]
+    )
     return {
         "checkpoint_dir": checkpoint_dir,
         "checkpoint_metadata": inspected["metadata"],
-        "checkpoint_metadata_fingerprint": fingerprint,
+        **provenance,
     }
 
 
@@ -234,9 +195,7 @@ def _resolve_training_run(method_id, entry, spec_dir):
         "history_path": history_path.resolve(),
         "history_rows": rows,
         "checkpoint_path": checkpoint_dir.resolve(),
-        "checkpoint_metadata_fingerprint": inspected[
-            "checkpoint_metadata_fingerprint"
-        ],
+        **{field: inspected[field] for field in CHECKPOINT_PROVENANCE_FIELDS},
     }
 
 
@@ -373,51 +332,114 @@ def _validate_manifest_point(point, metadata, suite):
     }
 
 
-def _validate_aggregate_envelope(rows, metadata):
-    point_by_id = {
-        point["point_id"]: point for point in metadata.get("points", ())
-    }
-    metric_contracts = {
-        "energy_efficiency_mbit_per_j": (None, "Mbit/J"),
-        "average_e2e_delay_seconds": ({"FOV", "COM"}, "seconds"),
-        "violation_probability": ({"FOV", "COM"}, "probability"),
-    }
-    for row in rows:
-        metric = row.get("metric")
-        if metric not in metric_contracts:
+def _validate_checkpoint_record(record, expected, *, method_id, point_id, layer):
+    expected_path = expected.get("checkpoint_path")
+    actual_path = record.get("checkpoint_path")
+    if expected_path is None:
+        if actual_path is not None:
             raise IncompatiblePaperRunError(
-                f"unexpected aggregate metric: {metric}"
+                f"method={method_id}, point={point_id}, layer={layer}: "
+                f"checkpoint_path mismatch: expected=None, actual={actual_path!r}"
             )
-        if row.get("semantic_suite") != metadata.get("semantic_suite"):
-            raise IncompatiblePaperRunError("aggregate semantic suite mismatch")
-        if row.get("method_id") != metadata.get("method_id"):
-            raise IncompatiblePaperRunError("aggregate method mismatch")
-        point = point_by_id.get(row.get("point_id"))
-        if point is None:
+    elif not actual_path or Path(actual_path).resolve() != Path(expected_path).resolve():
+        raise IncompatiblePaperRunError(
+            f"method={method_id}, point={point_id}, layer={layer}: "
+            f"checkpoint_path mismatch: expected={expected_path!r}, actual={actual_path!r}"
+        )
+    for field in CHECKPOINT_PROVENANCE_FIELDS:
+        expected_value = expected.get(field)
+        actual_value = record.get(field)
+        if actual_value != expected_value:
             raise IncompatiblePaperRunError(
-                f"unexpected aggregate point: {row.get('point_id')}"
+                f"method={method_id}, point={point_id}, layer={layer}: "
+                f"{field} mismatch: expected={expected_value!r}, actual={actual_value!r}"
             )
-        if row.get("x_value") != point.get("x_value") or row.get("x_unit") != point.get("x_unit"):
-            raise IncompatiblePaperRunError(
-                f"aggregate x value/unit mismatch at {row.get('point_id')}"
+
+
+def _read_point_episode_rows(point, *, method_id):
+    outputs = point.get("outputs") or {}
+    path_value = outputs.get("per_episode_jsonl")
+    if not path_value:
+        raise IncompatiblePaperRunError(
+            f"method={method_id}, point={point.get('point_id')}: "
+            "point metadata lacks outputs.per_episode_jsonl"
+        )
+    path = Path(path_value).resolve()
+    expected = Path(point["output_directory"]).resolve() / "per_episode.jsonl"
+    if path != expected:
+        raise IncompatiblePaperRunError(
+            f"method={method_id}, point={point.get('point_id')}: per-episode path "
+            f"mismatch: expected={expected}, actual={path}"
+        )
+    try:
+        rows = [
+            json.loads(line)
+            for line in path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+    except (FileNotFoundError, OSError, json.JSONDecodeError) as exc:
+        raise IncompatiblePaperRunError(
+            f"method={method_id}, point={point.get('point_id')}: "
+            f"per-episode artifact is missing or invalid: {path}"
+        ) from exc
+    if not rows:
+        raise IncompatiblePaperRunError(
+            f"method={method_id}, point={point.get('point_id')}: "
+            "per-episode artifact is empty"
+        )
+    return rows
+
+
+def _validate_aggregate_layers(evaluation_dir, metadata, top_rows):
+    suite = metadata["semantic_suite"]
+    method_id = metadata["method_id"]
+    if suite == "uav_trajectory_snapshots":
+        return top_rows
+    points = metadata["points"]
+    point_ids = [point["point_id"] for point in points]
+    combined = []
+    try:
+        validate_aggregate_collection(top_rows, method_id, point_ids)
+        for point in points:
+            point_id = point["point_id"]
+            aggregate_path = Path(point.get("aggregated_plot_data", "")).resolve()
+            expected_path = (
+                Path(point["output_directory"]).resolve()
+                / "aggregated_plot_data.json"
             )
-        if int(row.get("evaluation_episode_count", -1)) != int(
-            point["evaluation_episode_count"]
-        ):
-            raise IncompatiblePaperRunError(
-                f"aggregate evaluation count mismatch at {row.get('point_id')}"
+            if aggregate_path != expected_path:
+                raise ValueError(
+                    f"method={method_id}, point={point_id}: point aggregate path "
+                    f"mismatch: expected={expected_path}, actual={aggregate_path}"
+                )
+            point_rows = _read_json(aggregate_path)
+            validate_canonical_aggregate_rows(point_rows, method_id, point_id)
+            episode_rows = _read_point_episode_rows(point, method_id=method_id)
+            recomputed = aggregate_paper_point_metrics(
+                method_id, suite, point, episode_rows
             )
-        tasks, value_unit = metric_contracts[metric]
-        if (tasks is None and row.get("task_type") is not None) or (
-            tasks is not None and row.get("task_type") not in tasks
-        ):
-            raise IncompatiblePaperRunError(
-                f"unexpected aggregate task for {metric}: {row.get('task_type')}"
+            compare_aggregate_collections(
+                recomputed,
+                point_rows,
+                context=(
+                    f"point-level/per-episode mismatch: method={method_id}, "
+                    f"point={point_id}"
+                ),
             )
-        if row.get("value_unit") != value_unit:
-            raise IncompatiblePaperRunError(
-                f"unexpected aggregate unit for {metric}: {row.get('value_unit')}"
-            )
+            combined.extend(point_rows)
+        compare_aggregate_collections(
+            combined,
+            top_rows,
+            context=(
+                f"top-level/point-level mismatch: method={method_id}, "
+                f"evaluation_dir={Path(evaluation_dir).resolve()}"
+            ),
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        if isinstance(exc, IncompatiblePaperRunError):
+            raise
+        raise IncompatiblePaperRunError(str(exc)) from exc
+    return top_rows
 
 
 def _resolve_evaluation_run(method_id, entry, spec_dir, expected_suite):
@@ -468,22 +490,33 @@ def _resolve_evaluation_run(method_id, entry, spec_dir, expected_suite):
         checkpoint = _inspect_checkpoint(
             method_id, checkpoint_path, training_seed, formal_config
         )
-        fingerprint = checkpoint["checkpoint_metadata_fingerprint"]
-        if metadata.get("checkpoint_metadata_fingerprint") != fingerprint:
-            raise IncompatiblePaperRunError(
-                f"top-level checkpoint fingerprint mismatch for {method_id}"
-            )
+        checkpoint_provenance = {
+            "checkpoint_path": str(checkpoint_path),
+            **{
+                field: checkpoint[field] for field in CHECKPOINT_PROVENANCE_FIELDS
+            },
+        }
     else:
-        fingerprint = None
-        forbidden = (
-            metadata.get("checkpoint_path"),
-            metadata.get("checkpoint_metadata_fingerprint"),
-            metadata.get("training_run"),
-        )
-        if any(value is not None for value in forbidden):
+        checkpoint_path = None
+        checkpoint_provenance = {
+            "checkpoint_path": None,
+            **{field: None for field in CHECKPOINT_PROVENANCE_FIELDS},
+        }
+        if metadata.get("training_run") is not None or any(
+            metadata.get(field) is not None
+            for field in ("checkpoint_path", *CHECKPOINT_PROVENANCE_FIELDS)
+        ):
             raise IncompatiblePaperRunError(
-                "pure-random evaluation must have no checkpoint provenance"
+                f"method={method_id}: pure-random evaluation must have no neural "
+                "checkpoint provenance or training run"
             )
+    _validate_checkpoint_record(
+        metadata,
+        checkpoint_provenance,
+        method_id=method_id,
+        point_id="<top-level>",
+        layer="paper_evaluation_metadata.json",
+    )
     points = metadata.get("points")
     if not isinstance(points, list) or not points:
         raise PaperFigureSpecError(f"evaluation has no point metadata: {evaluation_dir}")
@@ -492,17 +525,32 @@ def _resolve_evaluation_run(method_id, entry, spec_dir, expected_suite):
             raise IncompatiblePaperRunError(
                 f"checkpoint requirement mismatch at {point.get('point_id')}"
             )
-        point_path = point.get("checkpoint_path")
-        point_fingerprint = point.get("checkpoint_metadata_fingerprint")
-        if checkpoint_required:
-            if Path(point_path).resolve() != checkpoint_path or point_fingerprint != fingerprint:
-                raise IncompatiblePaperRunError(
-                    f"checkpoint provenance mismatch at {point.get('point_id')}"
-                )
-        elif point_path is not None or point_fingerprint is not None:
+        point_id = point.get("point_id")
+        _validate_checkpoint_record(
+            point,
+            checkpoint_provenance,
+            method_id=method_id,
+            point_id=point_id,
+            layer="point metadata",
+        )
+        outputs = point.get("outputs") or {}
+        run_metadata_path = Path(outputs.get("run_metadata", "")).resolve()
+        expected_run_metadata_path = (
+            Path(point["output_directory"]).resolve() / "run_metadata.json"
+        )
+        if run_metadata_path != expected_run_metadata_path:
             raise IncompatiblePaperRunError(
-                "pure-random point must not supply checkpoint provenance"
+                f"method={method_id}, point={point_id}: run metadata path mismatch: "
+                f"expected={expected_run_metadata_path}, actual={run_metadata_path}"
             )
+        point_run_metadata = _read_json(run_metadata_path)
+        _validate_checkpoint_record(
+            point_run_metadata,
+            checkpoint_provenance,
+            method_id=method_id,
+            point_id=point_id,
+            layer="run_metadata.json",
+        )
     point_provenance = [
         _validate_manifest_point(point, metadata, expected_suite) for point in points
     ]
@@ -510,13 +558,17 @@ def _resolve_evaluation_run(method_id, entry, spec_dir, expected_suite):
     aggregate_rows = _read_json(aggregate_path)
     if not isinstance(aggregate_rows, list) or not aggregate_rows:
         raise PaperFigureSpecError(f"evaluation aggregate is empty: {aggregate_path}")
-    _validate_aggregate_envelope(aggregate_rows, metadata)
+    _validate_aggregate_layers(evaluation_dir, metadata, aggregate_rows)
     return {
         "evaluation_dir": evaluation_dir,
         "metadata": metadata,
         "aggregate_path": aggregate_path,
         "aggregate_rows": aggregate_rows,
-        "checkpoint_metadata_fingerprint": fingerprint,
+        **{
+            field: checkpoint_provenance[field]
+            for field in CHECKPOINT_PROVENANCE_FIELDS
+        },
+        "checkpoint_provenance": checkpoint_provenance,
         "point_provenance": point_provenance,
     }
 
@@ -614,6 +666,9 @@ def _emit(figure_id, figure, output_dir, rows, resolved, json_value=None):
         "csv": str(csv_path),
         "json": str(json_path),
         "resolved_spec": str(spec_path),
+        "method_to_checkpoint_provenance": resolved.get(
+            "method_to_checkpoint_provenance", {}
+        ),
     }
 
 
@@ -703,7 +758,16 @@ def _build_training(spec, spec_path, output_dir, git_sha):
             "source_spec": str(spec_path),
             "method_to_training_run": {method: str(run["run_dir"]) for method, run in runs.items()},
             "checkpoint_paths": {method: str(run["checkpoint_path"]) for method, run in runs.items()},
-            "checkpoint_metadata_fingerprints": {method: run["checkpoint_metadata_fingerprint"] for method, run in runs.items()},
+            "method_to_checkpoint_provenance": {
+                method: {
+                    "checkpoint_path": str(run["checkpoint_path"]),
+                    **{
+                        field: run[field]
+                        for field in CHECKPOINT_PROVENANCE_FIELDS
+                    },
+                }
+                for method, run in runs.items()
+            },
             "metric_definition": "episode timely delivered Mbit * 1e6 / max(episode mobility J, 1e-12 J)",
             "trailing_average_definition": "causal mean over max(1,e-49)..e",
             "git_sha": git_sha,
@@ -901,8 +965,8 @@ def _run_mapping(runs):
 
 def _validated_provenance(runs):
     return {
-        "checkpoint_metadata_fingerprints": {
-            method: run["checkpoint_metadata_fingerprint"]
+        "method_to_checkpoint_provenance": {
+            method: dict(run["checkpoint_provenance"])
             for method, run in runs.items()
         },
         "validated_points": {
@@ -941,23 +1005,6 @@ def _build_standalone_ee(spec, spec_path, output_dir, git_sha, figure_id):
     )
 
 
-def _trajectory_rows(artifact):
-    rows = []
-    for snapshot in artifact["snapshots"]:
-        for uav in snapshot["uavs"]:
-            rows.append(
-                {
-                    "scenario_id": artifact["scenario_id"],
-                    "target_uav_id": artifact["target_uav_id"],
-                    "requested_time_seconds": snapshot["requested_time_seconds"],
-                    "actual_time_seconds": snapshot["actual_time_seconds"],
-                    "target_uav_phase": snapshot["target_uav_phase"],
-                    **uav,
-                }
-            )
-    return rows
-
-
 def _draw_ground_circle(axis, x, y, radius, *, color, linewidth=1.0):
     import numpy as np
 
@@ -973,6 +1020,163 @@ def _phase_subtitle(phase):
         "FOV+COM": "UAV in VS and COM mode",
         "Hover": "UAV in hovering mode",
     }.get(str(phase), f"UAV in {phase} mode")
+
+
+def render_standalone_trajectory_source(source):
+    """Render one axes using only a standalone trajectory source object."""
+
+    validate_standalone_trajectory_source(source)
+    import matplotlib.pyplot as plt
+    from matplotlib.lines import Line2D
+    from matplotlib.patches import Patch
+    from mpl_toolkits.mplot3d.art3d import Poly3DCollection
+
+    figure = plt.figure(figsize=(7.2, 6.4))
+    axis = figure.add_subplot(projection="3d")
+    actual = float(source["actual_time_seconds"])
+    target_uav_id = int(source["target_uav_id"])
+    uavs = {int(item["uav_id"]): item for item in source["uavs"]}
+    target = uavs[target_uav_id]
+    target_path = source["uav_paths"][str(target_uav_id)]
+    axis.plot(
+        [point["x"] for point in target_path],
+        [point["y"] for point in target_path],
+        [point["z"] for point in target_path],
+        color="green",
+        linewidth=1.5,
+    )
+    axis.scatter(
+        target_path[0]["x"],
+        target_path[0]["y"],
+        target_path[0]["z"],
+        color="green",
+        s=36,
+    )
+    axis.scatter(
+        target["x"],
+        target["y"],
+        target["z"],
+        facecolors="none",
+        edgecolors="green",
+        s=42,
+    )
+    others = [item for uid, item in uavs.items() if uid != target_uav_id]
+    axis.scatter(
+        [uav["x"] for uav in others],
+        [uav["y"] for uav in others],
+        [uav["z"] for uav in others],
+        color="lightgray",
+        alpha=0.45,
+        s=24,
+    )
+    for sr in source["sr_teams"]:
+        sr_path = source["sr_paths"][str(sr["sr_id"])]
+        axis.plot(
+            [point["x"] for point in sr_path],
+            [point["y"] for point in sr_path],
+            [point["z"] for point in sr_path],
+            color="#243BFF",
+            linestyle="--",
+            linewidth=1.0,
+        )
+        axis.scatter(
+            sr_path[0]["x"],
+            sr_path[0]["y"],
+            sr_path[0]["z"],
+            color="#243BFF",
+            marker="s",
+            s=26,
+        )
+        axis.scatter(
+            sr["x"],
+            sr["y"],
+            sr["z"],
+            facecolors="none",
+            edgecolors="#243BFF",
+            marker="s",
+            s=30,
+        )
+    ground_station = source["ground_station"]
+    axis.scatter(
+        ground_station["x"],
+        ground_station["y"],
+        ground_station["z"],
+        color="red",
+        marker="^",
+        s=50,
+    )
+    for target_row in source["ground_targets"]:
+        _draw_ground_circle(
+            axis,
+            target_row["x"],
+            target_row["y"],
+            target_row["radius_m"],
+            color="magenta" if target_row["detected"] else "gray",
+        )
+    for coverage in source["sensing_coverage"]:
+        bounds = coverage["clipped_bounds"]
+        vertices = [[
+            (bounds["x_min"], bounds["y_min"], 0.0),
+            (bounds["x_max"], bounds["y_min"], 0.0),
+            (bounds["x_max"], bounds["y_max"], 0.0),
+            (bounds["x_min"], bounds["y_max"], 0.0),
+        ]]
+        axis.add_collection3d(
+            Poly3DCollection(
+                vertices,
+                facecolor="#E8B95A",
+                alpha=0.25,
+                edgecolor="#C6902E",
+            )
+        )
+    for link in source["active_links"]:
+        sender = uavs[int(link["sender_id"])]
+        receiver = (
+            ground_station
+            if int(link["receiver_id"]) == int(ground_station["gs_id"])
+            else uavs[int(link["receiver_id"])]
+        )
+        color = "red" if link["link_type"] == "U2U" else "purple"
+        axis.plot(
+            [sender["x"], receiver["x"]],
+            [sender["y"], receiver["y"]],
+            [sender["z"], receiver["z"]],
+            color=color,
+            linestyle="--",
+            linewidth=1.3,
+        )
+    contract = source["render_contract"]
+    limits = contract["axis_limits"]
+    labels = contract["axis_labels"]
+    axis.set_xlim(*limits["x"])
+    axis.set_ylim(*limits["y"])
+    axis.set_zlim(*limits["z"])
+    axis.set_xlabel(labels["x"])
+    axis.set_ylabel(labels["y"])
+    axis.set_zlabel(labels["z"])
+    camera = contract["camera"]
+    axis.view_init(
+        elev=float(camera["elevation_degrees"]),
+        azim=float(camera["azimuth_degrees"]),
+    )
+    title = f"t = {actual:g} s: {_phase_subtitle(source['actual_phase'])}"
+    axis.set_title(title)
+    handles = [
+        Line2D([0], [0], color="green", label="Target UAV"),
+        Line2D([0], [0], marker="o", color="green", linestyle="", label="UAV initial point"),
+        Line2D([0], [0], marker="o", color="lightgray", linestyle="", label="Other UAVs"),
+        Line2D([0], [0], color="#243BFF", linestyle="--", label="SR Path"),
+        Line2D([0], [0], marker="s", color="#243BFF", linestyle="", label="SR team initial point"),
+        Line2D([0], [0], marker="^", color="red", linestyle="", label="GS"),
+        Line2D([0], [0], marker="o", markerfacecolor="none", markeredgecolor="magenta", color="none", label="Detected RoIs"),
+        Line2D([0], [0], marker="o", markerfacecolor="none", markeredgecolor="gray", color="none", label="Other RoIs"),
+        Line2D([0], [0], color="red", linestyle="--", label="U2U Link"),
+        Line2D([0], [0], color="purple", linestyle="--", label="U2G Link"),
+        Patch(facecolor="#E8B95A", alpha=0.25, label="Sensing coverage"),
+    ]
+    axis.legend(handles=handles, fontsize=7, ncol=2, loc="upper right")
+    figure.tight_layout()
+    return figure
 
 
 def _build_trajectory(spec, spec_path, output_dir, git_sha, figure_id):
@@ -1006,8 +1210,13 @@ def _build_trajectory(spec, spec_path, output_dir, git_sha, figure_id):
         run["metadata"]["checkpoint_path"]
     ).resolve():
         raise IncompatiblePaperRunError("trajectory artifact checkpoint path mismatch")
-    if artifact.get("checkpoint_fingerprint") != run["checkpoint_metadata_fingerprint"]:
-        raise IncompatiblePaperRunError("trajectory artifact checkpoint fingerprint mismatch")
+    _validate_checkpoint_record(
+        artifact,
+        run["checkpoint_provenance"],
+        method_id=method,
+        point_id="trajectory",
+        layer="trajectory artifact",
+    )
     snapshots = artifact.get("snapshots", [])
     requested = tuple(float(item["requested_time_seconds"]) for item in snapshots)
     if requested != (5.0, 10.0, 15.0, 25.0):
@@ -1023,77 +1232,21 @@ def _build_trajectory(spec, spec_path, output_dir, git_sha, figure_id):
             f"trajectory artifact must contain one snapshot requested at {requested_time:g} s"
         )
     snapshot = selected[0]
-
-    import matplotlib.pyplot as plt
-    from matplotlib.lines import Line2D
-    from matplotlib.patches import Patch
-    from mpl_toolkits.mplot3d.art3d import Poly3DCollection
-
-    figure = plt.figure(figsize=(7.2, 6.4))
-    axis = figure.add_subplot(projection="3d")
-    target_path = artifact["uav_paths"][str(target_uav_id)]
-    sr_paths = artifact["sr_paths"]
-    actual = float(snapshot["actual_time_seconds"])
-    uavs = {int(item["uav_id"]): item for item in snapshot["uavs"]}
-    target = uavs[int(target_uav_id)]
-    path = [item for item in target_path if float(item["actual_time_seconds"]) <= actual]
-    axis.plot([p["x"] for p in path], [p["y"] for p in path], [p["z"] for p in path], color="green", linewidth=1.5)
-    axis.scatter(path[0]["x"], path[0]["y"], path[0]["z"], color="green", s=36)
-    axis.scatter(target["x"], target["y"], target["z"], facecolors="none", edgecolors="green", s=42)
-    others = [item for uid, item in uavs.items() if uid != int(target_uav_id)]
-    axis.scatter([u["x"] for u in others], [u["y"] for u in others], [u["z"] for u in others], color="lightgray", alpha=0.45, s=24)
-    for sr in snapshot["sr_teams"]:
-        sr_path = [item for item in sr_paths[str(sr["sr_id"])] if float(item["actual_time_seconds"]) <= actual]
-        axis.plot([p["x"] for p in sr_path], [p["y"] for p in sr_path], [p["z"] for p in sr_path], color="#243BFF", linestyle="--", linewidth=1.0)
-        axis.scatter(sr_path[0]["x"], sr_path[0]["y"], sr_path[0]["z"], color="#243BFF", marker="s", s=26)
-        axis.scatter(sr["x"], sr["y"], sr["z"], facecolors="none", edgecolors="#243BFF", marker="s", s=30)
-    gs = snapshot["ground_station"]
-    axis.scatter(gs["x"], gs["y"], gs["z"], color="red", marker="^", s=50)
-    for gt in snapshot["ground_targets"]:
-        _draw_ground_circle(axis, gt["x"], gt["y"], gt["radius_m"], color="magenta" if gt["detected"] else "gray")
-    for coverage in snapshot["sensing_coverage"]:
-        bounds = coverage["clipped_bounds"]
-        verts = [[
-            (bounds["x_min"], bounds["y_min"], 0.0),
-            (bounds["x_max"], bounds["y_min"], 0.0),
-            (bounds["x_max"], bounds["y_max"], 0.0),
-            (bounds["x_min"], bounds["y_max"], 0.0),
-        ]]
-        axis.add_collection3d(Poly3DCollection(verts, facecolor="#E8B95A", alpha=0.25, edgecolor="#C6902E"))
-    for link in snapshot["active_links"]:
-        sender = uavs[link["sender_id"]]
-        receiver = gs if link["receiver_id"] == gs["gs_id"] else uavs[link["receiver_id"]]
-        color = "red" if link["link_type"] == "U2U" else "purple"
-        axis.plot([sender["x"], receiver["x"]], [sender["y"], receiver["y"]], [sender["z"], receiver["z"]], color=color, linestyle="--", linewidth=1.3)
-    axis.set_xlim(0, 1000)
-    axis.set_ylim(0, 1000)
-    axis.set_zlim(0, 180)
-    axis.set_xlabel("X(m)")
-    axis.set_ylabel("Y(m)")
-    axis.set_zlabel("Z(m)")
-    axis.view_init(elev=20, azim=60)
-    title = f"t = {actual:g} s: {_phase_subtitle(snapshot['target_uav_phase'])}"
-    axis.set_title(title)
-    handles = [
-        Line2D([0], [0], color="green", label="Target UAV"),
-        Line2D([0], [0], marker="o", color="green", linestyle="", label="UAV initial point"),
-        Line2D([0], [0], marker="o", color="lightgray", linestyle="", label="Other UAVs"),
-        Line2D([0], [0], color="#243BFF", linestyle="--", label="SR Path"),
-        Line2D([0], [0], marker="s", color="#243BFF", linestyle="", label="SR team initial point"),
-        Line2D([0], [0], marker="^", color="red", linestyle="", label="GS"),
-        Line2D([0], [0], marker="o", markerfacecolor="none", markeredgecolor="magenta", color="none", label="Detected RoIs"),
-        Line2D([0], [0], marker="o", markerfacecolor="none", markeredgecolor="gray", color="none", label="Other RoIs"),
-        Line2D([0], [0], color="red", linestyle="--", label="U2U Link"),
-        Line2D([0], [0], color="purple", linestyle="--", label="U2G Link"),
-        Patch(facecolor="#E8B95A", alpha=0.25, label="Sensing coverage"),
-    ]
-    axis.legend(handles=handles, fontsize=7, ncol=2, loc="upper right")
-    figure.tight_layout()
-    rows = [
-        row
-        for row in _trajectory_rows(artifact)
-        if float(row["requested_time_seconds"]) == requested_time
-    ]
+    source = build_standalone_trajectory_source(
+        figure_id=figure_id,
+        method_id=method,
+        artifact=artifact,
+        snapshot=snapshot,
+        requested_time_seconds=requested_time,
+        git_sha=git_sha,
+        checkpoint_provenance=run["checkpoint_provenance"],
+        camera=FIGURE_REGISTRY[figure_id]["camera"],
+        style=PLOT_STYLES[suite],
+    )
+    figure = render_standalone_trajectory_source(source)
+    actual = source["actual_time_seconds"]
+    title = figure.axes[0].get_title()
+    rows = standalone_trajectory_csv_rows(source)
     return _emit(
         figure_id,
         figure,
@@ -1105,24 +1258,17 @@ def _build_trajectory(spec, spec_path, output_dir, git_sha, figure_id):
             "target_uav_id": int(target_uav_id),
             "scenario_id": artifact["scenario_id"],
             "scenario_manifest_hash": artifact["scenario_manifest_hash"],
-            "checkpoint_path": artifact.get("checkpoint_path"),
-            "checkpoint_fingerprint": artifact.get("checkpoint_fingerprint"),
+            "checkpoint_path": source["checkpoint_path"],
+            **{field: source[field] for field in CHECKPOINT_PROVENANCE_FIELDS},
             **_validated_provenance(runs),
             "requested_time_seconds": requested_time,
             "actual_time_seconds": actual,
-            "target_uav_phase": snapshot["target_uav_phase"],
+            "target_uav_phase": source["actual_phase"],
             "title": title,
             "title_definition": "actual artifact time and target_uav_phase",
             "git_sha": git_sha,
         },
-        json_value={
-            "scenario_id": artifact["scenario_id"],
-            "target_uav_id": artifact["target_uav_id"],
-            "scenario_manifest_hash": artifact["scenario_manifest_hash"],
-            "checkpoint_path": artifact.get("checkpoint_path"),
-            "checkpoint_fingerprint": artifact.get("checkpoint_fingerprint"),
-            "snapshot": snapshot,
-        },
+        json_value=source,
     )
 
 

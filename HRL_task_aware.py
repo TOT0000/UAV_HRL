@@ -62,8 +62,8 @@ from observation_strategy import (
 from routing_agents import create_routing_agent
 from training_checkpoint import (
     FULL_RESUME_LOGGING_SCHEMA_VERSION,
+    checkpoint_artifact_provenance,
     checkpoint_episode_schedule,
-    checkpoint_metadata_fingerprint,
     load_full_resume_checkpoint,
     load_model_checkpoint,
     save_full_resume_checkpoint,
@@ -358,6 +358,7 @@ def _trajectory_state(
                 "y": float(uav.y_u),
                 "z": float(uav.z_u),
                 "task_phase": _uav_task_phase(env, uav_id),
+                "assigned_tasks": copy.deepcopy(env.multi_tasks.get(uav_id, [])),
             }
             for uav_id, uav in sorted(env.uav_dict.items())
         ],
@@ -1128,6 +1129,9 @@ def train(
             expected_formal_config=expected_checkpoint_formal_config,
         )
         checkpoint_experiment = loaded_checkpoint_metadata["experiment"]
+        artifact_provenance = checkpoint_artifact_provenance(
+            checkpoint_dir, metadata=loaded_checkpoint_metadata
+        )
         checkpoint_provenance = {
             "training_manifest_hash": checkpoint_experiment.get("manifest_hash"),
             "evaluation_manifest_hash": (
@@ -1147,9 +1151,7 @@ def train(
             "checkpoint_metadata_path": os.path.abspath(
                 os.path.join(checkpoint_dir, "metadata.json")
             ),
-            "checkpoint_metadata_fingerprint": (
-                checkpoint_metadata_fingerprint(loaded_checkpoint_metadata)
-            ),
+            **artifact_provenance,
             "checkpoint_dinkelbach_config": (
                 dinkelbach_config_metadata(checkpoint_experiment["formal_config"])
                 if method_spec.uses_dinkelbach
@@ -1175,6 +1177,8 @@ def train(
             "checkpoint_method_spec_fingerprint": None,
             "checkpoint_metadata_path": None,
             "checkpoint_metadata_fingerprint": None,
+            "checkpoint_models_sha256": None,
+            "checkpoint_artifact_fingerprint": None,
             "no_checkpoint_reason": (
                 "method learns neither movement nor routing; no neural state exists"
             ),
@@ -1665,6 +1669,10 @@ def train(
                                 "x": uav["x"],
                                 "y": uav["y"],
                                 "z": uav["z"],
+                                "task_phase": uav["task_phase"],
+                                "assigned_tasks": copy.deepcopy(
+                                    uav.get("assigned_tasks", [])
+                                ),
                             }
                             for state in trajectory_history
                             for uav in state["uavs"]
@@ -2117,6 +2125,15 @@ def train(
                 "checkpoint_required": checkpoint_required,
                 "checkpoint_fingerprint": checkpoint_provenance.get(
                     "checkpoint_metadata_fingerprint"
+                ),
+                "checkpoint_metadata_fingerprint": checkpoint_provenance.get(
+                    "checkpoint_metadata_fingerprint"
+                ),
+                "checkpoint_models_sha256": checkpoint_provenance.get(
+                    "checkpoint_models_sha256"
+                ),
+                "checkpoint_artifact_fingerprint": checkpoint_provenance.get(
+                    "checkpoint_artifact_fingerprint"
                 ),
             }
             for artifact in trajectory_artifacts

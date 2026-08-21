@@ -108,6 +108,12 @@ class PaperMethodSmokeTest(unittest.TestCase):
                 self.assertTrue(all(evaluation["evaluation_invariants"].values()))
                 self.assertEqual(evaluation["movement_agent_kind"], method.agent)
                 self.assertEqual(evaluation["routing_agent_kind"], method.routing)
+                for field in (
+                    "checkpoint_metadata_fingerprint",
+                    "checkpoint_models_sha256",
+                    "checkpoint_artifact_fingerprint",
+                ):
+                    self.assertEqual(len(evaluation["run_metadata"][field]), 64)
                 if method.routing == "random":
                     artifact = evaluation["trajectory_artifacts"][0]
                     self.assertEqual(artifact["requested_times_seconds"], [1.0])
@@ -127,6 +133,14 @@ class PaperMethodSmokeTest(unittest.TestCase):
                     self.assertIn("sensing_coverage", artifact["snapshots"][0])
                     self.assertIn("ground_targets", artifact)
                     self.assertIn("initial_sr_teams", artifact)
+                    for field in (
+                        "checkpoint_metadata_fingerprint",
+                        "checkpoint_models_sha256",
+                        "checkpoint_artifact_fingerprint",
+                    ):
+                        self.assertEqual(
+                            artifact[field], evaluation["run_metadata"][field]
+                        )
 
 
 if __name__ == "__main__":

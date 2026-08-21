@@ -5,6 +5,7 @@ from pathlib import Path
 import re
 import shutil
 import uuid
+import zipfile
 
 import numpy as np
 import torch
@@ -118,6 +119,123 @@ def calibration_fingerprint(calibration):
 
 def checkpoint_metadata_fingerprint(metadata):
     return calibration_fingerprint(metadata)
+
+
+CHECKPOINT_ARTIFACT_FINGERPRINT_SCHEMA = "uav-hrl-checkpoint-artifact-v1"
+CHECKPOINT_HASH_CHUNK_BYTES = 1024 * 1024
+CHECKPOINT_PROVENANCE_FIELDS = (
+    "checkpoint_metadata_fingerprint",
+    "checkpoint_models_sha256",
+    "checkpoint_artifact_fingerprint",
+)
+
+
+def _checkpoint_models_path(checkpoint_or_models_path):
+    path = Path(checkpoint_or_models_path).resolve()
+    return path if path.name == "models.pt" else path / "models.pt"
+
+
+def checkpoint_models_sha256(checkpoint_or_models_path, *, chunk_bytes=None):
+    """Hash a structurally valid torch-save ZIP without loading its weights."""
+
+    models_path = _checkpoint_models_path(checkpoint_or_models_path)
+    chunk_bytes = int(chunk_bytes or CHECKPOINT_HASH_CHUNK_BYTES)
+    if chunk_bytes <= 0:
+        raise ValueError("checkpoint hash chunk size must be positive")
+    try:
+        size = models_path.stat().st_size
+    except OSError as exc:
+        raise FileNotFoundError(
+            f"checkpoint model payload is missing or unreadable: {models_path}"
+        ) from exc
+    if size <= 0:
+        raise RuntimeError(f"checkpoint model payload is empty: {models_path}")
+    try:
+        with zipfile.ZipFile(models_path, "r") as archive:
+            names = tuple(
+                info.filename for info in archive.infolist() if not info.is_dir()
+            )
+            if not names:
+                raise RuntimeError(
+                    f"checkpoint model payload contains no records: {models_path}"
+                )
+            required_suffixes = ("data.pkl", "version")
+            missing = [
+                suffix
+                for suffix in required_suffixes
+                if not any(
+                    name == suffix or name.endswith(f"/{suffix}") for name in names
+                )
+            ]
+            if missing:
+                raise RuntimeError(
+                    "checkpoint model payload is not a canonical torch-save archive: "
+                    f"path={models_path}, missing={missing}"
+                )
+            corrupt_record = archive.testzip()
+            if corrupt_record is not None:
+                raise RuntimeError(
+                    "checkpoint model payload is truncated or corrupt: "
+                    f"path={models_path}, record={corrupt_record}"
+                )
+    except (zipfile.BadZipFile, EOFError, OSError) as exc:
+        raise RuntimeError(
+            f"checkpoint model payload is truncated, corrupt, or unreadable: {models_path}"
+        ) from exc
+    digest = hashlib.sha256()
+    try:
+        with models_path.open("rb") as handle:
+            while True:
+                chunk = handle.read(chunk_bytes)
+                if not chunk:
+                    break
+                digest.update(chunk)
+    except OSError as exc:
+        raise RuntimeError(
+            f"checkpoint model payload became unreadable while hashing: {models_path}"
+        ) from exc
+    return digest.hexdigest()
+
+
+def checkpoint_artifact_fingerprint(metadata_fingerprint, models_sha256):
+    """Bind canonical metadata and model bytes using a versioned JSON identity."""
+
+    values = {
+        "schema": CHECKPOINT_ARTIFACT_FINGERPRINT_SCHEMA,
+        "checkpoint_metadata_fingerprint": str(metadata_fingerprint),
+        "checkpoint_models_sha256": str(models_sha256),
+    }
+    for field in (
+        "checkpoint_metadata_fingerprint",
+        "checkpoint_models_sha256",
+    ):
+        value = values[field]
+        if len(value) != 64 or any(char not in "0123456789abcdef" for char in value):
+            raise ValueError(f"{field} must be a lowercase SHA-256 digest")
+    return calibration_fingerprint(values)
+
+
+def checkpoint_artifact_provenance(checkpoint_dir, *, metadata=None):
+    """Recompute paper provenance from the actual checkpoint artifacts."""
+
+    checkpoint_dir = Path(checkpoint_dir).resolve()
+    if metadata is None:
+        metadata_path = checkpoint_dir / "metadata.json"
+        try:
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        except (FileNotFoundError, OSError, json.JSONDecodeError) as exc:
+            raise RuntimeError(
+                f"checkpoint metadata is missing, unreadable, or invalid: {metadata_path}"
+            ) from exc
+    metadata_fingerprint = checkpoint_metadata_fingerprint(metadata)
+    models_sha256 = checkpoint_models_sha256(checkpoint_dir)
+    return {
+        "checkpoint_metadata_fingerprint": metadata_fingerprint,
+        "checkpoint_models_sha256": models_sha256,
+        "checkpoint_artifact_fingerprint": checkpoint_artifact_fingerprint(
+            metadata_fingerprint, models_sha256
+        ),
+    }
 
 
 def checkpoint_episode_schedule(total_episodes, every):

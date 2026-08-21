@@ -10,7 +10,7 @@ Git history source: commit
 `57f6621d248e2917b6a577d872d6c19d298ed006`, `HRL_task_aware.py`, the inline
 Episodes--Reward plotting block. The production base audited for this change is
 `feature/centralized-td3` at
-`d07521d6bae8c28c67d0dd668cc6511d76d4fd82`.
+`465c4690aabf650dce472943f98d429ecd281a58`.
 
 ## Google Drive sources
 
@@ -59,12 +59,25 @@ machine-readable in `paper_figure_registry.py`.
 - Violation probability uses `sum(violation packets) / sum(generated packets)`.
 - Per-episode values, pooled numerators/denominators, aggregate values, and
   missing flags are persisted together.
+- Every non-trajectory point has exactly five rows: EE with no task type, FOV
+  and COM delay, and FOV and COM violation probability. Before any
+  figure-specific filtering, the builder validates that exact Cartesian set
+  and cross-checks top-level rows, point-level rows, and a fresh recomputation
+  from each point's per-episode JSONL through the shared `paper_metrics.py`
+  implementation. Missing, duplicate, extra, numerically inconsistent, or
+  semantically invalid rows fail closed.
 - Every learned method requires the formal `ep_2500` checkpoint. The
   `kkm_random_action_random_routing` baseline learns neither component, creates
   no `models.pt`, and records `checkpoint_required=false`.
 - Figure builds inspect the actual `metadata.json` and `models.pt` without
-  loading weights, recompute the canonical metadata fingerprint, and compare it
-  with top-level, point-level, trajectory, and resolved-spec provenance.
+  loading weights. They retain the canonical metadata fingerprint, stream a
+  SHA-256 over the structurally valid `models.pt`, and compute a versioned
+  combined artifact fingerprint over those two hashes. All three are compared
+  with top-level, point-level, per-point run metadata, trajectory,
+  resolved-spec, method-map, and final-figure provenance. Pure-random methods
+  require all checkpoint fields to be null. Existing training checkpoint
+  metadata and resume behavior are unchanged; evaluations derive the two new
+  hashes from the existing payload.
 - Every point reloads its actual `scenario_manifest.json` through
   `ScenarioManifest.load()`, verifies the canonical hash, scenario IDs,
   episode count, 60-second horizon, seeds, 16 UAV entries, fixed-RoI content,
@@ -72,3 +85,12 @@ machine-readable in `paper_figure_registry.py`.
 - Deprecated `fig*` names exist only as internal compatibility aliases. CLI
   choices, metadata, directories, and filenames use semantic names. Family
   aliases expand to standalone outputs and never render a composite.
+- Each trajectory source JSON is a self-contained
+  `uav-hrl-standalone-trajectory-v1` scene: all 16 UAV snapshots, assignments
+  and time-truncated paths; every SR snapshot/path; GS, targets, links,
+  coverage geometry; actual time/phase; complete provenance; and the camera,
+  axes, labels, and style contract. The companion long-form CSV distinguishes
+  path, snapshot, target, station, link, and coverage records. The standalone
+  JSON can redraw the figure after the original evaluation trajectory artifact
+  is unavailable, while preserving actual-time titles and the legacy `VS`
+  display name for FOV.

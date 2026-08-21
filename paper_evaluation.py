@@ -5,7 +5,6 @@ from __future__ import annotations
 import csv
 from datetime import datetime, timezone
 import json
-import math
 from pathlib import Path
 import subprocess
 
@@ -20,8 +19,13 @@ from experiment_config import (
 from HRL_task_aware import TrainingConfig, train
 from Packet_scheduler_v1 import TASK_DEADLINE_SECONDS
 from paper_figure_registry import FIGURE_REGISTRY, PAPER_METHOD_MAPPINGS
-from paper_figures import normalize_episode_ee, paper_energy_efficiency
+from paper_metrics import (
+    aggregate_paper_point_metrics,
+    normalize_episode_ee,
+    validate_canonical_aggregate_rows,
+)
 from scenario_manifest import ScenarioManifest, generate_manifest
+from training_checkpoint import CHECKPOINT_PROVENANCE_FIELDS
 
 
 TRAJECTORY_SNAPSHOT_SECONDS = (5.0, 10.0, 15.0, 25.0)
@@ -164,86 +168,6 @@ def evaluation_sweep_points(suite):
             for num_gt in FIXED_ROI_VALUES
         )
     raise RuntimeError(f"unsupported paper suite kind: {kind}")
-
-
-def aggregate_paper_point_metrics(method_id, suite, point, episode_rows):
-    """Pool packet-level numerators and denominators across episodes."""
-
-    rows = list(episode_rows)
-    if not rows:
-        raise ValueError("paper evaluation point has no episode rows")
-    suite = resolve_evaluation_suite(suite)
-    common = {
-        "semantic_suite": suite,
-        "method_id": str(method_id),
-        "point_id": str(point["point_id"]),
-        "x_value": point.get("x_value"),
-        "x_unit": point.get("x_unit"),
-        "fixed_num_gt": point.get("fixed_num_gt"),
-        "swept_task": point.get("swept_task"),
-        "evaluation_episode_count": len(rows),
-    }
-    timely_mbits = sum(float(row["timely_goodput_mbits"]) for row in rows)
-    mobility_joules = sum(float(row["total_mobility_energy_j"]) for row in rows)
-    result = [
-        {
-            **common,
-            "metric": "energy_efficiency_mbit_per_j",
-            "task_type": None,
-            "display_task_type": None,
-            "numerator": timely_mbits,
-            "numerator_unit": "Mbit",
-            "denominator": mobility_joules,
-            "denominator_unit": "J",
-            "value": paper_energy_efficiency(timely_mbits, mobility_joules),
-            "value_unit": "Mbit/J",
-            "missing": False,
-        }
-    ]
-    for task_type in ("FOV", "COM"):
-        prefix = task_type.lower()
-        delivered = sum(int(row[f"{prefix}_delivered_packets"]) for row in rows)
-        delay_sum = sum(
-            float(row[f"{prefix}_delivered_e2e_delay_sum_seconds"])
-            for row in rows
-        )
-        generated = sum(int(row[f"{prefix}_generated_packets"]) for row in rows)
-        violations = sum(int(row[f"{prefix}_violation_packets"]) for row in rows)
-        result.extend(
-            (
-                {
-                    **common,
-                    "metric": "average_e2e_delay_seconds",
-                    "task_type": task_type,
-                    "display_task_type": "VS" if task_type == "FOV" else "COM",
-                    "numerator": delay_sum,
-                    "numerator_unit": "seconds",
-                    "denominator": delivered,
-                    "denominator_unit": "delivered_packets",
-                    "value": delay_sum / delivered if delivered else None,
-                    "value_unit": "seconds",
-                    "missing": delivered == 0,
-                },
-                {
-                    **common,
-                    "metric": "violation_probability",
-                    "task_type": task_type,
-                    "display_task_type": "VS" if task_type == "FOV" else "COM",
-                    "numerator": violations,
-                    "numerator_unit": "violation_packets",
-                    "denominator": generated,
-                    "denominator_unit": "generated_packets",
-                    "value": violations / generated if generated else None,
-                    "value_unit": "probability",
-                    "missing": generated == 0,
-                },
-            )
-        )
-    for row in result:
-        value = row["value"]
-        if value is not None and not math.isfinite(float(value)):
-            raise ValueError(f"non-finite pooled paper metric: {row}")
-    return result
 
 
 def _read_json(path):
@@ -499,6 +423,9 @@ def run_paper_evaluation(
         aggregates = aggregate_paper_point_metrics(
             method.method_id, suite, point, result["episode_metrics"]
         )
+        validate_canonical_aggregate_rows(
+            aggregates, method.method_id, point["point_id"]
+        )
         _write_json(point_dir / "aggregated_plot_data.json", aggregates)
         _write_csv(point_dir / "aggregated_plot_data.csv", aggregates)
         all_aggregates.extend(aggregates)
@@ -523,9 +450,10 @@ def run_paper_evaluation(
                 "checkpoint_path": (
                     str(context["checkpoint"]) if checkpoint_required else None
                 ),
-                "checkpoint_metadata_fingerprint": result["run_metadata"].get(
-                    "checkpoint_metadata_fingerprint"
-                ),
+                **{
+                    field: result["run_metadata"].get(field)
+                    for field in CHECKPOINT_PROVENANCE_FIELDS
+                },
                 "output_directory": str(point_dir.resolve()),
                 "outputs": {key: str(value) for key, value in outputs.items()},
                 "aggregated_plot_data": str(
@@ -543,11 +471,10 @@ def run_paper_evaluation(
         "checkpoint_required": checkpoint_required,
         "checkpoint_path": str(context["checkpoint"]) if context["checkpoint"] else None,
         "checkpoint_episode": FORMAL_CHECKPOINT_EPISODE if checkpoint_required else None,
-        "checkpoint_metadata_fingerprint": (
-            point_results[0]["checkpoint_metadata_fingerprint"]
-            if point_results
-            else None
-        ),
+        **{
+            field: point_results[0].get(field) if point_results else None
+            for field in CHECKPOINT_PROVENANCE_FIELDS
+        },
         "formal_training_config": context["expected_training_config"],
         "no_checkpoint_reason": (
             None
