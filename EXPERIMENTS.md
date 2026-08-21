@@ -14,9 +14,23 @@ python -X utf8 run_experiment.py ddpg_ratio --smoke
 ```
 
 Each invocation creates a new leaf such as
-`results/td3_dinkelbach/20260821T074815213819Z_seed20260817_e354dbd/`.
+`results/td3_dinkelbach/run-seed20260817-e354dbd-<unique-id>/`.
 The scenario manifest, resolved config, per-episode CSV/JSONL history, metadata,
 and checkpoints stay below that leaf. Existing run leaves are never reused.
+
+The same simple runner infers method, seed, reward, agent, task-potential flag,
+manifest, and formal configuration from an existing run:
+
+```powershell
+python -X utf8 run_experiment.py resume results/<method>/<run-id>
+python -X utf8 run_experiment.py evaluate results/<method>/<run-id>
+```
+
+Evaluation defaults to the formal `ep_2500` checkpoint. Each invocation creates
+`<run>/evaluation/ep_2500/<unique-eval-id>/`; results, metadata, its evaluation
+manifest, and plots never overwrite a prior evaluation. `--smoke` explicitly
+marks a non-formal evaluation and may be combined with
+`--checkpoint-episode N` for lifecycle checks.
 
 `comparison_experiment.py` remains available for manifest-driven evaluation,
 design-dataset collection, aggregation, and exact-resume workflows.
@@ -31,6 +45,10 @@ design-dataset collection, aggregation, and exact-resume workflows.
 - formal model checkpoint `ep_2500`
 - TD3 noise, DDQN epsilon, and DDQN logits noise disabled in evaluation
 - no network, optimizer, target-network, replay, or Dinkelbach update in evaluation
+- direct-ratio methods store zero objective reward on every non-terminal
+  movement transition and the single episode value
+  `sum(timely delivered Mbit) / sum(all-UAV mobility energy J)` on the terminal
+  transition; task-potential shaping remains transition-local
 - Dinkelbach lambda starts at `0.0` and is fixed within each non-overlapping
   50-episode outer block
 - after every complete block, lambda becomes
@@ -178,8 +196,11 @@ python -X utf8 comparison_experiment.py aggregate --input-dir runs/comparison/ev
 
 Exact-resume checkpoints validate the method fingerprint, training-manifest
 hash, training seed, the complete Dinkelbach block state, and its configuration.
-Checkpoint schema v2 is required; older checkpoints without the block state are
-explicitly incompatible. A partial block is persisted exactly and resumes with
+Checkpoint schema v3 stores the terminal direct-ratio objective in joint replay.
+Schema-v2 Dinkelbach TD3/DDPG checkpoints remain loadable; schema-v2 ratio
+checkpoints are explicitly rejected because their per-transition `B/E` values
+cannot be migrated without episode-boundary information. A partial Dinkelbach
+block is persisted exactly and resumes with
 the same lambda, completed-episode count, numerator sum, denominator sum, block
 index, input-validity status, and successful-update count. An incomplete final
 block never triggers a forced update. Full-resume logging schema v1 separately
@@ -224,11 +245,13 @@ Aggregation writes `cross_seed_summary.csv`, JSON, and Student-t methodology in
 
 Every canonical training run writes canonical `training_history.jsonl`, its
 derived tabular projection `training_history.csv`, and
-`training_history_commit.json`. They contain one identical, finite row per
-completed episode with method/seed/training-manifest identity, reward, timely
-goodput, mobility energy, per-episode EE, the lambda used during that episode,
-the lambda after the episode, whether an update occurred, update status, block
-index/position, and the block numerator/denominator sums so far. Boundary rows
+`training_history_commit.json`. They contain one identical row per completed
+episode with method/seed/training-manifest identity, finite reward, timely
+goodput, mobility energy, and per-episode EE. Dinkelbach methods also record the
+finite lambda used during that episode, the lambda after the episode, whether
+an update occurred, update status, block index/position, and the block
+numerator/denominator sums so far. Direct-ratio methods store those inapplicable
+Dinkelbach fields as null rather than a fake lambda of zero. Boundary rows
 record the completed block's sums and resulting lambda; the following episode
 uses that new value. Invalid or non-finite block input, or a non-positive
 denominator, records an explicit status and preserves the old finite lambda

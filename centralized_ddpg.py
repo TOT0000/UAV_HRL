@@ -40,6 +40,10 @@ class CentralizedDDPG:
         self.max_action = float(max_action)
         self.gamma = float(gamma)
         self.tau = float(tau)
+        self.policy_delay = 1
+        self.target_policy_noise = None
+        self.target_noise_clip = None
+        self.twin_critics = False
         self.num_critic_update_iteration = 0
         self.num_actor_update_iteration = 0
         self.num_training = 0
@@ -148,5 +152,9 @@ class RandomMovementController:
 
     def __init__(self, gamma=1.0):
         self.gamma = float(gamma)
+        self.policy_delay = None
+        self.target_policy_noise = None
+        self.target_noise_clip = None
+        self.twin_critics = False
 
     decode_action = staticmethod(CentralizedDDPG.decode_action)

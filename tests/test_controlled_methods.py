@@ -1,4 +1,4 @@
-from dataclasses import asdict
+import json
 from pathlib import Path
 import tempfile
 import unittest
@@ -17,6 +17,8 @@ from experiment_config import (
     NUM_UAV,
     ROI_COUNT_MAX,
     ROI_COUNT_MIN,
+    effective_training_config,
+    movement_agent_configuration,
 )
 from HRL_task_aware import (
     ROUTING_STATE_DIM,
@@ -32,6 +34,7 @@ from Simulator import Simulator
 from training_checkpoint import (
     load_full_resume_checkpoint,
     save_full_resume_checkpoint,
+    validate_model_checkpoint_metadata,
 )
 from utils_update_v2 import ReplayBufferDiscrete, ReplayBufferJoint
 
@@ -147,16 +150,90 @@ class ControlledRewardTest(unittest.TestCase):
         first = _interval_reward(
             4.0, 2.0, 0.0, 1.0, self.potential_t, self.potential_t1,
             False, self.config, reward_mode="ratio", task_potential_enabled=False,
+            ratio_objective_reward=0.0,
         )
         second = _interval_reward(
             4.0, 2.0, 999.0, 1.0, self.potential_t, self.potential_t1,
-            False, self.config, reward_mode="ratio", task_potential_enabled=False,
+            True, self.config, reward_mode="ratio", task_potential_enabled=False,
+            ratio_objective_reward=2.5,
         )
         zero_energy = _interval_reward(
             4.0, 0.0, 999.0, 1.0, self.potential_t, self.potential_t1,
-            False, self.config, reward_mode="ratio", task_potential_enabled=False,
+            True, self.config, reward_mode="ratio", task_potential_enabled=False,
+            ratio_objective_reward=0.0,
         )
-        self.assertEqual((first, second, zero_energy), (2.0, 2.0, 0.0))
+        self.assertEqual((first, second, zero_energy), (0.0, 2.5, 0.0))
+
+    def test_ratio_of_episode_sums_is_stored_only_on_terminal_transition(self):
+        replay = ReplayBufferJoint(1, 1, max_size=4)
+        transitions = (
+            (1.0, 1.0, False, 0.0, 1.25, 0.0),
+            (9.0, 3.0, True, 2.5, -0.75, 0.0),
+        )
+        for delivered, energy, done, objective, phi_t, phi_t1 in transitions:
+            replay.add(
+                [0.0], [0.0], [0.0], done=done,
+                delivered_mbits=delivered,
+                total_mobility_energy=energy,
+                ratio_objective_reward=objective,
+                phi_search_t=phi_t,
+                phi_search_t1=phi_t1,
+                phi_vs_t=0.0, phi_vs_t1=0.0,
+                phi_com_t=0.0, phi_com_t1=0.0,
+            )
+        unshaped = replay._reward_numpy(
+            np.asarray([0, 1]), current_lambda=0.0, gamma=1.0,
+            reward_mode="ratio", task_potential_enabled=False,
+        ).ravel()
+        self.assertTrue(np.allclose(unshaped, [0.0, 2.5]))
+        self.assertAlmostEqual(float(unshaped.sum()), 2.5)
+        self.assertNotAlmostEqual(float(unshaped.sum()), 1.0 / 1.0 + 9.0 / 3.0)
+
+        shaped = replay._reward_numpy(
+            np.asarray([0, 1]), current_lambda=999.0, gamma=1.0,
+            reward_mode="ratio", task_potential_enabled=True,
+        ).ravel()
+        self.assertTrue(np.allclose(shaped, [-1.25, 3.25]))
+        same_ratio = replay._reward_numpy(
+            np.asarray([0, 1]), current_lambda=-123.0, gamma=1.0,
+            reward_mode="ratio", task_potential_enabled=False,
+        ).ravel()
+        self.assertTrue(np.array_equal(unshaped, same_ratio))
+
+        dinkelbach = replay._reward_numpy(
+            np.asarray([0, 1]), current_lambda=2.0, gamma=1.0,
+            reward_mode="dinkelbach", task_potential_enabled=False,
+        ).ravel()
+        self.assertTrue(np.allclose(dinkelbach, [-1.0, 3.0]))
+
+
+class EffectiveMovementConfigurationTest(unittest.TestCase):
+    def test_effective_algorithm_settings_are_method_specific(self):
+        expected = {
+            "td3_dinkelbach": (2, 0.20, 0.50, True),
+            "ddpg_dinkelbach": (1, None, None, False),
+            "random_action": (None, None, None, False),
+        }
+        for method_key, values in expected.items():
+            with self.subTest(method=method_key):
+                method = MethodSpec.parse(method_key)
+                effective = movement_agent_configuration(method)
+                self.assertEqual(
+                    (
+                        effective["policy_delay"],
+                        effective["target_policy_noise"],
+                        effective["target_noise_clip"],
+                        effective["twin_critics"],
+                    ),
+                    values,
+                )
+                serialized = effective_training_config(
+                    formal_training_config(1), method
+                )
+                self.assertEqual(serialized["policy_delay"], values[0])
+                self.assertEqual(
+                    serialized["movement_agent_configuration"], effective
+                )
 
 
 class ControlledDDPGCheckpointTest(unittest.TestCase):
@@ -177,10 +254,24 @@ class ControlledDDPGCheckpointTest(unittest.TestCase):
 
     def test_ddpg_full_checkpoint_round_trip_has_no_second_critic(self):
         config = formal_training_config(1, enable_plots=False, enable_csv=False)
-        formal_config = asdict(config)
+        formal_config = effective_training_config(
+            config, MethodSpec.parse("ddpg_dinkelbach")
+        )
         agent = self._agent()
         ddqn = DDQN(ROUTING_STATE_DIM, NUM_UAV + 1)
         joint = ReplayBufferJoint(MOVEMENT_STATE_DIM, JOINT_ACTION_DIM, max_size=8)
+        joint.add(
+            np.zeros(MOVEMENT_STATE_DIM),
+            np.zeros(JOINT_ACTION_DIM),
+            np.zeros(MOVEMENT_STATE_DIM),
+            done=True,
+            delivered_mbits=10.0,
+            total_mobility_energy=4.0,
+            phi_search_t=0.0, phi_search_t1=0.0,
+            phi_vs_t=0.0, phi_vs_t1=0.0,
+            phi_com_t=0.0, phi_com_t1=0.0,
+            ratio_objective_reward=2.5,
+        )
         routing = ReplayBufferDiscrete(
             ROUTING_STATE_DIM, NUM_UAV + 1, max_size=8, n_step=1, gamma=0.99
         )
@@ -221,8 +312,14 @@ class ControlledDDPGCheckpointTest(unittest.TestCase):
             payload = torch.load(
                 checkpoint / "training_state.pt", map_location="cpu", weights_only=False
             )
+            metadata = json.loads(
+                (checkpoint / "metadata.json").read_text(encoding="utf-8")
+            )
             self.assertEqual(payload["networks"]["movement_agent"]["kind"], "ddpg")
             self.assertNotIn("critic_2", payload["networks"]["movement_agent"])
+            self.assertNotIn("centralized_td3_gamma", metadata)
+            self.assertEqual(metadata["movement_agent_kind"], "ddpg")
+            self.assertEqual(metadata["movement_agent_gamma"], 1.0)
 
             restored = self._agent()
             restored_ddqn = DDQN(ROUTING_STATE_DIM, NUM_UAV + 1)
@@ -241,6 +338,20 @@ class ControlledDDPGCheckpointTest(unittest.TestCase):
             )
         for key, expected in expected_actor.items():
             self.assertTrue(torch.equal(restored.actor.state_dict()[key].cpu(), expected))
+        self.assertEqual(restored_joint.ratio_objective_reward[0, 0], 2.5)
+
+    def test_legacy_ratio_checkpoint_is_rejected_without_fake_migration(self):
+        legacy = {
+            "checkpoint_schema_version": 2,
+            "checkpoint_type": "model-only",
+            "experiment": {"reward_mode": "ratio"},
+        }
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "legacy ratio checkpoint uses per-transition B/E and cannot be resumed "
+            "under the terminal ratio-of-sums reward contract",
+        ):
+            validate_model_checkpoint_metadata(legacy)
 
 
 class UniqueRunDirectoryTest(unittest.TestCase):

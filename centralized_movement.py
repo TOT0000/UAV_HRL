@@ -100,7 +100,7 @@ def movement_state_feature_schema():
         (
             ("global_coverage", "mean of boolean visited bitmap"),
             ("found_gt_ratio", "found GT count / current GT count"),
-            ("num_gt", "clip(current GT count / 10, 0, 1)"),
+            ("num_gt", f"clip(current GT count / {GT_COUNT_MAX}, 0, 1)"),
             ("remaining_time", "remaining movement intervals / episode duration"),
         )
     ):

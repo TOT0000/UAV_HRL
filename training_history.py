@@ -54,7 +54,7 @@ BOOLEAN_COLUMNS = ("dinkelbach_lambda_updated",)
 
 STRING_COLUMNS = ("dinkelbach_update_status",)
 
-TRAINING_HISTORY_SCHEMA_VERSION = 2
+TRAINING_HISTORY_SCHEMA_VERSION = 3
 TRAINING_HISTORY_CSV = "training_history.csv"
 TRAINING_HISTORY_JSONL = "training_history.jsonl"
 TRAINING_HISTORY_COMMIT = "training_history_commit.json"
@@ -108,22 +108,16 @@ def build_training_history_row(
         "energy_efficiency_mbit_per_j": safe_energy_efficiency(
             timely_goodput_mbits, mobility_energy_j
         ),
-        "dinkelbach_lambda_used": float(dinkelbach_lambda_used),
-        "dinkelbach_lambda_after_episode": float(
-            dinkelbach_lambda_after_episode
-        ),
+        "dinkelbach_lambda_used": dinkelbach_lambda_used,
+        "dinkelbach_lambda_after_episode": dinkelbach_lambda_after_episode,
         "dinkelbach_lambda_updated": _normalize_bool(
             dinkelbach_lambda_updated
         ),
         "dinkelbach_update_status": str(dinkelbach_update_status),
-        "dinkelbach_block_index": int(dinkelbach_block_index),
-        "dinkelbach_block_episode": int(dinkelbach_block_episode),
-        "dinkelbach_block_timely_mbits_so_far": float(
-            dinkelbach_block_timely_mbits_so_far
-        ),
-        "dinkelbach_block_energy_joules_so_far": float(
-            dinkelbach_block_energy_joules_so_far
-        ),
+        "dinkelbach_block_index": dinkelbach_block_index,
+        "dinkelbach_block_episode": dinkelbach_block_episode,
+        "dinkelbach_block_timely_mbits_so_far": dinkelbach_block_timely_mbits_so_far,
+        "dinkelbach_block_energy_joules_so_far": dinkelbach_block_energy_joules_so_far,
     }
     return normalize_training_history_row(row)
 
@@ -138,8 +132,34 @@ def normalize_training_history_row(row):
         "training_manifest_hash": str(row["training_manifest_hash"]),
         "episode": int(row["episode"]),
     }
-    normalized.update({column: float(row[column]) for column in FLOAT_COLUMNS})
-    normalized.update({column: int(row[column]) for column in INTEGER_COLUMNS})
+    nullable = {
+        "dinkelbach_lambda_used",
+        "dinkelbach_lambda_after_episode",
+        "dinkelbach_block_index",
+        "dinkelbach_block_episode",
+        "dinkelbach_block_timely_mbits_so_far",
+        "dinkelbach_block_energy_joules_so_far",
+    }
+    normalized.update(
+        {
+            column: (
+                None
+                if column in nullable and row[column] in (None, "")
+                else float(row[column])
+            )
+            for column in FLOAT_COLUMNS
+        }
+    )
+    normalized.update(
+        {
+            column: (
+                None
+                if column in nullable and row[column] in (None, "")
+                else int(row[column])
+            )
+            for column in INTEGER_COLUMNS
+        }
+    )
     normalized.update(
         {column: _normalize_bool(row[column]) for column in BOOLEAN_COLUMNS}
     )
@@ -175,11 +195,11 @@ def validate_training_history(rows, identity):
                     f"row={row[key]}, expected={expected}"
                 )
         for column in FLOAT_COLUMNS:
-            if not math.isfinite(row[column]):
+            if row[column] is not None and not math.isfinite(row[column]):
                 raise ValueError(f"training history {column} must be finite")
-        if row["dinkelbach_block_index"] <= 0:
+        if row["dinkelbach_block_index"] is not None and row["dinkelbach_block_index"] <= 0:
             raise ValueError("training history Dinkelbach block index must be positive")
-        if row["dinkelbach_block_episode"] <= 0:
+        if row["dinkelbach_block_episode"] is not None and row["dinkelbach_block_episode"] <= 0:
             raise ValueError("training history Dinkelbach block episode must be positive")
         if not row["dinkelbach_update_status"]:
             raise ValueError("training history Dinkelbach status must be non-empty")
@@ -307,7 +327,7 @@ def _history_paths(run_directory):
 
 
 def _validate_commit_identity(commit, identity):
-    if commit.get("schema_version") != TRAINING_HISTORY_SCHEMA_VERSION:
+    if commit.get("schema_version") not in {2, TRAINING_HISTORY_SCHEMA_VERSION}:
         raise TrainingHistoryConsistencyError(
             "training history commit schema is incompatible"
         )

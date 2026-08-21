@@ -1,7 +1,7 @@
 import argparse
 from collections import defaultdict
 import copy
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 import hashlib
 import os
 import random
@@ -49,6 +49,8 @@ from experiment_config import (
     NUM_UAV,
     ROI_COUNT_MAX,
     ROI_COUNT_MIN,
+    effective_training_config,
+    movement_agent_configuration,
 )
 from movement_agents import create_movement_agent
 from training_checkpoint import (
@@ -424,6 +426,7 @@ def _interval_reward(
     config,
     reward_mode="dinkelbach",
     task_potential_enabled=True,
+    ratio_objective_reward=0.0,
 ):
     next_values = (0.0, 0.0, 0.0) if done else potentials_t1
     shaping = float(bool(task_potential_enabled)) * (
@@ -434,7 +437,9 @@ def _interval_reward(
     if reward_mode == "dinkelbach":
         objective = float(delivered_mbits) - float(current_lambda) * float(energy)
     elif reward_mode == "ratio":
-        objective = safe_energy_efficiency(delivered_mbits, energy)
+        objective = float(ratio_objective_reward)
+        if not np.isfinite(objective):
+            objective = 0.0
     else:
         raise ValueError(f"unsupported reward mode: {reward_mode}")
     return float(objective + shaping)
@@ -466,14 +471,14 @@ def _inactive_dinkelbach_event(episode):
     """Compatibility row for the legacy history schema; never updates lambda."""
 
     return {
-        "dinkelbach_lambda_used": 0.0,
-        "dinkelbach_lambda_after_episode": 0.0,
+        "dinkelbach_lambda_used": None,
+        "dinkelbach_lambda_after_episode": None,
         "dinkelbach_lambda_updated": False,
         "dinkelbach_update_status": "disabled_for_reward_mode",
-        "dinkelbach_block_index": int(episode) + 1,
-        "dinkelbach_block_episode": 1,
-        "dinkelbach_block_timely_mbits_so_far": 0.0,
-        "dinkelbach_block_energy_joules_so_far": 0.0,
+        "dinkelbach_block_index": None,
+        "dinkelbach_block_episode": None,
+        "dinkelbach_block_timely_mbits_so_far": None,
+        "dinkelbach_block_energy_joules_so_far": None,
         "dinkelbach_block_completed": False,
     }
 
@@ -578,6 +583,7 @@ def _experiment_identity(method_spec, scenario_manifest, training_seed, config):
             int(training_seed) if training_seed is not None else None
         ),
         "movement_agent": method_spec.agent,
+        "movement_agent_configuration": movement_agent_configuration(method_spec),
         "reward_mode": method_spec.reward_mode,
         "task_potential_enabled": bool(method_spec.task_potential_enabled),
         **(
@@ -787,6 +793,7 @@ def train(
         for key, value in method_spec.to_dict().items()
         if key != "method_id"
     })
+    formal_config = effective_training_config(config, method_spec)
     if scenario_manifest is not None:
         if scenario_manifest.episode_count < config.total_episodes:
             raise ValueError(
@@ -948,7 +955,7 @@ def train(
                     else {}
                 ),
             },
-            expected_formal_config=asdict(config),
+            expected_formal_config=formal_config,
         )
         training_state = restored["training_state"]
         start_episode = int(training_state["next_episode_index"])
@@ -1180,6 +1187,13 @@ def train(
                 / config.episode_seconds,
             )
             terminal_joint_transitions += int(done)
+            episode_delivered_mbits += interval_delivered_mbits
+            episode_energy += interval_energy
+            ratio_objective_reward = (
+                safe_energy_efficiency(episode_delivered_mbits, episode_energy)
+                if method_spec.reward_mode == "ratio" and done
+                else 0.0
+            )
             if not evaluation and method_spec.learns_movement:
                 joint_replay.add(
                     state,
@@ -1188,6 +1202,7 @@ def train(
                     done=done,
                     delivered_mbits=interval_delivered_mbits,
                     total_mobility_energy=interval_energy,
+                    ratio_objective_reward=ratio_objective_reward,
                     phi_search_t=potentials_t[0],
                     phi_search_t1=potentials_t1[0],
                     phi_vs_t=potentials_t[1],
@@ -1197,8 +1212,6 @@ def train(
                 )
             global_transition_index = total_joint_transitions
             total_joint_transitions += 1
-            episode_delivered_mbits += interval_delivered_mbits
-            episode_energy += interval_energy
             interval_reward = _interval_reward(
                 interval_delivered_mbits,
                 interval_energy,
@@ -1210,6 +1223,7 @@ def train(
                 config,
                 reward_mode=method_spec.reward_mode,
                 task_potential_enabled=method_spec.task_potential_enabled,
+                ratio_objective_reward=ratio_objective_reward,
             )
             episode_reward += interval_reward
             if transition_observer is not None:
@@ -1225,6 +1239,7 @@ def train(
                         "not_done": 1.0 - float(done),
                         "delivered_mbits": interval_delivered_mbits,
                         "total_mobility_energy_j": interval_energy,
+                        "ratio_objective_reward": ratio_objective_reward,
                         "phi_search_t": potentials_t[0],
                         "phi_search_t1": effective_potentials_t1[0],
                         "phi_vs_t": potentials_t[1],
@@ -1453,7 +1468,7 @@ def train(
                         if method_spec.uses_dinkelbach
                         else {"active": False, "update_count": 0}
                     ),
-                    "formal_config": asdict(config),
+                    "formal_config": formal_config,
                 },
             )
         if (
@@ -1491,7 +1506,7 @@ def train(
                     training_history_rows=training_history_rows,
                     dinkelbach_active=method_spec.uses_dinkelbach,
                 ),
-                formal_config=asdict(config),
+                formal_config=formal_config,
                 movement_state_dim=MOVEMENT_STATE_DIM,
                 joint_action_dim=JOINT_ACTION_DIM,
                 routing_state_dim=ROUTING_STATE_DIM,
@@ -1506,7 +1521,7 @@ def train(
                         if method_spec.uses_dinkelbach
                         else {"active": False, "update_count": 0}
                     ),
-                    "formal_config": asdict(config),
+                    "formal_config": formal_config,
                 },
                 keep_last=config.full_resume_keep_last,
             )
@@ -1598,8 +1613,14 @@ def train(
         "routing_state_dim": ROUTING_STATE_DIM,
         "movement_state_dim": MOVEMENT_STATE_DIM,
         "joint_action_dim": JOINT_ACTION_DIM,
-        "centralized_td3_gamma": movement_agent.gamma,
         "movement_agent_kind": movement_agent.agent_kind,
+        "movement_agent_gamma": movement_agent.gamma,
+        "movement_agent_configuration": movement_agent_configuration(method_spec),
+        **(
+            {"centralized_td3_gamma": movement_agent.gamma}
+            if movement_agent.agent_kind == "td3"
+            else {}
+        ),
         "routing_ddqn_gamma": ddqn.gamma,
         "joint_replay_size": joint_replay.size,
         "routing_replay_size": routing_replay.size,
@@ -1642,7 +1663,7 @@ def train(
         "run_metadata": {
             **experiment_identity,
             **checkpoint_provenance,
-            "formal_config": asdict(config),
+            "formal_config": formal_config,
             "dinkelbach_config": (
                 dinkelbach_config_metadata(config)
                 if method_spec.uses_dinkelbach

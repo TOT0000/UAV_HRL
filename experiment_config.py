@@ -201,3 +201,30 @@ FORMAL_EXPERIMENT_DEFAULTS = {
         },
     },
 }
+
+
+def movement_agent_configuration(method_spec: MethodSpec) -> dict:
+    """Return the algorithm settings that the selected controller really uses."""
+
+    method_spec = MethodSpec.parse(method_spec.method_id)
+    common = FORMAL_EXPERIMENT_DEFAULTS["movement_hyperparameters"]
+    algorithm = common.get(method_spec.agent, {})
+    return {
+        "movement_agent_kind": method_spec.agent,
+        "movement_agent_gamma": common["gamma"],
+        "tau": common["tau"] if method_spec.learns_movement else None,
+        "policy_delay": algorithm.get("policy_delay"),
+        "target_policy_noise": algorithm.get("target_policy_noise"),
+        "target_noise_clip": algorithm.get("target_noise_clip"),
+        "twin_critics": bool(algorithm.get("twin_critics", False)),
+    }
+
+
+def effective_training_config(config, method_spec: MethodSpec) -> dict:
+    """Serialize formal config with method-specific movement settings resolved."""
+
+    values = asdict(config) if not isinstance(config, dict) else dict(config)
+    movement = movement_agent_configuration(method_spec)
+    values["policy_delay"] = movement["policy_delay"]
+    values["movement_agent_configuration"] = movement
+    return values

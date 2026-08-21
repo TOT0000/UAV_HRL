@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import csv
-from dataclasses import asdict
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -22,7 +21,11 @@ from centralized_movement import (
 )
 from com_capacity_calibration import load_com_capacity_reference
 from evaluation_metrics import EPISODE_COLUMNS, IDENTITY_COLUMNS, METRIC_COLUMNS
-from experiment_config import FORMAL_EXPERIMENT_DEFAULTS, MethodSpec
+from experiment_config import (
+    FORMAL_EXPERIMENT_DEFAULTS,
+    MethodSpec,
+    effective_training_config,
+)
 from experiment_paths import (
     design_run_directory,
     design_run_identity,
@@ -583,11 +586,12 @@ def design_dataset_preflight(args):
     episode_count = int(args.episodes)
     if episode_count <= 0 or manifest.episode_count < episode_count:
         raise ValueError("manifest has fewer entries than requested design episodes")
-    expected_training_config = asdict(
+    expected_training_config = effective_training_config(
         formal_training_config(
             FORMAL_EXPERIMENT_DEFAULTS["training_episodes_per_seed"],
             random_seed=args.training_seed,
-        )
+        ),
+        method,
     )
     _, calibration = load_com_capacity_reference()
     checkpoint = inspect_model_checkpoint(
@@ -607,6 +611,7 @@ def design_dataset_preflight(args):
         ],
         expected_formal_config=expected_training_config,
         require_episode_directory=True,
+        movement_agent_kind=method.agent,
     )
     checkpoint_fingerprint = checkpoint_metadata_fingerprint(
         checkpoint["metadata"]

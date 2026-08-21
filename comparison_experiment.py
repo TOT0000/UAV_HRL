@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import argparse
-from dataclasses import asdict, replace
+from dataclasses import replace
 from functools import partial
 import json
 from pathlib import Path
@@ -17,6 +17,7 @@ from experiment_config import (
     MethodSpec,
     ROI_COUNT_MAX,
     ROI_COUNT_MIN,
+    effective_training_config,
 )
 from experiment_paths import (
     prepare_run_directory,
@@ -232,8 +233,9 @@ def _training_preflight(args):
             ddqn_gamma=0.99,
             calibration=calibration,
             expected_experiment_metadata=expected_experiment,
-            expected_formal_config=asdict(config),
+            expected_formal_config=effective_training_config(config, method),
             require_episode_directory=True,
+            movement_agent_kind=method.agent,
         )
         inspect_model = partial(
             inspect_model_checkpoint,
@@ -244,8 +246,9 @@ def _training_preflight(args):
             ddqn_gamma=0.99,
             calibration=calibration,
             expected_experiment_metadata=expected_experiment,
-            expected_formal_config=asdict(config),
+            expected_formal_config=effective_training_config(config, method),
             require_episode_directory=True,
+            movement_agent_kind=method.agent,
         )
         reconciliation_plan = plan_resume_reconciliation(
             run_dir,

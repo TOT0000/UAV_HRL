@@ -15,7 +15,8 @@ from dinkelbach_blocks import (
     dinkelbach_config_metadata,
 )
 
-CHECKPOINT_SCHEMA_VERSION = 2
+CHECKPOINT_SCHEMA_VERSION = 3
+LEGACY_DINKELBACH_CHECKPOINT_SCHEMA_VERSION = 2
 MODEL_CHECKPOINT_TYPE = "model-only"
 FULL_CHECKPOINT_TYPE = "full-resume"
 FULL_RESUME_LOGGING_SCHEMA_VERSION = 1
@@ -29,7 +30,7 @@ FULL_RESUME_LOGGING_STATE_FIELDS = (
     "lambda_after_episode_log",
 )
 
-JOINT_REPLAY_FIELDS = (
+LEGACY_JOINT_REPLAY_FIELDS = (
     "state",
     "action",
     "next_state",
@@ -42,6 +43,10 @@ JOINT_REPLAY_FIELDS = (
     "phi_vs_t1",
     "phi_com_t",
     "phi_com_t1",
+)
+JOINT_REPLAY_FIELDS = (
+    *LEGACY_JOINT_REPLAY_FIELDS,
+    "ratio_objective_reward",
 )
 ROUTING_REPLAY_FIELDS = (
     "state",
@@ -150,6 +155,49 @@ def _agent_kind(agent):
     return str(getattr(agent, "agent_kind", "td3"))
 
 
+def _movement_agent_configuration(agent):
+    kind = _agent_kind(agent)
+    return {
+        "movement_agent_kind": kind,
+        "movement_agent_gamma": float(agent.gamma),
+        "tau": float(agent.tau) if hasattr(agent, "tau") else None,
+        "policy_delay": getattr(agent, "policy_delay", None),
+        "target_policy_noise": (
+            float(agent.policy_noise)
+            if kind == "td3"
+            else getattr(agent, "target_policy_noise", None)
+        ),
+        "target_noise_clip": (
+            float(agent.noise_clip)
+            if kind == "td3"
+            else getattr(agent, "target_noise_clip", None)
+        ),
+        "twin_critics": kind == "td3",
+    }
+
+
+def _validate_effective_formal_movement_config(formal_config, kind, metadata=None):
+    if not isinstance(formal_config, dict):
+        raise RuntimeError("checkpoint has no formal training configuration")
+    expected_delay = {"td3": 2, "ddpg": 1, "random": None}.get(kind)
+    if kind not in {"td3", "ddpg", "random"}:
+        raise RuntimeError(f"unsupported movement agent kind: {kind}")
+    if not _metadata_value_matches(formal_config.get("policy_delay"), expected_delay):
+        raise RuntimeError(
+            "checkpoint formal training config is incompatible with effective "
+            f"{kind} policy delay: checkpoint={formal_config.get('policy_delay')}, "
+            f"expected={expected_delay}"
+        )
+    nested = formal_config.get("movement_agent_configuration")
+    if nested is not None and metadata is not None:
+        actual = metadata.get("movement_agent_configuration")
+        if nested != actual:
+            raise RuntimeError(
+                "checkpoint formal movement-agent configuration is incompatible "
+                "with checkpoint metadata"
+            )
+
+
 def _movement_network_states(agent):
     kind = _agent_kind(agent)
     if kind == "td3":
@@ -233,6 +281,7 @@ def _base_metadata(
     calibration,
     experiment_metadata=None,
 ):
+    kind = _agent_kind(td3)
     metadata = {
         "checkpoint_schema_version": CHECKPOINT_SCHEMA_VERSION,
         "checkpoint_type": checkpoint_type,
@@ -240,12 +289,14 @@ def _base_metadata(
         "movement_state_dim": int(movement_state_dim),
         "joint_action_dim": int(joint_action_dim),
         "routing_state_dim": int(routing_state_dim),
-        "centralized_td3_gamma": float(td3.gamma),
-        "movement_agent_kind": _agent_kind(td3),
+        "movement_agent_kind": kind,
         "movement_agent_gamma": float(td3.gamma),
+        "movement_agent_configuration": _movement_agent_configuration(td3),
         "routing_ddqn_gamma": float(ddqn.gamma),
         "com_calibration_fingerprint": calibration_fingerprint(calibration),
     }
+    if kind == "td3":
+        metadata["centralized_td3_gamma"] = float(td3.gamma)
     if experiment_metadata is not None:
         metadata["experiment"] = dict(experiment_metadata)
     return metadata
@@ -275,6 +326,11 @@ def save_model_checkpoint(
         calibration,
         experiment_metadata,
     )
+    experiment = metadata.get("experiment") or {}
+    if "formal_config" in experiment:
+        _validate_effective_formal_movement_config(
+            experiment["formal_config"], _agent_kind(td3), metadata
+        )
     def write(temporary):
         torch.save(_network_states(td3, ddqn), temporary / "models.pt")
         (temporary / "metadata.json").write_text(
@@ -383,6 +439,70 @@ def _checkpoint_uses_dinkelbach(metadata):
     return method_spec.get("reward_mode", experiment.get("reward_mode", "dinkelbach")) == "dinkelbach"
 
 
+def _validate_checkpoint_schema(metadata):
+    schema = metadata.get("checkpoint_schema_version")
+    if schema == CHECKPOINT_SCHEMA_VERSION:
+        return int(schema)
+    try:
+        legacy_schema = schema is None or int(schema) < CHECKPOINT_SCHEMA_VERSION
+    except (TypeError, ValueError):
+        legacy_schema = False
+    if (
+        not _checkpoint_uses_dinkelbach(metadata)
+        and legacy_schema
+    ):
+        raise RuntimeError(
+            "legacy ratio checkpoint uses per-transition B/E and cannot be "
+            "resumed under the terminal ratio-of-sums reward contract"
+        )
+    if schema == LEGACY_DINKELBACH_CHECKPOINT_SCHEMA_VERSION:
+        return int(schema)
+    raise RuntimeError(
+        "checkpoint checkpoint_schema_version is incompatible: "
+        f"checkpoint={schema}, expected={CHECKPOINT_SCHEMA_VERSION}"
+    )
+
+
+def _formal_config_for_validation(metadata, actual_config, expected_config):
+    """Normalize only behaviorally irrelevant schema-2 DDPG policy-delay labels."""
+
+    if (
+        metadata.get("checkpoint_schema_version")
+        == LEGACY_DINKELBACH_CHECKPOINT_SCHEMA_VERSION
+        and metadata.get("movement_agent_kind", "td3") == "ddpg"
+        and isinstance(actual_config, dict)
+        and isinstance(expected_config, dict)
+    ):
+        actual_config = dict(actual_config)
+        actual_config["policy_delay"] = expected_config.get("policy_delay")
+    return actual_config
+
+
+def _movement_gamma_key(metadata, schema):
+    kind = metadata.get("movement_agent_kind", "td3")
+    if kind == "td3" and "centralized_td3_gamma" in metadata:
+        return "centralized_td3_gamma"
+    return (
+        "movement_agent_gamma"
+        if schema >= CHECKPOINT_SCHEMA_VERSION
+        else "centralized_td3_gamma"
+    )
+
+
+def _validate_td3_gamma_alias(metadata):
+    if metadata.get("movement_agent_kind", "td3") != "td3":
+        return
+    if "movement_agent_gamma" not in metadata or "centralized_td3_gamma" not in metadata:
+        return
+    if not _metadata_value_matches(
+        metadata["movement_agent_gamma"], metadata["centralized_td3_gamma"]
+    ):
+        raise RuntimeError(
+            "checkpoint centralized_td3_gamma is incompatible with "
+            "movement_agent_gamma"
+        )
+
+
 def validate_model_checkpoint_metadata(
     metadata,
     *,
@@ -399,15 +519,12 @@ def validate_model_checkpoint_metadata(
 ):
     """Validate evaluation provenance before any model payload is loaded."""
 
-    checks = {
-        "checkpoint_schema_version": CHECKPOINT_SCHEMA_VERSION,
-        "checkpoint_type": MODEL_CHECKPOINT_TYPE,
-    }
+    schema = _validate_checkpoint_schema(metadata)
+    checks = {"checkpoint_type": MODEL_CHECKPOINT_TYPE}
     optional_checks = {
         "movement_state_dim": movement_state_dim,
         "joint_action_dim": joint_action_dim,
         "routing_state_dim": routing_state_dim,
-        "centralized_td3_gamma": td3_gamma,
         "routing_ddqn_gamma": ddqn_gamma,
     }
     checks.update(
@@ -426,6 +543,15 @@ def validate_model_checkpoint_metadata(
             raise RuntimeError(
                 f"checkpoint {key} is incompatible: "
                 f"checkpoint={actual}, expected={expected}"
+            )
+    _validate_td3_gamma_alias(metadata)
+    if td3_gamma is not None:
+        gamma_key = _movement_gamma_key(metadata, schema)
+        actual_gamma = metadata.get(gamma_key)
+        if not _metadata_value_matches(actual_gamma, td3_gamma):
+            raise RuntimeError(
+                f"checkpoint {gamma_key} is incompatible: "
+                f"checkpoint={actual_gamma}, expected={td3_gamma}"
             )
 
     if calibration is not None:
@@ -453,7 +579,9 @@ def validate_model_checkpoint_metadata(
     if expected_formal_config is not None:
         experiment = metadata.get("experiment") or {}
         _validate_formal_config(
-            experiment.get("formal_config"),
+            _formal_config_for_validation(
+                metadata, experiment.get("formal_config"), expected_formal_config
+            ),
             expected_formal_config,
             FORMAL_CORE_CONFIG_FIELDS,
         )
@@ -461,6 +589,11 @@ def validate_model_checkpoint_metadata(
             _validate_dinkelbach_checkpoint_metadata(
                 metadata, expected_formal_config
             )
+    experiment = metadata.get("experiment") or {}
+    if schema >= CHECKPOINT_SCHEMA_VERSION and "formal_config" in experiment:
+        _validate_effective_formal_movement_config(
+            experiment["formal_config"], metadata.get("movement_agent_kind", "td3"), metadata
+        )
     return metadata
 
 
@@ -645,6 +778,10 @@ def _movement_training_payload(agent):
             "movement_agent_hyperparameters": {
                 "gamma": float(agent.gamma),
                 "tau": float(agent.tau),
+                "policy_delay": int(agent.policy_delay),
+                "target_policy_noise": agent.target_policy_noise,
+                "target_noise_clip": agent.target_noise_clip,
+                "twin_critics": False,
                 "max_action": float(agent.max_action),
             },
         }
@@ -725,6 +862,14 @@ def save_full_resume_checkpoint(
         calibration,
         experiment_metadata,
     )
+    _validate_effective_formal_movement_config(
+        formal_config, _agent_kind(td3), metadata
+    )
+    experiment = metadata.get("experiment") or {}
+    if "formal_config" in experiment:
+        _validate_effective_formal_movement_config(
+            experiment["formal_config"], _agent_kind(td3), metadata
+        )
     def write(temporary):
         replay_metadata = {
             "joint": _save_replay(
@@ -820,8 +965,8 @@ def _validate_full_metadata(
         raise RuntimeError(
             "model-only checkpoint can only be used for evaluation, not exact resume"
         )
+    schema = _validate_checkpoint_schema(metadata)
     checks = {
-        "checkpoint_schema_version": CHECKPOINT_SCHEMA_VERSION,
         "movement_state_dim": int(movement_state_dim),
         "joint_action_dim": int(joint_action_dim),
         "routing_state_dim": int(routing_state_dim),
@@ -839,8 +984,10 @@ def _validate_full_metadata(
                 "checkpoint movement_agent_kind is incompatible: "
                 f"checkpoint={actual_kind}, current={movement_agent_kind}"
             )
+    _validate_td3_gamma_alias(metadata)
+    movement_gamma_key = _movement_gamma_key(metadata, schema)
     gamma_checks = {
-        "centralized_td3_gamma": float(td3_gamma),
+        movement_gamma_key: float(td3_gamma),
         "routing_ddqn_gamma": float(ddqn_gamma),
     }
     for key, expected in gamma_checks.items():
@@ -956,12 +1103,16 @@ def inspect_full_resume_checkpoint(
     if expected_formal_config is not None:
         experiment = metadata.get("experiment") or {}
         _validate_formal_config(
-            experiment.get("formal_config"),
+            _formal_config_for_validation(
+                metadata, experiment.get("formal_config"), expected_formal_config
+            ),
             expected_formal_config,
             FULL_RESUME_CONFIG_FIELDS,
         )
         _validate_formal_config(
-            formal_config,
+            _formal_config_for_validation(
+                metadata, formal_config, expected_formal_config
+            ),
             expected_formal_config,
             FULL_RESUME_CONFIG_FIELDS,
         )
@@ -971,6 +1122,14 @@ def inspect_full_resume_checkpoint(
             )
     if not isinstance(formal_config, dict):
         raise RuntimeError("checkpoint formal training configuration is invalid")
+    if metadata["checkpoint_schema_version"] >= CHECKPOINT_SCHEMA_VERSION:
+        kind = metadata.get("movement_agent_kind", "td3")
+        experiment = metadata.get("experiment") or {}
+        _validate_effective_formal_movement_config(formal_config, kind, metadata)
+        if "formal_config" in experiment:
+            _validate_effective_formal_movement_config(
+                experiment["formal_config"], kind, metadata
+            )
     _validate_full_resume_logging_state(training_state, completed_episode)
     if _checkpoint_uses_dinkelbach(metadata):
         dinkelbach_state = DinkelbachBlockState.from_training_state(
@@ -1042,7 +1201,11 @@ def load_full_resume_checkpoint(
     _load_replay(
         checkpoint_dir / "joint_replay.npz",
         joint_replay,
-        JOINT_REPLAY_FIELDS,
+        (
+            JOINT_REPLAY_FIELDS
+            if metadata["checkpoint_schema_version"] >= CHECKPOINT_SCHEMA_VERSION
+            else LEGACY_JOINT_REPLAY_FIELDS
+        ),
         replay_metadata["joint"],
     )
     _load_replay(

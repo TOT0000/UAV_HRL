@@ -167,6 +167,9 @@ class ReplayBufferJoint:
         self.not_done = np.zeros((self.max_size, 1), dtype=np.float32)
         self.delivered_mbits = np.zeros((self.max_size, 1), dtype=np.float32)
         self.total_mobility_energy = np.zeros((self.max_size, 1), dtype=np.float32)
+        self.ratio_objective_reward = np.zeros(
+            (self.max_size, 1), dtype=np.float32
+        )
         self.phi_search_t = np.zeros((self.max_size, 1), dtype=np.float32)
         self.phi_search_t1 = np.zeros((self.max_size, 1), dtype=np.float32)
         self.phi_vs_t = np.zeros((self.max_size, 1), dtype=np.float32)
@@ -190,6 +193,7 @@ class ReplayBufferJoint:
         phi_vs_t1,
         phi_com_t,
         phi_com_t1,
+        ratio_objective_reward=0.0,
     ):
         index = self.ptr
         self.state[index] = _to_np_float32(state)
@@ -198,6 +202,7 @@ class ReplayBufferJoint:
         self.not_done[index, 0] = 1.0 - float(bool(done))
         self.delivered_mbits[index, 0] = float(delivered_mbits)
         self.total_mobility_energy[index, 0] = float(total_mobility_energy)
+        self.ratio_objective_reward[index, 0] = float(ratio_objective_reward)
         self.phi_search_t[index, 0] = float(phi_search_t)
         self.phi_search_t1[index, 0] = float(phi_search_t1)
         self.phi_vs_t[index, 0] = float(phi_vs_t)
@@ -224,12 +229,7 @@ class ReplayBufferJoint:
         if reward_mode == "dinkelbach":
             objective = delivered - float(current_lambda) * energy
         elif reward_mode == "ratio":
-            objective = np.divide(
-                delivered,
-                energy,
-                out=np.zeros_like(delivered),
-                where=np.isfinite(energy) & (energy > 0.0),
-            )
+            objective = self.ratio_objective_reward[indices].copy()
             objective[~np.isfinite(objective)] = 0.0
         else:
             raise ValueError(f"unsupported reward mode: {reward_mode}")

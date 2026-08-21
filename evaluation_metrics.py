@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import csv
-from dataclasses import asdict
 import json
 import math
 from pathlib import Path
@@ -13,7 +12,11 @@ from scipy.stats import t as student_t
 
 from centralized_movement import JOINT_ACTION_DIM, MOVEMENT_STATE_DIM
 from com_capacity_calibration import load_com_capacity_reference
-from experiment_config import FORMAL_EXPERIMENT_DEFAULTS, MethodSpec
+from experiment_config import (
+    FORMAL_EXPERIMENT_DEFAULTS,
+    MethodSpec,
+    effective_training_config,
+)
 from experiment_paths import (
     evaluation_run_directory,
     evaluation_run_identity,
@@ -484,11 +487,12 @@ def _evaluation_preflight(args):
         enable_csv=False,
         random_seed=args.training_seed,
     )
-    expected_training_config = asdict(
+    expected_training_config = effective_training_config(
         formal_training_config(
             FORMAL_EXPERIMENT_DEFAULTS["training_episodes_per_seed"],
             random_seed=args.training_seed,
-        )
+        ),
+        method,
     )
     _, calibration = load_com_capacity_reference()
     inspect_model_checkpoint(
@@ -508,6 +512,7 @@ def _evaluation_preflight(args):
         ],
         expected_formal_config=expected_training_config,
         require_episode_directory=True,
+        movement_agent_kind=method.agent,
     )
     validate_run_directory_preflight(run_dir, identity)
     return {
