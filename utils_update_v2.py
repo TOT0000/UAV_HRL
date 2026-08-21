@@ -154,7 +154,7 @@ class ReplayBufferContinuous:
 
 
 class ReplayBufferJoint:
-    """One-step joint replay with rewards reconstructed from current lambda."""
+    """One-step joint replay supporting Dinkelbach reward reconstruction and stored terminal ratio objectives."""
 
     def __init__(self, state_dim, action_dim, max_size=int(2e5)):
         self.max_size = int(max_size)

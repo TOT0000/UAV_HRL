@@ -415,6 +415,24 @@ def _dinkelbach_update(delivered_mbits, total_energy, previous_lambda):
     return float(ratio) if np.isfinite(ratio) else float(previous_lambda)
 
 
+def terminal_ratio_objective(
+    reward_mode,
+    done,
+    cumulative_delivered_mbits,
+    cumulative_energy_j,
+):
+    """Return the direct-ratio objective only on an episode's terminal step."""
+
+    if reward_mode not in {"dinkelbach", "ratio"}:
+        raise ValueError(f"unsupported reward mode: {reward_mode}")
+    if reward_mode != "ratio" or not done:
+        return 0.0
+    return safe_energy_efficiency(
+        cumulative_delivered_mbits,
+        cumulative_energy_j,
+    )
+
+
 def _interval_reward(
     delivered_mbits,
     energy,
@@ -1189,10 +1207,11 @@ def train(
             terminal_joint_transitions += int(done)
             episode_delivered_mbits += interval_delivered_mbits
             episode_energy += interval_energy
-            ratio_objective_reward = (
-                safe_energy_efficiency(episode_delivered_mbits, episode_energy)
-                if method_spec.reward_mode == "ratio" and done
-                else 0.0
+            ratio_objective_reward = terminal_ratio_objective(
+                method_spec.reward_mode,
+                done,
+                episode_delivered_mbits,
+                episode_energy,
             )
             if not evaluation and method_spec.learns_movement:
                 joint_replay.add(

@@ -566,8 +566,6 @@ def _atomic_write_dataset(run_dir, arrays, metadata, episode_rows):
 def design_dataset_preflight(args):
     """Validate every collector input without weights, Simulator, or output writes."""
 
-    from HRL_task_aware import ROUTING_STATE_DIM, TrainingConfig, formal_training_config
-
     if getattr(args, "resume", None) is not None:
         raise ValueError("design collection accepts --checkpoint, not --resume")
     method = args.method
@@ -578,6 +576,13 @@ def design_dataset_preflight(args):
             if key != "method_id"
         }
     )
+    if method.method_id != "td3_dinkelbach":
+        raise ValueError(
+            "collect-design-dataset currently supports only td3_dinkelbach"
+        )
+
+    from HRL_task_aware import ROUTING_STATE_DIM, TrainingConfig, formal_training_config
+
     manifest = ScenarioManifest.load(args.manifest)
     if manifest.split != args.split:
         raise ValueError(

@@ -117,10 +117,12 @@ python -X utf8 comparison_experiment.py smoke --training-seed 1 --output-dir run
 ```
 
 Collect deterministic centralized joint transitions for offline LLM design
-analysis with the explicit, evaluation-only collector:
+analysis with the explicit, evaluation-only collector. This command currently
+supports only `td3_dinkelbach`; every other controlled method is rejected during
+preflight before checkpoint loading, Simulator construction, or output creation:
 
 ```powershell
-python -X utf8 comparison_experiment.py collect-design-dataset --split validation --manifest runs/comparison/manifests/validation.json --training-seed 20260817 --episodes 100 --checkpoint runs/comparison/<method>/train/<train-hash-8>/seed-20260817/checkpoints/models/ep_2500 --output-dir runs/design --reference-per-episode runs/comparison/<method>/evaluate/validation/<validation-hash-8>/seed-20260817/per_episode.csv
+python -X utf8 comparison_experiment.py collect-design-dataset --method td3_dinkelbach --split validation --manifest runs/comparison/manifests/validation.json --training-seed 20260817 --episodes 100 --checkpoint runs/comparison/td3_dinkelbach/train/<train-hash-8>/seed-20260817/checkpoints/models/ep_2500 --output-dir runs/design --reference-per-episode runs/comparison/td3_dinkelbach/evaluate/validation/<validation-hash-8>/seed-20260817/per_episode.csv
 ```
 
 The collector writes to an isolated

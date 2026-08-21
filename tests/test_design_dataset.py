@@ -299,6 +299,51 @@ class DesignDatasetIntegrationTest(unittest.TestCase):
             simulator.assert_not_called()
         self.assertFalse(output.exists())
 
+    def test_unsupported_methods_fail_before_manifest_checkpoint_or_output(self):
+        unsupported_methods = (
+            "ddpg_dinkelbach",
+            "td3_ratio",
+            "ddpg_ratio",
+            "random_action",
+            "td3_dinkelbach_no_task_potential",
+            "ddpg_dinkelbach_no_task_potential",
+        )
+        for method in unsupported_methods:
+            with self.subTest(method=method):
+                output = self.root / f"unsupported-{method}"
+                args = [
+                    "collect-design-dataset",
+                    "--method",
+                    method,
+                    "--manifest",
+                    str(self.root / "must-not-be-read.json"),
+                    "--training-seed",
+                    str(self.training_seed),
+                    "--episodes",
+                    "2",
+                    "--checkpoint",
+                    str(self.root / "must-not-be-loaded"),
+                    "--output-dir",
+                    str(output),
+                ]
+                with (
+                    mock.patch("design_dataset.ScenarioManifest.load") as load_manifest,
+                    mock.patch(
+                        "design_dataset.inspect_model_checkpoint"
+                    ) as inspect_checkpoint,
+                    mock.patch("HRL_task_aware.Simulator") as simulator,
+                ):
+                    with self.assertRaisesRegex(
+                        ValueError,
+                        "^collect-design-dataset currently supports only "
+                        "td3_dinkelbach$",
+                    ):
+                        comparison_main(args)
+                    load_manifest.assert_not_called()
+                    inspect_checkpoint.assert_not_called()
+                    simulator.assert_not_called()
+                self.assertFalse(output.exists())
+
     def test_invalid_manifest_split_creates_no_output_or_simulator(self):
         output = self.root / "invalid-manifest-output"
         manifest_path = self.root / "train-manifest.json"

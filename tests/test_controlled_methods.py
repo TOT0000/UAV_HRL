@@ -26,6 +26,7 @@ from HRL_task_aware import (
     _full_training_state,
     _interval_reward,
     formal_training_config,
+    terminal_ratio_objective,
     train,
 )
 from run_experiment import build_parser, create_unique_run_directory
@@ -167,10 +168,23 @@ class ControlledRewardTest(unittest.TestCase):
     def test_ratio_of_episode_sums_is_stored_only_on_terminal_transition(self):
         replay = ReplayBufferJoint(1, 1, max_size=4)
         transitions = (
-            (1.0, 1.0, False, 0.0, 1.25, 0.0),
-            (9.0, 3.0, True, 2.5, -0.75, 0.0),
+            (1.0, 1.0, False, 1.25, 0.0),
+            (9.0, 3.0, True, -0.75, 0.0),
         )
-        for delivered, energy, done, objective, phi_t, phi_t1 in transitions:
+        cumulative_delivered = 0.0
+        cumulative_energy = 0.0
+        objectives = []
+        online_rewards = []
+        for delivered, energy, done, phi_t, phi_t1 in transitions:
+            cumulative_delivered += delivered
+            cumulative_energy += energy
+            objective = terminal_ratio_objective(
+                "ratio",
+                done,
+                cumulative_delivered,
+                cumulative_energy,
+            )
+            objectives.append(objective)
             replay.add(
                 [0.0], [0.0], [0.0], done=done,
                 delivered_mbits=delivered,
@@ -181,6 +195,26 @@ class ControlledRewardTest(unittest.TestCase):
                 phi_vs_t=0.0, phi_vs_t1=0.0,
                 phi_com_t=0.0, phi_com_t1=0.0,
             )
+            online_rewards.append(
+                _interval_reward(
+                    delivered,
+                    energy,
+                    current_lambda=999.0,
+                    gamma=1.0,
+                    potentials_t=(phi_t, 0.0, 0.0),
+                    potentials_t1=(phi_t1, 0.0, 0.0),
+                    done=done,
+                    config=self.config,
+                    reward_mode="ratio",
+                    task_potential_enabled=True,
+                    ratio_objective_reward=objective,
+                )
+            )
+        self.assertEqual(objectives, [0.0, 2.5])
+        self.assertAlmostEqual(
+            objectives[-1],
+            (1.0 + 9.0) / (1.0 + 3.0),
+        )
         unshaped = replay._reward_numpy(
             np.asarray([0, 1]), current_lambda=0.0, gamma=1.0,
             reward_mode="ratio", task_potential_enabled=False,
@@ -194,6 +228,11 @@ class ControlledRewardTest(unittest.TestCase):
             reward_mode="ratio", task_potential_enabled=True,
         ).ravel()
         self.assertTrue(np.allclose(shaped, [-1.25, 3.25]))
+        self.assertTrue(np.allclose(online_rewards, shaped))
+        self.assertAlmostEqual(
+            sum(online_rewards),
+            objectives[-1] + (-1.25 + 0.75),
+        )
         same_ratio = replay._reward_numpy(
             np.asarray([0, 1]), current_lambda=-123.0, gamma=1.0,
             reward_mode="ratio", task_potential_enabled=False,
