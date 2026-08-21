@@ -4,19 +4,29 @@ from __future__ import annotations
 
 import csv
 from datetime import datetime, timezone
-import hashlib
 import json
 import math
 from pathlib import Path
 import subprocess
 
-from experiment_config import FORMAL_CHECKPOINT_EPISODE, MethodSpec
+from experiment_config import (
+    FORMAL_CHECKPOINT_EPISODE,
+    MethodSpec,
+    NUM_UAV,
+    comparison_method_configuration,
+)
+from Packet_scheduler_v1 import TASK_DEADLINE_SECONDS
 from paper_figure_registry import (
     FIGURE_REGISTRY,
     METHOD_DISPLAY_NAMES,
     PAPER_METHOD_MAPPINGS,
     PLOT_STYLES,
-    resolve_figure_id,
+    resolve_figure_ids,
+)
+from scenario_manifest import ScenarioManifest, current_environment_config
+from training_checkpoint import (
+    checkpoint_metadata_fingerprint,
+    inspect_model_checkpoint,
 )
 
 
@@ -125,11 +135,45 @@ def _read_jsonl(path):
     return rows
 
 
-def _metadata_fingerprint(metadata):
-    canonical = json.dumps(
-        metadata, sort_keys=True, separators=(",", ":"), allow_nan=False
-    ).encode("utf-8")
-    return hashlib.sha256(canonical).hexdigest()
+def _checkpoint_identity(method, training_seed):
+    return {
+        "method_id": method.method_id,
+        "method_spec": method.to_dict(),
+        "method_spec_fingerprint": method.compatible_fingerprints,
+        "training_seed": int(training_seed),
+        "movement_agent": method.agent,
+        "reward_mode": method.reward_mode,
+        "task_potential_enabled": bool(method.task_potential_enabled),
+        **comparison_method_configuration(method),
+    }
+
+
+def _inspect_checkpoint(method_id, checkpoint_dir, training_seed, formal_config):
+    method = MethodSpec.parse(method_id)
+    checkpoint_dir = Path(checkpoint_dir).resolve()
+    if checkpoint_dir.name != f"ep_{FORMAL_CHECKPOINT_EPISODE:04d}":
+        raise IncompatiblePaperRunError(
+            f"{method_id} checkpoint is not the formal ep_2500 directory: {checkpoint_dir}"
+        )
+    try:
+        inspected = inspect_model_checkpoint(
+            checkpoint_dir,
+            expected_experiment_metadata=_checkpoint_identity(method, training_seed),
+            expected_completed_episodes=FORMAL_CHECKPOINT_EPISODE,
+            expected_formal_config=formal_config,
+            require_episode_directory=True,
+            movement_agent_kind=method.agent,
+        )
+    except (FileNotFoundError, KeyError, TypeError, ValueError, RuntimeError) as exc:
+        raise IncompatiblePaperRunError(
+            f"checkpoint provenance is invalid for {method_id}: {exc}"
+        ) from exc
+    fingerprint = checkpoint_metadata_fingerprint(inspected["metadata"])
+    return {
+        "checkpoint_dir": checkpoint_dir,
+        "checkpoint_metadata": inspected["metadata"],
+        "checkpoint_metadata_fingerprint": fingerprint,
+    }
 
 
 def _entry_directory(method_id, entry, spec_dir, key):
@@ -170,11 +214,12 @@ def _resolve_training_run(method_id, entry, spec_dir):
     if checkpoint_episode != FORMAL_CHECKPOINT_EPISODE:
         raise IncompatiblePaperRunError(f"{method_id} must resolve to formal ep_2500")
     checkpoint_dir = run_dir / "checkpoints" / "models" / "ep_2500"
-    checkpoint_metadata = _read_json(checkpoint_dir / "metadata.json")
-    if int(checkpoint_metadata.get("episode", -2)) + 1 != FORMAL_CHECKPOINT_EPISODE:
-        raise IncompatiblePaperRunError(f"formal checkpoint episode mismatch for {method_id}")
-    if not (checkpoint_dir / "models.pt").is_file():
-        raise PaperFigureSpecError(f"formal checkpoint model payload is missing: {checkpoint_dir}")
+    inspected = _inspect_checkpoint(
+        method_id,
+        checkpoint_dir,
+        int(resolved["seed"]),
+        resolved.get("training_config"),
+    )
     history_path = run_dir / "training_history.jsonl"
     if isinstance(entry, dict) and entry.get("training_history"):
         history_path = Path(entry["training_history"])
@@ -189,8 +234,190 @@ def _resolve_training_run(method_id, entry, spec_dir):
         "history_path": history_path.resolve(),
         "history_rows": rows,
         "checkpoint_path": checkpoint_dir.resolve(),
-        "checkpoint_metadata_fingerprint": _metadata_fingerprint(checkpoint_metadata),
+        "checkpoint_metadata_fingerprint": inspected[
+            "checkpoint_metadata_fingerprint"
+        ],
     }
+
+
+def _expected_resolved_overrides(suite, point):
+    rates = {"FOV": None, "COM": None}
+    deadlines = {
+        "FOV": float(TASK_DEADLINE_SECONDS["FOV"]),
+        "COM": float(TASK_DEADLINE_SECONDS["COM"]),
+    }
+    flat = {}
+    if suite == "task_type_delay_vs_arrival_rate":
+        value = float(point["x_value"])
+        if point["swept_task"] == "COM":
+            rates = {"FOV": 5.0, "COM": value}
+        elif point["swept_task"] == "FOV":
+            rates = {"FOV": value, "COM": 50.0}
+        else:
+            raise IncompatiblePaperRunError("arrival point has an invalid swept_task")
+        flat = {
+            "fov_rate_packets_per_second": rates["FOV"],
+            "com_rate_packets_per_second": rates["COM"],
+        }
+    elif suite == "task_type_delay_violation_vs_target_delay":
+        value = float(point["x_value"])
+        if point["swept_task"] not in deadlines:
+            raise IncompatiblePaperRunError("deadline point has an invalid swept_task")
+        deadlines[point["swept_task"]] = value
+        flat = {
+            "fov_deadline_seconds": deadlines["FOV"],
+            "com_deadline_seconds": deadlines["COM"],
+        }
+    expected = {
+        "traffic_rates_packets_per_second": rates,
+        "task_deadlines_seconds": deadlines,
+        "units": {"traffic_rate": "packets/s", "deadline": "seconds"},
+    }
+    return flat, expected
+
+
+def _validate_manifest_point(point, metadata, suite):
+    path_value = point.get("scenario_manifest_path")
+    if not path_value:
+        raise IncompatiblePaperRunError(
+            f"{suite}/{point.get('point_id')} lacks scenario_manifest_path"
+        )
+    manifest_path = Path(path_value).resolve()
+    output_directory = Path(point.get("output_directory", "")).resolve()
+    if output_directory != manifest_path.parent:
+        raise IncompatiblePaperRunError(
+            f"manifest/output directory mismatch at {point.get('point_id')}"
+        )
+    try:
+        manifest = ScenarioManifest.load(manifest_path)
+    except (FileNotFoundError, KeyError, TypeError, ValueError) as exc:
+        raise IncompatiblePaperRunError(
+            f"scenario manifest is invalid at {manifest_path}: {exc}"
+        ) from exc
+    hashes = {
+        point.get("scenario_manifest_hash"),
+        point.get("manifest_hash"),
+        manifest.content_hash,
+    }
+    if None in hashes or len(hashes) != 1:
+        raise IncompatiblePaperRunError(
+            f"scenario manifest hash mismatch at {point.get('point_id')}"
+        )
+    scenario_ids = [entry["scenario_id"] for entry in manifest.episodes]
+    if point.get("scenario_ids") != scenario_ids:
+        raise IncompatiblePaperRunError(
+            f"scenario IDs mismatch at {point.get('point_id')}"
+        )
+    if int(point.get("evaluation_episode_count", -1)) != manifest.episode_count:
+        raise IncompatiblePaperRunError(
+            f"evaluation episode count mismatch at {point.get('point_id')}"
+        )
+    if int(metadata.get("evaluation_episodes_per_point", -1)) != manifest.episode_count:
+        raise IncompatiblePaperRunError("top-level evaluation episode count is incompatible")
+    horizon = int(point.get("evaluation_horizon_seconds", -1))
+    if horizon != int(metadata.get("evaluation_horizon_seconds", -2)):
+        raise IncompatiblePaperRunError(
+            f"evaluation horizon mismatch at {point.get('point_id')}"
+        )
+    if horizon != int(current_environment_config()["episode_seconds"]):
+        raise IncompatiblePaperRunError(
+            f"manifest horizon mismatch at {point.get('point_id')}"
+        )
+    if int(point.get("evaluation_seed", -1)) != int(metadata.get("evaluation_seed", -2)):
+        raise IncompatiblePaperRunError(
+            f"evaluation seed mismatch at {point.get('point_id')}"
+        )
+    if int(point.get("manifest_seed", -1)) != manifest.manifest_seed:
+        raise IncompatiblePaperRunError(
+            f"manifest seed mismatch at {point.get('point_id')}"
+        )
+    if int(point["manifest_seed"]) != int(metadata.get("manifest_seed", -2)):
+        raise IncompatiblePaperRunError(
+            f"top-level manifest seed mismatch at {point.get('point_id')}"
+        )
+    if int(point.get("num_uav", -1)) != NUM_UAV or any(
+        len(entry.get("uavs", ())) != NUM_UAV for entry in manifest.episodes
+    ):
+        raise IncompatiblePaperRunError(
+            f"paper evaluation requires {NUM_UAV} UAVs at {point.get('point_id')}"
+        )
+    if suite == "fixed_roi":
+        expected_num_gt = int(point["x_value"])
+        if int(point.get("fixed_num_gt", -1)) != expected_num_gt or any(
+            int(entry.get("num_GT", -1)) != expected_num_gt
+            for entry in manifest.episodes
+        ):
+            raise IncompatiblePaperRunError(
+                f"fixed-RoI manifest mismatch at {point.get('point_id')}"
+            )
+    expected_flat, expected_resolved = _expected_resolved_overrides(suite, point)
+    if point.get("overrides") != expected_flat:
+        raise IncompatiblePaperRunError(
+            f"sweep overrides mismatch at {point.get('point_id')}"
+        )
+    if point.get("resolved_overrides") != expected_resolved:
+        raise IncompatiblePaperRunError(
+            f"resolved sweep overrides mismatch at {point.get('point_id')}"
+        )
+    return {
+        "point_id": point.get("point_id"),
+        "manifest_path": str(manifest_path),
+        "manifest_hash": manifest.content_hash,
+        "scenario_ids": scenario_ids,
+        "evaluation_episode_count": manifest.episode_count,
+        "evaluation_horizon_seconds": horizon,
+        "evaluation_seed": int(point["evaluation_seed"]),
+        "manifest_seed": manifest.manifest_seed,
+        "num_uav": NUM_UAV,
+        "resolved_overrides": expected_resolved,
+    }
+
+
+def _validate_aggregate_envelope(rows, metadata):
+    point_by_id = {
+        point["point_id"]: point for point in metadata.get("points", ())
+    }
+    metric_contracts = {
+        "energy_efficiency_mbit_per_j": (None, "Mbit/J"),
+        "average_e2e_delay_seconds": ({"FOV", "COM"}, "seconds"),
+        "violation_probability": ({"FOV", "COM"}, "probability"),
+    }
+    for row in rows:
+        metric = row.get("metric")
+        if metric not in metric_contracts:
+            raise IncompatiblePaperRunError(
+                f"unexpected aggregate metric: {metric}"
+            )
+        if row.get("semantic_suite") != metadata.get("semantic_suite"):
+            raise IncompatiblePaperRunError("aggregate semantic suite mismatch")
+        if row.get("method_id") != metadata.get("method_id"):
+            raise IncompatiblePaperRunError("aggregate method mismatch")
+        point = point_by_id.get(row.get("point_id"))
+        if point is None:
+            raise IncompatiblePaperRunError(
+                f"unexpected aggregate point: {row.get('point_id')}"
+            )
+        if row.get("x_value") != point.get("x_value") or row.get("x_unit") != point.get("x_unit"):
+            raise IncompatiblePaperRunError(
+                f"aggregate x value/unit mismatch at {row.get('point_id')}"
+            )
+        if int(row.get("evaluation_episode_count", -1)) != int(
+            point["evaluation_episode_count"]
+        ):
+            raise IncompatiblePaperRunError(
+                f"aggregate evaluation count mismatch at {row.get('point_id')}"
+            )
+        tasks, value_unit = metric_contracts[metric]
+        if (tasks is None and row.get("task_type") is not None) or (
+            tasks is not None and row.get("task_type") not in tasks
+        ):
+            raise IncompatiblePaperRunError(
+                f"unexpected aggregate task for {metric}: {row.get('task_type')}"
+            )
+        if row.get("value_unit") != value_unit:
+            raise IncompatiblePaperRunError(
+                f"unexpected aggregate unit for {metric}: {row.get('value_unit')}"
+            )
 
 
 def _resolve_evaluation_run(method_id, entry, spec_dir, expected_suite):
@@ -215,17 +442,82 @@ def _resolve_evaluation_run(method_id, entry, spec_dir, expected_suite):
             raise IncompatiblePaperRunError(f"{method_id} evaluation is not from ep_2500")
         if not metadata.get("checkpoint_path"):
             raise IncompatiblePaperRunError(f"{method_id} lacks checkpoint provenance")
-    elif metadata.get("checkpoint_path") is not None:
-        raise IncompatiblePaperRunError("pure-random evaluation must have no checkpoint path")
+        training_run_value = metadata.get("training_run")
+        if not training_run_value:
+            raise IncompatiblePaperRunError(f"{method_id} lacks training-run provenance")
+        training_run = Path(training_run_value).resolve()
+        training_resolved = _read_json(training_run / "resolved_config.json")
+        if training_resolved.get("method") != method_id:
+            raise IncompatiblePaperRunError("evaluation training-run method mismatch")
+        if training_resolved.get("method_spec") != method.to_dict():
+            raise IncompatiblePaperRunError("evaluation training-run method spec mismatch")
+        expected_checkpoint = (
+            training_run / "checkpoints" / "models" / f"ep_{FORMAL_CHECKPOINT_EPISODE:04d}"
+        ).resolve()
+        checkpoint_path = Path(metadata["checkpoint_path"]).resolve()
+        if checkpoint_path != expected_checkpoint:
+            raise IncompatiblePaperRunError(
+                f"checkpoint path does not belong to the resolved training run: {checkpoint_path}"
+            )
+        formal_config = metadata.get("formal_training_config")
+        if formal_config != training_resolved.get("training_config"):
+            raise IncompatiblePaperRunError("formal training config provenance mismatch")
+        training_seed = int(metadata.get("training_seed", -1))
+        if training_seed != int(training_resolved.get("seed", -2)):
+            raise IncompatiblePaperRunError("checkpoint training seed mismatch")
+        checkpoint = _inspect_checkpoint(
+            method_id, checkpoint_path, training_seed, formal_config
+        )
+        fingerprint = checkpoint["checkpoint_metadata_fingerprint"]
+        if metadata.get("checkpoint_metadata_fingerprint") != fingerprint:
+            raise IncompatiblePaperRunError(
+                f"top-level checkpoint fingerprint mismatch for {method_id}"
+            )
+    else:
+        fingerprint = None
+        forbidden = (
+            metadata.get("checkpoint_path"),
+            metadata.get("checkpoint_metadata_fingerprint"),
+            metadata.get("training_run"),
+        )
+        if any(value is not None for value in forbidden):
+            raise IncompatiblePaperRunError(
+                "pure-random evaluation must have no checkpoint provenance"
+            )
+    points = metadata.get("points")
+    if not isinstance(points, list) or not points:
+        raise PaperFigureSpecError(f"evaluation has no point metadata: {evaluation_dir}")
+    for point in points:
+        if bool(point.get("checkpoint_required")) != checkpoint_required:
+            raise IncompatiblePaperRunError(
+                f"checkpoint requirement mismatch at {point.get('point_id')}"
+            )
+        point_path = point.get("checkpoint_path")
+        point_fingerprint = point.get("checkpoint_metadata_fingerprint")
+        if checkpoint_required:
+            if Path(point_path).resolve() != checkpoint_path or point_fingerprint != fingerprint:
+                raise IncompatiblePaperRunError(
+                    f"checkpoint provenance mismatch at {point.get('point_id')}"
+                )
+        elif point_path is not None or point_fingerprint is not None:
+            raise IncompatiblePaperRunError(
+                "pure-random point must not supply checkpoint provenance"
+            )
+    point_provenance = [
+        _validate_manifest_point(point, metadata, expected_suite) for point in points
+    ]
     aggregate_path = evaluation_dir / "aggregated_plot_data.json"
     aggregate_rows = _read_json(aggregate_path)
     if not isinstance(aggregate_rows, list) or not aggregate_rows:
         raise PaperFigureSpecError(f"evaluation aggregate is empty: {aggregate_path}")
+    _validate_aggregate_envelope(aggregate_rows, metadata)
     return {
         "evaluation_dir": evaluation_dir,
         "metadata": metadata,
         "aggregate_path": aggregate_path,
         "aggregate_rows": aggregate_rows,
+        "checkpoint_metadata_fingerprint": fingerprint,
+        "point_provenance": point_provenance,
     }
 
 
@@ -277,6 +569,16 @@ def _emit(figure_id, figure, output_dir, rows, resolved, json_value=None):
     csv_path = output_dir / f"{stem}.csv"
     json_path = output_dir / f"{stem}.json"
     spec_path = output_dir / f"{stem}_resolved_spec.json"
+    axes = list(figure.axes)
+    render_contract = {
+        "axes_count": len(axes),
+        "axes_titles": [axis.get_title() for axis in axes],
+        "axes_title_positions": [list(axis.title.get_position()) for axis in axes],
+    }
+    if render_contract["axes_count"] != 1:
+        raise PaperFigureSpecError(
+            f"formal figure {figure_id} must contain exactly one axes"
+        )
     figure.savefig(png, dpi=300, bbox_inches="tight")
     figure.savefig(pdf, bbox_inches="tight")
     import matplotlib.pyplot as plt
@@ -292,14 +594,11 @@ def _emit(figure_id, figure, output_dir, rows, resolved, json_value=None):
             {
                 "semantic_figure_id": figure_id,
                 "contract": _json_ready_contract(figure_id),
-                "resolved_style": (
-                    PLOT_STYLES.get(figure_id)
-                    if figure_id != "energy_efficiency_design_comparisons"
-                    else {
-                        component: PLOT_STYLES[component]
-                        for component in FIGURE_REGISTRY[figure_id]["components"]
-                    }
+                "resolved_style": PLOT_STYLES.get(
+                    figure_id,
+                    PLOT_STYLES.get("uav_trajectory_snapshots"),
                 ),
+                "render_contract": render_contract,
                 **resolved,
             },
             indent=2,
@@ -345,6 +644,13 @@ def _validate_training_compatibility(runs):
         raise IncompatiblePaperRunError(
             "training convergence methods must share seed, manifest hash, and checkpoint episode"
         )
+    for method, run in runs.items():
+        episodes = sorted(int(row["episode"]) for row in run["history_rows"])
+        expected = list(range(1, FORMAL_CHECKPOINT_EPISODE + 1))
+        if episodes != expected:
+            raise IncompatiblePaperRunError(
+                f"{method} training history must contain exactly episodes 1..2500"
+            )
     if len({len(run["history_rows"]) for run in runs.values()}) != 1:
         raise IncompatiblePaperRunError("training convergence histories must have equal lengths")
 
@@ -417,8 +723,16 @@ def _resolve_suite_runs(spec, spec_path, suite, methods):
     reference = None
     for method, run in runs.items():
         points = tuple(
-            (point.get("point_id"), point.get("manifest_hash"), point.get("x_value"), point.get("x_unit"))
-            for point in run["metadata"].get("points", [])
+            (
+                point["point_id"],
+                point["manifest_hash"],
+                tuple(point["scenario_ids"]),
+                point["evaluation_episode_count"],
+                point["evaluation_horizon_seconds"],
+                point["evaluation_seed"],
+                point["num_uav"],
+            )
+            for point in run["point_provenance"]
         )
         if reference is None:
             reference = points
@@ -427,7 +741,10 @@ def _resolve_suite_runs(spec, spec_path, suite, methods):
                 f"{suite} methods do not share identical sweep points and manifests; mismatch={method}"
             )
     expected = _expected_sweep_signature(suite)
-    actual = tuple((point_id, x_value, x_unit) for point_id, _, x_value, x_unit in reference)
+    actual = tuple(
+        (point.get("point_id"), point.get("x_value"), point.get("x_unit"))
+        for point in next(iter(runs.values()))["metadata"]["points"]
+    )
     if actual != expected:
         raise IncompatiblePaperRunError(
             f"{suite} sweep contract mismatch: expected={expected}, found={actual}"
@@ -460,22 +777,77 @@ def _expected_sweep_signature(suite):
     raise PaperFigureSpecError(f"no sweep contract for semantic suite: {suite}")
 
 
-def _metric_rows(runs, metric, task_type=None):
-    result = []
+def _metric_rows(
+    runs,
+    metric,
+    *,
+    point_ids,
+    task_types=(None,),
+    swept_only=False,
+):
+    expected_points = tuple(point_ids)
+    expected_tasks = tuple(task_types)
+    if swept_only:
+        point_tasks = {
+            point_id: (
+                "COM" if point_id.startswith("com_") else "FOV"
+                if point_id.startswith("fov_")
+                else None
+            )
+            for point_id in expected_points
+        }
+        if any(task not in expected_tasks for task in point_tasks.values()):
+            raise PaperFigureSpecError(
+                f"cannot infer swept task from point IDs for {metric}"
+            )
+        expected = {
+            (method, point_id, point_tasks[point_id])
+            for method in runs
+            for point_id in expected_points
+        }
+    else:
+        expected = {
+            (method, point_id, task_type)
+            for method in runs
+            for point_id in expected_points
+            for task_type in expected_tasks
+        }
+    found = {}
     for method, run in runs.items():
-        selected = [
-            row
-            for row in run["aggregate_rows"]
-            if row.get("metric") == metric
-            and (task_type is None or row.get("task_type") == task_type)
-        ]
-        if not selected:
-            raise PaperFigureSpecError(f"{method} has no {metric}/{task_type} rows")
-        for row in selected:
-            if row.get("missing") and metric == "energy_efficiency_mbit_per_j":
-                raise PaperFigureSpecError(f"{method} has missing EE at {row.get('point_id')}")
-            result.append(dict(row))
-    return result
+        for source in run["aggregate_rows"]:
+            if source.get("metric") != metric:
+                continue
+            task_type = source.get("task_type")
+            if swept_only and task_type != source.get("swept_task"):
+                continue
+            if task_type not in expected_tasks:
+                if swept_only and task_type in {"FOV", "COM"}:
+                    continue
+                raise IncompatiblePaperRunError(
+                    f"unexpected task for {metric}: {task_type}"
+                )
+            point_id = source.get("point_id")
+            if point_id not in expected_points:
+                raise IncompatiblePaperRunError(
+                    f"unexpected point for {metric}: {point_id}"
+                )
+            if source.get("method_id") != method:
+                raise IncompatiblePaperRunError(
+                    f"aggregate method mismatch: expected={method}, found={source.get('method_id')}"
+                )
+            key = (method, point_id, task_type)
+            if key in found:
+                raise IncompatiblePaperRunError(f"duplicate aggregate row: {key}")
+            if source.get("missing") and metric == "energy_efficiency_mbit_per_j":
+                raise PaperFigureSpecError(f"{method} has missing EE at {point_id}")
+            found[key] = dict(source)
+    missing = expected.difference(found)
+    extra = set(found).difference(expected)
+    if missing or extra:
+        raise IncompatiblePaperRunError(
+            f"{metric} aggregate Cartesian mismatch: missing={sorted(missing)}, extra={sorted(extra)}"
+        )
+    return [found[key] for key in sorted(found, key=lambda item: tuple(str(v) for v in item))]
 
 
 def _plot_ee_panel(axis, figure_id, rows):
@@ -515,12 +887,28 @@ def _fixed_ee_data(spec, spec_path, figure_id):
     mapping = PAPER_METHOD_MAPPINGS[figure_id]
     methods = tuple(mapping.values()) if isinstance(mapping, dict) else tuple(mapping)
     runs = _resolve_suite_runs(spec, spec_path, "fixed_roi", methods)
-    rows = _metric_rows(runs, "energy_efficiency_mbit_per_j")
+    rows = _metric_rows(
+        runs,
+        "energy_efficiency_mbit_per_j",
+        point_ids=tuple(f"roi_{value}" for value in range(2, 9)),
+    )
     return runs, rows
 
 
 def _run_mapping(runs):
     return {method: str(run["evaluation_dir"]) for method, run in runs.items()}
+
+
+def _validated_provenance(runs):
+    return {
+        "checkpoint_metadata_fingerprints": {
+            method: run["checkpoint_metadata_fingerprint"]
+            for method, run in runs.items()
+        },
+        "validated_points": {
+            method: run["point_provenance"] for method, run in runs.items()
+        },
+    }
 
 
 def _build_standalone_ee(spec, spec_path, output_dir, git_sha, figure_id):
@@ -530,6 +918,12 @@ def _build_standalone_ee(spec, spec_path, output_dir, git_sha, figure_id):
     size = (7, 4.2) if figure_id == "task_assignment_ee_vs_number_of_rois" else (9, 5.4)
     figure, axis = plt.subplots(figsize=size)
     plotted = _plot_ee_panel(axis, figure_id, rows)
+    title = {
+        "task_assignment_ee_vs_number_of_rois": "Task-assignment strategies",
+        "trajectory_design_ee_vs_number_of_rois": "Trajectory-design methods",
+        "hierarchical_architecture_ee_vs_number_of_rois": "Hierarchical learning architectures",
+    }[figure_id]
+    axis.set_title(title)
     figure.tight_layout()
     return _emit(
         figure_id,
@@ -539,37 +933,9 @@ def _build_standalone_ee(spec, spec_path, output_dir, git_sha, figure_id):
         {
             "source_spec": str(spec_path),
             "method_to_evaluation_run": _run_mapping(runs),
+            **_validated_provenance(runs),
             "aggregation": "ratio of pooled timely delivered Mbit to pooled mobility J",
-            "git_sha": git_sha,
-        },
-    )
-
-
-def _build_ee_composite(spec, spec_path, output_dir, git_sha):
-    figure_id = "energy_efficiency_design_comparisons"
-    components = FIGURE_REGISTRY[figure_id]["components"]
-    import matplotlib.pyplot as plt
-
-    figure, axes = plt.subplots(1, 3, figsize=(20, 5.5))
-    all_rows = []
-    all_runs = {}
-    titles = ("(a) Task-assignment strategies", "(b) Trajectory-design methods", "(c) Hierarchical architectures")
-    for axis, component, title in zip(axes, components, titles):
-        runs, rows = _fixed_ee_data(spec, spec_path, component)
-        all_runs.update(runs)
-        all_rows.extend(_plot_ee_panel(axis, component, rows))
-        axis.set_title(title, y=-0.27)
-    figure.subplots_adjust(bottom=0.25, wspace=0.3)
-    return _emit(
-        figure_id,
-        figure,
-        output_dir,
-        all_rows,
-        {
-            "source_spec": str(spec_path),
-            "components": list(components),
-            "method_to_evaluation_run": _run_mapping(all_runs),
-            "aggregation": "ratio of pooled timely delivered Mbit to pooled mobility J",
+            "title": title,
             "git_sha": git_sha,
         },
     )
@@ -609,10 +975,10 @@ def _phase_subtitle(phase):
     }.get(str(phase), f"UAV in {phase} mode")
 
 
-def _build_trajectory(spec, spec_path, output_dir, git_sha):
-    figure_id = "uav_trajectory_snapshots"
+def _build_trajectory(spec, spec_path, output_dir, git_sha, figure_id):
+    suite = "uav_trajectory_snapshots"
     method = "td3_dinkelbach"
-    runs = _resolve_suite_runs(spec, spec_path, figure_id, (method,))
+    runs = _resolve_suite_runs(spec, spec_path, suite, (method,))
     run = runs[method]
     target_uav_id = spec.get("target_uav_id")
     if target_uav_id is None:
@@ -631,81 +997,108 @@ def _build_trajectory(spec, spec_path, output_dir, git_sha):
     artifact = artifacts[0]
     if int(artifact.get("target_uav_id", -1)) != int(target_uav_id):
         raise IncompatiblePaperRunError("trajectory artifact target_uav_id mismatch")
+    point_provenance = run["point_provenance"][0]
+    if artifact.get("scenario_manifest_hash") != point_provenance["manifest_hash"]:
+        raise IncompatiblePaperRunError("trajectory artifact manifest hash mismatch")
+    if artifact.get("scenario_id") not in point_provenance["scenario_ids"]:
+        raise IncompatiblePaperRunError("trajectory artifact scenario ID mismatch")
+    if Path(artifact.get("checkpoint_path", "")).resolve() != Path(
+        run["metadata"]["checkpoint_path"]
+    ).resolve():
+        raise IncompatiblePaperRunError("trajectory artifact checkpoint path mismatch")
+    if artifact.get("checkpoint_fingerprint") != run["checkpoint_metadata_fingerprint"]:
+        raise IncompatiblePaperRunError("trajectory artifact checkpoint fingerprint mismatch")
     snapshots = artifact.get("snapshots", [])
     requested = tuple(float(item["requested_time_seconds"]) for item in snapshots)
     if requested != (5.0, 10.0, 15.0, 25.0):
         raise IncompatiblePaperRunError(f"unexpected trajectory snapshot times: {requested}")
+    requested_time = float(FIGURE_REGISTRY[figure_id]["requested_time_seconds"])
+    selected = [
+        snapshot
+        for snapshot in snapshots
+        if float(snapshot["requested_time_seconds"]) == requested_time
+    ]
+    if len(selected) != 1:
+        raise IncompatiblePaperRunError(
+            f"trajectory artifact must contain one snapshot requested at {requested_time:g} s"
+        )
+    snapshot = selected[0]
 
     import matplotlib.pyplot as plt
     from matplotlib.lines import Line2D
     from matplotlib.patches import Patch
     from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 
-    figure = plt.figure(figsize=(24, 6.4))
+    figure = plt.figure(figsize=(7.2, 6.4))
+    axis = figure.add_subplot(projection="3d")
     target_path = artifact["uav_paths"][str(target_uav_id)]
     sr_paths = artifact["sr_paths"]
-    for index, snapshot in enumerate(snapshots, 1):
-        axis = figure.add_subplot(1, 4, index, projection="3d")
-        actual = float(snapshot["actual_time_seconds"])
-        uavs = {int(item["uav_id"]): item for item in snapshot["uavs"]}
-        target = uavs[int(target_uav_id)]
-        path = [item for item in target_path if float(item["actual_time_seconds"]) <= actual]
-        axis.plot([p["x"] for p in path], [p["y"] for p in path], [p["z"] for p in path], color="green", linewidth=1.5)
-        axis.scatter(path[0]["x"], path[0]["y"], path[0]["z"], color="green", s=36)
-        axis.scatter(target["x"], target["y"], target["z"], facecolors="none", edgecolors="green", s=42)
-        others = [item for uid, item in uavs.items() if uid != int(target_uav_id)]
-        axis.scatter([u["x"] for u in others], [u["y"] for u in others], [u["z"] for u in others], color="lightgray", alpha=0.45, s=24)
-        for sr in snapshot["sr_teams"]:
-            sr_path = [item for item in sr_paths[str(sr["sr_id"])] if float(item["actual_time_seconds"]) <= actual]
-            axis.plot([p["x"] for p in sr_path], [p["y"] for p in sr_path], [p["z"] for p in sr_path], color="#243BFF", linestyle="--", linewidth=1.0)
-            axis.scatter(sr_path[0]["x"], sr_path[0]["y"], sr_path[0]["z"], color="#243BFF", marker="s", s=26)
-            axis.scatter(sr["x"], sr["y"], sr["z"], facecolors="none", edgecolors="#243BFF", marker="s", s=30)
-        gs = snapshot["ground_station"]
-        axis.scatter(gs["x"], gs["y"], gs["z"], color="red", marker="^", s=50)
-        for gt in snapshot["ground_targets"]:
-            _draw_ground_circle(axis, gt["x"], gt["y"], gt["radius_m"], color="magenta" if gt["detected"] else "gray")
-        for coverage in snapshot["sensing_coverage"]:
-            bounds = coverage["clipped_bounds"]
-            verts = [[
-                (bounds["x_min"], bounds["y_min"], 0.0),
-                (bounds["x_max"], bounds["y_min"], 0.0),
-                (bounds["x_max"], bounds["y_max"], 0.0),
-                (bounds["x_min"], bounds["y_max"], 0.0),
-            ]]
-            axis.add_collection3d(Poly3DCollection(verts, facecolor="#E8B95A", alpha=0.25, edgecolor="#C6902E"))
-        for link in snapshot["active_links"]:
-            sender = uavs[link["sender_id"]]
-            receiver = gs if link["receiver_id"] == gs["gs_id"] else uavs[link["receiver_id"]]
-            color = "red" if link["link_type"] == "U2U" else "purple"
-            axis.plot([sender["x"], receiver["x"]], [sender["y"], receiver["y"]], [sender["z"], receiver["z"]], color=color, linestyle="--", linewidth=1.3)
-        axis.set_xlim(0, 1000)
-        axis.set_ylim(0, 1000)
-        axis.set_zlim(0, 180)
-        axis.set_xlabel("X(m)")
-        axis.set_ylabel("Y(m)")
-        axis.set_zlabel("Z(m)")
-        axis.view_init(elev=20, azim=60)
-        axis.set_title(f"({chr(96 + index)}) $t={snapshot['requested_time_seconds']:g}$: {_phase_subtitle(snapshot['target_uav_phase'])}", y=-0.19)
-        handles = [
-            Line2D([0], [0], color="green", label="Target UAV"),
-            Line2D([0], [0], marker="o", color="green", linestyle="", label="UAV initial point"),
-            Line2D([0], [0], marker="o", color="lightgray", linestyle="", label="Other UAVs"),
-            Line2D([0], [0], color="#243BFF", linestyle="--", label="SR Path"),
-            Line2D([0], [0], marker="s", color="#243BFF", linestyle="", label="SR team initial point"),
-            Line2D([0], [0], marker="^", color="red", linestyle="", label="GS"),
-            Line2D([0], [0], marker="o", markerfacecolor="none", markeredgecolor="magenta", color="none", label="Detected RoIs"),
-            Line2D([0], [0], marker="o", markerfacecolor="none", markeredgecolor="gray", color="none", label="Other RoIs"),
-            Line2D([0], [0], color="red", linestyle="--", label="U2U Link"),
-            Line2D([0], [0], color="purple", linestyle="--", label="U2G Link"),
-            Patch(facecolor="#E8B95A", alpha=0.25, label="Sensing coverage"),
-        ]
-        axis.legend(handles=handles, fontsize=7, ncol=2, loc="upper right")
-    figure.subplots_adjust(bottom=0.18, wspace=0.12)
+    actual = float(snapshot["actual_time_seconds"])
+    uavs = {int(item["uav_id"]): item for item in snapshot["uavs"]}
+    target = uavs[int(target_uav_id)]
+    path = [item for item in target_path if float(item["actual_time_seconds"]) <= actual]
+    axis.plot([p["x"] for p in path], [p["y"] for p in path], [p["z"] for p in path], color="green", linewidth=1.5)
+    axis.scatter(path[0]["x"], path[0]["y"], path[0]["z"], color="green", s=36)
+    axis.scatter(target["x"], target["y"], target["z"], facecolors="none", edgecolors="green", s=42)
+    others = [item for uid, item in uavs.items() if uid != int(target_uav_id)]
+    axis.scatter([u["x"] for u in others], [u["y"] for u in others], [u["z"] for u in others], color="lightgray", alpha=0.45, s=24)
+    for sr in snapshot["sr_teams"]:
+        sr_path = [item for item in sr_paths[str(sr["sr_id"])] if float(item["actual_time_seconds"]) <= actual]
+        axis.plot([p["x"] for p in sr_path], [p["y"] for p in sr_path], [p["z"] for p in sr_path], color="#243BFF", linestyle="--", linewidth=1.0)
+        axis.scatter(sr_path[0]["x"], sr_path[0]["y"], sr_path[0]["z"], color="#243BFF", marker="s", s=26)
+        axis.scatter(sr["x"], sr["y"], sr["z"], facecolors="none", edgecolors="#243BFF", marker="s", s=30)
+    gs = snapshot["ground_station"]
+    axis.scatter(gs["x"], gs["y"], gs["z"], color="red", marker="^", s=50)
+    for gt in snapshot["ground_targets"]:
+        _draw_ground_circle(axis, gt["x"], gt["y"], gt["radius_m"], color="magenta" if gt["detected"] else "gray")
+    for coverage in snapshot["sensing_coverage"]:
+        bounds = coverage["clipped_bounds"]
+        verts = [[
+            (bounds["x_min"], bounds["y_min"], 0.0),
+            (bounds["x_max"], bounds["y_min"], 0.0),
+            (bounds["x_max"], bounds["y_max"], 0.0),
+            (bounds["x_min"], bounds["y_max"], 0.0),
+        ]]
+        axis.add_collection3d(Poly3DCollection(verts, facecolor="#E8B95A", alpha=0.25, edgecolor="#C6902E"))
+    for link in snapshot["active_links"]:
+        sender = uavs[link["sender_id"]]
+        receiver = gs if link["receiver_id"] == gs["gs_id"] else uavs[link["receiver_id"]]
+        color = "red" if link["link_type"] == "U2U" else "purple"
+        axis.plot([sender["x"], receiver["x"]], [sender["y"], receiver["y"]], [sender["z"], receiver["z"]], color=color, linestyle="--", linewidth=1.3)
+    axis.set_xlim(0, 1000)
+    axis.set_ylim(0, 1000)
+    axis.set_zlim(0, 180)
+    axis.set_xlabel("X(m)")
+    axis.set_ylabel("Y(m)")
+    axis.set_zlabel("Z(m)")
+    axis.view_init(elev=20, azim=60)
+    title = f"t = {actual:g} s: {_phase_subtitle(snapshot['target_uav_phase'])}"
+    axis.set_title(title)
+    handles = [
+        Line2D([0], [0], color="green", label="Target UAV"),
+        Line2D([0], [0], marker="o", color="green", linestyle="", label="UAV initial point"),
+        Line2D([0], [0], marker="o", color="lightgray", linestyle="", label="Other UAVs"),
+        Line2D([0], [0], color="#243BFF", linestyle="--", label="SR Path"),
+        Line2D([0], [0], marker="s", color="#243BFF", linestyle="", label="SR team initial point"),
+        Line2D([0], [0], marker="^", color="red", linestyle="", label="GS"),
+        Line2D([0], [0], marker="o", markerfacecolor="none", markeredgecolor="magenta", color="none", label="Detected RoIs"),
+        Line2D([0], [0], marker="o", markerfacecolor="none", markeredgecolor="gray", color="none", label="Other RoIs"),
+        Line2D([0], [0], color="red", linestyle="--", label="U2U Link"),
+        Line2D([0], [0], color="purple", linestyle="--", label="U2G Link"),
+        Patch(facecolor="#E8B95A", alpha=0.25, label="Sensing coverage"),
+    ]
+    axis.legend(handles=handles, fontsize=7, ncol=2, loc="upper right")
+    figure.tight_layout()
+    rows = [
+        row
+        for row in _trajectory_rows(artifact)
+        if float(row["requested_time_seconds"]) == requested_time
+    ]
     return _emit(
         figure_id,
         figure,
         output_dir,
-        _trajectory_rows(artifact),
+        rows,
         {
             "source_spec": str(spec_path),
             "method_to_evaluation_run": _run_mapping(runs),
@@ -714,53 +1107,83 @@ def _build_trajectory(spec, spec_path, output_dir, git_sha):
             "scenario_manifest_hash": artifact["scenario_manifest_hash"],
             "checkpoint_path": artifact.get("checkpoint_path"),
             "checkpoint_fingerprint": artifact.get("checkpoint_fingerprint"),
-            "subtitle_definition": "derived from each snapshot target_uav_phase",
+            **_validated_provenance(runs),
+            "requested_time_seconds": requested_time,
+            "actual_time_seconds": actual,
+            "target_uav_phase": snapshot["target_uav_phase"],
+            "title": title,
+            "title_definition": "actual artifact time and target_uav_phase",
             "git_sha": git_sha,
         },
-        json_value=artifact,
+        json_value={
+            "scenario_id": artifact["scenario_id"],
+            "target_uav_id": artifact["target_uav_id"],
+            "scenario_manifest_hash": artifact["scenario_manifest_hash"],
+            "checkpoint_path": artifact.get("checkpoint_path"),
+            "checkpoint_fingerprint": artifact.get("checkpoint_fingerprint"),
+            "snapshot": snapshot,
+        },
     )
 
 
-def _build_arrival(spec, spec_path, output_dir, git_sha):
-    figure_id = "task_type_delay_vs_arrival_rate"
+def _build_arrival(spec, spec_path, output_dir, git_sha, figure_id):
+    suite = "task_type_delay_vs_arrival_rate"
     mapping = PAPER_METHOD_MAPPINGS[figure_id]
     methods = tuple(mapping.values())
-    runs = _resolve_suite_runs(spec, spec_path, figure_id, methods)
-    rows = _metric_rows(runs, "average_e2e_delay_seconds")
+    runs = _resolve_suite_runs(spec, spec_path, suite, methods)
+    task_type = FIGURE_REGISTRY[figure_id]["task_type"]
+    x_values = (
+        (50.0, 100.0, 150.0, 200.0)
+        if task_type == "COM"
+        else (10.0, 20.0, 30.0, 40.0)
+    )
+    point_ids = tuple(f"{task_type.lower()}_rate_{value:g}" for value in x_values)
+    rows = _metric_rows(
+        runs,
+        "average_e2e_delay_seconds",
+        point_ids=point_ids,
+        task_types=(task_type,),
+        swept_only=True,
+    )
     import matplotlib.pyplot as plt
     import numpy as np
 
-    figure, axes = plt.subplots(1, 2, figsize=(11, 4.3))
+    figure, axis = plt.subplots(figsize=(6, 4.3))
     plotted = []
-    for axis, task_type, title in zip(axes, ("COM", "FOV"), ("(a) COM task", "(b) VS task")):
-        task_rows = [row for row in rows if row["task_type"] == task_type and row["swept_task"] == task_type]
-        x_values = sorted({float(row["x_value"]) for row in task_rows})
-        positions = np.arange(len(x_values), dtype=float)
-        width = 0.22
-        for method_index, (label, method) in enumerate(mapping.items()):
-            selected = {float(row["x_value"]): row for row in task_rows if row["method_id"] == method}
-            values = [
-                (float(selected[x]["value"]) * 1000.0 if selected[x]["value"] is not None else math.nan)
-                for x in x_values
-            ]
-            style = PLOT_STYLES[figure_id][method]
-            axis.bar(positions + (method_index - 1) * width, values, width, color=style["color"], label=label)
-            plotted.extend({**selected[x], "display_name": label, "plot_value_milliseconds": (None if selected[x]["value"] is None else selected[x]["value"] * 1000.0)} for x in x_values)
-        axis.set_xticks(positions, [f"{value:g}" for value in x_values])
-        axis.set_xlabel("Arrival rate (packet/s)")
-        axis.set_ylabel("Average E2E delay (ms)")
-        axis.set_title(title, y=-0.28)
-        axis.grid(True, axis="y", linestyle="--", alpha=0.5)
-        axis.legend(fontsize="small")
-    figure.subplots_adjust(bottom=0.25, wspace=0.32)
+    positions = np.arange(len(x_values), dtype=float)
+    width = 0.22
+    for method_index, (label, method) in enumerate(mapping.items()):
+        selected = {
+            float(row["x_value"]): row
+            for row in rows
+            if row["method_id"] == method
+        }
+        values = [
+            (float(selected[x]["value"]) * 1000.0 if selected[x]["value"] is not None else math.nan)
+            for x in x_values
+        ]
+        style = PLOT_STYLES[figure_id][method]
+        axis.bar(positions + (method_index - 1) * width, values, width, color=style["color"], label=label)
+        plotted.extend({**selected[x], "display_name": label, "plot_value_milliseconds": (None if selected[x]["value"] is None else selected[x]["value"] * 1000.0)} for x in x_values)
+    title = "COM task" if task_type == "COM" else "VS task"
+    axis.set_xticks(positions, [f"{value:g}" for value in x_values])
+    axis.set_xlabel("Arrival rate (packet/s)")
+    axis.set_ylabel("Average E2E delay (ms)")
+    axis.set_title(title)
+    axis.grid(True, axis="y", linestyle="--", alpha=0.5)
+    axis.legend(fontsize="small")
+    figure.tight_layout()
     return _emit(
         figure_id, figure, output_dir, plotted,
         {
             "source_spec": str(spec_path),
             "method_to_evaluation_run": _run_mapping(runs),
+            **_validated_provenance(runs),
             "aggregation": "pooled delivered-delay numerator / pooled delivered-packet denominator",
             "display_conversion": "seconds * 1000 = milliseconds",
             "missing_delay": "not plotted; retained as null with missing=true",
+            "task_type": task_type,
+            "title": title,
             "git_sha": git_sha,
         },
     )
@@ -770,7 +1193,18 @@ def _build_violation(spec, spec_path, output_dir, git_sha):
     figure_id = "task_type_delay_violation_vs_target_delay"
     methods = tuple(PAPER_METHOD_MAPPINGS[figure_id])
     runs = _resolve_suite_runs(spec, spec_path, figure_id, methods)
-    rows = _metric_rows(runs, "violation_probability")
+    point_ids = tuple(
+        f"{task.lower()}_deadline_{value:g}s"
+        for task in ("COM", "FOV")
+        for value in (0.5, 1.0, 1.5, 2.0, 2.5, 3.0)
+    )
+    rows = _metric_rows(
+        runs,
+        "violation_probability",
+        point_ids=point_ids,
+        task_types=("FOV", "COM"),
+        swept_only=True,
+    )
     import matplotlib.pyplot as plt
     import numpy as np
 
@@ -808,6 +1242,7 @@ def _build_violation(spec, spec_path, output_dir, git_sha):
         {
             "source_spec": str(spec_path),
             "method_to_evaluation_run": _run_mapping(runs),
+            **_validated_provenance(runs),
             "aggregation": "pooled violation count / pooled generated-packet count",
             "zero_probability_log_handling": "omitted as non-representable on log scale; no epsilon fabricated",
             "git_sha": git_sha,
@@ -819,7 +1254,12 @@ def _build_roi_delay(spec, spec_path, output_dir, git_sha):
     figure_id = "task_type_delay_vs_number_of_rois"
     methods = tuple(PAPER_METHOD_MAPPINGS[figure_id])
     runs = _resolve_suite_runs(spec, spec_path, "fixed_roi", methods)
-    rows = _metric_rows(runs, "average_e2e_delay_seconds")
+    rows = _metric_rows(
+        runs,
+        "average_e2e_delay_seconds",
+        point_ids=tuple(f"roi_{value}" for value in range(2, 9)),
+        task_types=("FOV", "COM"),
+    )
     import matplotlib.pyplot as plt
     import numpy as np
 
@@ -853,6 +1293,7 @@ def _build_roi_delay(spec, spec_path, output_dir, git_sha):
         {
             "source_spec": str(spec_path),
             "method_to_evaluation_run": _run_mapping(runs),
+            **_validated_provenance(runs),
             "aggregation": "pooled delivered-delay numerator / pooled delivered-packet denominator",
             "display_conversion": "seconds * 1000 = milliseconds",
             "missing_delay": "not plotted; retained as null with missing=true",
@@ -872,23 +1313,28 @@ def build_paper_figures(spec_path, figure="all", output_root="results/paper_figu
     if str(figure).lower() == "all":
         figure_ids = tuple(FIGURE_REGISTRY)
     else:
-        figure_ids = (resolve_figure_id(figure),)
+        figure_ids = resolve_figure_ids(figure)
     outputs = {}
     for figure_id in figure_ids:
         if figure_id == "training_ee_vs_episode":
             outputs[figure_id] = _build_training(spec, spec_path, output_dir, git_sha)
-        elif figure_id == "uav_trajectory_snapshots":
-            outputs[figure_id] = _build_trajectory(spec, spec_path, output_dir, git_sha)
-        elif figure_id == "energy_efficiency_design_comparisons":
-            outputs[figure_id] = _build_ee_composite(spec, spec_path, output_dir, git_sha)
+        elif figure_id.startswith("uav_trajectory_t_"):
+            outputs[figure_id] = _build_trajectory(
+                spec, spec_path, output_dir, git_sha, figure_id
+            )
         elif figure_id in {
             "task_assignment_ee_vs_number_of_rois",
             "trajectory_design_ee_vs_number_of_rois",
             "hierarchical_architecture_ee_vs_number_of_rois",
         }:
             outputs[figure_id] = _build_standalone_ee(spec, spec_path, output_dir, git_sha, figure_id)
-        elif figure_id == "task_type_delay_vs_arrival_rate":
-            outputs[figure_id] = _build_arrival(spec, spec_path, output_dir, git_sha)
+        elif figure_id in {
+            "com_task_delay_vs_arrival_rate",
+            "vs_task_delay_vs_arrival_rate",
+        }:
+            outputs[figure_id] = _build_arrival(
+                spec, spec_path, output_dir, git_sha, figure_id
+            )
         elif figure_id == "task_type_delay_violation_vs_target_delay":
             outputs[figure_id] = _build_violation(spec, spec_path, output_dir, git_sha)
         elif figure_id == "task_type_delay_vs_number_of_rois":

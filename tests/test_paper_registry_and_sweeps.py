@@ -15,19 +15,23 @@ from paper_figure_registry import (
     FIGURE_REGISTRY,
     PAPER_METHOD_MAPPINGS,
     resolve_figure_id,
+    resolve_figure_ids,
 )
 from build_paper_figures import build_parser as build_figure_parser
 from run_paper_evaluation import build_parser as build_evaluation_parser
 
 
 EXPECTED_SEMANTIC_FIGURES = (
-    "uav_trajectory_snapshots",
+    "uav_trajectory_t_5s",
+    "uav_trajectory_t_10s",
+    "uav_trajectory_t_15s",
+    "uav_trajectory_t_25s",
     "training_ee_vs_episode",
-    "energy_efficiency_design_comparisons",
     "task_assignment_ee_vs_number_of_rois",
     "trajectory_design_ee_vs_number_of_rois",
     "hierarchical_architecture_ee_vs_number_of_rois",
-    "task_type_delay_vs_arrival_rate",
+    "com_task_delay_vs_arrival_rate",
+    "vs_task_delay_vs_arrival_rate",
     "task_type_delay_violation_vs_target_delay",
     "task_type_delay_vs_number_of_rois",
 )
@@ -52,6 +56,14 @@ class SemanticContractTest(unittest.TestCase):
         self.assertEqual(tuple(FIGURE_REGISTRY), EXPECTED_SEMANTIC_FIGURES)
         self.assertFalse(any(key.startswith("fig") for key in FIGURE_REGISTRY))
         self.assertEqual(resolve_figure_id("fig6"), "task_type_delay_violation_vs_target_delay")
+        self.assertEqual(
+            resolve_figure_ids("fig4"),
+            (
+                "task_assignment_ee_vs_number_of_rois",
+                "trajectory_design_ee_vs_number_of_rois",
+                "hierarchical_architecture_ee_vs_number_of_rois",
+            ),
+        )
         self.assertIn("fig6", DEPRECATED_FIGURE_ALIASES)
 
     def test_cli_choices_expose_only_semantic_names(self):
@@ -60,6 +72,10 @@ class SemanticContractTest(unittest.TestCase):
         self.assertNotIn("fig3_trajectory", evaluation_help)
         self.assertNotIn("fig4a", figure_help)
         self.assertIn("uav_trajectory_snapshots", evaluation_help)
+        self.assertNotIn("uav_trajectory_snapshots", figure_help)
+        self.assertNotIn("energy_efficiency_design_comparisons", figure_help)
+        self.assertNotIn("task_type_delay_vs_arrival_rate", figure_help)
+        self.assertIn("uav_trajectory_t_5s", figure_help)
         self.assertIn("training_ee_vs_episode", figure_help)
 
     def test_drive_provenance_has_read_only_audit_fingerprints(self):

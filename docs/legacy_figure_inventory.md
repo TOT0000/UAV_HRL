@@ -10,7 +10,7 @@ Git history source: commit
 `57f6621d248e2917b6a577d872d6c19d298ed006`, `HRL_task_aware.py`, the inline
 Episodes--Reward plotting block. The production base audited for this change is
 `feature/centralized-td3` at
-`168c917adf5331eac715c0e25b3881123b439f46`.
+`d07521d6bae8c28c67d0dd668cc6511d76d4fd82`.
 
 ## Google Drive sources
 
@@ -34,17 +34,20 @@ Episodes--Reward plotting block. The production base audited for this change is
 
 | Semantic ID / output stem | Original visual contract | Production artifact and intentional changes |
 | --- | --- | --- |
-| `uav_trajectory_snapshots` / `UAV_trajectory_snapshots` | `plot_uav_scene`; 1x4 3D, elevation 20 degrees, azimuth 60 degrees, X/Y 0--1000 m, Z 0--180 m; screenshot `223053` | `trajectory_artifacts.json`. Target UAV is an explicit `target_uav_id`; phase subtitles, UAV/SR paths, detected RoIs, actual routing links, GS, and sensing footprint geometry all come from the selected scenario artifact. No hard-coded UAV 11 or link result remains. |
+| `uav_trajectory_t_5s` / `UAV_trajectory_t_5s` | Standalone t=5 s 3D axes, elevation 20 degrees, azimuth 60 degrees; screenshot `223053` | The t=5 requested snapshot from the shared `trajectory_artifacts.json`; title uses actual artifact time and phase. |
+| `uav_trajectory_t_10s` / `UAV_trajectory_t_10s` | Standalone t=10 s 3D axes; screenshot `223053` | The t=10 requested snapshot from the same evaluated artifact. |
+| `uav_trajectory_t_15s` / `UAV_trajectory_t_15s` | Standalone t=15 s 3D axes; screenshot `223053` | The t=15 requested snapshot from the same evaluated artifact. |
+| `uav_trajectory_t_25s` / `UAV_trajectory_t_25s` | Standalone t=25 s 3D axes; screenshot `223053` | The t=25 requested snapshot from the same evaluated artifact. |
 | `training_ee_vs_episode` / `Training_EE_Vs_episode` | Training renderer; red, green, orange, blue, purple raw/smooth pairs; screenshot `223103` | Five `training_history.jsonl` files. Each episode is timely Mbit x 1e6 divided by `max(mobility J, 1e-12 J)`, followed by an exact causal 50-episode trailing mean. Reward and Dinkelbach surrogate values are not plotted. |
 | `task_assignment_ee_vs_number_of_rois` / `Task_assignment_EE_Vs_number_of_RoIs` | Red-star K-KM, blue-triangle KM, green-circle Random; screenshot `223109` left | Fixed-RoI pooled evaluation data for `td3_dinkelbach`, `km_td3_dinkelbach`, and `random_assignment_td3_dinkelbach`. |
 | `trajectory_design_ee_vs_number_of_rois` / `Trajectory_design_EE_Vs_number_of_RoIs` | Blue-square, brown-diamond, magenta-up-triangle, orange-down-triangle, green-circle sequence; screenshot `223109` middle | Fixed-RoI data for seven registered methods. The two task-potential ablations use documented extra dashed palette entries. |
 | `hierarchical_architecture_ee_vs_number_of_rois` / `Hierarchical_architecture_EE_Vs_number_of_RoIs` | Red-star, blue-square, brown-diamond, green-circle; screenshot `223109` right | Fixed-RoI data for task-aware, masked TD3, masked DDPG, and pure-random architectures. The random method has explicit no-checkpoint provenance. |
-| `energy_efficiency_design_comparisons` / `Energy_efficiency_design_comparisons` | 1x3 composition of the preceding panels; screenshot `223109` | Composes the three semantic panels from the same evaluated artifacts; standalone figures are also emitted by `--figure all`. Y limits are data-driven. |
-| `task_type_delay_vs_arrival_rate` / `Task_type_delay_Vs_arrival_rate` | 1x2 grouped bars; Random green, DQN orange, Safe-DDQN red; screenshot `223114` | COM rates 50/100/150/200 packet/s with VS fixed at 5; VS rates 10/20/30/40 with COM fixed at 50. Delay is pooled from sums/counts in seconds then converted once to milliseconds. |
+| `com_task_delay_vs_arrival_rate` / `COM_task_delay_Vs_arrival_rate` | Standalone grouped bars titled `COM task`; screenshot `223114` | COM rates 50/100/150/200 packet/s with VS fixed at 5. Delay is pooled from sums/counts in seconds then converted once to milliseconds. |
+| `vs_task_delay_vs_arrival_rate` / `VS_task_delay_Vs_arrival_rate` | Standalone grouped bars titled `VS task`; screenshot `223114` | VS rates 10/20/30/40 packet/s with COM fixed at 50. Delay is pooled from sums/counts in seconds then converted once to milliseconds. |
 | `task_type_delay_violation_vs_target_delay` / `Task_type_delay_violation_Vs_target_delay` | Log-y; method color/marker plus VS solid-filled and COM dashed-open; screenshot `223119` | Every 0.5--3.0 s threshold is a real rerun. Probability is pooled violations/generated. A true zero is omitted on log axes and remains zero in source data; no epsilon is fabricated. |
 | `task_type_delay_vs_number_of_rois` / `Task_type_delay_Vs_number_of_RoIs` | Method color/marker plus VS solid-filled and COM dashed-open; screenshot `223125` | Fixed RoIs 2--8. Delay is pooled by delivered-packet count and converted from seconds to milliseconds. Zero-delivery points remain `null` with `missing=true`, never zero. |
 
-All nine contracts, method order, palette, markers, line styles, subplot shape,
+All twelve standalone contracts, method order, palette, markers, line styles, axes shape,
 source provenance, screenshot description, and intentional differences are
 machine-readable in `paper_figure_registry.py`.
 
@@ -59,5 +62,13 @@ machine-readable in `paper_figure_registry.py`.
 - Every learned method requires the formal `ep_2500` checkpoint. The
   `kkm_random_action_random_routing` baseline learns neither component, creates
   no `models.pt`, and records `checkpoint_required=false`.
+- Figure builds inspect the actual `metadata.json` and `models.pt` without
+  loading weights, recompute the canonical metadata fingerprint, and compare it
+  with top-level, point-level, trajectory, and resolved-spec provenance.
+- Every point reloads its actual `scenario_manifest.json` through
+  `ScenarioManifest.load()`, verifies the canonical hash, scenario IDs,
+  episode count, 60-second horizon, seeds, 16 UAV entries, fixed-RoI content,
+  and resolved arrival/deadline overrides.
 - Deprecated `fig*` names exist only as internal compatibility aliases. CLI
-  choices, metadata, directories, and filenames use semantic names.
+  choices, metadata, directories, and filenames use semantic names. Family
+  aliases expand to standalone outputs and never render a composite.

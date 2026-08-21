@@ -15,6 +15,7 @@ from experiment_config import (
     FORMAL_CHECKPOINT_EPISODE,
     FORMAL_EXPERIMENT_DEFAULTS,
     MethodSpec,
+    NUM_UAV,
 )
 from HRL_task_aware import TrainingConfig, train
 from Packet_scheduler_v1 import TASK_DEADLINE_SECONDS
@@ -504,9 +505,24 @@ def run_paper_evaluation(
         point_results.append(
             {
                 **point,
+                "scenario_manifest_path": str(
+                    (point_dir / "scenario_manifest.json").resolve()
+                ),
+                "scenario_manifest_hash": manifest.content_hash,
                 "manifest_hash": manifest.content_hash,
                 "scenario_ids": list(result["scenario_ids"]),
+                "evaluation_episode_count": resolved_episodes,
+                "evaluation_horizon_seconds": resolved_seconds,
+                "evaluation_seed": context["training_seed"],
+                "manifest_seed": manifest.manifest_seed,
+                "num_uav": NUM_UAV,
+                "resolved_overrides": result["run_metadata"].get(
+                    "evaluation_overrides"
+                ),
                 "checkpoint_required": checkpoint_required,
+                "checkpoint_path": (
+                    str(context["checkpoint"]) if checkpoint_required else None
+                ),
                 "checkpoint_metadata_fingerprint": result["run_metadata"].get(
                     "checkpoint_metadata_fingerprint"
                 ),
@@ -527,6 +543,12 @@ def run_paper_evaluation(
         "checkpoint_required": checkpoint_required,
         "checkpoint_path": str(context["checkpoint"]) if context["checkpoint"] else None,
         "checkpoint_episode": FORMAL_CHECKPOINT_EPISODE if checkpoint_required else None,
+        "checkpoint_metadata_fingerprint": (
+            point_results[0]["checkpoint_metadata_fingerprint"]
+            if point_results
+            else None
+        ),
+        "formal_training_config": context["expected_training_config"],
         "no_checkpoint_reason": (
             None
             if checkpoint_required

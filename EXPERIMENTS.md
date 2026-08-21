@@ -328,6 +328,9 @@ links, sensing footprint geometry, requested/actual times, scenario identity,
 method configuration, checkpoint provenance, and Git SHA.
 
 Each sweep point writes per-episode data plus `aggregated_plot_data.csv/json`.
+Its metadata also persists the actual manifest path and canonical hash,
+scenario IDs, evaluation count/horizon/seed, 16-UAV count, and fully resolved
+traffic-rate/deadline overrides.
 Delay is pooled as total delivered E2E delay divided by total delivered packet
 count. Violation probability is pooled violations divided by generated packet
 count. A delay with no delivered packets is `null` with `missing=true`. EE
@@ -355,16 +358,21 @@ The figure spec explicitly maps training and evaluation directories:
 For `--figure all`, include every required method mapping listed in
 `paper_figure_registry.py`. The builder validates exact methods, formal
 checkpoint/no-checkpoint provenance, sweep values, units, and common scenario
-manifest hashes before rendering. It never starts training.
+manifest hashes before rendering. It reloads every manifest and inspects the
+actual `ep_2500/metadata.json` plus `models.pt` without loading weights, then
+recomputes and compares the canonical checkpoint fingerprint. It never starts
+training.
 
 ```powershell
 python -X utf8 build_paper_figures.py --spec paper_runs.json --figure all
 python -X utf8 build_paper_figures.py --spec paper_runs.json --figure training_ee_vs_episode
 ```
 
-All nine semantic figures produce PNG, PDF, source CSV, source JSON, and a
+All twelve semantic figures produce PNG, PDF, source CSV, source JSON, and a
 resolved semantic specification in a collision-safe
-`results/paper_figures/<timestamp>_<git-sha>/` directory. The 1x3 EE composite
-and all three standalone EE panels are emitted by `all`. See
+`results/paper_figures/<timestamp>_<git-sha>/` directory. Every formal output
+contains exactly one axes. The four trajectory times, three EE comparisons,
+and two arrival-task charts are standalone files; deprecated family aliases
+expand to those files and never emit a composite. See
 `docs/legacy_figure_inventory.md` for Drive file IDs, content fingerprints,
 screenshot references, visual contracts, and intentional changes.

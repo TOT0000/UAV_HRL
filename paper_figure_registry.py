@@ -99,6 +99,16 @@ PAPER_METHOD_MAPPINGS = MappingProxyType(
             "DQN": "td3_dinkelbach_dqn",
             "Safe-DDQN": "td3_dinkelbach",
         },
+        "com_task_delay_vs_arrival_rate": {
+            "Random": "td3_dinkelbach_random_routing",
+            "DQN": "td3_dinkelbach_dqn",
+            "Safe-DDQN": "td3_dinkelbach",
+        },
+        "vs_task_delay_vs_arrival_rate": {
+            "Random": "td3_dinkelbach_random_routing",
+            "DQN": "td3_dinkelbach_dqn",
+            "Safe-DDQN": "td3_dinkelbach",
+        },
         "task_type_delay_violation_vs_target_delay": (
             "td3_dinkelbach_random_routing",
             "td3_dinkelbach_dqn",
@@ -182,6 +192,16 @@ PLOT_STYLES = MappingProxyType(
             "td3_dinkelbach_dqn": {"color": "#F39C00"},
             "td3_dinkelbach": {"color": "red"},
         },
+        "com_task_delay_vs_arrival_rate": {
+            "td3_dinkelbach_random_routing": {"color": "#187600"},
+            "td3_dinkelbach_dqn": {"color": "#F39C00"},
+            "td3_dinkelbach": {"color": "red"},
+        },
+        "vs_task_delay_vs_arrival_rate": {
+            "td3_dinkelbach_random_routing": {"color": "#187600"},
+            "td3_dinkelbach_dqn": {"color": "#F39C00"},
+            "td3_dinkelbach": {"color": "red"},
+        },
         "task_type_delay_violation_vs_target_delay": {
             "td3_dinkelbach_random_routing": {"label": "Random", "color": "#187600", "marker": "*"},
             "td3_dinkelbach_dqn": {"label": "DQN", "color": "#F39C00", "marker": "s"},
@@ -204,18 +224,45 @@ def _source(*keys):
 
 FIGURE_REGISTRY = MappingProxyType(
     {
-        "uav_trajectory_snapshots": {
-            "output_stem": "UAV_trajectory_snapshots",
+        "uav_trajectory_t_5s": {
+            "output_stem": "UAV_trajectory_t_5s",
             "sources": _source("total_collector"),
             "production_source": "trajectory_artifacts.json from deterministic unified-runner evaluation",
-            "screenshot_reference": "four 3D snapshots; screenshot 2026-08-21 223053",
-            "subplots": [1, 4],
+            "screenshot_reference": "standalone t=5 s 3D snapshot; screenshot 2026-08-21 223053",
+            "subplots": [1, 1],
+            "requested_time_seconds": 5.0,
             "camera": {"elevation_degrees": 20, "azimuth_degrees": 60},
             "methods": ("td3_dinkelbach",),
-            "intentional_changes": [
-                "target UAV is selected explicitly by target_uav_id",
-                "phase subtitles, paths, links, RoIs, and coverage come from artifacts",
-            ],
+        },
+        "uav_trajectory_t_10s": {
+            "output_stem": "UAV_trajectory_t_10s",
+            "sources": _source("total_collector"),
+            "production_source": "trajectory_artifacts.json from deterministic unified-runner evaluation",
+            "screenshot_reference": "standalone t=10 s 3D snapshot; screenshot 2026-08-21 223053",
+            "subplots": [1, 1],
+            "requested_time_seconds": 10.0,
+            "camera": {"elevation_degrees": 20, "azimuth_degrees": 60},
+            "methods": ("td3_dinkelbach",),
+        },
+        "uav_trajectory_t_15s": {
+            "output_stem": "UAV_trajectory_t_15s",
+            "sources": _source("total_collector"),
+            "production_source": "trajectory_artifacts.json from deterministic unified-runner evaluation",
+            "screenshot_reference": "standalone t=15 s 3D snapshot; screenshot 2026-08-21 223053",
+            "subplots": [1, 1],
+            "requested_time_seconds": 15.0,
+            "camera": {"elevation_degrees": 20, "azimuth_degrees": 60},
+            "methods": ("td3_dinkelbach",),
+        },
+        "uav_trajectory_t_25s": {
+            "output_stem": "UAV_trajectory_t_25s",
+            "sources": _source("total_collector"),
+            "production_source": "trajectory_artifacts.json from deterministic unified-runner evaluation",
+            "screenshot_reference": "standalone t=25 s 3D snapshot; screenshot 2026-08-21 223053",
+            "subplots": [1, 1],
+            "requested_time_seconds": 25.0,
+            "camera": {"elevation_degrees": 20, "azimuth_degrees": 60},
+            "methods": ("td3_dinkelbach",),
         },
         "training_ee_vs_episode": {
             "output_stem": "Training_EE_Vs_episode",
@@ -234,21 +281,6 @@ FIGURE_REGISTRY = MappingProxyType(
                 "reward is replaced with independent episode timely-bit/mobility-energy EE",
                 "Drive hard-coded y arrays are never used",
             ],
-        },
-        "energy_efficiency_design_comparisons": {
-            "output_stem": "Energy_efficiency_design_comparisons",
-            "sources": _source(
-                "assignment_renderer", "trajectory_design_renderer", "hierarchical_renderer"
-            ),
-            "production_source": "fixed_roi pooled evaluation artifacts",
-            "screenshot_reference": "one-by-three EE comparison; screenshot 2026-08-21 223109",
-            "subplots": [1, 3],
-            "components": (
-                "task_assignment_ee_vs_number_of_rois",
-                "trajectory_design_ee_vs_number_of_rois",
-                "hierarchical_architecture_ee_vs_number_of_rois",
-            ),
-            "intentional_changes": ["y limits are data-driven with padding"],
         },
         "task_assignment_ee_vs_number_of_rois": {
             "output_stem": "Task_assignment_EE_Vs_number_of_RoIs",
@@ -277,13 +309,24 @@ FIGURE_REGISTRY = MappingProxyType(
             "subplots": [1, 1],
             "methods": PAPER_METHOD_MAPPINGS["hierarchical_architecture_ee_vs_number_of_rois"],
         },
-        "task_type_delay_vs_arrival_rate": {
-            "output_stem": "Task_type_delay_Vs_arrival_rate",
+        "com_task_delay_vs_arrival_rate": {
+            "output_stem": "COM_task_delay_Vs_arrival_rate",
             "sources": _source("arrival_renderer"),
             "production_source": "task_type_delay_vs_arrival_rate pooled evaluation artifacts",
-            "screenshot_reference": "one-by-two grouped bars; screenshot 2026-08-21 223114",
-            "subplots": [1, 2],
-            "methods": PAPER_METHOD_MAPPINGS["task_type_delay_vs_arrival_rate"],
+            "screenshot_reference": "standalone COM grouped bars; screenshot 2026-08-21 223114",
+            "subplots": [1, 1],
+            "task_type": "COM",
+            "methods": PAPER_METHOD_MAPPINGS["com_task_delay_vs_arrival_rate"],
+            "conversion": {"internal": "seconds", "display": "milliseconds", "factor": 1000.0},
+        },
+        "vs_task_delay_vs_arrival_rate": {
+            "output_stem": "VS_task_delay_Vs_arrival_rate",
+            "sources": _source("arrival_renderer"),
+            "production_source": "task_type_delay_vs_arrival_rate pooled evaluation artifacts",
+            "screenshot_reference": "standalone VS grouped bars; screenshot 2026-08-21 223114",
+            "subplots": [1, 1],
+            "task_type": "FOV",
+            "methods": PAPER_METHOD_MAPPINGS["vs_task_delay_vs_arrival_rate"],
             "conversion": {"internal": "seconds", "display": "milliseconds", "factor": 1000.0},
         },
         "task_type_delay_violation_vs_target_delay": {
@@ -313,12 +356,39 @@ FIGURE_REGISTRY = MappingProxyType(
 DEPRECATED_FIGURE_ALIASES = MappingProxyType(
     {
         "fig2": "training_ee_vs_episode",
-        "fig3": "uav_trajectory_snapshots",
-        "fig4": "energy_efficiency_design_comparisons",
+        "fig3": (
+            "uav_trajectory_t_5s",
+            "uav_trajectory_t_10s",
+            "uav_trajectory_t_15s",
+            "uav_trajectory_t_25s",
+        ),
+        "uav_trajectory_snapshots": (
+            "uav_trajectory_t_5s",
+            "uav_trajectory_t_10s",
+            "uav_trajectory_t_15s",
+            "uav_trajectory_t_25s",
+        ),
+        "fig4": (
+            "task_assignment_ee_vs_number_of_rois",
+            "trajectory_design_ee_vs_number_of_rois",
+            "hierarchical_architecture_ee_vs_number_of_rois",
+        ),
+        "energy_efficiency_design_comparisons": (
+            "task_assignment_ee_vs_number_of_rois",
+            "trajectory_design_ee_vs_number_of_rois",
+            "hierarchical_architecture_ee_vs_number_of_rois",
+        ),
         "fig4a": "task_assignment_ee_vs_number_of_rois",
         "fig4b": "trajectory_design_ee_vs_number_of_rois",
         "fig4c": "hierarchical_architecture_ee_vs_number_of_rois",
-        "fig5": "task_type_delay_vs_arrival_rate",
+        "fig5": (
+            "com_task_delay_vs_arrival_rate",
+            "vs_task_delay_vs_arrival_rate",
+        ),
+        "task_type_delay_vs_arrival_rate": (
+            "com_task_delay_vs_arrival_rate",
+            "vs_task_delay_vs_arrival_rate",
+        ),
         "fig6": "task_type_delay_violation_vs_target_delay",
         "fig7": "task_type_delay_vs_number_of_rois",
     }
@@ -330,11 +400,24 @@ class LegacyFigureSourceUnavailable(RuntimeError):
 
 
 def resolve_figure_id(figure_id, *, allow_deprecated_alias=True):
+    resolved = resolve_figure_ids(
+        figure_id, allow_deprecated_alias=allow_deprecated_alias
+    )
+    if len(resolved) != 1:
+        raise KeyError(
+            f"deprecated paper figure {figure_id!r} expands to standalone figures: "
+            f"{', '.join(resolved)}"
+        )
+    return resolved[0]
+
+
+def resolve_figure_ids(figure_id, *, allow_deprecated_alias=True):
     key = str(figure_id).strip().lower()
     if key in FIGURE_REGISTRY:
-        return key
+        return (key,)
     if allow_deprecated_alias and key in DEPRECATED_FIGURE_ALIASES:
-        return DEPRECATED_FIGURE_ALIASES[key]
+        value = DEPRECATED_FIGURE_ALIASES[key]
+        return tuple(value) if isinstance(value, tuple) else (value,)
     raise KeyError(f"unknown semantic paper figure: {figure_id}")
 
 
