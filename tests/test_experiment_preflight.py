@@ -53,15 +53,15 @@ class ExperimentPreflightTest(unittest.TestCase):
     def _model_checkpoint(self, root, training_seed=17, mutate=None):
         _, calibration = load_com_capacity_reference()
         formal_config = asdict(
-            formal_training_config(1500, random_seed=training_seed)
+            formal_training_config(2500, random_seed=training_seed)
         )
         dinkelbach_state = DinkelbachBlockState.from_config(formal_config)
-        for _ in range(1500):
+        for _ in range(2500):
             dinkelbach_state.record_episode(1.0, 2.0)
         metadata = {
             "checkpoint_schema_version": CHECKPOINT_SCHEMA_VERSION,
             "checkpoint_type": MODEL_CHECKPOINT_TYPE,
-            "episode": 1499,
+            "episode": 2499,
             "movement_state_dim": 532,
             "joint_action_dim": 48,
             "routing_state_dim": 126,
@@ -80,7 +80,7 @@ class ExperimentPreflightTest(unittest.TestCase):
         }
         if mutate is not None:
             mutate(metadata)
-        checkpoint = Path(root) / "checkpoints" / "models" / "ep_1500"
+        checkpoint = Path(root) / "checkpoints" / "models" / "ep_2500"
         checkpoint.mkdir(parents=True)
         (checkpoint / "metadata.json").write_text(
             json.dumps(metadata), encoding="utf-8"

@@ -37,12 +37,20 @@ from com_capacity_calibration import load_com_capacity_reference
 from exploration_schedules import (
     ddqn_decay_steps,
     ddqn_epsilon,
-    td3_behavior_noise,
-    td3_decay_steps,
+    movement_behavior_noise,
+    movement_decay_steps,
 )
 from evaluation_metrics import safe_energy_efficiency
-from experiment_config import MethodSpec
-from td3 import TD3
+from experiment_config import (
+    DEFAULT_TRAINING_SEED,
+    FORMAL_CHECKPOINT_EPISODE,
+    FORMAL_EXPERIMENT_DEFAULTS,
+    MethodSpec,
+    NUM_UAV,
+    ROI_COUNT_MAX,
+    ROI_COUNT_MIN,
+)
+from movement_agents import create_movement_agent
 from training_checkpoint import (
     FULL_RESUME_LOGGING_SCHEMA_VERSION,
     checkpoint_episode_schedule,
@@ -66,10 +74,16 @@ import utils_update_v2
 
 MOVEMENT_CONTROL_INTERVAL = 4
 ROUTING_STATE_DIM = 126
-PRODUCTION_WARMUP_TRANSITIONS = 1000
-PRODUCTION_BATCH_SIZE = 64
-PRODUCTION_POLICY_DELAY = 2
-SMOKE_RANDOM_SEED = 20260817
+PRODUCTION_WARMUP_TRANSITIONS = FORMAL_EXPERIMENT_DEFAULTS[
+    "movement_hyperparameters"
+]["warmup_joint_transitions"]
+PRODUCTION_BATCH_SIZE = FORMAL_EXPERIMENT_DEFAULTS["movement_hyperparameters"][
+    "batch_size"
+]
+PRODUCTION_POLICY_DELAY = FORMAL_EXPERIMENT_DEFAULTS["movement_hyperparameters"][
+    "td3"
+]["policy_delay"]
+SMOKE_RANDOM_SEED = DEFAULT_TRAINING_SEED
 
 
 def _seed_training_rng(seed):
@@ -132,7 +146,9 @@ class TrainingConfig:
     warmup_joint_transitions: int = PRODUCTION_WARMUP_TRANSITIONS
     batch_size: int = PRODUCTION_BATCH_SIZE
     policy_delay: int = PRODUCTION_POLICY_DELAY
-    replay_max_size: int = int(2e5)
+    replay_max_size: int = FORMAL_EXPERIMENT_DEFAULTS["movement_hyperparameters"][
+        "replay_size"
+    ]
     beta_search: float = 1.0
     beta_vs: float = 1.0
     beta_com: float = 1.0
@@ -145,7 +161,7 @@ class TrainingConfig:
     model_checkpoint_every: int = 50
     full_resume_every: int = 50
     full_resume_keep_last: int = 2
-    formal_evaluation_episode: int = 1500
+    formal_evaluation_episode: int = FORMAL_CHECKPOINT_EPISODE
     checkpoint_root: str = "checkpoints_centralized_td3"
     resume_dir: str | None = None
     enable_model_checkpoints: bool = True
@@ -189,14 +205,14 @@ def smoke_training_config():
     )
 
 
-def formal_training_config(total_episodes, **overrides):
+def formal_training_config(total_episodes=None, **overrides):
     if total_episodes is None:
-        raise ValueError("formal training requires an explicit total_episodes value")
+        total_episodes = FORMAL_EXPERIMENT_DEFAULTS["training_episodes_per_seed"]
     values = {
         "total_episodes": int(total_episodes),
         "mode": "train",
-        "episode_seconds": 60,
-        "routing_slot_seconds": 0.25,
+        "episode_seconds": FORMAL_EXPERIMENT_DEFAULTS["episode_seconds"],
+        "routing_slot_seconds": FORMAL_EXPERIMENT_DEFAULTS["routing_slot_seconds"],
         "warmup_joint_transitions": PRODUCTION_WARMUP_TRANSITIONS,
         "batch_size": PRODUCTION_BATCH_SIZE,
         "policy_delay": PRODUCTION_POLICY_DELAY,
@@ -205,10 +221,15 @@ def formal_training_config(total_episodes, **overrides):
         "dinkelbach_update_rule": DINKELBACH_UPDATE_RULE,
         "dinkelbach_numerator_unit": DINKELBACH_NUMERATOR_UNIT,
         "dinkelbach_denominator_unit": DINKELBACH_DENOMINATOR_UNIT,
-        "model_checkpoint_every": 50,
-        "full_resume_every": 50,
+        "model_checkpoint_every": FORMAL_EXPERIMENT_DEFAULTS[
+            "checkpoint_interval_episodes"
+        ],
+        "full_resume_every": FORMAL_EXPERIMENT_DEFAULTS[
+            "checkpoint_interval_episodes"
+        ],
         "full_resume_keep_last": 2,
-        "formal_evaluation_episode": 1500,
+        "formal_evaluation_episode": FORMAL_CHECKPOINT_EPISODE,
+        "random_seed": DEFAULT_TRAINING_SEED,
     }
     values.update(overrides)
     return TrainingConfig(**values)
@@ -401,14 +422,22 @@ def _interval_reward(
     potentials_t1,
     done,
     config,
+    reward_mode="dinkelbach",
+    task_potential_enabled=True,
 ):
     next_values = (0.0, 0.0, 0.0) if done else potentials_t1
-    shaping = (
+    shaping = float(bool(task_potential_enabled)) * (
         config.beta_search * (gamma * next_values[0] - potentials_t[0])
         + config.beta_vs * (gamma * next_values[1] - potentials_t[1])
         + config.beta_com * (gamma * next_values[2] - potentials_t[2])
     )
-    return float(delivered_mbits - current_lambda * energy + shaping)
+    if reward_mode == "dinkelbach":
+        objective = float(delivered_mbits) - float(current_lambda) * float(energy)
+    elif reward_mode == "ratio":
+        objective = safe_energy_efficiency(delivered_mbits, energy)
+    else:
+        raise ValueError(f"unsupported reward mode: {reward_mode}")
+    return float(objective + shaping)
 
 
 def _is_checkpoint_episode(completed_episode, total_episodes, every):
@@ -423,9 +452,30 @@ def _append_lambda_history(
     *,
     lambda_used,
     lambda_after_episode,
+    dinkelbach_active=True,
 ):
-    lambda_used_log.append(float(lambda_used))
-    lambda_after_episode_log.append(float(lambda_after_episode))
+    if dinkelbach_active:
+        lambda_used_log.append(float(lambda_used))
+        lambda_after_episode_log.append(float(lambda_after_episode))
+    else:
+        lambda_used_log.append(None)
+        lambda_after_episode_log.append(None)
+
+
+def _inactive_dinkelbach_event(episode):
+    """Compatibility row for the legacy history schema; never updates lambda."""
+
+    return {
+        "dinkelbach_lambda_used": 0.0,
+        "dinkelbach_lambda_after_episode": 0.0,
+        "dinkelbach_lambda_updated": False,
+        "dinkelbach_update_status": "disabled_for_reward_mode",
+        "dinkelbach_block_index": int(episode) + 1,
+        "dinkelbach_block_episode": 1,
+        "dinkelbach_block_timely_mbits_so_far": 0.0,
+        "dinkelbach_block_energy_joules_so_far": 0.0,
+        "dinkelbach_block_completed": False,
+    }
 
 
 def _legacy_training_frame(
@@ -475,6 +525,7 @@ def _full_training_state(
     routing_epsilon_log,
     warmup_joint_transitions,
     training_history_rows,
+    dinkelbach_active=True,
 ):
     return {
         "completed_episode_index": int(episode),
@@ -482,7 +533,11 @@ def _full_training_state(
         "full_resume_logging_schema_version": (
             FULL_RESUME_LOGGING_SCHEMA_VERSION
         ),
-        **dinkelbach_state.training_state(),
+        **(
+            dinkelbach_state.training_state()
+            if dinkelbach_active
+            else {"dinkelbach_active": False}
+        ),
         "reward_log": list(reward_log),
         "delivered_log": list(delivered_log),
         "energy_log": list(energy_log),
@@ -495,6 +550,7 @@ def _full_training_state(
         ),
         "ddqn_schedule_slot": int(routing_slots_executed),
         "td3_noise_log": list(td3_noise_log),
+        "movement_noise_log": list(td3_noise_log),
         "routing_epsilon_log": list(routing_epsilon_log),
         "training_history_rows": list(training_history_rows),
     }
@@ -521,12 +577,19 @@ def _experiment_identity(method_spec, scenario_manifest, training_seed, config):
         "training_seed": (
             int(training_seed) if training_seed is not None else None
         ),
-        **dinkelbach_config_metadata(config),
+        "movement_agent": method_spec.agent,
+        "reward_mode": method_spec.reward_mode,
+        "task_potential_enabled": bool(method_spec.task_potential_enabled),
+        **(
+            dinkelbach_config_metadata(config)
+            if method_spec.uses_dinkelbach
+            else {"dinkelbach_active": False}
+        ),
     }
 
 
 def _evaluation_state_snapshot(
-    td3, ddqn, joint_replay, routing_replay, dinkelbach_state
+    movement_agent, ddqn, joint_replay, routing_replay, dinkelbach_state
 ):
     """Copy all learning state that evaluation is forbidden to mutate."""
 
@@ -544,34 +607,44 @@ def _evaluation_state_snapshot(
             snapshot["n_step_buffer"] = copy.deepcopy(replay.n_step_buffer)
         return snapshot
 
+    kind = movement_agent.agent_kind
+    online = {
+        "q_network": ddqn.q_network.state_dict(),
+        "cost_network": ddqn.cost_network.state_dict(),
+    }
+    targets = {
+        "target_q_network": ddqn.target_q_network.state_dict(),
+        "target_cost_network": ddqn.target_cost_network.state_dict(),
+    }
+    optimizers = {
+        "ddqn_reward": ddqn.optimizer.state_dict(),
+        "ddqn_cost": ddqn.cost_optimizer.state_dict(),
+    }
+    if kind in {"td3", "ddpg"}:
+        online["actor"] = movement_agent.actor.state_dict()
+        targets["actor_target"] = movement_agent.actor_target.state_dict()
+        optimizers["actor"] = movement_agent.actor_optimizer.state_dict()
+    if kind == "td3":
+        online.update(
+            critic_1=movement_agent.critic_1.state_dict(),
+            critic_2=movement_agent.critic_2.state_dict(),
+        )
+        targets.update(
+            critic_1_target=movement_agent.critic_1_target.state_dict(),
+            critic_2_target=movement_agent.critic_2_target.state_dict(),
+        )
+        optimizers.update(
+            critic_1=movement_agent.critic_1_optimizer.state_dict(),
+            critic_2=movement_agent.critic_2_optimizer.state_dict(),
+        )
+    elif kind == "ddpg":
+        online["critic"] = movement_agent.critic.state_dict()
+        targets["critic_target"] = movement_agent.critic_target.state_dict()
+        optimizers["critic"] = movement_agent.critic_optimizer.state_dict()
     return {
-        "online_networks": copy.deepcopy(
-            {
-                "actor": td3.actor.state_dict(),
-                "critic_1": td3.critic_1.state_dict(),
-                "critic_2": td3.critic_2.state_dict(),
-                "q_network": ddqn.q_network.state_dict(),
-                "cost_network": ddqn.cost_network.state_dict(),
-            }
-        ),
-        "target_networks": copy.deepcopy(
-            {
-                "actor_target": td3.actor_target.state_dict(),
-                "critic_1_target": td3.critic_1_target.state_dict(),
-                "critic_2_target": td3.critic_2_target.state_dict(),
-                "target_q_network": ddqn.target_q_network.state_dict(),
-                "target_cost_network": ddqn.target_cost_network.state_dict(),
-            }
-        ),
-        "optimizers": copy.deepcopy(
-            {
-                "actor": td3.actor_optimizer.state_dict(),
-                "critic_1": td3.critic_1_optimizer.state_dict(),
-                "critic_2": td3.critic_2_optimizer.state_dict(),
-                "ddqn_reward": ddqn.optimizer.state_dict(),
-                "ddqn_cost": ddqn.cost_optimizer.state_dict(),
-            }
-        ),
+        "online_networks": copy.deepcopy(online),
+        "target_networks": copy.deepcopy(targets),
+        "optimizers": copy.deepcopy(optimizers),
         "replays": {
             "joint": replay_snapshot(
                 joint_replay,
@@ -596,9 +669,10 @@ def _evaluation_state_snapshot(
             ),
         },
         "update_counters": {
-            "td3_critic": int(td3.num_critic_update_iteration),
-            "td3_actor": int(td3.num_actor_update_iteration),
-            "td3_training": int(td3.num_training),
+            "movement_agent_kind": kind,
+            "movement_critic": int(movement_agent.num_critic_update_iteration),
+            "movement_actor": int(movement_agent.num_actor_update_iteration),
+            "movement_training": int(movement_agent.num_training),
             "ddqn_training": int(ddqn.num_training),
             "ddqn_loss_log": list(ddqn.loss_log),
             "ddqn_cost_loss_log": list(ddqn.cost_loss_log),
@@ -699,6 +773,7 @@ def train(
     expected_checkpoint_episodes=None,
     expected_checkpoint_formal_config=None,
     transition_observer=None,
+    episode_observer=None,
 ):
     if config is None:
         raise ValueError(
@@ -732,14 +807,15 @@ def train(
     _seed_training_rng(config.random_seed)
 
     c_ref_com, calibration = load_com_capacity_reference()
-    env = Simulator(num_UAV=16)
-    packet_engine = PacketEngine(num_uav=16, step_time=config.routing_slot_seconds)
-    centralized_td3 = TD3(
+    env = Simulator(num_UAV=NUM_UAV)
+    packet_engine = PacketEngine(
+        num_uav=NUM_UAV, step_time=config.routing_slot_seconds
+    )
+    movement_agent = create_movement_agent(
+        method_spec,
         MOVEMENT_STATE_DIM,
         JOINT_ACTION_DIM,
-        max_action=1.0,
-        gamma=1.0,
-        policy_delay=config.policy_delay,
+        config,
     )
     ddqn = DDQN(ROUTING_STATE_DIM, env.num_UAV + 1)
     joint_replay = utils_update_v2.ReplayBufferJoint(
@@ -775,7 +851,7 @@ def train(
     if evaluation:
         loaded_checkpoint_metadata = load_model_checkpoint(
             checkpoint_dir,
-            centralized_td3,
+            movement_agent,
             ddqn,
             movement_state_dim=MOVEMENT_STATE_DIM,
             joint_action_dim=JOINT_ACTION_DIM,
@@ -811,17 +887,21 @@ def train(
             "checkpoint_metadata_fingerprint": (
                 checkpoint_metadata_fingerprint(loaded_checkpoint_metadata)
             ),
-            "checkpoint_dinkelbach_config": dinkelbach_config_metadata(
-                checkpoint_experiment["formal_config"]
+            "checkpoint_dinkelbach_config": (
+                dinkelbach_config_metadata(checkpoint_experiment["formal_config"])
+                if method_spec.uses_dinkelbach
+                else None
             ),
-            "checkpoint_dinkelbach_state": dict(
-                checkpoint_experiment["dinkelbach_state"]
+            "checkpoint_dinkelbach_state": (
+                dict(checkpoint_experiment["dinkelbach_state"])
+                if method_spec.uses_dinkelbach
+                else None
             ),
         }
 
     dinkelbach_state = DinkelbachBlockState.from_config(config)
     lambda_ee = float(dinkelbach_state.current_lambda)
-    if loaded_checkpoint_metadata is not None:
+    if loaded_checkpoint_metadata is not None and method_spec.uses_dinkelbach:
         checkpoint_experiment = loaded_checkpoint_metadata["experiment"]
         dinkelbach_state = DinkelbachBlockState.from_training_state(
             checkpoint_experiment.get("dinkelbach_state", {}),
@@ -847,7 +927,7 @@ def train(
             raise FileNotFoundError(f"centralized checkpoint not found: {config.resume_dir}")
         restored = load_full_resume_checkpoint(
             config.resume_dir,
-            td3=centralized_td3,
+            td3=movement_agent,
             ddqn=ddqn,
             joint_replay=joint_replay,
             routing_replay=routing_replay,
@@ -872,12 +952,13 @@ def train(
         )
         training_state = restored["training_state"]
         start_episode = int(training_state["next_episode_index"])
-        dinkelbach_state = DinkelbachBlockState.from_training_state(
-            training_state,
-            config,
-            expected_completed_episodes=start_episode,
-        )
-        lambda_ee = float(dinkelbach_state.current_lambda)
+        if method_spec.uses_dinkelbach:
+            dinkelbach_state = DinkelbachBlockState.from_training_state(
+                training_state,
+                config,
+                expected_completed_episodes=start_episode,
+            )
+            lambda_ee = float(dinkelbach_state.current_lambda)
         reward_log = list(training_state["reward_log"])
         delivered_log = list(training_state["delivered_log"])
         energy_log = list(training_state["energy_log"])
@@ -913,7 +994,7 @@ def train(
 
     evaluation_state_before = (
         _evaluation_state_snapshot(
-            centralized_td3,
+            movement_agent,
             ddqn,
             joint_replay,
             routing_replay,
@@ -929,7 +1010,7 @@ def train(
     proposal_batches = 0
     energy_evaluations = 0
     terminal_joint_transitions = 0
-    td3_schedule_decay = td3_decay_steps(
+    td3_schedule_decay = movement_decay_steps(
         config.total_episodes,
         config.episode_seconds,
         config.warmup_joint_transitions,
@@ -945,7 +1026,9 @@ def train(
     executed_scenario_ids = []
     for episode in range(start_episode, config.total_episodes):
         if scenario_manifest is None:
-            env.num_GT = int(np.random.randint(2, 10))
+            env.num_GT = int(
+                np.random.randint(ROI_COUNT_MIN, ROI_COUNT_MAX + 1)
+            )
             env.reset_environment()
             scenario_id = None
         else:
@@ -996,8 +1079,12 @@ def train(
                     duplicate_target_assertions += 1
                 raise
 
-            if evaluation:
-                raw_joint_action = centralized_td3.select_action(
+            if method_spec.agent == "random":
+                raw_joint_action = np.random.uniform(
+                    -1.0, 1.0, size=JOINT_ACTION_DIM
+                ).astype(np.float32)
+            elif evaluation:
+                raw_joint_action = movement_agent.select_action(
                     state, add_noise=False, noise_std=0.0
                 )
                 environment_actor_calls += 1
@@ -1008,11 +1095,11 @@ def train(
                     -1.0, 1.0, size=JOINT_ACTION_DIM
                 ).astype(np.float32)
             else:
-                behavior_noise = td3_behavior_noise(
+                behavior_noise = movement_behavior_noise(
                     total_joint_transitions - config.warmup_joint_transitions,
                     td3_schedule_decay,
                 )
-                raw_joint_action = centralized_td3.select_action(
+                raw_joint_action = movement_agent.select_action(
                     state, add_noise=True, noise_std=behavior_noise
                 )
                 td3_noise_log.append(behavior_noise)
@@ -1021,7 +1108,7 @@ def train(
 
             # Phase 1 is read-only: all sixteen proposals are built from one snapshot.
             proposals = build_joint_movement_proposals(
-                env, centralized_td3, projected_action
+                env, movement_agent, projected_action
             )
             proposal_batches += 1
             # Phase 2 mutates positions only after every proposal exists.
@@ -1093,7 +1180,7 @@ def train(
                 / config.episode_seconds,
             )
             terminal_joint_transitions += int(done)
-            if not evaluation:
+            if not evaluation and method_spec.learns_movement:
                 joint_replay.add(
                     state,
                     projected_action,
@@ -1116,11 +1203,13 @@ def train(
                 interval_delivered_mbits,
                 interval_energy,
                 episode_lambda,
-                centralized_td3.gamma,
+                movement_agent.gamma,
                 potentials_t,
                 potentials_t1,
                 done,
                 config,
+                reward_mode=method_spec.reward_mode,
+                task_potential_enabled=method_spec.task_potential_enabled,
             )
             episode_reward += interval_reward
             if transition_observer is not None:
@@ -1143,7 +1232,9 @@ def train(
                         "phi_com_t": potentials_t[2],
                         "phi_com_t1": effective_potentials_t1[2],
                         "reward_at_checkpoint_lambda": interval_reward,
-                        "checkpoint_lambda": episode_lambda,
+                        "checkpoint_lambda": (
+                            episode_lambda if method_spec.uses_dinkelbach else None
+                        ),
                         "episode_index": episode,
                         "movement_step": interval,
                         "global_transition_index": global_transition_index,
@@ -1154,16 +1245,19 @@ def train(
 
             if (
                 not evaluation
+                and method_spec.learns_movement
                 and total_joint_transitions >= config.warmup_joint_transitions
                 and joint_replay.size >= config.batch_size
             ):
-                centralized_td3.update_joint(
+                movement_agent.update_joint(
                     joint_replay,
                     current_lambda=episode_lambda,
                     batch_size=config.batch_size,
                     beta_search=config.beta_search,
                     beta_vs=config.beta_vs,
                     beta_com=config.beta_com,
+                    reward_mode=method_spec.reward_mode,
+                    task_potential_enabled=method_spec.task_potential_enabled,
                 )
 
         if not evaluation and routing_replay.size >= config.batch_size:
@@ -1174,12 +1268,14 @@ def train(
         timely_goodput_mbits = float(packet_engine.timely_goodput_bits) / 1e6
         raw_final_hop_mbits = float(packet_engine.raw_final_hop_bits) / 1e6
         dinkelbach_event = None
-        if not evaluation:
+        if not evaluation and method_spec.uses_dinkelbach:
             dinkelbach_event = dinkelbach_state.record_episode(
                 timely_goodput_mbits,
                 episode_energy,
             )
             lambda_ee = float(dinkelbach_state.current_lambda)
+        elif not evaluation:
+            dinkelbach_event = _inactive_dinkelbach_event(episode)
         env.lambda_EE_global = lambda_ee
         reward_log.append(episode_reward)
         delivered_log.append(episode_delivered_mbits)
@@ -1189,6 +1285,7 @@ def train(
             lambda_after_episode_log,
             lambda_used=episode_lambda,
             lambda_after_episode=lambda_ee,
+            dinkelbach_active=method_spec.uses_dinkelbach,
         )
         coverage = float(env.visited_bitmap.mean())
         found_gt_ratio = (
@@ -1253,6 +1350,23 @@ def train(
                 ),
             }
         )
+        if episode_observer is not None:
+            episode_observer(
+                {
+                    **episode_metrics[-1],
+                    "episode": episode + 1,
+                    "reward": float(episode_reward),
+                    "delivered_mbits": float(episode_delivered_mbits),
+                    "mobility_energy_j": float(episode_energy),
+                    "dinkelbach_lambda": (
+                        float(lambda_ee) if method_spec.uses_dinkelbach else None
+                    ),
+                    "reward_mode": method_spec.reward_mode,
+                    "task_potential_enabled": bool(
+                        method_spec.task_potential_enabled
+                    ),
+                }
+            )
         if history_identity is not None:
             training_history_rows.append(
                 build_training_history_row(
@@ -1269,18 +1383,22 @@ def train(
                 training_history_rows,
                 history_identity,
             )
+        lambda_summary = (
+            f"lambda_used={episode_lambda:.9f} lambda_after={lambda_ee:.9f}"
+            if method_spec.uses_dinkelbach
+            else "dinkelbach=disabled"
+        )
         print(
             f"[Episode {episode + 1}] joint_transitions={config.episode_seconds} "
             f"reward={episode_reward:.6f} delivered={episode_delivered_mbits:.6f} Mbit "
-            f"energy={episode_energy:.6f} J lambda_used={episode_lambda:.9f} "
-            f"lambda_after={lambda_ee:.9f} "
+            f"energy={episode_energy:.6f} J {lambda_summary} "
             f"routing_reward={episode_routing_reward:.6f} "
             f"raw_final_bits={packet_engine.raw_final_hop_bits:.0f} "
             f"timely_bits={packet_engine.timely_goodput_bits:.0f} "
             f"wait={packet_engine.wait_actions} partial={packet_engine.partial_transmissions} "
             f"deadline_drops={packet_engine.deadline_drops} "
-            f"critic_updates={centralized_td3.num_critic_update_iteration} "
-            f"actor_updates={centralized_td3.num_actor_update_iteration}"
+            f"critic_updates={movement_agent.num_critic_update_iteration} "
+            f"actor_updates={movement_agent.num_actor_update_iteration}"
         )
         if dinkelbach_event is not None and dinkelbach_event[
             "dinkelbach_block_completed"
@@ -1319,7 +1437,7 @@ def train(
                     config.checkpoint_root, "models", f"ep_{episode + 1:04d}"
                 ),
                 episode=episode,
-                td3=centralized_td3,
+                td3=movement_agent,
                 ddqn=ddqn,
                 movement_state_dim=MOVEMENT_STATE_DIM,
                 joint_action_dim=JOINT_ACTION_DIM,
@@ -1327,8 +1445,14 @@ def train(
                 calibration=calibration,
                 experiment_metadata={
                     **experiment_identity,
-                    "lambda_ee": float(lambda_ee),
-                    "dinkelbach_state": dinkelbach_state.training_state(),
+                    "lambda_ee": (
+                        float(lambda_ee) if method_spec.uses_dinkelbach else None
+                    ),
+                    "dinkelbach_state": (
+                        dinkelbach_state.training_state()
+                        if method_spec.uses_dinkelbach
+                        else {"active": False, "update_count": 0}
+                    ),
                     "formal_config": asdict(config),
                 },
             )
@@ -1347,7 +1471,7 @@ def train(
                     config.checkpoint_root, "full", f"ep_{episode + 1:04d}"
                 ),
                 episode=episode,
-                td3=centralized_td3,
+                td3=movement_agent,
                 ddqn=ddqn,
                 joint_replay=joint_replay,
                 routing_replay=routing_replay,
@@ -1365,6 +1489,7 @@ def train(
                     routing_epsilon_log=routing_epsilon_log,
                     warmup_joint_transitions=config.warmup_joint_transitions,
                     training_history_rows=training_history_rows,
+                    dinkelbach_active=method_spec.uses_dinkelbach,
                 ),
                 formal_config=asdict(config),
                 movement_state_dim=MOVEMENT_STATE_DIM,
@@ -1373,8 +1498,14 @@ def train(
                 calibration=calibration,
                 experiment_metadata={
                     **experiment_identity,
-                    "lambda_ee": float(lambda_ee),
-                    "dinkelbach_state": dinkelbach_state.training_state(),
+                    "lambda_ee": (
+                        float(lambda_ee) if method_spec.uses_dinkelbach else None
+                    ),
+                    "dinkelbach_state": (
+                        dinkelbach_state.training_state()
+                        if method_spec.uses_dinkelbach
+                        else {"active": False, "update_count": 0}
+                    ),
                     "formal_config": asdict(config),
                 },
                 keep_last=config.full_resume_keep_last,
@@ -1412,7 +1543,7 @@ def train(
     evaluation_state_fingerprints = None
     if evaluation:
         evaluation_state_after = _evaluation_state_snapshot(
-            centralized_td3,
+            movement_agent,
             ddqn,
             joint_replay,
             routing_replay,
@@ -1462,18 +1593,25 @@ def train(
         "episodes": len(reward_log),
         "episodes_run": len(reward_log) - initial_log_length,
         "joint_transitions": total_joint_transitions,
-        "critic_updates": centralized_td3.num_critic_update_iteration,
-        "actor_updates": centralized_td3.num_actor_update_iteration,
+        "critic_updates": movement_agent.num_critic_update_iteration,
+        "actor_updates": movement_agent.num_actor_update_iteration,
         "routing_state_dim": ROUTING_STATE_DIM,
         "movement_state_dim": MOVEMENT_STATE_DIM,
         "joint_action_dim": JOINT_ACTION_DIM,
-        "centralized_td3_gamma": centralized_td3.gamma,
+        "centralized_td3_gamma": movement_agent.gamma,
+        "movement_agent_kind": movement_agent.agent_kind,
         "routing_ddqn_gamma": ddqn.gamma,
         "joint_replay_size": joint_replay.size,
         "routing_replay_size": routing_replay.size,
-        "lambda": lambda_ee,
-        "dinkelbach_update_count": int(dinkelbach_state.update_count),
-        "dinkelbach_state": dinkelbach_state.training_state(),
+        "lambda": float(lambda_ee) if method_spec.uses_dinkelbach else None,
+        "dinkelbach_update_count": (
+            int(dinkelbach_state.update_count) if method_spec.uses_dinkelbach else 0
+        ),
+        "dinkelbach_state": (
+            dinkelbach_state.training_state()
+            if method_spec.uses_dinkelbach
+            else {"active": False, "update_count": 0}
+        ),
         "calibration": calibration,
         "duplicate_target_assertions": duplicate_target_assertions,
         "environment_actor_calls": environment_actor_calls,
@@ -1484,6 +1622,7 @@ def train(
         "ddqn_action_selections": ddqn_action_selections,
         "ddqn_training_updates": ddqn.num_training,
         "td3_noise_log": td3_noise_log,
+        "movement_noise_log": td3_noise_log,
         "routing_epsilon_log": routing_epsilon_log,
         "raw_final_hop_bits": packet_engine.raw_final_hop_bits,
         "timely_goodput_bits": packet_engine.timely_goodput_bits,
@@ -1504,8 +1643,16 @@ def train(
             **experiment_identity,
             **checkpoint_provenance,
             "formal_config": asdict(config),
-            "dinkelbach_config": dinkelbach_config_metadata(config),
-            "dinkelbach_state": dinkelbach_state.training_state(),
+            "dinkelbach_config": (
+                dinkelbach_config_metadata(config)
+                if method_spec.uses_dinkelbach
+                else None
+            ),
+            "dinkelbach_state": (
+                dinkelbach_state.training_state()
+                if method_spec.uses_dinkelbach
+                else {"active": False, "update_count": 0}
+            ),
             "evaluation": bool(evaluation),
             "training_history": (
                 {
@@ -1529,8 +1676,10 @@ def train(
         "reward_log": reward_log,
         "delivered_log": delivered_log,
         "energy_log": energy_log,
-        "lambda_used_log": lambda_used_log,
-        "lambda_after_episode_log": lambda_after_episode_log,
+        "lambda_used_log": lambda_used_log if method_spec.uses_dinkelbach else [],
+        "lambda_after_episode_log": (
+            lambda_after_episode_log if method_spec.uses_dinkelbach else []
+        ),
     }
 
 
@@ -1551,7 +1700,8 @@ def parse_training_config(argv=None):
             parser.error("smoke mode fixes --episodes to 1; do not pass --episodes")
         if args.seed is not None:
             parser.error(
-                "smoke mode fixes --seed to 20260817; do not pass --seed"
+                f"smoke mode fixes --seed to {DEFAULT_TRAINING_SEED}; "
+                "do not pass --seed"
             )
         if args.resume_dir is not None:
             parser.error("smoke mode does not support full resume")

@@ -11,7 +11,13 @@ from pathlib import Path
 from com_capacity_calibration import load_com_capacity_reference
 from centralized_movement import JOINT_ACTION_DIM, MOVEMENT_STATE_DIM
 from dinkelbach_blocks import DINKELBACH_TRAINING_STATE_FIELDS
-from experiment_config import FORMAL_EXPERIMENT_DEFAULTS, MethodSpec
+from experiment_config import (
+    DEFAULT_TRAINING_SEED,
+    FORMAL_EXPERIMENT_DEFAULTS,
+    MethodSpec,
+    ROI_COUNT_MAX,
+    ROI_COUNT_MIN,
+)
 from experiment_paths import (
     prepare_run_directory,
     training_run_directory,
@@ -56,8 +62,10 @@ def _num_gt(value):
         number = int(value)
     except ValueError as exc:
         raise argparse.ArgumentTypeError("num_GT must be an integer") from exc
-    if not 2 <= number <= 9:
-        raise argparse.ArgumentTypeError("num_GT must be in [2, 9]")
+    if not ROI_COUNT_MIN <= number <= ROI_COUNT_MAX:
+        raise argparse.ArgumentTypeError(
+            f"num_GT must be in [{ROI_COUNT_MIN}, {ROI_COUNT_MAX}]"
+        )
     return number
 
 
@@ -113,7 +121,9 @@ def command_smoke(args):
         _load_manifest(args.manifest, expected_split=args.split)
         if args.manifest
         else generate_manifest(
-            args.split, manifest_seed=20260817, episode_count=args.episodes
+            args.split,
+            manifest_seed=DEFAULT_TRAINING_SEED,
+            episode_count=args.episodes,
         )
     )
     config = replace(
@@ -252,9 +262,9 @@ def _training_preflight(args):
             "td3_noise_log",
             "routing_epsilon_log",
             "training_history_rows",
-        } | set(DINKELBACH_TRAINING_STATE_FIELDS) | set(
-            FULL_RESUME_LOGGING_STATE_FIELDS
-        )
+        } | set(FULL_RESUME_LOGGING_STATE_FIELDS)
+        if method.uses_dinkelbach:
+            required_training_state |= set(DINKELBACH_TRAINING_STATE_FIELDS)
         missing = required_training_state.difference(training_state)
         if missing:
             raise RuntimeError(
@@ -324,7 +334,9 @@ def build_parser():
     smoke.add_argument("--method", type=_method, default=MethodSpec())
     smoke.add_argument("--split", default="test", choices=("train", "validation", "test"))
     smoke.add_argument("--manifest")
-    smoke.add_argument("--training-seed", type=int, default=20260817)
+    smoke.add_argument(
+        "--training-seed", type=int, default=DEFAULT_TRAINING_SEED
+    )
     smoke.add_argument("--episodes", type=int, default=1)
     smoke.add_argument("--checkpoint")
     smoke.add_argument("--output-dir", default=str(DEFAULT_OUTPUT_DIR / "smoke"))

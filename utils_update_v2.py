@@ -215,12 +215,27 @@ class ReplayBufferJoint:
         beta_search=1.0,
         beta_vs=1.0,
         beta_com=1.0,
+        reward_mode="dinkelbach",
+        task_potential_enabled=True,
     ):
         not_done = self.not_done[indices]
-        reward = (
-            self.delivered_mbits[indices]
-            - float(current_lambda) * self.total_mobility_energy[indices]
-            + float(beta_search)
+        delivered = self.delivered_mbits[indices]
+        energy = self.total_mobility_energy[indices]
+        if reward_mode == "dinkelbach":
+            objective = delivered - float(current_lambda) * energy
+        elif reward_mode == "ratio":
+            objective = np.divide(
+                delivered,
+                energy,
+                out=np.zeros_like(delivered),
+                where=np.isfinite(energy) & (energy > 0.0),
+            )
+            objective[~np.isfinite(objective)] = 0.0
+        else:
+            raise ValueError(f"unsupported reward mode: {reward_mode}")
+        shaping_scale = 1.0 if task_potential_enabled else 0.0
+        reward = objective + shaping_scale * (
+            float(beta_search)
             * (float(gamma) * not_done * self.phi_search_t1[indices] - self.phi_search_t[indices])
             + float(beta_vs)
             * (float(gamma) * not_done * self.phi_vs_t1[indices] - self.phi_vs_t[indices])
@@ -237,6 +252,8 @@ class ReplayBufferJoint:
         beta_search=1.0,
         beta_vs=1.0,
         beta_com=1.0,
+        reward_mode="dinkelbach",
+        task_potential_enabled=True,
     ):
         if self.size <= 0:
             raise ValueError("Replay buffer is empty")
@@ -248,6 +265,8 @@ class ReplayBufferJoint:
             beta_search=beta_search,
             beta_vs=beta_vs,
             beta_com=beta_com,
+            reward_mode=reward_mode,
+            task_potential_enabled=task_potential_enabled,
         )
         return (
             torch.from_numpy(self.state[indices]).to(self.device),

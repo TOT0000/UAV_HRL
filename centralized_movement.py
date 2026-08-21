@@ -4,16 +4,16 @@ import numpy as np
 import torch
 from scipy.integrate import quad
 
+from experiment_config import NUM_UAV, ROI_COUNT_MAX
 from Fov_model_phase import FovModel
 
 
-NUM_UAV = 16
 TASK_TYPES = ("Search", "FOV", "COM", "Hovering")
 LOCAL_MOVEMENT_DIM = 17
 MOVEMENT_STATE_DIM = 532
 JOINT_ACTION_DIM = NUM_UAV * 3
 BACKLOG_NORM_REF_BITS = 5e7
-GT_COUNT_MAX = 10
+GT_COUNT_MAX = ROI_COUNT_MAX
 COVERAGE_GRID_SIZE = 16
 VS_COVERAGE_EPS = 1e-6
 HOVER_ACTION = (-1.0, 0.0, 0.0)

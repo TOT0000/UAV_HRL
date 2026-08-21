@@ -11,6 +11,8 @@ from typing import Any, Iterable
 
 import numpy as np
 
+from experiment_config import NUM_UAV, ROI_COUNT_MAX, ROI_COUNT_MIN
+
 
 SCENARIO_SCHEMA_VERSION = "uav-hrl-scenario-v2"
 OBSOLETE_SCHEMA_VERSION = "uav-hrl-scenario-v1"
@@ -46,7 +48,9 @@ def sha256_json(value: Any) -> str:
 
 def current_environment_config() -> dict[str, Any]:
     return {
-        "num_uav": 16,
+        "num_uav": NUM_UAV,
+        "roi_count_min": ROI_COUNT_MIN,
+        "roi_count_max": ROI_COUNT_MAX,
         "episode_seconds": 60,
         "routing_slot_seconds": 0.25,
         "environment_width_m": 1000,
@@ -72,19 +76,25 @@ def build_generation_profile(num_gt: int | None = None) -> dict[str, Any]:
         return {
             "num_gt_mode": "mixed",
             "fixed_num_gt": None,
-            "mixed_num_gt_min": 2,
-            "mixed_num_gt_max": 9,
+            "mixed_num_gt_min": ROI_COUNT_MIN,
+            "mixed_num_gt_max": ROI_COUNT_MAX,
         }
     if isinstance(num_gt, bool) or int(num_gt) != num_gt:
-        raise ValueError("fixed num_GT must be an integer from 2 through 9")
+        raise ValueError(
+            f"fixed num_GT must be an integer from {ROI_COUNT_MIN} "
+            f"through {ROI_COUNT_MAX}"
+        )
     fixed_num_gt = int(num_gt)
-    if not 2 <= fixed_num_gt <= 9:
-        raise ValueError("fixed num_GT must be in the inclusive range [2, 9]")
+    if not ROI_COUNT_MIN <= fixed_num_gt <= ROI_COUNT_MAX:
+        raise ValueError(
+            "fixed num_GT must be in the inclusive range "
+            f"[{ROI_COUNT_MIN}, {ROI_COUNT_MAX}]"
+        )
     return {
         "num_gt_mode": "fixed",
         "fixed_num_gt": fixed_num_gt,
-        "mixed_num_gt_min": 2,
-        "mixed_num_gt_max": 9,
+        "mixed_num_gt_min": ROI_COUNT_MIN,
+        "mixed_num_gt_max": ROI_COUNT_MAX,
     }
 
 
@@ -197,7 +207,7 @@ def generate_scenario_entry(
     np_rng = np.random.default_rng(scenario_seed)
     py_rng = random.Random(scenario_seed)
     episode_num_gt = (
-        int(np_rng.integers(2, 10))
+        int(np_rng.integers(ROI_COUNT_MIN, ROI_COUNT_MAX + 1))
         if generation_profile["num_gt_mode"] == "mixed"
         else int(generation_profile["fixed_num_gt"])
     )
@@ -251,8 +261,12 @@ def validate_scenario_entry(entry: dict[str, Any]) -> None:
         )
     if int(entry["num_GT"]) != len(entry["ground_targets"]):
         raise ValueError("scenario num_GT does not match ground target data")
-    if len(entry["uavs"]) != 16:
-        raise ValueError("scenario must contain exactly 16 UAVs")
+    if not ROI_COUNT_MIN <= int(entry["num_GT"]) <= ROI_COUNT_MAX:
+        raise ValueError(
+            f"scenario num_GT must be in [{ROI_COUNT_MIN}, {ROI_COUNT_MAX}]"
+        )
+    if len(entry["uavs"]) != NUM_UAV:
+        raise ValueError(f"scenario must contain exactly {NUM_UAV} UAVs")
     if len(entry["sr_teams"]) != int(entry["num_GT"]):
         raise ValueError("scenario SR team count must equal num_GT")
 
@@ -328,8 +342,11 @@ class ScenarioManifest:
             if generation_profile["num_gt_mode"] == "fixed":
                 if num_gt != int(generation_profile["fixed_num_gt"]):
                     raise ValueError("fixed num_GT manifest contains a mixed entry")
-            elif not 2 <= num_gt <= 9:
-                raise ValueError("mixed num_GT entry is outside [2, 9]")
+            elif not ROI_COUNT_MIN <= num_gt <= ROI_COUNT_MAX:
+                raise ValueError(
+                    "mixed num_GT entry is outside "
+                    f"[{ROI_COUNT_MIN}, {ROI_COUNT_MAX}]"
+                )
         unsigned = {key: value for key, value in data.items() if key != "content_hash"}
         expected_hash = sha256_json(unsigned)
         if data.get("content_hash") != expected_hash:

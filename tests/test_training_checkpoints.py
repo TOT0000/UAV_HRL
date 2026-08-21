@@ -620,7 +620,7 @@ class TrainingCliTest(unittest.TestCase):
         with contextlib.redirect_stderr(stderr):
             with self.assertRaises(SystemExit):
                 parse_training_config(
-                    ["--mode", "train", "--episodes", "1500"]
+                    ["--mode", "train", "--episodes", "2500"]
                 )
         self.assertIn("formal train mode requires --seed", stderr.getvalue())
 
@@ -634,19 +634,19 @@ class TrainingCliTest(unittest.TestCase):
                 "--mode",
                 "train",
                 "--episodes",
-                "1500",
+                "2500",
                 "--seed",
                 "20260817",
             ]
         )
         self.assertEqual(formal.mode, "train")
-        self.assertEqual(formal.total_episodes, 1500)
+        self.assertEqual(formal.total_episodes, 2500)
         self.assertEqual(formal.random_seed, 20260817)
         self.assertEqual(formal.warmup_joint_transitions, 1000)
         self.assertEqual(formal.model_checkpoint_every, 50)
         self.assertEqual(formal.full_resume_every, 50)
         self.assertEqual(formal.full_resume_keep_last, 2)
-        self.assertEqual(formal.formal_evaluation_episode, 1500)
+        self.assertEqual(formal.formal_evaluation_episode, 2500)
         self.assertEqual(formal.dinkelbach_initial_lambda, 0.0)
         self.assertEqual(formal.dinkelbach_update_interval_episodes, 50)
         self.assertEqual(formal.dinkelbach_update_rule, "ratio_of_block_sums")

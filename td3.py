@@ -64,6 +64,8 @@ class Critic(nn.Module):
 
 
 class TD3():
+    agent_kind = "td3"
+
     def __init__(
         self, 
         state_dim,
@@ -73,7 +75,9 @@ class TD3():
         tau=0.005,
         policy_noise=0.2,
         noise_clip=0.5,
-        policy_delay=2
+        policy_delay=2,
+        actor_lr=6e-5,
+        critic_lr=2e-4,
         ):
 
         # self.lambd = 1
@@ -88,9 +92,9 @@ class TD3():
         # self.cost_2 = Critic(state_dim, action_dim).to(device)
         # self.cost_2_target = Critic(state_dim, action_dim).to(device)        
 
-        self.actor_optimizer = optim.Adam(self.actor.parameters(), lr=6e-5)
-        self.critic_1_optimizer = optim.Adam(self.critic_1.parameters(), lr=2e-4)
-        self.critic_2_optimizer = optim.Adam(self.critic_2.parameters(), lr=2e-4)       
+        self.actor_optimizer = optim.Adam(self.actor.parameters(), lr=actor_lr)
+        self.critic_1_optimizer = optim.Adam(self.critic_1.parameters(), lr=critic_lr)
+        self.critic_2_optimizer = optim.Adam(self.critic_2.parameters(), lr=critic_lr)
 
         self.actor_target.load_state_dict(self.actor.state_dict())
         self.critic_1_target.load_state_dict(self.critic_1.state_dict())
@@ -248,6 +252,8 @@ class TD3():
         beta_search=1.0,
         beta_vs=1.0,
         beta_com=1.0,
+        reward_mode="dinkelbach",
+        task_potential_enabled=True,
     ):
         state, action, next_state, reward, not_done = replay_memory.sample(
             batch_size=batch_size,
@@ -256,6 +262,8 @@ class TD3():
             beta_search=beta_search,
             beta_vs=beta_vs,
             beta_com=beta_com,
+            reward_mode=reward_mode,
+            task_potential_enabled=task_potential_enabled,
         )
         state = state.to(device)
         action = action.to(device)

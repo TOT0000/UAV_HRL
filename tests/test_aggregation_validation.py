@@ -18,7 +18,7 @@ class FormalAggregationValidationTest(unittest.TestCase):
                     "scenario_id": scenario,
                     "evaluation_manifest_hash": "evaluation-hash",
                     "training_manifest_hash": "training-hash",
-                    "checkpoint_completed_episodes": 1500,
+                    "checkpoint_completed_episodes": 2500,
                     "checkpoint_metadata_fingerprint": f"checkpoint-{seed}",
                 }
                 row.update({metric: 1.0 for metric in METRIC_COLUMNS})

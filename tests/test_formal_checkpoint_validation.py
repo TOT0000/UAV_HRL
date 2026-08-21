@@ -37,15 +37,15 @@ class FormalCheckpointMetadataTest(unittest.TestCase):
         self.training_seed = 17
         self.calibration = {"seed": 8, "c_ref_com": 12.5}
         self.formal_config = asdict(
-            formal_training_config(1500, random_seed=self.training_seed)
+            formal_training_config(2500, random_seed=self.training_seed)
         )
         dinkelbach_state = DinkelbachBlockState.from_config(self.formal_config)
-        for _ in range(1500):
+        for _ in range(2500):
             dinkelbach_state.record_episode(1.0, 2.0)
         self.metadata = {
             "checkpoint_schema_version": CHECKPOINT_SCHEMA_VERSION,
             "checkpoint_type": MODEL_CHECKPOINT_TYPE,
-            "episode": 1499,
+            "episode": 2499,
             "movement_state_dim": MOVEMENT_STATE_DIM,
             "joint_action_dim": JOINT_ACTION_DIM,
             "routing_state_dim": ROUTING_STATE_DIM,
@@ -78,15 +78,15 @@ class FormalCheckpointMetadataTest(unittest.TestCase):
                 "method_spec_fingerprint": self.method.fingerprint,
                 "training_seed": self.training_seed,
             },
-            expected_completed_episodes=1500,
+            expected_completed_episodes=2500,
             expected_formal_config=self.formal_config,
         )
 
-    def test_synthetic_1500_episode_metadata_is_accepted(self):
+    def test_synthetic_2500_episode_metadata_is_accepted(self):
         validated = self._validate()
 
         self.assertIs(validated, self.metadata)
-        self.assertEqual(validated["episode"] + 1, 1500)
+        self.assertEqual(validated["episode"] + 1, 2500)
 
     def test_training_and_evaluation_manifest_hashes_may_differ(self):
         metadata = deepcopy(self.metadata)
@@ -205,7 +205,7 @@ class FormalCheckpointLoadOrderTest(unittest.TestCase):
         _, calibration = load_com_capacity_reference()
         td3, ddqn = self._models()
         formal_config = asdict(
-            formal_training_config(1500, random_seed=training_seed)
+            formal_training_config(2500, random_seed=training_seed)
         )
         dinkelbach_state = DinkelbachBlockState.from_config(formal_config)
         dinkelbach_state.record_episode(1.0, 2.0)

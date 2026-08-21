@@ -146,15 +146,40 @@ def prune_full_resume_checkpoints(full_root, keep_last):
     return removed
 
 
+def _agent_kind(agent):
+    return str(getattr(agent, "agent_kind", "td3"))
+
+
+def _movement_network_states(agent):
+    kind = _agent_kind(agent)
+    if kind == "td3":
+        return {
+            "actor": agent.actor.state_dict(),
+            "actor_target": agent.actor_target.state_dict(),
+            "critic_1": agent.critic_1.state_dict(),
+            "critic_1_target": agent.critic_1_target.state_dict(),
+            "critic_2": agent.critic_2.state_dict(),
+            "critic_2_target": agent.critic_2_target.state_dict(),
+        }
+    if kind == "ddpg":
+        return {
+            "actor": agent.actor.state_dict(),
+            "actor_target": agent.actor_target.state_dict(),
+            "critic": agent.critic.state_dict(),
+            "critic_target": agent.critic_target.state_dict(),
+        }
+    if kind == "random":
+        return {}
+    raise ValueError(f"unsupported movement agent kind: {kind}")
+
+
 def _network_states(td3, ddqn):
+    kind = _agent_kind(td3)
+    movement_key = "td3" if kind == "td3" else "movement_agent"
     return {
-        "td3": {
-            "actor": td3.actor.state_dict(),
-            "actor_target": td3.actor_target.state_dict(),
-            "critic_1": td3.critic_1.state_dict(),
-            "critic_1_target": td3.critic_1_target.state_dict(),
-            "critic_2": td3.critic_2.state_dict(),
-            "critic_2_target": td3.critic_2_target.state_dict(),
+        movement_key: {
+            **({"kind": kind} if movement_key == "movement_agent" else {}),
+            **_movement_network_states(td3),
         },
         "ddqn": {
             "q_network": ddqn.q_network.state_dict(),
@@ -166,13 +191,29 @@ def _network_states(td3, ddqn):
 
 
 def _load_network_states(payload, td3, ddqn):
-    td3_state = payload["td3"]
-    td3.actor.load_state_dict(td3_state["actor"])
-    td3.actor_target.load_state_dict(td3_state["actor_target"])
-    td3.critic_1.load_state_dict(td3_state["critic_1"])
-    td3.critic_1_target.load_state_dict(td3_state["critic_1_target"])
-    td3.critic_2.load_state_dict(td3_state["critic_2"])
-    td3.critic_2_target.load_state_dict(td3_state["critic_2_target"])
+    kind = _agent_kind(td3)
+    if kind == "td3":
+        td3_state = payload["td3"]
+        td3.actor.load_state_dict(td3_state["actor"])
+        td3.actor_target.load_state_dict(td3_state["actor_target"])
+        td3.critic_1.load_state_dict(td3_state["critic_1"])
+        td3.critic_1_target.load_state_dict(td3_state["critic_1_target"])
+        td3.critic_2.load_state_dict(td3_state["critic_2"])
+        td3.critic_2_target.load_state_dict(td3_state["critic_2_target"])
+    elif kind == "ddpg":
+        state = payload["movement_agent"]
+        if state.get("kind") != "ddpg":
+            raise RuntimeError("checkpoint movement agent kind is incompatible")
+        td3.actor.load_state_dict(state["actor"])
+        td3.actor_target.load_state_dict(state["actor_target"])
+        td3.critic.load_state_dict(state["critic"])
+        td3.critic_target.load_state_dict(state["critic_target"])
+    elif kind == "random":
+        state = payload.get("movement_agent") or {}
+        if state.get("kind") != "random":
+            raise RuntimeError("checkpoint movement agent kind is incompatible")
+    else:
+        raise RuntimeError(f"unsupported movement agent kind: {kind}")
 
     ddqn_state = payload["ddqn"]
     ddqn.q_network.load_state_dict(ddqn_state["q_network"])
@@ -200,6 +241,8 @@ def _base_metadata(
         "joint_action_dim": int(joint_action_dim),
         "routing_state_dim": int(routing_state_dim),
         "centralized_td3_gamma": float(td3.gamma),
+        "movement_agent_kind": _agent_kind(td3),
+        "movement_agent_gamma": float(td3.gamma),
         "routing_ddqn_gamma": float(ddqn.gamma),
         "com_calibration_fingerprint": calibration_fingerprint(calibration),
     }
@@ -334,6 +377,12 @@ def _validate_dinkelbach_checkpoint_metadata(metadata, expected_formal_config):
     return state
 
 
+def _checkpoint_uses_dinkelbach(metadata):
+    experiment = metadata.get("experiment") or {}
+    method_spec = experiment.get("method_spec") or {}
+    return method_spec.get("reward_mode", experiment.get("reward_mode", "dinkelbach")) == "dinkelbach"
+
+
 def validate_model_checkpoint_metadata(
     metadata,
     *,
@@ -346,6 +395,7 @@ def validate_model_checkpoint_metadata(
     expected_experiment_metadata=None,
     expected_completed_episodes=None,
     expected_formal_config=None,
+    movement_agent_kind=None,
 ):
     """Validate evaluation provenance before any model payload is loaded."""
 
@@ -363,6 +413,13 @@ def validate_model_checkpoint_metadata(
     checks.update(
         {key: value for key, value in optional_checks.items() if value is not None}
     )
+    if movement_agent_kind is not None:
+        actual_kind = metadata.get("movement_agent_kind", "td3")
+        if actual_kind != movement_agent_kind:
+            raise RuntimeError(
+                "checkpoint movement_agent_kind is incompatible: "
+                f"checkpoint={actual_kind}, expected={movement_agent_kind}"
+            )
     for key, expected in checks.items():
         actual = metadata.get(key)
         if not _metadata_value_matches(actual, expected):
@@ -400,9 +457,10 @@ def validate_model_checkpoint_metadata(
             expected_formal_config,
             FORMAL_CORE_CONFIG_FIELDS,
         )
-        _validate_dinkelbach_checkpoint_metadata(
-            metadata, expected_formal_config
-        )
+        if _checkpoint_uses_dinkelbach(metadata):
+            _validate_dinkelbach_checkpoint_metadata(
+                metadata, expected_formal_config
+            )
     return metadata
 
 
@@ -419,6 +477,7 @@ def inspect_model_checkpoint(
     expected_completed_episodes=None,
     expected_formal_config=None,
     require_episode_directory=False,
+    movement_agent_kind=None,
 ):
     """Validate model metadata and required files without loading weights."""
 
@@ -439,6 +498,7 @@ def inspect_model_checkpoint(
         expected_experiment_metadata=expected_experiment_metadata,
         expected_completed_episodes=expected_completed_episodes,
         expected_formal_config=expected_formal_config,
+        movement_agent_kind=movement_agent_kind,
     )
     if not models_path.is_file():
         raise RuntimeError(f"checkpoint model payload is missing: {models_path}")
@@ -479,6 +539,7 @@ def load_model_checkpoint(
         expected_experiment_metadata=expected_experiment_metadata,
         expected_completed_episodes=expected_completed_episodes,
         expected_formal_config=expected_formal_config,
+        movement_agent_kind=_agent_kind(td3),
     )
     metadata = inspected["metadata"]
     payload = torch.load(
@@ -550,6 +611,82 @@ def _rng_state():
     }
 
 
+def _movement_training_payload(agent):
+    kind = _agent_kind(agent)
+    counters = {
+        "critic_updates": int(agent.num_critic_update_iteration),
+        "actor_updates": int(agent.num_actor_update_iteration),
+        "training_updates": int(agent.num_training),
+    }
+    if kind == "td3":
+        return {
+            "td3_optimizers": {
+                "actor": agent.actor_optimizer.state_dict(),
+                "critic_1": agent.critic_1_optimizer.state_dict(),
+                "critic_2": agent.critic_2_optimizer.state_dict(),
+            },
+            "td3_counters": counters,
+            "td3_hyperparameters": {
+                "gamma": float(agent.gamma),
+                "tau": float(agent.tau),
+                "policy_delay": int(agent.policy_delay),
+                "policy_noise": float(agent.policy_noise),
+                "noise_clip": float(agent.noise_clip),
+                "max_action": float(agent.max_action),
+            },
+        }
+    if kind == "ddpg":
+        return {
+            "movement_agent_optimizers": {
+                "actor": agent.actor_optimizer.state_dict(),
+                "critic": agent.critic_optimizer.state_dict(),
+            },
+            "movement_agent_counters": counters,
+            "movement_agent_hyperparameters": {
+                "gamma": float(agent.gamma),
+                "tau": float(agent.tau),
+                "max_action": float(agent.max_action),
+            },
+        }
+    if kind == "random":
+        return {
+            "movement_agent_optimizers": {},
+            "movement_agent_counters": counters,
+            "movement_agent_hyperparameters": {"gamma": float(agent.gamma)},
+        }
+    raise ValueError(f"unsupported movement agent kind: {kind}")
+
+
+def _restore_movement_training_payload(agent, payload):
+    kind = _agent_kind(agent)
+    if kind == "td3":
+        agent.actor_optimizer.load_state_dict(payload["td3_optimizers"]["actor"])
+        agent.critic_1_optimizer.load_state_dict(
+            payload["td3_optimizers"]["critic_1"]
+        )
+        agent.critic_2_optimizer.load_state_dict(
+            payload["td3_optimizers"]["critic_2"]
+        )
+        counters = payload["td3_counters"]
+        hyperparameters = payload["td3_hyperparameters"]
+    elif kind == "ddpg":
+        optimizers = payload["movement_agent_optimizers"]
+        agent.actor_optimizer.load_state_dict(optimizers["actor"])
+        agent.critic_optimizer.load_state_dict(optimizers["critic"])
+        counters = payload["movement_agent_counters"]
+        hyperparameters = payload["movement_agent_hyperparameters"]
+    elif kind == "random":
+        counters = payload["movement_agent_counters"]
+        hyperparameters = payload["movement_agent_hyperparameters"]
+    else:
+        raise RuntimeError(f"unsupported movement agent kind: {kind}")
+    agent.num_critic_update_iteration = int(counters["critic_updates"])
+    agent.num_actor_update_iteration = int(counters["actor_updates"])
+    agent.num_training = int(counters["training_updates"])
+    for name, value in hyperparameters.items():
+        setattr(agent, name, value)
+
+
 def _restore_rng_state(state):
     random.setstate(state["python"])
     np.random.set_state(state["numpy"])
@@ -601,24 +738,7 @@ def save_full_resume_checkpoint(
         }
         payload = {
             "networks": _network_states(td3, ddqn),
-            "td3_optimizers": {
-                "actor": td3.actor_optimizer.state_dict(),
-                "critic_1": td3.critic_1_optimizer.state_dict(),
-                "critic_2": td3.critic_2_optimizer.state_dict(),
-            },
-            "td3_counters": {
-                "critic_updates": int(td3.num_critic_update_iteration),
-                "actor_updates": int(td3.num_actor_update_iteration),
-                "training_updates": int(td3.num_training),
-            },
-            "td3_hyperparameters": {
-                "gamma": float(td3.gamma),
-                "tau": float(td3.tau),
-                "policy_delay": int(td3.policy_delay),
-                "policy_noise": float(td3.policy_noise),
-                "noise_clip": float(td3.noise_clip),
-                "max_action": float(td3.max_action),
-            },
+            **_movement_training_payload(td3),
             "ddqn_optimizers": {
                 "reward": ddqn.optimizer.state_dict(),
                 "cost": ddqn.cost_optimizer.state_dict(),
@@ -658,6 +778,8 @@ def _validate_full_resume_logging_state(training_state, completed_episode):
             f"expected={FULL_RESUME_LOGGING_SCHEMA_VERSION}"
         )
     expected_length = int(completed_episode)
+    dinkelbach_active = training_state.get("dinkelbach_active", True) is not False
+    lambda_fields = {"lambda_used_log", "lambda_after_episode_log"}
     for field in FULL_RESUME_LOGGING_STATE_FIELDS[1:]:
         values = training_state.get(field)
         if not isinstance(values, (list, tuple)):
@@ -669,10 +791,13 @@ def _validate_full_resume_logging_state(training_state, completed_episode):
                 "checkpoint full-resume logging length is incompatible: "
                 f"{field}={len(values)}, completed_episodes={expected_length}"
             )
-        try:
-            finite = all(np.isfinite(float(value)) for value in values)
-        except (TypeError, ValueError):
-            finite = False
+        if not dinkelbach_active and field in lambda_fields:
+            finite = all(value is None for value in values)
+        else:
+            try:
+                finite = all(np.isfinite(float(value)) for value in values)
+            except (TypeError, ValueError):
+                finite = False
         if not finite:
             raise RuntimeError(
                 f"checkpoint full-resume logging state is non-finite: {field}"
@@ -689,6 +814,7 @@ def _validate_full_metadata(
     ddqn_gamma,
     calibration,
     expected_experiment_metadata=None,
+    movement_agent_kind=None,
 ):
     if metadata.get("checkpoint_type") != FULL_CHECKPOINT_TYPE:
         raise RuntimeError(
@@ -705,6 +831,13 @@ def _validate_full_metadata(
         if actual != expected:
             raise RuntimeError(
                 f"checkpoint {key} is incompatible: checkpoint={actual}, current={expected}"
+            )
+    if movement_agent_kind is not None:
+        actual_kind = metadata.get("movement_agent_kind", "td3")
+        if actual_kind != movement_agent_kind:
+            raise RuntimeError(
+                "checkpoint movement_agent_kind is incompatible: "
+                f"checkpoint={actual_kind}, current={movement_agent_kind}"
             )
     gamma_checks = {
         "centralized_td3_gamma": float(td3_gamma),
@@ -754,6 +887,7 @@ def inspect_full_resume_checkpoint(
     expected_experiment_metadata=None,
     expected_formal_config=None,
     require_episode_directory=False,
+    movement_agent_kind=None,
 ):
     """Validate an exact-resume checkpoint without mutating training state."""
 
@@ -780,6 +914,7 @@ def inspect_full_resume_checkpoint(
         ddqn_gamma=ddqn_gamma,
         calibration=calibration,
         expected_experiment_metadata=expected_experiment_metadata,
+        movement_agent_kind=movement_agent_kind,
     )
     completed_episode = (
         _checkpoint_directory_episode(checkpoint_dir, metadata)
@@ -830,25 +965,27 @@ def inspect_full_resume_checkpoint(
             expected_formal_config,
             FULL_RESUME_CONFIG_FIELDS,
         )
-        _validate_dinkelbach_checkpoint_metadata(
-            metadata, expected_formal_config
-        )
+        if _checkpoint_uses_dinkelbach(metadata):
+            _validate_dinkelbach_checkpoint_metadata(
+                metadata, expected_formal_config
+            )
     if not isinstance(formal_config, dict):
         raise RuntimeError("checkpoint formal training configuration is invalid")
     _validate_full_resume_logging_state(training_state, completed_episode)
-    dinkelbach_state = DinkelbachBlockState.from_training_state(
-        training_state,
-        formal_config,
-        expected_completed_episodes=completed_episode,
-    )
-    if completed_episode > 0 and not np.isclose(
-        float(training_state["lambda_after_episode_log"][-1]),
-        dinkelbach_state.current_lambda,
-    ):
-        raise RuntimeError(
-            "checkpoint lambda-after-episode log is incompatible with "
-            "Dinkelbach block state"
+    if _checkpoint_uses_dinkelbach(metadata):
+        dinkelbach_state = DinkelbachBlockState.from_training_state(
+            training_state,
+            formal_config,
+            expected_completed_episodes=completed_episode,
         )
+        if completed_episode > 0 and not np.isclose(
+            float(training_state["lambda_after_episode_log"][-1]),
+            dinkelbach_state.current_lambda,
+        ):
+            raise RuntimeError(
+                "checkpoint lambda-after-episode log is incompatible with "
+                "Dinkelbach block state"
+            )
     return {
         "checkpoint_dir": checkpoint_dir,
         "completed_episode": completed_episode,
@@ -884,20 +1021,12 @@ def load_full_resume_checkpoint(
         calibration=calibration,
         expected_experiment_metadata=expected_experiment_metadata,
         expected_formal_config=expected_formal_config,
+        movement_agent_kind=_agent_kind(td3),
     )
     metadata = inspected["metadata"]
     payload = inspected["payload"]
     _load_network_states(payload["networks"], td3, ddqn)
-    td3.actor_optimizer.load_state_dict(payload["td3_optimizers"]["actor"])
-    td3.critic_1_optimizer.load_state_dict(payload["td3_optimizers"]["critic_1"])
-    td3.critic_2_optimizer.load_state_dict(payload["td3_optimizers"]["critic_2"])
-    td3.num_critic_update_iteration = int(
-        payload["td3_counters"]["critic_updates"]
-    )
-    td3.num_actor_update_iteration = int(payload["td3_counters"]["actor_updates"])
-    td3.num_training = int(payload["td3_counters"]["training_updates"])
-    for name, value in payload["td3_hyperparameters"].items():
-        setattr(td3, name, value)
+    _restore_movement_training_payload(td3, payload)
 
     ddqn.optimizer.load_state_dict(payload["ddqn_optimizers"]["reward"])
     ddqn.cost_optimizer.load_state_dict(payload["ddqn_optimizers"]["cost"])

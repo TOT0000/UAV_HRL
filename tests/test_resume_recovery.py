@@ -31,7 +31,7 @@ class ResumeRecoveryTest(unittest.TestCase):
         self.calibration = {"c_ref_com": 12.5, "seed": 7}
         self.method = MethodSpec()
         self.formal_config = asdict(
-            formal_training_config(1500, random_seed=101)
+            formal_training_config(2500, random_seed=101)
         )
         self.experiment = {
             "method_spec_fingerprint": self.method.fingerprint,

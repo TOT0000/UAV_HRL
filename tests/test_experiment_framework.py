@@ -32,7 +32,7 @@ class ExperimentFrameworkTest(unittest.TestCase):
             ["aggregate", "--input-dir", "evaluation-results"]
         )
 
-        self.assertEqual(args.expected_seed_count, 5)
+        self.assertEqual(args.expected_seed_count, 1)
         self.assertEqual(args.expected_episodes_per_seed, 100)
 
     def test_manifest_cli_accepts_only_supported_fixed_num_gt(self):

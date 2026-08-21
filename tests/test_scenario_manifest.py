@@ -137,7 +137,7 @@ class ScenarioManifestTest(unittest.TestCase):
 
         self.assertEqual(manifest.schema_version, SCENARIO_SCHEMA_VERSION)
         self.assertEqual(manifest.generation_profile["num_gt_mode"], "mixed")
-        self.assertEqual(values, set(range(2, 10)))
+        self.assertEqual(values, set(range(2, 9)))
 
     def test_fixed_num_gt_profile_applies_to_every_episode_and_environment(self):
         manifest = generate_manifest("test", 910, 5, num_gt=4)
@@ -148,7 +148,7 @@ class ScenarioManifestTest(unittest.TestCase):
                 "num_gt_mode": "fixed",
                 "fixed_num_gt": 4,
                 "mixed_num_gt_min": 2,
-                "mixed_num_gt_max": 9,
+                "mixed_num_gt_max": 8,
             },
         )
         self.assertEqual({entry["num_GT"] for entry in manifest.episodes}, {4})
@@ -164,12 +164,12 @@ class ScenarioManifestTest(unittest.TestCase):
             {2},
         )
         self.assertEqual(
-            {entry["num_GT"] for entry in generate_manifest("test", 1, 2, num_gt=9).episodes},
-            {9},
+            {entry["num_GT"] for entry in generate_manifest("test", 1, 2, num_gt=8).episodes},
+            {8},
         )
-        for value in (1, 10):
+        for value in (1, 9):
             with self.subTest(value=value), self.assertRaisesRegex(
-                ValueError, r"\[2, 9\]"
+                ValueError, r"\[2, 8\]"
             ):
                 generate_manifest("test", 1, 1, num_gt=value)
 

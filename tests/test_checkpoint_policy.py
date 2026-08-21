@@ -10,16 +10,16 @@ from training_checkpoint import (
 
 
 class CheckpointScheduleTest(unittest.TestCase):
-    def test_formal_model_and_full_schedules_are_every_50_with_final_1500(self):
-        expected = list(range(50, 1501, 50))
+    def test_formal_model_and_full_schedules_are_every_50_with_final_2500(self):
+        expected = list(range(50, 2501, 50))
 
-        model_schedule = checkpoint_episode_schedule(1500, 50)
-        full_schedule = checkpoint_episode_schedule(1500, 50)
+        model_schedule = checkpoint_episode_schedule(2500, 50)
+        full_schedule = checkpoint_episode_schedule(2500, 50)
 
         self.assertEqual(model_schedule, expected)
         self.assertEqual(full_schedule, expected)
-        self.assertEqual(len(model_schedule), 30)
-        self.assertEqual(model_schedule.count(1500), 1)
+        self.assertEqual(len(model_schedule), 50)
+        self.assertEqual(model_schedule.count(2500), 1)
 
     def test_custom_75_episode_run_adds_one_nonduplicate_final_checkpoint(self):
         self.assertEqual(checkpoint_episode_schedule(75, 50), [50, 75])

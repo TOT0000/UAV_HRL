@@ -1,37 +1,48 @@
 # Manifest-driven comparison experiments
 
-`comparison_experiment.py` is the single entry point for reproducible training
-and evaluation. This framework version intentionally exposes only the corrected
-current method:
+`run_experiment.py METHOD` runs exactly one controlled trajectory method per
+process. The registry keys are `td3_dinkelbach`, `ddpg_dinkelbach`,
+`td3_ratio`, `ddpg_ratio`, `random_action`,
+`td3_dinkelbach_no_task_potential`, and
+`ddpg_dinkelbach_no_task_potential`. All seven share current K-KM assignment,
+16 UAVs, the common Simulator and synchronous projection/movement flow,
+safe-DDQN routing, energy/delivery accounting, evaluation, and logging.
 
-```text
-current K-KM + centralized TD3 + safe-DDQN + Dinkelbach + no LLM
+```powershell
+python -X utf8 run_experiment.py td3_dinkelbach
+python -X utf8 run_experiment.py ddpg_ratio --smoke
 ```
 
-Unsupported method components fail immediately; there is no fallback to DDPG,
-DQN, KM/random assignment, fixed lambda, or an LLM agent.
+Each invocation creates a new leaf such as
+`results/td3_dinkelbach/20260821T074815213819Z_seed20260817_e354dbd/`.
+The scenario manifest, resolved config, per-episode CSV/JSONL history, metadata,
+and checkpoints stay below that leaf. Existing run leaves are never reused.
+
+`comparison_experiment.py` remains available for manifest-driven evaluation,
+design-dataset collection, aggregation, and exact-resume workflows.
 
 ## Formal protocol
 
-- 1,500 training episodes per training seed
-- 5 independent training seeds
+- 2,500 training episodes for the centrally configured seed `20260817`
+- inclusive RoI count range 2 through 8
 - 60 seconds per episode
 - four 0.25-second routing slots per movement interval
-- 100 evaluation episodes per trained seed
+- 100 evaluation episodes
+- formal model checkpoint `ep_2500`
 - TD3 noise, DDQN epsilon, and DDQN logits noise disabled in evaluation
 - no network, optimizer, target-network, replay, or Dinkelbach update in evaluation
 - Dinkelbach lambda starts at `0.0` and is fixed within each non-overlapping
   50-episode outer block
 - after every complete block, lambda becomes
   `sum(timely delivered Mbit) / sum(all-UAV mobility energy J)`; no scaling,
-  clipping, or moving average is applied (1,500 episodes contain 30 complete
+  clipping, or moving average is applied (2,500 episodes contain 50 complete
   block updates)
 - model-only checkpoint every 50 episodes, including exactly one final checkpoint
 - full-resume checkpoint every 50 episodes, retaining only the latest two
 
-Run one method and one training seed per training/evaluation job. Uncertainty is
-computed from the five trained-policy seed means. Evaluation episodes are
-averaged within each seed first; the 500 episodes are not pooled as 500
+Run one method and the configured training seed per training/evaluation job.
+Evaluation episodes are averaged within the seed; additional explicitly run
+seeds may be aggregated as independent trained-policy seed means
 independent policies. The cross-seed report uses sample standard deviation and
 the Student-t 95% interval `mean +/- t(0.975, n-1) * s / sqrt(n)`. For five
 seeds, the critical value is approximately `2.776`.
@@ -75,7 +86,7 @@ and FOV state; the manifest stores only the underlying demand primitive.
 Generate separate manifests (runtime artifacts should remain outside Git):
 
 ```powershell
-python -X utf8 comparison_experiment.py generate-manifest --split train --manifest-seed 101 --episodes 1500 --manifest runs/comparison/manifests/train.json
+python -X utf8 comparison_experiment.py generate-manifest --split train --manifest-seed 101 --episodes 2500 --manifest runs/comparison/manifests/train.json
 python -X utf8 comparison_experiment.py generate-manifest --split validation --manifest-seed 202 --episodes 100 --manifest runs/comparison/manifests/validation.json
 python -X utf8 comparison_experiment.py generate-manifest --split test --manifest-seed 303 --episodes 100 --manifest runs/comparison/manifests/test.json
 python -X utf8 comparison_experiment.py generate-manifest --split test --manifest-seed 303 --episodes 100 --num-gt 4 --manifest runs/comparison/manifests/test-num-gt-4.json
@@ -91,7 +102,7 @@ Collect deterministic centralized joint transitions for offline LLM design
 analysis with the explicit, evaluation-only collector:
 
 ```powershell
-python -X utf8 comparison_experiment.py collect-design-dataset --split validation --manifest runs/comparison/manifests/validation.json --training-seed 1 --episodes 100 --checkpoint runs/comparison/<method>/train/<train-hash-8>/seed-1/checkpoints/models/ep_1500 --output-dir runs/design --reference-per-episode runs/comparison/<method>/evaluate/validation/<validation-hash-8>/seed-1/per_episode.csv
+python -X utf8 comparison_experiment.py collect-design-dataset --split validation --manifest runs/comparison/manifests/validation.json --training-seed 20260817 --episodes 100 --checkpoint runs/comparison/<method>/train/<train-hash-8>/seed-20260817/checkpoints/models/ep_2500 --output-dir runs/design --reference-per-episode runs/comparison/<method>/evaluate/validation/<validation-hash-8>/seed-20260817/per_episode.csv
 ```
 
 The collector writes to an isolated
@@ -134,17 +145,17 @@ A matching exact resume of an interrupted/failed training run records
 `RESUMING`, then `RUNNING` and `COMPLETED`. Completed evaluation directories
 remain collision protected.
 
-Train one formal seed and evaluate its episode-1500 model-only checkpoint:
+Train the formal seed and evaluate its episode-2500 model-only checkpoint:
 
 ```powershell
-python -X utf8 comparison_experiment.py train --manifest runs/comparison/manifests/train.json --training-seed 1 --episodes 1500 --output-dir runs/comparison
-python -X utf8 comparison_experiment.py evaluate --split test --manifest runs/comparison/manifests/test.json --training-seed 1 --episodes 100 --checkpoint runs/comparison/<method>/train/<train-hash-8>/seed-1/checkpoints/models/ep_1500 --output-dir runs/comparison
+python -X utf8 comparison_experiment.py train --manifest runs/comparison/manifests/train.json --training-seed 20260817 --episodes 2500 --output-dir runs/comparison
+python -X utf8 comparison_experiment.py evaluate --split test --manifest runs/comparison/manifests/test.json --training-seed 20260817 --episodes 100 --checkpoint runs/comparison/<method>/train/<train-hash-8>/seed-20260817/checkpoints/models/ep_2500 --output-dir runs/comparison
 ```
 
 Resume uses a retained full checkpoint from the same canonical run:
 
 ```powershell
-python -X utf8 comparison_experiment.py train --manifest runs/comparison/manifests/train.json --training-seed 1 --episodes 1500 --resume runs/comparison/<method>/train/<train-hash-8>/seed-1/checkpoints/full/ep_1450 --output-dir runs/comparison
+python -X utf8 comparison_experiment.py train --manifest runs/comparison/manifests/train.json --training-seed 20260817 --episodes 2500 --resume runs/comparison/<method>/train/<train-hash-8>/seed-20260817/checkpoints/full/ep_2450 --output-dir runs/comparison
 ```
 
 Exact resume must select the latest valid full-resume checkpoint in the
@@ -175,21 +186,21 @@ block never triggers a forced update. Full-resume logging schema v1 separately
 persists `lambda_used_log` and `lambda_after_episode_log`; a legacy ambiguous
 single-lambda log is rejected for exact resume without changing model-only
 checkpoint compatibility. Formal evaluation validates model-only type, schema,
-532/48/126 dimensions, TD3/DDQN gamma, COM calibration, method/seed, the formal
-core configuration, and exactly 1,500 completed training episodes before
+532/48/126 dimensions, movement-agent/DDQN gamma, COM calibration, method/seed,
+the formal core configuration, and exactly 2,500 completed training episodes before
 loading weights. A distinct validation/test manifest is expected; output
 metadata records both training/evaluation manifest hashes and checkpoint
 provenance, including the fixed Dinkelbach configuration and state. Evaluation
 does not mutate that state.
 
 Checkpoint directories are written through a same-parent temporary directory
-and atomically renamed only after every file succeeds. A 1,500-episode run has
-30 model-only checkpoints (`ep_0050` through `ep_1500`). Full-resume saves use
+and atomically renamed only after every file succeeds. A 2,500-episode run has
+50 model-only checkpoints (`ep_0050` through `ep_2500`). Full-resume saves use
 the same 50-episode schedule but retain only the latest two directories. If a
 custom run ends off schedule—for example at episode 75—it saves episodes 50 and
 75 exactly once. Retention never removes model-only checkpoints or files outside
 that run's `checkpoints/full` directory. Formal evaluation always uses
-`ep_1500`; test performance is not used to select a checkpoint.
+`ep_2500`; test performance is not used to select a checkpoint.
 
 ## Metrics and artifacts
 

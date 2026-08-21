@@ -8,6 +8,7 @@ from collections import defaultdict
 from Energy_model import EnergyConsumptionModel
 from Task_assignment import UAVAssigner, Task
 from object import UAV, SRTeam, GroundTarget
+from experiment_config import ROI_COUNT_MAX, ROI_COUNT_MIN
 
 
 class Simulator:
@@ -1022,6 +1023,10 @@ class Simulator:
                 "base_com_packets_per_second": 50.0,
                 "generation_model": "task-and-fov-gated-rate-accumulator-v1",
             }
+        if not ROI_COUNT_MIN <= int(self.num_GT) <= ROI_COUNT_MAX:
+            raise ValueError(
+                f"environment num_GT must be in [{ROI_COUNT_MIN}, {ROI_COUNT_MAX}]"
+            )
         self.load_factor = float(self.traffic_primitives["load_factor"])
         self.need_reassign = True   
         self.UAVs.clear()

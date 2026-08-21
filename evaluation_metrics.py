@@ -214,9 +214,13 @@ def validate_formal_aggregation_rows(
     *,
     expected_method_id,
     expected_split,
-    expected_seed_count=5,
-    expected_episodes_per_seed=100,
-    expected_completed_episodes=1500,
+    expected_seed_count=FORMAL_EXPERIMENT_DEFAULTS["training_seed_count"],
+    expected_episodes_per_seed=FORMAL_EXPERIMENT_DEFAULTS[
+        "evaluation_episodes_per_trained_seed"
+    ],
+    expected_completed_episodes=FORMAL_EXPERIMENT_DEFAULTS[
+        "formal_checkpoint_episode"
+    ],
 ):
     if int(expected_seed_count) <= 0 or int(expected_episodes_per_seed) <= 0:
         raise ValueError("expected seed and episode counts must be positive")
