@@ -11,6 +11,7 @@ import numpy as np
 import pandas as pd
 import torch
 
+from Fov_model_phase import FovModel
 from dinkelbach_blocks import (
     DINKELBACH_DENOMINATOR_UNIT,
     DINKELBACH_INITIAL_LAMBDA,
@@ -306,9 +307,50 @@ def _uav_task_phase(env, uav_id):
     return "Hover"
 
 
-def _trajectory_state(env, *, actual_time_seconds):
+def _sensing_footprint(env, uav_id):
+    """Return the exact rectangular footprint used by search coverage."""
+
+    uav = env.uav_dict[int(uav_id)]
+    model = FovModel(
+        f=0.004, wl=0.008, i_l=0.012, z_u=uav.z_u, gamma_g=80
+    )
+    width, height = model.get_ground_fov_size(uav.z_u)
+    x_min = max(0.0, float(uav.x_u) - float(width) / 2.0)
+    x_max = min(float(env.env_width), float(uav.x_u) + float(width) / 2.0)
+    y_min = max(0.0, float(uav.y_u) - float(height) / 2.0)
+    y_max = min(float(env.env_height), float(uav.y_u) + float(height) / 2.0)
+    return {
+        "uav_id": int(uav_id),
+        "geometry": "axis_aligned_ground_rectangle",
+        "center_x": float(uav.x_u),
+        "center_y": float(uav.y_u),
+        "ground_z": 0.0,
+        "width_m": float(width),
+        "height_m": float(height),
+        "clipped_bounds": {
+            "x_min": x_min,
+            "x_max": x_max,
+            "y_min": y_min,
+            "y_max": y_max,
+        },
+        "model": {"f_m": 0.004, "image_width_m": 0.008, "image_length_m": 0.012},
+    }
+
+
+def _trajectory_state(
+    env, *, actual_time_seconds, target_uav_id=None, active_links=None
+):
+    target_uav_id = (
+        None if target_uav_id is None else int(target_uav_id)
+    )
     return {
         "actual_time_seconds": float(actual_time_seconds),
+        "target_uav_id": target_uav_id,
+        "target_uav_phase": (
+            _uav_task_phase(env, target_uav_id)
+            if target_uav_id is not None
+            else None
+        ),
         "uavs": [
             {
                 "uav_id": int(uav_id),
@@ -329,6 +371,32 @@ def _trajectory_state(env, *, actual_time_seconds):
             }
             for sr in sorted(env.SR_teams, key=lambda item: item.id)
         ],
+        "ground_targets": [
+            {
+                "gt_id": int(gt.id),
+                "x": float(gt.x),
+                "y": float(gt.y),
+                "z": float(gt.z),
+                "radius_m": float(gt.radius),
+                "detected": bool(gt.is_found),
+                "detected_by_uav_id": (
+                    int(gt.found_by) if gt.found_by is not None else None
+                ),
+            }
+            for gt in sorted(env.gts, key=lambda item: item.id)
+        ],
+        "ground_station": {
+            "gs_id": int(env.GS_ID),
+            "x": float(env.GS_pos[0]),
+            "y": float(env.GS_pos[1]),
+            "z": float(env.GS_pos[2]),
+        },
+        "active_links": copy.deepcopy(list(active_links or [])),
+        "sensing_coverage": (
+            [_sensing_footprint(env, target_uav_id)]
+            if target_uav_id is not None
+            else []
+        ),
     }
 
 
@@ -465,10 +533,21 @@ def _run_routing_slot(
                 transition_done,
                 tag_gt=env.num_GT,
             )
+    selected_links = [
+        {
+            "sender_id": int(sender),
+            "receiver_id": int(receiver),
+            "link_type": "U2G" if int(receiver) == int(env.GS_ID) else "U2U",
+            "capacity_bits_per_second": float(capacity),
+        }
+        for (sender, receiver), capacity in sorted(active_capacities.items())
+        if float(capacity) > 0.0
+    ]
     return (
         float(slot_result["timely_goodput_bits"]),
         float(sum(slot_result["reward_by_sender"].values())),
         len(next_hops),
+        selected_links,
     )
 
 
@@ -917,6 +996,7 @@ def train(
     episode_observer=None,
     evaluation_overrides=None,
     trajectory_snapshot_times=None,
+    trajectory_target_uav_id=None,
 ):
     if config is None:
         raise ValueError(
@@ -940,15 +1020,24 @@ def train(
             raise ValueError("formal training requires a train scenario manifest")
         if evaluation and scenario_manifest.split not in {"validation", "test"}:
             raise ValueError("evaluation requires validation or test scenarios")
-    if evaluation and checkpoint_dir is None:
+    checkpoint_required = bool(
+        method_spec.learns_movement or method_spec.learns_routing
+    )
+    if evaluation and checkpoint_required and checkpoint_dir is None:
         raise ValueError("evaluation requires a model checkpoint")
+    if evaluation and not checkpoint_required and checkpoint_dir is not None:
+        raise ValueError("pure-random evaluation must not use a model checkpoint")
     if evaluation and config.random_seed is None:
         raise ValueError("evaluation requires the checkpoint training seed")
     if evaluation and config.resume_dir is not None:
         raise ValueError("evaluation cannot load a full-resume training state")
     if transition_observer is not None and not evaluation:
         raise ValueError("transition collection is available only in evaluation")
-    if not evaluation and (evaluation_overrides or trajectory_snapshot_times):
+    if not evaluation and (
+        evaluation_overrides
+        or trajectory_snapshot_times
+        or trajectory_target_uav_id is not None
+    ):
         raise ValueError("paper evaluation overrides are unavailable during training")
     resolved_evaluation = _normalize_evaluation_overrides(evaluation_overrides)
     requested_snapshot_times = tuple(
@@ -963,6 +1052,12 @@ def train(
         config.episode_seconds
     ):
         raise ValueError("trajectory snapshot time exceeds the evaluation horizon")
+    if requested_snapshot_times and trajectory_target_uav_id is None:
+        raise ValueError("trajectory snapshots require an explicit target_uav_id")
+    if trajectory_target_uav_id is not None and not (
+        0 <= int(trajectory_target_uav_id) < NUM_UAV
+    ):
+        raise ValueError(f"target_uav_id must be in [0, {NUM_UAV - 1}]")
     _seed_training_rng(config.random_seed)
 
     c_ref_com, calibration = load_com_capacity_reference()
@@ -1016,7 +1111,7 @@ def train(
         )
     loaded_checkpoint_metadata = None
     checkpoint_provenance = {}
-    if evaluation:
+    if evaluation and checkpoint_required:
         loaded_checkpoint_metadata = load_model_checkpoint(
             checkpoint_dir,
             movement_agent,
@@ -1064,6 +1159,24 @@ def train(
                 dict(checkpoint_experiment["dinkelbach_state"])
                 if method_spec.uses_dinkelbach
                 else None
+            ),
+        }
+    elif evaluation:
+        checkpoint_provenance = {
+            "training_manifest_hash": None,
+            "evaluation_manifest_hash": (
+                scenario_manifest.content_hash
+                if scenario_manifest is not None
+                else None
+            ),
+            "checkpoint_required": False,
+            "checkpoint_completed_episodes": None,
+            "checkpoint_training_seed": None,
+            "checkpoint_method_spec_fingerprint": None,
+            "checkpoint_metadata_path": None,
+            "checkpoint_metadata_fingerprint": None,
+            "no_checkpoint_reason": (
+                "method learns neither movement nor routing; no neural state exists"
             ),
         }
 
@@ -1229,7 +1342,15 @@ def train(
                 else float(scenario_rates.get("base_com_packets_per_second", 50.0))
             ),
         }
-        trajectory_history = [_trajectory_state(env, actual_time_seconds=0.0)]
+        latest_active_links = []
+        trajectory_history = [
+            _trajectory_state(
+                env,
+                actual_time_seconds=0.0,
+                target_uav_id=trajectory_target_uav_id,
+                active_links=latest_active_links,
+            )
+        ]
         pending_snapshot_times = list(requested_snapshot_times)
         episode_snapshots = []
         env.lambda_EE_global = float(lambda_ee)
@@ -1349,7 +1470,12 @@ def train(
                     interval == config.episode_seconds - 1
                     and routing_slot == MOVEMENT_CONTROL_INTERVAL - 1
                 )
-                delivered_bits, routing_reward, action_selections = _run_routing_slot(
+                (
+                    delivered_bits,
+                    routing_reward,
+                    action_selections,
+                    latest_active_links,
+                ) = _run_routing_slot(
                     env,
                     packet_engine,
                     ddqn,
@@ -1375,7 +1501,10 @@ def train(
             actual_time_seconds = float(interval + 1)
             trajectory_history.append(
                 _trajectory_state(
-                    env, actual_time_seconds=actual_time_seconds
+                    env,
+                    actual_time_seconds=actual_time_seconds,
+                    target_uav_id=trajectory_target_uav_id,
+                    active_links=latest_active_links,
                 )
             )
             while (
@@ -1526,8 +1655,39 @@ def train(
                         else None
                     ),
                     "requested_times_seconds": list(requested_snapshot_times),
+                    "target_uav_id": int(trajectory_target_uav_id),
                     "snapshots": episode_snapshots,
                     "trajectory_history": trajectory_history,
+                    "uav_paths": {
+                        str(uav_id): [
+                            {
+                                "actual_time_seconds": state["actual_time_seconds"],
+                                "x": uav["x"],
+                                "y": uav["y"],
+                                "z": uav["z"],
+                            }
+                            for state in trajectory_history
+                            for uav in state["uavs"]
+                            if uav["uav_id"] == uav_id
+                        ]
+                        for uav_id in range(env.num_UAV)
+                    },
+                    "sr_paths": {
+                        str(sr_id): [
+                            {
+                                "actual_time_seconds": state["actual_time_seconds"],
+                                "x": sr["x"],
+                                "y": sr["y"],
+                                "z": sr["z"],
+                            }
+                            for state in trajectory_history
+                            for sr in state["sr_teams"]
+                            if sr["sr_id"] == sr_id
+                        ]
+                        for sr_id in sorted(
+                            {sr["sr_id"] for sr in trajectory_history[0]["sr_teams"]}
+                        )
+                    },
                     "ground_targets": copy.deepcopy(
                         (scenario_entry or {}).get("ground_targets", [])
                     ),
@@ -1713,6 +1873,8 @@ def train(
         if (
             not evaluation
             and
+            checkpoint_required
+            and
             config.enable_model_checkpoints
             and _is_checkpoint_episode(
                 episode + 1,
@@ -1746,6 +1908,8 @@ def train(
             )
         if (
             not evaluation
+            and
+            checkpoint_required
             and
             config.enable_full_resume
             and _is_checkpoint_episode(
@@ -1945,9 +2109,12 @@ def train(
         "trajectory_artifacts": [
             {
                 **artifact,
+                "method_id": method_spec.method_id,
+                "method_spec": method_spec.to_dict(),
                 "checkpoint_path": (
                     os.path.abspath(checkpoint_dir) if checkpoint_dir else None
                 ),
+                "checkpoint_required": checkpoint_required,
                 "checkpoint_fingerprint": checkpoint_provenance.get(
                     "checkpoint_metadata_fingerprint"
                 ),
@@ -1969,6 +2136,7 @@ def train(
                 else {"active": False, "update_count": 0}
             ),
             "evaluation": bool(evaluation),
+            "checkpoint_required": checkpoint_required,
             "evaluation_overrides": (
                 resolved_evaluation if evaluation else None
             ),

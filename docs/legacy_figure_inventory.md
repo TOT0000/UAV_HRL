@@ -1,26 +1,63 @@
-# Legacy paper figure inventory
+# Original paper renderer inventory
 
-Audit base: `feature/centralized-td3` at `931aa268e22d1c608b296096fc9a2281aa9c4408`.
+This inventory joins four sources of evidence: reachable Git history, the
+original testing renderers read from Google Drive, the six supplied paper
+screenshots, and current unified-runner artifacts. Google Drive was audited
+read-only; no Drive file is a runtime dependency and none of its hard-coded
+result arrays is copied into production.
 
-Legacy source commit: `57f6621d248e2917b6a577d872d6c19d298ed006` (`Add original HRL source code`). This is also `origin/main`. The complete reachable history, all local/remote branches, and tag `baseline/corrected-per-uav-20260811` were inspected without checkout or reset.
+Git history source: commit
+`57f6621d248e2917b6a577d872d6c19d298ed006`, `HRL_task_aware.py`, the inline
+Episodes--Reward plotting block. The production base audited for this change is
+`feature/centralized-td3` at
+`168c917adf5331eac715c0e25b3881123b439f46`.
 
-The audit used `git log --all --reverse --oneline`, `git log --all --name-status`, `git ls-tree -r`, `git show`, `git grep`, and history searches for `plot`, `figure`, `fig`, `savefig`, `matplotlib`, `pyplot`, `reward`, `energy efficiency`, `E2E delay`, `violation`, `arrival rate`, `number of RoIs`, `trajectory`, `K-KM`, `KM`, `Random`, `DQN`, `DDQN`, `TD3`, and `DDPG`.
+## Google Drive sources
 
-## Inventory
+| Role | Original path | Drive file ID | Read-content SHA-256 |
+| --- | --- | --- | --- |
+| Training renderer | `Training trend chart/Reward_Vs_episode.py` | `1_yX7ObsF1DIYv3Nlue1BIs_oK3VSrwZf` | `65d93a1f92347cfaa0c89cdb08113d9f9a0abd6c5183a18b5c67e5bc09052de4` |
+| Assignment collector | `Task_assignment/Plot_curve_EE.py` | `1nPQc8nH8E3pi7hPqqmfghROBKli7lQ0n` | `fb60215c1bbe8e626c6bd868d0f356dbf53534fb95f1a668ee8008de89381057` |
+| Assignment renderer | `Task_assignment/EE_Vs_num_gt_task_assignment/EE_Vs_number_of_GT.py` | `1tfMd3Q8kFoTKQfVVtHonN8b5B6rYK7My` | `1f02612d1aef68f0f09e262faf4ab88b2d67d053c0a78b215d342626c40a9192` |
+| Trajectory-design collector | `UAV_deployment/Plot_curve_EE.py` | `1L6mFwoTOWSPhf4jJCpAK6LEP7QNCXeG5` | `261277b5d6d884c25db177fc85ddc9153afa1cb96809d05eda4e79fa867de485` |
+| Trajectory-design renderer | `UAV_deployment/EE_Vs_num_gt/EE_Vs_number_of_GT.py` | `1S6oxfzELeWvDckAEQhzX1sMWhrAnheHm` | `83b243c80be735e7edd289c121e0559c1858b7b8a7da8e0437ebb96fdd049194` |
+| GS-count renderer | `UAV_deployment/EE_Vs_number_of_GS.py` | `1uAAsn_cqY1VNag-ehC9HuGzwRxdAHp1f` | `f51836db4f5b5c81780b349ac00cec4dff9198938bc5c70779a2636ebc1f1f8c` |
+| Total collector and `plot_uav_scene` | `Total/Plot_curve_EE.py` | `1sHwN2_3QcOeNiyPUETI-fnMB7yJ_BivU` | `5b8521ac026267509c83cd9736477c5fc447bba17f88b6a10fa3956a2d031afb` |
+| Total delay collector | `Total/Plot_curve_delay.py` | `1mODVMjC4N7rG2o2vA2NaVWczznOIZ2L6` | `4699165b3d817757ca53376d041d10f8efd3aae540a9621e42e0cd4a76658443` |
+| Hierarchical renderer | `Total/組合比較圖_EE/EE_Vs_number_of_GT.py` | `14bVvMGsCw_UCqN8MEE6yNhGkQTJpw_ZK` | `5c5c427131acfe2d9ca1b0083c5c22a377c7c26ecfdb1cadbf344b944cf00b4d` |
+| RoI-delay renderer | `Total/組合比較圖_e2e_delays/Task_type_delay_Vs_number_of_GT.py` | `17eaSEyqwf7cDgy3O-vr5s82RsLogtV6X` | `29807a04626951d358670fa39269f31db906949b800660744c376e099ee6ed19` |
+| Arrival-rate renderer | `Total/Delays_Vs_arrival rate/Task_type_delay_Vs_arrival_rate.py` | `1j0vfNcdgjnYb67KXPA9rgfMuWnGedyUH` | `95370a5a2f050220a9265f5406a44cb2b9b6c5e9193a8cee315a3a1ffe6bc690` |
+| Violation collector | `Delay_violation/Plot_curve_delay.py` | `17Wx5ii-xTIsBC2PdVffL5DmIIDRyY0V-` | `85d3bceb73d912f115b0cdba86a42a19b48c04fe71e9f0f7239c19606cea4f1e` |
+| Violation renderer | `Delay_violation/Delay_violation_Vs_target_delay/Task_type_delay_violation_Vs_target_delay.py` | `1yIA4PI_JOhVks6vfHtodeFb59NcLbmAN` | `d7890c0aae6ecd24d23952467f9117fb527809cdfd0c306cec6d7ad983e832b1` |
 
-| Figure | Legacy commit / source / entry | Data source | Axes / subplots | Methods | Legacy style and aggregation | Production replacement |
-| --- | --- | --- | --- | --- | --- | --- |
-| Fig.2, Episodes-Reward, `Total_reward.png` convention | `57f6621`; `HRL_task_aware.py`; inline block after `train()` (legacy lines 426-460). The same block is duplicated in each `Train_*` script. | Per-method in-memory `reward_log`; no comparison CSV and no hard-coded paper values. | Episode vs Total Reward; one 8×6 axes. | One method per old training script. The requested production overlay maps to `td3_dinkelbach`, `td3_dinkelbach_wo_ta`, `ddpg_dinkelbach`, `km_td3_dinkelbach`, `km_ddpg_dinkelbach`. | Raw light line: width 1, alpha .2; smoothed line: width 2; legend, grid, tight layout. The related legacy violation loop uses Matplotlib's default color cycle and reuses each raw color for its smooth line. Legacy smoothing is causal but has an off-by-one window. | `training_history.jsonl`; EE is recomputed per row from timely delivered Mbit and that episode's mobility J, converted to bit/J, then a correct causal 50-episode trailing mean is saved with the raw series. |
-| Fig.3 trajectory | No source found. `Simulator.py`, `Simulator_KM.py`, and `Simulator_Rand.py` import Matplotlib and retain SR trajectory state, but contain no trajectory renderer, subplot, 3D axes, camera, markers, legend, or figure filename. | Missing. | Missing. | Missing. | Missing. | The production evaluator records replayable trajectory JSON at requested 5/10/15/25 s, but no visual is rendered until an authoritative legacy source is supplied. |
-| Fig.4(a) assignment | No source found in any reachable tree. | Missing. | X metric/range/unit missing; no subplot contract. | Prompt mapping is retained in `paper_figure_registry.py`, but it is not treated as legacy visual evidence. | Colors, markers, ordering, labels, filename missing. | Structured method mapping only; renderer fails closed. |
-| Fig.4(b) movement/objective | No source found. | Missing. | Missing. | Requested seven-method mapping is retained. | Original five-method palette/markers/order not present in Git. | Structured method mapping only; renderer fails closed. |
-| Fig.4(c) hierarchical | No source found. | Missing. | Missing. | Requested four-method mapping is retained. | Display labels/grouping absent. | Structured method mapping only; renderer fails closed. |
-| Fig.5 arrival rate / E2E delay | No plotting source found. `Packet_scheduler_v1.py` contains packet delay fields and lifecycle logic only. | No paper plot arrays or evaluation CSV. | Subplot arrangement/axis formatting absent. | Prompt routing mapping retained. | Colors, markers, legend and filename absent. | Common evaluator supports the authoritative COM and VS rate sweeps and writes task-specific delay artifacts; renderer fails closed. |
-| Fig.6 deadline / violation | No paper sweep renderer found. Legacy training scripts only draw per-episode FOV/COM violation-rate trends using default Matplotlib colors. | In-memory training violation logs. | Deadline x-axis, layout, and grouping absent. | Prompt minimum method mapping retained. | Only the unrelated training trend's raw/smooth style is recoverable. | Common evaluator reruns every seconds-based threshold with instance-scoped deadlines and conserved outcomes; renderer fails closed. |
-| Fig.7 RoI count / E2E delay | No source found. Fixed-RoI manifests were introduced later at commit `1db80f2`, after the original source. | Missing. | Missing. | Prompt mapping retained. | Missing. | Deterministic shared fixed-RoI manifests and delay artifacts are supported; renderer fails closed. |
+## Semantic figure contracts
 
-## Reused versus intentionally changed
+| Semantic ID / output stem | Original visual contract | Production artifact and intentional changes |
+| --- | --- | --- |
+| `uav_trajectory_snapshots` / `UAV_trajectory_snapshots` | `plot_uav_scene`; 1x4 3D, elevation 20 degrees, azimuth 60 degrees, X/Y 0--1000 m, Z 0--180 m; screenshot `223053` | `trajectory_artifacts.json`. Target UAV is an explicit `target_uav_id`; phase subtitles, UAV/SR paths, detected RoIs, actual routing links, GS, and sensing footprint geometry all come from the selected scenario artifact. No hard-coded UAV 11 or link result remains. |
+| `training_ee_vs_episode` / `Training_EE_Vs_episode` | Training renderer; red, green, orange, blue, purple raw/smooth pairs; screenshot `223103` | Five `training_history.jsonl` files. Each episode is timely Mbit x 1e6 divided by `max(mobility J, 1e-12 J)`, followed by an exact causal 50-episode trailing mean. Reward and Dinkelbach surrogate values are not plotted. |
+| `task_assignment_ee_vs_number_of_rois` / `Task_assignment_EE_Vs_number_of_RoIs` | Red-star K-KM, blue-triangle KM, green-circle Random; screenshot `223109` left | Fixed-RoI pooled evaluation data for `td3_dinkelbach`, `km_td3_dinkelbach`, and `random_assignment_td3_dinkelbach`. |
+| `trajectory_design_ee_vs_number_of_rois` / `Trajectory_design_EE_Vs_number_of_RoIs` | Blue-square, brown-diamond, magenta-up-triangle, orange-down-triangle, green-circle sequence; screenshot `223109` middle | Fixed-RoI data for seven registered methods. The two task-potential ablations use documented extra dashed palette entries. |
+| `hierarchical_architecture_ee_vs_number_of_rois` / `Hierarchical_architecture_EE_Vs_number_of_RoIs` | Red-star, blue-square, brown-diamond, green-circle; screenshot `223109` right | Fixed-RoI data for task-aware, masked TD3, masked DDPG, and pure-random architectures. The random method has explicit no-checkpoint provenance. |
+| `energy_efficiency_design_comparisons` / `Energy_efficiency_design_comparisons` | 1x3 composition of the preceding panels; screenshot `223109` | Composes the three semantic panels from the same evaluated artifacts; standalone figures are also emitted by `--figure all`. Y limits are data-driven. |
+| `task_type_delay_vs_arrival_rate` / `Task_type_delay_Vs_arrival_rate` | 1x2 grouped bars; Random green, DQN orange, Safe-DDQN red; screenshot `223114` | COM rates 50/100/150/200 packet/s with VS fixed at 5; VS rates 10/20/30/40 with COM fixed at 50. Delay is pooled from sums/counts in seconds then converted once to milliseconds. |
+| `task_type_delay_violation_vs_target_delay` / `Task_type_delay_violation_Vs_target_delay` | Log-y; method color/marker plus VS solid-filled and COM dashed-open; screenshot `223119` | Every 0.5--3.0 s threshold is a real rerun. Probability is pooled violations/generated. A true zero is omitted on log axes and remains zero in source data; no epsilon is fabricated. |
+| `task_type_delay_vs_number_of_rois` / `Task_type_delay_Vs_number_of_RoIs` | Method color/marker plus VS solid-filled and COM dashed-open; screenshot `223125` | Fixed RoIs 2--8. Delay is pooled by delivered-packet count and converted from seconds to milliseconds. Zero-delivery points remain `null` with `missing=true`, never zero. |
 
-Fig.2 directly preserves the audited 8×6 single axes, raw alpha/width, smooth width, grid, legend, tight layout, and `Total_reward` filename stem. Its multi-method pairing uses the legacy violation loop's default-cycle/raw-and-smooth color rule. The intentional changes are the user-requested five-method overlay, independent per-episode EE, the exact 50-episode causal window, one legend handle per method, and persisted normalized data.
+All nine contracts, method order, palette, markers, line styles, subplot shape,
+source provenance, screenshot description, and intentional differences are
+machine-readable in `paper_figure_registry.py`.
 
-No visual contract has been invented for Fig.3-Fig.7. Their production evaluation data can be collected, but `build_paper_figures.py` raises `LegacyFigureSourceUnavailable` when one of those figures is requested directly. Supplying the missing authoritative commit/files is required before those renderers can be implemented.
+## Aggregation and provenance rules
+
+- EE comparison points use `sum(timely delivered Mbit) /
+  max(sum(mobility J), 1e-12 J)`.
+- Task delay uses `sum(delivered E2E delay seconds) / sum(delivered packets)`.
+- Violation probability uses `sum(violation packets) / sum(generated packets)`.
+- Per-episode values, pooled numerators/denominators, aggregate values, and
+  missing flags are persisted together.
+- Every learned method requires the formal `ep_2500` checkpoint. The
+  `kkm_random_action_random_routing` baseline learns neither component, creates
+  no `models.pt`, and records `checkpoint_required=false`.
+- Deprecated `fig*` names exist only as internal compatibility aliases. CLI
+  choices, metadata, directories, and filenames use semantic names.

@@ -447,7 +447,7 @@ class RandomMovementRoutingTest(unittest.TestCase):
         self.assertEqual(first["dinkelbach_update_count"], 0)
         self.assertIsNone(first["lambda"])
 
-    def test_random_checkpoint_contains_no_fake_actor_critic_or_q_network(self):
+    def test_pure_random_training_does_not_create_a_fake_checkpoint(self):
         method = MethodSpec.parse("kkm_random_action_random_routing")
         manifest = generate_manifest("train", 20260817, 1, num_gt=2)
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -467,22 +467,35 @@ class RandomMovementRoutingTest(unittest.TestCase):
                 random_seed=20260817,
             )
             train(config, scenario_manifest=manifest, method_spec=method)
-            model_payload = torch.load(
-                Path(config.checkpoint_root) / "models" / "ep_0001" / "models.pt",
-                map_location="cpu",
-                weights_only=False,
-            )
-            full_payload = torch.load(
-                Path(config.checkpoint_root)
-                / "full"
-                / "ep_0001"
-                / "training_state.pt",
-                map_location="cpu",
-                weights_only=False,
-            )
-        for networks in (model_payload, full_payload["networks"]):
-            self.assertEqual(networks["movement_agent"], {"kind": "random"})
-            self.assertEqual(networks["routing_agent"], {"kind": "random"})
+            self.assertFalse(Path(config.checkpoint_root, "models").exists())
+            self.assertFalse(Path(config.checkpoint_root, "full").exists())
+
+    def test_pure_random_evaluation_runs_without_checkpoint_provenance(self):
+        method = MethodSpec.parse("kkm_random_action_random_routing")
+        manifest = generate_manifest("test", 20260817, 1, num_gt=2)
+        result = train(
+            TrainingConfig(
+                total_episodes=1,
+                mode="custom",
+                episode_seconds=1,
+                warmup_joint_transitions=0,
+                batch_size=1,
+                enable_model_checkpoints=False,
+                enable_full_resume=False,
+                enable_plots=False,
+                enable_csv=False,
+                random_seed=20260817,
+            ),
+            scenario_manifest=manifest,
+            method_spec=method,
+            evaluation=True,
+            checkpoint_dir=None,
+        )
+        metadata = result["run_metadata"]
+        self.assertFalse(metadata["checkpoint_required"])
+        self.assertIsNone(metadata["checkpoint_metadata_path"])
+        self.assertIsNone(metadata["checkpoint_metadata_fingerprint"])
+        self.assertIn("no neural state", metadata["no_checkpoint_reason"])
 
 
 if __name__ == "__main__":

@@ -75,6 +75,16 @@ class EvaluationMetricTest(unittest.TestCase):
             self.assertNotIn("NaN", Path(paths["per_episode_jsonl"]).read_text())
             self.assertNotIn("Infinity", Path(paths["per_episode_jsonl"]).read_text())
 
+    def test_no_checkpoint_baseline_preserves_null_provenance(self):
+        row = self._row(11, "a", 0.0)
+        row["training_manifest_hash"] = None
+        row["checkpoint_completed_episodes"] = None
+        row["checkpoint_metadata_fingerprint"] = None
+        summaries = summarize_training_seeds([row])
+        self.assertIsNone(summaries[0]["training_manifest_hash"])
+        self.assertIsNone(summaries[0]["checkpoint_completed_episodes"])
+        self.assertIsNone(summaries[0]["checkpoint_metadata_fingerprint"])
+
 
 class EvaluationModeIntegrationTest(unittest.TestCase):
     def test_evaluation_disables_exploration_and_preserves_learning_state(self):

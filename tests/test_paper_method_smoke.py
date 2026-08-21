@@ -101,6 +101,9 @@ class PaperMethodSmokeTest(unittest.TestCase):
                     trajectory_snapshot_times=(1.0,)
                     if method.routing == "random"
                     else None,
+                    trajectory_target_uav_id=0
+                    if method.routing == "random"
+                    else None,
                 )
                 self.assertTrue(all(evaluation["evaluation_invariants"].values()))
                 self.assertEqual(evaluation["movement_agent_kind"], method.agent)
@@ -115,6 +118,13 @@ class PaperMethodSmokeTest(unittest.TestCase):
                         artifact["snapshots"][0]["actual_time_seconds"], 1.0
                     )
                     self.assertEqual(len(artifact["snapshots"][0]["uavs"]), 16)
+                    self.assertEqual(artifact["target_uav_id"], 0)
+                    self.assertEqual(artifact["method_id"], method_id)
+                    self.assertIn("uav_paths", artifact)
+                    self.assertIn("sr_paths", artifact)
+                    self.assertIn("ground_station", artifact["snapshots"][0])
+                    self.assertIn("active_links", artifact["snapshots"][0])
+                    self.assertIn("sensing_coverage", artifact["snapshots"][0])
                     self.assertIn("ground_targets", artifact)
                     self.assertIn("initial_sr_teams", artifact)
 

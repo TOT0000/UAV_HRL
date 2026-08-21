@@ -134,6 +134,14 @@ def _write_csv(path, rows, fieldnames):
     return path
 
 
+def _optional_int(value):
+    return None if value is None or value == "" else int(value)
+
+
+def _optional_text(value):
+    return None if value is None or value == "" else str(value)
+
+
 def summarize_training_seeds(episode_rows):
     grouped = {}
     for row in episode_rows:
@@ -141,10 +149,10 @@ def summarize_training_seeds(episode_rows):
             str(row["method_id"]),
             str(row["evaluation_split"]),
             str(row["evaluation_manifest_hash"]),
-            str(row["training_manifest_hash"]),
+            _optional_text(row["training_manifest_hash"]),
             int(row["training_seed"]),
-            int(row["checkpoint_completed_episodes"]),
-            str(row["checkpoint_metadata_fingerprint"]),
+            _optional_int(row["checkpoint_completed_episodes"]),
+            _optional_text(row["checkpoint_metadata_fingerprint"]),
         )
         grouped.setdefault(key, []).append(row)
 
@@ -184,8 +192,8 @@ def aggregate_seed_means(seed_summaries):
             str(row["method_id"]),
             str(row["evaluation_split"]),
             str(row["evaluation_manifest_hash"]),
-            str(row["training_manifest_hash"]),
-            int(row["checkpoint_completed_episodes"]),
+            _optional_text(row["training_manifest_hash"]),
+            _optional_int(row["checkpoint_completed_episodes"]),
         )
         grouped.setdefault(key, []).append(row)
 

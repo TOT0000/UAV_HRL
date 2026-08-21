@@ -6,7 +6,9 @@ process. The registry keys are `td3_dinkelbach`, `ddpg_dinkelbach`,
 `td3_dinkelbach_no_task_potential`,
 `ddpg_dinkelbach_no_task_potential`, `td3_dinkelbach_wo_ta`,
 `td3_dinkelbach_dqn`, `kkm_random_action_random_routing`,
-`km_td3_dinkelbach`, and `random_assignment_td3_dinkelbach`. All twelve share
+`km_td3_dinkelbach`, `random_assignment_td3_dinkelbach`,
+`km_ddpg_dinkelbach`, `ddpg_dinkelbach_wo_ta`,
+`td3_dinkelbach_random_routing`, and `td3_dinkelbach_dqn_wo_ta`. All sixteen share
 16 UAVs, the common Simulator and synchronous projection/movement flow,
 energy/delivery accounting, evaluation, and logging.
 
@@ -297,58 +299,72 @@ The legacy `HRL_task_aware.py --mode smoke` and explicit
 training CSV names the corresponding columns `lambda_used` and
 `lambda_after_episode`; it no longer emits an ambiguous `lambda` column.
 
-## Paper evaluation and legacy figure build
+## Semantic paper evaluation and figure build
 
-The complete method registry contains 16 orthogonal configurations. The paper
-additions are `km_ddpg_dinkelbach`, `ddpg_dinkelbach_wo_ta`,
-`td3_dinkelbach_random_routing`, and `td3_dinkelbach_dqn_wo_ta`; they use the
-same one-method training command and common Simulator as every other method.
+Paper evaluation remains one method per process and never trains or resumes a
+model. Learned methods require the completed formal `ep_2500` run. The pure
+random `kkm_random_action_random_routing` baseline must omit `--run-dir`; it
+loads no model, creates no fake `models.pt`, and records
+`checkpoint_required=false`.
 
-Paper evaluation is also one method at a time and only accepts a completed run
-with its model-only `ep_2500` checkpoint. It never starts or resumes training:
+The canonical evaluation suites are `training_ee_vs_episode`,
+`uav_trajectory_snapshots`, `task_type_delay_vs_arrival_rate`,
+`task_type_delay_violation_vs_target_delay`, and `fixed_roi`. Deprecated
+`fig*` aliases are accepted only by internal Python compatibility boundaries;
+they do not appear in CLI help, output paths, or metadata.
 
 ```powershell
-python -X utf8 run_paper_evaluation.py td3_dinkelbach --run-dir results/td3_dinkelbach/<run-id> --suite fig3_trajectory --manifest runs/comparison/manifests/test.json
-python -X utf8 run_paper_evaluation.py td3_dinkelbach_random_routing --run-dir results/td3_dinkelbach_random_routing/<run-id> --suite fig5_arrival --manifest runs/comparison/manifests/test.json
-python -X utf8 run_paper_evaluation.py td3_dinkelbach --run-dir results/td3_dinkelbach/<run-id> --suite fig6_deadline --manifest runs/comparison/manifests/test.json
-python -X utf8 run_paper_evaluation.py td3_dinkelbach --run-dir results/td3_dinkelbach/<run-id> --suite fig7_fixed_roi
+python -X utf8 run_paper_evaluation.py td3_dinkelbach --run-dir results/td3_dinkelbach/<run-id> --suite uav_trajectory_snapshots --manifest runs/comparison/manifests/trajectory-test.json --target-uav-id 0
+python -X utf8 run_paper_evaluation.py td3_dinkelbach_random_routing --run-dir results/td3_dinkelbach_random_routing/<run-id> --suite task_type_delay_vs_arrival_rate --manifest runs/comparison/manifests/test.json
+python -X utf8 run_paper_evaluation.py td3_dinkelbach --run-dir results/td3_dinkelbach/<run-id> --suite task_type_delay_violation_vs_target_delay --manifest runs/comparison/manifests/test.json
+python -X utf8 run_paper_evaluation.py td3_dinkelbach --run-dir results/td3_dinkelbach/<run-id> --suite fixed_roi
+python -X utf8 run_paper_evaluation.py kkm_random_action_random_routing --suite fixed_roi --manifest-seed 20260817
 ```
 
-The available suites are `fig2_convergence`, `fig3_trajectory`,
-`fig5_arrival`, `fig6_deadline`, and `fig7_fixed_roi`. Fig.5 changes only the
-selected FOV/COM packet rate at each point. Fig.6 reruns each 0.5--3.0 second
-threshold with instance-scoped deadlines while preserving the other task's
-production default. Fig.7 creates deterministic common fixed-RoI manifests for
-2--8 RoIs from the centralized manifest seed. Each result is written below a
-unique microsecond-and-Git-SHA directory in `results/paper_evaluations/` and
-contains the resolved sweep point, manifest, per-episode metrics, mutually
-exclusive packet outcomes, checkpoint provenance, and any trajectory artifact.
+The trajectory manifest contains exactly the requested evaluation episode
+count (one by default). Its artifact records all 16 UAVs and paths, explicit
+target UAV and phase, RoIs/detection, SR paths, GS, actual selected U2U/U2G
+links, sensing footprint geometry, requested/actual times, scenario identity,
+method configuration, checkpoint provenance, and Git SHA.
 
-The figure builder only reads explicitly mapped artifacts. A Fig.2 spec maps
-exactly one completed run for each required method, for example:
+Each sweep point writes per-episode data plus `aggregated_plot_data.csv/json`.
+Delay is pooled as total delivered E2E delay divided by total delivered packet
+count. Violation probability is pooled violations divided by generated packet
+count. A delay with no delivered packets is `null` with `missing=true`. EE
+comparison points use pooled timely Mbit divided by pooled mobility joules.
+
+The figure spec explicitly maps training and evaluation directories:
 
 ```json
 {
-  "methods": {
-    "td3_dinkelbach": {"run_dir": "results/td3_dinkelbach/<run-id>"},
-    "td3_dinkelbach_wo_ta": {"run_dir": "results/td3_dinkelbach_wo_ta/<run-id>"},
-    "ddpg_dinkelbach": {"run_dir": "results/ddpg_dinkelbach/<run-id>"},
-    "km_td3_dinkelbach": {"run_dir": "results/km_td3_dinkelbach/<run-id>"},
-    "km_ddpg_dinkelbach": {"run_dir": "results/km_ddpg_dinkelbach/<run-id>"}
+  "target_uav_id": 0,
+  "training_runs": {
+    "td3_dinkelbach": {"run_dir": "results/td3_dinkelbach/<run-id>"}
+  },
+  "evaluation_runs": {
+    "uav_trajectory_snapshots": {
+      "td3_dinkelbach": {"evaluation_dir": "results/paper_evaluations/uav_trajectory_snapshots/td3_dinkelbach/<evaluation-id>"}
+    },
+    "fixed_roi": {
+      "td3_dinkelbach": {"evaluation_dir": "results/paper_evaluations/fixed_roi/td3_dinkelbach/<evaluation-id>"}
+    }
   }
 }
 ```
 
+For `--figure all`, include every required method mapping listed in
+`paper_figure_registry.py`. The builder validates exact methods, formal
+checkpoint/no-checkpoint provenance, sweep values, units, and common scenario
+manifest hashes before rendering. It never starts training.
+
 ```powershell
 python -X utf8 build_paper_figures.py --spec paper_runs.json --figure all
+python -X utf8 build_paper_figures.py --spec paper_runs.json --figure training_ee_vs_episode
 ```
 
-Builds use unique directories below `results/paper_figures/` and persist PNG,
-PDF, normalized CSV/JSON, the resolved method-to-run mapping, metric definition,
-moving-average definition, Git SHA, and the audited legacy source. Multiple
-candidate runs are rejected instead of selecting the latest. Only the original
-Episodes--Reward renderer is present in reachable Git history, so the audited
-Fig.2 Episodes--EE adapter is the only enabled renderer. Fig.3--Fig.7 evaluation
-data can be collected, but requesting those visuals directly fails closed until
-an authoritative legacy plotting source is supplied. See
-`docs/legacy_figure_inventory.md` for the audit evidence.
+All nine semantic figures produce PNG, PDF, source CSV, source JSON, and a
+resolved semantic specification in a collision-safe
+`results/paper_figures/<timestamp>_<git-sha>/` directory. The 1x3 EE composite
+and all three standalone EE panels are emitted by `all`. See
+`docs/legacy_figure_inventory.md` for Drive file IDs, content fingerprints,
+screenshot references, visual contracts, and intentional changes.
