@@ -14,46 +14,61 @@ ROI_COUNT_MAX = 8
 DEFAULT_TRAINING_SEED = 20260817
 FORMAL_TRAINING_EPISODES = 2500
 FORMAL_CHECKPOINT_EPISODE = FORMAL_TRAINING_EPISODES
+SEARCH_UTILITY = 0.05
+SEARCH_COVERAGE_THRESHOLD = 0.99
+FOV_COM_PAIR_MAX_DISTANCE_M = 200.0
+ASSIGNMENT_DUMMY_UTILITY = 0.0
+UTILITY_NORMALIZATION_MODE = "per_task_type_global_minmax_feasible_only"
+TASK_COMPATIBILITY_POLICY = "fov_com_only_with_distance_limit"
 
 CURRENT_METHOD_ID = "td3_dinkelbach"
 
+_COMMON_METHOD = {
+    "assignment": "k_km",
+    "assignment_rounds": 2,
+    "routing": "safe_ddqn",
+    "task_observation": "full",
+    "task_potential_enabled": True,
+}
+
 _METHOD_DEFINITIONS = {
     "td3_dinkelbach": {
+        **_COMMON_METHOD,
         "agent": "td3",
         "movement": "centralized_td3",
         "reward_mode": "dinkelbach",
-        "task_potential_enabled": True,
         "label": "TD3 + Dinkelbach",
     },
     "ddpg_dinkelbach": {
+        **_COMMON_METHOD,
         "agent": "ddpg",
         "movement": "centralized_ddpg",
         "reward_mode": "dinkelbach",
-        "task_potential_enabled": True,
         "label": "DDPG + Dinkelbach",
     },
     "td3_ratio": {
+        **_COMMON_METHOD,
         "agent": "td3",
         "movement": "centralized_td3",
         "reward_mode": "ratio",
-        "task_potential_enabled": True,
         "label": "TD3 + Direct ratio",
     },
     "ddpg_ratio": {
+        **_COMMON_METHOD,
         "agent": "ddpg",
         "movement": "centralized_ddpg",
         "reward_mode": "ratio",
-        "task_potential_enabled": True,
         "label": "DDPG + Direct ratio",
     },
     "random_action": {
+        **_COMMON_METHOD,
         "agent": "random",
         "movement": "random_action",
         "reward_mode": "ratio",
-        "task_potential_enabled": True,
         "label": "Random selected",
     },
     "td3_dinkelbach_no_task_potential": {
+        **_COMMON_METHOD,
         "agent": "td3",
         "movement": "centralized_td3",
         "reward_mode": "dinkelbach",
@@ -61,14 +76,58 @@ _METHOD_DEFINITIONS = {
         "label": "TD3 + Dinkelbach without task potential",
     },
     "ddpg_dinkelbach_no_task_potential": {
+        **_COMMON_METHOD,
         "agent": "ddpg",
         "movement": "centralized_ddpg",
         "reward_mode": "dinkelbach",
         "task_potential_enabled": False,
         "label": "DDPG + Dinkelbach without task potential",
     },
+    "td3_dinkelbach_wo_ta": {
+        **_COMMON_METHOD,
+        "agent": "td3",
+        "movement": "centralized_td3",
+        "reward_mode": "dinkelbach",
+        "task_observation": "masked",
+        "label": "TD3 + Dinkelbach without task-assignment observations",
+    },
+    "td3_dinkelbach_dqn": {
+        **_COMMON_METHOD,
+        "agent": "td3",
+        "movement": "centralized_td3",
+        "reward_mode": "dinkelbach",
+        "routing": "dqn",
+        "label": "TD3 + Dinkelbach + controlled DQN routing",
+    },
+    "kkm_random_action_random_routing": {
+        **_COMMON_METHOD,
+        "agent": "random",
+        "movement": "random_action",
+        "reward_mode": "ratio",
+        "routing": "random",
+        "label": "K-KM + random movement + random routing",
+    },
+    "km_td3_dinkelbach": {
+        **_COMMON_METHOD,
+        "agent": "td3",
+        "movement": "centralized_td3",
+        "reward_mode": "dinkelbach",
+        "assignment": "km",
+        "assignment_rounds": 1,
+        "label": "KM + TD3 + Dinkelbach",
+    },
+    "random_assignment_td3_dinkelbach": {
+        **_COMMON_METHOD,
+        "agent": "td3",
+        "movement": "centralized_td3",
+        "reward_mode": "dinkelbach",
+        "assignment": "random_one_to_one",
+        "assignment_rounds": 1,
+        "label": "Random assignment + TD3 + Dinkelbach",
+    },
 }
 METHOD_REGISTRY = MappingProxyType(_METHOD_DEFINITIONS)
+_LEGACY_METHOD_IDS = frozenset(tuple(_METHOD_DEFINITIONS)[:7])
 
 
 @dataclass(frozen=True)
@@ -76,9 +135,11 @@ class MethodSpec:
     """Validated registry entry used by the shared experiment flow."""
 
     method_key: str = CURRENT_METHOD_ID
-    assignment: str = "current_k_km"
+    assignment: str = "k_km"
     movement: str = "centralized_td3"
     routing: str = "safe_ddqn"
+    task_observation: str = "full"
+    assignment_rounds: int = 2
     lambda_mode: str = "dinkelbach"
     llm_enabled: bool = False
     agent: str = "td3"
@@ -95,9 +156,11 @@ class MethodSpec:
                 f"{', '.join(METHOD_REGISTRY)}"
             )
         expected = {
-            "assignment": "current_k_km",
+            "assignment": definition["assignment"],
             "movement": definition["movement"],
-            "routing": "safe_ddqn",
+            "routing": definition["routing"],
+            "task_observation": definition["task_observation"],
+            "assignment_rounds": definition["assignment_rounds"],
             "lambda_mode": definition["reward_mode"],
             "llm_enabled": False,
             "agent": definition["agent"],
@@ -129,11 +192,40 @@ class MethodSpec:
         return self.agent in {"td3", "ddpg"}
 
     @property
+    def learns_routing(self) -> bool:
+        return self.routing in {"safe_ddqn", "dqn"}
+
+    @property
     def fingerprint(self) -> str:
         encoded = json.dumps(
             self.to_dict(), sort_keys=True, separators=(",", ":"), allow_nan=False
         ).encode("utf-8")
         return hashlib.sha256(encoded).hexdigest()
+
+    @property
+    def compatible_fingerprints(self) -> tuple[str, ...]:
+        """Accept the pre-strategy fingerprint only for the original methods."""
+
+        fingerprints = [self.fingerprint]
+        if self.method_id in _LEGACY_METHOD_IDS:
+            legacy = {
+                "method_id": self.method_id,
+                "method_key": self.method_id,
+                "assignment": "current_k_km",
+                "movement": self.movement,
+                "routing": "safe_ddqn",
+                "lambda_mode": self.reward_mode,
+                "llm_enabled": False,
+                "agent": self.agent,
+                "reward_mode": self.reward_mode,
+                "task_potential_enabled": self.task_potential_enabled,
+                "label": self.label,
+            }
+            encoded = json.dumps(
+                legacy, sort_keys=True, separators=(",", ":"), allow_nan=False
+            ).encode("utf-8")
+            fingerprints.append(hashlib.sha256(encoded).hexdigest())
+        return tuple(fingerprints)
 
     def to_dict(self) -> dict:
         return {"method_id": self.method_id, **asdict(self)}
@@ -151,7 +243,11 @@ class MethodSpec:
             )
         return cls(
             method_key=normalized,
+            assignment=definition["assignment"],
             movement=definition["movement"],
+            routing=definition["routing"],
+            task_observation=definition["task_observation"],
+            assignment_rounds=definition["assignment_rounds"],
             lambda_mode=definition["reward_mode"],
             agent=definition["agent"],
             reward_mode=definition["reward_mode"],
@@ -227,4 +323,26 @@ def effective_training_config(config, method_spec: MethodSpec) -> dict:
     movement = movement_agent_configuration(method_spec)
     values["policy_delay"] = movement["policy_delay"]
     values["movement_agent_configuration"] = movement
+    values.update(comparison_method_configuration(method_spec))
     return values
+
+
+def comparison_method_configuration(method_spec: MethodSpec) -> dict:
+    """Resolve orthogonal comparison strategies and shared assignment constants."""
+
+    method_spec = MethodSpec.parse(method_spec.method_id)
+    return {
+        "assignment_strategy": method_spec.assignment,
+        "assignment_rounds": int(method_spec.assignment_rounds),
+        "movement_policy": method_spec.agent,
+        "movement_objective": method_spec.reward_mode,
+        "routing_policy": method_spec.routing,
+        "task_observation_mode": method_spec.task_observation,
+        "fov_com_pair_max_distance_m": FOV_COM_PAIR_MAX_DISTANCE_M,
+        "search_utility": SEARCH_UTILITY,
+        "search_coverage_threshold": SEARCH_COVERAGE_THRESHOLD,
+        "utility_normalization_mode": UTILITY_NORMALIZATION_MODE,
+        "task_compatibility_policy": TASK_COMPATIBILITY_POLICY,
+        "hover_assignment_candidate": False,
+        "assignment_dummy_utility": ASSIGNMENT_DUMMY_UTILITY,
+    }

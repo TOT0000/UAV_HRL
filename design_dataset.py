@@ -608,7 +608,7 @@ def design_dataset_preflight(args):
         ddqn_gamma=0.99,
         calibration=calibration,
         expected_experiment_metadata={
-            "method_spec_fingerprint": method.fingerprint,
+            "method_spec_fingerprint": method.compatible_fingerprints,
             "training_seed": int(args.training_seed),
         },
         expected_completed_episodes=FORMAL_EXPERIMENT_DEFAULTS[

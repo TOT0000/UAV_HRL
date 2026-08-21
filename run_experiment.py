@@ -23,6 +23,7 @@ from experiment_config import (
     ROI_COUNT_MAX,
     ROI_COUNT_MIN,
     effective_training_config,
+    comparison_method_configuration,
     movement_agent_configuration,
 )
 from HRL_task_aware import (
@@ -31,6 +32,7 @@ from HRL_task_aware import (
     formal_training_config,
     train,
 )
+from observation_strategy import masked_observation_metadata
 from resume_recovery import (
     execute_resume_reconciliation,
     plan_resume_reconciliation,
@@ -201,6 +203,7 @@ def _training_config_from_resolved(resolved, **overrides):
 
 
 def _base_resolved(run_dir, method, manifest, config, values, args, git_sha):
+    comparison = comparison_method_configuration(method)
     return {
         "status": "RUNNING",
         "method": method.method_key,
@@ -208,6 +211,12 @@ def _base_resolved(run_dir, method, manifest, config, values, args, git_sha):
         "agent": method.agent,
         "reward_mode": method.reward_mode,
         "task_potential_enabled": method.task_potential_enabled,
+        **comparison,
+        "masked_state_fields": (
+            masked_observation_metadata()
+            if method.task_observation == "masked"
+            else None
+        ),
         "seed": values["seed"],
         "episodes": values["episodes"],
         "num_uav": FORMAL_EXPERIMENT_DEFAULTS["num_uav"],
@@ -314,7 +323,7 @@ def run_resume(args):
     formal_config = effective_training_config(config, method)
     _, calibration = load_com_capacity_reference()
     expected_experiment = {
-        "method_spec_fingerprint": method.fingerprint,
+        "method_spec_fingerprint": method.compatible_fingerprints,
         "manifest_hash": manifest.content_hash,
         "training_seed": int(resolved["seed"]),
     }
@@ -468,7 +477,7 @@ def run_evaluate(args):
         ddqn_gamma=0.99,
         calibration=calibration,
         expected_experiment_metadata={
-            "method_spec_fingerprint": method.fingerprint,
+            "method_spec_fingerprint": method.compatible_fingerprints,
             "training_seed": int(resolved["seed"]),
         },
         expected_completed_episodes=checkpoint_episode,

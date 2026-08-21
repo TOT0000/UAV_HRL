@@ -8,7 +8,13 @@ from collections import defaultdict
 from Energy_model import EnergyConsumptionModel
 from Task_assignment import UAVAssigner, Task
 from object import UAV, SRTeam, GroundTarget
-from experiment_config import ROI_COUNT_MAX, ROI_COUNT_MIN
+from experiment_config import (
+    FOV_COM_PAIR_MAX_DISTANCE_M,
+    ROI_COUNT_MAX,
+    ROI_COUNT_MIN,
+    SEARCH_COVERAGE_THRESHOLD,
+    SEARCH_UTILITY,
+)
 
 
 class Simulator:
@@ -86,7 +92,23 @@ class Simulator:
                 "only_uav_ids": [0,1,4],
             }
             }
-        
+        self.assignment_strategy = "k_km"
+        self.assignment_rounds = 2
+        self.fov_com_pair_max_distance_m = FOV_COM_PAIR_MAX_DISTANCE_M
+        self.assignment_search_utility = SEARCH_UTILITY
+        self.search_coverage_threshold = SEARCH_COVERAGE_THRESHOLD
+        self.assignment_invocations = 0
+        self.search_to_hover_conversions = 0
+
+    def configure_method(self, method_spec):
+        """Install comparison strategies before any episode reset."""
+
+        self.assignment_strategy = str(method_spec.assignment)
+        self.assignment_rounds = int(method_spec.assignment_rounds)
+        self.fov_com_pair_max_distance_m = FOV_COM_PAIR_MAX_DISTANCE_M
+        self.assignment_search_utility = SEARCH_UTILITY
+        self.search_coverage_threshold = SEARCH_COVERAGE_THRESHOLD
+
     def add_uav_path(self, uav_id, path): # 記錄 UAV 路徑
         """存儲 UAV 移動軌跡"""
         self.uav_paths[uav_id] = path  
@@ -104,9 +126,20 @@ class Simulator:
     def assign_tasks(self):
         uav_id_list = self.get_available_uav_ids() #建立左邊的頂點
         assigner = UAVAssigner(self)
-        assigner.assign_tasks(uav_id_list, self.task_list, mode="KM")
+        assigner.assign_tasks(
+            uav_id_list,
+            self.task_list,
+            K=self.assignment_rounds,
+            strategy=self.assignment_strategy,
+            max_distance_m=self.fov_com_pair_max_distance_m,
+            search_utility=self.assignment_search_utility,
+            coverage_threshold=self.search_coverage_threshold,
+        )
         assigner.build_uav_tasks_from_assignment()# 分配結果改成任務列表
     # ====================更新探索區域=====================
+        self.assignment_invocations += 1
+        self.last_assignment = assigner
+
     def update_visited_grid(self, uav_id):
         """
         根據 UAV 的 FOV 更新 visited_grid，並判斷是否有 Ground Target 被發現。
@@ -256,7 +289,43 @@ class Simulator:
 
         self.sim_step_count += 1
 
+    def _convert_search_to_hovering_phase(self):
+        if self._search_phase_over and self.search_completed:
+            return
+        self._search_phase_over = True
+        self.search_completed = True
+        self.search_to_hover_conversions += 1
+        for task in self.task_list:
+            if task.task_type == "Search":
+                task.task_type = "Hovering"
+                uav = self.uav_dict[int(task.target_obj_id)]
+                task.target_obj = uav
+                task.target_obj_id = uav.id
+        for uav_id in range(self.num_UAV):
+            uav = self.uav_dict[uav_id]
+            retained = [
+                dict(task)
+                for task in self.multi_tasks.get(uav_id, [])
+                if task["task_type"] in {"FOV", "COM"}
+            ]
+            if not retained:
+                retained = [
+                    {
+                        "task_type": "Hovering",
+                        "target_id": None,
+                        "target_obj_id": uav_id,
+                        "target_pos": uav.get_position(),
+                        "phase_fallback": True,
+                    }
+                ]
+            self.multi_tasks[uav_id] = retained
+            uav.active_task_index = 0
+            uav.task_type = retained[0]["task_type"]
+            uav.assigned_target_id = retained[0]["target_id"]
+            uav.target_position = retained[0]["target_pos"]
+
     def convert_search_to_hovering(self):
+        return self._convert_search_to_hovering_phase()
         """將所有 Search 任務轉換成 Hovering，避免 UAV 被重新分配到 FOV/COM。"""
         # 全域 task_list 內的 Search 改為 Hovering
         for t in self.task_list:
@@ -1029,6 +1098,8 @@ class Simulator:
             )
         self.load_factor = float(self.traffic_primitives["load_factor"])
         self.need_reassign = True   
+        self.assignment_invocations = 0
+        self.search_to_hover_conversions = 0
         self.UAVs.clear()
         self.current_time = 0
         self.uav_tasks = {}

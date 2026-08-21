@@ -20,6 +20,26 @@ def _bellman_target(immediate_value, next_value, not_done, discount):
     return immediate_value + not_done * discount * next_value
 
 
+def routing_action_mask_from_state(next_state, action_dim):
+    """Extract the embedded effective action mask from a routing state batch."""
+
+    num_uav = int(action_dim) - 1
+    state_dim = next_state.shape[1]
+    if state_dim == 5 * num_uav + 20:
+        mask_start = num_uav + 7
+    elif state_dim == 6 * num_uav + 30:
+        mask_start = num_uav + 8
+    else:
+        raise ValueError(
+            f"Unsupported routing state layout: state_dim={state_dim}, "
+            f"action_dim={action_dim}"
+        )
+    action_mask = next_state[:, mask_start : mask_start + int(action_dim)].bool()
+    if (~action_mask.any(dim=1)).any():
+        raise ValueError("routing target state has no legal action")
+    return action_mask
+
+
 """
 The Q-Network has as input a state s and outputs the state-action values q(s,a_1), ..., q(s,a_n) for all n actions.
 """
@@ -66,6 +86,8 @@ class QNetworkCNN(nn.Module):
 
 
 class DDQN:
+    routing_agent_kind = "safe_ddqn"
+
     def __init__(
         self,
         state_dim,
@@ -93,6 +115,7 @@ class DDQN:
         self.loss_log = []
         self.cost_loss_log = []
         self.num_training = 0
+        self.target_update_count = 0
     def select_action(self, state, uav_id, mask=None, visited_nodes=None, epsilon=0.5, logits_noise_std=0.5, eta=None):
         if eta is None:
             eta = self.eta
@@ -129,7 +152,7 @@ class DDQN:
         # ---------- 套用 mask 到 Q 值 ----------
         # 非法動作的 Q 值設成極小
         q_values_masked = q_values.copy()
-        q_values_masked[~final_mask] = -1e9
+        q_values_masked[~final_mask] = -np.inf
 
         # 加上 noise（可選）
         if logits_noise_std > 0:
@@ -147,27 +170,7 @@ class DDQN:
         return action
 
     def _routing_action_mask(self, next_state):
-        num_uav = self.action_dim - 1
-        state_dim = next_state.shape[1]
-
-        if state_dim == 5 * num_uav + 20:
-            mask_start = num_uav + 7
-        elif state_dim == 6 * num_uav + 30:
-            mask_start = num_uav + 8
-        else:
-            raise ValueError(
-                f"Unsupported routing state layout: state_dim={state_dim}, "
-                f"action_dim={self.action_dim}"
-            )
-
-        action_mask = next_state[
-            :, mask_start : mask_start + self.action_dim
-        ].bool()
-
-        if (~action_mask.any(dim=1)).any():
-            raise ValueError("routing target state has no legal action")
-
-        return action_mask
+        return routing_action_mask_from_state(next_state, self.action_dim)
 
     @torch.no_grad()
     def _safe_targets(self, next_state, reward, cost, not_done):
@@ -235,6 +238,7 @@ class DDQN:
             target_param.data.copy_(self.tau * param.data + (1 - self.tau) * target_param.data)
         for param, target_param in zip(self.cost_network.parameters(), self.target_cost_network.parameters()):
             target_param.data.copy_(self.tau * param.data + (1 - self.tau) * target_param.data)
+        self.target_update_count += 1
 
     def update_parameters(current_model, target_model):
         target_model.load_state_dict(current_model.state_dict())

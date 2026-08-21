@@ -210,6 +210,103 @@ class SimpleRunnerLifecycleIntegrationTest(unittest.TestCase):
             self.assertEqual(metadata["formal_config"]["total_episodes"], 3)
             self.assertEqual(metadata["training_config"]["total_episodes"], 3)
 
+    def test_controlled_dqn_partial_resume_preserves_epsilon_and_target_counters(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output = Path(temp_dir) / "results"
+            command = [
+                "td3_dinkelbach_dqn",
+                "--episodes", "3",
+                "--episode-seconds", "1",
+                "--checkpoint-interval", "1",
+                "--roi-count", "2",
+                "--output-root", str(output),
+            ]
+            original_apply = Simulator.apply_scenario_entry
+            calls = []
+
+            def interrupt(simulator, scenario_entry):
+                calls.append(str(scenario_entry["scenario_id"]))
+                if len(calls) == 2:
+                    raise RuntimeError("controlled DQN interruption")
+                return original_apply(simulator, scenario_entry)
+
+            with mock.patch.object(
+                Simulator, "apply_scenario_entry", new=interrupt
+            ):
+                with self.assertRaisesRegex(
+                    RuntimeError, "controlled DQN interruption"
+                ):
+                    main(command)
+
+            run_dir = next((output / "td3_dinkelbach_dqn").iterdir())
+            ep1 = run_dir / "checkpoints" / "full" / "ep_0001"
+            self.assertTrue(ep1.is_dir())
+            payload1 = torch.load(
+                ep1 / "training_state.pt", map_location="cpu", weights_only=False
+            )
+            routing1 = payload1["routing_agent_state"]
+            self.assertEqual(routing1["kind"], "dqn")
+            self.assertEqual(routing1["target_update_count"], 1)
+            self.assertEqual(payload1["training_state"]["global_routing_slot"], 4)
+            self.assertEqual(
+                len(payload1["training_state"]["routing_epsilon_log"]), 4
+            )
+
+            resumed = []
+
+            def record(simulator, scenario_entry):
+                resumed.append(str(scenario_entry["scenario_id"]))
+                return original_apply(simulator, scenario_entry)
+
+            with mock.patch.object(
+                Simulator, "apply_scenario_entry", new=record
+            ):
+                self.assertEqual(main(["resume", str(run_dir)]), 0)
+
+            manifest = json.loads(
+                (run_dir / "scenario_manifest.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(
+                resumed,
+                [
+                    manifest["episodes"][1]["scenario_id"],
+                    manifest["episodes"][2]["scenario_id"],
+                ],
+            )
+            final = run_dir / "checkpoints" / "full" / "ep_0003"
+            payload3 = torch.load(
+                final / "training_state.pt", map_location="cpu", weights_only=False
+            )
+            routing3 = payload3["routing_agent_state"]
+            state3 = payload3["training_state"]
+            self.assertEqual(routing3["kind"], "dqn")
+            self.assertEqual(routing3["target_update_count"], 3)
+            self.assertGreaterEqual(
+                routing3["training_updates"], routing1["training_updates"]
+            )
+            self.assertEqual(state3["global_routing_slot"], 12)
+            self.assertEqual(state3["ddqn_schedule_slot"], 12)
+            self.assertEqual(len(state3["routing_epsilon_log"]), 12)
+            np.testing.assert_array_equal(
+                state3["routing_epsilon_log"][:4],
+                payload1["training_state"]["routing_epsilon_log"],
+            )
+            history = [
+                json.loads(line)
+                for line in (run_dir / "training_history.jsonl")
+                .read_text(encoding="utf-8")
+                .splitlines()
+                if line
+            ]
+            self.assertEqual([row["episode"] for row in history], [1, 2, 3])
+            metadata = json.loads(
+                (run_dir / "run_metadata.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(metadata["routing_policy"], "dqn")
+            self.assertEqual(Path(metadata["resume_checkpoint"]).name, "ep_0001")
+            self.assertEqual(metadata["history_rows"], 3)
+            self.assertEqual(metadata["training_config"]["total_episodes"], 3)
+
     def test_new_resume_and_collision_free_smoke_evaluations(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             output = Path(temp_dir) / "results"

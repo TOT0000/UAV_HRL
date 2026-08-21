@@ -76,6 +76,18 @@ FORMAL_CORE_CONFIG_FIELDS = (
     "dinkelbach_update_rule",
     "dinkelbach_numerator_unit",
     "dinkelbach_denominator_unit",
+    "assignment_strategy",
+    "assignment_rounds",
+    "movement_policy",
+    "movement_objective",
+    "routing_policy",
+    "task_observation_mode",
+    "fov_com_pair_max_distance_m",
+    "search_utility",
+    "utility_normalization_mode",
+    "task_compatibility_policy",
+    "hover_assignment_candidate",
+    "assignment_dummy_utility",
 )
 
 FULL_RESUME_CONFIG_FIELDS = (
@@ -155,6 +167,10 @@ def _agent_kind(agent):
     return str(getattr(agent, "agent_kind", "td3"))
 
 
+def _routing_agent_kind(agent):
+    return str(getattr(agent, "routing_agent_kind", "safe_ddqn"))
+
+
 def _movement_agent_configuration(agent):
     kind = _agent_kind(agent)
     return {
@@ -223,19 +239,32 @@ def _movement_network_states(agent):
 
 def _network_states(td3, ddqn):
     kind = _agent_kind(td3)
+    routing_kind = _routing_agent_kind(ddqn)
     movement_key = "td3" if kind == "td3" else "movement_agent"
-    return {
+    states = {
         movement_key: {
             **({"kind": kind} if movement_key == "movement_agent" else {}),
             **_movement_network_states(td3),
         },
-        "ddqn": {
+    }
+    if routing_kind == "safe_ddqn":
+        states["ddqn"] = {
             "q_network": ddqn.q_network.state_dict(),
             "target_q_network": ddqn.target_q_network.state_dict(),
             "cost_network": ddqn.cost_network.state_dict(),
             "target_cost_network": ddqn.target_cost_network.state_dict(),
-        },
-    }
+        }
+    elif routing_kind == "dqn":
+        states["routing_agent"] = {
+            "kind": "dqn",
+            "q_network": ddqn.q_network.state_dict(),
+            "target_q_network": ddqn.target_q_network.state_dict(),
+        }
+    elif routing_kind == "random":
+        states["routing_agent"] = {"kind": "random"}
+    else:
+        raise ValueError(f"unsupported routing agent kind: {routing_kind}")
+    return states
 
 
 def _load_network_states(payload, td3, ddqn):
@@ -263,11 +292,25 @@ def _load_network_states(payload, td3, ddqn):
     else:
         raise RuntimeError(f"unsupported movement agent kind: {kind}")
 
-    ddqn_state = payload["ddqn"]
-    ddqn.q_network.load_state_dict(ddqn_state["q_network"])
-    ddqn.target_q_network.load_state_dict(ddqn_state["target_q_network"])
-    ddqn.cost_network.load_state_dict(ddqn_state["cost_network"])
-    ddqn.target_cost_network.load_state_dict(ddqn_state["target_cost_network"])
+    routing_kind = _routing_agent_kind(ddqn)
+    if routing_kind == "safe_ddqn":
+        ddqn_state = payload["ddqn"]
+        ddqn.q_network.load_state_dict(ddqn_state["q_network"])
+        ddqn.target_q_network.load_state_dict(ddqn_state["target_q_network"])
+        ddqn.cost_network.load_state_dict(ddqn_state["cost_network"])
+        ddqn.target_cost_network.load_state_dict(ddqn_state["target_cost_network"])
+    elif routing_kind == "dqn":
+        state = payload.get("routing_agent") or {}
+        if state.get("kind") != "dqn" or "cost_network" in state:
+            raise RuntimeError("checkpoint routing agent kind is incompatible")
+        ddqn.q_network.load_state_dict(state["q_network"])
+        ddqn.target_q_network.load_state_dict(state["target_q_network"])
+    elif routing_kind == "random":
+        state = payload.get("routing_agent") or {}
+        if state != {"kind": "random"}:
+            raise RuntimeError("checkpoint routing agent kind is incompatible")
+    else:
+        raise RuntimeError(f"unsupported routing agent kind: {routing_kind}")
 
 
 def _base_metadata(
@@ -293,6 +336,7 @@ def _base_metadata(
         "movement_agent_gamma": float(td3.gamma),
         "movement_agent_configuration": _movement_agent_configuration(td3),
         "routing_ddqn_gamma": float(ddqn.gamma),
+        "routing_agent_kind": _routing_agent_kind(ddqn),
         "com_calibration_fingerprint": calibration_fingerprint(calibration),
     }
     if kind == "td3":
@@ -464,7 +508,7 @@ def _validate_checkpoint_schema(metadata):
 
 
 def _formal_config_for_validation(metadata, actual_config, expected_config):
-    """Normalize only behaviorally irrelevant schema-2 DDPG policy-delay labels."""
+    """Normalize documented legacy fields without weakening current checks."""
 
     if (
         metadata.get("checkpoint_schema_version")
@@ -475,6 +519,17 @@ def _formal_config_for_validation(metadata, actual_config, expected_config):
     ):
         actual_config = dict(actual_config)
         actual_config["policy_delay"] = expected_config.get("policy_delay")
+    experiment = metadata.get("experiment") or {}
+    legacy_method_spec = experiment.get("method_spec") or {}
+    if (
+        isinstance(actual_config, dict)
+        and isinstance(expected_config, dict)
+        and "task_observation" not in legacy_method_spec
+    ):
+        actual_config = dict(actual_config)
+        for field in FORMAL_CORE_CONFIG_FIELDS:
+            if field not in actual_config and field in expected_config:
+                actual_config[field] = expected_config[field]
     return actual_config
 
 
@@ -824,6 +879,67 @@ def _restore_movement_training_payload(agent, payload):
         setattr(agent, name, value)
 
 
+def _routing_training_payload(agent):
+    kind = _routing_agent_kind(agent)
+    state = {
+        "kind": kind,
+        "gamma": float(agent.gamma),
+        "tau": float(agent.tau) if agent.tau is not None else None,
+        "training_updates": int(agent.num_training),
+        "target_update_count": int(getattr(agent, "target_update_count", 0)),
+        "loss_log": list(agent.loss_log),
+    }
+    if kind == "safe_ddqn":
+        return {
+            "ddqn_optimizers": {
+                "reward": agent.optimizer.state_dict(),
+                "cost": agent.cost_optimizer.state_dict(),
+            },
+            "ddqn_state": {
+                **state,
+                "eta": float(agent.eta),
+                "cost_loss_log": list(agent.cost_loss_log),
+            },
+        }
+    if kind == "dqn":
+        return {
+            "routing_agent_optimizer": agent.optimizer.state_dict(),
+            "routing_agent_state": state,
+        }
+    if kind == "random":
+        return {"routing_agent_state": state}
+    raise ValueError(f"unsupported routing agent kind: {kind}")
+
+
+def _restore_routing_training_payload(agent, payload):
+    kind = _routing_agent_kind(agent)
+    if kind == "safe_ddqn":
+        agent.optimizer.load_state_dict(payload["ddqn_optimizers"]["reward"])
+        agent.cost_optimizer.load_state_dict(payload["ddqn_optimizers"]["cost"])
+        state = payload["ddqn_state"]
+        if state.get("kind", "safe_ddqn") != "safe_ddqn":
+            raise RuntimeError("checkpoint routing agent kind is incompatible")
+        agent.eta = float(state["eta"])
+        agent.cost_loss_log = list(state["cost_loss_log"])
+    elif kind == "dqn":
+        state = payload.get("routing_agent_state") or {}
+        if state.get("kind") != "dqn":
+            raise RuntimeError("checkpoint routing agent kind is incompatible")
+        agent.optimizer.load_state_dict(payload["routing_agent_optimizer"])
+    elif kind == "random":
+        state = payload.get("routing_agent_state") or {}
+        if state.get("kind") != "random":
+            raise RuntimeError("checkpoint routing agent kind is incompatible")
+    else:
+        raise RuntimeError(f"unsupported routing agent kind: {kind}")
+    agent.gamma = float(state["gamma"])
+    if state.get("tau") is not None:
+        agent.tau = float(state["tau"])
+    agent.num_training = int(state["training_updates"])
+    agent.target_update_count = int(state.get("target_update_count", 0))
+    agent.loss_log = list(state["loss_log"])
+
+
 def _restore_rng_state(state):
     random.setstate(state["python"])
     np.random.set_state(state["numpy"])
@@ -884,18 +1000,7 @@ def save_full_resume_checkpoint(
         payload = {
             "networks": _network_states(td3, ddqn),
             **_movement_training_payload(td3),
-            "ddqn_optimizers": {
-                "reward": ddqn.optimizer.state_dict(),
-                "cost": ddqn.cost_optimizer.state_dict(),
-            },
-            "ddqn_state": {
-                "eta": float(ddqn.eta),
-                "tau": float(ddqn.tau),
-                "gamma": float(ddqn.gamma),
-                "training_updates": int(ddqn.num_training),
-                "loss_log": list(ddqn.loss_log),
-                "cost_loss_log": list(ddqn.cost_loss_log),
-            },
+            **_routing_training_payload(ddqn),
             "training_state": dict(training_state),
             "formal_config": dict(formal_config),
             "replay_metadata": replay_metadata,
@@ -1011,11 +1116,15 @@ def validate_checkpoint_experiment_metadata(metadata, expected):
     actual = metadata.get("experiment")
     if actual is None:
         raise RuntimeError("checkpoint has no experiment identity metadata")
-    mismatches = {
-        key: (actual.get(key), value)
-        for key, value in expected.items()
-        if actual.get(key) != value
-    }
+    mismatches = {}
+    for key, value in expected.items():
+        actual_value = actual.get(key)
+        if isinstance(value, (tuple, list, set, frozenset)):
+            matches = actual_value in value
+        else:
+            matches = actual_value == value
+        if not matches:
+            mismatches[key] = (actual_value, value)
     if mismatches:
         raise RuntimeError(
             f"checkpoint experiment metadata is incompatible: {mismatches}"
@@ -1186,16 +1295,7 @@ def load_full_resume_checkpoint(
     payload = inspected["payload"]
     _load_network_states(payload["networks"], td3, ddqn)
     _restore_movement_training_payload(td3, payload)
-
-    ddqn.optimizer.load_state_dict(payload["ddqn_optimizers"]["reward"])
-    ddqn.cost_optimizer.load_state_dict(payload["ddqn_optimizers"]["cost"])
-    ddqn_state = payload["ddqn_state"]
-    ddqn.eta = float(ddqn_state["eta"])
-    ddqn.tau = float(ddqn_state["tau"])
-    ddqn.gamma = float(ddqn_state["gamma"])
-    ddqn.num_training = int(ddqn_state["training_updates"])
-    ddqn.loss_log = list(ddqn_state["loss_log"])
-    ddqn.cost_loss_log = list(ddqn_state["cost_loss_log"])
+    _restore_routing_training_payload(ddqn, payload)
 
     replay_metadata = payload["replay_metadata"]
     _load_replay(

@@ -1,4 +1,3 @@
-from dataclasses import asdict
 import json
 import tempfile
 import unittest
@@ -29,7 +28,7 @@ from design_dataset import (
 )
 from dinkelbach_blocks import DinkelbachBlockState, dinkelbach_config_metadata
 from evaluation_metrics import EPISODE_COLUMNS, write_evaluation_outputs
-from experiment_config import MethodSpec
+from experiment_config import MethodSpec, effective_training_config
 from experiment_paths import design_run_directory, read_run_status
 from HRL_task_aware import TrainingConfig, formal_training_config, train
 from scenario_manifest import generate_manifest
@@ -64,8 +63,9 @@ class DesignDatasetIntegrationTest(unittest.TestCase):
         cls.manifest = generate_manifest("validation", 8811, 2)
         cls.manifest_path = cls.root / "validation.json"
         cls.manifest.save(cls.manifest_path)
-        cls.formal_config = asdict(
-            formal_training_config(2500, random_seed=cls.training_seed)
+        cls.formal_config = effective_training_config(
+            formal_training_config(2500, random_seed=cls.training_seed),
+            cls.method,
         )
         cls.dinkelbach_state = DinkelbachBlockState.from_config(cls.formal_config)
         for _ in range(2500):
@@ -307,6 +307,11 @@ class DesignDatasetIntegrationTest(unittest.TestCase):
             "random_action",
             "td3_dinkelbach_no_task_potential",
             "ddpg_dinkelbach_no_task_potential",
+            "td3_dinkelbach_wo_ta",
+            "td3_dinkelbach_dqn",
+            "kkm_random_action_random_routing",
+            "km_td3_dinkelbach",
+            "random_assignment_td3_dinkelbach",
         )
         for method in unsupported_methods:
             with self.subTest(method=method):

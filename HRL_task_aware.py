@@ -11,7 +11,6 @@ import numpy as np
 import pandas as pd
 import torch
 
-from DDQN import DDQN
 from dinkelbach_blocks import (
     DINKELBACH_DENOMINATOR_UNIT,
     DINKELBACH_INITIAL_LAMBDA,
@@ -51,8 +50,14 @@ from experiment_config import (
     ROI_COUNT_MIN,
     effective_training_config,
     movement_agent_configuration,
+    comparison_method_configuration,
 )
-from movement_agents import create_movement_agent
+from movement_agents import create_movement_agent, sample_random_joint_action
+from observation_strategy import (
+    apply_observation_strategy,
+    masked_observation_metadata,
+)
+from routing_agents import create_routing_agent
 from training_checkpoint import (
     FULL_RESUME_LOGGING_SCHEMA_VERSION,
     checkpoint_episode_schedule,
@@ -266,6 +271,7 @@ def _run_routing_slot(
     violation_stats,
     epsilon,
     write_replay=True,
+    task_observation_mode="full",
 ):
     step_time = float(packet_engine.step_time)
     env.current_time = float(current_time)
@@ -285,7 +291,7 @@ def _run_routing_slot(
         for uid in uavs_with_packets
     }
 
-    states = {
+    physical_states = {
         uid: packet_engine.get_state_ta(
             env,
             uid,
@@ -293,6 +299,12 @@ def _run_routing_slot(
             action_mask=effective_masks[uid],
         )
         for uid in uavs_with_packets
+    }
+    states = {
+        uid: apply_observation_strategy(
+            state, task_observation_mode, "routing"
+        )
+        for uid, state in physical_states.items()
     }
     for uid, state in states.items():
         if state.shape != (ROUTING_STATE_DIM,):
@@ -339,7 +351,7 @@ def _run_routing_slot(
             violation_stats[task_type]["timely_delivered_packets"] += 1
 
     backlog_after = _active_backlog(packet_engine)
-    next_states = {
+    physical_next_states = {
         uid: packet_engine.get_state_ta(
             env,
             uid,
@@ -349,6 +361,12 @@ def _run_routing_slot(
             ),
         )
         for uid in uavs_with_packets
+    }
+    next_states = {
+        uid: apply_observation_strategy(
+            state, task_observation_mode, "routing"
+        )
+        for uid, state in physical_next_states.items()
     }
     if write_replay:
         for uid in uavs_with_packets:
@@ -580,6 +598,7 @@ def _full_training_state(
 
 
 def _experiment_identity(method_spec, scenario_manifest, training_seed, config):
+    comparison = comparison_method_configuration(method_spec)
     return {
         "method_id": method_spec.method_id,
         "method_spec": method_spec.to_dict(),
@@ -604,6 +623,12 @@ def _experiment_identity(method_spec, scenario_manifest, training_seed, config):
         "movement_agent_configuration": movement_agent_configuration(method_spec),
         "reward_mode": method_spec.reward_mode,
         "task_potential_enabled": bool(method_spec.task_potential_enabled),
+        **comparison,
+        "masked_state_fields": (
+            masked_observation_metadata()
+            if method_spec.task_observation == "masked"
+            else None
+        ),
         **(
             dinkelbach_config_metadata(config)
             if method_spec.uses_dinkelbach
@@ -632,18 +657,17 @@ def _evaluation_state_snapshot(
         return snapshot
 
     kind = movement_agent.agent_kind
-    online = {
-        "q_network": ddqn.q_network.state_dict(),
-        "cost_network": ddqn.cost_network.state_dict(),
-    }
-    targets = {
-        "target_q_network": ddqn.target_q_network.state_dict(),
-        "target_cost_network": ddqn.target_cost_network.state_dict(),
-    }
-    optimizers = {
-        "ddqn_reward": ddqn.optimizer.state_dict(),
-        "ddqn_cost": ddqn.cost_optimizer.state_dict(),
-    }
+    online = {}
+    targets = {}
+    optimizers = {}
+    if hasattr(ddqn, "q_network"):
+        online["q_network"] = ddqn.q_network.state_dict()
+        targets["target_q_network"] = ddqn.target_q_network.state_dict()
+        optimizers["routing_reward"] = ddqn.optimizer.state_dict()
+    if hasattr(ddqn, "cost_network"):
+        online["cost_network"] = ddqn.cost_network.state_dict()
+        targets["target_cost_network"] = ddqn.target_cost_network.state_dict()
+        optimizers["routing_cost"] = ddqn.cost_optimizer.state_dict()
     if kind in {"td3", "ddpg"}:
         online["actor"] = movement_agent.actor.state_dict()
         targets["actor_target"] = movement_agent.actor_target.state_dict()
@@ -699,7 +723,11 @@ def _evaluation_state_snapshot(
             "movement_training": int(movement_agent.num_training),
             "ddqn_training": int(ddqn.num_training),
             "ddqn_loss_log": list(ddqn.loss_log),
-            "ddqn_cost_loss_log": list(ddqn.cost_loss_log),
+            "ddqn_cost_loss_log": list(getattr(ddqn, "cost_loss_log", [])),
+            "routing_target_updates": int(
+                getattr(ddqn, "target_update_count", 0)
+            ),
+            "routing_agent_kind": str(ddqn.routing_agent_kind),
         },
         "dinkelbach_state": copy.deepcopy(dinkelbach_state.training_state()),
     }
@@ -833,6 +861,7 @@ def train(
 
     c_ref_com, calibration = load_com_capacity_reference()
     env = Simulator(num_UAV=NUM_UAV)
+    env.configure_method(method_spec)
     packet_engine = PacketEngine(
         num_uav=NUM_UAV, step_time=config.routing_slot_seconds
     )
@@ -842,7 +871,9 @@ def train(
         JOINT_ACTION_DIM,
         config,
     )
-    ddqn = DDQN(ROUTING_STATE_DIM, env.num_UAV + 1)
+    ddqn = create_routing_agent(
+        method_spec, ROUTING_STATE_DIM, env.num_UAV + 1
+    )
     joint_replay = utils_update_v2.ReplayBufferJoint(
         MOVEMENT_STATE_DIM,
         JOINT_ACTION_DIM,
@@ -883,7 +914,7 @@ def train(
             routing_state_dim=ROUTING_STATE_DIM,
             calibration=calibration,
             expected_experiment_metadata={
-                "method_spec_fingerprint": method_spec.fingerprint,
+                "method_spec_fingerprint": method_spec.compatible_fingerprints,
                 "training_seed": int(config.random_seed),
             },
             expected_completed_episodes=expected_checkpoint_episodes,
@@ -961,7 +992,7 @@ def train(
             routing_state_dim=ROUTING_STATE_DIM,
             calibration=calibration,
             expected_experiment_metadata={
-                "method_spec_fingerprint": method_spec.fingerprint,
+                "method_spec_fingerprint": method_spec.compatible_fingerprints,
                 "training_seed": (
                     int(config.random_seed)
                     if config.random_seed is not None
@@ -1090,13 +1121,18 @@ def train(
 
             backlog_before = _active_backlog(packet_engine)
             try:
-                state = get_global_movement_state(
+                physical_state = get_global_movement_state(
                     env,
                     packet_engine,
                     backlog_before,
                     c_ref_com,
                     remaining_time=(config.episode_seconds - interval)
                     / config.episode_seconds,
+                )
+                state = apply_observation_strategy(
+                    physical_state,
+                    method_spec.task_observation,
+                    "movement",
                 )
                 potentials_t = calculate_movement_potentials(env, c_ref_com)
             except ValueError as exc:
@@ -1105,9 +1141,7 @@ def train(
                 raise
 
             if method_spec.agent == "random":
-                raw_joint_action = np.random.uniform(
-                    -1.0, 1.0, size=JOINT_ACTION_DIM
-                ).astype(np.float32)
+                raw_joint_action = sample_random_joint_action(JOINT_ACTION_DIM)
             elif evaluation:
                 raw_joint_action = movement_agent.select_action(
                     state, add_noise=False, noise_std=0.0
@@ -1129,7 +1163,9 @@ def train(
                 )
                 td3_noise_log.append(behavior_noise)
                 environment_actor_calls += 1
-            projected_action = project_joint_action(raw_joint_action, state)
+            projected_action = project_joint_action(
+                raw_joint_action, physical_state
+            )
 
             # Phase 1 is read-only: all sixteen proposals are built from one snapshot.
             proposals = build_joint_movement_proposals(
@@ -1161,7 +1197,7 @@ def train(
             for routing_slot in range(MOVEMENT_CONTROL_INTERVAL):
                 slot_epsilon = (
                     0.0
-                    if evaluation
+                    if evaluation or method_spec.routing == "random"
                     else ddqn_epsilon(
                         routing_slots_executed, ddqn_schedule_decay
                     )
@@ -1184,7 +1220,8 @@ def train(
                     delay_bound_steps=delay_bound_steps,
                     violation_stats=violation_stats,
                     epsilon=slot_epsilon,
-                    write_replay=not evaluation,
+                    write_replay=(not evaluation and method_spec.learns_routing),
+                    task_observation_mode=method_spec.task_observation,
                 )
                 ddqn_action_selections += action_selections
                 interval_delivered_bits += delivered_bits
@@ -1196,13 +1233,18 @@ def train(
                 env.advance_sr_teams()
             backlog_after = _active_backlog(packet_engine)
             potentials_t1 = calculate_movement_potentials(env, c_ref_com)
-            next_state = get_global_movement_state(
+            physical_next_state = get_global_movement_state(
                 env,
                 packet_engine,
                 backlog_after,
                 c_ref_com,
                 remaining_time=(config.episode_seconds - (interval + 1))
                 / config.episode_seconds,
+            )
+            next_state = apply_observation_strategy(
+                physical_next_state,
+                method_spec.task_observation,
+                "movement",
             )
             terminal_joint_transitions += int(done)
             episode_delivered_mbits += interval_delivered_mbits
@@ -1294,9 +1336,13 @@ def train(
                     task_potential_enabled=method_spec.task_potential_enabled,
                 )
 
-        if not evaluation and routing_replay.size >= config.batch_size:
+        if (
+            not evaluation
+            and method_spec.learns_routing
+            and routing_replay.size >= config.batch_size
+        ):
             ddqn.train(routing_replay, config.batch_size)
-        if not evaluation:
+        if not evaluation and method_spec.learns_routing:
             ddqn.update_target()
 
         timely_goodput_mbits = float(packet_engine.timely_goodput_bits) / 1e6
@@ -1641,6 +1687,8 @@ def train(
             else {}
         ),
         "routing_ddqn_gamma": ddqn.gamma,
+        "routing_agent_kind": ddqn.routing_agent_kind,
+        "routing_policy": method_spec.routing,
         "joint_replay_size": joint_replay.size,
         "routing_replay_size": routing_replay.size,
         "lambda": float(lambda_ee) if method_spec.uses_dinkelbach else None,
@@ -1661,6 +1709,9 @@ def train(
         "routing_slots_executed": routing_slots_executed,
         "ddqn_action_selections": ddqn_action_selections,
         "ddqn_training_updates": ddqn.num_training,
+        "routing_target_update_count": getattr(
+            ddqn, "target_update_count", 0
+        ),
         "td3_noise_log": td3_noise_log,
         "movement_noise_log": td3_noise_log,
         "routing_epsilon_log": routing_epsilon_log,

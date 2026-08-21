@@ -225,7 +225,19 @@ class ComStateCalibrationAndDeliveryTest(unittest.TestCase):
             _, _, phi_com = calculate_movement_potentials(
                 self.env, c_ref_com=24.0
             )
-            assignment = UAVAssigner(self.env).assign_uav_tasks_k_times(
+            assigner = UAVAssigner(self.env)
+            problem = assigner.build_problem(
+                [0],
+                [
+                    Task(
+                        task_id=0,
+                        task_type="COM",
+                        target_obj=sr,
+                        target_obj_id=0,
+                    )
+                ],
+            )
+            assignment = assigner.assign_uav_tasks_k_times(
                 [0],
                 [
                     Task(
@@ -241,7 +253,8 @@ class ComStateCalibrationAndDeliveryTest(unittest.TestCase):
         com_capacity_index = LOCAL_MOVEMENT_DIM - 1
         self.assertEqual(state[com_capacity_index], 0.5)
         self.assertEqual(phi_com, 0.5)
-        self.assertEqual(assignment[0][0][2], 12.0)
+        self.assertEqual(problem.raw_com_utility[0, 0], 12.0)
+        self.assertEqual(assignment[0][0][2], 0.5)
         self.assertGreaterEqual(capacity_helper.call_count, 3)
         source = inspect.getsource(UAVAssigner.assign_uav_tasks_k_times)
         self.assertNotIn("capacity / 1e6", source)

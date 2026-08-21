@@ -3,14 +3,38 @@
 `run_experiment.py METHOD` runs exactly one controlled trajectory method per
 process. The registry keys are `td3_dinkelbach`, `ddpg_dinkelbach`,
 `td3_ratio`, `ddpg_ratio`, `random_action`,
-`td3_dinkelbach_no_task_potential`, and
-`ddpg_dinkelbach_no_task_potential`. All seven share current K-KM assignment,
+`td3_dinkelbach_no_task_potential`,
+`ddpg_dinkelbach_no_task_potential`, `td3_dinkelbach_wo_ta`,
+`td3_dinkelbach_dqn`, `kkm_random_action_random_routing`,
+`km_td3_dinkelbach`, and `random_assignment_td3_dinkelbach`. All twelve share
 16 UAVs, the common Simulator and synchronous projection/movement flow,
-safe-DDQN routing, energy/delivery accounting, evaluation, and logging.
+energy/delivery accounting, evaluation, and logging.
+
+The added baselines are orthogonal configurations of that shared flow. The
+`wo_ta` method keeps the 532-D/126-D layouts but zeros named task-assignment
+observation fields. The controlled DQN method replaces safe-DDQN with a masked
+standard DQN. The combined random baseline uses K-KM, the common projected
+continuous movement domain, and uniform random routing over each slot's current
+effective mask. The assignment baselines use one KM round and one seeded
+shuffle-and-pair random round, respectively.
+
+All assignment solvers exclude Hovering. Below 0.99 coverage the candidates are
+FOV, COM, and Search; at or above 0.99 they are FOV and COM only. FOV and COM
+raw utilities are normalized separately with a global feasible-pair min/max per
+type (equal values map to 0.5), while Search utility is 0.05. A separate
+feasibility mask and zero-utility dummy choices prevent forced assignments;
+solver-only infinities never enter the domain utility matrix. K-KM uses at most
+two rounds, and FOV+COM is its only legal two-task combination, with current
+horizontal targets no more than 200 m apart.
 
 ```powershell
 python -X utf8 run_experiment.py td3_dinkelbach
 python -X utf8 run_experiment.py ddpg_ratio --smoke
+python -X utf8 run_experiment.py td3_dinkelbach_wo_ta --smoke
+python -X utf8 run_experiment.py td3_dinkelbach_dqn --smoke
+python -X utf8 run_experiment.py kkm_random_action_random_routing --smoke
+python -X utf8 run_experiment.py km_td3_dinkelbach --smoke
+python -X utf8 run_experiment.py random_assignment_td3_dinkelbach --smoke
 ```
 
 Each invocation creates a new leaf such as

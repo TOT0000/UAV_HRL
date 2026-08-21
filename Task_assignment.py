@@ -1,204 +1,437 @@
-from scipy.optimize import linear_sum_assignment
-import numpy as np
+"""Shared task-assignment strategies for K-KM, KM, and random baselines."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+import math
 import random
+
+import numpy as np
+from scipy.optimize import linear_sum_assignment
+
+from experiment_config import (
+    ASSIGNMENT_DUMMY_UTILITY,
+    FOV_COM_PAIR_MAX_DISTANCE_M,
+    SEARCH_COVERAGE_THRESHOLD,
+    SEARCH_UTILITY,
+)
 from Fov_model_phase import FovModel
 
+
+ASSIGNMENT_TASK_TYPES = ("FOV", "COM", "Search")
+
+
+@dataclass(frozen=True)
+class AssignmentProblem:
+    """Finite domain utilities plus the authoritative feasibility mask."""
+
+    uav_ids: tuple[int, ...]
+    tasks: tuple[object, ...]
+    original_task_indices: tuple[int, ...]
+    utility_matrix: np.ndarray
+    feasible_mask: np.ndarray
+    raw_fov_utility: np.ndarray
+    raw_com_utility: np.ndarray
+
+
+def normalize_feasible_values(raw_values, feasible_mask):
+    """Globally min-max normalize one task type using feasible pairs only."""
+
+    raw = np.asarray(raw_values, dtype=float)
+    feasible = np.asarray(feasible_mask, dtype=bool)
+    if raw.shape != feasible.shape:
+        raise ValueError("raw utility and feasible mask shapes differ")
+    normalized = np.zeros(raw.shape, dtype=float)
+    values = raw[feasible]
+    if values.size == 0:
+        return normalized
+    if not np.isfinite(values).all():
+        raise ValueError("feasible raw utility contains NaN or Inf")
+    minimum = float(values.min())
+    maximum = float(values.max())
+    if np.isclose(minimum, maximum):
+        normalized[feasible] = 0.5
+    else:
+        normalized[feasible] = (values - minimum) / (maximum - minimum)
+    return normalized
+
+
+def fov_com_distance_m(fov_task, com_task):
+    """Return horizontal distance between the current FOV and COM targets."""
+
+    fov_target = fov_task.target_obj
+    com_target = com_task.target_obj
+    return float(
+        math.hypot(
+            float(fov_target.x) - float(com_target.x),
+            float(fov_target.y) - float(com_target.y),
+        )
+    )
+
+
+def fov_com_pair_is_feasible(
+    first_task,
+    second_task,
+    max_distance_m=FOV_COM_PAIR_MAX_DISTANCE_M,
+):
+    """Allow only symmetric FOV+COM pairs within the configured distance."""
+
+    pair = {first_task.task_type, second_task.task_type}
+    if pair != {"FOV", "COM"}:
+        return False
+    fov_task = first_task if first_task.task_type == "FOV" else second_task
+    com_task = first_task if first_task.task_type == "COM" else second_task
+    return fov_com_distance_m(fov_task, com_task) <= float(max_distance_m)
+
+
+def solve_assignment_with_dummies(
+    utility_matrix,
+    feasible_mask,
+    dummy_utility=ASSIGNMENT_DUMMY_UTILITY,
+):
+    """Solve one round without exposing solver sentinels as domain utilities."""
+
+    utility = np.asarray(utility_matrix, dtype=float)
+    feasible = np.asarray(feasible_mask, dtype=bool)
+    if utility.shape != feasible.shape or utility.ndim != 2:
+        raise ValueError("assignment utility and feasible mask must be equal 2-D shapes")
+    if not np.isfinite(utility).all():
+        raise ValueError("assignment utility matrix must contain only finite values")
+    row_count, task_count = utility.shape
+    if row_count == 0:
+        return []
+    solver_cost = np.full((row_count, task_count + row_count), np.inf, dtype=float)
+    solver_cost[:, :task_count][feasible] = -utility[feasible]
+    solver_cost[:, task_count:] = -float(dummy_utility)
+    rows, columns = linear_sum_assignment(solver_cost)
+    selected = []
+    for row, column in zip(rows.tolist(), columns.tolist()):
+        if column >= task_count:
+            continue
+        if not feasible[row, column]:
+            raise AssertionError("solver selected a task outside the feasible mask")
+        selected.append((row, column))
+    return selected
+
+
 class UAVAssigner:
+    """Build and solve assignment rounds while preserving one environment flow."""
+
     def __init__(self, env):
         self.env = env
-    def assign_tasks(self, uav_id_list, task_list,K=2, alpha=0.6, beta=0.4, mode="KM"):
-        """
-        根據 mode 來分配任務:
-        - mode="KM"     → K 次 KM 演算法 (K=1 時就是單次 KM)
-        - mode="Random" → 隨機分配
+        self.assignments = {}
+        self.last_round_problems = []
+
+    def assign_tasks(
+        self,
+        uav_id_list,
+        task_list,
+        K=2,
+        alpha=None,
+        beta=None,
+        mode="KM",
+        strategy=None,
+        max_distance_m=None,
+        search_utility=None,
+        coverage_threshold=None,
+    ):
+        """Dispatch one centralized assignment strategy.
+
+        ``alpha`` and ``beta`` remain accepted for call compatibility, but no
+        weighted FOV/COM mixture is used.
         """
 
-        if mode == "KM":
-            self.assign_uav_tasks_k_times(uav_id_list, task_list, K, alpha=alpha, beta=beta)
-        elif mode == "Random":
-            self.random_assign_tasks(uav_id_list, task_list)
-        else:
-            raise ValueError(f"Unknown assignment mode: {mode}")
-        return self.assignments
-    def assign_uav_tasks_k_times(self, uav_list, task_list, K=2, alpha=0.6, beta=0.4):
-        """
-        執行 K 次 KM 任務分配，每次指派一組 UAV→任務 配對。
-        支援多任務被指派給同一 UAV（例如 FOV + COM）
-        """
+        del alpha, beta
+        if strategy is None:
+            strategy = "random_one_to_one" if mode == "Random" else "k_km"
+        if strategy not in {"k_km", "km", "random_one_to_one"}:
+            raise ValueError(f"unknown assignment strategy: {strategy}")
         self._snapshot_tasks = list(task_list)
+        max_distance_m = float(
+            FOV_COM_PAIR_MAX_DISTANCE_M
+            if max_distance_m is None
+            else max_distance_m
+        )
+        search_utility = float(
+            SEARCH_UTILITY if search_utility is None else search_utility
+        )
+        coverage_threshold = float(
+            SEARCH_COVERAGE_THRESHOLD
+            if coverage_threshold is None
+            else coverage_threshold
+        )
+        if strategy == "random_one_to_one":
+            return self.random_assign_tasks(
+                uav_id_list,
+                task_list,
+                coverage_threshold=coverage_threshold,
+            )
+        rounds = 1 if strategy == "km" else min(int(K), 2)
+        return self.assign_uav_tasks_k_times(
+            uav_id_list,
+            task_list,
+            K=rounds,
+            max_distance_m=max_distance_m,
+            search_utility=search_utility,
+            coverage_threshold=coverage_threshold,
+        )
 
-        num_uav = len(uav_list)
-        num_task = len(task_list)
+    def _candidate_tasks(self, task_list, coverage_threshold):
+        search_active = (
+            not bool(getattr(self.env, "_search_phase_over", False))
+            and float(np.asarray(self.env.visited_bitmap, dtype=bool).mean())
+            < float(coverage_threshold)
+        )
+        candidates = []
+        for index, task in enumerate(task_list):
+            if task.task_type == "Hovering":
+                continue
+            if task.task_type not in ASSIGNMENT_TASK_TYPES:
+                continue
+            if task.task_type == "Search" and not search_active:
+                continue
+            candidates.append((index, task))
+        return candidates
 
-        incompatible_task_pairs = [
-        ("Search", "FOV"),
-        ("FOV", "Search"),
-        ("Search", "Search")
-    ]
-         # 初始化 assignment 結構：每台 UAV 對應一組任務清單
-        self.assignments = {uid: [] for uid in uav_list}
-        available_task_ids = set(range(num_task))  # 以 task list index 編號
+    def build_problem(
+        self,
+        uav_ids,
+        task_list,
+        *,
+        search_utility=SEARCH_UTILITY,
+        coverage_threshold=SEARCH_COVERAGE_THRESHOLD,
+    ):
+        candidates = self._candidate_tasks(task_list, coverage_threshold)
+        uav_ids = tuple(int(uid) for uid in uav_ids)
+        original_indices = tuple(index for index, _ in candidates)
+        tasks = tuple(task for _, task in candidates)
+        shape = (len(uav_ids), len(tasks))
+        raw_fov = np.zeros(shape, dtype=float)
+        raw_com = np.zeros(shape, dtype=float)
+        fov_feasible = np.zeros(shape, dtype=bool)
+        com_feasible = np.zeros(shape, dtype=bool)
+        search_feasible = np.zeros(shape, dtype=bool)
 
-        # Step 1: 建立對應矩陣
-        # 1) 矩陣預設為 -1e9，作為不可選遮罩
-        FOV_matrix = np.full((num_uav, num_task), -1e9, dtype=float)
-        Cap_matrix = np.full((num_uav, num_task), -1e9, dtype=float)
-
-        # 將電量加入權重
-        explore_weights = np.array([
-            self.env.get_unexplored_ratio(uav_id)
-            for uav_id in uav_list
-        ]).reshape(-1, 1)
-
-        for i, uav_id in enumerate(uav_list):
+        for row, uav_id in enumerate(uav_ids):
             uav = self.env.uav_dict[uav_id]
-            for j, task in enumerate(task_list):
-                # 搜完後：直接遮罩所有 Search 任務
-                if getattr(self.env, "search_completed", False) and task.task_type == "Search":
-                    continue  # 保持 -1e9
+            for column, task in enumerate(tasks):
                 if task.task_type == "FOV":
-                    gt_id = task.target_obj_id 
-                    gt = self.env.gts[gt_id]
-                    
-                    if not gt.is_found:
-                        # FOV_matrix[i, j] = 0
+                    gt = self.env.gts[int(task.target_obj_id)]
+                    if not bool(gt.is_found):
                         continue
-                    # 計算 FOV
-                    x_g, y_g, z_g = gt.x, gt.y, gt.z
-                    fov_model = FovModel(f=0.004, wl=0.008, i_l=0.012, z_u=uav.z_u, gamma_g=80)
-                    fov,_ = fov_model.calculate_fov_single(uav.x_u, uav.y_u, uav.z_u, x_g, y_g, z_g)
-                    eps = 1e-6 
-                    if fov <= 1.0 + eps:
-                        FOV_matrix[i, j] = fov
-                    else:
-                        continue  # 保持 -1e9，不可行就不給選
-                elif task.task_type == "COM":
-                    sr_id = task.target_obj_id 
-                    sr = self.env.SR_teams[sr_id]
-                    if not sr.active:
-                        # Cap_matrix[i, j] = 0  
-                        continue
-                    # Canonical helper already returns Mbps.
-                    Cap_matrix[i, j] = self.env.get_sr_uav_capacity_mbps(
-                        uav_id, sr_id
+                    model = FovModel(
+                        f=0.004,
+                        wl=0.008,
+                        i_l=0.012,
+                        z_u=float(uav.z_u),
+                        gamma_g=80,
                     )
-                elif task.task_type == "Hovering":
-                    # 分數直接給一個固定值（例如鼓勵保持原地懸停）
-                    FOV_matrix[i, j] = 0.1
-                elif task.task_type == "Search":
-                    # 尚未搜完時：允許 Search，被當作可選（給個基礎分數）
-                    if not getattr(self.env, "search_completed", False):
-                        FOV_matrix[i, j] = 0.05  # 或用 self.env.get_unexplored_ratio(uav_id)
-
-
-        W = (alpha * FOV_matrix + beta * Cap_matrix)
-
-        for round in range(K):
-            if not available_task_ids:
-                break
-
-            W_filtered = W.copy()
-
-            for i, uav_id in enumerate(uav_list):
-                uav_prev_tasks = [task_type for (_, task_type, _) in self.assignments[uav_id]]
-
-                for j in range(num_task):
-                    task = task_list[j]
-
-                    if j not in available_task_ids:
-                        W_filtered[i, j] = -1e9
+                    raw, _ = model.calculate_fov_single(
+                        float(uav.x_u),
+                        float(uav.y_u),
+                        float(uav.z_u),
+                        float(gt.x),
+                        float(gt.y),
+                        float(gt.z),
+                    )
+                    if math.isfinite(float(raw)):
+                        raw_fov[row, column] = float(raw)
+                        fov_feasible[row, column] = True
+                elif task.task_type == "COM":
+                    sr = self.env.SR_teams[int(task.target_obj_id)]
+                    if not bool(sr.active):
                         continue
+                    raw = self.env.get_sr_uav_capacity_mbps(
+                        uav_id, int(task.target_obj_id)
+                    )
+                    if math.isfinite(float(raw)):
+                        raw_com[row, column] = max(float(raw), 0.0)
+                        com_feasible[row, column] = True
+                elif task.task_type == "Search":
+                    search_feasible[row, column] = True
 
-                    # 只從第2輪之後開始檢查不相容組合
-                    if round > 0:
-                        for prev_task_type in uav_prev_tasks:
-                            if prev_task_type == task.task_type:
-                                W_filtered[i, j] = -1e9
-                        for prev_task_type in uav_prev_tasks:
-                            if (prev_task_type, task.task_type) in incompatible_task_pairs:
-                                W_filtered[i, j] = -1e9
-                                # print(f"🚫 UAV {uav_id} 任務組合衝突: {prev_task_type} + {task.task_type} → 已遮罩")
-                                break
+        normalized_fov = normalize_feasible_values(raw_fov, fov_feasible)
+        normalized_com = normalize_feasible_values(raw_com, com_feasible)
+        utility = normalized_fov + normalized_com
+        utility[search_feasible] = float(search_utility)
+        feasible = fov_feasible | com_feasible | search_feasible
+        if not np.isfinite(utility).all():
+            raise AssertionError("production assignment utility contains NaN or Inf")
+        return AssignmentProblem(
+            uav_ids=uav_ids,
+            tasks=tasks,
+            original_task_indices=original_indices,
+            utility_matrix=utility,
+            feasible_mask=feasible,
+            raw_fov_utility=raw_fov,
+            raw_com_utility=raw_com,
+        )
 
-            # 執行匈牙利指派
-            cost_matrix = -W_filtered
-            row_ind, col_ind = linear_sum_assignment(cost_matrix)
+    def _round_feasible_mask(
+        self,
+        problem,
+        assignments,
+        available_original_indices,
+        round_index,
+        max_distance_m,
+    ):
+        feasible = problem.feasible_mask.copy()
+        for column, original_index in enumerate(problem.original_task_indices):
+            if original_index not in available_original_indices:
+                feasible[:, column] = False
+        if round_index == 0:
+            return feasible
+        for row, uav_id in enumerate(problem.uav_ids):
+            previous = assignments[uav_id]
+            if not previous:
+                continue
+            if len(previous) >= 2:
+                feasible[row, :] = False
+                continue
+            first_task = self._snapshot_tasks[previous[0][0]]
+            for column, candidate in enumerate(problem.tasks):
+                feasible[row, column] &= fov_com_pair_is_feasible(
+                    first_task,
+                    candidate,
+                    max_distance_m=max_distance_m,
+                )
+        return feasible
 
-            for i, j in zip(row_ind, col_ind):
-                if j not in available_task_ids:
-                    continue
-
-                task = task_list[j]
-                score = FOV_matrix[i, j] if task.task_type == "FOV" else Cap_matrix[i, j]
-                self.assignments[uav_list[i]].append((j, task.task_type, score))
-                available_task_ids.remove(j)
-
+    def assign_uav_tasks_k_times(
+        self,
+        uav_list,
+        task_list,
+        K=2,
+        *,
+        max_distance_m=FOV_COM_PAIR_MAX_DISTANCE_M,
+        search_utility=SEARCH_UTILITY,
+        coverage_threshold=SEARCH_COVERAGE_THRESHOLD,
+    ):
+        rounds = min(max(int(K), 0), 2)
+        self.assignments = {int(uid): [] for uid in uav_list}
+        problem = self.build_problem(
+            uav_list,
+            task_list,
+            search_utility=search_utility,
+            coverage_threshold=coverage_threshold,
+        )
+        available = set(problem.original_task_indices)
+        self.last_round_problems = []
+        for round_index in range(rounds):
+            if not available or not problem.tasks:
+                break
+            feasible = self._round_feasible_mask(
+                problem,
+                self.assignments,
+                available,
+                round_index,
+                max_distance_m,
+            )
+            self.last_round_problems.append((problem.utility_matrix.copy(), feasible.copy()))
+            for row, column in solve_assignment_with_dummies(
+                problem.utility_matrix,
+                feasible,
+            ):
+                original_index = problem.original_task_indices[column]
+                if original_index not in available or not feasible[row, column]:
+                    raise AssertionError("assignment result failed post-solve validation")
+                task = problem.tasks[column]
+                self.assignments[problem.uav_ids[row]].append(
+                    (
+                        original_index,
+                        task.task_type,
+                        float(problem.utility_matrix[row, column]),
+                    )
+                )
+                available.remove(original_index)
         return self.assignments
-    def random_assign_tasks(self, uav_list, task_list):
-        """
-        隨機分配 UAV → 任務，並建立 self.assignments
-        """
-        task_ids = list(range(len(task_list)))
-        random.shuffle(task_ids)
 
-        # ✅ 建立與 KM 相同格式的 self.assignments
-        self.assignments = {uid: [] for uid in uav_list}
-        for uav_id, task_id in zip(uav_list, task_ids):
-            task = task_list[task_id]
-            # 隨機分配就不需要分數，給個 0.0
-            self.assignments[uav_id].append((task_id, task.task_type, 0.0))
+    def random_assign_tasks(
+        self,
+        uav_list,
+        task_list,
+        *,
+        coverage_threshold=SEARCH_COVERAGE_THRESHOLD,
+    ):
+        candidates = self._candidate_tasks(task_list, coverage_threshold)
+        task_indices = [index for index, _ in candidates]
+        random.shuffle(task_indices)
+        self.assignments = {int(uid): [] for uid in uav_list}
+        for uav_id, task_index in zip(uav_list, task_indices):
+            task = task_list[task_index]
+            self.assignments[int(uav_id)].append(
+                (int(task_index), task.task_type, 0.0)
+            )
+        self.last_round_problems = []
         return self.assignments
+
     def build_uav_tasks_from_assignment(self):
-        # ✅ 用 assign 時的快照來還原任務，避免 env.task_list 被修改導致錯位
-        snapshot = getattr(self, "_snapshot_tasks", None)
-        if snapshot is None:
-            snapshot = self.env.task_list  # 後備（不建議）
+        """Materialize explicit assignments plus phase fallback behavior."""
+
+        snapshot = getattr(self, "_snapshot_tasks", self.env.task_list)
+        coverage_threshold = float(
+            getattr(
+                self.env,
+                "search_coverage_threshold",
+                SEARCH_COVERAGE_THRESHOLD,
+            )
+        )
+        search_active = (
+            not bool(getattr(self.env, "_search_phase_over", False))
+            and float(np.asarray(self.env.visited_bitmap, dtype=bool).mean())
+            < coverage_threshold
+        )
         self.env.multi_tasks = {}
-
-        for uav_id, task_list in self.assignments.items():
+        for uav_id, assigned in self.assignments.items():
             uav = self.env.uav_dict[uav_id]
-            task_entries = []
-            for task_id, task_type, _ in task_list:
-                # 根據任務類型取得目標位置
-                task = snapshot[task_id]
+            entries = []
+            for task_index, task_type, _ in assigned:
+                task = snapshot[task_index]
                 if task_type == "FOV":
-                    gt = self.env.gts[task.target_obj_id]
-                    x_tgt, y_tgt, z_tgt = gt.get_position()
+                    target = self.env.gts[int(task.target_obj_id)]
+                    position = target.get_position()
+                    target_object_id = int(task.target_obj_id)
                 elif task_type == "COM":
-                    sr = self.env.SR_teams[task.target_obj_id]
-                    x_tgt, y_tgt, z_tgt = sr.get_position()
-                else:  # Hovering or fallback
-                    x_tgt, y_tgt, z_tgt = uav.get_position()
+                    target = self.env.SR_teams[int(task.target_obj_id)]
+                    position = target.get_position()
+                    target_object_id = int(task.target_obj_id)
+                elif task_type == "Search":
+                    position = uav.get_position()
+                    target_object_id = int(uav_id)
+                else:
+                    raise AssertionError(f"non-candidate task was assigned: {task_type}")
+                entries.append(
+                    {
+                        "task_type": task_type,
+                        "target_id": int(task_index),
+                        "target_obj_id": target_object_id,
+                        "target_pos": tuple(position),
+                    }
+                )
+            if not entries:
+                fallback_type = "Search" if search_active else "Hovering"
+                entries.append(
+                    {
+                        "task_type": fallback_type,
+                        "target_id": None,
+                        "target_obj_id": int(uav_id),
+                        "target_pos": tuple(uav.get_position()),
+                        "phase_fallback": True,
+                    }
+                )
+            self.env.multi_tasks[uav_id] = entries
+            primary = entries[0]
+            uav.active_task_index = 0
+            uav.task_type = primary["task_type"]
+            uav.assigned_target_id = primary["target_id"]
+            uav.target_position = primary["target_pos"]
 
-                # 新增任務進 UAV 任務列表
-                task_entries.append({
-                    "task_type": task_type,
-                    "target_id": task_id,
-                    "target_obj_id": task.target_obj_id,
-                    "target_pos": (x_tgt, y_tgt, z_tgt)
-                })
-
-            # 儲存到環境中
-            self.env.multi_tasks[uav_id] = task_entries
-
-            # ✅ 選擇第一個任務作為主任務（方便原架構使用）
-            if task_entries:
-                primary = task_entries[0]
-                uav.task_type = primary["task_type"]
-                uav.assigned_target_id = primary["target_id"]
-                uav.target_position = primary["target_pos"]
-        # print("\n📋 [Debug] UAV 任務分配結果：")
-        # for uav_id, task_entries in self.env.multi_tasks.items():
-        #     print(f"UAV {uav_id}:")
-        #     for i, task in enumerate(task_entries):
-        #         print(f"  Task {i}: Type = {task['task_type']}, Target ID = {task['target_id']}, Target Pos = {task['target_pos']}")
-                
 
 class Task:
-    def __init__(self, task_id, task_type, target_obj, target_obj_id ):
+    def __init__(self, task_id, task_type, target_obj, target_obj_id):
         self.task_id = task_id
-        self.task_type = task_type  # "Search", "FOV", "COM"
-        self.target_obj = target_obj  # 可以是 UAV、GT、SR team 等
-        self.target_obj_id = target_obj_id          # ✅ 額外存一份物件 ID
-        self.target_type = type(target_obj).__name__  # eg. "GroundTarget", "SRTeam", "UAV"
+        self.task_type = task_type
+        self.target_obj = target_obj
+        self.target_obj_id = target_obj_id
+        self.target_type = type(target_obj).__name__
         self.is_assigned = False

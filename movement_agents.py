@@ -1,11 +1,19 @@
 """Movement-agent factory shared by training, evaluation, and smoke runs."""
 
+import numpy as np
+
 from centralized_ddpg import CentralizedDDPG, RandomMovementController
 from experiment_config import (
     FORMAL_EXPERIMENT_DEFAULTS,
     movement_agent_configuration,
 )
 from td3 import TD3
+
+
+def sample_random_joint_action(action_dim):
+    """Sample the common continuous joint-action domain with the seeded RNG."""
+
+    return np.random.uniform(-1.0, 1.0, size=int(action_dim)).astype(np.float32)
 
 
 def create_movement_agent(method_spec, state_dim, action_dim, config):

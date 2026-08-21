@@ -220,7 +220,7 @@ def _training_preflight(args):
     reconciliation_plan = None
     if args.resume is not None:
         expected_experiment = {
-            "method_spec_fingerprint": method.fingerprint,
+            "method_spec_fingerprint": method.compatible_fingerprints,
             "manifest_hash": manifest.content_hash,
             "training_seed": int(args.training_seed),
         }

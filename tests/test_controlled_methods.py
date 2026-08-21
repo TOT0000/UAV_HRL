@@ -11,12 +11,15 @@ from centralized_movement import JOINT_ACTION_DIM, MOVEMENT_STATE_DIM
 from DDQN import DDQN
 from dinkelbach_blocks import DinkelbachBlockState, dinkelbach_config_metadata
 from experiment_config import (
+    FOV_COM_PAIR_MAX_DISTANCE_M,
     FORMAL_EXPERIMENT_DEFAULTS,
     METHOD_REGISTRY,
     MethodSpec,
     NUM_UAV,
     ROI_COUNT_MAX,
     ROI_COUNT_MIN,
+    SEARCH_COVERAGE_THRESHOLD,
+    SEARCH_UTILITY,
     effective_training_config,
     movement_agent_configuration,
 )
@@ -40,7 +43,7 @@ from training_checkpoint import (
 from utils_update_v2 import ReplayBufferDiscrete, ReplayBufferJoint
 
 
-EXPECTED_METHODS = (
+EXISTING_METHODS = (
     "td3_dinkelbach",
     "ddpg_dinkelbach",
     "td3_ratio",
@@ -49,10 +52,18 @@ EXPECTED_METHODS = (
     "td3_dinkelbach_no_task_potential",
     "ddpg_dinkelbach_no_task_potential",
 )
+NEW_METHODS = (
+    "td3_dinkelbach_wo_ta",
+    "td3_dinkelbach_dqn",
+    "kkm_random_action_random_routing",
+    "km_td3_dinkelbach",
+    "random_assignment_td3_dinkelbach",
+)
+EXPECTED_METHODS = EXISTING_METHODS + NEW_METHODS
 
 
 class ControlledMethodRegistryTest(unittest.TestCase):
-    def test_registry_contains_and_parses_exactly_seven_methods(self):
+    def test_registry_contains_and_parses_all_twelve_methods(self):
         self.assertEqual(tuple(METHOD_REGISTRY), EXPECTED_METHODS)
         self.assertEqual(
             [MethodSpec.parse(key).method_key for key in EXPECTED_METHODS],
@@ -61,9 +72,9 @@ class ControlledMethodRegistryTest(unittest.TestCase):
         self.assertEqual(MethodSpec.parse("random_action").label, "Random selected")
 
     def test_shared_environment_contract_is_kkm_16_uav_and_roi_2_through_8(self):
-        for key in EXPECTED_METHODS:
+        for key in EXISTING_METHODS:
             spec = MethodSpec.parse(key)
-            self.assertEqual(spec.assignment, "current_k_km")
+            self.assertEqual(spec.assignment, "k_km")
             self.assertEqual(spec.routing, "safe_ddqn")
         self.assertEqual(NUM_UAV, 16)
         self.assertEqual((ROI_COUNT_MIN, ROI_COUNT_MAX), (2, 8))
@@ -117,13 +128,72 @@ class ControlledMethodRegistryTest(unittest.TestCase):
                 self.assertEqual(result["movement_state_dim"], 532)
                 self.assertEqual(result["joint_action_dim"], 48)
                 self.assertEqual(result["proposal_batches"], 1)
+                metadata = result["run_metadata"]
+                self.assertEqual(metadata["assignment_strategy"], spec.assignment)
+                self.assertEqual(metadata["assignment_rounds"], spec.assignment_rounds)
+                self.assertEqual(metadata["movement_policy"], spec.agent)
+                self.assertEqual(metadata["movement_objective"], spec.reward_mode)
+                self.assertEqual(metadata["routing_policy"], spec.routing)
+                self.assertEqual(
+                    metadata["task_observation_mode"], spec.task_observation
+                )
+                self.assertEqual(
+                    metadata["fov_com_pair_max_distance_m"],
+                    FOV_COM_PAIR_MAX_DISTANCE_M,
+                )
+                self.assertEqual(metadata["search_utility"], SEARCH_UTILITY)
+                self.assertEqual(
+                    metadata["search_coverage_threshold"],
+                    SEARCH_COVERAGE_THRESHOLD,
+                )
+                self.assertFalse(metadata["hover_assignment_candidate"])
+                self.assertEqual(
+                    metadata["masked_state_fields"] is not None,
+                    spec.task_observation == "masked",
+                )
                 if spec.agent == "random":
                     self.assertEqual(result["joint_replay_size"], 0)
                     self.assertEqual(result["critic_updates"], 0)
                     self.assertEqual(result["actor_updates"], 0)
+                if spec.routing == "random":
+                    self.assertEqual(result["routing_replay_size"], 0)
+                    self.assertEqual(result["ddqn_training_updates"], 0)
+                    self.assertEqual(result["routing_target_update_count"], 0)
                 if spec.reward_mode == "ratio":
                     self.assertEqual(result["dinkelbach_update_count"], 0)
                     self.assertIsNone(result["lambda"])
+
+    def test_new_methods_resolve_orthogonal_strategies(self):
+        expected = {
+            "td3_dinkelbach_wo_ta": (
+                "k_km", "td3", "dinkelbach", "masked", "safe_ddqn", 2
+            ),
+            "td3_dinkelbach_dqn": (
+                "k_km", "td3", "dinkelbach", "full", "dqn", 2
+            ),
+            "kkm_random_action_random_routing": (
+                "k_km", "random", "ratio", "full", "random", 2
+            ),
+            "km_td3_dinkelbach": (
+                "km", "td3", "dinkelbach", "full", "safe_ddqn", 1
+            ),
+            "random_assignment_td3_dinkelbach": (
+                "random_one_to_one", "td3", "dinkelbach", "full", "safe_ddqn", 1
+            ),
+        }
+        for method_key, values in expected.items():
+            method = MethodSpec.parse(method_key)
+            self.assertEqual(
+                (
+                    method.assignment,
+                    method.agent,
+                    method.reward_mode,
+                    method.task_observation,
+                    method.routing,
+                    method.assignment_rounds,
+                ),
+                values,
+            )
 
 
 class ControlledRewardTest(unittest.TestCase):
