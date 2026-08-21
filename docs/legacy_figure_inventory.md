@@ -1,0 +1,26 @@
+# Legacy paper figure inventory
+
+Audit base: `feature/centralized-td3` at `931aa268e22d1c608b296096fc9a2281aa9c4408`.
+
+Legacy source commit: `57f6621d248e2917b6a577d872d6c19d298ed006` (`Add original HRL source code`). This is also `origin/main`. The complete reachable history, all local/remote branches, and tag `baseline/corrected-per-uav-20260811` were inspected without checkout or reset.
+
+The audit used `git log --all --reverse --oneline`, `git log --all --name-status`, `git ls-tree -r`, `git show`, `git grep`, and history searches for `plot`, `figure`, `fig`, `savefig`, `matplotlib`, `pyplot`, `reward`, `energy efficiency`, `E2E delay`, `violation`, `arrival rate`, `number of RoIs`, `trajectory`, `K-KM`, `KM`, `Random`, `DQN`, `DDQN`, `TD3`, and `DDPG`.
+
+## Inventory
+
+| Figure | Legacy commit / source / entry | Data source | Axes / subplots | Methods | Legacy style and aggregation | Production replacement |
+| --- | --- | --- | --- | --- | --- | --- |
+| Fig.2, Episodes-Reward, `Total_reward.png` convention | `57f6621`; `HRL_task_aware.py`; inline block after `train()` (legacy lines 426-460). The same block is duplicated in each `Train_*` script. | Per-method in-memory `reward_log`; no comparison CSV and no hard-coded paper values. | Episode vs Total Reward; one 8×6 axes. | One method per old training script. The requested production overlay maps to `td3_dinkelbach`, `td3_dinkelbach_wo_ta`, `ddpg_dinkelbach`, `km_td3_dinkelbach`, `km_ddpg_dinkelbach`. | Raw light line: width 1, alpha .2; smoothed line: width 2; legend, grid, tight layout. The related legacy violation loop uses Matplotlib's default color cycle and reuses each raw color for its smooth line. Legacy smoothing is causal but has an off-by-one window. | `training_history.jsonl`; EE is recomputed per row from timely delivered Mbit and that episode's mobility J, converted to bit/J, then a correct causal 50-episode trailing mean is saved with the raw series. |
+| Fig.3 trajectory | No source found. `Simulator.py`, `Simulator_KM.py`, and `Simulator_Rand.py` import Matplotlib and retain SR trajectory state, but contain no trajectory renderer, subplot, 3D axes, camera, markers, legend, or figure filename. | Missing. | Missing. | Missing. | Missing. | The production evaluator records replayable trajectory JSON at requested 5/10/15/25 s, but no visual is rendered until an authoritative legacy source is supplied. |
+| Fig.4(a) assignment | No source found in any reachable tree. | Missing. | X metric/range/unit missing; no subplot contract. | Prompt mapping is retained in `paper_figure_registry.py`, but it is not treated as legacy visual evidence. | Colors, markers, ordering, labels, filename missing. | Structured method mapping only; renderer fails closed. |
+| Fig.4(b) movement/objective | No source found. | Missing. | Missing. | Requested seven-method mapping is retained. | Original five-method palette/markers/order not present in Git. | Structured method mapping only; renderer fails closed. |
+| Fig.4(c) hierarchical | No source found. | Missing. | Missing. | Requested four-method mapping is retained. | Display labels/grouping absent. | Structured method mapping only; renderer fails closed. |
+| Fig.5 arrival rate / E2E delay | No plotting source found. `Packet_scheduler_v1.py` contains packet delay fields and lifecycle logic only. | No paper plot arrays or evaluation CSV. | Subplot arrangement/axis formatting absent. | Prompt routing mapping retained. | Colors, markers, legend and filename absent. | Common evaluator supports the authoritative COM and VS rate sweeps and writes task-specific delay artifacts; renderer fails closed. |
+| Fig.6 deadline / violation | No paper sweep renderer found. Legacy training scripts only draw per-episode FOV/COM violation-rate trends using default Matplotlib colors. | In-memory training violation logs. | Deadline x-axis, layout, and grouping absent. | Prompt minimum method mapping retained. | Only the unrelated training trend's raw/smooth style is recoverable. | Common evaluator reruns every seconds-based threshold with instance-scoped deadlines and conserved outcomes; renderer fails closed. |
+| Fig.7 RoI count / E2E delay | No source found. Fixed-RoI manifests were introduced later at commit `1db80f2`, after the original source. | Missing. | Missing. | Prompt mapping retained. | Missing. | Deterministic shared fixed-RoI manifests and delay artifacts are supported; renderer fails closed. |
+
+## Reused versus intentionally changed
+
+Fig.2 directly preserves the audited 8×6 single axes, raw alpha/width, smooth width, grid, legend, tight layout, and `Total_reward` filename stem. Its multi-method pairing uses the legacy violation loop's default-cycle/raw-and-smooth color rule. The intentional changes are the user-requested five-method overlay, independent per-episode EE, the exact 50-episode causal window, one legend handle per method, and persisted normalized data.
+
+No visual contract has been invented for Fig.3-Fig.7. Their production evaluation data can be collected, but `build_paper_figures.py` raises `LegacyFigureSourceUnavailable` when one of those figures is requested directly. Supplying the missing authoritative commit/files is required before those renderers can be implemented.

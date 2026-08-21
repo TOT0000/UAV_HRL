@@ -21,7 +21,7 @@ from dinkelbach_blocks import (
     dinkelbach_config_metadata,
     validate_dinkelbach_config,
 )
-from Packet_scheduler_v1 import PacketEngine
+from Packet_scheduler_v1 import PacketEngine, TASK_DEADLINE_SECONDS
 from Simulator import Simulator
 from centralized_movement import (
     JOINT_ACTION_DIM,
@@ -254,6 +254,84 @@ def _active_backlog(packet_engine):
     return defaultdict(float, packet_engine.backlog_bits)
 
 
+def _normalize_evaluation_overrides(overrides):
+    values = dict(overrides or {})
+    allowed = {
+        "fov_rate_packets_per_second",
+        "com_rate_packets_per_second",
+        "fov_deadline_seconds",
+        "com_deadline_seconds",
+    }
+    unknown = set(values).difference(allowed)
+    if unknown:
+        raise ValueError(f"unknown evaluation override fields: {sorted(unknown)}")
+    rates = {
+        "FOV": values.get("fov_rate_packets_per_second"),
+        "COM": values.get("com_rate_packets_per_second"),
+    }
+    for task_type, value in tuple(rates.items()):
+        if value is None:
+            continue
+        value = float(value)
+        if not np.isfinite(value) or value < 0.0:
+            raise ValueError(f"{task_type} packet rate must be finite and non-negative")
+        rates[task_type] = value
+    deadlines = {
+        "FOV": float(
+            values.get("fov_deadline_seconds", TASK_DEADLINE_SECONDS["FOV"])
+        ),
+        "COM": float(
+            values.get("com_deadline_seconds", TASK_DEADLINE_SECONDS["COM"])
+        ),
+    }
+    if any(not np.isfinite(value) or value <= 0.0 for value in deadlines.values()):
+        raise ValueError("evaluation deadlines must be finite positive seconds")
+    return {
+        "traffic_rates_packets_per_second": rates,
+        "task_deadlines_seconds": deadlines,
+        "units": {"traffic_rate": "packets/s", "deadline": "seconds"},
+    }
+
+
+def _uav_task_phase(env, uav_id):
+    tasks = [
+        str(task.get("task_type", "Hovering"))
+        for task in env.multi_tasks.get(int(uav_id), [])
+    ]
+    active = [task for task in tasks if task != "Hovering"]
+    if "FOV" in active and "COM" in active:
+        return "FOV+COM"
+    if active:
+        return active[0]
+    return "Hover"
+
+
+def _trajectory_state(env, *, actual_time_seconds):
+    return {
+        "actual_time_seconds": float(actual_time_seconds),
+        "uavs": [
+            {
+                "uav_id": int(uav_id),
+                "x": float(uav.x_u),
+                "y": float(uav.y_u),
+                "z": float(uav.z_u),
+                "task_phase": _uav_task_phase(env, uav_id),
+            }
+            for uav_id, uav in sorted(env.uav_dict.items())
+        ],
+        "sr_teams": [
+            {
+                "sr_id": int(sr.id),
+                "x": float(sr.x),
+                "y": float(sr.y),
+                "z": float(sr.z),
+                "active": bool(sr.active),
+            }
+            for sr in sorted(env.SR_teams, key=lambda item: item.id)
+        ],
+    }
+
+
 def _routing_transition_done(episode_done, next_hol):
     """Cut DDQN bootstrap when this UAV has no next routing decision."""
 
@@ -273,13 +351,18 @@ def _run_routing_slot(
     epsilon,
     write_replay=True,
     task_observation_mode="full",
+    traffic_rate_overrides=None,
 ):
     step_time = float(packet_engine.step_time)
     env.current_time = float(current_time)
     # Source generation precedes cleanup by contract. Prior-slot expirations are
     # normally already gone; this makes the boundary explicit and idempotent.
     packet_engine.inject_packets(
-        env, delay_bound_steps, env.current_time, step_time=step_time
+        env,
+        delay_bound_steps,
+        env.current_time,
+        step_time=step_time,
+        rate_overrides=traffic_rate_overrides,
     )
     packet_engine.expire_packets(env.current_time, inclusive=True)
     packet_engine.drop_expired_packets(env.current_time)
@@ -644,6 +727,8 @@ def _evaluation_state_snapshot(
     """Copy all learning state that evaluation is forbidden to mutate."""
 
     def replay_snapshot(replay, fields):
+        if replay is None:
+            return None
         size = int(replay.size)
         snapshot = {
             "size": size,
@@ -830,6 +915,8 @@ def train(
     expected_checkpoint_formal_config=None,
     transition_observer=None,
     episode_observer=None,
+    evaluation_overrides=None,
+    trajectory_snapshot_times=None,
 ):
     if config is None:
         raise ValueError(
@@ -861,13 +948,30 @@ def train(
         raise ValueError("evaluation cannot load a full-resume training state")
     if transition_observer is not None and not evaluation:
         raise ValueError("transition collection is available only in evaluation")
+    if not evaluation and (evaluation_overrides or trajectory_snapshot_times):
+        raise ValueError("paper evaluation overrides are unavailable during training")
+    resolved_evaluation = _normalize_evaluation_overrides(evaluation_overrides)
+    requested_snapshot_times = tuple(
+        sorted({float(value) for value in (trajectory_snapshot_times or ())})
+    )
+    if any(
+        not np.isfinite(value) or value < 0.0
+        for value in requested_snapshot_times
+    ):
+        raise ValueError("trajectory snapshot times must be finite and non-negative")
+    if requested_snapshot_times and requested_snapshot_times[-1] > float(
+        config.episode_seconds
+    ):
+        raise ValueError("trajectory snapshot time exceeds the evaluation horizon")
     _seed_training_rng(config.random_seed)
 
     c_ref_com, calibration = load_com_capacity_reference()
     env = Simulator(num_UAV=NUM_UAV)
     env.configure_method(method_spec)
     packet_engine = PacketEngine(
-        num_uav=NUM_UAV, step_time=config.routing_slot_seconds
+        num_uav=NUM_UAV,
+        step_time=config.routing_slot_seconds,
+        task_deadlines_seconds=resolved_evaluation["task_deadlines_seconds"],
     )
     movement_agent = create_movement_agent(
         method_spec,
@@ -883,12 +987,16 @@ def train(
         JOINT_ACTION_DIM,
         max_size=config.replay_max_size,
     )
-    routing_replay = utils_update_v2.ReplayBufferDiscrete(
-        ROUTING_STATE_DIM,
-        env.num_UAV + 1,
-        max_size=config.replay_max_size,
-        n_step=1,
-        gamma=0.99,
+    routing_replay = (
+        utils_update_v2.ReplayBufferDiscrete(
+            ROUTING_STATE_DIM,
+            env.num_UAV + 1,
+            max_size=config.replay_max_size,
+            n_step=1,
+            gamma=0.99,
+        )
+        if method_spec.learns_routing
+        else None
     )
 
     experiment_identity = _experiment_identity(
@@ -982,6 +1090,8 @@ def train(
     td3_noise_log = []
     routing_epsilon_log = []
     episode_metrics = []
+    trajectory_artifacts = []
+    packet_outcome_artifacts = []
     if config.resume_dir is not None:
         if not os.path.isdir(config.resume_dir):
             raise FileNotFoundError(f"centralized checkpoint not found: {config.resume_dir}")
@@ -1097,6 +1207,31 @@ def train(
             scenario_id = str(scenario_entry["scenario_id"])
         executed_scenario_ids.append(scenario_id)
         packet_engine.reset_packet_state()
+        scenario_entry = (
+            scenario_manifest.episodes[episode]
+            if scenario_manifest is not None
+            else None
+        )
+        scenario_rates = dict(
+            (scenario_entry or {}).get("traffic_primitives", {})
+        )
+        resolved_episode_rates = {
+            "FOV": (
+                resolved_evaluation["traffic_rates_packets_per_second"]["FOV"]
+                if resolved_evaluation["traffic_rates_packets_per_second"]["FOV"]
+                is not None
+                else float(scenario_rates.get("base_fov_packets_per_second", 5.0))
+            ),
+            "COM": (
+                resolved_evaluation["traffic_rates_packets_per_second"]["COM"]
+                if resolved_evaluation["traffic_rates_packets_per_second"]["COM"]
+                is not None
+                else float(scenario_rates.get("base_com_packets_per_second", 50.0))
+            ),
+        }
+        trajectory_history = [_trajectory_state(env, actual_time_seconds=0.0)]
+        pending_snapshot_times = list(requested_snapshot_times)
+        episode_snapshots = []
         env.lambda_EE_global = float(lambda_ee)
         episode_lambda = float(lambda_ee)
         episode_delivered_mbits = 0.0
@@ -1227,6 +1362,7 @@ def train(
                     epsilon=slot_epsilon,
                     write_replay=(not evaluation and method_spec.learns_routing),
                     task_observation_mode=method_spec.task_observation,
+                    traffic_rate_overrides=resolved_episode_rates,
                 )
                 ddqn_action_selections += action_selections
                 interval_delivered_bits += delivered_bits
@@ -1236,6 +1372,23 @@ def train(
             done = interval == config.episode_seconds - 1
             if not done:
                 env.advance_sr_teams()
+            actual_time_seconds = float(interval + 1)
+            trajectory_history.append(
+                _trajectory_state(
+                    env, actual_time_seconds=actual_time_seconds
+                )
+            )
+            while (
+                pending_snapshot_times
+                and actual_time_seconds >= pending_snapshot_times[0]
+            ):
+                requested_time = pending_snapshot_times.pop(0)
+                episode_snapshots.append(
+                    {
+                        "requested_time_seconds": requested_time,
+                        **copy.deepcopy(trajectory_history[-1]),
+                    }
+                )
             backlog_after = _active_backlog(packet_engine)
             potentials_t1 = calculate_movement_potentials(env, c_ref_com)
             physical_next_state = get_global_movement_state(
@@ -1353,6 +1506,36 @@ def train(
         if not evaluation and method_spec.learns_routing:
             ddqn.update_target()
 
+        packet_metrics = packet_engine.finalize_episode(
+            float(config.episode_seconds)
+        )
+        packet_outcome_artifacts.append(
+            {
+                "scenario_id": scenario_id,
+                "packet_outcomes": copy.deepcopy(packet_engine.packet_outcomes),
+                "summary": copy.deepcopy(packet_metrics),
+            }
+        )
+        if requested_snapshot_times:
+            trajectory_artifacts.append(
+                {
+                    "scenario_id": scenario_id,
+                    "scenario_manifest_hash": (
+                        scenario_manifest.content_hash
+                        if scenario_manifest is not None
+                        else None
+                    ),
+                    "requested_times_seconds": list(requested_snapshot_times),
+                    "snapshots": episode_snapshots,
+                    "trajectory_history": trajectory_history,
+                    "ground_targets": copy.deepcopy(
+                        (scenario_entry or {}).get("ground_targets", [])
+                    ),
+                    "initial_sr_teams": copy.deepcopy(
+                        (scenario_entry or {}).get("sr_teams", [])
+                    ),
+                }
+            )
         timely_goodput_mbits = float(packet_engine.timely_goodput_bits) / 1e6
         raw_final_hop_mbits = float(packet_engine.raw_final_hop_bits) / 1e6
         dinkelbach_event = None
@@ -1427,6 +1610,23 @@ def train(
                 "fov_deadline_violations": int(packet_engine.fov_violated),
                 "com_deadline_violations": int(packet_engine.com_violated),
                 "total_deadline_violations": int(packet_engine.total_violated),
+                **{
+                    f"{task.lower()}_{field}": value
+                    for task, metrics in packet_metrics.items()
+                    for field, value in metrics.items()
+                },
+                "fov_rate_packets_per_second": float(
+                    resolved_episode_rates["FOV"]
+                ),
+                "com_rate_packets_per_second": float(
+                    resolved_episode_rates["COM"]
+                ),
+                "fov_deadline_seconds": float(
+                    resolved_evaluation["task_deadlines_seconds"]["FOV"]
+                ),
+                "com_deadline_seconds": float(
+                    resolved_evaluation["task_deadlines_seconds"]["COM"]
+                ),
                 "coverage": coverage,
                 "found_GT_ratio": found_gt_ratio,
                 "routing_wait_count": int(packet_engine.wait_actions),
@@ -1664,7 +1864,8 @@ def train(
             for uav_id in range(env.num_UAV)
         )
         deadline_counter_consistent = (
-            packet_engine.total_violated == packet_engine.deadline_drops
+            packet_engine.total_violated
+            == packet_engine.deadline_drops
             == packet_engine.fov_violated + packet_engine.com_violated
         )
         if not backlog_invariant_passed:
@@ -1698,7 +1899,9 @@ def train(
         "routing_agent_kind": ddqn.routing_agent_kind,
         "routing_policy": method_spec.routing,
         "joint_replay_size": joint_replay.size,
-        "routing_replay_size": routing_replay.size,
+        "routing_replay_size": (
+            int(routing_replay.size) if routing_replay is not None else 0
+        ),
         "lambda": float(lambda_ee) if method_spec.uses_dinkelbach else None,
         "dinkelbach_update_count": (
             int(dinkelbach_state.update_count) if method_spec.uses_dinkelbach else 0
@@ -1738,6 +1941,19 @@ def train(
         "evaluation_state_fingerprints": evaluation_state_fingerprints,
         "scenario_ids": executed_scenario_ids,
         "episode_metrics": episode_metrics,
+        "packet_outcome_artifacts": packet_outcome_artifacts,
+        "trajectory_artifacts": [
+            {
+                **artifact,
+                "checkpoint_path": (
+                    os.path.abspath(checkpoint_dir) if checkpoint_dir else None
+                ),
+                "checkpoint_fingerprint": checkpoint_provenance.get(
+                    "checkpoint_metadata_fingerprint"
+                ),
+            }
+            for artifact in trajectory_artifacts
+        ],
         "run_metadata": {
             **experiment_identity,
             **checkpoint_provenance,
@@ -1753,6 +1969,23 @@ def train(
                 else {"active": False, "update_count": 0}
             ),
             "evaluation": bool(evaluation),
+            "evaluation_overrides": (
+                resolved_evaluation if evaluation else None
+            ),
+            "packet_metric_definition": (
+                {
+                    "average_e2e_delay": (
+                        "mean(GS arrival time - generation time) over packets "
+                        "that reached GS, in seconds"
+                    ),
+                    "violation_probability": (
+                        "(late delivered + expired/dropped + unfinished) / generated"
+                    ),
+                    "terminal_outcomes_mutually_exclusive": True,
+                }
+                if evaluation
+                else None
+            ),
             "training_history": (
                 {
                     "row_count": len(training_history_rows),

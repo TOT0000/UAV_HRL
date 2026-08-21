@@ -57,7 +57,29 @@ METRIC_COLUMNS = (
     "slot_budget_violation_count",
 )
 
-EPISODE_COLUMNS = (*IDENTITY_COLUMNS, *METRIC_COLUMNS)
+PACKET_METRIC_COLUMNS = tuple(
+    f"{task}_{field}"
+    for task in ("fov", "com")
+    for field in (
+        "generated_packets",
+        "on_time_delivered_packets",
+        "late_delivered_packets",
+        "expired_dropped_packets",
+        "unfinished_packets",
+        "delivered_packets",
+        "delivered_e2e_delay_sum_seconds",
+        "average_e2e_delay_seconds",
+        "violation_packets",
+        "violation_probability",
+    )
+) + (
+    "fov_rate_packets_per_second",
+    "com_rate_packets_per_second",
+    "fov_deadline_seconds",
+    "com_deadline_seconds",
+)
+
+EPISODE_COLUMNS = (*IDENTITY_COLUMNS, *METRIC_COLUMNS, *PACKET_METRIC_COLUMNS)
 
 SEED_SUMMARY_IDENTITY_COLUMNS = (
     "method_id",
@@ -229,7 +251,7 @@ def validate_formal_aggregation_rows(
         raise ValueError("expected seed and episode counts must be positive")
     missing = [
         column
-        for column in EPISODE_COLUMNS
+        for column in (*IDENTITY_COLUMNS, *METRIC_COLUMNS)
         if any(column not in row for row in episode_rows)
     ]
     if missing:
@@ -337,7 +359,7 @@ def write_evaluation_outputs(output_dir, episode_rows, run_metadata):
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     normalized_rows = [
-        {column: row[column] for column in EPISODE_COLUMNS}
+        {column: row.get(column) for column in EPISODE_COLUMNS}
         for row in episode_rows
     ]
     seed_summaries = summarize_training_seeds(normalized_rows)

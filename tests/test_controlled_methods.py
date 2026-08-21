@@ -58,12 +58,16 @@ NEW_METHODS = (
     "kkm_random_action_random_routing",
     "km_td3_dinkelbach",
     "random_assignment_td3_dinkelbach",
+    "km_ddpg_dinkelbach",
+    "ddpg_dinkelbach_wo_ta",
+    "td3_dinkelbach_random_routing",
+    "td3_dinkelbach_dqn_wo_ta",
 )
 EXPECTED_METHODS = EXISTING_METHODS + NEW_METHODS
 
 
 class ControlledMethodRegistryTest(unittest.TestCase):
-    def test_registry_contains_and_parses_all_twelve_methods(self):
+    def test_registry_contains_and_parses_all_sixteen_methods(self):
         self.assertEqual(tuple(METHOD_REGISTRY), EXPECTED_METHODS)
         self.assertEqual(
             [MethodSpec.parse(key).method_key for key in EXPECTED_METHODS],

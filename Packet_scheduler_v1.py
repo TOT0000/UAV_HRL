@@ -21,9 +21,29 @@ EPISODE_INJECTION_CUTOFF_SECONDS = 58.5
 
 
 class PacketEngine:
-    def __init__(self, num_uav, step_time=0.25, E_max=10000):  # ★ 改成可傳入 UAV 數
+    def __init__(
+        self,
+        num_uav,
+        step_time=0.25,
+        E_max=10000,
+        task_deadlines_seconds=None,
+    ):
         self.step_time = step_time
-        self.num_UAV = num_uav                                 # ★ 存起來，避免外部依賴
+        self.num_UAV = num_uav
+        deadlines = dict(TASK_DEADLINE_SECONDS)
+        if task_deadlines_seconds is not None:
+            deadlines.update(
+                {
+                    self._task_norm(task): float(value)
+                    for task, value in dict(task_deadlines_seconds).items()
+                }
+            )
+        if set(deadlines) != {"FOV", "COM"} or any(
+            not np.isfinite(value) or value <= 0.0
+            for value in deadlines.values()
+        ):
+            raise ValueError("task deadlines must contain positive FOV and COM seconds")
+        self.task_deadlines_seconds = deadlines
         self._next_pkt_id = 0
         self._active_idx = set()
 
@@ -72,6 +92,8 @@ class PacketEngine:
         self.wait_actions = 0
         self.deadline_drops = 0
         self.link_slot_budget_violations = 0
+        self.generated_packet_counts = {"FOV": 0, "COM": 0}
+        self.packet_outcomes = []
 
         self.bp_skip_inject_steps = 0
         # self.max_packets = 3000
@@ -168,6 +190,8 @@ class PacketEngine:
         size_bits = float(size_bits)
         generation_time = float(generation_time)
         pool_idx = len(self.packet_pool)
+        task_type = self._task_norm(task_type)
+        deadline_seconds = float(self.task_deadlines_seconds[task_type])
         pkt = {
             "id": self._next_pkt_id,
             "_pool_idx": pool_idx,
@@ -177,9 +201,8 @@ class PacketEngine:
             "arrival_time": generation_time,
             "generation_time": generation_time,
             "queue_enter_time": generation_time,
-            "deadline": TASK_DEADLINE_SECONDS[task_type],
-            "deadline_abs": generation_time
-            + TASK_DEADLINE_SECONDS[task_type],
+            "deadline": deadline_seconds,
+            "deadline_abs": generation_time + deadline_seconds,
             "done": False,
             "hops": 0,
             "task_type": task_type,
@@ -197,7 +220,9 @@ class PacketEngine:
             "final_hop_accum_bits": 0.0,
             "timely_goodput_counted": False,
             "violation_counted": False,
+            "terminal_outcome": None,
         }
+        self.generated_packet_counts[task_type] += 1
         self.packet_pool.append(pkt)
         self._active_idx.add(pool_idx)
         self.enqueue_packet(pkt, source, generation_time)
@@ -332,11 +357,9 @@ class PacketEngine:
             )
         return ordered
 
-    def _mark_deadline_violation(
-        self, pkt, current_time, sender=None, remove_from_queue=True
-    ):
+    def _count_violation(self, pkt):
         if pkt.get("violation_counted", False):
-            return None
+            return False
         pkt["violation_counted"] = True
         task_type = self._task_norm(pkt.get("task_type", "COM"))
         self.total_violated += 1
@@ -345,11 +368,24 @@ class PacketEngine:
             self.fov_violated += 1
         else:
             self.com_violated += 1
+        return True
+
+    def _mark_deadline_violation(
+        self,
+        pkt,
+        current_time,
+        sender=None,
+        remove_from_queue=True,
+        reason="deadline",
+    ):
+        if not self._count_violation(pkt):
+            return None
+        task_type = self._task_norm(pkt.get("task_type", "COM"))
         owner = int(pkt.get("current", -1) if sender is None else sender)
         self.mark_packet_done(
             pkt,
             current_time=float(current_time),
-            reason="deadline",
+            reason=reason,
             remove_from_queue=remove_from_queue,
         )
         return {
@@ -584,7 +620,10 @@ class PacketEngine:
                             )
                         else:
                             violation = self._mark_deadline_violation(
-                                pkt, completion_time, sender=sender
+                                pkt,
+                                completion_time,
+                                sender=sender,
+                                reason="late_delivered",
                             )
                             if violation is not None:
                                 result["cost_by_sender"][sender] += 1.0
@@ -660,8 +699,16 @@ class PacketEngine:
             )
         return result
 
-    def inject_packets(self, env, delay_bound_steps, current_time, step_time=0.25,
-                       base_fov_rate=5, base_ctrl_rate=50):
+    def inject_packets(
+        self,
+        env,
+        delay_bound_steps,
+        current_time,
+        step_time=0.25,
+        base_fov_rate=5,
+        base_ctrl_rate=50,
+        rate_overrides=None,
+    ):
         if float(current_time) >= EPISODE_INJECTION_CUTOFF_SECONDS:
             return 0
         # if self.target_total_packets is not None and self.total_injected_packets >= self.target_total_packets:
@@ -684,6 +731,17 @@ class PacketEngine:
         base_ctrl_rate = float(
             traffic_primitives.get("base_com_packets_per_second", base_ctrl_rate)
         )
+        if rate_overrides is not None:
+            resolved = dict(rate_overrides)
+            if resolved.get("FOV") is not None:
+                base_fov_rate = float(resolved["FOV"])
+            if resolved.get("COM") is not None:
+                base_ctrl_rate = float(resolved["COM"])
+            if any(
+                not np.isfinite(value) or value < 0.0
+                for value in (base_fov_rate, base_ctrl_rate)
+            ):
+                raise ValueError("packet rates must be finite and non-negative")
         base_fov_rate  = base_fov_rate  * load_factor
         base_ctrl_rate = base_ctrl_rate * load_factor
 
@@ -762,7 +820,8 @@ class PacketEngine:
         if pkt is None:
             return
 
-        # 1) mark done
+        # 1) mark done and retain one immutable terminal outcome before the
+        # lifecycle pool releases the packet object.
         pkt["done"] = True
         if reason is not None:
             pkt["reason"] = reason
@@ -770,6 +829,8 @@ class PacketEngine:
             pkt.setdefault("reason", "done")
         if current_time is not None:
             pkt["finish_time"] = current_time
+        terminal_reason = str(pkt.get("reason", "done"))
+        self._record_terminal_outcome(pkt, terminal_reason)
 
         # 2) remove the packet from whichever per-UAV FIFO currently owns it.
         if remove_from_queue:
@@ -789,6 +850,110 @@ class PacketEngine:
         # 4) clear pool slot
         if 0 <= pi < len(self.packet_pool):
             self.packet_pool[pi] = None
+
+    def _record_terminal_outcome(self, pkt, reason):
+        if pkt.get("terminal_outcome") is not None:
+            return
+        mapping = {
+            "delivered": "on_time_delivered",
+            "late_delivered": "late_delivered",
+            "deadline": "expired_dropped",
+            "max_hops": "expired_dropped",
+            "dropped": "expired_dropped",
+            "unfinished": "unfinished",
+        }
+        outcome = mapping.get(str(reason))
+        if outcome is None:
+            raise RuntimeError(f"unsupported packet terminal reason: {reason}")
+        task_type = self._task_norm(pkt.get("task_type", "COM"))
+        generation_time = float(pkt.get("generation_time", 0.0))
+        finish_time = float(pkt.get("finish_time", generation_time))
+        delivered_to_gs = outcome in {"on_time_delivered", "late_delivered"}
+        e2e_seconds = (
+            max(finish_time - generation_time, 0.0) if delivered_to_gs else None
+        )
+        pkt["terminal_outcome"] = outcome
+        self.packet_outcomes.append(
+            {
+                "packet_id": int(pkt["id"]),
+                "source_uav_id": int(pkt.get("source", -1)),
+                "task_type": task_type,
+                "outcome": outcome,
+                "generation_time_seconds": generation_time,
+                "finish_time_seconds": finish_time,
+                "deadline_seconds": float(pkt.get("deadline", 0.0)),
+                "e2e_delay_seconds": e2e_seconds,
+                "size_bits": float(pkt.get("size_bits", 0.0)),
+                "delivered_to_gs": delivered_to_gs,
+            }
+        )
+
+    def finalize_episode(self, current_time):
+        """Classify every still-active packet as unfinished exactly once."""
+
+        for pkt in list(self.get_active_packets()):
+            self.mark_packet_done(
+                pkt,
+                current_time=float(current_time),
+                reason="unfinished",
+            )
+        return self.packet_metric_summary()
+
+    def packet_metric_summary(self):
+        """Return conserved task-specific packet outcomes and GS delay metrics."""
+
+        result = {}
+        for task_type in ("FOV", "COM"):
+            rows = [
+                row
+                for row in self.packet_outcomes
+                if row["task_type"] == task_type
+            ]
+            counts = {
+                name: sum(row["outcome"] == name for row in rows)
+                for name in (
+                    "on_time_delivered",
+                    "late_delivered",
+                    "expired_dropped",
+                    "unfinished",
+                )
+            }
+            generated = int(self.generated_packet_counts[task_type])
+            conserved = sum(counts.values())
+            if generated != conserved:
+                raise AssertionError(
+                    f"packet outcome conservation failed for {task_type}: "
+                    f"generated={generated}, terminal={conserved}"
+                )
+            delivered_delays = [
+                float(row["e2e_delay_seconds"])
+                for row in rows
+                if row["delivered_to_gs"]
+            ]
+            delivered = len(delivered_delays)
+            delay_sum = float(sum(delivered_delays))
+            violations = (
+                counts["late_delivered"]
+                + counts["expired_dropped"]
+                + counts["unfinished"]
+            )
+            result[task_type] = {
+                "generated_packets": generated,
+                **{
+                    f"{name}_packets": int(value)
+                    for name, value in counts.items()
+                },
+                "delivered_packets": delivered,
+                "delivered_e2e_delay_sum_seconds": delay_sum,
+                "average_e2e_delay_seconds": (
+                    delay_sum / delivered if delivered else None
+                ),
+                "violation_packets": int(violations),
+                "violation_probability": (
+                    float(violations) / generated if generated else None
+                ),
+            }
+        return result
 
 
 
@@ -904,6 +1069,8 @@ class PacketEngine:
         self.wait_actions = 0
         self.deadline_drops = 0
         self.link_slot_budget_violations = 0
+        self.generated_packet_counts = {"FOV": 0, "COM": 0}
+        self.packet_outcomes = []
         self.delay_log = []  # 每跳記錄
         self.type_delay_accum = {
             "FOV": {"sum_queue": 0.0, "sum_tx": 0.0, "sum_total": 0.0, "count": 0},

@@ -1079,12 +1079,20 @@ def save_full_resume_checkpoint(
             "joint": _save_replay(
                 temporary / "joint_replay.npz", joint_replay, JOINT_REPLAY_FIELDS
             ),
-            "routing": _save_replay(
+            "routing": None,
+        }
+        routing_kind = _routing_agent_kind(ddqn)
+        if routing_kind == "random":
+            if routing_replay is not None:
+                raise ValueError("random routing must not allocate a routing replay")
+        else:
+            if routing_replay is None:
+                raise ValueError(f"{routing_kind} routing requires a replay")
+            replay_metadata["routing"] = _save_replay(
                 temporary / "routing_replay.npz",
                 routing_replay,
                 ROUTING_REPLAY_FIELDS,
-            ),
-        }
+            )
         payload = {
             "networks": _network_states(td3, ddqn),
             **_movement_training_payload(td3),
@@ -1265,11 +1273,12 @@ def inspect_full_resume_checkpoint(
         if require_episode_directory
         else int(metadata["episode"]) + 1
     )
-    required_paths = (
+    required_paths = [
         checkpoint_dir / "training_state.pt",
         checkpoint_dir / "joint_replay.npz",
-        checkpoint_dir / "routing_replay.npz",
-    )
+    ]
+    if metadata.get("routing_agent_kind", "safe_ddqn") != "random":
+        required_paths.append(checkpoint_dir / "routing_replay.npz")
     missing = [str(path) for path in required_paths if not path.is_file()]
     if missing:
         raise RuntimeError(
@@ -1283,6 +1292,12 @@ def inspect_full_resume_checkpoint(
     )
     if not isinstance(payload, dict):
         raise RuntimeError("checkpoint full-resume payload is invalid")
+    replay_metadata = payload.get("replay_metadata") or {}
+    routing_kind = metadata.get("routing_agent_kind", "safe_ddqn")
+    routing_replay_path = checkpoint_dir / "routing_replay.npz"
+    if routing_kind == "random":
+        if routing_replay_path.exists() or replay_metadata.get("routing") is not None:
+            raise RuntimeError("random-routing checkpoint must not contain a routing replay")
     training_state = payload.get("training_state")
     formal_config = payload.get("formal_config")
     if not isinstance(training_state, dict):
@@ -1407,12 +1422,19 @@ def load_full_resume_checkpoint(
     )
     if metadata["checkpoint_schema_version"] < CHECKPOINT_SCHEMA_VERSION:
         _reconstruct_legacy_full_observation_masks(joint_replay, metadata)
-    _load_replay(
-        checkpoint_dir / "routing_replay.npz",
-        routing_replay,
-        ROUTING_REPLAY_FIELDS,
-        replay_metadata["routing"],
-    )
+    routing_kind = metadata.get("routing_agent_kind", "safe_ddqn")
+    if routing_kind == "random":
+        if routing_replay is not None or replay_metadata.get("routing") is not None:
+            raise RuntimeError("random-routing checkpoint contains a routing replay")
+    else:
+        if routing_replay is None:
+            raise RuntimeError(f"{routing_kind} routing requires a replay")
+        _load_replay(
+            checkpoint_dir / "routing_replay.npz",
+            routing_replay,
+            ROUTING_REPLAY_FIELDS,
+            replay_metadata["routing"],
+        )
     _restore_rng_state(payload["rng_state"])
     return {
         "metadata": metadata,

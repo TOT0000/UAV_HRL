@@ -296,3 +296,59 @@ The legacy `HRL_task_aware.py --mode smoke` and explicit
 `--mode train --episodes N` interfaces remain available. Its optional legacy
 training CSV names the corresponding columns `lambda_used` and
 `lambda_after_episode`; it no longer emits an ambiguous `lambda` column.
+
+## Paper evaluation and legacy figure build
+
+The complete method registry contains 16 orthogonal configurations. The paper
+additions are `km_ddpg_dinkelbach`, `ddpg_dinkelbach_wo_ta`,
+`td3_dinkelbach_random_routing`, and `td3_dinkelbach_dqn_wo_ta`; they use the
+same one-method training command and common Simulator as every other method.
+
+Paper evaluation is also one method at a time and only accepts a completed run
+with its model-only `ep_2500` checkpoint. It never starts or resumes training:
+
+```powershell
+python -X utf8 run_paper_evaluation.py td3_dinkelbach --run-dir results/td3_dinkelbach/<run-id> --suite fig3_trajectory --manifest runs/comparison/manifests/test.json
+python -X utf8 run_paper_evaluation.py td3_dinkelbach_random_routing --run-dir results/td3_dinkelbach_random_routing/<run-id> --suite fig5_arrival --manifest runs/comparison/manifests/test.json
+python -X utf8 run_paper_evaluation.py td3_dinkelbach --run-dir results/td3_dinkelbach/<run-id> --suite fig6_deadline --manifest runs/comparison/manifests/test.json
+python -X utf8 run_paper_evaluation.py td3_dinkelbach --run-dir results/td3_dinkelbach/<run-id> --suite fig7_fixed_roi
+```
+
+The available suites are `fig2_convergence`, `fig3_trajectory`,
+`fig5_arrival`, `fig6_deadline`, and `fig7_fixed_roi`. Fig.5 changes only the
+selected FOV/COM packet rate at each point. Fig.6 reruns each 0.5--3.0 second
+threshold with instance-scoped deadlines while preserving the other task's
+production default. Fig.7 creates deterministic common fixed-RoI manifests for
+2--8 RoIs from the centralized manifest seed. Each result is written below a
+unique microsecond-and-Git-SHA directory in `results/paper_evaluations/` and
+contains the resolved sweep point, manifest, per-episode metrics, mutually
+exclusive packet outcomes, checkpoint provenance, and any trajectory artifact.
+
+The figure builder only reads explicitly mapped artifacts. A Fig.2 spec maps
+exactly one completed run for each required method, for example:
+
+```json
+{
+  "methods": {
+    "td3_dinkelbach": {"run_dir": "results/td3_dinkelbach/<run-id>"},
+    "td3_dinkelbach_wo_ta": {"run_dir": "results/td3_dinkelbach_wo_ta/<run-id>"},
+    "ddpg_dinkelbach": {"run_dir": "results/ddpg_dinkelbach/<run-id>"},
+    "km_td3_dinkelbach": {"run_dir": "results/km_td3_dinkelbach/<run-id>"},
+    "km_ddpg_dinkelbach": {"run_dir": "results/km_ddpg_dinkelbach/<run-id>"}
+  }
+}
+```
+
+```powershell
+python -X utf8 build_paper_figures.py --spec paper_runs.json --figure all
+```
+
+Builds use unique directories below `results/paper_figures/` and persist PNG,
+PDF, normalized CSV/JSON, the resolved method-to-run mapping, metric definition,
+moving-average definition, Git SHA, and the audited legacy source. Multiple
+candidate runs are rejected instead of selecting the latest. Only the original
+Episodes--Reward renderer is present in reachable Git history, so the audited
+Fig.2 Episodes--EE adapter is the only enabled renderer. Fig.3--Fig.7 evaluation
+data can be collected, but requesting those visuals directly fails closed until
+an authoritative legacy plotting source is supplied. See
+`docs/legacy_figure_inventory.md` for the audit evidence.

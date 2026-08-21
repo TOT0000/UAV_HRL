@@ -125,6 +125,40 @@ _METHOD_DEFINITIONS = {
         "assignment_rounds": 1,
         "label": "Random assignment + TD3 + Dinkelbach",
     },
+    "km_ddpg_dinkelbach": {
+        **_COMMON_METHOD,
+        "agent": "ddpg",
+        "movement": "centralized_ddpg",
+        "reward_mode": "dinkelbach",
+        "assignment": "km",
+        "assignment_rounds": 1,
+        "label": "KM + DDPG + Dinkelbach",
+    },
+    "ddpg_dinkelbach_wo_ta": {
+        **_COMMON_METHOD,
+        "agent": "ddpg",
+        "movement": "centralized_ddpg",
+        "reward_mode": "dinkelbach",
+        "task_observation": "masked",
+        "label": "DDPG + Dinkelbach without task-assignment observations",
+    },
+    "td3_dinkelbach_random_routing": {
+        **_COMMON_METHOD,
+        "agent": "td3",
+        "movement": "centralized_td3",
+        "reward_mode": "dinkelbach",
+        "routing": "random",
+        "label": "TD3 + Dinkelbach + random routing",
+    },
+    "td3_dinkelbach_dqn_wo_ta": {
+        **_COMMON_METHOD,
+        "agent": "td3",
+        "movement": "centralized_td3",
+        "reward_mode": "dinkelbach",
+        "routing": "dqn",
+        "task_observation": "masked",
+        "label": "TD3 + Dinkelbach + controlled DQN without task-assignment observations",
+    },
 }
 METHOD_REGISTRY = MappingProxyType(_METHOD_DEFINITIONS)
 _LEGACY_METHOD_IDS = frozenset(tuple(_METHOD_DEFINITIONS)[:7])

@@ -20,7 +20,12 @@ from centralized_movement import (
     projected_joint_action_schema,
 )
 from com_capacity_calibration import load_com_capacity_reference
-from evaluation_metrics import EPISODE_COLUMNS, IDENTITY_COLUMNS, METRIC_COLUMNS
+from evaluation_metrics import (
+    EPISODE_COLUMNS,
+    IDENTITY_COLUMNS,
+    METRIC_COLUMNS,
+    PACKET_METRIC_COLUMNS,
+)
 from experiment_config import (
     FORMAL_EXPERIMENT_DEFAULTS,
     MethodSpec,
@@ -94,6 +99,9 @@ INTEGER_EPISODE_COLUMNS = {
     "routing_wait_count",
     "partial_transmission_count",
     "slot_budget_violation_count",
+}
+PACKET_INTEGER_COLUMNS = {
+    column for column in PACKET_METRIC_COLUMNS if column.endswith("_packets")
 }
 
 
@@ -310,6 +318,14 @@ def _normalize_episode_row(row):
             number = float(value)
             if not np.isfinite(number):
                 raise RuntimeError(f"evaluation metric {column} is non-finite")
+            normalized[column] = number
+        elif column in PACKET_METRIC_COLUMNS:
+            if value is None or value == "":
+                normalized[column] = None
+                continue
+            number = int(value) if column in PACKET_INTEGER_COLUMNS else float(value)
+            if not np.isfinite(number):
+                raise RuntimeError(f"packet metric {column} is non-finite")
             normalized[column] = number
         else:
             normalized[column] = str(value)
