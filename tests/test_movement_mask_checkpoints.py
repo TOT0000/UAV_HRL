@@ -32,6 +32,7 @@ from training_checkpoint import (
     save_model_checkpoint,
 )
 from utils_update_v2 import ReplayBufferDiscrete, ReplayBufferJoint
+from fov_ema_fixtures import initialized_fov_ema_state
 
 
 class MovementMaskCheckpointTest(unittest.TestCase):
@@ -108,6 +109,7 @@ class MovementMaskCheckpointTest(unittest.TestCase):
             routing_epsilon_log=[1.0] * 4,
             warmup_joint_transitions=config.warmup_joint_transitions,
             training_history_rows=[],
+            fov_ema_state=initialized_fov_ema_state(),
         )
         checkpoint = Path(root) / method_key / "ep_0001"
         experiment = {

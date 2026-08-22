@@ -44,6 +44,7 @@ from training_checkpoint import (
     validate_checkpoint_experiment_metadata,
 )
 from utils_update_v2 import ReplayBufferDiscrete, ReplayBufferJoint
+from fov_ema_fixtures import initialized_fov_ema_state
 
 
 class FixedNetwork(nn.Module):
@@ -349,6 +350,7 @@ class ControlledDQNTest(unittest.TestCase):
             td3_noise_log=[], routing_epsilon_log=[1.0] * 4,
             warmup_joint_transitions=config.warmup_joint_transitions,
             training_history_rows=[],
+            fov_ema_state=initialized_fov_ema_state(),
         )
         experiment = {
             "method_spec_fingerprint": method.fingerprint,

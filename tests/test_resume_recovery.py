@@ -11,7 +11,6 @@ import torch
 from dinkelbach_blocks import DinkelbachBlockState, dinkelbach_config_metadata
 from HRL_task_aware import formal_training_config
 from experiment_config import (
-    FOV_EMA_LIFECYCLE_VERSION,
     MethodSpec,
     SR_ROUTE_LIFECYCLE_VERSION,
 )
@@ -29,6 +28,7 @@ from training_checkpoint import (
     inspect_full_resume_checkpoint,
     inspect_model_checkpoint,
 )
+from fov_ema_fixtures import initialized_fov_ema_state
 
 
 class ResumeRecoveryTest(unittest.TestCase):
@@ -75,14 +75,9 @@ class ResumeRecoveryTest(unittest.TestCase):
             "lambda_after_episode_log": lambda_after_episode_log,
             "lambda_cost_used_log": [0.0] * completed_episode,
             "lambda_cost_after_episode_log": [0.0] * completed_episode,
-            "fov_ema_state": {
-                "lifecycle_version": FOV_EMA_LIFECYCLE_VERSION,
-                "values": {},
-                "initialized_uav_ids": [],
-                "previous_footprints": {},
-                "transition_marker": None,
-                "update_count": 0,
-            },
+            "fov_ema_state": initialized_fov_ema_state(
+                marker=f"fixture-episode={completed_episode - 1}"
+            ),
             "sr_route_state": {
                 "lifecycle_version": SR_ROUTE_LIFECYCLE_VERSION,
                 "teams": [],

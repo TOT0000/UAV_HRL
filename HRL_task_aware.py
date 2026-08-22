@@ -773,6 +773,7 @@ def _full_training_state(
             "initialized_uav_ids": [],
             "previous_footprints": {},
             "transition_marker": None,
+            "footprint_transition_marker": None,
             "update_count": 0,
         }
     if sr_route_state is None:
@@ -1560,8 +1561,8 @@ def train(
             interval_energy = float(interval_energies.sum())
 
             fov_transitions = _mark_search_observations(env)
-            if any(transition.map_changed for transition in fov_transitions):
-                packet_engine.update_fov_ema(
+            if fov_transitions:
+                packet_engine.process_fov_transitions(
                     env,
                     transition_marker=f"episode={episode},interval={interval}",
                     footprint_transitions=fov_transitions,

@@ -13,7 +13,7 @@ import torch
 
 from DDQN import DDQN
 from dinkelbach_blocks import DinkelbachBlockState, dinkelbach_config_metadata
-from experiment_config import FOV_EMA_LIFECYCLE_VERSION, SR_ROUTE_LIFECYCLE_VERSION
+from experiment_config import SR_ROUTE_LIFECYCLE_VERSION
 from HRL_task_aware import (
     _seed_training_rng,
     _uses_warmup_random_action,
@@ -31,6 +31,7 @@ from training_checkpoint import (
     save_model_checkpoint,
 )
 from utils_update_v2 import ReplayBufferDiscrete, ReplayBufferJoint
+from fov_ema_fixtures import initialized_fov_ema_state
 
 
 ROUTING_STATE_DIM = 126
@@ -44,14 +45,9 @@ def _lifecycle_training_state(episode_count, lambda_after=0.0):
     return {
         "lambda_cost_used_log": [0.0] * int(episode_count),
         "lambda_cost_after_episode_log": after_log,
-        "fov_ema_state": {
-            "lifecycle_version": FOV_EMA_LIFECYCLE_VERSION,
-            "values": {},
-            "initialized_uav_ids": [],
-            "previous_footprints": {},
-            "transition_marker": None,
-            "update_count": 0,
-        },
+        "fov_ema_state": initialized_fov_ema_state(
+            marker=f"fixture-episode={int(episode_count) - 1}"
+        ),
         "sr_route_state": {
             "lifecycle_version": SR_ROUTE_LIFECYCLE_VERSION,
             "teams": [],

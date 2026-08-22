@@ -12,11 +12,12 @@ import torch
 
 from centralized_movement import MOVEMENT_STATE_DIM, movement_mask_from_state
 from experiment_config import (
-    FOV_EMA_LIFECYCLE_VERSION,
+    NUM_UAV,
     SAFE_DDQN_ETA_C,
     SAFE_DDQN_INITIAL_LAMBDA_COST,
     SAFE_DDQN_QOS_COST_BUDGET,
 )
+from fov_ema_lifecycle import validate_fov_ema_state
 
 from dinkelbach_blocks import (
     DINKELBACH_CONFIG_FIELDS,
@@ -1394,15 +1395,14 @@ def _validate_full_resume_logging_state(
                 )
     if int(checkpoint_schema_version) >= CHECKPOINT_SCHEMA_VERSION:
         fov_ema_state = training_state.get("fov_ema_state")
-        if not isinstance(fov_ema_state, dict):
-            raise RuntimeError("checkpoint lacks FOV EMA lifecycle state")
-        if (
-            fov_ema_state.get("lifecycle_version")
-            != FOV_EMA_LIFECYCLE_VERSION
-            or not isinstance(fov_ema_state.get("previous_footprints"), dict)
-        ):
+        validated_fov_state = validate_fov_ema_state(
+            fov_ema_state, num_uav=NUM_UAV
+        )
+        if expected_length > 0 and not validated_fov_state[
+            "initialized_uav_ids"
+        ]:
             raise RuntimeError(
-                "checkpoint FOV EMA lifecycle lacks compatible previous-footprint state"
+                "checkpoint FOV EMA lifecycle is uninitialized after completed episodes"
             )
     if (
         int(checkpoint_schema_version) >= CHECKPOINT_SCHEMA_VERSION

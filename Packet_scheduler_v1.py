@@ -9,6 +9,7 @@ from experiment_config import (
     PRODUCTION_PACKET_INJECTION_CUTOFF_SECONDS,
     PRODUCTION_TASK_DEADLINE_SECONDS,
 )
+from fov_ema_lifecycle import validate_fov_ema_state
 import numpy as np
 
 
@@ -125,6 +126,7 @@ class PacketEngine:
         self.fov_ema_initialized = set()
         self.fov_previous_footprints = {}
         self.fov_ema_transition_marker = None
+        self.fov_footprint_transition_marker = None
         self.fov_ema_update_count = 0
         self.norm_cfg = dict(
             C_MAX=200.0,
@@ -184,18 +186,78 @@ class PacketEngine:
             raise ValueError("FOV footprint must contain four grid indices")
         return values
 
-    def update_fov_ema(self, env, transition_marker, footprint_transitions=()):
-        """Advance EMA once after an actual Search/FOV map transition."""
-
-        marker = str(transition_marker)
-        if marker == self.fov_ema_transition_marker:
-            return False
+    def _fov_transitions_by_uav(self, footprint_transitions):
         transitions_by_uav = {}
         for transition in footprint_transitions:
             uav_id = int(transition.uav_id)
+            if not 0 <= uav_id < self.num_UAV:
+                raise ValueError(f"FOV transition UAV ID is out of range: {uav_id}")
             if uav_id in transitions_by_uav:
                 raise ValueError(f"duplicate FOV transition for UAV {uav_id}")
             transitions_by_uav[uav_id] = transition
+        return transitions_by_uav
+
+    def _resolved_transition_footprints(self, transition):
+        uav_id = int(transition.uav_id)
+        committed_previous = self.fov_previous_footprints.get(uav_id)
+        transition_previous = self._copy_footprint(
+            transition.previous_footprint
+        )
+        if transition_previous is None:
+            previous = committed_previous
+        elif (
+            committed_previous is not None
+            and transition_previous != committed_previous
+        ):
+            raise RuntimeError(
+                f"FOV previous footprint is inconsistent for UAV {uav_id}"
+            )
+        else:
+            previous = transition_previous
+        return previous, self._copy_footprint(transition.current_footprint)
+
+    def _commit_fov_footprints(self, env, current_footprints):
+        for uav_id, footprint in current_footprints.items():
+            if footprint is None:
+                self.fov_previous_footprints.pop(uav_id, None)
+            else:
+                self.fov_previous_footprints[uav_id] = footprint
+            env.uav_dict[uav_id].last_box_idx = footprint
+
+    def process_fov_transitions(
+        self,
+        env,
+        transition_marker,
+        footprint_transitions=(),
+        *,
+        force_ema=False,
+    ):
+        """Commit Search footprints and conditionally advance the shared EMA."""
+
+        marker = str(transition_marker)
+        if marker in {
+            self.fov_footprint_transition_marker,
+            self.fov_ema_transition_marker,
+        }:
+            return False
+        transitions_by_uav = self._fov_transitions_by_uav(
+            footprint_transitions
+        )
+        should_advance_ema = bool(force_ema) or any(
+            bool(transition.map_changed)
+            for transition in transitions_by_uav.values()
+        )
+
+        if not should_advance_ema:
+            current_footprints = {}
+            for uav_id, transition in transitions_by_uav.items():
+                _previous, current = self._resolved_transition_footprints(
+                    transition
+                )
+                current_footprints[uav_id] = current
+            self._commit_fov_footprints(env, current_footprints)
+            self.fov_footprint_transition_marker = marker
+            return False
 
         samples = {}
         current_footprints = {}
@@ -207,22 +269,9 @@ class PacketEngine:
                     previous = getattr(env.uav_dict[uav_id], "last_box_idx", None)
                 current = env.fov_footprint_indices(uav_id)
             else:
-                committed_previous = self.fov_previous_footprints.get(uav_id)
-                transition_previous = self._copy_footprint(
-                    transition.previous_footprint
+                previous, current = self._resolved_transition_footprints(
+                    transition
                 )
-                if transition_previous is None:
-                    previous = committed_previous
-                elif (
-                    committed_previous is not None
-                    and transition_previous != committed_previous
-                ):
-                    raise RuntimeError(
-                        f"FOV previous footprint is inconsistent for UAV {uav_id}"
-                    )
-                else:
-                    previous = transition_previous
-                current = transition.current_footprint
             previous = self._copy_footprint(previous)
             current = self._copy_footprint(current)
             samples[uav_id] = self._fov_observation_sample(
@@ -245,16 +294,21 @@ class PacketEngine:
                 for field in ("overlap", "unvisited", "frontier")
             }
             self.fov_ema_initialized.add(uav_id)
-        self.fov_previous_footprints = {
-            uav_id: footprint
-            for uav_id, footprint in current_footprints.items()
-            if footprint is not None
-        }
-        for uav_id, footprint in current_footprints.items():
-            env.uav_dict[uav_id].last_box_idx = footprint
+        self._commit_fov_footprints(env, current_footprints)
         self.fov_ema_transition_marker = marker
+        self.fov_footprint_transition_marker = marker
         self.fov_ema_update_count += 1
         return True
+
+    def update_fov_ema(self, env, transition_marker, footprint_transitions=()):
+        """Compatibility entry point for a known map-changing/reset transition."""
+
+        return self.process_fov_transitions(
+            env,
+            transition_marker,
+            footprint_transitions,
+            force_ema=True,
+        )
 
     def _fov_ema_values(self, uav_id):
         values = self.fov_ema.get(
@@ -281,35 +335,27 @@ class PacketEngine:
                 )
             },
             "transition_marker": self.fov_ema_transition_marker,
+            "footprint_transition_marker": (
+                self.fov_footprint_transition_marker
+            ),
             "update_count": int(self.fov_ema_update_count),
         }
 
     def load_fov_ema_state(self, state, env=None):
-        if (state or {}).get("lifecycle_version") != FOV_EMA_LIFECYCLE_VERSION:
-            raise RuntimeError("checkpoint FOV EMA lifecycle is incompatible")
-        if "previous_footprints" not in state:
-            raise RuntimeError("checkpoint lacks FOV previous-footprint state")
-        self.fov_ema = {
-            int(uav_id): {
-                field: float(values[field])
-                for field in ("overlap", "unvisited", "frontier")
-            }
-            for uav_id, values in state.get("values", {}).items()
-        }
-        self.fov_ema_initialized = {
-            int(uav_id) for uav_id in state.get("initialized_uav_ids", [])
-        }
-        self.fov_previous_footprints = {
-            int(uav_id): self._copy_footprint(footprint)
-            for uav_id, footprint in state["previous_footprints"].items()
-        }
+        validated = validate_fov_ema_state(state, num_uav=self.num_UAV)
+        self.fov_ema = validated["values"]
+        self.fov_ema_initialized = validated["initialized_uav_ids"]
+        self.fov_previous_footprints = validated["previous_footprints"]
         if env is not None:
             for uav_id in range(self.num_UAV):
                 env.uav_dict[uav_id].last_box_idx = (
                     self.fov_previous_footprints.get(uav_id)
                 )
-        self.fov_ema_transition_marker = state.get("transition_marker")
-        self.fov_ema_update_count = int(state.get("update_count", 0))
+        self.fov_ema_transition_marker = validated["transition_marker"]
+        self.fov_footprint_transition_marker = validated[
+            "footprint_transition_marker"
+        ]
+        self.fov_ema_update_count = validated["update_count"]
     # （可選）若要用到才保留；否則刪掉它避免 self.num_UAV 未定義
     def initialize_packet_buffer(self, num_pkt):
         self.packet_buffer = {
@@ -1280,6 +1326,7 @@ class PacketEngine:
         self.fov_ema_initialized = set()
         self.fov_previous_footprints = {}
         self.fov_ema_transition_marker = None
+        self.fov_footprint_transition_marker = None
         self.fov_ema_update_count = 0
 
         # 總延遲時間
