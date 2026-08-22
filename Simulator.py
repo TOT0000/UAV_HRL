@@ -1,6 +1,7 @@
 import numpy as np
 import random
 import math
+from dataclasses import dataclass
 from Channel_model import ChannelModel
 from Fov_model_phase import FovModel
 from collections import defaultdict
@@ -15,6 +16,16 @@ from experiment_config import (
     SEARCH_COVERAGE_THRESHOLD,
     SEARCH_UTILITY,
 )
+
+
+@dataclass(frozen=True)
+class FovCoverageTransition:
+    """Immutable Search-map transition before its current footprint is committed."""
+
+    uav_id: int
+    previous_footprint: tuple[int, int, int, int] | None
+    current_footprint: tuple[int, int, int, int]
+    map_changed: bool
 
 
 class Simulator:
@@ -188,8 +199,9 @@ class Simulator:
                                     )
                 self.need_reassign = True
 
-    def mark_search_coverage(self, uav_id):
-        """Mark the boolean camera footprint for centralized Search coverage."""
+    def fov_footprint_indices(self, uav_id):
+        """Return one UAV's current camera footprint without mutating state."""
+
         uav = self.uav_dict[uav_id]
         model = FovModel(
             f=0.004, wl=0.008, i_l=0.012, z_u=uav.z_u, gamma_g=80
@@ -206,9 +218,28 @@ class Simulator:
             self.visited_bitmap,
         )
         if bx_max < bx_min or by_max < by_min:
-            return
+            return None
+        return (int(bx_min), int(bx_max), int(by_min), int(by_max))
+
+    def mark_search_coverage(self, uav_id):
+        """Apply coverage and return the uncommitted footprint transition."""
+
+        uav = self.uav_dict[uav_id]
+        current = self.fov_footprint_indices(uav_id)
+        if current is None:
+            return None
+        previous = getattr(uav, "last_box_idx", None)
+        previous = tuple(int(value) for value in previous) if previous is not None else None
+        bx_min, bx_max, by_min, by_max = current
+        patch = self.visited_bitmap[bx_min : bx_max + 1, by_min : by_max + 1]
+        map_changed = bool((~patch).any())
         self.visited_bitmap[bx_min : bx_max + 1, by_min : by_max + 1] = True
-        uav.last_box_idx = (bx_min, bx_max, by_min, by_max)
+        return FovCoverageTransition(
+            uav_id=int(uav_id),
+            previous_footprint=previous,
+            current_footprint=current,
+            map_changed=map_changed,
+        )
         
         # if (not self.search_completed) and self.is_search_done(cov_th=0.8, min_found=4):
         #     self.search_completed = True

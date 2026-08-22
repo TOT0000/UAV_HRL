@@ -123,6 +123,7 @@ class PacketEngine:
         # one manifest scenario into the next when this engine is reused.
         self.fov_ema = {}
         self.fov_ema_initialized = set()
+        self.fov_previous_footprints = {}
         self.fov_ema_transition_marker = None
         self.fov_ema_update_count = 0
         self.norm_cfg = dict(
@@ -133,33 +134,19 @@ class PacketEngine:
             ema_alpha=0.7,
         )
 
-    def _fov_observation_sample(self, env, uav_id):
+    def _fov_observation_sample(
+        self,
+        env,
+        uav_id,
+        *,
+        previous_footprint,
+        current_footprint,
+    ):
         """Compute one physical-map sample without mutating engine or environment."""
 
-        uav = env.uav_dict[int(uav_id)]
-        x_u, y_u, _ = uav.get_position()
-        model = FovModel(
-            f=0.004,
-            wl=0.008,
-            i_l=0.012,
-            z_u=float(uav.z_u),
-            gamma_g=80,
-        )
-        fov_w, fov_h = model.get_ground_fov_size(float(uav.z_u))
-        bx_min, bx_max, by_min, by_max, _patch, _cells = (
-            env.fov_to_indices_and_patch(
-                x_u,
-                y_u,
-                fov_w,
-                fov_h,
-                env.env_width,
-                env.env_height,
-                env.bit_resolution,
-                env.visited_bitmap,
-            )
-        )
-        if bx_max < bx_min or by_max < by_min:
+        if current_footprint is None:
             return {"overlap": 0.0, "unvisited": 0.0, "frontier": 0.0}
+        bx_min, bx_max, by_min, by_max = current_footprint
         patch = env.visited_bitmap[bx_min : bx_max + 1, by_min : by_max + 1]
         fov_cells = max(1, (bx_max - bx_min + 1) * (by_max - by_min + 1))
         unvisited = float((~patch).mean()) if patch.size else 0.0
@@ -170,11 +157,10 @@ class PacketEngine:
             frontier = float((~border).mean())
         else:
             frontier = 0.0
-        previous = getattr(uav, "last_box_idx", None)
-        if previous is None:
+        if previous_footprint is None:
             overlap = 0.0
         else:
-            lbx0, lbx1, lby0, lby1 = previous
+            lbx0, lbx1, lby0, lby1 = previous_footprint
             ix0, iy0 = max(bx_min, lbx0), max(by_min, lby0)
             ix1, iy1 = min(bx_max, lbx1), min(by_max, lby1)
             intersection = (
@@ -189,15 +175,67 @@ class PacketEngine:
             "frontier": float(frontier),
         }
 
-    def update_fov_ema(self, env, transition_marker):
+    @staticmethod
+    def _copy_footprint(footprint):
+        if footprint is None:
+            return None
+        values = tuple(int(value) for value in footprint)
+        if len(values) != 4:
+            raise ValueError("FOV footprint must contain four grid indices")
+        return values
+
+    def update_fov_ema(self, env, transition_marker, footprint_transitions=()):
         """Advance EMA once after an actual Search/FOV map transition."""
 
         marker = str(transition_marker)
         if marker == self.fov_ema_transition_marker:
             return False
+        transitions_by_uav = {}
+        for transition in footprint_transitions:
+            uav_id = int(transition.uav_id)
+            if uav_id in transitions_by_uav:
+                raise ValueError(f"duplicate FOV transition for UAV {uav_id}")
+            transitions_by_uav[uav_id] = transition
+
+        samples = {}
+        current_footprints = {}
+        for uav_id in range(self.num_UAV):
+            transition = transitions_by_uav.get(uav_id)
+            if transition is None:
+                previous = self.fov_previous_footprints.get(uav_id)
+                if previous is None:
+                    previous = getattr(env.uav_dict[uav_id], "last_box_idx", None)
+                current = env.fov_footprint_indices(uav_id)
+            else:
+                committed_previous = self.fov_previous_footprints.get(uav_id)
+                transition_previous = self._copy_footprint(
+                    transition.previous_footprint
+                )
+                if transition_previous is None:
+                    previous = committed_previous
+                elif (
+                    committed_previous is not None
+                    and transition_previous != committed_previous
+                ):
+                    raise RuntimeError(
+                        f"FOV previous footprint is inconsistent for UAV {uav_id}"
+                    )
+                else:
+                    previous = transition_previous
+                current = transition.current_footprint
+            previous = self._copy_footprint(previous)
+            current = self._copy_footprint(current)
+            samples[uav_id] = self._fov_observation_sample(
+                env,
+                uav_id,
+                previous_footprint=previous,
+                current_footprint=current,
+            )
+            current_footprints[uav_id] = current
+
         alpha = float(self.norm_cfg["ema_alpha"])
         for uav_id in range(self.num_UAV):
-            sample = self._fov_observation_sample(env, uav_id)
+            sample = samples[uav_id]
             previous = self.fov_ema.get(
                 uav_id, {"overlap": 0.0, "unvisited": 0.0, "frontier": 0.0}
             )
@@ -207,6 +245,13 @@ class PacketEngine:
                 for field in ("overlap", "unvisited", "frontier")
             }
             self.fov_ema_initialized.add(uav_id)
+        self.fov_previous_footprints = {
+            uav_id: footprint
+            for uav_id, footprint in current_footprints.items()
+            if footprint is not None
+        }
+        for uav_id, footprint in current_footprints.items():
+            env.uav_dict[uav_id].last_box_idx = footprint
         self.fov_ema_transition_marker = marker
         self.fov_ema_update_count += 1
         return True
@@ -229,13 +274,21 @@ class PacketEngine:
                 for uav_id, values in sorted(self.fov_ema.items())
             },
             "initialized_uav_ids": sorted(self.fov_ema_initialized),
+            "previous_footprints": {
+                str(uav_id): list(footprint)
+                for uav_id, footprint in sorted(
+                    self.fov_previous_footprints.items()
+                )
+            },
             "transition_marker": self.fov_ema_transition_marker,
             "update_count": int(self.fov_ema_update_count),
         }
 
-    def load_fov_ema_state(self, state):
+    def load_fov_ema_state(self, state, env=None):
         if (state or {}).get("lifecycle_version") != FOV_EMA_LIFECYCLE_VERSION:
             raise RuntimeError("checkpoint FOV EMA lifecycle is incompatible")
+        if "previous_footprints" not in state:
+            raise RuntimeError("checkpoint lacks FOV previous-footprint state")
         self.fov_ema = {
             int(uav_id): {
                 field: float(values[field])
@@ -246,6 +299,15 @@ class PacketEngine:
         self.fov_ema_initialized = {
             int(uav_id) for uav_id in state.get("initialized_uav_ids", [])
         }
+        self.fov_previous_footprints = {
+            int(uav_id): self._copy_footprint(footprint)
+            for uav_id, footprint in state["previous_footprints"].items()
+        }
+        if env is not None:
+            for uav_id in range(self.num_UAV):
+                env.uav_dict[uav_id].last_box_idx = (
+                    self.fov_previous_footprints.get(uav_id)
+                )
         self.fov_ema_transition_marker = state.get("transition_marker")
         self.fov_ema_update_count = int(state.get("update_count", 0))
     # （可選）若要用到才保留；否則刪掉它避免 self.num_UAV 未定義
@@ -1216,6 +1278,7 @@ class PacketEngine:
         }
         self.fov_ema = {}
         self.fov_ema_initialized = set()
+        self.fov_previous_footprints = {}
         self.fov_ema_transition_marker = None
         self.fov_ema_update_count = 0
 

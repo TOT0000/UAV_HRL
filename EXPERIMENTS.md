@@ -86,10 +86,13 @@ design-dataset collection, aggregation, and exact-resume workflows.
 - production FOV/COM deadlines `1.5 s`/`1.0 s`; completion at the exact deadline
   is timely
 - production packet injection cutoff `58.5 s`
-- FOV EMA is advanced only by episode-map/reset lifecycle hooks; routing state
-  getters are pure reads. SR routes omit the duplicated start point, include the
-  exact target, and mark arrival on the update that consumes the final waypoint.
-  Full checkpoints persist both lifecycle states as episode-boundary snapshots;
+- FOV EMA is advanced only by episode-map/reset lifecycle hooks. Each overlap
+  sample uses an immutable previous/current footprint pair and commits current
+  only after smoothing; routing state getters are pure reads. Full checkpoints
+  persist EMA values, initialization, previous footprints, marker, and count.
+  SR routes omit the duplicated start point, include the exact target, and mark
+  arrival on the update that consumes the final waypoint; both lifecycle states
+  remain episode-boundary snapshots in full checkpoints
   mid-episode checkpointing is explicitly unsupported.
 - 100 evaluation episodes
 - formal model checkpoint `ep_2500`

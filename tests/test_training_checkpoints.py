@@ -48,6 +48,7 @@ def _lifecycle_training_state(episode_count, lambda_after=0.0):
             "lifecycle_version": FOV_EMA_LIFECYCLE_VERSION,
             "values": {},
             "initialized_uav_ids": [],
+            "previous_footprints": {},
             "transition_marker": None,
             "update_count": 0,
         },

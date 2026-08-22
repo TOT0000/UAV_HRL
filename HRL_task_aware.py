@@ -593,8 +593,8 @@ def _select_routing_actions(ddqn, states, routing_masks, epsilon):
 
 def _mark_search_observations(env):
     if getattr(env, "_search_phase_over", False):
-        return False
-    before = np.asarray(env.visited_bitmap, dtype=bool).copy()
+        return ()
+    transitions = []
     for uav_id in range(env.num_UAV):
         has_search = any(
             task.get("task_type") == "Search"
@@ -602,8 +602,10 @@ def _mark_search_observations(env):
         )
         if has_search:
             env.update_visited_grid(uav_id)
-            env.mark_search_coverage(uav_id)
-    return not np.array_equal(before, np.asarray(env.visited_bitmap, dtype=bool))
+            transition = env.mark_search_coverage(uav_id)
+            if transition is not None:
+                transitions.append(transition)
+    return tuple(transitions)
 
 
 def _dinkelbach_update(delivered_mbits, total_energy, previous_lambda):
@@ -769,6 +771,7 @@ def _full_training_state(
             "lifecycle_version": FOV_EMA_LIFECYCLE_VERSION,
             "values": {},
             "initialized_uav_ids": [],
+            "previous_footprints": {},
             "transition_marker": None,
             "update_count": 0,
         }
@@ -1556,10 +1559,12 @@ def train(
             energy_evaluations += int(interval_energies.size)
             interval_energy = float(interval_energies.sum())
 
-            map_changed = _mark_search_observations(env)
-            if map_changed:
+            fov_transitions = _mark_search_observations(env)
+            if any(transition.map_changed for transition in fov_transitions):
                 packet_engine.update_fov_ema(
-                    env, transition_marker=f"episode={episode},interval={interval}"
+                    env,
+                    transition_marker=f"episode={episode},interval={interval}",
+                    footprint_transitions=fov_transitions,
                 )
             if getattr(env, "need_reassign", False):
                 env.assign_tasks()

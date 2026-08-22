@@ -12,6 +12,7 @@ import torch
 
 from centralized_movement import MOVEMENT_STATE_DIM, movement_mask_from_state
 from experiment_config import (
+    FOV_EMA_LIFECYCLE_VERSION,
     SAFE_DDQN_ETA_C,
     SAFE_DDQN_INITIAL_LAMBDA_COST,
     SAFE_DDQN_QOS_COST_BUDGET,
@@ -1391,11 +1392,18 @@ def _validate_full_resume_logging_state(
                 raise RuntimeError(
                     f"safe-DDQN checkpoint multiplier log is non-finite: {field}"
                 )
-    if (
-        int(checkpoint_schema_version) >= CHECKPOINT_SCHEMA_VERSION
-        and not isinstance(training_state.get("fov_ema_state"), dict)
-    ):
-        raise RuntimeError("checkpoint lacks FOV EMA lifecycle state")
+    if int(checkpoint_schema_version) >= CHECKPOINT_SCHEMA_VERSION:
+        fov_ema_state = training_state.get("fov_ema_state")
+        if not isinstance(fov_ema_state, dict):
+            raise RuntimeError("checkpoint lacks FOV EMA lifecycle state")
+        if (
+            fov_ema_state.get("lifecycle_version")
+            != FOV_EMA_LIFECYCLE_VERSION
+            or not isinstance(fov_ema_state.get("previous_footprints"), dict)
+        ):
+            raise RuntimeError(
+                "checkpoint FOV EMA lifecycle lacks compatible previous-footprint state"
+            )
     if (
         int(checkpoint_schema_version) >= CHECKPOINT_SCHEMA_VERSION
         and not isinstance(training_state.get("sr_route_state"), dict)
