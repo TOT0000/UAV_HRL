@@ -15,13 +15,18 @@ from centralized_movement import (
     project_joint_action,
 )
 from dinkelbach_blocks import DinkelbachBlockState, dinkelbach_config_metadata
-from experiment_config import MethodSpec, effective_training_config
+from experiment_config import (
+    MethodSpec,
+    effective_training_config,
+    exploration_schedule_configuration,
+)
 from HRL_task_aware import (
     ROUTING_STATE_DIM,
     _full_training_state,
     formal_training_config,
 )
 from observation_strategy import apply_observation_strategy
+from routing_lifecycle import RoutingLearnerLifecycle
 from td3 import TD3
 from training_checkpoint import (
     CHECKPOINT_SCHEMA_VERSION,
@@ -110,6 +115,10 @@ class MovementMaskCheckpointTest(unittest.TestCase):
             warmup_joint_transitions=config.warmup_joint_transitions,
             training_history_rows=[],
             fov_ema_state=initialized_fov_ema_state(),
+            routing_lifecycle_state=RoutingLearnerLifecycle(
+                global_slot_count=4
+            ).state_dict(),
+            exploration_state=exploration_schedule_configuration(config, method),
         )
         checkpoint = Path(root) / method_key / "ep_0001"
         experiment = {

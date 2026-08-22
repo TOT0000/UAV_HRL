@@ -13,6 +13,9 @@ from experiment_config import (
     SAFE_DDQN_ETA_C,
     SAFE_DDQN_INITIAL_LAMBDA_COST,
     SAFE_DDQN_QOS_COST_BUDGET,
+    ROUTING_GAMMA,
+    ROUTING_LEARNING_RATE,
+    ROUTING_TAU,
 )
 
 """
@@ -99,9 +102,9 @@ class DDQN:
         state_dim,
         action_dim,
         hidden_dim=128,
-        gamma=0.99,
-        tau=0.005,
-        lr=1e-3,
+        gamma=ROUTING_GAMMA,
+        tau=ROUTING_TAU,
+        lr=ROUTING_LEARNING_RATE,
         lambda_cost=SAFE_DDQN_INITIAL_LAMBDA_COST,
         eta_c=SAFE_DDQN_ETA_C,
         qos_cost_budget=SAFE_DDQN_QOS_COST_BUDGET,
@@ -117,6 +120,7 @@ class DDQN:
 
         self.gamma = gamma
         self.tau = tau
+        self.learning_rate = float(lr)
         self.action_dim = action_dim
         self.lambda_cost = float(lambda_cost)
         self.initial_lambda_cost = float(SAFE_DDQN_INITIAL_LAMBDA_COST)
@@ -141,6 +145,10 @@ class DDQN:
         self.cost_loss_log = []
         self.num_training = 0
         self.target_update_count = 0
+        self.reward_optimizer_update_count = 0
+        self.cost_optimizer_update_count = 0
+        self.reward_target_update_count = 0
+        self.cost_target_update_count = 0
     def select_action(self, state, uav_id, mask=None, visited_nodes=None, epsilon=0.5, logits_noise_std=0.5, eta=None):
         if eta is not None and not np.isclose(float(eta), self.lambda_cost):
             raise ValueError(
@@ -326,6 +334,7 @@ class DDQN:
         loss.backward()
         self.optimizer.step()
         self.loss_log.append(loss.item())
+        self.reward_optimizer_update_count += 1
 
         # === cost critic 訓練 ===
         c_values = self.cost_network(state)
@@ -336,6 +345,7 @@ class DDQN:
         cost_loss.backward()
         self.cost_optimizer.step()
         self.cost_loss_log.append(cost_loss.item())
+        self.cost_optimizer_update_count += 1
         self.num_training += 1
         # print("q_values.shape =", q_values.shape)
         # print("target_q.shape =", target_q.shape)
@@ -351,6 +361,8 @@ class DDQN:
         for param, target_param in zip(self.cost_network.parameters(), self.target_cost_network.parameters()):
             target_param.data.copy_(self.tau * param.data + (1 - self.tau) * target_param.data)
         self.target_update_count += 1
+        self.reward_target_update_count += 1
+        self.cost_target_update_count += 1
 
     def update_parameters(current_model, target_model):
         target_model.load_state_dict(current_model.state_dict())

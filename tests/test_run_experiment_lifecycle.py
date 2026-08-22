@@ -126,8 +126,9 @@ class SimpleRunnerLifecycleIntegrationTest(unittest.TestCase):
             self.assertEqual(ep1_state["global_routing_slot"], 8)
             self.assertEqual(len(ep1_state["routing_epsilon_log"]), 8)
             self.assertEqual(ep1_state["lambda_cost_used_log"], [0.0])
-            self.assertEqual(
-                ep1_state["lambda_cost_after_episode_log"], [0.0]
+            self.assertEqual(len(ep1_state["lambda_cost_after_episode_log"]), 1)
+            self.assertGreaterEqual(
+                ep1_state["lambda_cost_after_episode_log"][0], 0.0
             )
             self.assertIn("fov_ema_state", ep1_state)
             self.assertEqual(ep1_state["td3_noise_log"], [])
@@ -211,9 +212,11 @@ class SimpleRunnerLifecycleIntegrationTest(unittest.TestCase):
             self.assertEqual(final_state["td3_post_warmup_transition"], 0)
             self.assertEqual(len(final_state["routing_epsilon_log"]), 24)
             self.assertEqual(final_state["td3_noise_log"], [])
-            self.assertEqual(final_state["lambda_cost_used_log"], [0.0] * 3)
+            self.assertEqual(len(final_state["lambda_cost_used_log"]), 3)
+            self.assertEqual(len(final_state["lambda_cost_after_episode_log"]), 3)
             self.assertEqual(
-                final_state["lambda_cost_after_episode_log"], [0.0] * 3
+                final_state["lambda_cost_used_log"][1],
+                ep1_state["lambda_cost_after_episode_log"][0],
             )
             self.assertEqual(
                 final_payload["ddqn_state"]["constraint_state"][
@@ -316,7 +319,7 @@ class SimpleRunnerLifecycleIntegrationTest(unittest.TestCase):
             )
             routing1 = payload1["routing_agent_state"]
             self.assertEqual(routing1["kind"], "dqn")
-            self.assertEqual(routing1["target_update_count"], 1)
+            self.assertEqual(routing1["target_update_count"], 0)
             self.assertEqual(payload1["training_state"]["global_routing_slot"], 4)
             self.assertEqual(
                 len(payload1["training_state"]["routing_epsilon_log"]), 4
@@ -350,13 +353,18 @@ class SimpleRunnerLifecycleIntegrationTest(unittest.TestCase):
             routing3 = payload3["routing_agent_state"]
             state3 = payload3["training_state"]
             self.assertEqual(routing3["kind"], "dqn")
-            self.assertEqual(routing3["target_update_count"], 3)
-            self.assertGreaterEqual(
-                routing3["training_updates"], routing1["training_updates"]
-            )
+            self.assertEqual(routing3["target_update_count"], 0)
+            self.assertEqual(routing3["training_updates"], 0)
             self.assertEqual(state3["global_routing_slot"], 12)
             self.assertEqual(state3["ddqn_schedule_slot"], 12)
             self.assertEqual(len(state3["routing_epsilon_log"]), 12)
+            self.assertEqual(state3["routing_epsilon_log"], [1.0] * 12)
+            self.assertEqual(
+                state3["routing_lifecycle_state"][
+                    "routing_optimizer_update_count"
+                ],
+                0,
+            )
             np.testing.assert_array_equal(
                 state3["routing_epsilon_log"][:4],
                 payload1["training_state"]["routing_epsilon_log"],

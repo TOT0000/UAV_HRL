@@ -5,6 +5,7 @@ from dataclasses import dataclass
 import hashlib
 import os
 import random
+import subprocess
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -39,26 +40,29 @@ from centralized_movement import (
     project_joint_action,
 )
 from com_capacity_calibration import load_com_capacity_reference
-from exploration_schedules import (
-    ddqn_decay_steps,
-    ddqn_epsilon,
-    movement_behavior_noise,
-    movement_decay_steps,
-)
+from exploration_schedules import movement_behavior_noise
 from evaluation_metrics import safe_energy_efficiency
 from experiment_config import (
     DEFAULT_TRAINING_SEED,
     FOV_EMA_LIFECYCLE_VERSION,
     FORMAL_CHECKPOINT_EPISODE,
     FORMAL_EXPERIMENT_DEFAULTS,
+    MOVEMENT_EXPLORATION_DECAY_EPISODES,
+    MOVEMENT_INTERVAL_SECONDS,
     MethodSpec,
     NUM_UAV,
     ROI_COUNT_MAX,
     ROI_COUNT_MIN,
+    ROUTING_EPSILON_DECAY_EPISODES,
+    ROUTING_GRADIENT_STEPS_PER_UPDATE,
+    ROUTING_UPDATE_INTERVAL_SLOTS,
+    ROUTING_WARMUP_TRANSITIONS,
     SR_ROUTE_LIFECYCLE_VERSION,
     effective_training_config,
+    exploration_schedule_configuration,
     movement_agent_configuration,
     comparison_method_configuration,
+    routing_agent_configuration,
 )
 from movement_agents import create_movement_agent, sample_random_joint_action
 from observation_strategy import (
@@ -66,7 +70,9 @@ from observation_strategy import (
     masked_observation_metadata,
 )
 from routing_agents import create_routing_agent
+from routing_lifecycle import RoutingLearnerLifecycle
 from training_checkpoint import (
+    CHECKPOINT_SCHEMA_VERSION,
     FULL_RESUME_LOGGING_SCHEMA_VERSION,
     checkpoint_artifact_provenance,
     checkpoint_episode_schedule,
@@ -110,6 +116,18 @@ def _seed_training_rng(seed):
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+
+
+def _git_commit_sha():
+    try:
+        return subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+    except (OSError, subprocess.CalledProcessError):
+        return None
 
 
 def _is_movement_decision(slot, interval=MOVEMENT_CONTROL_INTERVAL):
@@ -164,6 +182,13 @@ class TrainingConfig:
     replay_max_size: int = FORMAL_EXPERIMENT_DEFAULTS["movement_hyperparameters"][
         "replay_size"
     ]
+    routing_warmup_transitions: int = ROUTING_WARMUP_TRANSITIONS
+    routing_update_interval_slots: int = ROUTING_UPDATE_INTERVAL_SLOTS
+    routing_gradient_steps_per_update: int = ROUTING_GRADIENT_STEPS_PER_UPDATE
+    movement_exploration_decay_episodes: int = (
+        MOVEMENT_EXPLORATION_DECAY_EPISODES
+    )
+    routing_epsilon_decay_episodes: int = ROUTING_EPSILON_DECAY_EPISODES
     beta_search: float = 1.0
     beta_vs: float = 1.0
     beta_com: float = 1.0
@@ -196,6 +221,27 @@ class TrainingConfig:
             raise ValueError("episode_seconds and total_episodes must be positive")
         if self.warmup_joint_transitions < 0 or self.batch_size <= 0:
             raise ValueError("warmup must be non-negative and batch_size positive")
+        if (
+            self.routing_warmup_transitions <= 0
+            or self.routing_update_interval_slots <= 0
+            or self.routing_gradient_steps_per_update <= 0
+            or self.movement_exploration_decay_episodes <= 0
+            or self.routing_epsilon_decay_episodes <= 0
+        ):
+            raise ValueError("routing lifecycle and exploration horizons must be positive")
+        if (
+            self.routing_update_interval_slots != ROUTING_UPDATE_INTERVAL_SLOTS
+            or self.routing_gradient_steps_per_update
+            != ROUTING_GRADIENT_STEPS_PER_UPDATE
+            or self.movement_exploration_decay_episodes
+            != MOVEMENT_EXPLORATION_DECAY_EPISODES
+            or self.routing_epsilon_decay_episodes
+            != ROUTING_EPSILON_DECAY_EPISODES
+        ):
+            raise ValueError(
+                "production cadence and exploration horizons are fixed; use "
+                "synthetic lifecycle counters for shortened tests"
+            )
         if self.full_resume_keep_last <= 0:
             raise ValueError("full_resume_keep_last must be positive")
         if self.formal_evaluation_episode <= 0:
@@ -210,6 +256,7 @@ def smoke_training_config():
         episode_seconds=60,
         routing_slot_seconds=0.25,
         warmup_joint_transitions=0,
+        routing_warmup_transitions=1,
         batch_size=1,
         policy_delay=2,
         enable_model_checkpoints=False,
@@ -760,6 +807,8 @@ def _full_training_state(
     lambda_cost_after_episode_log=None,
     fov_ema_state=None,
     sr_route_state=None,
+    routing_lifecycle_state=None,
+    exploration_state,
 ):
     completed_episode_count = int(episode) + 1
     if lambda_cost_used_log is None:
@@ -784,6 +833,9 @@ def _full_training_state(
             "checkpoint_scope": "episode_boundary_terminal_snapshot",
             "mid_episode_checkpoint_supported": False,
         }
+    movement_post_warmup = max(
+        int(total_joint_transitions) - int(warmup_joint_transitions), 0
+    )
     return {
         "completed_episode_index": int(episode),
         "next_episode_index": int(episode) + 1,
@@ -802,10 +854,25 @@ def _full_training_state(
         "lambda_after_episode_log": list(lambda_after_episode_log),
         "total_joint_transitions": int(total_joint_transitions),
         "global_routing_slot": int(routing_slots_executed),
-        "td3_post_warmup_transition": max(
-            int(total_joint_transitions) - int(warmup_joint_transitions), 0
+        "td3_post_warmup_transition": movement_post_warmup,
+        "movement_post_warmup_transition_count": movement_post_warmup,
+        "ddqn_schedule_slot": (
+            int(routing_lifecycle_state["routing_global_slot_count"])
+            if routing_lifecycle_state is not None
+            else 0
         ),
-        "ddqn_schedule_slot": int(routing_slots_executed),
+        "routing_lifecycle_state": copy.deepcopy(routing_lifecycle_state),
+        **(
+            copy.deepcopy(routing_lifecycle_state)
+            if routing_lifecycle_state is not None
+            else {}
+        ),
+        **copy.deepcopy(exploration_state),
+        "routing_epsilon_decay_start_slot": (
+            routing_lifecycle_state["routing_epsilon_decay_start_slot"]
+            if routing_lifecycle_state is not None
+            else None
+        ),
         "td3_noise_log": list(td3_noise_log),
         "movement_noise_log": list(td3_noise_log),
         "routing_epsilon_log": list(routing_epsilon_log),
@@ -821,6 +888,7 @@ def _full_training_state(
 
 def _experiment_identity(method_spec, scenario_manifest, training_seed, config):
     comparison = comparison_method_configuration(method_spec)
+    resolved_exploration = exploration_schedule_configuration(config, method_spec)
     return {
         "method_id": method_spec.method_id,
         "method_spec": method_spec.to_dict(),
@@ -841,10 +909,23 @@ def _experiment_identity(method_spec, scenario_manifest, training_seed, config):
         "training_seed": (
             int(training_seed) if training_seed is not None else None
         ),
+        "training_episode_count": int(config.total_episodes),
+        "episode_horizon_seconds": int(config.episode_seconds),
+        "movement_interval_seconds": MOVEMENT_INTERVAL_SECONDS,
+        "routing_slot_seconds": float(config.routing_slot_seconds),
+        "routing_slots_per_episode": resolved_exploration[
+            "routing_slots_per_episode"
+        ],
+        "git_sha": _git_commit_sha(),
+        "checkpoint_schema_version": CHECKPOINT_SCHEMA_VERSION,
         "movement_agent": method_spec.agent,
         "movement_agent_configuration": movement_agent_configuration(
             method_spec, config
         ),
+        "routing_agent_configuration": routing_agent_configuration(
+            method_spec, config
+        ),
+        "exploration_schedule_configuration": resolved_exploration,
         "reward_mode": method_spec.reward_mode,
         "task_potential_enabled": bool(method_spec.task_potential_enabled),
         **comparison,
@@ -862,7 +943,12 @@ def _experiment_identity(method_spec, scenario_manifest, training_seed, config):
 
 
 def _evaluation_state_snapshot(
-    movement_agent, ddqn, joint_replay, routing_replay, dinkelbach_state
+    movement_agent,
+    ddqn,
+    joint_replay,
+    routing_replay,
+    dinkelbach_state,
+    schedule_counters=None,
 ):
     """Copy all learning state that evaluation is forbidden to mutate."""
 
@@ -964,6 +1050,7 @@ def _evaluation_state_snapshot(
             ),
         },
         "dinkelbach_state": copy.deepcopy(dinkelbach_state.training_state()),
+        "schedule_counters": copy.deepcopy(schedule_counters),
     }
 
 
@@ -1038,6 +1125,9 @@ def _evaluation_invariants(before, after, routing_epsilon_log, td3_noise_log):
         "dinkelbach_state_unchanged": _nested_state_equal(
             before["dinkelbach_state"], after["dinkelbach_state"]
         ),
+        "schedule_counters_unchanged": _nested_state_equal(
+            before["schedule_counters"], after["schedule_counters"]
+        ),
         "exploration_disabled": (
             not td3_noise_log
             and all(float(epsilon) == 0.0 for epsilon in routing_epsilon_log)
@@ -1077,6 +1167,8 @@ def train(
         if key != "method_id"
     })
     formal_config = effective_training_config(config, method_spec)
+    resolved_exploration = exploration_schedule_configuration(config, method_spec)
+    resolved_routing = routing_agent_configuration(method_spec, config)
     if scenario_manifest is not None:
         if scenario_manifest.episode_count < config.total_episodes:
             raise ValueError(
@@ -1162,6 +1254,15 @@ def train(
         if method_spec.learns_routing
         else None
     )
+    routing_lifecycle = (
+        RoutingLearnerLifecycle(
+            update_interval_slots=config.routing_update_interval_slots,
+            gradient_steps_per_update=config.routing_gradient_steps_per_update,
+            warmup_transitions=config.routing_warmup_transitions,
+        )
+        if method_spec.learns_routing
+        else None
+    )
 
     experiment_identity = _experiment_identity(
         method_spec, scenario_manifest, config.random_seed, config
@@ -1209,6 +1310,23 @@ def train(
             ),
             "checkpoint_completed_episodes": (
                 int(loaded_checkpoint_metadata["episode"]) + 1
+            ),
+            "checkpoint_schema_version": loaded_checkpoint_metadata.get(
+                "checkpoint_schema_version"
+            ),
+            "checkpoint_training_exploration_schedule_version": (
+                checkpoint_experiment.get("formal_config", {})
+                .get("exploration_schedule_configuration", {})
+                .get("exploration_schedule_version")
+                or "legacy_or_unrecorded"
+            ),
+            "checkpoint_training_schedule_conforms_to_current": bool(
+                loaded_checkpoint_metadata.get("checkpoint_schema_version")
+                == CHECKPOINT_SCHEMA_VERSION
+                and checkpoint_experiment.get("formal_config", {})
+                .get("exploration_schedule_configuration", {})
+                .get("exploration_schedule_version")
+                == resolved_exploration["exploration_schedule_version"]
             ),
             "checkpoint_training_seed": checkpoint_experiment.get(
                 "training_seed"
@@ -1327,6 +1445,31 @@ def train(
         routing_slots_executed = int(training_state["global_routing_slot"])
         td3_noise_log = list(training_state["td3_noise_log"])
         routing_epsilon_log = list(training_state["routing_epsilon_log"])
+        if method_spec.learns_routing:
+            routing_lifecycle = RoutingLearnerLifecycle.from_state(
+                training_state.get("routing_lifecycle_state"),
+                update_interval_slots=config.routing_update_interval_slots,
+                gradient_steps_per_update=(
+                    config.routing_gradient_steps_per_update
+                ),
+                warmup_transitions=config.routing_warmup_transitions,
+            )
+            if routing_lifecycle.global_slot_count != routing_slots_executed:
+                raise RuntimeError(
+                    "routing lifecycle slot counter is inconsistent with history"
+                )
+            if (
+                routing_lifecycle.optimizer_update_count != ddqn.num_training
+                or routing_lifecycle.target_update_count
+                != ddqn.target_update_count
+            ):
+                raise RuntimeError(
+                    "routing lifecycle update counters are inconsistent with agent state"
+                )
+        elif training_state.get("routing_lifecycle_state") is not None:
+            raise RuntimeError(
+                "random-routing checkpoint must not contain learner lifecycle state"
+            )
         try:
             packet_engine.load_fov_ema_state(training_state["fov_ema_state"])
         except KeyError as exc:
@@ -1382,13 +1525,52 @@ def train(
         )
         if int(training_state["td3_post_warmup_transition"]) != expected_post_warmup:
             raise RuntimeError("TD3 exploration counter is inconsistent with replay history")
-        if int(training_state["ddqn_schedule_slot"]) != routing_slots_executed:
+        expected_ddqn_slot = (
+            routing_lifecycle.global_slot_count
+            if routing_lifecycle is not None
+            else 0
+        )
+        if int(training_state["ddqn_schedule_slot"]) != expected_ddqn_slot:
             raise RuntimeError("DDQN exploration counter is inconsistent with slot history")
+        expected_exploration_state = {
+            key: resolved_exploration[key]
+            for key in (
+                "exploration_schedule_version",
+                "movement_exploration_decay_episodes",
+                "routing_epsilon_decay_episodes",
+                "resolved_movement_decay_steps",
+                "resolved_routing_decay_slots",
+                "movement_noise_start",
+                "movement_noise_end",
+                "routing_epsilon_start",
+                "routing_epsilon_end",
+            )
+        }
+        mismatches = {
+            key: (training_state.get(key), value)
+            for key, value in expected_exploration_state.items()
+            if training_state.get(key) != value
+        }
+        if mismatches:
+            raise RuntimeError(
+                "checkpoint exploration schedule is incompatible: "
+                f"{mismatches}"
+            )
     elif history_identity is not None:
         training_history_rows = prepare_training_history(
             config.run_directory, history_identity
         )
 
+    schedule_counters_before = {
+        "movement_post_warmup_transition_count": max(
+            total_joint_transitions - config.warmup_joint_transitions, 0
+        ),
+        "routing_lifecycle_state": (
+            routing_lifecycle.state_dict()
+            if routing_lifecycle is not None
+            else None
+        ),
+    }
     evaluation_state_before = (
         _evaluation_state_snapshot(
             movement_agent,
@@ -1396,6 +1578,7 @@ def train(
             joint_replay,
             routing_replay,
             dinkelbach_state,
+            schedule_counters_before,
         )
         if evaluation
         else None
@@ -1407,16 +1590,11 @@ def train(
     proposal_batches = 0
     energy_evaluations = 0
     terminal_joint_transitions = 0
-    td3_schedule_decay = movement_decay_steps(
-        config.total_episodes,
-        config.episode_seconds,
-        config.warmup_joint_transitions,
-    )
-    ddqn_schedule_decay = ddqn_decay_steps(
-        config.total_episodes,
-        config.episode_seconds,
-        MOVEMENT_CONTROL_INTERVAL,
-    )
+    evaluation_observation_transition_index = 0
+    td3_schedule_decay = resolved_exploration[
+        "resolved_movement_decay_steps"
+    ]
+    ddqn_schedule_decay = resolved_exploration["resolved_routing_decay_slots"]
     delay_bound_steps = int(5.0 / config.routing_slot_seconds)
 
     ddqn_action_selections = 0
@@ -1584,13 +1762,10 @@ def train(
             for routing_slot in range(MOVEMENT_CONTROL_INTERVAL):
                 slot_epsilon = (
                     0.0
-                    if evaluation or method_spec.routing == "random"
-                    else ddqn_epsilon(
-                        routing_slots_executed, ddqn_schedule_decay
-                    )
+                    if evaluation or not method_spec.learns_routing
+                    else routing_lifecycle.epsilon(ddqn_schedule_decay)
                 )
                 routing_epsilon_log.append(slot_epsilon)
-                routing_slots_executed += 1
                 absolute_slot = interval * MOVEMENT_CONTROL_INTERVAL + routing_slot
                 final_slot = (
                     interval == config.episode_seconds - 1
@@ -1619,6 +1794,11 @@ def train(
                 ddqn_action_selections += action_selections
                 interval_delivered_bits += delivered_bits
                 episode_routing_reward += routing_reward
+                routing_slots_executed += 1
+                if not evaluation and method_spec.learns_routing:
+                    routing_lifecycle.complete_slot(
+                        ddqn, routing_replay, config.batch_size
+                    )
 
             interval_delivered_mbits = interval_delivered_bits / 1e6
             done = interval == config.episode_seconds - 1
@@ -1687,8 +1867,15 @@ def train(
                     current_movement_mask=current_movement_mask,
                     next_movement_mask=next_movement_mask,
                 )
-            global_transition_index = total_joint_transitions
-            total_joint_transitions += 1
+            global_transition_index = (
+                evaluation_observation_transition_index
+                if evaluation
+                else total_joint_transitions
+            )
+            if not evaluation and method_spec.learns_movement:
+                total_joint_transitions += 1
+            if evaluation:
+                evaluation_observation_transition_index += 1
             interval_reward = _interval_reward(
                 interval_delivered_mbits,
                 interval_energy,
@@ -1751,15 +1938,6 @@ def train(
                     reward_mode=method_spec.reward_mode,
                     task_potential_enabled=method_spec.task_potential_enabled,
                 )
-
-        if (
-            not evaluation
-            and method_spec.learns_routing
-            and routing_replay.size >= config.batch_size
-        ):
-            ddqn.train(routing_replay, config.batch_size)
-        if not evaluation and method_spec.learns_routing:
-            ddqn.update_target()
 
         packet_metrics = packet_engine.finalize_episode(
             float(config.episode_seconds)
@@ -2104,6 +2282,25 @@ def train(
                     ),
                     fov_ema_state=packet_engine.fov_ema_state(),
                     sr_route_state=env.sr_route_state(),
+                    routing_lifecycle_state=(
+                        routing_lifecycle.state_dict()
+                        if routing_lifecycle is not None
+                        else None
+                    ),
+                    exploration_state={
+                        key: resolved_exploration[key]
+                        for key in (
+                            "exploration_schedule_version",
+                            "movement_exploration_decay_episodes",
+                            "routing_epsilon_decay_episodes",
+                            "resolved_movement_decay_steps",
+                            "resolved_routing_decay_slots",
+                            "movement_noise_start",
+                            "movement_noise_end",
+                            "routing_epsilon_start",
+                            "routing_epsilon_end",
+                        )
+                    },
                     warmup_joint_transitions=config.warmup_joint_transitions,
                     training_history_rows=training_history_rows,
                     dinkelbach_active=method_spec.uses_dinkelbach,
@@ -2165,6 +2362,17 @@ def train(
             joint_replay,
             routing_replay,
             dinkelbach_state,
+            {
+                "movement_post_warmup_transition_count": max(
+                    total_joint_transitions - config.warmup_joint_transitions,
+                    0,
+                ),
+                "routing_lifecycle_state": (
+                    routing_lifecycle.state_dict()
+                    if routing_lifecycle is not None
+                    else None
+                ),
+            },
         )
         evaluation_invariants = _evaluation_invariants(
             evaluation_state_before,
@@ -2249,10 +2457,36 @@ def train(
         "energy_evaluations": energy_evaluations,
         "terminal_joint_transitions": terminal_joint_transitions,
         "routing_slots_executed": routing_slots_executed,
+        "routing_training_global_slot_count": (
+            routing_lifecycle.global_slot_count
+            if routing_lifecycle is not None
+            else 0
+        ),
         "ddqn_action_selections": ddqn_action_selections,
         "ddqn_training_updates": ddqn.num_training,
         "routing_target_update_count": getattr(
             ddqn, "target_update_count", 0
+        ),
+        "routing_reward_optimizer_update_count": getattr(
+            ddqn, "reward_optimizer_update_count", 0
+        ),
+        "routing_cost_optimizer_update_count": getattr(
+            ddqn, "cost_optimizer_update_count", 0
+        ),
+        "routing_reward_target_update_count": getattr(
+            ddqn, "reward_target_update_count", 0
+        ),
+        "routing_cost_target_update_count": getattr(
+            ddqn, "cost_target_update_count", 0
+        ),
+        "routing_lifecycle_state": (
+            routing_lifecycle.state_dict()
+            if routing_lifecycle is not None
+            else None
+        ),
+        "exploration_schedule_configuration": resolved_exploration,
+        "movement_post_warmup_transition_count": max(
+            total_joint_transitions - config.warmup_joint_transitions, 0
         ),
         "lambda_cost": (
             float(ddqn.lambda_cost)
@@ -2331,6 +2565,17 @@ def train(
                 else None
             ),
             "routing_mask_scope": "every_slot",
+            **resolved_routing,
+            **resolved_exploration,
+            "routing_optimizer_update_count": int(ddqn.num_training),
+            "routing_target_update_count": int(
+                getattr(ddqn, "target_update_count", 0)
+            ),
+            "routing_epsilon_decay_start_slot": (
+                routing_lifecycle.epsilon_decay_start_slot
+                if routing_lifecycle is not None
+                else None
+            ),
             "fov_ema_state": packet_engine.fov_ema_state(),
             "sr_route_state": env.sr_route_state(),
             "resolved_packet_configuration": {

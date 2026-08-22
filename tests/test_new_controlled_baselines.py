@@ -17,7 +17,11 @@ from centralized_movement import (
     project_joint_action,
 )
 from dinkelbach_blocks import DinkelbachBlockState, dinkelbach_config_metadata
-from experiment_config import MethodSpec, effective_training_config
+from experiment_config import (
+    MethodSpec,
+    effective_training_config,
+    exploration_schedule_configuration,
+)
 from HRL_task_aware import (
     ROUTING_STATE_DIM,
     TrainingConfig,
@@ -35,6 +39,7 @@ from observation_strategy import (
 from Packet_scheduler_v1 import PacketEngine
 from Simulator import Simulator
 from routing_agents import ControlledDQN, RandomRoutingController
+from routing_lifecycle import RoutingLearnerLifecycle
 from scenario_manifest import generate_manifest
 from Simulator import Simulator
 from td3 import TD3
@@ -317,12 +322,19 @@ class ControlledDQNTest(unittest.TestCase):
 
     def test_full_checkpoint_round_trip_has_no_cost_network(self):
         method = MethodSpec.parse("td3_dinkelbach_dqn")
-        config = formal_training_config(1, enable_plots=False, enable_csv=False)
+        config = formal_training_config(
+            1,
+            enable_plots=False,
+            enable_csv=False,
+            routing_warmup_transitions=1,
+        )
         formal_config = effective_training_config(config, method)
         movement = TD3(4, 2, 1.0, gamma=1.0)
         routing = ControlledDQN(42, 3, hidden_dim=8)
-        routing.num_training = 7
-        routing.target_update_count = 4
+        routing.num_training = 1
+        routing.target_update_count = 1
+        routing.reward_optimizer_update_count = 1
+        routing.reward_target_update_count = 1
         routing.loss_log = [1.25]
         joint = ReplayBufferJoint(4, 2, max_size=8)
         joint.add(
@@ -351,6 +363,15 @@ class ControlledDQNTest(unittest.TestCase):
             warmup_joint_transitions=config.warmup_joint_transitions,
             training_history_rows=[],
             fov_ema_state=initialized_fov_ema_state(),
+            routing_lifecycle_state=RoutingLearnerLifecycle(
+                warmup_transitions=1,
+                global_slot_count=4,
+                optimizer_update_count=1,
+                target_update_count=1,
+                epsilon_decay_start_slot=1,
+                last_optimizer_update_slot=4,
+            ).state_dict(),
+            exploration_state=exploration_schedule_configuration(config, method),
         )
         experiment = {
             "method_spec_fingerprint": method.fingerprint,
@@ -405,8 +426,8 @@ class ControlledDQNTest(unittest.TestCase):
                 },
                 expected_formal_config=formal_config,
             )
-        self.assertEqual(restored_routing.num_training, 7)
-        self.assertEqual(restored_routing.target_update_count, 4)
+        self.assertEqual(restored_routing.num_training, 1)
+        self.assertEqual(restored_routing.target_update_count, 1)
         self.assertEqual(restored_routing.loss_log, [1.25])
         self.assertEqual(restored_replay.size, 1)
 

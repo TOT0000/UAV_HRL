@@ -11,6 +11,12 @@ from exploration_schedules import (
     td3_behavior_noise,
     td3_decay_steps,
 )
+from experiment_config import (
+    EXPLORATION_SCHEDULE_VERSION,
+    MethodSpec,
+    exploration_schedule_configuration,
+)
+from HRL_task_aware import formal_training_config
 from td3 import TD3
 
 
@@ -21,6 +27,9 @@ class ExplorationScheduleTest(unittest.TestCase):
         self.assertAlmostEqual(td3_behavior_noise(100, 100), 0.05)
         self.assertAlmostEqual(td3_behavior_noise(150, 100), 0.05)
         self.assertEqual(td3_behavior_noise(0, 100, evaluation=True), 0.0)
+        uninterrupted = [td3_behavior_noise(step, 100) for step in range(151)]
+        resumed = [td3_behavior_noise(step, 100) for step in range(37, 151)]
+        self.assertEqual(resumed, uninterrupted[37:])
 
     def test_ddqn_epsilon_start_mid_end_overrun_resume_and_evaluation(self):
         self.assertAlmostEqual(ddqn_epsilon(0, 100), 1.0)
@@ -32,9 +41,21 @@ class ExplorationScheduleTest(unittest.TestCase):
         self.assertEqual(resumed, uninterrupted[37:])
         self.assertEqual(ddqn_epsilon(0, 100, evaluation=True), 0.0)
 
-    def test_default_decay_horizons_cover_eighty_percent_of_formal_steps(self):
-        self.assertEqual(td3_decay_steps(100, 60, 1000), 4000)
-        self.assertEqual(ddqn_decay_steps(100, 60, 4), 19200)
+    def test_formal_decay_horizons_are_fixed_at_one_thousand_episodes(self):
+        self.assertEqual(td3_decay_steps(2500, 60, 1000), 60000)
+        self.assertEqual(ddqn_decay_steps(60, 0.25), 240000)
+        formal = formal_training_config(2500)
+        resolved = exploration_schedule_configuration(
+            formal, MethodSpec.parse("td3_dinkelbach")
+        )
+        self.assertEqual(
+            resolved["exploration_schedule_version"],
+            EXPLORATION_SCHEDULE_VERSION,
+        )
+        self.assertEqual(resolved["movement_exploration_decay_episodes"], 1000)
+        self.assertEqual(resolved["routing_epsilon_decay_episodes"], 1000)
+        self.assertEqual(resolved["resolved_movement_decay_steps"], 60000)
+        self.assertEqual(resolved["resolved_routing_decay_slots"], 240000)
 
     def test_same_routing_slot_uses_one_epsilon_and_zero_logits_noise(self):
         calls = []

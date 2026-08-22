@@ -21,6 +21,7 @@ from experiment_config import (
     SEARCH_COVERAGE_THRESHOLD,
     SEARCH_UTILITY,
     effective_training_config,
+    exploration_schedule_configuration,
     movement_agent_configuration,
 )
 from HRL_task_aware import (
@@ -33,6 +34,7 @@ from HRL_task_aware import (
     train,
 )
 from run_experiment import build_parser, create_unique_run_directory
+from routing_lifecycle import RoutingLearnerLifecycle
 from scenario_manifest import generate_manifest
 from Simulator import Simulator
 from training_checkpoint import (
@@ -119,6 +121,7 @@ class ControlledMethodRegistryTest(unittest.TestCase):
                         mode="smoke",
                         episode_seconds=1,
                         warmup_joint_transitions=0,
+                        routing_warmup_transitions=1,
                         batch_size=1,
                         enable_model_checkpoints=False,
                         enable_full_resume=False,
@@ -143,6 +146,20 @@ class ControlledMethodRegistryTest(unittest.TestCase):
                     metadata["task_observation_mode"], spec.task_observation
                 )
                 self.assertEqual(
+                    metadata["exploration_schedule_version"],
+                    "linear_v2_1000ep",
+                )
+                self.assertEqual(metadata["evaluation_exploration_mode"], "disabled")
+                self.assertEqual(
+                    metadata["routing_optimizer_update_scope"],
+                    "every_4_routing_slots" if spec.learns_routing else None,
+                )
+                self.assertEqual(
+                    metadata["routing_warmup_counter_source"],
+                    "routing_replay_size" if spec.learns_routing else None,
+                )
+                self.assertEqual(metadata["routing_slots_per_episode"], 4)
+                self.assertEqual(
                     metadata["fov_com_pair_max_distance_m"],
                     FOV_COM_PAIR_MAX_DISTANCE_M,
                 )
@@ -164,6 +181,10 @@ class ControlledMethodRegistryTest(unittest.TestCase):
                     self.assertEqual(result["routing_replay_size"], 0)
                     self.assertEqual(result["ddqn_training_updates"], 0)
                     self.assertEqual(result["routing_target_update_count"], 0)
+                else:
+                    self.assertGreaterEqual(result["routing_replay_size"], 1)
+                    self.assertEqual(result["ddqn_training_updates"], 1)
+                    self.assertEqual(result["routing_target_update_count"], 1)
                 if spec.reward_mode == "ratio":
                     self.assertEqual(result["dinkelbach_update_count"], 0)
                     self.assertIsNone(result["lambda"])
@@ -402,6 +423,12 @@ class ControlledDDPGCheckpointTest(unittest.TestCase):
             warmup_joint_transitions=config.warmup_joint_transitions,
             training_history_rows=[],
             fov_ema_state=initialized_fov_ema_state(),
+            routing_lifecycle_state=RoutingLearnerLifecycle(
+                global_slot_count=4
+            ).state_dict(),
+            exploration_state=exploration_schedule_configuration(
+                config, MethodSpec.parse("ddpg_dinkelbach")
+            ),
         )
         expected_actor = {
             key: value.detach().cpu().clone()

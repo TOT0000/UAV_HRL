@@ -11,9 +11,13 @@ import torch
 from dinkelbach_blocks import DinkelbachBlockState, dinkelbach_config_metadata
 from HRL_task_aware import formal_training_config
 from experiment_config import (
+    EXPLORATION_SCHEDULE_VERSION,
+    MOVEMENT_EXPLORATION_DECAY_EPISODES,
     MethodSpec,
+    ROUTING_EPSILON_DECAY_EPISODES,
     SR_ROUTE_LIFECYCLE_VERSION,
 )
+from routing_lifecycle import RoutingLearnerLifecycle
 from resume_recovery import (
     execute_resume_reconciliation,
     plan_resume_reconciliation,
@@ -62,6 +66,9 @@ class ResumeRecoveryTest(unittest.TestCase):
             lambda_after_episode_log.append(
                 event["dinkelbach_lambda_after_episode"]
             )
+        lifecycle = RoutingLearnerLifecycle(
+            global_slot_count=completed_episode * 240
+        ).state_dict()
         return {
             "completed_episode_index": completed_episode - 1,
             "next_episode_index": completed_episode,
@@ -85,6 +92,20 @@ class ResumeRecoveryTest(unittest.TestCase):
                 "checkpoint_scope": "episode_boundary_terminal_snapshot",
                 "mid_episode_checkpoint_supported": False,
             },
+            "routing_lifecycle_state": lifecycle,
+            "routing_epsilon_decay_start_slot": None,
+            "exploration_schedule_version": EXPLORATION_SCHEDULE_VERSION,
+            "movement_exploration_decay_episodes": (
+                MOVEMENT_EXPLORATION_DECAY_EPISODES
+            ),
+            "routing_epsilon_decay_episodes": ROUTING_EPSILON_DECAY_EPISODES,
+            "resolved_movement_decay_steps": 60000,
+            "resolved_routing_decay_slots": 240000,
+            "movement_post_warmup_transition_count": 0,
+            "movement_noise_start": 0.20,
+            "movement_noise_end": 0.05,
+            "routing_epsilon_start": 1.0,
+            "routing_epsilon_end": 0.05,
             **state.training_state(),
         }
 
@@ -137,6 +158,11 @@ class ResumeRecoveryTest(unittest.TestCase):
                 {
                     "training_state": self._training_state(completed_episode),
                     "formal_config": self.formal_config,
+                    "ddqn_state": {
+                        "training_updates": 0,
+                        "target_update_count": 0,
+                    },
+                    "replay_metadata": {"routing": {"size": 0}},
                 },
                 path / "training_state.pt",
             )

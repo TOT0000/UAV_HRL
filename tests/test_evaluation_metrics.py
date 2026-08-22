@@ -152,6 +152,8 @@ class EvaluationModeIntegrationTest(unittest.TestCase):
         self.assertEqual(result["routing_epsilon_log"], [0.0] * 4)
         self.assertEqual(result["joint_replay_size"], 0)
         self.assertEqual(result["routing_replay_size"], 0)
+        self.assertEqual(result["routing_training_global_slot_count"], 0)
+        self.assertEqual(result["movement_post_warmup_transition_count"], 0)
         self.assertEqual(result["dinkelbach_update_count"], 0)
         self.assertEqual(result["dinkelbach_state"], checkpoint_dinkelbach_state)
         for field, value in result["safe_ddqn_constraint_state"].items():

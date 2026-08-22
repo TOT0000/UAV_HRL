@@ -13,7 +13,12 @@ import torch
 
 from DDQN import DDQN
 from dinkelbach_blocks import DinkelbachBlockState, dinkelbach_config_metadata
-from experiment_config import SR_ROUTE_LIFECYCLE_VERSION
+from experiment_config import (
+    EXPLORATION_SCHEDULE_VERSION,
+    MOVEMENT_EXPLORATION_DECAY_EPISODES,
+    ROUTING_EPSILON_DECAY_EPISODES,
+    SR_ROUTE_LIFECYCLE_VERSION,
+)
 from HRL_task_aware import (
     _seed_training_rng,
     _uses_warmup_random_action,
@@ -22,6 +27,7 @@ from HRL_task_aware import (
 )
 from centralized_movement import JOINT_ACTION_DIM, MOVEMENT_STATE_DIM
 from td3 import TD3
+from routing_lifecycle import RoutingLearnerLifecycle
 from training_checkpoint import (
     CHECKPOINT_SCHEMA_VERSION,
     FULL_RESUME_LOGGING_SCHEMA_VERSION,
@@ -38,10 +44,28 @@ ROUTING_STATE_DIM = 126
 ROUTING_ACTION_DIM = 17
 
 
-def _lifecycle_training_state(episode_count, lambda_after=0.0):
+def _lifecycle_training_state(
+    episode_count,
+    lambda_after=0.0,
+    *,
+    routing_slots=0,
+    routing_updates=0,
+    routing_warmup=1000,
+    movement_post_warmup=0,
+):
     after_log = [0.0] * int(episode_count)
     if after_log:
         after_log[-1] = float(lambda_after)
+    lifecycle = RoutingLearnerLifecycle(
+        warmup_transitions=int(routing_warmup),
+        global_slot_count=int(routing_slots),
+        optimizer_update_count=int(routing_updates),
+        target_update_count=int(routing_updates),
+        epsilon_decay_start_slot=(1 if routing_updates else None),
+        last_optimizer_update_slot=(
+            int(routing_slots) if routing_updates else None
+        ),
+    ).state_dict()
     return {
         "lambda_cost_used_log": [0.0] * int(episode_count),
         "lambda_cost_after_episode_log": after_log,
@@ -55,6 +79,22 @@ def _lifecycle_training_state(episode_count, lambda_after=0.0):
             "checkpoint_scope": "episode_boundary_terminal_snapshot",
             "mid_episode_checkpoint_supported": False,
         },
+        "routing_lifecycle_state": lifecycle,
+        "routing_epsilon_decay_start_slot": lifecycle[
+            "routing_epsilon_decay_start_slot"
+        ],
+        "exploration_schedule_version": EXPLORATION_SCHEDULE_VERSION,
+        "movement_exploration_decay_episodes": (
+            MOVEMENT_EXPLORATION_DECAY_EPISODES
+        ),
+        "routing_epsilon_decay_episodes": ROUTING_EPSILON_DECAY_EPISODES,
+        "resolved_movement_decay_steps": 60000,
+        "resolved_routing_decay_slots": 240000,
+        "movement_post_warmup_transition_count": int(movement_post_warmup),
+        "movement_noise_start": 0.20,
+        "movement_noise_end": 0.05,
+        "routing_epsilon_start": 1.0,
+        "routing_epsilon_end": 0.05,
     }
 
 
@@ -197,6 +237,7 @@ class FullResumeCheckpointTest(unittest.TestCase):
             tag_gt=4,
         )
         ddqn.train(routing, batch_size=1)
+        ddqn.update_target()
 
     def test_full_resume_round_trip_restores_exact_training_state_and_rng(self):
         td3, ddqn, joint, routing = self._components()
@@ -220,9 +261,19 @@ class FullResumeCheckpointTest(unittest.TestCase):
             "ddqn_schedule_slot": 148,
             "td3_noise_log": [0.2],
             "routing_epsilon_log": [1.0, 0.99],
-            **_lifecycle_training_state(7, lambda_after=ddqn.lambda_cost),
+            **_lifecycle_training_state(
+                7,
+                lambda_after=ddqn.lambda_cost,
+                routing_slots=148,
+                routing_updates=1,
+                routing_warmup=1,
+            ),
         }
-        formal_config = asdict(formal_training_config(100, random_seed=123))
+        formal_config = asdict(
+            formal_training_config(
+                100, random_seed=123, routing_warmup_transitions=1
+            )
+        )
         dinkelbach_state = DinkelbachBlockState.from_config(formal_config)
         for _ in range(7):
             dinkelbach_state.record_episode(1.0, 2.0)
@@ -654,6 +705,13 @@ class FullResumeCheckpointTest(unittest.TestCase):
 
             metadata_path = checkpoint_dir / "metadata.json"
             metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            metadata["checkpoint_schema_version"] = CHECKPOINT_SCHEMA_VERSION - 1
+            metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+            with self.assertRaisesRegex(
+                RuntimeError, "lacks unambiguous routing cadence"
+            ):
+                load_full_resume_checkpoint(**common)
+
             metadata["checkpoint_schema_version"] = CHECKPOINT_SCHEMA_VERSION + 1
             metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
             with self.assertRaisesRegex(RuntimeError, "checkpoint_schema_version"):
@@ -719,7 +777,7 @@ class TrainingCliTest(unittest.TestCase):
         )
 
     def test_checkpoint_schema_is_explicit(self):
-        self.assertEqual(CHECKPOINT_SCHEMA_VERSION, 5)
+        self.assertEqual(CHECKPOINT_SCHEMA_VERSION, 6)
 
 
 if __name__ == "__main__":

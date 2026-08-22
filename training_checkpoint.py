@@ -25,7 +25,8 @@ from dinkelbach_blocks import (
     dinkelbach_config_metadata,
 )
 
-CHECKPOINT_SCHEMA_VERSION = 5
+CHECKPOINT_SCHEMA_VERSION = 6
+PRE_ROUTING_LIFECYCLE_CHECKPOINT_SCHEMA_VERSION = 5
 PRE_ADAPTIVE_SAFE_DDQN_CHECKPOINT_SCHEMA_VERSION = 4
 PRE_MOVEMENT_MASK_CHECKPOINT_SCHEMA_VERSION = 3
 LEGACY_DINKELBACH_CHECKPOINT_SCHEMA_VERSION = 2
@@ -89,6 +90,11 @@ FORMAL_CORE_CONFIG_FIELDS = (
     "beta_com",
     "search_coverage_threshold",
     "replay_max_size",
+    "routing_warmup_transitions",
+    "routing_update_interval_slots",
+    "routing_gradient_steps_per_update",
+    "movement_exploration_decay_episodes",
+    "routing_epsilon_decay_episodes",
     "dinkelbach_initial_lambda",
     "dinkelbach_update_interval_episodes",
     "dinkelbach_update_rule",
@@ -120,6 +126,15 @@ FORMAL_CORE_CONFIG_FIELDS = (
     "resolved_fov_deadline_seconds",
     "resolved_com_deadline_seconds",
     "packet_injection_cutoff_seconds",
+)
+ROUTING_EXPLORATION_CONFIG_FIELDS = frozenset(
+    {
+        "routing_warmup_transitions",
+        "routing_update_interval_slots",
+        "routing_gradient_steps_per_update",
+        "movement_exploration_decay_episodes",
+        "routing_epsilon_decay_episodes",
+    }
 )
 
 FULL_RESUME_CONFIG_FIELDS = (
@@ -320,17 +335,42 @@ def _routing_agent_kind(agent):
     return str(getattr(agent, "routing_agent_kind", "safe_ddqn"))
 
 
-def _routing_agent_configuration(agent):
+def _routing_agent_configuration(agent, resolved_configuration=None):
     kind = _routing_agent_kind(agent)
+    resolved = dict(resolved_configuration or {})
     common = {
+        **resolved,
         "routing_agent_kind": kind,
         "gamma": float(agent.gamma),
+        "tau": float(agent.tau) if agent.tau is not None else None,
+        "learning_rate": getattr(agent, "learning_rate", None),
         "target_update_scope": (
-            "episode_end" if kind in {"safe_ddqn", "dqn"} else None
+            "after_each_optimizer_event"
+            if kind in {"safe_ddqn", "dqn"}
+            else None
+        ),
+        "routing_optimizer_update_count": int(agent.num_training),
+        "routing_target_update_count": int(
+            getattr(agent, "target_update_count", 0)
+        ),
+        "reward_optimizer_update_count": int(
+            getattr(agent, "reward_optimizer_update_count", 0)
+        ),
+        "reward_target_update_count": int(
+            getattr(agent, "reward_target_update_count", 0)
         ),
     }
     if kind == "safe_ddqn":
-        return {**common, **agent.constraint_state()}
+        return {
+            **common,
+            "cost_optimizer_update_count": int(
+                getattr(agent, "cost_optimizer_update_count", 0)
+            ),
+            "cost_target_update_count": int(
+                getattr(agent, "cost_target_update_count", 0)
+            ),
+            **agent.constraint_state(),
+        }
     return common
 
 
@@ -535,6 +575,7 @@ def _base_metadata(
     experiment = dict(experiment_metadata or {})
     formal_config = experiment.get("formal_config") or {}
     resolved_movement = formal_config.get("movement_agent_configuration")
+    resolved_routing = formal_config.get("routing_agent_configuration")
     metadata = {
         "checkpoint_schema_version": CHECKPOINT_SCHEMA_VERSION,
         "checkpoint_type": checkpoint_type,
@@ -549,7 +590,9 @@ def _base_metadata(
         ),
         "routing_ddqn_gamma": float(ddqn.gamma),
         "routing_agent_kind": _routing_agent_kind(ddqn),
-        "routing_agent_configuration": _routing_agent_configuration(ddqn),
+        "routing_agent_configuration": _routing_agent_configuration(
+            ddqn, resolved_routing
+        ),
         "com_calibration_fingerprint": calibration_fingerprint(calibration),
     }
     if kind == "td3":
@@ -700,12 +743,13 @@ def _validate_checkpoint_schema(metadata):
     schema = metadata.get("checkpoint_schema_version")
     if schema in {
         CHECKPOINT_SCHEMA_VERSION,
+        PRE_ROUTING_LIFECYCLE_CHECKPOINT_SCHEMA_VERSION,
         PRE_ADAPTIVE_SAFE_DDQN_CHECKPOINT_SCHEMA_VERSION,
         PRE_MOVEMENT_MASK_CHECKPOINT_SCHEMA_VERSION,
     }:
         schema = int(schema)
         if (
-            schema < CHECKPOINT_SCHEMA_VERSION
+            schema < PRE_ROUTING_LIFECYCLE_CHECKPOINT_SCHEMA_VERSION
             and metadata.get("routing_agent_kind", "safe_ddqn") == "safe_ddqn"
         ):
             raise RuntimeError(
@@ -757,7 +801,11 @@ def _formal_config_for_validation(metadata, actual_config, expected_config):
     ):
         actual_config = dict(actual_config)
         for field in FORMAL_CORE_CONFIG_FIELDS:
-            if field not in actual_config and field in expected_config:
+            if (
+                field not in ROUTING_EXPLORATION_CONFIG_FIELDS
+                and field not in actual_config
+                and field in expected_config
+            ):
                 actual_config[field] = expected_config[field]
     return actual_config
 
@@ -1184,6 +1232,23 @@ def _restore_movement_training_payload(agent, payload):
 
 def _routing_training_payload(agent):
     kind = _routing_agent_kind(agent)
+    if kind in {"safe_ddqn", "dqn"}:
+        expected = int(agent.num_training)
+        counters = {
+            "target": int(agent.target_update_count),
+            "reward_optimizer": int(agent.reward_optimizer_update_count),
+            "reward_target": int(agent.reward_target_update_count),
+        }
+        if kind == "safe_ddqn":
+            counters.update(
+                cost_optimizer=int(agent.cost_optimizer_update_count),
+                cost_target=int(agent.cost_target_update_count),
+            )
+        if any(value != expected for value in counters.values()):
+            raise RuntimeError(
+                "routing optimizer/target counters are inconsistent: "
+                f"training={expected}, counters={counters}"
+            )
     state = {
         "kind": kind,
         "gamma": float(agent.gamma),
@@ -1191,6 +1256,12 @@ def _routing_training_payload(agent):
         "training_updates": int(agent.num_training),
         "target_update_count": int(getattr(agent, "target_update_count", 0)),
         "loss_log": list(agent.loss_log),
+        "reward_optimizer_update_count": int(
+            getattr(agent, "reward_optimizer_update_count", 0)
+        ),
+        "reward_target_update_count": int(
+            getattr(agent, "reward_target_update_count", 0)
+        ),
     }
     if kind == "safe_ddqn":
         return {
@@ -1202,6 +1273,10 @@ def _routing_training_payload(agent):
                 **state,
                 "cost_loss_log": list(agent.cost_loss_log),
                 "constraint_state": agent.constraint_state(),
+                "cost_optimizer_update_count": int(
+                    agent.cost_optimizer_update_count
+                ),
+                "cost_target_update_count": int(agent.cost_target_update_count),
             },
         }
     if kind == "dqn":
@@ -1228,6 +1303,10 @@ def _restore_routing_training_payload(agent, payload):
             )
         agent.load_constraint_state(state["constraint_state"])
         agent.cost_loss_log = list(state["cost_loss_log"])
+        agent.cost_optimizer_update_count = int(
+            state["cost_optimizer_update_count"]
+        )
+        agent.cost_target_update_count = int(state["cost_target_update_count"])
     elif kind == "dqn":
         state = payload.get("routing_agent_state") or {}
         if state.get("kind") != "dqn":
@@ -1245,6 +1324,26 @@ def _restore_routing_training_payload(agent, payload):
     agent.num_training = int(state["training_updates"])
     agent.target_update_count = int(state.get("target_update_count", 0))
     agent.loss_log = list(state["loss_log"])
+    agent.reward_optimizer_update_count = int(
+        state["reward_optimizer_update_count"]
+    )
+    agent.reward_target_update_count = int(state["reward_target_update_count"])
+    if kind in {"safe_ddqn", "dqn"}:
+        expected = int(agent.num_training)
+        counters = {
+            "target": int(agent.target_update_count),
+            "reward_optimizer": int(agent.reward_optimizer_update_count),
+            "reward_target": int(agent.reward_target_update_count),
+        }
+        if kind == "safe_ddqn":
+            counters.update(
+                cost_optimizer=int(agent.cost_optimizer_update_count),
+                cost_target=int(agent.cost_target_update_count),
+            )
+        if any(value != expected for value in counters.values()):
+            raise RuntimeError(
+                "checkpoint routing optimizer/target counters are inconsistent"
+            )
 
 
 def _restore_rng_state(state):
@@ -1409,6 +1508,66 @@ def _validate_full_resume_logging_state(
         and not isinstance(training_state.get("sr_route_state"), dict)
     ):
         raise RuntimeError("checkpoint lacks SR route lifecycle state")
+    if int(checkpoint_schema_version) >= CHECKPOINT_SCHEMA_VERSION:
+        exploration_fields = (
+            "exploration_schedule_version",
+            "movement_exploration_decay_episodes",
+            "routing_epsilon_decay_episodes",
+            "resolved_movement_decay_steps",
+            "resolved_routing_decay_slots",
+            "movement_post_warmup_transition_count",
+            "movement_noise_start",
+            "movement_noise_end",
+            "routing_epsilon_start",
+            "routing_epsilon_end",
+            "routing_epsilon_decay_start_slot",
+        )
+        missing = [field for field in exploration_fields if field not in training_state]
+        if missing:
+            raise RuntimeError(
+                f"checkpoint exploration lifecycle state is incomplete: {missing}"
+            )
+        lifecycle = training_state.get("routing_lifecycle_state")
+        if routing_agent_kind == "random":
+            if lifecycle is not None:
+                raise RuntimeError(
+                    "random-routing checkpoint must not contain learner lifecycle state"
+                )
+        else:
+            if not isinstance(lifecycle, dict):
+                raise RuntimeError("checkpoint routing lifecycle state is missing")
+            required_lifecycle = {
+                "routing_optimizer_update_scope",
+                "routing_update_interval_slots",
+                "routing_gradient_steps_per_update",
+                "routing_warmup_transitions",
+                "routing_global_slot_count",
+                "routing_update_phase",
+                "routing_optimizer_update_count",
+                "routing_target_update_count",
+                "routing_slots_since_last_update",
+                "routing_warmup_complete",
+                "routing_epsilon_decay_start_slot",
+                "routing_last_optimizer_update_slot",
+            }
+            lifecycle_missing = sorted(required_lifecycle.difference(lifecycle))
+            if lifecycle_missing:
+                raise RuntimeError(
+                    "checkpoint routing lifecycle state is incomplete: "
+                    f"{lifecycle_missing}"
+                )
+            interval = int(lifecycle["routing_update_interval_slots"])
+            global_slots = int(lifecycle["routing_global_slot_count"])
+            if (
+                interval <= 0
+                or int(lifecycle["routing_update_phase"])
+                != global_slots % interval
+                or int(lifecycle["routing_optimizer_update_count"])
+                != int(lifecycle["routing_target_update_count"])
+                or training_state["routing_epsilon_decay_start_slot"]
+                != lifecycle["routing_epsilon_decay_start_slot"]
+            ):
+                raise RuntimeError("checkpoint routing lifecycle counters are inconsistent")
 
 
 def _validate_full_metadata(
@@ -1428,6 +1587,11 @@ def _validate_full_metadata(
             "model-only checkpoint can only be used for evaluation, not exact resume"
         )
     schema = _validate_checkpoint_schema(metadata)
+    if schema < CHECKPOINT_SCHEMA_VERSION:
+        raise RuntimeError(
+            "legacy full-resume checkpoint lacks unambiguous routing cadence and "
+            "exploration schedule state"
+        )
     checks = {
         "movement_state_dim": int(movement_state_dim),
         "joint_action_dim": int(joint_action_dim),
@@ -1614,6 +1778,41 @@ def inspect_full_resume_checkpoint(
         routing_kind,
         metadata["checkpoint_schema_version"],
     )
+    if routing_kind != "random":
+        lifecycle = training_state["routing_lifecycle_state"]
+        routing_agent_state = (
+            payload.get("ddqn_state")
+            if routing_kind == "safe_ddqn"
+            else payload.get("routing_agent_state")
+        ) or {}
+        if (
+            int(lifecycle["routing_optimizer_update_count"])
+            != int(routing_agent_state.get("training_updates", -1))
+            or int(lifecycle["routing_target_update_count"])
+            != int(routing_agent_state.get("target_update_count", -1))
+        ):
+            raise RuntimeError(
+                "checkpoint routing lifecycle counters disagree with agent state"
+            )
+        routing_replay_metadata = replay_metadata.get("routing")
+        if not isinstance(routing_replay_metadata, dict):
+            raise RuntimeError("checkpoint routing replay metadata is missing")
+        replay_size = int(routing_replay_metadata.get("size", -1))
+        warmup = int(lifecycle["routing_warmup_transitions"])
+        warmup_complete = bool(lifecycle["routing_warmup_complete"])
+        marker = lifecycle["routing_epsilon_decay_start_slot"]
+        if (
+            replay_size < 0
+            or warmup_complete != (replay_size >= warmup)
+            or warmup_complete != (marker is not None)
+            or (
+                marker is not None
+                and not 0 < int(marker) <= int(lifecycle["routing_global_slot_count"])
+            )
+        ):
+            raise RuntimeError(
+                "checkpoint routing replay warm-up and epsilon marker are inconsistent"
+            )
     if _checkpoint_uses_dinkelbach(metadata):
         dinkelbach_state = DinkelbachBlockState.from_training_state(
             training_state,

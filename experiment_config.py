@@ -34,6 +34,20 @@ SAFE_DDQN_ETA_C = 0.01
 SAFE_DDQN_LAMBDA_UPDATE_SCOPE = "episode_end"
 SAFE_DDQN_EVALUATION_LAMBDA_MODE = "checkpoint_frozen"
 ROUTING_MASK_SCOPE = "every_slot"
+MOVEMENT_INTERVAL_SECONDS = 1.0
+EXPLORATION_SCHEDULE_VERSION = "linear_v2_1000ep"
+EXPLORATION_SCHEDULE_TYPE = "linear"
+MOVEMENT_EXPLORATION_DECAY_EPISODES = 1000
+ROUTING_EPSILON_DECAY_EPISODES = 1000
+ROUTING_EPSILON_START = 1.0
+ROUTING_EPSILON_END = 0.05
+ROUTING_WARMUP_TRANSITIONS = 1000
+ROUTING_UPDATE_INTERVAL_SLOTS = 4
+ROUTING_GRADIENT_STEPS_PER_UPDATE = 1
+ROUTING_LEARNING_RATE = 1e-3
+ROUTING_GAMMA = 0.99
+ROUTING_TAU = 0.005
+ROUTING_OPTIMIZER_UPDATE_SCOPE = "every_4_routing_slots"
 FOV_EMA_LIFECYCLE_VERSION = "no-map-footprint-progression-v3"
 SR_ROUTE_LIFECYCLE_VERSION = "no-duplicate-start-exact-endpoint-v1"
 PRODUCTION_TASK_DEADLINE_SECONDS = {"FOV": 1.5, "COM": 1.0}
@@ -389,13 +403,160 @@ def movement_agent_configuration(method_spec: MethodSpec, training_config=None) 
         "batch_size": batch_size,
         "replay_capacity": replay_capacity,
         "warmup_joint_transitions": warmup,
-        "exploration_noise_start": common["exploration_noise_start"],
-        "exploration_noise_end": common["exploration_noise_end"],
+        "behavior_exploration_enabled": bool(method_spec.learns_movement),
+        "exploration_schedule_version": (
+            EXPLORATION_SCHEDULE_VERSION if method_spec.learns_movement else None
+        ),
+        "exploration_noise_start": (
+            common["exploration_noise_start"] if method_spec.learns_movement else None
+        ),
+        "exploration_noise_end": (
+            common["exploration_noise_end"] if method_spec.learns_movement else None
+        ),
         "policy_delay": algorithm.get("policy_delay"),
         "target_policy_noise": algorithm.get("target_policy_noise"),
         "target_noise_clip": algorithm.get("target_noise_clip"),
         "twin_critics": bool(algorithm.get("twin_critics", False)),
         "optimizer_update_scope": "every_movement_transition_after_warmup",
+    }
+
+
+def exploration_schedule_configuration(config, method_spec: MethodSpec) -> dict:
+    """Resolve fixed-episode exploration horizons from the shared time grid."""
+
+    method_spec = MethodSpec.parse(method_spec.method_id)
+    values = asdict(config) if not isinstance(config, dict) else dict(config)
+    episode_seconds = float(values["episode_seconds"])
+    routing_slot_seconds = float(values["routing_slot_seconds"])
+    movement_decay_episodes = int(
+        values.get(
+            "movement_exploration_decay_episodes",
+            MOVEMENT_EXPLORATION_DECAY_EPISODES,
+        )
+    )
+    routing_decay_episodes = int(
+        values.get(
+            "routing_epsilon_decay_episodes", ROUTING_EPSILON_DECAY_EPISODES
+        )
+    )
+    movement_steps_per_episode = int(
+        round(episode_seconds / MOVEMENT_INTERVAL_SECONDS)
+    )
+    routing_slots_per_episode = int(round(episode_seconds / routing_slot_seconds))
+    return {
+        "exploration_schedule_version": EXPLORATION_SCHEDULE_VERSION,
+        "exploration_schedule_type": EXPLORATION_SCHEDULE_TYPE,
+        "movement_exploration_enabled": bool(method_spec.learns_movement),
+        "routing_epsilon_enabled": bool(method_spec.learns_routing),
+        "movement_exploration_decay_episodes": movement_decay_episodes,
+        "routing_epsilon_decay_episodes": routing_decay_episodes,
+        "movement_noise_start": (
+            FORMAL_EXPERIMENT_DEFAULTS["movement_hyperparameters"][
+                "exploration_noise_start"
+            ]
+            if method_spec.learns_movement
+            else None
+        ),
+        "movement_noise_end": (
+            FORMAL_EXPERIMENT_DEFAULTS["movement_hyperparameters"][
+                "exploration_noise_end"
+            ]
+            if method_spec.learns_movement
+            else None
+        ),
+        "routing_epsilon_start": (
+            ROUTING_EPSILON_START if method_spec.learns_routing else None
+        ),
+        "routing_epsilon_end": (
+            ROUTING_EPSILON_END if method_spec.learns_routing else None
+        ),
+        "resolved_movement_decay_steps": (
+            movement_decay_episodes * movement_steps_per_episode
+            if method_spec.learns_movement
+            else None
+        ),
+        "resolved_routing_decay_slots": (
+            routing_decay_episodes * routing_slots_per_episode
+            if method_spec.learns_routing
+            else None
+        ),
+        "movement_transitions_per_episode": movement_steps_per_episode,
+        "routing_slots_per_episode": routing_slots_per_episode,
+        "movement_interval_seconds": MOVEMENT_INTERVAL_SECONDS,
+        "movement_warmup_transitions": int(
+            values.get(
+                "warmup_joint_transitions",
+                FORMAL_EXPERIMENT_DEFAULTS["movement_hyperparameters"][
+                    "warmup_joint_transitions"
+                ],
+            )
+        ),
+        "exploration_counter_scope": {
+            "movement": "post_warmup_joint_movement_transitions",
+            "routing": "global_routing_slots_after_replay_warmup",
+        },
+        "evaluation_exploration_mode": "disabled",
+    }
+
+
+def routing_agent_configuration(method_spec: MethodSpec, training_config=None) -> dict:
+    """Return the resolved lifecycle and optimizer settings for routing."""
+
+    method_spec = MethodSpec.parse(method_spec.method_id)
+    resolved = (
+        asdict(training_config)
+        if training_config is not None and not isinstance(training_config, dict)
+        else dict(training_config or {})
+    )
+    learned = method_spec.learns_routing
+    return {
+        "routing_agent_kind": method_spec.routing,
+        "routing_learner_enabled": bool(learned),
+        "routing_optimizer_update_scope": (
+            ROUTING_OPTIMIZER_UPDATE_SCOPE if learned else None
+        ),
+        "routing_update_interval_slots": (
+            int(
+                resolved.get(
+                    "routing_update_interval_slots", ROUTING_UPDATE_INTERVAL_SLOTS
+                )
+            )
+            if learned
+            else None
+        ),
+        "routing_gradient_steps_per_update": (
+            int(
+                resolved.get(
+                    "routing_gradient_steps_per_update",
+                    ROUTING_GRADIENT_STEPS_PER_UPDATE,
+                )
+            )
+            if learned
+            else None
+        ),
+        "routing_warmup_transitions": (
+            int(
+                resolved.get(
+                    "routing_warmup_transitions", ROUTING_WARMUP_TRANSITIONS
+                )
+            )
+            if learned
+            else None
+        ),
+        "routing_warmup_counter_source": (
+            "routing_replay_size" if learned else None
+        ),
+        "batch_size": (
+            int(resolved.get("batch_size", 64)) if learned else None
+        ),
+        "replay_capacity": (
+            int(resolved.get("replay_max_size", 200_000)) if learned else None
+        ),
+        "learning_rate": ROUTING_LEARNING_RATE if learned else None,
+        "gamma": ROUTING_GAMMA,
+        "tau": ROUTING_TAU if learned else None,
+        "target_update_scope": "after_each_optimizer_event" if learned else None,
+        "routing_mask_scope": ROUTING_MASK_SCOPE,
     }
 
 
@@ -406,6 +567,12 @@ def effective_training_config(config, method_spec: MethodSpec) -> dict:
     movement = movement_agent_configuration(method_spec, config)
     values["policy_delay"] = movement["policy_delay"]
     values["movement_agent_configuration"] = movement
+    values["routing_agent_configuration"] = routing_agent_configuration(
+        method_spec, config
+    )
+    values["exploration_schedule_configuration"] = (
+        exploration_schedule_configuration(config, method_spec)
+    )
     values.update(comparison_method_configuration(method_spec))
     return values
 

@@ -22,9 +22,12 @@ from experiment_config import (
     MethodSpec,
     ROI_COUNT_MAX,
     ROI_COUNT_MIN,
+    ROUTING_WARMUP_TRANSITIONS,
     effective_training_config,
+    exploration_schedule_configuration,
     comparison_method_configuration,
     movement_agent_configuration,
+    routing_agent_configuration,
 )
 from HRL_task_aware import (
     ROUTING_STATE_DIM,
@@ -224,7 +227,15 @@ def _base_resolved(run_dir, method, manifest, config, values, args, git_sha):
         "checkpoint_interval": values["checkpoint_interval"],
         "formal_checkpoint_episode": FORMAL_CHECKPOINT_EPISODE,
         "movement_hyperparameters": FORMAL_EXPERIMENT_DEFAULTS["movement_hyperparameters"],
-        "effective_movement_agent_configuration": movement_agent_configuration(method),
+        "effective_movement_agent_configuration": movement_agent_configuration(
+            method, config
+        ),
+        "effective_routing_agent_configuration": routing_agent_configuration(
+            method, config
+        ),
+        "exploration_schedule_configuration": exploration_schedule_configuration(
+            config, method
+        ),
         "training_config": effective_training_config(config, method),
         "training_manifest_hash": manifest.content_hash,
         "started_at": datetime.now(timezone.utc).isoformat(),
@@ -252,6 +263,9 @@ def run(args):
             0
             if args.smoke
             else FORMAL_EXPERIMENT_DEFAULTS["movement_hyperparameters"]["warmup_joint_transitions"]
+        ),
+        routing_warmup_transitions=(
+            1 if args.smoke else ROUTING_WARMUP_TRANSITIONS
         ),
         batch_size=(
             1

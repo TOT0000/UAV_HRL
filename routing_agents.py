@@ -9,6 +9,7 @@ import torch
 import torch.nn.functional as F
 
 from DDQN import DDQN, QNetwork, device, routing_action_mask_from_state
+from experiment_config import ROUTING_GAMMA, ROUTING_LEARNING_RATE, ROUTING_TAU
 
 
 class ControlledDQN:
@@ -21,19 +22,22 @@ class ControlledDQN:
         state_dim,
         action_dim,
         hidden_dim=128,
-        gamma=0.99,
-        tau=0.005,
-        lr=1e-3,
+        gamma=ROUTING_GAMMA,
+        tau=ROUTING_TAU,
+        lr=ROUTING_LEARNING_RATE,
     ):
         self.q_network = QNetwork(action_dim, state_dim, hidden_dim).to(device)
         self.target_q_network = copy.deepcopy(self.q_network)
         self.optimizer = torch.optim.Adam(self.q_network.parameters(), lr=lr)
         self.gamma = float(gamma)
         self.tau = float(tau)
+        self.learning_rate = float(lr)
         self.action_dim = int(action_dim)
         self.loss_log = []
         self.num_training = 0
         self.target_update_count = 0
+        self.reward_optimizer_update_count = 0
+        self.reward_target_update_count = 0
 
     def select_action(
         self,
@@ -89,6 +93,7 @@ class ControlledDQN:
         self.optimizer.step()
         self.loss_log.append(float(loss.item()))
         self.num_training += 1
+        self.reward_optimizer_update_count += 1
 
     def update_target(self):
         for parameter, target_parameter in zip(
@@ -99,6 +104,7 @@ class ControlledDQN:
                 + (1.0 - self.tau) * target_parameter.data
             )
         self.target_update_count += 1
+        self.reward_target_update_count += 1
 
 
 class RandomRoutingController:
@@ -106,7 +112,7 @@ class RandomRoutingController:
 
     routing_agent_kind = "random"
 
-    def __init__(self, gamma=0.99):
+    def __init__(self, gamma=ROUTING_GAMMA):
         self.gamma = float(gamma)
         self.tau = None
         self.num_training = 0

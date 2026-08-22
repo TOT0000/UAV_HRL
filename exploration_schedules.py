@@ -1,4 +1,10 @@
-from experiment_config import FORMAL_EXPERIMENT_DEFAULTS
+from experiment_config import (
+    FORMAL_EXPERIMENT_DEFAULTS,
+    MOVEMENT_EXPLORATION_DECAY_EPISODES,
+    ROUTING_EPSILON_DECAY_EPISODES,
+    ROUTING_EPSILON_END,
+    ROUTING_EPSILON_START,
+)
 
 
 _MOVEMENT_HYPERPARAMETERS = FORMAL_EXPERIMENT_DEFAULTS["movement_hyperparameters"]
@@ -6,9 +12,8 @@ MOVEMENT_NOISE_START = _MOVEMENT_HYPERPARAMETERS["exploration_noise_start"]
 MOVEMENT_NOISE_END = _MOVEMENT_HYPERPARAMETERS["exploration_noise_end"]
 TD3_NOISE_START = MOVEMENT_NOISE_START
 TD3_NOISE_END = MOVEMENT_NOISE_END
-DDQN_EPSILON_START = 1.0
-DDQN_EPSILON_END = 0.05
-FORMAL_DECAY_FRACTION = 0.80
+DDQN_EPSILON_START = ROUTING_EPSILON_START
+DDQN_EPSILON_END = ROUTING_EPSILON_END
 
 
 def _linear_decay(start, end, step, decay_steps):
@@ -39,13 +44,13 @@ def td3_behavior_noise(post_warmup_transition, decay_steps, evaluation=False):
     )
 
 
-def ddqn_epsilon(global_routing_slot, decay_steps, evaluation=False):
+def ddqn_epsilon(post_warmup_routing_slot, decay_steps, evaluation=False):
     if evaluation:
         return 0.0
     return _linear_decay(
         DDQN_EPSILON_START,
         DDQN_EPSILON_END,
-        global_routing_slot,
+        post_warmup_routing_slot,
         decay_steps,
     )
 
@@ -58,22 +63,34 @@ def evaluation_exploration_settings():
     }
 
 
-def movement_decay_steps(total_episodes, episode_seconds, warmup_transitions):
-    total_transitions = int(total_episodes) * int(episode_seconds)
-    post_warmup = max(total_transitions - int(warmup_transitions), 0)
-    return max(1, int(FORMAL_DECAY_FRACTION * post_warmup))
+def movement_decay_steps(
+    episode_seconds,
+    movement_interval_seconds=1.0,
+    decay_episodes=MOVEMENT_EXPLORATION_DECAY_EPISODES,
+):
+    transitions_per_episode = int(
+        round(float(episode_seconds) / float(movement_interval_seconds))
+    )
+    if transitions_per_episode <= 0 or int(decay_episodes) <= 0:
+        raise ValueError("movement decay horizon must be positive")
+    return int(decay_episodes) * transitions_per_episode
 
 
 def td3_decay_steps(total_episodes, episode_seconds, warmup_transitions):
     """Backward-compatible name for the transition-derived movement horizon."""
 
-    return movement_decay_steps(
-        total_episodes, episode_seconds, warmup_transitions
-    )
+    del total_episodes, warmup_transitions
+    return movement_decay_steps(episode_seconds)
 
 
-def ddqn_decay_steps(total_episodes, episode_seconds, slots_per_interval):
-    total_slots = (
-        int(total_episodes) * int(episode_seconds) * int(slots_per_interval)
+def ddqn_decay_steps(
+    episode_seconds,
+    routing_slot_seconds=0.25,
+    decay_episodes=ROUTING_EPSILON_DECAY_EPISODES,
+):
+    slots_per_episode = int(
+        round(float(episode_seconds) / float(routing_slot_seconds))
     )
-    return max(1, int(FORMAL_DECAY_FRACTION * total_slots))
+    if slots_per_episode <= 0 or int(decay_episodes) <= 0:
+        raise ValueError("routing decay horizon must be positive")
+    return int(decay_episodes) * slots_per_episode
