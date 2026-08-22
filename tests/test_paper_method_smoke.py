@@ -54,6 +54,19 @@ class PaperMethodSmokeTest(unittest.TestCase):
                 metadata = json.loads((checkpoint / "metadata.json").read_text())
                 self.assertEqual(metadata["movement_agent_kind"], method.agent)
                 self.assertEqual(metadata["routing_agent_kind"], method.routing)
+                training_provenance = metadata["training_provenance"]
+                self.assertEqual(
+                    training_provenance["training_episode_count"], 1
+                )
+                self.assertTrue(training_provenance["provenance_complete"])
+                if method.learns_routing:
+                    self.assertIsInstance(
+                        training_provenance["routing_lifecycle"], dict
+                    )
+                else:
+                    self.assertIsNone(
+                        training_provenance["routing_lifecycle"]
+                    )
                 self.assertEqual(
                     metadata["experiment"]["task_observation_mode"],
                     method.task_observation,
@@ -108,12 +121,42 @@ class PaperMethodSmokeTest(unittest.TestCase):
                 self.assertTrue(all(evaluation["evaluation_invariants"].values()))
                 self.assertEqual(evaluation["movement_agent_kind"], method.agent)
                 self.assertEqual(evaluation["routing_agent_kind"], method.routing)
+                run_metadata = evaluation["run_metadata"]
+                self.assertEqual(
+                    run_metadata["checkpoint_training_provenance"],
+                    training_provenance,
+                )
+                runtime = run_metadata["evaluation_runtime_provenance"]
+                self.assertEqual(runtime["evaluation_episode_count"], 1)
+                self.assertEqual(run_metadata["training_episode_count"], 1)
+                self.assertEqual(run_metadata["evaluation_episode_count"], 1)
+                if method.learns_routing:
+                    self.assertEqual(
+                        runtime["routing_lifecycle"][
+                            "routing_optimizer_update_count"
+                        ],
+                        0,
+                    )
+                    self.assertEqual(
+                        runtime["routing_lifecycle"][
+                            "routing_target_update_count"
+                        ],
+                        0,
+                    )
+                else:
+                    self.assertIsNone(runtime["routing_lifecycle"])
+                self.assertEqual(
+                    runtime["lambda_cost_source"],
+                    "checkpoint_frozen"
+                    if method.routing == "safe_ddqn"
+                    else None,
+                )
                 for field in (
                     "checkpoint_metadata_fingerprint",
                     "checkpoint_models_sha256",
                     "checkpoint_artifact_fingerprint",
                 ):
-                    self.assertEqual(len(evaluation["run_metadata"][field]), 64)
+                    self.assertEqual(len(run_metadata[field]), 64)
                 if method.routing == "random":
                     artifact = evaluation["trajectory_artifacts"][0]
                     self.assertEqual(artifact["requested_times_seconds"], [1.0])

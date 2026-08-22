@@ -1,3 +1,4 @@
+from copy import deepcopy
 from dataclasses import asdict
 import csv
 import json
@@ -35,6 +36,7 @@ from paper_figures import (
     render_standalone_trajectory_source,
 )
 from scenario_manifest import generate_manifest
+from routing_lifecycle import RoutingLearnerLifecycle
 from training_checkpoint import (
     CHECKPOINT_PROVENANCE_FIELDS,
     CHECKPOINT_SCHEMA_VERSION,
@@ -127,6 +129,7 @@ class SyntheticFigureBuildTest(unittest.TestCase):
             "method_spec": method.to_dict(),
             "method_spec_fingerprint": method.fingerprint,
             "training_seed": TRAINING_SEED,
+            "git_sha": "synthetic-training-sha",
             "movement_agent": method.agent,
             "reward_mode": method.reward_mode,
             "task_potential_enabled": method.task_potential_enabled,
@@ -164,7 +167,44 @@ class SyntheticFigureBuildTest(unittest.TestCase):
                 "lambda_update_scope": "episode_end",
                 "cost_denominator": "network_routing_slot_steps",
                 "mid_episode_checkpoint_supported": False,
+                "routing_optimizer_update_count": 17,
+                "routing_target_update_count": 17,
             }
+        lifecycle = (
+            RoutingLearnerLifecycle(
+                global_slot_count=600000,
+                optimizer_update_count=17,
+                target_update_count=17,
+                epsilon_decay_start_slot=63,
+                last_optimizer_update_slot=600000,
+            ).state_dict()
+            if method.learns_routing
+            else None
+        )
+        resolved = deepcopy(formal_config)
+        resolved.update(
+            {
+                "method_key": method.method_id,
+                "method_id": method.method_id,
+                "method_spec": method.to_dict(),
+                "method_spec_fingerprint": method.fingerprint,
+                "training_episode_count": 2500,
+                "training_seed": TRAINING_SEED,
+                "checkpoint_schema_version": CHECKPOINT_SCHEMA_VERSION,
+            }
+        )
+        metadata["training_provenance"] = {
+            "training_episode_count": 2500,
+            "training_git_sha": "synthetic-training-sha",
+            "resolved_training_config": resolved,
+            "routing_lifecycle": lifecycle,
+            "safe_ddqn_constraint_state": (
+                deepcopy(metadata.get("routing_agent_configuration"))
+                if method.routing == "safe_ddqn"
+                else None
+            ),
+            "provenance_complete": True,
+        }
         return metadata
 
     @staticmethod
@@ -401,6 +441,53 @@ class SyntheticFigureBuildTest(unittest.TestCase):
             )
             if checkpoint_required
             else {field: None for field in CHECKPOINT_PROVENANCE_FIELDS}
+        )
+        checkpoint_training = (
+            deepcopy(checkpoint_metadata["training_provenance"])
+            if checkpoint_required
+            else None
+        )
+        runtime = {
+            "evaluation_episode_count": EVALUATION_EPISODES,
+            "evaluation_git_sha": "synthetic-evaluation-sha",
+            "resolved_evaluation_config": {
+                "method_id": method_id,
+                "evaluation_episode_count": EVALUATION_EPISODES,
+                "learning_state_frozen": True,
+            },
+            "routing_lifecycle": (
+                RoutingLearnerLifecycle().state_dict()
+                if method.learns_routing
+                else None
+            ),
+            "lambda_cost_source": (
+                "checkpoint_frozen"
+                if method.routing == "safe_ddqn"
+                else None
+            ),
+            "safe_ddqn_constraint_state": (
+                deepcopy(
+                    checkpoint_metadata["routing_agent_configuration"]
+                )
+                if method.routing == "safe_ddqn"
+                else None
+            ),
+        }
+        provenance.update(
+            {
+                "checkpoint_training_provenance": checkpoint_training,
+                "evaluation_runtime_provenance": runtime,
+                "checkpoint_training_episode_count": (
+                    2500 if checkpoint_training is not None else None
+                ),
+                "evaluation_episode_count": EVALUATION_EPISODES,
+                "checkpoint_training_git_sha": (
+                    "synthetic-training-sha"
+                    if checkpoint_training is not None
+                    else None
+                ),
+                "evaluation_git_sha": "synthetic-evaluation-sha",
+            }
         )
         points = list(evaluation_sweep_points(suite))
         metadata_points = []

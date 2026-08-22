@@ -265,6 +265,10 @@ class MovementMaskCheckpointTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             movement, routing_agent, _, _ = self._components()
             checkpoint = Path(temp_dir) / "model" / "ep_0001"
+            method = MethodSpec()
+            formal_config = effective_training_config(
+                formal_training_config(1, random_seed=1), method
+            )
             save_model_checkpoint(
                 checkpoint,
                 episode=0,
@@ -274,6 +278,15 @@ class MovementMaskCheckpointTest(unittest.TestCase):
                 joint_action_dim=JOINT_ACTION_DIM,
                 routing_state_dim=ROUTING_STATE_DIM,
                 calibration=self.calibration,
+                experiment_metadata={
+                    "method_id": method.method_id,
+                    "method_spec": method.to_dict(),
+                    "method_spec_fingerprint": method.fingerprint,
+                    "training_seed": 1,
+                    "git_sha": "fixture-training-sha",
+                    "formal_config": formal_config,
+                },
+                routing_lifecycle_state=RoutingLearnerLifecycle().state_dict(),
             )
             metadata_path = checkpoint / "metadata.json"
             metadata = json.loads(metadata_path.read_text(encoding="utf-8"))

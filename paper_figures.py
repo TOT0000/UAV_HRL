@@ -43,7 +43,9 @@ from paper_trajectory import (
 from scenario_manifest import ScenarioManifest, current_environment_config
 from training_checkpoint import (
     CHECKPOINT_PROVENANCE_FIELDS,
+    EVALUATION_PROVENANCE_FIELDS,
     checkpoint_artifact_provenance,
+    checkpoint_training_provenance,
     inspect_model_checkpoint,
 )
 
@@ -136,6 +138,9 @@ def _inspect_checkpoint(method_id, checkpoint_dir, training_seed, formal_config)
     return {
         "checkpoint_dir": checkpoint_dir,
         "checkpoint_metadata": inspected["metadata"],
+        "checkpoint_training_provenance": checkpoint_training_provenance(
+            inspected["metadata"]
+        ),
         **provenance,
     }
 
@@ -371,6 +376,79 @@ def _validate_checkpoint_record(record, expected, *, method_id, point_id, layer)
             )
 
 
+def _validate_evaluation_provenance_record(
+    record, expected_training, *, method, point_id, layer
+):
+    training = record.get("checkpoint_training_provenance")
+    if training != expected_training:
+        raise IncompatiblePaperRunError(
+            f"method={method.method_id}, point={point_id}, layer={layer}: "
+            "checkpoint training provenance mismatch"
+        )
+    runtime = record.get("evaluation_runtime_provenance")
+    if not isinstance(runtime, dict):
+        raise IncompatiblePaperRunError(
+            f"method={method.method_id}, point={point_id}, layer={layer}: "
+            "evaluation runtime provenance is missing"
+        )
+    aliases = {
+        "checkpoint_training_episode_count": (
+            None
+            if training is None
+            else int(training["training_episode_count"])
+        ),
+        "checkpoint_training_git_sha": (
+            None if training is None else training["training_git_sha"]
+        ),
+        "evaluation_episode_count": int(runtime["evaluation_episode_count"]),
+        "evaluation_git_sha": runtime["evaluation_git_sha"],
+    }
+    mismatches = {
+        field: (record.get(field), expected)
+        for field, expected in aliases.items()
+        if record.get(field) != expected
+    }
+    if mismatches:
+        raise IncompatiblePaperRunError(
+            f"method={method.method_id}, point={point_id}, layer={layer}: "
+            f"evaluation provenance aliases mismatch: {mismatches}"
+        )
+    lifecycle = runtime.get("routing_lifecycle")
+    if method.learns_routing:
+        if not isinstance(lifecycle, dict):
+            raise IncompatiblePaperRunError(
+                f"method={method.method_id}, point={point_id}, layer={layer}: "
+                "evaluation learner lifecycle is missing"
+            )
+        expected_zero = {
+            "routing_global_slot_count": 0,
+            "routing_update_phase": 0,
+            "routing_slots_since_last_update": 0,
+            "routing_optimizer_update_count": 0,
+            "routing_target_update_count": 0,
+            "routing_epsilon_decay_start_slot": None,
+            "routing_last_optimizer_update_slot": None,
+        }
+        if any(lifecycle.get(key) != value for key, value in expected_zero.items()):
+            raise IncompatiblePaperRunError(
+                f"method={method.method_id}, point={point_id}, layer={layer}: "
+                "evaluation routing lifecycle is not frozen at zero"
+            )
+    elif lifecycle is not None:
+        raise IncompatiblePaperRunError(
+            f"method={method.method_id}, point={point_id}, layer={layer}: "
+            "random routing must record evaluation routing_lifecycle=null"
+        )
+    expected_lambda_source = (
+        "checkpoint_frozen" if method.routing == "safe_ddqn" else None
+    )
+    if runtime.get("lambda_cost_source") != expected_lambda_source:
+        raise IncompatiblePaperRunError(
+            f"method={method.method_id}, point={point_id}, layer={layer}: "
+            "lambda_cost provenance is incompatible"
+        )
+
+
 def _read_point_episode_rows(point, *, method_id):
     outputs = point.get("outputs") or {}
     path_value = outputs.get("per_episode_jsonl")
@@ -510,13 +588,25 @@ def _resolve_evaluation_run(method_id, entry, spec_dir, expected_suite):
             **{
                 field: checkpoint[field] for field in CHECKPOINT_PROVENANCE_FIELDS
             },
+            **{
+                field: metadata.get(field)
+                for field in EVALUATION_PROVENANCE_FIELDS
+            },
         }
+        expected_training_provenance = checkpoint[
+            "checkpoint_training_provenance"
+        ]
     else:
         checkpoint_path = None
         checkpoint_provenance = {
             "checkpoint_path": None,
             **{field: None for field in CHECKPOINT_PROVENANCE_FIELDS},
+            **{
+                field: metadata.get(field)
+                for field in EVALUATION_PROVENANCE_FIELDS
+            },
         }
+        expected_training_provenance = None
         if metadata.get("training_run") is not None or any(
             metadata.get(field) is not None
             for field in ("checkpoint_path", *CHECKPOINT_PROVENANCE_FIELDS)
@@ -529,6 +619,13 @@ def _resolve_evaluation_run(method_id, entry, spec_dir, expected_suite):
         metadata,
         checkpoint_provenance,
         method_id=method_id,
+        point_id="<top-level>",
+        layer="paper_evaluation_metadata.json",
+    )
+    _validate_evaluation_provenance_record(
+        metadata,
+        expected_training_provenance,
+        method=method,
         point_id="<top-level>",
         layer="paper_evaluation_metadata.json",
     )
@@ -545,6 +642,13 @@ def _resolve_evaluation_run(method_id, entry, spec_dir, expected_suite):
             point,
             checkpoint_provenance,
             method_id=method_id,
+            point_id=point_id,
+            layer="point metadata",
+        )
+        _validate_evaluation_provenance_record(
+            point,
+            expected_training_provenance,
+            method=method,
             point_id=point_id,
             layer="point metadata",
         )
@@ -566,6 +670,13 @@ def _resolve_evaluation_run(method_id, entry, spec_dir, expected_suite):
             point_id=point_id,
             layer="run_metadata.json",
         )
+        _validate_evaluation_provenance_record(
+            point_run_metadata,
+            expected_training_provenance,
+            method=method,
+            point_id=point_id,
+            layer="run_metadata.json",
+        )
     point_provenance = [
         _validate_manifest_point(point, metadata, expected_suite) for point in points
     ]
@@ -581,7 +692,10 @@ def _resolve_evaluation_run(method_id, entry, spec_dir, expected_suite):
         "aggregate_rows": aggregate_rows,
         **{
             field: checkpoint_provenance[field]
-            for field in CHECKPOINT_PROVENANCE_FIELDS
+            for field in (
+                *CHECKPOINT_PROVENANCE_FIELDS,
+                *EVALUATION_PROVENANCE_FIELDS,
+            )
         },
         "checkpoint_provenance": checkpoint_provenance,
         "point_provenance": point_provenance,
@@ -1275,6 +1389,7 @@ def _build_trajectory(spec, spec_path, output_dir, git_sha, figure_id):
             "scenario_manifest_hash": artifact["scenario_manifest_hash"],
             "checkpoint_path": source["checkpoint_path"],
             **{field: source[field] for field in CHECKPOINT_PROVENANCE_FIELDS},
+            **{field: source[field] for field in EVALUATION_PROVENANCE_FIELDS},
             **_validated_provenance(runs),
             "requested_time_seconds": requested_time,
             "actual_time_seconds": actual,

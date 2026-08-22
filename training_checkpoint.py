@@ -1,6 +1,7 @@
 import hashlib
 import json
 import random
+from copy import deepcopy
 from pathlib import Path
 import re
 import shutil
@@ -25,7 +26,8 @@ from dinkelbach_blocks import (
     dinkelbach_config_metadata,
 )
 
-CHECKPOINT_SCHEMA_VERSION = 6
+CHECKPOINT_SCHEMA_VERSION = 7
+ROUTING_LIFECYCLE_CHECKPOINT_SCHEMA_VERSION = 6
 PRE_ROUTING_LIFECYCLE_CHECKPOINT_SCHEMA_VERSION = 5
 PRE_ADAPTIVE_SAFE_DDQN_CHECKPOINT_SCHEMA_VERSION = 4
 PRE_MOVEMENT_MASK_CHECKPOINT_SCHEMA_VERSION = 3
@@ -164,6 +166,27 @@ CHECKPOINT_PROVENANCE_FIELDS = (
     "checkpoint_metadata_fingerprint",
     "checkpoint_models_sha256",
     "checkpoint_artifact_fingerprint",
+)
+EVALUATION_PROVENANCE_FIELDS = (
+    "checkpoint_training_provenance",
+    "evaluation_runtime_provenance",
+    "checkpoint_training_episode_count",
+    "evaluation_episode_count",
+    "checkpoint_training_git_sha",
+    "evaluation_git_sha",
+)
+
+ROUTING_LIFECYCLE_PROVENANCE_FIELDS = (
+    "routing_global_slot_count",
+    "routing_update_phase",
+    "routing_slots_since_last_update",
+    "routing_optimizer_update_count",
+    "routing_target_update_count",
+    "routing_epsilon_decay_start_slot",
+    "routing_last_optimizer_update_slot",
+    "routing_warmup_transitions",
+    "routing_update_interval_slots",
+    "routing_gradient_steps_per_update",
 )
 
 
@@ -333,6 +356,245 @@ def _agent_kind(agent):
 
 def _routing_agent_kind(agent):
     return str(getattr(agent, "routing_agent_kind", "safe_ddqn"))
+
+
+def _resolved_training_config_for_provenance(metadata):
+    experiment = metadata.get("experiment") or {}
+    resolved = deepcopy(experiment.get("formal_config") or {})
+    resolved.update(
+        {
+            "method_key": experiment.get("method_id"),
+            "method_id": experiment.get("method_id"),
+            "method_spec": deepcopy(experiment.get("method_spec")),
+            "method_spec_fingerprint": experiment.get(
+                "method_spec_fingerprint"
+            ),
+            "training_episode_count": int(metadata["episode"]) + 1,
+            "training_seed": experiment.get("training_seed"),
+            "checkpoint_schema_version": int(
+                metadata["checkpoint_schema_version"]
+            ),
+        }
+    )
+    return resolved
+
+
+def _validate_routing_lifecycle_provenance(metadata, lifecycle):
+    routing_kind = metadata.get("routing_agent_kind", "safe_ddqn")
+    if routing_kind == "random":
+        if lifecycle is not None:
+            raise RuntimeError(
+                "random-routing checkpoint must record routing_lifecycle=null"
+            )
+        return None
+    if not isinstance(lifecycle, dict):
+        raise RuntimeError(
+            "learned-routing model checkpoint lacks training lifecycle provenance"
+        )
+    missing = sorted(
+        set(ROUTING_LIFECYCLE_PROVENANCE_FIELDS).difference(lifecycle)
+    )
+    if missing:
+        raise RuntimeError(
+            "checkpoint training routing lifecycle provenance is incomplete: "
+            f"{missing}"
+        )
+    try:
+        global_slots = int(lifecycle["routing_global_slot_count"])
+        interval = int(lifecycle["routing_update_interval_slots"])
+        gradient_steps = int(lifecycle["routing_gradient_steps_per_update"])
+        warmup = int(lifecycle["routing_warmup_transitions"])
+        phase = int(lifecycle["routing_update_phase"])
+        slots_since = int(lifecycle["routing_slots_since_last_update"])
+        optimizer_count = int(lifecycle["routing_optimizer_update_count"])
+        target_count = int(lifecycle["routing_target_update_count"])
+        marker = lifecycle["routing_epsilon_decay_start_slot"]
+        last_update = lifecycle["routing_last_optimizer_update_slot"]
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(
+            "checkpoint training routing lifecycle provenance is invalid"
+        ) from exc
+    if (
+        global_slots < 0
+        or interval <= 0
+        or gradient_steps <= 0
+        or warmup <= 0
+        or phase != global_slots % interval
+        or optimizer_count < 0
+        or optimizer_count != target_count
+    ):
+        raise RuntimeError(
+            "checkpoint training routing lifecycle counters are inconsistent"
+        )
+    if marker is not None and not 0 < int(marker) <= global_slots:
+        raise RuntimeError(
+            "checkpoint training routing epsilon marker is inconsistent"
+        )
+    if (optimizer_count == 0) != (last_update is None):
+        raise RuntimeError(
+            "checkpoint training routing last-update marker is inconsistent"
+        )
+    if last_update is not None:
+        last_update = int(last_update)
+        if not 0 < last_update <= global_slots or last_update % interval:
+            raise RuntimeError(
+                "checkpoint training routing last-update marker is inconsistent"
+            )
+    if slots_since != global_slots - int(last_update or 0):
+        raise RuntimeError(
+            "checkpoint training routing slots-since-update is inconsistent"
+        )
+    routing_config = metadata.get("routing_agent_configuration") or {}
+    counter_mismatches = {
+        "routing_optimizer_update_count": (
+            routing_config.get("routing_optimizer_update_count"),
+            optimizer_count,
+        ),
+        "routing_target_update_count": (
+            routing_config.get("routing_target_update_count"),
+            target_count,
+        ),
+    }
+    counter_mismatches = {
+        key: value
+        for key, value in counter_mismatches.items()
+        if value[0] is not None and int(value[0]) != value[1]
+    }
+    if counter_mismatches:
+        raise RuntimeError(
+            "checkpoint training routing lifecycle disagrees with agent counters: "
+            f"{counter_mismatches}"
+        )
+    return deepcopy(lifecycle)
+
+
+def _validate_complete_training_provenance(metadata, provenance):
+    if not isinstance(provenance, dict):
+        raise RuntimeError("checkpoint training_provenance is missing")
+    required = {
+        "training_episode_count",
+        "training_git_sha",
+        "resolved_training_config",
+        "routing_lifecycle",
+        "provenance_complete",
+    }
+    missing = sorted(required.difference(provenance))
+    if missing:
+        raise RuntimeError(f"checkpoint training_provenance is incomplete: {missing}")
+    if provenance.get("provenance_complete") is not True:
+        raise RuntimeError("checkpoint training provenance is not complete")
+    completed_episodes = int(metadata["episode"]) + 1
+    if int(provenance["training_episode_count"]) != completed_episodes:
+        raise RuntimeError(
+            "checkpoint training provenance episode count is inconsistent"
+        )
+    training_git_sha = provenance.get("training_git_sha")
+    if not isinstance(training_git_sha, str) or not training_git_sha.strip():
+        raise RuntimeError("checkpoint training provenance Git SHA is missing")
+    experiment = metadata.get("experiment") or {}
+    if experiment.get("git_sha") != training_git_sha:
+        raise RuntimeError(
+            "checkpoint training provenance Git SHA disagrees with experiment metadata"
+        )
+    resolved = provenance.get("resolved_training_config")
+    required_config = {
+        "method_id",
+        "method_spec",
+        "assignment_strategy",
+        "movement_policy",
+        "task_observation_mode",
+        "routing_policy",
+        "total_episodes",
+        "episode_seconds",
+        "routing_slot_seconds",
+        "random_seed",
+        "movement_agent_configuration",
+        "routing_agent_configuration",
+        "exploration_schedule_configuration",
+        "checkpoint_schema_version",
+    }
+    if not isinstance(resolved, dict):
+        raise RuntimeError(
+            "checkpoint resolved training configuration is missing"
+        )
+    missing_config = sorted(required_config.difference(resolved))
+    if missing_config:
+        raise RuntimeError(
+            "checkpoint resolved training configuration is incomplete: "
+            f"{missing_config}"
+        )
+    expected_resolved = _resolved_training_config_for_provenance(metadata)
+    if resolved != expected_resolved:
+        raise RuntimeError(
+            "checkpoint resolved training configuration disagrees with metadata"
+        )
+    if resolved["routing_policy"] != metadata.get("routing_agent_kind"):
+        raise RuntimeError(
+            "checkpoint method routing policy disagrees with routing agent kind"
+        )
+    lifecycle = _validate_routing_lifecycle_provenance(
+        metadata, provenance.get("routing_lifecycle")
+    )
+    return {
+        **deepcopy(provenance),
+        "resolved_training_config": deepcopy(resolved),
+        "routing_lifecycle": lifecycle,
+    }
+
+
+def _build_training_provenance(metadata, routing_lifecycle_state):
+    routing_kind = metadata.get("routing_agent_kind", "safe_ddqn")
+    provenance = {
+        "training_episode_count": int(metadata["episode"]) + 1,
+        "training_git_sha": (metadata.get("experiment") or {}).get("git_sha"),
+        "resolved_training_config": _resolved_training_config_for_provenance(
+            metadata
+        ),
+        "routing_lifecycle": (
+            None
+            if routing_kind == "random"
+            else deepcopy(routing_lifecycle_state)
+        ),
+        "safe_ddqn_constraint_state": (
+            deepcopy(metadata.get("routing_agent_configuration"))
+            if routing_kind == "safe_ddqn"
+            else None
+        ),
+        "provenance_complete": True,
+    }
+    return _validate_complete_training_provenance(metadata, provenance)
+
+
+def checkpoint_training_provenance(metadata, *, allow_incomplete=False):
+    """Return immutable training provenance without consulting evaluator state."""
+
+    schema = int(metadata.get("checkpoint_schema_version", -1))
+    if schema >= CHECKPOINT_SCHEMA_VERSION:
+        return _validate_complete_training_provenance(
+            metadata, metadata.get("training_provenance")
+        )
+    routing_kind = metadata.get("routing_agent_kind", "safe_ddqn")
+    if routing_kind != "random" and not allow_incomplete:
+        raise RuntimeError(
+            "schema-6 learned-routing model checkpoint lacks unambiguous "
+            "training lifecycle provenance"
+        )
+    experiment = metadata.get("experiment") or {}
+    inferred = {
+        "training_episode_count": int(metadata["episode"]) + 1,
+        "training_git_sha": experiment.get("git_sha"),
+        "resolved_training_config": _resolved_training_config_for_provenance(
+            metadata
+        ),
+        "routing_lifecycle": None,
+        "safe_ddqn_constraint_state": (
+            deepcopy(metadata.get("routing_agent_configuration"))
+            if routing_kind == "safe_ddqn"
+            else None
+        ),
+        "provenance_complete": routing_kind == "random",
+    }
+    return inferred
 
 
 def _routing_agent_configuration(agent, resolved_configuration=None):
@@ -613,6 +875,7 @@ def save_model_checkpoint(
     routing_state_dim,
     calibration,
     experiment_metadata=None,
+    routing_lifecycle_state=None,
 ):
     checkpoint_dir = Path(checkpoint_dir)
     metadata = _base_metadata(
@@ -631,6 +894,9 @@ def save_model_checkpoint(
         _validate_effective_formal_movement_config(
             experiment["formal_config"], _agent_kind(td3), metadata
         )
+    metadata["training_provenance"] = _build_training_provenance(
+        metadata, routing_lifecycle_state
+    )
     def write(temporary):
         torch.save(_network_states(td3, ddqn), temporary / "models.pt")
         (temporary / "metadata.json").write_text(
@@ -743,6 +1009,7 @@ def _validate_checkpoint_schema(metadata):
     schema = metadata.get("checkpoint_schema_version")
     if schema in {
         CHECKPOINT_SCHEMA_VERSION,
+        ROUTING_LIFECYCLE_CHECKPOINT_SCHEMA_VERSION,
         PRE_ROUTING_LIFECYCLE_CHECKPOINT_SCHEMA_VERSION,
         PRE_ADAPTIVE_SAFE_DDQN_CHECKPOINT_SCHEMA_VERSION,
         PRE_MOVEMENT_MASK_CHECKPOINT_SCHEMA_VERSION,
@@ -848,6 +1115,7 @@ def validate_model_checkpoint_metadata(
     expected_completed_episodes=None,
     expected_formal_config=None,
     movement_agent_kind=None,
+    allow_incomplete_provenance=False,
 ):
     """Validate evaluation provenance before any model payload is loaded."""
 
@@ -930,6 +1198,9 @@ def validate_model_checkpoint_metadata(
             experiment["formal_config"], metadata.get("movement_agent_kind", "td3"), metadata
         )
     _validate_safe_ddqn_constraint_metadata(metadata)
+    checkpoint_training_provenance(
+        metadata, allow_incomplete=allow_incomplete_provenance
+    )
     return metadata
 
 
@@ -947,6 +1218,7 @@ def inspect_model_checkpoint(
     expected_formal_config=None,
     require_episode_directory=False,
     movement_agent_kind=None,
+    allow_incomplete_provenance=False,
 ):
     """Validate model metadata and required files without loading weights."""
 
@@ -968,6 +1240,7 @@ def inspect_model_checkpoint(
         expected_completed_episodes=expected_completed_episodes,
         expected_formal_config=expected_formal_config,
         movement_agent_kind=movement_agent_kind,
+        allow_incomplete_provenance=allow_incomplete_provenance,
     )
     if not models_path.is_file():
         raise RuntimeError(f"checkpoint model payload is missing: {models_path}")
@@ -995,6 +1268,7 @@ def load_model_checkpoint(
     expected_experiment_metadata=None,
     expected_completed_episodes=None,
     expected_formal_config=None,
+    allow_incomplete_provenance=False,
 ):
     checkpoint_dir = Path(checkpoint_dir).resolve()
     inspected = inspect_model_checkpoint(
@@ -1009,6 +1283,7 @@ def load_model_checkpoint(
         expected_completed_episodes=expected_completed_episodes,
         expected_formal_config=expected_formal_config,
         movement_agent_kind=_agent_kind(td3),
+        allow_incomplete_provenance=allow_incomplete_provenance,
     )
     metadata = inspected["metadata"]
     payload = torch.load(
@@ -1086,7 +1361,7 @@ def _validate_joint_replay_projection_masks(checkpoint_dir, metadata):
 
     schema = int(metadata["checkpoint_schema_version"])
     observation_mode = _checkpoint_task_observation_mode(metadata)
-    if schema < CHECKPOINT_SCHEMA_VERSION:
+    if schema < ROUTING_LIFECYCLE_CHECKPOINT_SCHEMA_VERSION:
         if observation_mode == "masked":
             raise RuntimeError(
                 "legacy masked-observation full-resume checkpoint lacks true "
@@ -1397,6 +1672,13 @@ def save_full_resume_checkpoint(
         _validate_effective_formal_movement_config(
             experiment["formal_config"], _agent_kind(td3), metadata
         )
+    if all(
+        experiment.get(field) is not None
+        for field in ("method_id", "git_sha", "formal_config")
+    ):
+        metadata["training_provenance"] = _build_training_provenance(
+            metadata, training_state.get("routing_lifecycle_state")
+        )
     def write(temporary):
         replay_metadata = {
             "joint": _save_replay(
@@ -1492,7 +1774,10 @@ def _validate_full_resume_logging_state(
                 raise RuntimeError(
                     f"safe-DDQN checkpoint multiplier log is non-finite: {field}"
                 )
-    if int(checkpoint_schema_version) >= CHECKPOINT_SCHEMA_VERSION:
+    if (
+        int(checkpoint_schema_version)
+        >= ROUTING_LIFECYCLE_CHECKPOINT_SCHEMA_VERSION
+    ):
         fov_ema_state = training_state.get("fov_ema_state")
         validated_fov_state = validate_fov_ema_state(
             fov_ema_state, num_uav=NUM_UAV
@@ -1504,11 +1789,15 @@ def _validate_full_resume_logging_state(
                 "checkpoint FOV EMA lifecycle is uninitialized after completed episodes"
             )
     if (
-        int(checkpoint_schema_version) >= CHECKPOINT_SCHEMA_VERSION
+        int(checkpoint_schema_version)
+        >= ROUTING_LIFECYCLE_CHECKPOINT_SCHEMA_VERSION
         and not isinstance(training_state.get("sr_route_state"), dict)
     ):
         raise RuntimeError("checkpoint lacks SR route lifecycle state")
-    if int(checkpoint_schema_version) >= CHECKPOINT_SCHEMA_VERSION:
+    if (
+        int(checkpoint_schema_version)
+        >= ROUTING_LIFECYCLE_CHECKPOINT_SCHEMA_VERSION
+    ):
         exploration_fields = (
             "exploration_schedule_version",
             "movement_exploration_decay_episodes",
@@ -1587,7 +1876,7 @@ def _validate_full_metadata(
             "model-only checkpoint can only be used for evaluation, not exact resume"
         )
     schema = _validate_checkpoint_schema(metadata)
-    if schema < CHECKPOINT_SCHEMA_VERSION:
+    if schema < ROUTING_LIFECYCLE_CHECKPOINT_SCHEMA_VERSION:
         raise RuntimeError(
             "legacy full-resume checkpoint lacks unambiguous routing cadence and "
             "exploration schedule state"
@@ -1813,6 +2102,20 @@ def inspect_full_resume_checkpoint(
             raise RuntimeError(
                 "checkpoint routing replay warm-up and epsilon marker are inconsistent"
             )
+    if (
+        int(metadata["checkpoint_schema_version"])
+        >= CHECKPOINT_SCHEMA_VERSION
+        and "training_provenance" in metadata
+    ):
+        provenance = _validate_complete_training_provenance(
+            metadata, metadata["training_provenance"]
+        )
+        if provenance["routing_lifecycle"] != training_state.get(
+            "routing_lifecycle_state"
+        ):
+            raise RuntimeError(
+                "checkpoint metadata provenance disagrees with full-resume lifecycle"
+            )
     if _checkpoint_uses_dinkelbach(metadata):
         dinkelbach_state = DinkelbachBlockState.from_training_state(
             training_state,
@@ -1876,7 +2179,8 @@ def load_full_resume_checkpoint(
         joint_replay,
         (
             JOINT_REPLAY_FIELDS
-            if metadata["checkpoint_schema_version"] >= CHECKPOINT_SCHEMA_VERSION
+            if metadata["checkpoint_schema_version"]
+            >= ROUTING_LIFECYCLE_CHECKPOINT_SCHEMA_VERSION
             else (
                 PRE_MOVEMENT_MASK_JOINT_REPLAY_FIELDS
                 if metadata["checkpoint_schema_version"]
@@ -1886,7 +2190,10 @@ def load_full_resume_checkpoint(
         ),
         replay_metadata["joint"],
     )
-    if metadata["checkpoint_schema_version"] < CHECKPOINT_SCHEMA_VERSION:
+    if (
+        metadata["checkpoint_schema_version"]
+        < ROUTING_LIFECYCLE_CHECKPOINT_SCHEMA_VERSION
+    ):
         _reconstruct_legacy_full_observation_masks(joint_replay, metadata)
     routing_kind = metadata.get("routing_agent_kind", "safe_ddqn")
     if routing_kind == "random":

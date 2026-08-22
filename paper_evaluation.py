@@ -25,7 +25,10 @@ from paper_metrics import (
     validate_canonical_aggregate_rows,
 )
 from scenario_manifest import ScenarioManifest, generate_manifest
-from training_checkpoint import CHECKPOINT_PROVENANCE_FIELDS
+from training_checkpoint import (
+    CHECKPOINT_PROVENANCE_FIELDS,
+    EVALUATION_PROVENANCE_FIELDS,
+)
 
 
 TRAJECTORY_SNAPSHOT_SECONDS = (5.0, 10.0, 15.0, 25.0)
@@ -456,7 +459,10 @@ def run_paper_evaluation(
                 ),
                 **{
                     field: result["run_metadata"].get(field)
-                    for field in CHECKPOINT_PROVENANCE_FIELDS
+                    for field in (
+                        *CHECKPOINT_PROVENANCE_FIELDS,
+                        *EVALUATION_PROVENANCE_FIELDS,
+                    )
                 },
                 "output_directory": str(point_dir.resolve()),
                 "outputs": {key: str(value) for key, value in outputs.items()},
@@ -477,7 +483,10 @@ def run_paper_evaluation(
         "checkpoint_episode": FORMAL_CHECKPOINT_EPISODE if checkpoint_required else None,
         **{
             field: point_results[0].get(field) if point_results else None
-            for field in CHECKPOINT_PROVENANCE_FIELDS
+            for field in (
+                *CHECKPOINT_PROVENANCE_FIELDS,
+                *EVALUATION_PROVENANCE_FIELDS,
+            )
         },
         "formal_training_config": context["expected_training_config"],
         "no_checkpoint_reason": (

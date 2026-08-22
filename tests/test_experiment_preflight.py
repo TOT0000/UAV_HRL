@@ -12,7 +12,8 @@ from HRL_task_aware import formal_training_config
 from com_capacity_calibration import load_com_capacity_reference
 from comparison_experiment import main as comparison_main
 from dinkelbach_blocks import DinkelbachBlockState, dinkelbach_config_metadata
-from experiment_config import MethodSpec
+from experiment_config import MethodSpec, effective_training_config
+from routing_lifecycle import RoutingLearnerLifecycle
 from experiment_paths import (
     evaluation_run_directory,
     prepare_run_directory,
@@ -53,8 +54,9 @@ class ExperimentPreflightTest(unittest.TestCase):
 
     def _model_checkpoint(self, root, training_seed=17, mutate=None):
         _, calibration = load_com_capacity_reference()
-        formal_config = asdict(
-            formal_training_config(2500, random_seed=training_seed)
+        formal_config = effective_training_config(
+            formal_training_config(2500, random_seed=training_seed),
+            self.method,
         )
         dinkelbach_state = DinkelbachBlockState.from_config(formal_config)
         for _ in range(2500):
@@ -66,6 +68,11 @@ class ExperimentPreflightTest(unittest.TestCase):
             "movement_state_dim": 532,
             "joint_action_dim": 48,
             "routing_state_dim": 126,
+            "movement_agent_kind": "td3",
+            "movement_agent_gamma": 1.0,
+            "movement_agent_configuration": formal_config[
+                "movement_agent_configuration"
+            ],
             "centralized_td3_gamma": 1.0,
             "routing_ddqn_gamma": 0.99,
             "routing_agent_kind": "safe_ddqn",
@@ -80,14 +87,40 @@ class ExperimentPreflightTest(unittest.TestCase):
             },
             "com_calibration_fingerprint": calibration_fingerprint(calibration),
             "experiment": {
+                "method_id": self.method.method_id,
+                "method_spec": self.method.to_dict(),
                 "method_spec_fingerprint": self.method.fingerprint,
                 "training_seed": training_seed,
+                "git_sha": "fixture-training-sha",
                 "manifest_hash": "training-manifest",
                 "formal_config": formal_config,
                 **dinkelbach_config_metadata(formal_config),
                 "lambda_ee": dinkelbach_state.current_lambda,
                 "dinkelbach_state": dinkelbach_state.training_state(),
             },
+        }
+        lifecycle = RoutingLearnerLifecycle().state_dict()
+        resolved = dict(formal_config)
+        resolved.update(
+            {
+                "method_key": self.method.method_id,
+                "method_id": self.method.method_id,
+                "method_spec": self.method.to_dict(),
+                "method_spec_fingerprint": self.method.fingerprint,
+                "training_episode_count": 2500,
+                "training_seed": training_seed,
+                "checkpoint_schema_version": CHECKPOINT_SCHEMA_VERSION,
+            }
+        )
+        metadata["training_provenance"] = {
+            "training_episode_count": 2500,
+            "training_git_sha": "fixture-training-sha",
+            "resolved_training_config": resolved,
+            "routing_lifecycle": lifecycle,
+            "safe_ddqn_constraint_state": dict(
+                metadata["routing_agent_configuration"]
+            ),
+            "provenance_complete": True,
         }
         if mutate is not None:
             mutate(metadata)

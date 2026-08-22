@@ -76,6 +76,7 @@ from training_checkpoint import (
     FULL_RESUME_LOGGING_SCHEMA_VERSION,
     checkpoint_artifact_provenance,
     checkpoint_episode_schedule,
+    checkpoint_training_provenance,
     load_full_resume_checkpoint,
     load_model_checkpoint,
     save_full_resume_checkpoint,
@@ -886,7 +887,9 @@ def _full_training_state(
     }
 
 
-def _experiment_identity(method_spec, scenario_manifest, training_seed, config):
+def _experiment_identity(
+    method_spec, scenario_manifest, training_seed, config, *, evaluation=False
+):
     comparison = comparison_method_configuration(method_spec)
     resolved_exploration = exploration_schedule_configuration(config, method_spec)
     return {
@@ -909,7 +912,12 @@ def _experiment_identity(method_spec, scenario_manifest, training_seed, config):
         "training_seed": (
             int(training_seed) if training_seed is not None else None
         ),
-        "training_episode_count": int(config.total_episodes),
+        "training_episode_count": (
+            None if evaluation else int(config.total_episodes)
+        ),
+        "evaluation_episode_count": (
+            int(config.total_episodes) if evaluation else None
+        ),
         "episode_horizon_seconds": int(config.episode_seconds),
         "movement_interval_seconds": MOVEMENT_INTERVAL_SECONDS,
         "routing_slot_seconds": float(config.routing_slot_seconds),
@@ -938,6 +946,107 @@ def _experiment_identity(method_spec, scenario_manifest, training_seed, config):
             dinkelbach_config_metadata(config)
             if method_spec.uses_dinkelbach
             else {"dinkelbach_active": False}
+        ),
+    }
+
+
+def _evaluation_runtime_provenance(
+    method_spec,
+    scenario_manifest,
+    config,
+    resolved_evaluation,
+    routing_lifecycle,
+    ddqn,
+    evaluation_git_sha,
+):
+    return {
+        "evaluation_episode_count": int(config.total_episodes),
+        "evaluation_git_sha": str(evaluation_git_sha),
+        "resolved_evaluation_config": {
+            "method_id": method_spec.method_id,
+            "method_spec": method_spec.to_dict(),
+            "evaluation_episode_count": int(config.total_episodes),
+            "evaluation_seed": (
+                int(config.random_seed)
+                if config.random_seed is not None
+                else None
+            ),
+            "evaluation_manifest_hash": (
+                scenario_manifest.content_hash
+                if scenario_manifest is not None
+                else None
+            ),
+            "evaluation_manifest_split": (
+                scenario_manifest.split
+                if scenario_manifest is not None
+                else None
+            ),
+            "episode_horizon_seconds": float(config.episode_seconds),
+            "movement_interval_seconds": MOVEMENT_INTERVAL_SECONDS,
+            "routing_slot_seconds": float(config.routing_slot_seconds),
+            "evaluation_overrides": copy.deepcopy(resolved_evaluation),
+            "learning_state_frozen": True,
+        },
+        "routing_lifecycle": (
+            routing_lifecycle.state_dict()
+            if routing_lifecycle is not None
+            else None
+        ),
+        "lambda_cost_source": (
+            "checkpoint_frozen"
+            if method_spec.routing == "safe_ddqn"
+            else None
+        ),
+        "safe_ddqn_constraint_state": (
+            ddqn.constraint_state()
+            if method_spec.routing == "safe_ddqn"
+            else None
+        ),
+    }
+
+
+def _evaluation_provenance_aliases(checkpoint_training, evaluation_runtime):
+    if not isinstance(evaluation_runtime, dict):
+        raise ValueError("evaluation runtime provenance is required")
+    lifecycle = (
+        checkpoint_training.get("routing_lifecycle")
+        if checkpoint_training is not None
+        else None
+    )
+    return {
+        "training_episode_count": (
+            int(checkpoint_training["training_episode_count"])
+            if checkpoint_training is not None
+            else None
+        ),
+        "evaluation_episode_count": int(
+            evaluation_runtime["evaluation_episode_count"]
+        ),
+        "checkpoint_training_episode_count": (
+            int(checkpoint_training["training_episode_count"])
+            if checkpoint_training is not None
+            else None
+        ),
+        "checkpoint_training_git_sha": (
+            checkpoint_training["training_git_sha"]
+            if checkpoint_training is not None
+            else None
+        ),
+        "evaluation_git_sha": evaluation_runtime["evaluation_git_sha"],
+        "routing_optimizer_update_count": (
+            int(lifecycle["routing_optimizer_update_count"])
+            if lifecycle is not None
+            else 0
+        ),
+        "routing_target_update_count": (
+            int(lifecycle["routing_target_update_count"])
+            if lifecycle is not None
+            else 0
+        ),
+        "routing_epsilon_decay_start_slot": (
+            lifecycle["routing_epsilon_decay_start_slot"]
+            if lifecycle is not None
+            else None
         ),
     }
 
@@ -1265,7 +1374,11 @@ def train(
     )
 
     experiment_identity = _experiment_identity(
-        method_spec, scenario_manifest, config.random_seed, config
+        method_spec,
+        scenario_manifest,
+        config.random_seed,
+        config,
+        evaluation=evaluation,
     )
     history_identity = None
     training_history_rows = []
@@ -1298,6 +1411,9 @@ def train(
             expected_formal_config=expected_checkpoint_formal_config,
         )
         checkpoint_experiment = loaded_checkpoint_metadata["experiment"]
+        loaded_training_provenance = checkpoint_training_provenance(
+            loaded_checkpoint_metadata
+        )
         artifact_provenance = checkpoint_artifact_provenance(
             checkpoint_dir, metadata=loaded_checkpoint_metadata
         )
@@ -1311,6 +1427,13 @@ def train(
             "checkpoint_completed_episodes": (
                 int(loaded_checkpoint_metadata["episode"]) + 1
             ),
+            "checkpoint_training_provenance": loaded_training_provenance,
+            "checkpoint_training_episode_count": int(
+                loaded_training_provenance["training_episode_count"]
+            ),
+            "checkpoint_training_git_sha": loaded_training_provenance[
+                "training_git_sha"
+            ],
             "checkpoint_schema_version": loaded_checkpoint_metadata.get(
                 "checkpoint_schema_version"
             ),
@@ -1365,6 +1488,9 @@ def train(
             "checkpoint_metadata_fingerprint": None,
             "checkpoint_models_sha256": None,
             "checkpoint_artifact_fingerprint": None,
+            "checkpoint_training_provenance": None,
+            "checkpoint_training_episode_count": None,
+            "checkpoint_training_git_sha": None,
             "no_checkpoint_reason": (
                 "method learns neither movement nor routing; no neural state exists"
             ),
@@ -2242,6 +2368,11 @@ def train(
                     ),
                     "formal_config": formal_config,
                 },
+                routing_lifecycle_state=(
+                    routing_lifecycle.state_dict()
+                    if routing_lifecycle is not None
+                    else None
+                ),
             )
         if (
             not evaluation
@@ -2415,6 +2546,28 @@ def train(
             f"deadline_counters={deadline_counter_consistent}"
         )
 
+    checkpoint_training = checkpoint_provenance.get(
+        "checkpoint_training_provenance"
+    )
+    evaluation_runtime = (
+        _evaluation_runtime_provenance(
+            method_spec,
+            scenario_manifest,
+            config,
+            resolved_evaluation,
+            routing_lifecycle,
+            ddqn,
+            experiment_identity["git_sha"],
+        )
+        if evaluation
+        else None
+    )
+    evaluation_aliases = (
+        _evaluation_provenance_aliases(checkpoint_training, evaluation_runtime)
+        if evaluation
+        else None
+    )
+
     return {
         "episodes": len(reward_log),
         "episodes_run": len(reward_log) - initial_log_length,
@@ -2542,12 +2695,37 @@ def train(
                 "checkpoint_artifact_fingerprint": checkpoint_provenance.get(
                     "checkpoint_artifact_fingerprint"
                 ),
+                "checkpoint_training_provenance": copy.deepcopy(
+                    checkpoint_training
+                ),
+                "evaluation_runtime_provenance": copy.deepcopy(
+                    evaluation_runtime
+                ),
             }
             for artifact in trajectory_artifacts
         ],
         "run_metadata": {
             **experiment_identity,
             **checkpoint_provenance,
+            "checkpoint_training_provenance": copy.deepcopy(
+                checkpoint_training
+            ),
+            "evaluation_runtime_provenance": copy.deepcopy(
+                evaluation_runtime
+            ),
+            **(
+                evaluation_aliases
+                if evaluation
+                else {
+                    "training_episode_count": int(
+                        experiment_identity["training_episode_count"]
+                    ),
+                    "evaluation_episode_count": None,
+                    "checkpoint_training_episode_count": None,
+                    "checkpoint_training_git_sha": None,
+                    "evaluation_git_sha": None,
+                }
+            ),
             "formal_config": formal_config,
             "dinkelbach_config": (
                 dinkelbach_config_metadata(config)
@@ -2567,13 +2745,28 @@ def train(
             "routing_mask_scope": "every_slot",
             **resolved_routing,
             **resolved_exploration,
-            "routing_optimizer_update_count": int(ddqn.num_training),
-            "routing_target_update_count": int(
-                getattr(ddqn, "target_update_count", 0)
+            "routing_optimizer_update_count": (
+                evaluation_aliases["routing_optimizer_update_count"]
+                if evaluation
+                else int(ddqn.num_training)
+            ),
+            "routing_target_update_count": (
+                evaluation_aliases["routing_target_update_count"]
+                if evaluation
+                else int(getattr(ddqn, "target_update_count", 0))
             ),
             "routing_epsilon_decay_start_slot": (
-                routing_lifecycle.epsilon_decay_start_slot
-                if routing_lifecycle is not None
+                evaluation_aliases["routing_epsilon_decay_start_slot"]
+                if evaluation
+                else (
+                    routing_lifecycle.epsilon_decay_start_slot
+                    if routing_lifecycle is not None
+                    else None
+                )
+            ),
+            "lambda_cost_source": (
+                "checkpoint_frozen"
+                if evaluation and method_spec.routing == "safe_ddqn"
                 else None
             ),
             "fov_ema_state": packet_engine.fov_ema_state(),

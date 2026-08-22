@@ -1,4 +1,3 @@
-from dataclasses import asdict
 from functools import partial
 import json
 import tempfile
@@ -16,6 +15,7 @@ from experiment_config import (
     MethodSpec,
     ROUTING_EPSILON_DECAY_EPISODES,
     SR_ROUTE_LIFECYCLE_VERSION,
+    effective_training_config,
 )
 from routing_lifecycle import RoutingLearnerLifecycle
 from resume_recovery import (
@@ -39,13 +39,16 @@ class ResumeRecoveryTest(unittest.TestCase):
     def setUp(self):
         self.calibration = {"c_ref_com": 12.5, "seed": 7}
         self.method = MethodSpec()
-        self.formal_config = asdict(
-            formal_training_config(2500, random_seed=101)
+        self.formal_config = effective_training_config(
+            formal_training_config(2500, random_seed=101), self.method
         )
         self.experiment = {
+            "method_id": self.method.method_id,
+            "method_spec": self.method.to_dict(),
             "method_spec_fingerprint": self.method.fingerprint,
             "manifest_hash": "a" * 64,
             "training_seed": 101,
+            "git_sha": "fixture-training-sha",
             "formal_config": self.formal_config,
             **dinkelbach_config_metadata(self.formal_config),
         }
@@ -110,13 +113,18 @@ class ResumeRecoveryTest(unittest.TestCase):
         }
 
     def _metadata(self, checkpoint_type, completed_episode):
-        return {
+        metadata = {
             "checkpoint_schema_version": CHECKPOINT_SCHEMA_VERSION,
             "checkpoint_type": checkpoint_type,
             "episode": completed_episode - 1,
             "movement_state_dim": 532,
             "joint_action_dim": 48,
             "routing_state_dim": 126,
+            "movement_agent_kind": "td3",
+            "movement_agent_gamma": 1.0,
+            "movement_agent_configuration": self.formal_config[
+                "movement_agent_configuration"
+            ],
             "centralized_td3_gamma": 1.0,
             "routing_ddqn_gamma": 0.99,
             "routing_agent_kind": "safe_ddqn",
@@ -140,6 +148,33 @@ class ResumeRecoveryTest(unittest.TestCase):
                 "dinkelbach_state": self._dinkelbach_state(completed_episode),
             },
         }
+        if checkpoint_type == MODEL_CHECKPOINT_TYPE:
+            lifecycle = RoutingLearnerLifecycle(
+                global_slot_count=completed_episode * 240
+            ).state_dict()
+            resolved = dict(self.formal_config)
+            resolved.update(
+                {
+                    "method_key": self.method.method_id,
+                    "method_id": self.method.method_id,
+                    "method_spec": self.method.to_dict(),
+                    "method_spec_fingerprint": self.method.fingerprint,
+                    "training_episode_count": completed_episode,
+                    "training_seed": 101,
+                    "checkpoint_schema_version": CHECKPOINT_SCHEMA_VERSION,
+                }
+            )
+            metadata["training_provenance"] = {
+                "training_episode_count": completed_episode,
+                "training_git_sha": "fixture-training-sha",
+                "resolved_training_config": resolved,
+                "routing_lifecycle": lifecycle,
+                "safe_ddqn_constraint_state": dict(
+                    metadata["routing_agent_configuration"]
+                ),
+                "provenance_complete": True,
+            }
+        return metadata
 
     def _full(self, run_dir, completed_episode, *, complete=True):
         path = (

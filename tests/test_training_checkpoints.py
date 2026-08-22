@@ -15,9 +15,11 @@ from DDQN import DDQN
 from dinkelbach_blocks import DinkelbachBlockState, dinkelbach_config_metadata
 from experiment_config import (
     EXPLORATION_SCHEDULE_VERSION,
+    MethodSpec,
     MOVEMENT_EXPLORATION_DECAY_EPISODES,
     ROUTING_EPSILON_DECAY_EPISODES,
     SR_ROUTE_LIFECYCLE_VERSION,
+    effective_training_config,
 )
 from HRL_task_aware import (
     _seed_training_rng,
@@ -31,6 +33,8 @@ from routing_lifecycle import RoutingLearnerLifecycle
 from training_checkpoint import (
     CHECKPOINT_SCHEMA_VERSION,
     FULL_RESUME_LOGGING_SCHEMA_VERSION,
+    PRE_ROUTING_LIFECYCLE_CHECKPOINT_SCHEMA_VERSION,
+    ROUTING_LIFECYCLE_CHECKPOINT_SCHEMA_VERSION,
     load_full_resume_checkpoint,
     load_model_checkpoint,
     save_full_resume_checkpoint,
@@ -42,6 +46,24 @@ from fov_ema_fixtures import initialized_fov_ema_state
 
 ROUTING_STATE_DIM = 126
 ROUTING_ACTION_DIM = 17
+
+
+def _model_provenance_fixture(episode_count):
+    method = MethodSpec()
+    config = formal_training_config(int(episode_count), random_seed=1)
+    formal_config = effective_training_config(config, method)
+    return {
+        "method_id": method.method_id,
+        "method_spec": method.to_dict(),
+        "method_spec_fingerprint": method.fingerprint,
+        "training_seed": 1,
+        "git_sha": "fixture-training-sha",
+        "formal_config": formal_config,
+    }
+
+
+def _empty_routing_lifecycle():
+    return RoutingLearnerLifecycle().state_dict()
 
 
 def _lifecycle_training_state(
@@ -307,6 +329,14 @@ class FullResumeCheckpointTest(unittest.TestCase):
                     "dinkelbach_state": dinkelbach_state.training_state(),
                 },
             )
+            metadata_path = checkpoint_dir / "metadata.json"
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            metadata["checkpoint_schema_version"] = (
+                ROUTING_LIFECYCLE_CHECKPOINT_SCHEMA_VERSION
+            )
+            metadata_path.write_text(
+                json.dumps(metadata, indent=2) + "\n", encoding="utf-8"
+            )
 
             with np.load(checkpoint_dir / "joint_replay.npz") as saved_joint:
                 self.assertEqual(saved_joint["state"].shape[0], joint.size)
@@ -419,6 +449,8 @@ class FullResumeCheckpointTest(unittest.TestCase):
                 joint_action_dim=JOINT_ACTION_DIM,
                 routing_state_dim=ROUTING_STATE_DIM,
                 calibration=calibration,
+                experiment_metadata=_model_provenance_fixture(2),
+                routing_lifecycle_state=_empty_routing_lifecycle(),
             )
             metadata = json.loads(
                 (checkpoint_dir / "metadata.json").read_text(encoding="utf-8")
@@ -473,6 +505,8 @@ class FullResumeCheckpointTest(unittest.TestCase):
                 joint_action_dim=JOINT_ACTION_DIM,
                 routing_state_dim=ROUTING_STATE_DIM,
                 calibration={"fixture": "legacy-safe"},
+                experiment_metadata=_model_provenance_fixture(1),
+                routing_lifecycle_state=_empty_routing_lifecycle(),
             )
             metadata_path = checkpoint_dir / "metadata.json"
             metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
@@ -705,7 +739,9 @@ class FullResumeCheckpointTest(unittest.TestCase):
 
             metadata_path = checkpoint_dir / "metadata.json"
             metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-            metadata["checkpoint_schema_version"] = CHECKPOINT_SCHEMA_VERSION - 1
+            metadata["checkpoint_schema_version"] = (
+                PRE_ROUTING_LIFECYCLE_CHECKPOINT_SCHEMA_VERSION
+            )
             metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
             with self.assertRaisesRegex(
                 RuntimeError, "lacks unambiguous routing cadence"
@@ -777,7 +813,7 @@ class TrainingCliTest(unittest.TestCase):
         )
 
     def test_checkpoint_schema_is_explicit(self):
-        self.assertEqual(CHECKPOINT_SCHEMA_VERSION, 6)
+        self.assertEqual(CHECKPOINT_SCHEMA_VERSION, 7)
 
 
 if __name__ == "__main__":

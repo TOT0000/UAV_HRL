@@ -7,7 +7,10 @@ import json
 import math
 
 from experiment_config import NUM_UAV
-from training_checkpoint import CHECKPOINT_PROVENANCE_FIELDS
+from training_checkpoint import (
+    CHECKPOINT_PROVENANCE_FIELDS,
+    EVALUATION_PROVENANCE_FIELDS,
+)
 
 
 STANDALONE_TRAJECTORY_SCHEMA_VERSION = "uav-hrl-standalone-trajectory-v1"
@@ -96,7 +99,10 @@ def build_standalone_trajectory_source(
         "checkpoint_path": checkpoint_provenance.get("checkpoint_path"),
         **{
             field: checkpoint_provenance.get(field)
-            for field in CHECKPOINT_PROVENANCE_FIELDS
+            for field in (
+                *CHECKPOINT_PROVENANCE_FIELDS,
+                *EVALUATION_PROVENANCE_FIELDS,
+            )
         },
     }
     if any(value is None for value in checkpoint.values()):
@@ -179,6 +185,24 @@ def validate_standalone_trajectory_source(source):
         value = source.get(field)
         if not isinstance(value, str) or len(value) != 64:
             raise ValueError(f"standalone trajectory source has invalid {field}")
+    training = source.get("checkpoint_training_provenance")
+    runtime = source.get("evaluation_runtime_provenance")
+    if not isinstance(training, dict) or not isinstance(runtime, dict):
+        raise ValueError(
+            "standalone trajectory source lacks separated evaluation provenance"
+        )
+    if (
+        int(source.get("checkpoint_training_episode_count", -1))
+        != int(training.get("training_episode_count", -2))
+        or source.get("checkpoint_training_git_sha")
+        != training.get("training_git_sha")
+        or int(source.get("evaluation_episode_count", -1))
+        != int(runtime.get("evaluation_episode_count", -2))
+        or source.get("evaluation_git_sha") != runtime.get("evaluation_git_sha")
+    ):
+        raise ValueError(
+            "standalone trajectory source provenance aliases are inconsistent"
+        )
     return source
 
 
@@ -194,6 +218,18 @@ def standalone_trajectory_csv_rows(source):
         "scenario_manifest_hash": source["scenario_manifest_hash"],
         "checkpoint_path": source["checkpoint_path"],
         **{field: source[field] for field in CHECKPOINT_PROVENANCE_FIELDS},
+        "checkpoint_training_episode_count": source[
+            "checkpoint_training_episode_count"
+        ],
+        "evaluation_episode_count": source["evaluation_episode_count"],
+        "checkpoint_training_git_sha": source["checkpoint_training_git_sha"],
+        "evaluation_git_sha": source["evaluation_git_sha"],
+        "checkpoint_training_provenance_json": json.dumps(
+            source["checkpoint_training_provenance"], sort_keys=True
+        ),
+        "evaluation_runtime_provenance_json": json.dumps(
+            source["evaluation_runtime_provenance"], sort_keys=True
+        ),
         "git_sha": source["git_sha"],
     }
     rows = []

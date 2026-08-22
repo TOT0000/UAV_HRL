@@ -1,5 +1,4 @@
 from copy import deepcopy
-from dataclasses import asdict
 import json
 import tempfile
 import unittest
@@ -14,7 +13,8 @@ from HRL_task_aware import formal_training_config
 from centralized_movement import JOINT_ACTION_DIM, MOVEMENT_STATE_DIM
 from com_capacity_calibration import load_com_capacity_reference
 from comparison_experiment import main as comparison_main
-from experiment_config import MethodSpec
+from experiment_config import MethodSpec, effective_training_config
+from routing_lifecycle import RoutingLearnerLifecycle
 from scenario_manifest import generate_manifest
 from td3 import TD3
 from training_checkpoint import (
@@ -36,8 +36,9 @@ class FormalCheckpointMetadataTest(unittest.TestCase):
         self.method = MethodSpec()
         self.training_seed = 17
         self.calibration = {"seed": 8, "c_ref_com": 12.5}
-        self.formal_config = asdict(
-            formal_training_config(2500, random_seed=self.training_seed)
+        self.formal_config = effective_training_config(
+            formal_training_config(2500, random_seed=self.training_seed),
+            self.method,
         )
         dinkelbach_state = DinkelbachBlockState.from_config(self.formal_config)
         for _ in range(2500):
@@ -49,6 +50,11 @@ class FormalCheckpointMetadataTest(unittest.TestCase):
             "movement_state_dim": MOVEMENT_STATE_DIM,
             "joint_action_dim": JOINT_ACTION_DIM,
             "routing_state_dim": ROUTING_STATE_DIM,
+            "movement_agent_kind": "td3",
+            "movement_agent_gamma": 1.0,
+            "movement_agent_configuration": deepcopy(
+                self.formal_config["movement_agent_configuration"]
+            ),
             "centralized_td3_gamma": 1.0,
             "routing_ddqn_gamma": 0.99,
             "routing_agent_kind": "safe_ddqn",
@@ -65,14 +71,46 @@ class FormalCheckpointMetadataTest(unittest.TestCase):
                 self.calibration
             ),
             "experiment": {
+                "method_id": self.method.method_id,
+                "method_spec": self.method.to_dict(),
                 "method_spec_fingerprint": self.method.fingerprint,
                 "training_seed": self.training_seed,
+                "git_sha": "synthetic-training-sha",
                 "manifest_hash": "training-manifest",
                 "formal_config": self.formal_config,
                 **dinkelbach_config_metadata(self.formal_config),
                 "lambda_ee": dinkelbach_state.current_lambda,
                 "dinkelbach_state": dinkelbach_state.training_state(),
             },
+        }
+        lifecycle = RoutingLearnerLifecycle(
+            global_slot_count=240000,
+            optimizer_update_count=17,
+            target_update_count=17,
+            epsilon_decay_start_slot=63,
+            last_optimizer_update_slot=240000,
+        ).state_dict()
+        resolved = deepcopy(self.formal_config)
+        resolved.update(
+            {
+                "method_key": self.method.method_id,
+                "method_id": self.method.method_id,
+                "method_spec": self.method.to_dict(),
+                "method_spec_fingerprint": self.method.fingerprint,
+                "training_episode_count": 2500,
+                "training_seed": self.training_seed,
+                "checkpoint_schema_version": CHECKPOINT_SCHEMA_VERSION,
+            }
+        )
+        self.metadata["training_provenance"] = {
+            "training_episode_count": 2500,
+            "training_git_sha": "synthetic-training-sha",
+            "resolved_training_config": resolved,
+            "routing_lifecycle": lifecycle,
+            "safe_ddqn_constraint_state": deepcopy(
+                self.metadata["routing_agent_configuration"]
+            ),
+            "provenance_complete": True,
         }
 
     def _validate(self, metadata=None):
@@ -214,8 +252,8 @@ class FormalCheckpointLoadOrderTest(unittest.TestCase):
         method = MethodSpec()
         _, calibration = load_com_capacity_reference()
         td3, ddqn = self._models()
-        formal_config = asdict(
-            formal_training_config(2500, random_seed=training_seed)
+        formal_config = effective_training_config(
+            formal_training_config(2500, random_seed=training_seed), method
         )
         dinkelbach_state = DinkelbachBlockState.from_config(formal_config)
         dinkelbach_state.record_episode(1.0, 2.0)
@@ -232,14 +270,18 @@ class FormalCheckpointLoadOrderTest(unittest.TestCase):
                 routing_state_dim=ROUTING_STATE_DIM,
                 calibration=calibration,
                 experiment_metadata={
+                    "method_id": method.method_id,
+                    "method_spec": method.to_dict(),
                     "method_spec_fingerprint": method.fingerprint,
                     "training_seed": training_seed,
+                    "git_sha": "fixture-training-sha",
                     "manifest_hash": "training-manifest",
                     "formal_config": formal_config,
                     **dinkelbach_config_metadata(formal_config),
                     "lambda_ee": dinkelbach_state.current_lambda,
                     "dinkelbach_state": dinkelbach_state.training_state(),
                 },
+                routing_lifecycle_state=RoutingLearnerLifecycle().state_dict(),
             )
             manifest_path = root / "validation.json"
             generate_manifest("validation", 902, 1).save(manifest_path)

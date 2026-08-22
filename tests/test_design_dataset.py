@@ -32,6 +32,7 @@ from experiment_config import MethodSpec, effective_training_config
 from experiment_paths import design_run_directory, read_run_status
 from HRL_task_aware import TrainingConfig, formal_training_config, train
 from scenario_manifest import generate_manifest
+from routing_lifecycle import RoutingLearnerLifecycle
 from td3 import TD3
 from training_checkpoint import save_model_checkpoint
 
@@ -91,11 +92,13 @@ class DesignDatasetIntegrationTest(unittest.TestCase):
                 "manifest_hash": "a" * 64,
                 "manifest_split": "train",
                 "training_seed": cls.training_seed,
+                "git_sha": "fixture-training-sha",
                 **dinkelbach_config_metadata(cls.formal_config),
                 "lambda_ee": cls.dinkelbach_state.current_lambda,
                 "dinkelbach_state": cls.dinkelbach_state.training_state(),
                 "formal_config": cls.formal_config,
             },
+            routing_lifecycle_state=RoutingLearnerLifecycle().state_dict(),
         )
 
         evaluation_config = TrainingConfig(
