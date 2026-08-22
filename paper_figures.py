@@ -15,7 +15,10 @@ from experiment_config import (
     NUM_UAV,
     comparison_method_configuration,
 )
-from Packet_scheduler_v1 import TASK_DEADLINE_SECONDS
+from Packet_scheduler_v1 import (
+    EPISODE_INJECTION_CUTOFF_SECONDS,
+    TASK_DEADLINE_SECONDS,
+)
 from paper_figure_registry import (
     FIGURE_REGISTRY,
     METHOD_DISPLAY_NAMES,
@@ -206,6 +209,12 @@ def _expected_resolved_overrides(suite, point):
         "COM": float(TASK_DEADLINE_SECONDS["COM"]),
     }
     flat = {}
+    injection_cutoff = float(
+        point.get("overrides", {}).get(
+            "packet_injection_cutoff_seconds",
+            EPISODE_INJECTION_CUTOFF_SECONDS,
+        )
+    )
     if suite == "task_type_delay_vs_arrival_rate":
         value = float(point["x_value"])
         if point["swept_task"] == "COM":
@@ -226,11 +235,17 @@ def _expected_resolved_overrides(suite, point):
         flat = {
             "fov_deadline_seconds": deadlines["FOV"],
             "com_deadline_seconds": deadlines["COM"],
+            "packet_injection_cutoff_seconds": injection_cutoff,
         }
     expected = {
         "traffic_rates_packets_per_second": rates,
         "task_deadlines_seconds": deadlines,
-        "units": {"traffic_rate": "packets/s", "deadline": "seconds"},
+        "packet_injection_cutoff_seconds": injection_cutoff,
+        "units": {
+            "traffic_rate": "packets/s",
+            "deadline": "seconds",
+            "packet_injection_cutoff": "seconds",
+        },
     }
     return flat, expected
 

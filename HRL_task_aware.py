@@ -22,7 +22,11 @@ from dinkelbach_blocks import (
     dinkelbach_config_metadata,
     validate_dinkelbach_config,
 )
-from Packet_scheduler_v1 import PacketEngine, TASK_DEADLINE_SECONDS
+from Packet_scheduler_v1 import (
+    EPISODE_INJECTION_CUTOFF_SECONDS,
+    PacketEngine,
+    TASK_DEADLINE_SECONDS,
+)
 from Simulator import Simulator
 from centralized_movement import (
     JOINT_ACTION_DIM,
@@ -44,12 +48,14 @@ from exploration_schedules import (
 from evaluation_metrics import safe_energy_efficiency
 from experiment_config import (
     DEFAULT_TRAINING_SEED,
+    FOV_EMA_LIFECYCLE_VERSION,
     FORMAL_CHECKPOINT_EPISODE,
     FORMAL_EXPERIMENT_DEFAULTS,
     MethodSpec,
     NUM_UAV,
     ROI_COUNT_MAX,
     ROI_COUNT_MIN,
+    SR_ROUTE_LIFECYCLE_VERSION,
     effective_training_config,
     movement_agent_configuration,
     comparison_method_configuration,
@@ -262,6 +268,7 @@ def _normalize_evaluation_overrides(overrides):
         "com_rate_packets_per_second",
         "fov_deadline_seconds",
         "com_deadline_seconds",
+        "packet_injection_cutoff_seconds",
     }
     unknown = set(values).difference(allowed)
     if unknown:
@@ -287,10 +294,23 @@ def _normalize_evaluation_overrides(overrides):
     }
     if any(not np.isfinite(value) or value <= 0.0 for value in deadlines.values()):
         raise ValueError("evaluation deadlines must be finite positive seconds")
+    injection_cutoff = float(
+        values.get(
+            "packet_injection_cutoff_seconds",
+            EPISODE_INJECTION_CUTOFF_SECONDS,
+        )
+    )
+    if not np.isfinite(injection_cutoff) or injection_cutoff < 0.0:
+        raise ValueError("packet injection cutoff must be finite and non-negative")
     return {
         "traffic_rates_packets_per_second": rates,
         "task_deadlines_seconds": deadlines,
-        "units": {"traffic_rate": "packets/s", "deadline": "seconds"},
+        "packet_injection_cutoff_seconds": injection_cutoff,
+        "units": {
+            "traffic_rate": "packets/s",
+            "deadline": "seconds",
+            "packet_injection_cutoff": "seconds",
+        },
     }
 
 
@@ -422,6 +442,7 @@ def _run_routing_slot(
     task_observation_mode="full",
     traffic_rate_overrides=None,
 ):
+    del routing_masks
     step_time = float(packet_engine.step_time)
     env.current_time = float(current_time)
     # Source generation precedes cleanup by contract. Prior-slot expirations are
@@ -439,7 +460,7 @@ def _run_routing_slot(
     uavs_with_packets = packet_engine.nonempty_uav_ids()
     effective_masks = {
         uid: packet_engine.get_effective_action_mask(
-            env, uid, routing_masks[uid]
+            env, uid, env.get_routing_action_mask(uid).astype(bool)
         )
         for uid in uavs_with_packets
     }
@@ -510,7 +531,7 @@ def _run_routing_slot(
             uid,
             backlog_bits=backlog_after,
             action_mask=packet_engine.get_effective_action_mask(
-                env, uid, routing_masks[uid]
+                env, uid, env.get_routing_action_mask(uid).astype(bool)
             ),
         )
         for uid in uavs_with_packets
@@ -572,7 +593,8 @@ def _select_routing_actions(ddqn, states, routing_masks, epsilon):
 
 def _mark_search_observations(env):
     if getattr(env, "_search_phase_over", False):
-        return
+        return False
+    before = np.asarray(env.visited_bitmap, dtype=bool).copy()
     for uav_id in range(env.num_UAV):
         has_search = any(
             task.get("task_type") == "Search"
@@ -581,6 +603,7 @@ def _mark_search_observations(env):
         if has_search:
             env.update_visited_grid(uav_id)
             env.mark_search_coverage(uav_id)
+    return not np.array_equal(before, np.asarray(env.visited_bitmap, dtype=bool))
 
 
 def _dinkelbach_update(delivered_mbits, total_energy, previous_lambda):
@@ -731,7 +754,32 @@ def _full_training_state(
     warmup_joint_transitions,
     training_history_rows,
     dinkelbach_active=True,
+    lambda_cost_used_log=None,
+    lambda_cost_after_episode_log=None,
+    fov_ema_state=None,
+    sr_route_state=None,
 ):
+    completed_episode_count = int(episode) + 1
+    if lambda_cost_used_log is None:
+        lambda_cost_used_log = [0.0] * completed_episode_count
+    if lambda_cost_after_episode_log is None:
+        lambda_cost_after_episode_log = [0.0] * completed_episode_count
+    if fov_ema_state is None:
+        fov_ema_state = {
+            "lifecycle_version": FOV_EMA_LIFECYCLE_VERSION,
+            "values": {},
+            "initialized_uav_ids": [],
+            "transition_marker": None,
+            "update_count": 0,
+        }
+    if sr_route_state is None:
+        sr_route_state = {
+            "lifecycle_version": SR_ROUTE_LIFECYCLE_VERSION,
+            "teams": [],
+            "trajectory": {},
+            "checkpoint_scope": "episode_boundary_terminal_snapshot",
+            "mid_episode_checkpoint_supported": False,
+        }
     return {
         "completed_episode_index": int(episode),
         "next_episode_index": int(episode) + 1,
@@ -757,6 +805,12 @@ def _full_training_state(
         "td3_noise_log": list(td3_noise_log),
         "movement_noise_log": list(td3_noise_log),
         "routing_epsilon_log": list(routing_epsilon_log),
+        "lambda_cost_used_log": list(lambda_cost_used_log),
+        "lambda_cost_after_episode_log": list(
+            lambda_cost_after_episode_log
+        ),
+        "fov_ema_state": copy.deepcopy(fov_ema_state),
+        "sr_route_state": copy.deepcopy(sr_route_state),
         "training_history_rows": list(training_history_rows),
     }
 
@@ -784,7 +838,9 @@ def _experiment_identity(method_spec, scenario_manifest, training_seed, config):
             int(training_seed) if training_seed is not None else None
         ),
         "movement_agent": method_spec.agent,
-        "movement_agent_configuration": movement_agent_configuration(method_spec),
+        "movement_agent_configuration": movement_agent_configuration(
+            method_spec, config
+        ),
         "reward_mode": method_spec.reward_mode,
         "task_potential_enabled": bool(method_spec.task_potential_enabled),
         **comparison,
@@ -897,6 +953,11 @@ def _evaluation_state_snapshot(
                 getattr(ddqn, "target_update_count", 0)
             ),
             "routing_agent_kind": str(ddqn.routing_agent_kind),
+            "routing_constraint_state": (
+                copy.deepcopy(ddqn.constraint_state())
+                if ddqn.routing_agent_kind == "safe_ddqn"
+                else None
+            ),
         },
         "dinkelbach_state": copy.deepcopy(dinkelbach_state.training_state()),
     }
@@ -1068,6 +1129,9 @@ def train(
         num_uav=NUM_UAV,
         step_time=config.routing_slot_seconds,
         task_deadlines_seconds=resolved_evaluation["task_deadlines_seconds"],
+        injection_cutoff_seconds=resolved_evaluation[
+            "packet_injection_cutoff_seconds"
+        ],
     )
     movement_agent = create_movement_agent(
         method_spec,
@@ -1206,6 +1270,8 @@ def train(
     routing_slots_executed = 0
     td3_noise_log = []
     routing_epsilon_log = []
+    lambda_cost_used_log = []
+    lambda_cost_after_episode_log = []
     episode_metrics = []
     trajectory_artifacts = []
     packet_outcome_artifacts = []
@@ -1257,6 +1323,46 @@ def train(
         routing_slots_executed = int(training_state["global_routing_slot"])
         td3_noise_log = list(training_state["td3_noise_log"])
         routing_epsilon_log = list(training_state["routing_epsilon_log"])
+        try:
+            packet_engine.load_fov_ema_state(training_state["fov_ema_state"])
+        except KeyError as exc:
+            raise RuntimeError(
+                "resume checkpoint lacks FOV EMA lifecycle state"
+            ) from exc
+        try:
+            saved_sr_route_state = training_state["sr_route_state"]
+        except KeyError as exc:
+            raise RuntimeError(
+                "resume checkpoint lacks SR route lifecycle state"
+            ) from exc
+        if (
+            saved_sr_route_state.get("lifecycle_version")
+            != SR_ROUTE_LIFECYCLE_VERSION
+            or saved_sr_route_state.get("checkpoint_scope")
+            != "episode_boundary_terminal_snapshot"
+            or bool(saved_sr_route_state.get("mid_episode_checkpoint_supported"))
+        ):
+            raise RuntimeError("resume checkpoint SR route state is incompatible")
+        if method_spec.routing == "safe_ddqn":
+            try:
+                lambda_cost_used_log = list(
+                    training_state["lambda_cost_used_log"]
+                )
+                lambda_cost_after_episode_log = list(
+                    training_state["lambda_cost_after_episode_log"]
+                )
+            except KeyError as exc:
+                raise RuntimeError(
+                    "safe-DDQN resume checkpoint lacks adaptive multiplier logs"
+                ) from exc
+            if not (
+                len(lambda_cost_used_log)
+                == len(lambda_cost_after_episode_log)
+                == start_episode
+            ):
+                raise RuntimeError(
+                    "safe-DDQN multiplier history is inconsistent with resume episode"
+                )
         if history_identity is not None:
             if "training_history_rows" not in training_state:
                 raise RuntimeError(
@@ -1324,6 +1430,9 @@ def train(
             scenario_id = str(scenario_entry["scenario_id"])
         executed_scenario_ids.append(scenario_id)
         packet_engine.reset_packet_state()
+        packet_engine.update_fov_ema(
+            env, transition_marker=f"episode={episode},map_reset"
+        )
         scenario_entry = (
             scenario_manifest.episodes[episode]
             if scenario_manifest is not None
@@ -1363,6 +1472,11 @@ def train(
         episode_energy = 0.0
         episode_reward = 0.0
         episode_routing_reward = 0.0
+        episode_lambda_cost = (
+            float(ddqn.lambda_cost)
+            if method_spec.routing == "safe_ddqn"
+            else None
+        )
         violation_stats = {
             "FOV": {
                 "timely_delivered_packets": 0,
@@ -1442,7 +1556,11 @@ def train(
             energy_evaluations += int(interval_energies.size)
             interval_energy = float(interval_energies.sum())
 
-            _mark_search_observations(env)
+            map_changed = _mark_search_observations(env)
+            if map_changed:
+                packet_engine.update_fov_ema(
+                    env, transition_marker=f"episode={episode},interval={interval}"
+                )
             if getattr(env, "need_reassign", False):
                 env.assign_tasks()
                 env.need_reassign = False
@@ -1456,8 +1574,6 @@ def train(
             env.update_source_uavs()
             env.update_u2u_channels()
             env.update_u2g_channels()
-            masks = _routing_masks(env)
-
             interval_delivered_bits = 0.0
             for routing_slot in range(MOVEMENT_CONTROL_INTERVAL):
                 slot_epsilon = (
@@ -1484,7 +1600,7 @@ def train(
                     packet_engine,
                     ddqn,
                     routing_replay,
-                    masks,
+                    None,
                     current_time=absolute_slot * config.routing_slot_seconds,
                     done=final_slot,
                     delay_bound_steps=delay_bound_steps,
@@ -1642,6 +1758,27 @@ def train(
         packet_metrics = packet_engine.finalize_episode(
             float(config.episode_seconds)
         )
+        episode_routing_cost_sum = float(packet_engine.total_violated)
+        episode_routing_slot_steps = int(
+            round(float(config.episode_seconds) / config.routing_slot_seconds)
+        )
+        if episode_routing_slot_steps != (
+            int(config.episode_seconds) * MOVEMENT_CONTROL_INTERVAL
+        ):
+            raise AssertionError("routing slot-step denominator is inconsistent")
+        lambda_cost_after_episode = episode_lambda_cost
+        if method_spec.routing == "safe_ddqn":
+            if not evaluation:
+                lambda_cost_after_episode = ddqn.update_cost_multiplier(
+                    episode_routing_cost_sum,
+                    episode_routing_slot_steps,
+                )
+            else:
+                lambda_cost_after_episode = float(ddqn.lambda_cost)
+            lambda_cost_used_log.append(float(episode_lambda_cost))
+            lambda_cost_after_episode_log.append(
+                float(lambda_cost_after_episode)
+            )
         packet_outcome_artifacts.append(
             {
                 "scenario_id": scenario_id,
@@ -1795,6 +1932,14 @@ def train(
                 "com_deadline_seconds": float(
                     resolved_evaluation["task_deadlines_seconds"]["COM"]
                 ),
+                "packet_injection_cutoff_seconds": float(
+                    resolved_evaluation["packet_injection_cutoff_seconds"]
+                ),
+                "episode_horizon_seconds": float(config.episode_seconds),
+                "routing_cost_sum": episode_routing_cost_sum,
+                "routing_cost_slot_steps": episode_routing_slot_steps,
+                "lambda_cost_used": episode_lambda_cost,
+                "lambda_cost_after_episode": lambda_cost_after_episode,
                 "coverage": coverage,
                 "found_GT_ratio": found_gt_ratio,
                 "routing_wait_count": int(packet_engine.wait_actions),
@@ -1947,6 +2092,12 @@ def train(
                     routing_slots_executed=routing_slots_executed,
                     td3_noise_log=td3_noise_log,
                     routing_epsilon_log=routing_epsilon_log,
+                    lambda_cost_used_log=lambda_cost_used_log,
+                    lambda_cost_after_episode_log=(
+                        lambda_cost_after_episode_log
+                    ),
+                    fov_ema_state=packet_engine.fov_ema_state(),
+                    sr_route_state=env.sr_route_state(),
                     warmup_joint_transitions=config.warmup_joint_transitions,
                     training_history_rows=training_history_rows,
                     dinkelbach_active=method_spec.uses_dinkelbach,
@@ -2061,7 +2212,9 @@ def train(
         "joint_action_dim": JOINT_ACTION_DIM,
         "movement_agent_kind": movement_agent.agent_kind,
         "movement_agent_gamma": movement_agent.gamma,
-        "movement_agent_configuration": movement_agent_configuration(method_spec),
+        "movement_agent_configuration": movement_agent_configuration(
+            method_spec, config
+        ),
         **(
             {"centralized_td3_gamma": movement_agent.gamma}
             if movement_agent.agent_kind == "td3"
@@ -2095,6 +2248,20 @@ def train(
         "routing_target_update_count": getattr(
             ddqn, "target_update_count", 0
         ),
+        "lambda_cost": (
+            float(ddqn.lambda_cost)
+            if method_spec.routing == "safe_ddqn"
+            else None
+        ),
+        "safe_ddqn_constraint_state": (
+            ddqn.constraint_state()
+            if method_spec.routing == "safe_ddqn"
+            else None
+        ),
+        "lambda_cost_used_log": lambda_cost_used_log,
+        "lambda_cost_after_episode_log": lambda_cost_after_episode_log,
+        "fov_ema_state": packet_engine.fov_ema_state(),
+        "sr_route_state": env.sr_route_state(),
         "td3_noise_log": td3_noise_log,
         "movement_noise_log": td3_noise_log,
         "routing_epsilon_log": routing_epsilon_log,
@@ -2152,6 +2319,18 @@ def train(
                 if method_spec.uses_dinkelbach
                 else {"active": False, "update_count": 0}
             ),
+            "safe_ddqn_constraint_state": (
+                ddqn.constraint_state()
+                if method_spec.routing == "safe_ddqn"
+                else None
+            ),
+            "routing_mask_scope": "every_slot",
+            "fov_ema_state": packet_engine.fov_ema_state(),
+            "sr_route_state": env.sr_route_state(),
+            "resolved_packet_configuration": {
+                **copy.deepcopy(resolved_evaluation),
+                "episode_horizon_seconds": float(config.episode_seconds),
+            },
             "evaluation": bool(evaluation),
             "checkpoint_required": checkpoint_required,
             "evaluation_overrides": (

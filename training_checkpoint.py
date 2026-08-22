@@ -11,6 +11,11 @@ import numpy as np
 import torch
 
 from centralized_movement import MOVEMENT_STATE_DIM, movement_mask_from_state
+from experiment_config import (
+    SAFE_DDQN_ETA_C,
+    SAFE_DDQN_INITIAL_LAMBDA_COST,
+    SAFE_DDQN_QOS_COST_BUDGET,
+)
 
 from dinkelbach_blocks import (
     DINKELBACH_CONFIG_FIELDS,
@@ -18,7 +23,8 @@ from dinkelbach_blocks import (
     dinkelbach_config_metadata,
 )
 
-CHECKPOINT_SCHEMA_VERSION = 4
+CHECKPOINT_SCHEMA_VERSION = 5
+PRE_ADAPTIVE_SAFE_DDQN_CHECKPOINT_SCHEMA_VERSION = 4
 PRE_MOVEMENT_MASK_CHECKPOINT_SCHEMA_VERSION = 3
 LEGACY_DINKELBACH_CHECKPOINT_SCHEMA_VERSION = 2
 MODEL_CHECKPOINT_TYPE = "model-only"
@@ -98,6 +104,20 @@ FORMAL_CORE_CONFIG_FIELDS = (
     "task_compatibility_policy",
     "hover_assignment_candidate",
     "assignment_dummy_utility",
+    "fov_assignment_utility_version",
+    "fov_quality_transform",
+    "fov_coverage_source",
+    "safe_ddqn_qos_cost_budget",
+    "safe_ddqn_initial_lambda_cost",
+    "safe_ddqn_eta_c",
+    "safe_ddqn_lambda_update_scope",
+    "safe_ddqn_evaluation_lambda_mode",
+    "routing_mask_scope",
+    "fov_ema_lifecycle_version",
+    "sr_route_lifecycle_version",
+    "resolved_fov_deadline_seconds",
+    "resolved_com_deadline_seconds",
+    "packet_injection_cutoff_seconds",
 )
 
 FULL_RESUME_CONFIG_FIELDS = (
@@ -298,9 +318,47 @@ def _routing_agent_kind(agent):
     return str(getattr(agent, "routing_agent_kind", "safe_ddqn"))
 
 
-def _movement_agent_configuration(agent):
+def _routing_agent_configuration(agent):
+    kind = _routing_agent_kind(agent)
+    common = {
+        "routing_agent_kind": kind,
+        "gamma": float(agent.gamma),
+        "target_update_scope": (
+            "episode_end" if kind in {"safe_ddqn", "dqn"} else None
+        ),
+    }
+    if kind == "safe_ddqn":
+        return {**common, **agent.constraint_state()}
+    return common
+
+
+def _validate_safe_ddqn_constraint_metadata(metadata):
+    if metadata.get("routing_agent_kind", "safe_ddqn") != "safe_ddqn":
+        return
+    routing = metadata.get("routing_agent_configuration") or {}
+    expected = {
+        "initial_lambda_cost": SAFE_DDQN_INITIAL_LAMBDA_COST,
+        "eta_c": SAFE_DDQN_ETA_C,
+        "qos_cost_budget": SAFE_DDQN_QOS_COST_BUDGET,
+        "lambda_update_scope": "episode_end",
+        "cost_denominator": "network_routing_slot_steps",
+        "mid_episode_checkpoint_supported": False,
+    }
+    mismatches = {
+        field: (routing.get(field), value)
+        for field, value in expected.items()
+        if not _metadata_value_matches(routing.get(field), value)
+    }
+    if mismatches or "lambda_cost" not in routing:
+        raise RuntimeError(
+            "checkpoint safe-DDQN constraint metadata is incomplete or "
+            f"incompatible: mismatches={mismatches}"
+        )
+
+
+def _movement_agent_configuration(agent, resolved_configuration=None):
     kind = _agent_kind(agent)
-    return {
+    actual = {
         "movement_agent_kind": kind,
         "movement_agent_gamma": float(agent.gamma),
         "tau": float(agent.tau) if hasattr(agent, "tau") else None,
@@ -317,6 +375,20 @@ def _movement_agent_configuration(agent):
         ),
         "twin_critics": kind == "td3",
     }
+    if resolved_configuration is None:
+        return actual
+    resolved = dict(resolved_configuration)
+    mismatches = {
+        field: (resolved.get(field), value)
+        for field, value in actual.items()
+        if not _metadata_value_matches(resolved.get(field), value)
+    }
+    if mismatches:
+        raise RuntimeError(
+            "resolved movement-agent metadata does not match the live agent: "
+            f"{mismatches}"
+        )
+    return resolved
 
 
 def _validate_effective_formal_movement_config(formal_config, kind, metadata=None):
@@ -380,6 +452,7 @@ def _network_states(td3, ddqn):
             "target_q_network": ddqn.target_q_network.state_dict(),
             "cost_network": ddqn.cost_network.state_dict(),
             "target_cost_network": ddqn.target_cost_network.state_dict(),
+            "constraint_state": ddqn.constraint_state(),
         }
     elif routing_kind == "dqn":
         states["routing_agent"] = {
@@ -426,6 +499,11 @@ def _load_network_states(payload, td3, ddqn):
         ddqn.target_q_network.load_state_dict(ddqn_state["target_q_network"])
         ddqn.cost_network.load_state_dict(ddqn_state["cost_network"])
         ddqn.target_cost_network.load_state_dict(ddqn_state["target_cost_network"])
+        if "constraint_state" not in ddqn_state:
+            raise RuntimeError(
+                "legacy safe-DDQN checkpoint lacks adaptive constraint state"
+            )
+        ddqn.load_constraint_state(ddqn_state["constraint_state"])
     elif routing_kind == "dqn":
         state = payload.get("routing_agent") or {}
         if state.get("kind") != "dqn" or "cost_network" in state:
@@ -452,6 +530,9 @@ def _base_metadata(
     experiment_metadata=None,
 ):
     kind = _agent_kind(td3)
+    experiment = dict(experiment_metadata or {})
+    formal_config = experiment.get("formal_config") or {}
+    resolved_movement = formal_config.get("movement_agent_configuration")
     metadata = {
         "checkpoint_schema_version": CHECKPOINT_SCHEMA_VERSION,
         "checkpoint_type": checkpoint_type,
@@ -461,15 +542,18 @@ def _base_metadata(
         "routing_state_dim": int(routing_state_dim),
         "movement_agent_kind": kind,
         "movement_agent_gamma": float(td3.gamma),
-        "movement_agent_configuration": _movement_agent_configuration(td3),
+        "movement_agent_configuration": _movement_agent_configuration(
+            td3, resolved_movement
+        ),
         "routing_ddqn_gamma": float(ddqn.gamma),
         "routing_agent_kind": _routing_agent_kind(ddqn),
+        "routing_agent_configuration": _routing_agent_configuration(ddqn),
         "com_calibration_fingerprint": calibration_fingerprint(calibration),
     }
     if kind == "td3":
         metadata["centralized_td3_gamma"] = float(td3.gamma)
     if experiment_metadata is not None:
-        metadata["experiment"] = dict(experiment_metadata)
+        metadata["experiment"] = experiment
     return metadata
 
 
@@ -614,9 +698,19 @@ def _validate_checkpoint_schema(metadata):
     schema = metadata.get("checkpoint_schema_version")
     if schema in {
         CHECKPOINT_SCHEMA_VERSION,
+        PRE_ADAPTIVE_SAFE_DDQN_CHECKPOINT_SCHEMA_VERSION,
         PRE_MOVEMENT_MASK_CHECKPOINT_SCHEMA_VERSION,
     }:
-        return int(schema)
+        schema = int(schema)
+        if (
+            schema < CHECKPOINT_SCHEMA_VERSION
+            and metadata.get("routing_agent_kind", "safe_ddqn") == "safe_ddqn"
+        ):
+            raise RuntimeError(
+                "legacy safe-DDQN checkpoint lacks adaptive lambda_cost, eta_c, "
+                "and QoS budget state"
+            )
+        return schema
     try:
         legacy_schema = (
             schema is None
@@ -785,6 +879,7 @@ def validate_model_checkpoint_metadata(
         _validate_effective_formal_movement_config(
             experiment["formal_config"], metadata.get("movement_agent_kind", "td3"), metadata
         )
+    _validate_safe_ddqn_constraint_metadata(metadata)
     return metadata
 
 
@@ -1103,8 +1198,8 @@ def _routing_training_payload(agent):
             },
             "ddqn_state": {
                 **state,
-                "eta": float(agent.eta),
                 "cost_loss_log": list(agent.cost_loss_log),
+                "constraint_state": agent.constraint_state(),
             },
         }
     if kind == "dqn":
@@ -1125,7 +1220,11 @@ def _restore_routing_training_payload(agent, payload):
         state = payload["ddqn_state"]
         if state.get("kind", "safe_ddqn") != "safe_ddqn":
             raise RuntimeError("checkpoint routing agent kind is incompatible")
-        agent.eta = float(state["eta"])
+        if "constraint_state" not in state:
+            raise RuntimeError(
+                "legacy safe-DDQN resume checkpoint lacks constraint state"
+            )
+        agent.load_constraint_state(state["constraint_state"])
         agent.cost_loss_log = list(state["cost_loss_log"])
     elif kind == "dqn":
         state = payload.get("routing_agent_state") or {}
@@ -1172,7 +1271,12 @@ def save_full_resume_checkpoint(
     keep_last=None,
 ):
     checkpoint_dir = Path(checkpoint_dir)
-    _validate_full_resume_logging_state(training_state, int(episode) + 1)
+    _validate_full_resume_logging_state(
+        training_state,
+        int(episode) + 1,
+        _routing_agent_kind(ddqn),
+        CHECKPOINT_SCHEMA_VERSION,
+    )
     metadata = _base_metadata(
         FULL_CHECKPOINT_TYPE,
         episode,
@@ -1231,7 +1335,9 @@ def save_full_resume_checkpoint(
     return saved
 
 
-def _validate_full_resume_logging_state(training_state, completed_episode):
+def _validate_full_resume_logging_state(
+    training_state, completed_episode, routing_agent_kind, checkpoint_schema_version
+):
     if not isinstance(training_state, dict):
         raise RuntimeError("checkpoint training state is invalid")
     schema_version = training_state.get("full_resume_logging_schema_version")
@@ -1266,6 +1372,35 @@ def _validate_full_resume_logging_state(training_state, completed_episode):
             raise RuntimeError(
                 f"checkpoint full-resume logging state is non-finite: {field}"
             )
+    if routing_agent_kind == "safe_ddqn":
+        for field in (
+            "lambda_cost_used_log",
+            "lambda_cost_after_episode_log",
+        ):
+            values = training_state.get(field)
+            if not isinstance(values, (list, tuple)) or len(values) != expected_length:
+                raise RuntimeError(
+                    "safe-DDQN checkpoint multiplier logging state is "
+                    f"incompatible: {field}"
+                )
+            try:
+                finite = all(np.isfinite(float(value)) for value in values)
+            except (TypeError, ValueError):
+                finite = False
+            if not finite:
+                raise RuntimeError(
+                    f"safe-DDQN checkpoint multiplier log is non-finite: {field}"
+                )
+    if (
+        int(checkpoint_schema_version) >= CHECKPOINT_SCHEMA_VERSION
+        and not isinstance(training_state.get("fov_ema_state"), dict)
+    ):
+        raise RuntimeError("checkpoint lacks FOV EMA lifecycle state")
+    if (
+        int(checkpoint_schema_version) >= CHECKPOINT_SCHEMA_VERSION
+        and not isinstance(training_state.get("sr_route_state"), dict)
+    ):
+        raise RuntimeError("checkpoint lacks SR route lifecycle state")
 
 
 def _validate_full_metadata(
@@ -1322,6 +1457,7 @@ def _validate_full_metadata(
         validate_checkpoint_experiment_metadata(
             metadata, expected_experiment_metadata
         )
+    _validate_safe_ddqn_constraint_metadata(metadata)
 
 
 def validate_checkpoint_experiment_metadata(metadata, expected):
@@ -1464,7 +1600,12 @@ def inspect_full_resume_checkpoint(
             _validate_effective_formal_movement_config(
                 experiment["formal_config"], kind, metadata
             )
-    _validate_full_resume_logging_state(training_state, completed_episode)
+    _validate_full_resume_logging_state(
+        training_state,
+        completed_episode,
+        routing_kind,
+        metadata["checkpoint_schema_version"],
+    )
     if _checkpoint_uses_dinkelbach(metadata):
         dinkelbach_state = DinkelbachBlockState.from_training_state(
             training_state,

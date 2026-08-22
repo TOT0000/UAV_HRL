@@ -2,7 +2,6 @@ import numpy as np
 import random
 import math
 from Channel_model import ChannelModel
-from UAV_task import UAVTask
 from Fov_model_phase import FovModel
 from collections import defaultdict
 from Energy_model import EnergyConsumptionModel
@@ -12,6 +11,7 @@ from experiment_config import (
     FOV_COM_PAIR_MAX_DISTANCE_M,
     ROI_COUNT_MAX,
     ROI_COUNT_MIN,
+    SR_ROUTE_LIFECYCLE_VERSION,
     SEARCH_COVERAGE_THRESHOLD,
     SEARCH_UTILITY,
 )
@@ -89,7 +89,6 @@ class Simulator:
                 "gs_pos": (0.0, 0.0, 0.0),
                 "r_soft": 180.0,
                 "r_hard": 200.0,
-                "only_uav_ids": [0,1,4],
             }
             }
         self.assignment_strategy = "k_km"
@@ -348,31 +347,71 @@ class Simulator:
             nearest_sr_idx = available_indices[nearest_idx]
 
             sr = self.SR_teams[nearest_sr_idx]
-            start = (sr.x, sr.y)
-            goal = (gt.x, gt.y)
-            sr.path = list(
-                UAVTask.move_towards_target(
-                    start, goal, v_max=float(getattr(self, "sr_speed_mps", 1.0))
-                )
+            sr.assign_mission(
+                gt.id,
+                (gt.x, gt.y),
+                speed=float(getattr(self, "sr_speed_mps", 1.0)),
             )
-            # print(sr.path)
-            # print(sr.x, sr.y)
-            sr.active= True
-            sr.assigned_gt_id = gt.id
-            sr.current_step = 0          # 從路徑頭開始
-            sr.arrived = False
-            self.SR_paths = sr.path
+            self.SR_paths = list(sr.path)
             gt.assigned = True
             # print(f"[SR Team] 指派 SR {sr.id} 前往 GT {gt.id}")
             # print(self.SR_paths)
             return sr
     def advance_sr_teams(self):
         for sr in self.SR_teams:
-            # 先把「推進前」的位置也記一筆，確保軌跡連續
-            self.sr_trajectory[sr.id].append([sr.x, sr.y, sr.z])
             sr.step_forward()
-            # 推進後再記一筆
-            self.sr_trajectory[sr.id].append([sr.x, sr.y, sr.z])
+            point = [sr.x, sr.y, sr.z]
+            if not self.sr_trajectory[sr.id] or self.sr_trajectory[sr.id][-1] != point:
+                self.sr_trajectory[sr.id].append(point)
+
+    def sr_route_state(self):
+        return {
+            "lifecycle_version": SR_ROUTE_LIFECYCLE_VERSION,
+            "teams": [
+                team.route_state()
+                for team in sorted(self.SR_teams, key=lambda item: item.id)
+            ],
+            "trajectory": {
+                str(team_id): [list(map(float, point)) for point in points]
+                for team_id, points in sorted(
+                    getattr(self, "sr_trajectory", {}).items()
+                )
+            },
+            "checkpoint_scope": "episode_boundary_terminal_snapshot",
+            "mid_episode_checkpoint_supported": False,
+        }
+
+    def load_sr_route_state(self, state):
+        if (state or {}).get("lifecycle_version") != SR_ROUTE_LIFECYCLE_VERSION:
+            raise RuntimeError("checkpoint SR route lifecycle is incompatible")
+        if (
+            state.get("checkpoint_scope")
+            != "episode_boundary_terminal_snapshot"
+            or bool(state.get("mid_episode_checkpoint_supported"))
+        ):
+            raise RuntimeError("checkpoint SR route scope is incompatible")
+        teams = list(state.get("teams", []))
+        if len(teams) != len(self.SR_teams):
+            raise RuntimeError("checkpoint SR route team count is incompatible")
+        by_id = {int(team.id): team for team in self.SR_teams}
+        for team_state in teams:
+            team_id = int(team_state.get("sr_id", -1))
+            if team_id not in by_id:
+                raise RuntimeError("checkpoint SR route team id is incompatible")
+            by_id[team_id].load_route_state(team_state)
+        trajectory = state.get("trajectory") or {}
+        if set(map(int, trajectory)) != set(by_id):
+            raise RuntimeError("checkpoint SR trajectory ids are incompatible")
+        restored_trajectory = {}
+        for team_id, points in trajectory.items():
+            restored_points = []
+            for point in points:
+                values = np.asarray(point, dtype=float)
+                if values.shape != (3,) or not np.isfinite(values).all():
+                    raise RuntimeError("checkpoint SR trajectory point is invalid")
+                restored_points.append(values.tolist())
+            restored_trajectory[int(team_id)] = restored_points
+        self.sr_trajectory = restored_trajectory
     def get_unexplored_ratio(self, uav_id):
         uav = self.uav_dict[uav_id]
         if not hasattr(self, "FovModel"):

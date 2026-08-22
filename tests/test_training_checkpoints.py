@@ -13,6 +13,7 @@ import torch
 
 from DDQN import DDQN
 from dinkelbach_blocks import DinkelbachBlockState, dinkelbach_config_metadata
+from experiment_config import FOV_EMA_LIFECYCLE_VERSION, SR_ROUTE_LIFECYCLE_VERSION
 from HRL_task_aware import (
     _seed_training_rng,
     _uses_warmup_random_action,
@@ -34,6 +35,30 @@ from utils_update_v2 import ReplayBufferDiscrete, ReplayBufferJoint
 
 ROUTING_STATE_DIM = 126
 ROUTING_ACTION_DIM = 17
+
+
+def _lifecycle_training_state(episode_count, lambda_after=0.0):
+    after_log = [0.0] * int(episode_count)
+    if after_log:
+        after_log[-1] = float(lambda_after)
+    return {
+        "lambda_cost_used_log": [0.0] * int(episode_count),
+        "lambda_cost_after_episode_log": after_log,
+        "fov_ema_state": {
+            "lifecycle_version": FOV_EMA_LIFECYCLE_VERSION,
+            "values": {},
+            "initialized_uav_ids": [],
+            "transition_marker": None,
+            "update_count": 0,
+        },
+        "sr_route_state": {
+            "lifecycle_version": SR_ROUTE_LIFECYCLE_VERSION,
+            "teams": [],
+            "trajectory": {},
+            "checkpoint_scope": "episode_boundary_terminal_snapshot",
+            "mid_episode_checkpoint_supported": False,
+        },
+    }
 
 
 def _assert_module_equal(testcase, expected, actual):
@@ -179,6 +204,7 @@ class FullResumeCheckpointTest(unittest.TestCase):
     def test_full_resume_round_trip_restores_exact_training_state_and_rng(self):
         td3, ddqn, joint, routing = self._components()
         self._populate_and_train(td3, ddqn, joint, routing)
+        ddqn.update_cost_multiplier(20.0 * 240, 240)
         calibration = {"seed": 20260817, "c_ref_com": 32.5, "unit": "Mbps"}
         training_state = {
             "completed_episode_index": 6,
@@ -197,6 +223,7 @@ class FullResumeCheckpointTest(unittest.TestCase):
             "ddqn_schedule_slot": 148,
             "td3_noise_log": [0.2],
             "routing_epsilon_log": [1.0, 0.99],
+            **_lifecycle_training_state(7, lambda_after=ddqn.lambda_cost),
         }
         formal_config = asdict(formal_training_config(100, random_seed=123))
         dinkelbach_state = DinkelbachBlockState.from_config(formal_config)
@@ -302,7 +329,7 @@ class FullResumeCheckpointTest(unittest.TestCase):
         self.assertEqual(restored_ddqn.num_training, ddqn.num_training)
         self.assertEqual(restored_td3.gamma, td3.gamma)
         self.assertEqual(restored_td3.policy_delay, td3.policy_delay)
-        self.assertEqual(restored_ddqn.eta, ddqn.eta)
+        self.assertEqual(restored_ddqn.constraint_state(), ddqn.constraint_state())
         self.assertEqual(restored_ddqn.loss_log, ddqn.loss_log)
         self.assertEqual(restored_ddqn.cost_loss_log, ddqn.cost_loss_log)
         self.assertEqual(restored_joint.ptr, joint.ptr)
@@ -359,6 +386,7 @@ class FullResumeCheckpointTest(unittest.TestCase):
                     "target_q_network",
                     "cost_network",
                     "target_cost_network",
+                    "constraint_state",
                 },
             )
             original_actor = {
@@ -384,6 +412,33 @@ class FullResumeCheckpointTest(unittest.TestCase):
                     calibration=calibration,
                 )
 
+    def test_pre_adaptive_safe_ddqn_checkpoint_is_rejected_explicitly(self):
+        td3, ddqn, _joint, _routing = self._components()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            checkpoint_dir = Path(temp_dir) / "model"
+            save_model_checkpoint(
+                checkpoint_dir,
+                episode=0,
+                td3=td3,
+                ddqn=ddqn,
+                movement_state_dim=MOVEMENT_STATE_DIM,
+                joint_action_dim=JOINT_ACTION_DIM,
+                routing_state_dim=ROUTING_STATE_DIM,
+                calibration={"fixture": "legacy-safe"},
+            )
+            metadata_path = checkpoint_dir / "metadata.json"
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            metadata["checkpoint_schema_version"] = 4
+            metadata_path.write_text(
+                json.dumps(metadata, indent=2) + "\n", encoding="utf-8"
+            )
+            with mock.patch(
+                "training_checkpoint._load_network_states"
+            ) as load_networks:
+                with self.assertRaisesRegex(RuntimeError, "legacy safe-DDQN"):
+                    load_model_checkpoint(checkpoint_dir, td3, ddqn)
+                load_networks.assert_not_called()
+
     def test_legacy_single_lambda_log_is_rejected_before_network_restore(self):
         td3, ddqn, joint, routing = self._components()
         calibration = {"seed": 1, "c_ref_com": 10.0}
@@ -403,6 +458,7 @@ class FullResumeCheckpointTest(unittest.TestCase):
             "lambda_after_episode_log": [
                 event["dinkelbach_lambda_after_episode"]
             ],
+            **_lifecycle_training_state(1),
             **dinkelbach_state.training_state(),
         }
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -467,6 +523,7 @@ class FullResumeCheckpointTest(unittest.TestCase):
             "lambda_after_episode_log": [
                 event["dinkelbach_lambda_after_episode"]
             ],
+            **_lifecycle_training_state(1),
             **dinkelbach_state.training_state(),
         }
         experiment_metadata = {
@@ -540,6 +597,7 @@ class FullResumeCheckpointTest(unittest.TestCase):
             "lambda_used_log": [0.0],
             "lambda_after_episode_log": [0.0],
             "total_joint_transitions": 0,
+            **_lifecycle_training_state(1),
         }
         formal_config = asdict(formal_training_config(1, random_seed=1))
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -664,7 +722,7 @@ class TrainingCliTest(unittest.TestCase):
         )
 
     def test_checkpoint_schema_is_explicit(self):
-        self.assertEqual(CHECKPOINT_SCHEMA_VERSION, 4)
+        self.assertEqual(CHECKPOINT_SCHEMA_VERSION, 5)
 
 
 if __name__ == "__main__":

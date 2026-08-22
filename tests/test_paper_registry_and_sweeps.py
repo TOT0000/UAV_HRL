@@ -1,8 +1,14 @@
 import unittest
 
-from experiment_config import METHOD_REGISTRY, MethodSpec, movement_agent_configuration
+from experiment_config import (
+    METHOD_REGISTRY,
+    MethodSpec,
+    comparison_method_configuration,
+    movement_agent_configuration,
+)
 from paper_evaluation import (
     ARRIVAL_RATE_SWEEPS,
+    DEADLINE_SWEEP_INJECTION_CUTOFF_SECONDS,
     DEADLINE_SWEEP_SECONDS,
     FIXED_ROI_VALUES,
     PAPER_EVALUATION_SUITES,
@@ -49,6 +55,47 @@ class PaperMethodRegistryTest(unittest.TestCase):
         pure_random = MethodSpec.parse("kkm_random_action_random_routing")
         self.assertFalse(pure_random.learns_movement)
         self.assertFalse(pure_random.learns_routing)
+
+    def test_shared_lifecycle_metadata_is_resolved_for_all_methods(self):
+        safe_method_count = 0
+        for method_id in METHOD_REGISTRY:
+            spec = MethodSpec.parse(method_id)
+            resolved = comparison_method_configuration(spec)
+            self.assertEqual(resolved["routing_mask_scope"], "every_slot")
+            self.assertEqual(resolved["packet_injection_cutoff_seconds"], 58.5)
+            self.assertEqual(resolved["resolved_fov_deadline_seconds"], 1.5)
+            self.assertEqual(resolved["resolved_com_deadline_seconds"], 1.0)
+            if spec.routing == "safe_ddqn":
+                safe_method_count += 1
+                self.assertEqual(resolved["safe_ddqn_qos_cost_budget"], 12.0)
+                self.assertEqual(resolved["safe_ddqn_initial_lambda_cost"], 0.0)
+                self.assertEqual(resolved["safe_ddqn_eta_c"], 0.01)
+            else:
+                self.assertIsNone(resolved["safe_ddqn_qos_cost_budget"])
+                self.assertIsNone(resolved["safe_ddqn_eta_c"])
+        self.assertEqual(safe_method_count, 12)
+
+    def test_td3_and_ddpg_hyperparameters_are_explicit_and_unchanged(self):
+        td3 = movement_agent_configuration(MethodSpec.parse("td3_dinkelbach"))
+        ddpg = movement_agent_configuration(MethodSpec.parse("ddpg_dinkelbach"))
+        for resolved in (td3, ddpg):
+            self.assertEqual(resolved["actor_learning_rate"], 6e-5)
+            self.assertEqual(resolved["critic_learning_rate"], 2e-4)
+            self.assertEqual(resolved["movement_agent_gamma"], 1.0)
+            self.assertEqual(resolved["tau"], 0.005)
+            self.assertEqual(resolved["batch_size"], 64)
+            self.assertEqual(resolved["replay_capacity"], 200_000)
+            self.assertEqual(resolved["warmup_joint_transitions"], 1000)
+            self.assertEqual(resolved["exploration_noise_start"], 0.20)
+            self.assertEqual(resolved["exploration_noise_end"], 0.05)
+        self.assertEqual(td3["policy_delay"], 2)
+        self.assertEqual(td3["target_policy_noise"], 0.20)
+        self.assertEqual(td3["target_noise_clip"], 0.50)
+        self.assertTrue(td3["twin_critics"])
+        self.assertEqual(ddpg["policy_delay"], 1)
+        self.assertIsNone(ddpg["target_policy_noise"])
+        self.assertIsNone(ddpg["target_noise_clip"])
+        self.assertFalse(ddpg["twin_critics"])
 
 
 class SemanticContractTest(unittest.TestCase):
@@ -107,6 +154,14 @@ class PaperSweepContractTest(unittest.TestCase):
         points = evaluation_sweep_points("task_type_delay_violation_vs_target_delay")
         self.assertEqual(len(points), 12)
         self.assertEqual(DEADLINE_SWEEP_SECONDS, (0.5, 1.0, 1.5, 2.0, 2.5, 3.0))
+        self.assertEqual(DEADLINE_SWEEP_INJECTION_CUTOFF_SECONDS, 57.0)
+        self.assertEqual(
+            {
+                point["overrides"]["packet_injection_cutoff_seconds"]
+                for point in points
+            },
+            {57.0},
+        )
         self.assertEqual(FIXED_ROI_VALUES, tuple(range(2, 9)))
         self.assertEqual(
             tuple(point["fixed_num_gt"] for point in evaluation_sweep_points("fixed_roi")),

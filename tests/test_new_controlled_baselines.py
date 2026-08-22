@@ -33,6 +33,7 @@ from observation_strategy import (
     apply_observation_strategy,
 )
 from Packet_scheduler_v1 import PacketEngine
+from Simulator import Simulator
 from routing_agents import ControlledDQN, RandomRoutingController
 from scenario_manifest import generate_manifest
 from Simulator import Simulator
@@ -221,7 +222,9 @@ class ControlledDQNTest(unittest.TestCase):
         manifest = generate_manifest("train", 20260817, 1, num_gt=2)
         active_slot = [None]
         effective_mask_calls = {}
+        physical_mask_calls = {}
         original_effective_mask = PacketEngine.get_effective_action_mask
+        original_physical_mask = Simulator.get_routing_action_mask
 
         def track_slot(*args, **kwargs):
             active_slot[0] = float(kwargs["current_time"])
@@ -236,6 +239,13 @@ class ControlledDQNTest(unittest.TestCase):
                     effective_mask_calls.get(active_slot[0], 0) + 1
                 )
             return original_effective_mask(engine, env, uav_id, physical_mask)
+
+        def track_physical_mask(env, uav_id, cap_eps=0.1):
+            if active_slot[0] is not None:
+                physical_mask_calls[active_slot[0]] = (
+                    physical_mask_calls.get(active_slot[0], 0) + 1
+                )
+            return original_physical_mask(env, uav_id, cap_eps)
 
         config = TrainingConfig(
             total_episodes=1,
@@ -257,6 +267,12 @@ class ControlledDQNTest(unittest.TestCase):
                 autospec=True,
                 side_effect=track_effective_mask,
             ),
+            mock.patch.object(
+                Simulator,
+                "get_routing_action_mask",
+                autospec=True,
+                side_effect=track_physical_mask,
+            ),
         ):
             train(
                 config,
@@ -264,7 +280,9 @@ class ControlledDQNTest(unittest.TestCase):
                 method_spec=MethodSpec.parse("td3_dinkelbach_dqn"),
             )
         self.assertEqual(set(effective_mask_calls), {0.0, 0.25, 0.5, 0.75})
+        self.assertEqual(set(physical_mask_calls), {0.0, 0.25, 0.5, 0.75})
         self.assertTrue(all(count > 0 for count in effective_mask_calls.values()))
+        self.assertTrue(all(count > 0 for count in physical_mask_calls.values()))
 
     def test_has_reward_network_only_and_uses_standard_masked_target_maximum(self):
         agent = ControlledDQN.__new__(ControlledDQN)

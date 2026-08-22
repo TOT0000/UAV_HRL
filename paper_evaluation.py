@@ -35,6 +35,7 @@ ARRIVAL_RATE_SWEEPS = {
     "FOV": {"values": (10.0, 20.0, 30.0, 40.0), "fixed": {"COM": 50.0}},
 }
 DEADLINE_SWEEP_SECONDS = (0.5, 1.0, 1.5, 2.0, 2.5, 3.0)
+DEADLINE_SWEEP_INJECTION_CUTOFF_SECONDS = 57.0
 
 _FIXED_ROI_METHODS = tuple(
     dict.fromkeys(
@@ -148,6 +149,9 @@ def evaluation_sweep_points(suite):
                         "overrides": {
                             "fov_deadline_seconds": deadlines["FOV"],
                             "com_deadline_seconds": deadlines["COM"],
+                            "packet_injection_cutoff_seconds": (
+                                DEADLINE_SWEEP_INJECTION_CUTOFF_SECONDS
+                            ),
                         },
                         "swept_task": task_type,
                         "display_task": "VS" if task_type == "FOV" else "COM",

@@ -9,6 +9,12 @@ import collections
 from torch.optim.lr_scheduler import StepLR
 import matplotlib.pyplot as plt
 
+from experiment_config import (
+    SAFE_DDQN_ETA_C,
+    SAFE_DDQN_INITIAL_LAMBDA_COST,
+    SAFE_DDQN_QOS_COST_BUDGET,
+)
+
 """
 Implementation of Double DQN for gym environments with discrete action space.
 """
@@ -96,7 +102,9 @@ class DDQN:
         gamma=0.99,
         tau=0.005,
         lr=1e-3,
-        eta=0.1,
+        lambda_cost=SAFE_DDQN_INITIAL_LAMBDA_COST,
+        eta_c=SAFE_DDQN_ETA_C,
+        qos_cost_budget=SAFE_DDQN_QOS_COST_BUDGET,
     ):
         self.q_network = QNetwork(action_dim, state_dim, hidden_dim).to(device)
         self.target_q_network = copy.deepcopy(self.q_network)
@@ -110,30 +118,41 @@ class DDQN:
         self.gamma = gamma
         self.tau = tau
         self.action_dim = action_dim
-        self.eta = eta
+        self.lambda_cost = float(lambda_cost)
+        self.initial_lambda_cost = float(SAFE_DDQN_INITIAL_LAMBDA_COST)
+        self.eta_c = float(eta_c)
+        self.qos_cost_budget = float(qos_cost_budget)
+        if (
+            not np.isfinite(self.lambda_cost)
+            or self.lambda_cost < 0.0
+            or not np.isfinite(self.eta_c)
+            or self.eta_c <= 0.0
+            or not np.isfinite(self.qos_cost_budget)
+            or self.qos_cost_budget < 0.0
+        ):
+            raise ValueError("safe-DDQN constraint parameters are invalid")
+        self.cost_multiplier_update_count = 0
+        self.last_episode_cost_sum = None
+        self.last_episode_slot_steps = None
+        self.last_lambda_cost_used = None
+        self.last_lambda_cost_after = None
 
         self.loss_log = []
         self.cost_loss_log = []
         self.num_training = 0
         self.target_update_count = 0
     def select_action(self, state, uav_id, mask=None, visited_nodes=None, epsilon=0.5, logits_noise_std=0.5, eta=None):
-        if eta is None:
-            eta = self.eta
+        if eta is not None and not np.isclose(float(eta), self.lambda_cost):
+            raise ValueError(
+                "safe-DDQN action selection must use the episode lambda_cost"
+            )
         state_t = torch.FloatTensor(state.reshape(1, -1)).to(device)
         with torch.no_grad():
             q_r = self.q_network(state_t).cpu().numpy().flatten()      # reward Q
             q_c = self.cost_network(state_t).cpu().numpy().flatten()   # cost Q
         # if np.random.rand() < 0.001:  # 0.1% 機率印，避免爆log
-        #     q_c_eff = np.maximum(q_c, 0.0)
-        #     qt = q_r - eta * q_c_eff
-        #     # qt = q_r - float(eta) * q_c
-        #     print(f"[lag] eta={eta:.4f} "
-        #         f"q_r(min,max)=({q_r.min():.3f},{q_r.max():.3f}) "
-        #         f"q_c(min,max)=({q_c_eff.min():.3f},{q_c_eff.max():.3f}) "
-        #         f"q_t(min,max)=({qt.min():.3f},{qt.max():.3f})")
         # Lagrangian 合成（越大越好，所以 cost 用減的）
-        q_c_eff = np.maximum(q_c, 0.0)
-        q_values = q_r - float(eta) * q_c_eff
+        q_values = q_r - self.lambda_cost * q_c
         # ----------  mask ----------
         # 1. 先從「外部傳入的 mask」開始，如果沒有就預設全 1
         if mask is None:
@@ -176,8 +195,7 @@ class DDQN:
     def _safe_targets(self, next_state, reward, cost, not_done):
         next_q_online = self.q_network(next_state)
         next_c_online = self.cost_network(next_state)
-        next_c_eff = torch.clamp(next_c_online, min=0.0)
-        safe_scores = next_q_online - self.eta * next_c_eff
+        safe_scores = next_q_online - self.lambda_cost * next_c_online
 
         action_mask = self._routing_action_mask(next_state)
         safe_scores = safe_scores.masked_fill(~action_mask, float("-inf"))
@@ -197,6 +215,100 @@ class DDQN:
             cost.squeeze(1), next_c_target, not_done.squeeze(1), self.gamma
         )
         return target_q, target_c, next_actions
+
+    def update_cost_multiplier(self, episode_cost_sum, episode_slot_steps):
+        """Advance the network-wide QoS multiplier exactly once per episode."""
+
+        cost_sum = float(episode_cost_sum)
+        slot_steps = int(episode_slot_steps)
+        if not np.isfinite(cost_sum) or cost_sum < 0.0:
+            raise ValueError("episode routing cost must be finite and non-negative")
+        if slot_steps <= 0:
+            raise ValueError("episode routing slot-step denominator must be positive")
+        used = float(self.lambda_cost)
+        updated = max(
+            0.0,
+            used
+            + self.eta_c
+            * (cost_sum / float(slot_steps) - self.qos_cost_budget),
+        )
+        self.lambda_cost = float(updated)
+        self.cost_multiplier_update_count += 1
+        self.last_episode_cost_sum = cost_sum
+        self.last_episode_slot_steps = slot_steps
+        self.last_lambda_cost_used = used
+        self.last_lambda_cost_after = float(updated)
+        return float(updated)
+
+    def constraint_state(self):
+        return {
+            "lambda_cost": float(self.lambda_cost),
+            "initial_lambda_cost": float(self.initial_lambda_cost),
+            "eta_c": float(self.eta_c),
+            "qos_cost_budget": float(self.qos_cost_budget),
+            "lambda_update_scope": "episode_end",
+            "cost_denominator": "network_routing_slot_steps",
+            "cost_multiplier_update_count": int(
+                self.cost_multiplier_update_count
+            ),
+            "episode_cost_accumulator": 0.0,
+            "episode_slot_step_accumulator": 0,
+            "mid_episode_checkpoint_supported": False,
+            "last_episode_cost_sum": self.last_episode_cost_sum,
+            "last_episode_slot_steps": self.last_episode_slot_steps,
+            "last_lambda_cost_used": self.last_lambda_cost_used,
+            "last_lambda_cost_after": self.last_lambda_cost_after,
+        }
+
+    def load_constraint_state(self, state):
+        required = {
+            "lambda_cost",
+            "initial_lambda_cost",
+            "eta_c",
+            "qos_cost_budget",
+            "lambda_update_scope",
+            "cost_denominator",
+            "cost_multiplier_update_count",
+            "episode_cost_accumulator",
+            "episode_slot_step_accumulator",
+            "mid_episode_checkpoint_supported",
+        }
+        missing = sorted(required.difference(state or {}))
+        if missing:
+            raise RuntimeError(
+                f"safe-DDQN checkpoint constraint state is incomplete: {missing}"
+            )
+        if (
+            float(state["initial_lambda_cost"])
+            != SAFE_DDQN_INITIAL_LAMBDA_COST
+            or float(state["eta_c"]) != SAFE_DDQN_ETA_C
+            or float(state["qos_cost_budget"])
+            != SAFE_DDQN_QOS_COST_BUDGET
+            or state["lambda_update_scope"] != "episode_end"
+            or state["cost_denominator"] != "network_routing_slot_steps"
+            or float(state["episode_cost_accumulator"]) != 0.0
+            or int(state["episode_slot_step_accumulator"]) != 0
+            or bool(state["mid_episode_checkpoint_supported"])
+        ):
+            raise RuntimeError(
+                "safe-DDQN checkpoint constraint configuration is incompatible"
+            )
+        self.lambda_cost = float(state["lambda_cost"])
+        if not np.isfinite(self.lambda_cost) or self.lambda_cost < 0.0:
+            raise RuntimeError("safe-DDQN checkpoint lambda_cost is invalid")
+        self.initial_lambda_cost = SAFE_DDQN_INITIAL_LAMBDA_COST
+        self.eta_c = SAFE_DDQN_ETA_C
+        self.qos_cost_budget = SAFE_DDQN_QOS_COST_BUDGET
+        self.cost_multiplier_update_count = int(
+            state["cost_multiplier_update_count"]
+        )
+        for field in (
+            "last_episode_cost_sum",
+            "last_episode_slot_steps",
+            "last_lambda_cost_used",
+            "last_lambda_cost_after",
+        ):
+            setattr(self, field, state.get(field))
 
     def train(self, replay_buffer, batch_size=64):
 

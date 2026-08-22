@@ -4,6 +4,11 @@ from Energy_model import EnergyConsumptionModel
 from Fov_model_phase import FovModel
 from Channel_model import ChannelModel
 from centralized_movement import vs_data_valid
+from experiment_config import (
+    FOV_EMA_LIFECYCLE_VERSION,
+    PRODUCTION_PACKET_INJECTION_CUTOFF_SECONDS,
+    PRODUCTION_TASK_DEADLINE_SECONDS,
+)
 import numpy as np
 
 
@@ -15,8 +20,8 @@ def final_hop_delivered_bits(to_target, gs_id, bits_tx_used):
 
 MAX_PACKET_HOPS = 20
 PACKET_EPS = 1e-9
-TASK_DEADLINE_SECONDS = {"FOV": 1.5, "COM": 1.0}
-EPISODE_INJECTION_CUTOFF_SECONDS = 58.5
+TASK_DEADLINE_SECONDS = dict(PRODUCTION_TASK_DEADLINE_SECONDS)
+EPISODE_INJECTION_CUTOFF_SECONDS = PRODUCTION_PACKET_INJECTION_CUTOFF_SECONDS
 
 
 
@@ -27,6 +32,7 @@ class PacketEngine:
         step_time=0.25,
         E_max=10000,
         task_deadlines_seconds=None,
+        injection_cutoff_seconds=EPISODE_INJECTION_CUTOFF_SECONDS,
     ):
         self.step_time = step_time
         self.num_UAV = num_uav
@@ -44,6 +50,12 @@ class PacketEngine:
         ):
             raise ValueError("task deadlines must contain positive FOV and COM seconds")
         self.task_deadlines_seconds = deadlines
+        self.injection_cutoff_seconds = float(injection_cutoff_seconds)
+        if (
+            not np.isfinite(self.injection_cutoff_seconds)
+            or self.injection_cutoff_seconds < 0.0
+        ):
+            raise ValueError("packet injection cutoff must be finite and non-negative")
         self._next_pkt_id = 0
         self._active_idx = set()
 
@@ -110,6 +122,132 @@ class PacketEngine:
         # Routing-observation history is episode-scoped. It must not leak from
         # one manifest scenario into the next when this engine is reused.
         self.fov_ema = {}
+        self.fov_ema_initialized = set()
+        self.fov_ema_transition_marker = None
+        self.fov_ema_update_count = 0
+        self.norm_cfg = dict(
+            C_MAX=200.0,
+            D_MAX=3.0,
+            B_MAX=2e6,
+            ETA_MAX=60.0,
+            ema_alpha=0.7,
+        )
+
+    def _fov_observation_sample(self, env, uav_id):
+        """Compute one physical-map sample without mutating engine or environment."""
+
+        uav = env.uav_dict[int(uav_id)]
+        x_u, y_u, _ = uav.get_position()
+        model = FovModel(
+            f=0.004,
+            wl=0.008,
+            i_l=0.012,
+            z_u=float(uav.z_u),
+            gamma_g=80,
+        )
+        fov_w, fov_h = model.get_ground_fov_size(float(uav.z_u))
+        bx_min, bx_max, by_min, by_max, _patch, _cells = (
+            env.fov_to_indices_and_patch(
+                x_u,
+                y_u,
+                fov_w,
+                fov_h,
+                env.env_width,
+                env.env_height,
+                env.bit_resolution,
+                env.visited_bitmap,
+            )
+        )
+        if bx_max < bx_min or by_max < by_min:
+            return {"overlap": 0.0, "unvisited": 0.0, "frontier": 0.0}
+        patch = env.visited_bitmap[bx_min : bx_max + 1, by_min : by_max + 1]
+        fov_cells = max(1, (bx_max - bx_min + 1) * (by_max - by_min + 1))
+        unvisited = float((~patch).mean()) if patch.size else 0.0
+        if patch.size:
+            border = np.concatenate(
+                [patch[0, :], patch[-1, :], patch[:, 0], patch[:, -1]]
+            )
+            frontier = float((~border).mean())
+        else:
+            frontier = 0.0
+        previous = getattr(uav, "last_box_idx", None)
+        if previous is None:
+            overlap = 0.0
+        else:
+            lbx0, lbx1, lby0, lby1 = previous
+            ix0, iy0 = max(bx_min, lbx0), max(by_min, lby0)
+            ix1, iy1 = min(bx_max, lbx1), min(by_max, lby1)
+            intersection = (
+                (ix1 - ix0 + 1) * (iy1 - iy0 + 1)
+                if ix1 >= ix0 and iy1 >= iy0
+                else 0
+            )
+            overlap = intersection / float(fov_cells)
+        return {
+            "overlap": float(overlap),
+            "unvisited": float(unvisited),
+            "frontier": float(frontier),
+        }
+
+    def update_fov_ema(self, env, transition_marker):
+        """Advance EMA once after an actual Search/FOV map transition."""
+
+        marker = str(transition_marker)
+        if marker == self.fov_ema_transition_marker:
+            return False
+        alpha = float(self.norm_cfg["ema_alpha"])
+        for uav_id in range(self.num_UAV):
+            sample = self._fov_observation_sample(env, uav_id)
+            previous = self.fov_ema.get(
+                uav_id, {"overlap": 0.0, "unvisited": 0.0, "frontier": 0.0}
+            )
+            self.fov_ema[uav_id] = {
+                field: alpha * float(previous[field])
+                + (1.0 - alpha) * float(sample[field])
+                for field in ("overlap", "unvisited", "frontier")
+            }
+            self.fov_ema_initialized.add(uav_id)
+        self.fov_ema_transition_marker = marker
+        self.fov_ema_update_count += 1
+        return True
+
+    def _fov_ema_values(self, uav_id):
+        values = self.fov_ema.get(
+            int(uav_id),
+            {"overlap": 0.0, "unvisited": 0.0, "frontier": 0.0},
+        )
+        return tuple(
+            float(values[field])
+            for field in ("overlap", "unvisited", "frontier")
+        )
+
+    def fov_ema_state(self):
+        return {
+            "lifecycle_version": FOV_EMA_LIFECYCLE_VERSION,
+            "values": {
+                str(uav_id): dict(values)
+                for uav_id, values in sorted(self.fov_ema.items())
+            },
+            "initialized_uav_ids": sorted(self.fov_ema_initialized),
+            "transition_marker": self.fov_ema_transition_marker,
+            "update_count": int(self.fov_ema_update_count),
+        }
+
+    def load_fov_ema_state(self, state):
+        if (state or {}).get("lifecycle_version") != FOV_EMA_LIFECYCLE_VERSION:
+            raise RuntimeError("checkpoint FOV EMA lifecycle is incompatible")
+        self.fov_ema = {
+            int(uav_id): {
+                field: float(values[field])
+                for field in ("overlap", "unvisited", "frontier")
+            }
+            for uav_id, values in state.get("values", {}).items()
+        }
+        self.fov_ema_initialized = {
+            int(uav_id) for uav_id in state.get("initialized_uav_ids", [])
+        }
+        self.fov_ema_transition_marker = state.get("transition_marker")
+        self.fov_ema_update_count = int(state.get("update_count", 0))
     # （可選）若要用到才保留；否則刪掉它避免 self.num_UAV 未定義
     def initialize_packet_buffer(self, num_pkt):
         self.packet_buffer = {
@@ -238,14 +376,14 @@ class PacketEngine:
 
     def get_hol_packet(self, uav_id):
         queue = self.uav_queues[int(uav_id)]
-        while queue and (queue[0] is None or queue[0].get("done", False)):
-            stale = queue.popleft()
-            if stale is not None and stale.get("_queued_uav") == int(uav_id):
-                self._decrease_backlog(
-                    int(uav_id), stale.get("rem_bits", 0.0)
-                )
-                stale["_queued_uav"] = None
-        return queue[0] if queue else None
+        return next(
+            (
+                packet
+                for packet in queue
+                if packet is not None and not packet.get("done", False)
+            ),
+            None,
+        )
 
     def nonempty_uav_ids(self):
         return [
@@ -709,7 +847,7 @@ class PacketEngine:
         base_ctrl_rate=50,
         rate_overrides=None,
     ):
-        if float(current_time) >= EPISODE_INJECTION_CUTOFF_SECONDS:
+        if float(current_time) >= self.injection_cutoff_seconds:
             return 0
         # if self.target_total_packets is not None and self.total_injected_packets >= self.target_total_packets:
         #     return
@@ -1077,6 +1215,9 @@ class PacketEngine:
             "COM": {"sum_queue": 0.0, "sum_tx": 0.0, "sum_total": 0.0, "count": 0},
         }
         self.fov_ema = {}
+        self.fov_ema_initialized = set()
+        self.fov_ema_transition_marker = None
+        self.fov_ema_update_count = 0
 
         # 總延遲時間
     def log_hop_delay(self, env, pkt, current_node, next_hop, link_capacity_mbps, current_time, pkt_bits, backlog_bits):
@@ -1211,20 +1352,11 @@ class PacketEngine:
         """
         
 
-        # ---------- 常數/正規化上限（可依環境微調） ----------
-        if not hasattr(self, "norm_cfg"):
-            self.norm_cfg = dict(
-                C_MAX=200.0,   # 容量上限 (Mbps)
-                D_MAX=3.0,     # 延遲上限 (s)
-                B_MAX=2e6,     # backlog 上限 (bits)
-                ETA_MAX=60.0,  # 估計回GS所需slot數的上限
-                ema_alpha=0.7  # FOV特徵EMA係數
-            )
+        # ---------- 常數/正規化上限（建構時固定；getter 為 pure read） ----------
         C_MAX = float(self.norm_cfg["C_MAX"])
         D_MAX = float(self.norm_cfg["D_MAX"])
         B_MAX = float(self.norm_cfg["B_MAX"])
         ETA_MAX = float(self.norm_cfg["ETA_MAX"])
-        ALPHA = float(self.norm_cfg["ema_alpha"])
 
         # ---------- 基本物件 ----------
         N = env.num_UAV
@@ -1249,52 +1381,7 @@ class PacketEngine:
         fov_task_flag = 0.0                       # 固定 0
         task_feat = np.concatenate([task_flags, np.array([fov_task_flag])], axis=0)  # 4 維
 
-        # ---------- FOV 三特徵（與你現有計法一致，後續做EMA） ----------
-        if not hasattr(self, "FovModel"):
-            self.FovModel = FovModel(f=0.004, wl=0.008, i_l=0.012, z_u=uav.z_u, gamma_g=80)
-        fov_w, fov_h = self.FovModel.get_ground_fov_size(uav.z_u)
-
-        bx_min, bx_max, by_min, by_max, patch, fov_cells = env.fov_to_indices_and_patch(
-            x_u, y_u, fov_w, fov_h,
-            env.env_width, env.env_height,
-            env.bit_resolution, env.visited_bitmap
-        )
-
-        if bx_max >= bx_min and by_max >= by_min:
-            patch = env.visited_bitmap[bx_min:bx_max+1, by_min:by_max+1]
-            fov_cells = max(1, (bx_max - bx_min + 1) * (by_max - by_min + 1))
-
-            unvisited_ratio_patch = float((~patch).mean()) if patch.size > 0 else 0.0
-            if patch.size > 0:
-                border = np.concatenate([patch[0, :], patch[-1, :], patch[:, 0], patch[:, -1]])
-                frontier_density = float((~border).mean())
-            else:
-                frontier_density = 0.0
-
-            if getattr(uav, "last_box_idx", None) is not None:
-                lbx0, lbx1, lby0, lby1 = uav.last_box_idx
-                ix0, iy0 = max(bx_min, lbx0), max(by_min, lby0)
-                ix1, iy1 = min(bx_max, lbx1), min(by_max, lby1)
-                inter_cells = (ix1 - ix0 + 1) * (iy1 - iy0 + 1) if (ix1 >= ix0 and iy1 >= iy0) else 0
-                overlap_rate_local = inter_cells / float(fov_cells)
-            else:
-                overlap_rate_local = 0.0
-        else:
-            unvisited_ratio_patch = 0.0
-            frontier_density = 0.0
-            overlap_rate_local = 0.0
-
-        # FOV EMA 緩存
-        if not hasattr(self, "fov_ema"):
-            self.fov_ema = {}
-        if uav_id not in self.fov_ema:
-            self.fov_ema[uav_id] = dict(overlap=0.0, unvisited=0.0, frontier=0.0)
-        self.fov_ema[uav_id]["overlap"]  = ALPHA * self.fov_ema[uav_id]["overlap"]  + (1-ALPHA) * overlap_rate_local
-        self.fov_ema[uav_id]["unvisited"]= ALPHA * self.fov_ema[uav_id]["unvisited"]+ (1-ALPHA) * unvisited_ratio_patch
-        self.fov_ema[uav_id]["frontier"] = ALPHA * self.fov_ema[uav_id]["frontier"] + (1-ALPHA) * frontier_density
-        overlap_ema   = float(self.fov_ema[uav_id]["overlap"])
-        unvisited_ema = float(self.fov_ema[uav_id]["unvisited"])
-        frontier_ema  = float(self.fov_ema[uav_id]["frontier"])
+        overlap_ema, unvisited_ema, frontier_ema = self._fov_ema_values(uav_id)
 
         # ---------- 通訊向量（含 GS）：用 mask+正規化，取代「延遲=1 代表無效」 ----------
         link_valid_mask           = np.zeros(L, dtype=float)
@@ -1405,20 +1492,11 @@ class PacketEngine:
 
         
 
-        # ---------- 常數/正規化上限（可依環境微調） ----------
-        if not hasattr(self, "norm_cfg"):
-            self.norm_cfg = dict(
-                C_MAX=200.0,   # 容量上限 (Mbps)
-                D_MAX=3.0,     # 延遲上限 (s)
-                B_MAX=2e6,     # backlog 上限 (bits)
-                ETA_MAX=60.0,  # 估計回GS所需slot數的上限
-                ema_alpha=0.7  # FOV特徵EMA係數
-            )
+        # ---------- 常數/正規化上限（建構時固定；getter 為 pure read） ----------
         C_MAX = float(self.norm_cfg["C_MAX"])
         D_MAX = float(self.norm_cfg["D_MAX"])
         B_MAX = float(self.norm_cfg["B_MAX"])
         ETA_MAX = float(self.norm_cfg["ETA_MAX"])
-        ALPHA = float(self.norm_cfg["ema_alpha"])
 
         # ---------- 基本物件 ----------
         N = env.num_UAV
@@ -1455,12 +1533,14 @@ class PacketEngine:
         try:
             if getattr(uav, "task_type", None) == "FOV" and hasattr(uav, "target_position"):
                 tx, ty, tz = uav.target_position
-                if not hasattr(self, "_state_fov_model"):
-                    self._state_fov_model = FovModel(f=0.004, wl=0.008, i_l=0.012, z_u=float(z_u), gamma_g=80)
-                else:
-                    if hasattr(self._state_fov_model, "z_u"):
-                        self._state_fov_model.z_u = float(z_u)
-                fov_now, _ = self._state_fov_model.calculate_fov_single(float(x_u), float(y_u), float(z_u), tx, ty, tz)
+                state_fov_model = FovModel(
+                    f=0.004,
+                    wl=0.008,
+                    i_l=0.012,
+                    z_u=float(z_u),
+                    gamma_g=80,
+                )
+                fov_now, _ = state_fov_model.calculate_fov_single(float(x_u), float(y_u), float(z_u), tx, ty, tz)
                 fov_now_clip = float(np.clip(fov_now, 0.0, 3.0))
                 fov_err_clip = float(np.clip(fov_now - 1.0, -3.0, 3.0))
         except Exception:
@@ -1488,52 +1568,7 @@ class PacketEngine:
         fov_task_flag = 1.0 if uav.task_type == "FOV" else 0.0  # 原本的 "Current FOV: 0/1"
         # 新增：是否為來源 UAV
         is_source_flag = 1.0 if uav_id in env.source_uavs else 0.0
-        # ---------- FOV 三特徵（與你現有計法一致，後續做EMA） ----------
-        if not hasattr(self, "FovModel"):
-            self.FovModel = FovModel(f=0.004, wl=0.008, i_l=0.012, z_u=uav.z_u, gamma_g=80)
-        fov_w, fov_h = self.FovModel.get_ground_fov_size(uav.z_u)
-
-        bx_min, bx_max, by_min, by_max, patch, fov_cells = env.fov_to_indices_and_patch(
-            x_u, y_u, fov_w, fov_h,
-            env.env_width, env.env_height,
-            env.bit_resolution, env.visited_bitmap
-        )
-
-        if bx_max >= bx_min and by_max >= by_min:
-            patch = env.visited_bitmap[bx_min:bx_max+1, by_min:by_max+1]
-            fov_cells = max(1, (bx_max - bx_min + 1) * (by_max - by_min + 1))
-
-            unvisited_ratio_patch = float((~patch).mean()) if patch.size > 0 else 0.0
-            if patch.size > 0:
-                border = np.concatenate([patch[0, :], patch[-1, :], patch[:, 0], patch[:, -1]])
-                frontier_density = float((~border).mean())
-            else:
-                frontier_density = 0.0
-
-            if getattr(uav, "last_box_idx", None) is not None:
-                lbx0, lbx1, lby0, lby1 = uav.last_box_idx
-                ix0, iy0 = max(bx_min, lbx0), max(by_min, lby0)
-                ix1, iy1 = min(bx_max, lbx1), min(by_max, lby1)
-                inter_cells = (ix1 - ix0 + 1) * (iy1 - iy0 + 1) if (ix1 >= ix0 and iy1 >= iy0) else 0
-                overlap_rate_local = inter_cells / float(fov_cells)
-            else:
-                overlap_rate_local = 0.0
-        else:
-            unvisited_ratio_patch = 0.0
-            frontier_density = 0.0
-            overlap_rate_local = 0.0
-
-        # FOV EMA 緩存
-        if not hasattr(self, "fov_ema"):
-            self.fov_ema = {}
-        if uav_id not in self.fov_ema:
-            self.fov_ema[uav_id] = dict(overlap=0.0, unvisited=0.0, frontier=0.0)
-        self.fov_ema[uav_id]["overlap"]  = ALPHA * self.fov_ema[uav_id]["overlap"]  + (1-ALPHA) * overlap_rate_local
-        self.fov_ema[uav_id]["unvisited"]= ALPHA * self.fov_ema[uav_id]["unvisited"]+ (1-ALPHA) * unvisited_ratio_patch
-        self.fov_ema[uav_id]["frontier"] = ALPHA * self.fov_ema[uav_id]["frontier"] + (1-ALPHA) * frontier_density
-        overlap_ema   = float(self.fov_ema[uav_id]["overlap"])
-        unvisited_ema = float(self.fov_ema[uav_id]["unvisited"])
-        frontier_ema  = float(self.fov_ema[uav_id]["frontier"])
+        overlap_ema, unvisited_ema, frontier_ema = self._fov_ema_values(uav_id)
 
         # ---------- 通訊向量（含 GS）：用 mask+正規化，取代「延遲=1 代表無效」 ----------
         link_valid_mask           = np.zeros(L, dtype=float)
@@ -1617,7 +1652,7 @@ class PacketEngine:
             hol_context[1] = 1.0 if hol_task == "COM" else 0.0
             deadline_abs = hol.get("deadline_abs")
             if deadline_abs is not None:
-                deadline_window = TASK_DEADLINE_SECONDS[hol_task]
+                deadline_window = self.task_deadlines_seconds[hol_task]
                 hol_context[2] = np.clip(
                     (float(deadline_abs) - float(getattr(env, "current_time", 0.0)))
                     / deadline_window,

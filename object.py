@@ -3,6 +3,30 @@ import numpy as np
 from Fov_model_phase import FovModel
 from Energy_model import EnergyConsumptionModel
 
+
+def straight_line_route(start, goal, speed=1.0):
+    """Return movement points after start, ending exactly at the target."""
+
+    speed = float(speed)
+    if not np.isfinite(speed) or speed <= 0.0:
+        raise ValueError("SR route speed must be finite and positive")
+    start_xy = np.asarray(start[:2], dtype=float)
+    goal_xy = np.asarray(goal[:2], dtype=float)
+    if not np.isfinite(start_xy).all() or not np.isfinite(goal_xy).all():
+        raise ValueError("SR route endpoints must be finite")
+    delta = goal_xy - start_xy
+    distance = float(np.linalg.norm(delta))
+    if distance <= 1e-12:
+        return []
+    direction = delta / distance
+    step_count = int(np.ceil(distance / speed))
+    route = [
+        tuple(start_xy + direction * min(step * speed, distance))
+        for step in range(1, step_count + 1)
+    ]
+    route[-1] = tuple(goal_xy)
+    return route
+
 class UAV:
     def __init__(self, id, x, y, z, battery=100, task_type=None, max_buffer_bits=1e6, assigned_target_id=None, E_max=10000):
         self.energy = E_max
@@ -73,8 +97,7 @@ class UAV:
         raw_z = float(self.z_u) + dz_m
 
         comm_safe = mobility_params.get("comm_safety", {}) if mobility_params else {}
-        only_ids = comm_safe.get("only_uav_ids", [0])
-        apply_safe = comm_safe.get("enable", False) and self.id in only_ids
+        apply_safe = bool(comm_safe.get("enable", False))
         is_stationary = bool(
             np.isclose(dx_m, 0.0) and np.isclose(dy_m, 0.0) and np.isclose(dz_m, 0.0)
         )
@@ -170,8 +193,7 @@ class UAV:
         raw_z = self.z_u + dz_m
 
         comm_safe = mobility_params.get("comm_safety", {}) if mobility_params else {}
-        only_ids = comm_safe.get("only_uav_ids", [0])
-        apply_safe = comm_safe.get("enable", False) and (getattr(self, "id", None) in only_ids)
+        apply_safe = bool(comm_safe.get("enable", False))
 
         if apply_safe:
             # 原本的投影邏輯不變
@@ -343,20 +365,67 @@ class SRTeam:
         ✅ 由環境分派 GT 任務並啟動移動
         """
         self.assigned_gt_id = gt_id
-        self.path = self.plan_path(self.get_position(), gt_pos, speed)
-        self.active = True
-        self.arrived = False
+        self.path = straight_line_route(self.get_position(), gt_pos, speed)
+        self.active = bool(self.path)
+        self.arrived = not self.path
         self.current_step = 0
     def step_forward(self):
         if not self.active:
             return
         if self.path is None or len(self.path) == 0:
+            self.active = False
+            self.arrived = True
             return
         if self.current_step < len(self.path):
             nx, ny = self.path[self.current_step]
             self.x, self.y = float(nx), float(ny)
             self.z = 0.0
             self.current_step += 1
-        else:
+        if self.current_step >= len(self.path):
             self.active = False
             self.arrived = True
+
+    def route_state(self):
+        """Serialize the exact waypoint cursor used by deterministic resume."""
+
+        return {
+            "sr_id": int(self.id),
+            "assigned_gt_id": self.assigned_gt_id,
+            "path": [[float(x), float(y)] for x, y in self.path],
+            "current_step": int(self.current_step),
+            "position": [float(self.x), float(self.y), float(self.z)],
+            "active": bool(self.active),
+            "arrived": bool(self.arrived),
+        }
+
+    def load_route_state(self, state):
+        """Restore position, route, cursor, and arrival flags without replanning."""
+
+        if int(state.get("sr_id", -1)) != int(self.id):
+            raise RuntimeError("SR route state belongs to a different team")
+        path = [tuple(map(float, point)) for point in state.get("path", [])]
+        if any(len(point) != 2 or not np.isfinite(point).all() for point in path):
+            raise RuntimeError("SR route checkpoint path is invalid")
+        current_step = int(state.get("current_step", -1))
+        if not 0 <= current_step <= len(path):
+            raise RuntimeError("SR route checkpoint cursor is invalid")
+        position = np.asarray(state.get("position", []), dtype=float)
+        if position.shape != (3,) or not np.isfinite(position).all():
+            raise RuntimeError("SR route checkpoint position is invalid")
+        active = bool(state.get("active", False))
+        arrived = bool(state.get("arrived", False))
+        assigned_gt_id = state.get("assigned_gt_id")
+        expected_active = current_step < len(path)
+        idle = assigned_gt_id is None and not path and current_step == 0
+        if (
+            active != expected_active
+            or (arrived and active)
+            or (not active and not arrived and not idle)
+        ):
+            raise RuntimeError("SR route checkpoint lifecycle flags are inconsistent")
+        self.assigned_gt_id = assigned_gt_id
+        self.path = path
+        self.current_step = current_step
+        self.x, self.y, self.z = position.tolist()
+        self.active = active
+        self.arrived = arrived

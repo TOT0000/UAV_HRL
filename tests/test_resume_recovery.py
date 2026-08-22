@@ -10,7 +10,11 @@ import torch
 
 from dinkelbach_blocks import DinkelbachBlockState, dinkelbach_config_metadata
 from HRL_task_aware import formal_training_config
-from experiment_config import MethodSpec
+from experiment_config import (
+    FOV_EMA_LIFECYCLE_VERSION,
+    MethodSpec,
+    SR_ROUTE_LIFECYCLE_VERSION,
+)
 from resume_recovery import (
     execute_resume_reconciliation,
     plan_resume_reconciliation,
@@ -69,6 +73,22 @@ class ResumeRecoveryTest(unittest.TestCase):
             "energy_log": [2.0] * completed_episode,
             "lambda_used_log": lambda_used_log,
             "lambda_after_episode_log": lambda_after_episode_log,
+            "lambda_cost_used_log": [0.0] * completed_episode,
+            "lambda_cost_after_episode_log": [0.0] * completed_episode,
+            "fov_ema_state": {
+                "lifecycle_version": FOV_EMA_LIFECYCLE_VERSION,
+                "values": {},
+                "initialized_uav_ids": [],
+                "transition_marker": None,
+                "update_count": 0,
+            },
+            "sr_route_state": {
+                "lifecycle_version": SR_ROUTE_LIFECYCLE_VERSION,
+                "teams": [],
+                "trajectory": {},
+                "checkpoint_scope": "episode_boundary_terminal_snapshot",
+                "mid_episode_checkpoint_supported": False,
+            },
             **state.training_state(),
         }
 
@@ -82,6 +102,16 @@ class ResumeRecoveryTest(unittest.TestCase):
             "routing_state_dim": 126,
             "centralized_td3_gamma": 1.0,
             "routing_ddqn_gamma": 0.99,
+            "routing_agent_kind": "safe_ddqn",
+            "routing_agent_configuration": {
+                "lambda_cost": 0.0,
+                "initial_lambda_cost": 0.0,
+                "eta_c": 0.01,
+                "qos_cost_budget": 12.0,
+                "lambda_update_scope": "episode_end",
+                "cost_denominator": "network_routing_slot_steps",
+                "mid_episode_checkpoint_supported": False,
+            },
             "com_calibration_fingerprint": calibration_fingerprint(
                 self.calibration
             ),

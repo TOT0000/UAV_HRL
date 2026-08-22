@@ -20,6 +20,24 @@ FOV_COM_PAIR_MAX_DISTANCE_M = 200.0
 ASSIGNMENT_DUMMY_UTILITY = 0.0
 UTILITY_NORMALIZATION_MODE = "per_task_type_global_minmax_feasible_only"
 TASK_COMPATIBILITY_POLICY = "fov_com_only_with_distance_limit"
+FOV_ASSIGNMENT_UTILITY_VERSION = "coverage_times_reciprocal_image_quality-v1"
+FOV_QUALITY_TRANSFORM = (
+    "q(I)=0 for non-finite or I<=0; I for 0<I<=1; 1/I for I>1"
+)
+FOV_COVERAGE_SOURCE = (
+    "centralized_movement.fov_task_metrics circle-ROI/rectangular-FOV "
+    "intersection ratio [0,1]"
+)
+SAFE_DDQN_QOS_COST_BUDGET = 12.0
+SAFE_DDQN_INITIAL_LAMBDA_COST = 0.0
+SAFE_DDQN_ETA_C = 0.01
+SAFE_DDQN_LAMBDA_UPDATE_SCOPE = "episode_end"
+SAFE_DDQN_EVALUATION_LAMBDA_MODE = "checkpoint_frozen"
+ROUTING_MASK_SCOPE = "every_slot"
+FOV_EMA_LIFECYCLE_VERSION = "episode-reset-and-physical-map-transition-v1"
+SR_ROUTE_LIFECYCLE_VERSION = "no-duplicate-start-exact-endpoint-v1"
+PRODUCTION_TASK_DEADLINE_SECONDS = {"FOV": 1.5, "COM": 1.0}
+PRODUCTION_PACKET_INJECTION_CUTOFF_SECONDS = 58.5
 
 CURRENT_METHOD_ID = "td3_dinkelbach"
 
@@ -333,20 +351,51 @@ FORMAL_EXPERIMENT_DEFAULTS = {
 }
 
 
-def movement_agent_configuration(method_spec: MethodSpec) -> dict:
+def movement_agent_configuration(method_spec: MethodSpec, training_config=None) -> dict:
     """Return the algorithm settings that the selected controller really uses."""
 
     method_spec = MethodSpec.parse(method_spec.method_id)
     common = FORMAL_EXPERIMENT_DEFAULTS["movement_hyperparameters"]
     algorithm = common.get(method_spec.agent, {})
+    resolved_training = (
+        dict(training_config)
+        if isinstance(training_config, dict)
+        else asdict(training_config)
+        if training_config is not None
+        else {}
+    )
+    batch_size = int(resolved_training.get("batch_size", common["batch_size"]))
+    replay_capacity = int(
+        resolved_training.get("replay_max_size", common["replay_size"])
+    )
+    warmup = int(
+        resolved_training.get(
+            "warmup_joint_transitions", common["warmup_joint_transitions"]
+        )
+    )
     return {
         "movement_agent_kind": method_spec.agent,
         "movement_agent_gamma": common["gamma"],
         "tau": common["tau"] if method_spec.learns_movement else None,
+        "actor_learning_rate": (
+            common["actor_learning_rate"] if method_spec.learns_movement else None
+        ),
+        "critic_learning_rate": (
+            common["critic_learning_rate"] if method_spec.learns_movement else None
+        ),
+        "hidden_layers": (
+            list(common["hidden_layers"]) if method_spec.learns_movement else None
+        ),
+        "batch_size": batch_size,
+        "replay_capacity": replay_capacity,
+        "warmup_joint_transitions": warmup,
+        "exploration_noise_start": common["exploration_noise_start"],
+        "exploration_noise_end": common["exploration_noise_end"],
         "policy_delay": algorithm.get("policy_delay"),
         "target_policy_noise": algorithm.get("target_policy_noise"),
         "target_noise_clip": algorithm.get("target_noise_clip"),
         "twin_critics": bool(algorithm.get("twin_critics", False)),
+        "optimizer_update_scope": "every_movement_transition_after_warmup",
     }
 
 
@@ -354,7 +403,7 @@ def effective_training_config(config, method_spec: MethodSpec) -> dict:
     """Serialize formal config with method-specific movement settings resolved."""
 
     values = asdict(config) if not isinstance(config, dict) else dict(config)
-    movement = movement_agent_configuration(method_spec)
+    movement = movement_agent_configuration(method_spec, config)
     values["policy_delay"] = movement["policy_delay"]
     values["movement_agent_configuration"] = movement
     values.update(comparison_method_configuration(method_spec))
@@ -379,4 +428,38 @@ def comparison_method_configuration(method_spec: MethodSpec) -> dict:
         "task_compatibility_policy": TASK_COMPATIBILITY_POLICY,
         "hover_assignment_candidate": False,
         "assignment_dummy_utility": ASSIGNMENT_DUMMY_UTILITY,
+        "fov_assignment_utility_version": FOV_ASSIGNMENT_UTILITY_VERSION,
+        "fov_quality_transform": FOV_QUALITY_TRANSFORM,
+        "fov_coverage_source": FOV_COVERAGE_SOURCE,
+        "safe_ddqn_qos_cost_budget": (
+            SAFE_DDQN_QOS_COST_BUDGET
+            if method_spec.routing == "safe_ddqn"
+            else None
+        ),
+        "safe_ddqn_initial_lambda_cost": (
+            SAFE_DDQN_INITIAL_LAMBDA_COST
+            if method_spec.routing == "safe_ddqn"
+            else None
+        ),
+        "safe_ddqn_eta_c": (
+            SAFE_DDQN_ETA_C if method_spec.routing == "safe_ddqn" else None
+        ),
+        "safe_ddqn_lambda_update_scope": (
+            SAFE_DDQN_LAMBDA_UPDATE_SCOPE
+            if method_spec.routing == "safe_ddqn"
+            else None
+        ),
+        "safe_ddqn_evaluation_lambda_mode": (
+            SAFE_DDQN_EVALUATION_LAMBDA_MODE
+            if method_spec.routing == "safe_ddqn"
+            else None
+        ),
+        "routing_mask_scope": ROUTING_MASK_SCOPE,
+        "fov_ema_lifecycle_version": FOV_EMA_LIFECYCLE_VERSION,
+        "sr_route_lifecycle_version": SR_ROUTE_LIFECYCLE_VERSION,
+        "resolved_fov_deadline_seconds": PRODUCTION_TASK_DEADLINE_SECONDS["FOV"],
+        "resolved_com_deadline_seconds": PRODUCTION_TASK_DEADLINE_SECONDS["COM"],
+        "packet_injection_cutoff_seconds": (
+            PRODUCTION_PACKET_INJECTION_CUTOFF_SECONDS
+        ),
     }

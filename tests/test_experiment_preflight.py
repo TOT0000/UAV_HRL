@@ -68,6 +68,16 @@ class ExperimentPreflightTest(unittest.TestCase):
             "routing_state_dim": 126,
             "centralized_td3_gamma": 1.0,
             "routing_ddqn_gamma": 0.99,
+            "routing_agent_kind": "safe_ddqn",
+            "routing_agent_configuration": {
+                "lambda_cost": 0.0,
+                "initial_lambda_cost": 0.0,
+                "eta_c": 0.01,
+                "qos_cost_budget": 12.0,
+                "lambda_update_scope": "episode_end",
+                "cost_denominator": "network_routing_slot_steps",
+                "mid_episode_checkpoint_supported": False,
+            },
             "com_calibration_fingerprint": calibration_fingerprint(calibration),
             "experiment": {
                 "method_spec_fingerprint": self.method.fingerprint,
@@ -308,6 +318,16 @@ class ExperimentPreflightTest(unittest.TestCase):
                 "routing_state_dim": 126,
                 "centralized_td3_gamma": 1.0,
                 "routing_ddqn_gamma": 0.99,
+                "routing_agent_kind": "safe_ddqn",
+                "routing_agent_configuration": {
+                    "lambda_cost": 0.0,
+                    "initial_lambda_cost": 0.0,
+                    "eta_c": 0.01,
+                    "qos_cost_budget": 12.0,
+                    "lambda_update_scope": "episode_end",
+                    "cost_denominator": "network_routing_slot_steps",
+                    "mid_episode_checkpoint_supported": False,
+                },
                 "com_calibration_fingerprint": calibration_fingerprint(
                     calibration
                 ),

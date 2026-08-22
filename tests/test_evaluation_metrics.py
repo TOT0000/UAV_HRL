@@ -122,6 +122,9 @@ class EvaluationModeIntegrationTest(unittest.TestCase):
             checkpoint_dinkelbach_state = checkpoint_metadata["experiment"][
                 "dinkelbach_state"
             ]
+            checkpoint_constraint_state = checkpoint_metadata[
+                "routing_agent_configuration"
+            ]
 
             evaluation_config = TrainingConfig(
                 total_episodes=1,
@@ -151,6 +154,16 @@ class EvaluationModeIntegrationTest(unittest.TestCase):
         self.assertEqual(result["routing_replay_size"], 0)
         self.assertEqual(result["dinkelbach_update_count"], 0)
         self.assertEqual(result["dinkelbach_state"], checkpoint_dinkelbach_state)
+        for field, value in result["safe_ddqn_constraint_state"].items():
+            self.assertEqual(value, checkpoint_constraint_state[field])
+        self.assertEqual(
+            result["lambda_cost_used_log"],
+            [checkpoint_constraint_state["lambda_cost"]],
+        )
+        self.assertEqual(
+            result["lambda_cost_after_episode_log"],
+            [checkpoint_constraint_state["lambda_cost"]],
+        )
         self.assertEqual(len(result["episode_metrics"]), 1)
         self.assertEqual(
             result["episode_metrics"][0]["scenario_id"],

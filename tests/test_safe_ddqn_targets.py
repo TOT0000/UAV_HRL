@@ -18,11 +18,11 @@ class FixedNetwork(nn.Module):
 
 
 class SafeDDQNTargetTest(unittest.TestCase):
-    def test_negative_cost_gets_no_bonus_and_matches_execution_scoring(self):
+    def test_exact_unclamped_lagrangian_score_matches_execution_and_target(self):
         model = DDQN.__new__(DDQN)
         model.action_dim = 3
         model.gamma = 0.9
-        model.eta = 1.0
+        model.lambda_cost = 1.0
 
         model.q_network = FixedNetwork([[0.0, 1.0, 2.0]])
         model.cost_network = FixedNetwork([[0.0, -10.0, 0.0]])
@@ -47,13 +47,13 @@ class SafeDDQNTargetTest(unittest.TestCase):
             not_done=torch.tensor([[0.0]]),
         )
 
-        # Without clamping, action 1 would receive a +10 bonus from negative cost.
+        # The required score is exactly Q - lambda*C, including learned negatives.
         raw_cost_scores = torch.tensor([0.0, 1.0, 2.0]) - torch.tensor(
             [0.0, -10.0, 0.0]
         )
         self.assertEqual(raw_cost_scores.argmax().item(), 1)
-        self.assertEqual(execution_action, 2)
-        self.assertEqual(target_actions.item(), 2)
+        self.assertEqual(execution_action, 1)
+        self.assertEqual(target_actions.item(), 1)
         self.assertEqual(target_q.item(), 2.0)
         self.assertEqual(target_c.item(), -4.0)
 
@@ -61,7 +61,7 @@ class SafeDDQNTargetTest(unittest.TestCase):
         model = DDQN.__new__(DDQN)
         model.action_dim = 3
         model.gamma = 0.9
-        model.eta = 1.0
+        model.lambda_cost = 1.0
 
         model.q_network = FixedNetwork([[1.0, 100.0, 8.0], [1.0, 100.0, 8.0]])
         model.cost_network = FixedNetwork([[0.0, 1.0, 1.0], [0.0, 1.0, 1.0]])
@@ -95,7 +95,7 @@ class SafeDDQNTargetTest(unittest.TestCase):
         model = DDQN.__new__(DDQN)
         model.action_dim = 3
         model.gamma = 0.9
-        model.eta = 1.0
+        model.lambda_cost = 1.0
         model.q_network = FixedNetwork([[100.0, 1.0, 200.0]])
         model.cost_network = FixedNetwork([[0.0, 0.0, 0.0]])
         model.target_q_network = FixedNetwork([[10.0, 20.0, 30.0]])
@@ -144,6 +144,29 @@ class SafeDDQNTargetTest(unittest.TestCase):
 
         self.assertEqual(len(model.loss_log), 1)
         self.assertEqual(len(model.cost_loss_log), 1)
+
+    def test_constraint_defaults_and_episode_end_update_formula(self):
+        model = DDQN(state_dim=42, action_dim=3, hidden_dim=8)
+        self.assertEqual(model.qos_cost_budget, 12.0)
+        self.assertEqual(model.lambda_cost, 0.0)
+        self.assertEqual(model.eta_c, 0.01)
+
+        increased = model.update_cost_multiplier(
+            episode_cost_sum=20.0 * 240,
+            episode_slot_steps=240,
+        )
+        self.assertAlmostEqual(increased, 0.08)
+        self.assertEqual(model.cost_multiplier_update_count, 1)
+        decreased = model.update_cost_multiplier(
+            episode_cost_sum=0.0,
+            episode_slot_steps=240,
+        )
+        self.assertEqual(decreased, 0.0)
+        self.assertEqual(model.cost_multiplier_update_count, 2)
+        state = model.constraint_state()
+        self.assertEqual(state["lambda_update_scope"], "episode_end")
+        self.assertEqual(state["cost_denominator"], "network_routing_slot_steps")
+        self.assertFalse(state["mid_episode_checkpoint_supported"])
 
 
 if __name__ == "__main__":

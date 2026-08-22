@@ -9,13 +9,13 @@ import random
 import numpy as np
 from scipy.optimize import linear_sum_assignment
 
+from centralized_movement import fov_task_metrics
 from experiment_config import (
     ASSIGNMENT_DUMMY_UTILITY,
     FOV_COM_PAIR_MAX_DISTANCE_M,
     SEARCH_COVERAGE_THRESHOLD,
     SEARCH_UTILITY,
 )
-from Fov_model_phase import FovModel
 
 
 ASSIGNMENT_TASK_TYPES = ("FOV", "COM", "Search")
@@ -32,6 +32,44 @@ class AssignmentProblem:
     feasible_mask: np.ndarray
     raw_fov_utility: np.ndarray
     raw_com_utility: np.ndarray
+    raw_fov_coverage: np.ndarray | None = None
+    raw_fov_image_quality: np.ndarray | None = None
+
+
+def fov_quality_transform(image_quality):
+    """Apply the assignment-only reciprocal quality policy to production I."""
+
+    value = float(image_quality)
+    if not math.isfinite(value) or value <= 0.0:
+        return 0.0
+    return value if value <= 1.0 else 1.0 / value
+
+
+def assignment_fov_pair_metrics(env, uav_id, task):
+    """Reuse the movement path's ROI coverage and geometric image quantity."""
+
+    target = task.target_obj
+    descriptor = {
+        "task_type": "FOV",
+        "target_obj_id": int(task.target_obj_id),
+        "target_pos": (
+            float(target.x),
+            float(target.y),
+            float(getattr(target, "z", 0.0)),
+        ),
+    }
+    coverage, image_quality, geometry_valid = fov_task_metrics(
+        env, int(uav_id), descriptor
+    )
+    coverage = float(coverage)
+    if not math.isfinite(coverage):
+        coverage = 0.0
+    coverage = min(max(coverage, 0.0), 1.0)
+    return (
+        coverage,
+        float(image_quality),
+        bool(geometry_valid),
+    )
 
 
 def normalize_feasible_values(raw_values, feasible_mask):
@@ -84,12 +122,12 @@ def fov_com_pair_is_feasible(
     return fov_com_distance_m(fov_task, com_task) <= float(max_distance_m)
 
 
-def solve_assignment_with_dummies(
+def solve_assignment_plan_with_dummies(
     utility_matrix,
     feasible_mask,
     dummy_utility=ASSIGNMENT_DUMMY_UTILITY,
 ):
-    """Solve one round without exposing solver sentinels as domain utilities."""
+    """Return the deterministic real/dummy plan for one assignment round."""
 
     utility = np.asarray(utility_matrix, dtype=float)
     feasible = np.asarray(feasible_mask, dtype=bool)
@@ -104,14 +142,48 @@ def solve_assignment_with_dummies(
     solver_cost[:, :task_count][feasible] = -utility[feasible]
     solver_cost[:, task_count:] = -float(dummy_utility)
     rows, columns = linear_sum_assignment(solver_cost)
-    selected = []
-    for row, column in zip(rows.tolist(), columns.tolist()):
+    assignments = list(zip(rows.tolist(), columns.tolist()))
+    dummy_rows = sorted(row for row, column in assignments if column >= task_count)
+    dummy_columns = sorted(
+        column for _row, column in assignments if column >= task_count
+    )
+    canonical_dummy_by_row = dict(zip(dummy_rows, dummy_columns))
+    plan = []
+    for row, column in sorted(assignments):
         if column >= task_count:
+            canonical_column = canonical_dummy_by_row[row]
+            plan.append(
+                {
+                    "row": row,
+                    "task_column": None,
+                    "dummy_id": f"dummy_{canonical_column - task_count + 1}",
+                }
+            )
             continue
         if not feasible[row, column]:
             raise AssertionError("solver selected a task outside the feasible mask")
-        selected.append((row, column))
-    return selected
+        plan.append(
+            {"row": row, "task_column": column, "dummy_id": None}
+        )
+    return plan
+
+
+def solve_assignment_with_dummies(
+    utility_matrix,
+    feasible_mask,
+    dummy_utility=ASSIGNMENT_DUMMY_UTILITY,
+):
+    """Solve one round without exposing solver sentinels as domain utilities."""
+
+    return [
+        (entry["row"], entry["task_column"])
+        for entry in solve_assignment_plan_with_dummies(
+            utility_matrix,
+            feasible_mask,
+            dummy_utility=dummy_utility,
+        )
+        if entry["task_column"] is not None
+    ]
 
 
 class UAVAssigner:
@@ -208,34 +280,27 @@ class UAVAssigner:
         shape = (len(uav_ids), len(tasks))
         raw_fov = np.zeros(shape, dtype=float)
         raw_com = np.zeros(shape, dtype=float)
+        raw_fov_coverage = np.zeros(shape, dtype=float)
+        raw_fov_image_quality = np.zeros(shape, dtype=float)
         fov_feasible = np.zeros(shape, dtype=bool)
         com_feasible = np.zeros(shape, dtype=bool)
         search_feasible = np.zeros(shape, dtype=bool)
 
         for row, uav_id in enumerate(uav_ids):
-            uav = self.env.uav_dict[uav_id]
             for column, task in enumerate(tasks):
                 if task.task_type == "FOV":
                     gt = self.env.gts[int(task.target_obj_id)]
                     if not bool(gt.is_found):
                         continue
-                    model = FovModel(
-                        f=0.004,
-                        wl=0.008,
-                        i_l=0.012,
-                        z_u=float(uav.z_u),
-                        gamma_g=80,
+                    coverage, image_quality, geometry_valid = (
+                        assignment_fov_pair_metrics(self.env, uav_id, task)
                     )
-                    raw, _ = model.calculate_fov_single(
-                        float(uav.x_u),
-                        float(uav.y_u),
-                        float(uav.z_u),
-                        float(gt.x),
-                        float(gt.y),
-                        float(gt.z),
+                    raw_fov_coverage[row, column] = coverage
+                    raw_fov_image_quality[row, column] = image_quality
+                    raw_fov[row, column] = (
+                        coverage * fov_quality_transform(image_quality)
                     )
-                    if math.isfinite(float(raw)):
-                        raw_fov[row, column] = float(raw)
+                    if geometry_valid:
                         fov_feasible[row, column] = True
                 elif task.task_type == "COM":
                     sr = self.env.SR_teams[int(task.target_obj_id)]
@@ -252,7 +317,9 @@ class UAVAssigner:
 
         normalized_fov = normalize_feasible_values(raw_fov, fov_feasible)
         normalized_com = normalize_feasible_values(raw_com, com_feasible)
-        utility = normalized_fov + normalized_com
+        utility = np.zeros(shape, dtype=float)
+        utility[fov_feasible] = normalized_fov[fov_feasible]
+        utility[com_feasible] = normalized_com[com_feasible]
         utility[search_feasible] = float(search_utility)
         feasible = fov_feasible | com_feasible | search_feasible
         if not np.isfinite(utility).all():
@@ -265,6 +332,8 @@ class UAVAssigner:
             feasible_mask=feasible,
             raw_fov_utility=raw_fov,
             raw_com_utility=raw_com,
+            raw_fov_coverage=raw_fov_coverage,
+            raw_fov_image_quality=raw_fov_image_quality,
         )
 
     def _round_feasible_mask(

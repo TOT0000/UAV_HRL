@@ -185,7 +185,7 @@ class MovementMaskCheckpointTest(unittest.TestCase):
         )
         return movement, joint, result
 
-    def test_schema_four_round_trip_preserves_masks_value_for_value(self):
+    def test_current_schema_round_trip_preserves_masks_value_for_value(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             saved = self._save_checkpoint(temp_dir, "td3_dinkelbach_wo_ta")
             metadata = json.loads(
@@ -209,22 +209,12 @@ class MovementMaskCheckpointTest(unittest.TestCase):
         )
         self.assertTrue(restored.movement_mask_valid[0, 0])
 
-    def test_legacy_full_observation_reconstructs_masks_from_replay_states(self):
+    def test_pre_adaptive_safe_checkpoint_is_rejected_before_restore(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             saved = self._save_checkpoint(temp_dir, "td3_dinkelbach")
             self._downgrade_to_pre_mask_schema(saved["checkpoint"])
-            _, restored, result = self._load(saved)
-        self.assertEqual(
-            result["metadata"]["checkpoint_schema_version"],
-            PRE_MOVEMENT_MASK_CHECKPOINT_SCHEMA_VERSION,
-        )
-        np.testing.assert_array_equal(
-            restored.current_movement_mask[0], saved["current_mask"]
-        )
-        np.testing.assert_array_equal(
-            restored.next_movement_mask[0], saved["next_mask"]
-        )
-        self.assertTrue(restored.movement_mask_valid[0, 0])
+            with self.assertRaisesRegex(RuntimeError, "legacy safe-DDQN"):
+                self._load(saved)
 
     def test_legacy_masked_checkpoint_is_rejected_before_network_restore(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -237,7 +227,7 @@ class MovementMaskCheckpointTest(unittest.TestCase):
             }
             with self.assertRaisesRegex(
                 RuntimeError,
-                "legacy masked-observation.*lacks true movement projection masks",
+                "legacy safe-DDQN",
             ):
                 load_full_resume_checkpoint(
                     saved["checkpoint"],
@@ -260,7 +250,7 @@ class MovementMaskCheckpointTest(unittest.TestCase):
                 self.assertTrue(torch.equal(movement.actor.state_dict()[key], expected))
             self.assertEqual(joint.size, 0)
 
-    def test_pre_mask_model_only_checkpoint_remains_loadable(self):
+    def test_pre_adaptive_model_only_checkpoint_is_rejected(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             movement, routing_agent, _, _ = self._components()
             checkpoint = Path(temp_dir) / "model" / "ep_0001"
@@ -283,20 +273,17 @@ class MovementMaskCheckpointTest(unittest.TestCase):
                 json.dumps(metadata, indent=2) + "\n", encoding="utf-8"
             )
             restored_movement, restored_routing, _, _ = self._components()
-            load_model_checkpoint(
-                checkpoint,
-                restored_movement,
-                restored_routing,
-                movement_state_dim=MOVEMENT_STATE_DIM,
-                joint_action_dim=JOINT_ACTION_DIM,
-                routing_state_dim=ROUTING_STATE_DIM,
-                calibration=self.calibration,
-                expected_completed_episodes=1,
-            )
-        for key, expected in movement.actor.state_dict().items():
-            self.assertTrue(
-                torch.equal(restored_movement.actor.state_dict()[key], expected)
-            )
+            with self.assertRaisesRegex(RuntimeError, "legacy safe-DDQN"):
+                load_model_checkpoint(
+                    checkpoint,
+                    restored_movement,
+                    restored_routing,
+                    movement_state_dim=MOVEMENT_STATE_DIM,
+                    joint_action_dim=JOINT_ACTION_DIM,
+                    routing_state_dim=ROUTING_STATE_DIM,
+                    calibration=self.calibration,
+                    expected_completed_episodes=1,
+                )
 
 
 if __name__ == "__main__":

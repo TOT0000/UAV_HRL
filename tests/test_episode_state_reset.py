@@ -22,6 +22,8 @@ class EpisodeScopedRoutingStateTest(unittest.TestCase):
                 backlog_bits=reused.backlog_bits,
                 action_mask=env.get_routing_action_mask(0),
             )
+        self.assertEqual(reused.fov_ema, {})
+        reused.update_fov_ema(env, "scenario-a-map")
         self.assertIn(0, reused.fov_ema)
         self.assertTrue(any(value != 0.0 for value in reused.fov_ema[0].values()))
 

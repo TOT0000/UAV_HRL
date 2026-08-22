@@ -29,6 +29,15 @@ solver-only infinities never enter the domain utility matrix. K-KM uses at most
 two rounds, and FOV+COM is its only legal two-task combination, with current
 horizontal targets no more than 200 m apart.
 
+FOV assignment uses the production pair geometry from
+`centralized_movement.fov_task_metrics`. Its raw utility is
+`coverage * q(I)`, where `q(I)=0` for non-finite or non-positive `I`, `q(I)=I`
+for `0<I<=1`, and `q(I)=1/I` for `I>1`. Geometry feasibility remains a separate
+mask, so a finite pair with `I>1` stays feasible. No FOV/COM blend, clipping,
+bonus, penalty, or all-zero fallback is applied. The seeded random-assignment
+baseline bypasses these utilities entirely. Equal dummy candidates are reported
+as `dummy_1`, `dummy_2`, ... in deterministic row/ID order.
+
 ```powershell
 python -X utf8 run_experiment.py td3_dinkelbach
 python -X utf8 run_experiment.py ddpg_ratio --smoke
@@ -67,6 +76,21 @@ design-dataset collection, aggregation, and exact-resume workflows.
 - inclusive RoI count range 2 through 8
 - 60 seconds per episode
 - four 0.25-second routing slots per movement interval
+- physical and effective routing masks recomputed in every routing slot for
+  safe-DDQN, controlled DQN, and random routing
+- safe-DDQN QoS budget `12`, initial `lambda_cost=0`, and `eta_c=0.01`; every
+  episode uses one frozen multiplier for both executed and target actions, then
+  updates it once with
+  `max(0, lambda_cost + eta_c * (network_violation_cost / TS - 12))`, where
+  `TS=240` routing slot-steps in a formal 60-second episode
+- production FOV/COM deadlines `1.5 s`/`1.0 s`; completion at the exact deadline
+  is timely
+- production packet injection cutoff `58.5 s`
+- FOV EMA is advanced only by episode-map/reset lifecycle hooks; routing state
+  getters are pure reads. SR routes omit the duplicated start point, include the
+  exact target, and mark arrival on the update that consumes the final waypoint.
+  Full checkpoints persist both lifecycle states as episode-boundary snapshots;
+  mid-episode checkpointing is explicitly unsupported.
 - 100 evaluation episodes
 - formal model checkpoint `ep_2500`
 - TD3 noise, DDQN epsilon, and DDQN logits noise disabled in evaluation
@@ -224,7 +248,12 @@ python -X utf8 comparison_experiment.py aggregate --input-dir runs/comparison/ev
 
 Exact-resume checkpoints validate the method fingerprint, training-manifest
 hash, training seed, the complete Dinkelbach block state, and its configuration.
-Checkpoint schema v3 stores the terminal direct-ratio objective in joint replay.
+Checkpoint schema v5 stores adaptive safe-DDQN constraint state and the shared
+FOV-EMA lifecycle state. Schema-v4 safe-DDQN checkpoints are explicitly rejected
+because they do not contain `lambda_cost`, `eta_c`, and the QoS budget; other
+older routing types remain subject to their existing type and formal-config
+compatibility validation. Checkpoint schema v3 stores the terminal direct-ratio
+objective in joint replay.
 Schema-v2 Dinkelbach TD3/DDPG checkpoints remain loadable; schema-v2 ratio
 checkpoints are explicitly rejected because their per-transition `B/E` values
 cannot be migrated without episode-boundary information. A partial Dinkelbach
@@ -358,7 +387,10 @@ without the complete provenance triplet are intentionally rejected.
 Each sweep point writes per-episode data plus `aggregated_plot_data.csv/json`.
 Its metadata also persists the actual manifest path and canonical hash,
 scenario IDs, evaluation count/horizon/seed, 16-UAV count, and fully resolved
-traffic-rate/deadline overrides.
+traffic-rate/deadline/cutoff overrides. The deadline-violation (Fig. 6) sweep
+uses a scoped `57.0 s` packet-injection cutoff so its maximum `3.0 s` deadline
+can resolve within the 60-second horizon; other training and evaluation suites
+retain the production `58.5 s` cutoff.
 Delay is pooled as total delivered E2E delay divided by total delivered packet
 count. Violation probability is pooled violations divided by generated packet
 count. A delay with no delivered packets is `null` with `missing=true`. EE

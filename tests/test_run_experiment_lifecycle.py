@@ -125,6 +125,11 @@ class SimpleRunnerLifecycleIntegrationTest(unittest.TestCase):
             self.assertEqual(ep1_state["total_joint_transitions"], 2)
             self.assertEqual(ep1_state["global_routing_slot"], 8)
             self.assertEqual(len(ep1_state["routing_epsilon_log"]), 8)
+            self.assertEqual(ep1_state["lambda_cost_used_log"], [0.0])
+            self.assertEqual(
+                ep1_state["lambda_cost_after_episode_log"], [0.0]
+            )
+            self.assertIn("fov_ema_state", ep1_state)
             self.assertEqual(ep1_state["td3_noise_log"], [])
             self.assertEqual(ep1_payload["replay_metadata"]["joint"]["size"], 2)
             with np.load(
@@ -206,6 +211,16 @@ class SimpleRunnerLifecycleIntegrationTest(unittest.TestCase):
             self.assertEqual(final_state["td3_post_warmup_transition"], 0)
             self.assertEqual(len(final_state["routing_epsilon_log"]), 24)
             self.assertEqual(final_state["td3_noise_log"], [])
+            self.assertEqual(final_state["lambda_cost_used_log"], [0.0] * 3)
+            self.assertEqual(
+                final_state["lambda_cost_after_episode_log"], [0.0] * 3
+            )
+            self.assertEqual(
+                final_payload["ddqn_state"]["constraint_state"][
+                    "cost_multiplier_update_count"
+                ],
+                3,
+            )
             self.assertEqual(final_state["lambda_used_log"], [None, None, None])
             self.assertEqual(
                 final_state["lambda_after_episode_log"], [None, None, None]

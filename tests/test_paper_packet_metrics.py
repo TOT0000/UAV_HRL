@@ -1,7 +1,11 @@
 import unittest
 from types import SimpleNamespace
 
-from Packet_scheduler_v1 import PacketEngine, TASK_DEADLINE_SECONDS
+from Packet_scheduler_v1 import (
+    EPISODE_INJECTION_CUTOFF_SECONDS,
+    PacketEngine,
+    TASK_DEADLINE_SECONDS,
+)
 
 
 class PaperPacketMetricTest(unittest.TestCase):
@@ -85,6 +89,15 @@ class PaperPacketMetricTest(unittest.TestCase):
             base_ctrl_rate=0.0,
         )
         self.assertEqual(engine.generated_packet_counts["COM"], 1)
+
+    def test_packet_injection_cutoff_override_is_instance_scoped(self):
+        production = PacketEngine(num_uav=1)
+        deadline_sweep = PacketEngine(
+            num_uav=1, injection_cutoff_seconds=57.0
+        )
+        self.assertEqual(production.injection_cutoff_seconds, 58.5)
+        self.assertEqual(deadline_sweep.injection_cutoff_seconds, 57.0)
+        self.assertEqual(EPISODE_INJECTION_CUTOFF_SECONDS, 58.5)
 
 
 if __name__ == "__main__":

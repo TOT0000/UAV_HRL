@@ -14,7 +14,10 @@ from experiment_config import (
     effective_training_config,
 )
 from HRL_task_aware import formal_training_config
-from Packet_scheduler_v1 import TASK_DEADLINE_SECONDS
+from Packet_scheduler_v1 import (
+    EPISODE_INJECTION_CUTOFF_SECONDS,
+    TASK_DEADLINE_SECONDS,
+)
 from paper_evaluation import (
     PAPER_EVALUATION_SUITES,
     aggregate_paper_point_metrics,
@@ -141,7 +144,7 @@ class SyntheticFigureBuildTest(unittest.TestCase):
                     "dinkelbach_state": state.training_state(),
                 }
             )
-        return {
+        metadata = {
             "checkpoint_schema_version": CHECKPOINT_SCHEMA_VERSION,
             "checkpoint_type": MODEL_CHECKPOINT_TYPE,
             "episode": 2499,
@@ -151,6 +154,18 @@ class SyntheticFigureBuildTest(unittest.TestCase):
             ],
             "experiment": experiment,
         }
+        metadata["routing_agent_kind"] = method.routing
+        if method.routing == "safe_ddqn":
+            metadata["routing_agent_configuration"] = {
+                "lambda_cost": 0.0,
+                "initial_lambda_cost": 0.0,
+                "eta_c": 0.01,
+                "qos_cost_budget": 12.0,
+                "lambda_update_scope": "episode_end",
+                "cost_denominator": "network_routing_slot_steps",
+                "mid_episode_checkpoint_supported": False,
+            }
+        return metadata
 
     @staticmethod
     def _write_synthetic_models(path, marker):
@@ -244,7 +259,17 @@ class SyntheticFigureBuildTest(unittest.TestCase):
         return {
             "traffic_rates_packets_per_second": rates,
             "task_deadlines_seconds": deadlines,
-            "units": {"traffic_rate": "packets/s", "deadline": "seconds"},
+            "packet_injection_cutoff_seconds": float(
+                point["overrides"].get(
+                    "packet_injection_cutoff_seconds",
+                    EPISODE_INJECTION_CUTOFF_SECONDS,
+                )
+            ),
+            "units": {
+                "traffic_rate": "packets/s",
+                "deadline": "seconds",
+                "packet_injection_cutoff": "seconds",
+            },
         }
 
     @staticmethod

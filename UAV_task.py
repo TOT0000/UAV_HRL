@@ -1,6 +1,7 @@
 import numpy as np
 import math
 import matplotlib.pyplot as plt
+from object import straight_line_route
 # from Environment import UAVEnvironment
 # from Fov_model import FovModel
 # from Channel_model import ChannelModel
@@ -81,25 +82,8 @@ class UAVTask:
     @staticmethod
     def move_towards_target(start, goal, v_max=1, time=360):
         """搜救隊移動路徑(靠近地面目標)"""
-        """ 
-        讓搜救隊朝著目標前進，每次移動 step_size 的距離 
-        """
-        path = [start[:2]]
-        current_pos = np.array(start[:2])
-        goal = np.array(goal[:2])
-        time_elapsed = 0  # 記錄時間 (秒)
-        
-        while time_elapsed < time:
-            if np.linalg.norm(current_pos - goal) <= v_max:  
-                break  # ✅ 如果下一步可以到 `goal`，就停止
-
-            direction = (goal - current_pos) / np.linalg.norm(goal - current_pos)
-            current_pos = current_pos + direction * v_max
-            path.append(tuple(current_pos))
-            time_elapsed += 1
-
-        # path.append(tuple(goal))  # 抵達目標
-        # print(path)
-        return np.array(path)
+        del time
+        route = straight_line_route(start, goal, speed=v_max)
+        return np.asarray(route, dtype=float).reshape((-1, 2))
     
     

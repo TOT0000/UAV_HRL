@@ -10,8 +10,10 @@ from Task_assignment import (
     AssignmentProblem,
     Task,
     UAVAssigner,
+    fov_quality_transform,
     fov_com_pair_is_feasible,
     normalize_feasible_values,
+    solve_assignment_plan_with_dummies,
     solve_assignment_with_dummies,
 )
 
@@ -36,8 +38,8 @@ class AssignmentUtilityTest(unittest.TestCase):
         assigner = UAVAssigner(self.env)
         with (
             mock.patch(
-                "Task_assignment.FovModel.calculate_fov_single",
-                side_effect=[(2.0, None), (4.0, None)],
+                "Task_assignment.assignment_fov_pair_metrics",
+                side_effect=[(0.25, 1.0, True), (1.0, 1.0, True)],
             ),
             mock.patch.object(
                 self.env,
@@ -52,8 +54,39 @@ class AssignmentUtilityTest(unittest.TestCase):
         np.testing.assert_allclose(problem.utility_matrix[:, 1], [0.0, 1.0])
         np.testing.assert_allclose(problem.utility_matrix[:, 2], [0.05, 0.05])
         self.assertTrue(problem.feasible_mask.all())
-        self.assertGreater(problem.raw_fov_utility[0, 0], 1.0)
+        np.testing.assert_allclose(problem.raw_fov_utility[:, 0], [0.25, 1.0])
+        np.testing.assert_allclose(problem.raw_fov_coverage[:, 0], [0.25, 1.0])
+        np.testing.assert_allclose(problem.raw_fov_image_quality[:, 0], [1.0, 1.0])
         self.assertTrue(np.isfinite(problem.utility_matrix).all())
+
+    def test_fov_quality_transform_piecewise_policy_is_finite(self):
+        cases = (
+            (-1.0, 0.0),
+            (0.0, 0.0),
+            (0.5, 0.5),
+            (1.0, 1.0),
+            (2.0, 0.5),
+            (float("nan"), 0.0),
+            (float("inf"), 0.0),
+        )
+        for value, expected in cases:
+            with self.subTest(value=value):
+                transformed = fov_quality_transform(value)
+                self.assertTrue(np.isfinite(transformed))
+                self.assertEqual(transformed, expected)
+
+    def test_fov_coverage_multiplies_quality_and_i_above_one_remains_feasible(self):
+        gt = self.env.gts[0]
+        gt.is_found = True
+        task = Task(0, "FOV", gt, gt.id)
+        with mock.patch(
+            "Task_assignment.assignment_fov_pair_metrics",
+            return_value=(0.4, 2.0, True),
+        ):
+            problem = UAVAssigner(self.env).build_problem([0], [task])
+        self.assertAlmostEqual(problem.raw_fov_utility[0, 0], 0.2)
+        self.assertTrue(problem.feasible_mask[0, 0])
+        self.assertAlmostEqual(problem.utility_matrix[0, 0], 0.5)
 
     def test_normalization_uses_only_feasible_values_and_equal_values_are_neutral(self):
         raw = np.asarray([[5.0, -999.0], [5.0, 999.0]])
@@ -68,6 +101,16 @@ class AssignmentUtilityTest(unittest.TestCase):
             np.asarray([[False], [False]]),
         )
         self.assertEqual(selected, [])
+
+    def test_dummy_ids_are_canonicalized_lexicographically(self):
+        plan = solve_assignment_plan_with_dummies(
+            np.zeros((3, 0), dtype=float),
+            np.zeros((3, 0), dtype=bool),
+        )
+        self.assertEqual(
+            [entry["dummy_id"] for entry in plan],
+            ["dummy_1", "dummy_2", "dummy_3"],
+        )
 
     def test_hover_and_search_are_excluded_after_threshold(self):
         self.env.visited_bitmap[:] = True
@@ -223,7 +266,11 @@ class AssignmentLifecycleTest(unittest.TestCase):
             Task(99, "Hovering", self.env.uav_dict[0], 0)
         )
         random.seed(1234)
-        self.env.assign_tasks()
+        with mock.patch(
+            "Task_assignment.assignment_fov_pair_metrics",
+            side_effect=AssertionError("random assignment must not score utilities"),
+        ):
+            self.env.assign_tasks()
         first = {
             uid: tuple(task["target_id"] for task in tasks)
             for uid, tasks in self.env.multi_tasks.items()
