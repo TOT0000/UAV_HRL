@@ -135,7 +135,12 @@ class ControlledMethodRegistryTest(unittest.TestCase):
                 self.assertEqual(result["movement_state_dim"], 429)
                 self.assertEqual(result["joint_action_dim"], 30)
                 self.assertEqual(result["proposal_batches"], 4)
+                self.assertIsNone(result["packet_outcome_artifacts"])
                 metadata = result["run_metadata"]
+                self.assertFalse(metadata["collect_packet_outcomes"])
+                self.assertEqual(
+                    metadata["packet_outcome_artifact_mode"], "disabled"
+                )
                 self.assertEqual(metadata["assignment_strategy"], spec.assignment)
                 self.assertEqual(metadata["assignment_rounds"], spec.assignment_rounds)
                 self.assertEqual(metadata["movement_policy"], spec.agent)

@@ -73,6 +73,15 @@ from observation_strategy import (
     apply_observation_strategy,
     masked_observation_metadata,
 )
+from packet_outcome_artifacts import (
+    MAX_BOUNDED_PACKET_OUTCOME_EPISODES,
+    PACKET_OUTCOME_ARTIFACT_MODES,
+    PACKET_OUTCOME_ARTIFACT_SCHEMA_VERSION,
+    PACKET_OUTCOME_MODE_BOUNDED,
+    PACKET_OUTCOME_MODE_DISABLED,
+    PACKET_OUTCOME_MODE_STREAMING,
+    packet_outcome_episode_record,
+)
 from routing_agents import create_routing_agent
 from routing_lifecycle import RoutingLearnerLifecycle
 from training_checkpoint import (
@@ -214,10 +223,57 @@ class TrainingConfig:
     enable_csv: bool = True
     random_seed: int | None = None
     run_directory: str | None = None
+    collect_packet_outcomes: bool = False
+    packet_outcome_artifact_mode: str = PACKET_OUTCOME_MODE_DISABLED
+    packet_outcome_collection_limit: int = 0
 
     def __post_init__(self):
         if self.mode not in {"smoke", "train", "custom"}:
             raise ValueError(f"unsupported training mode: {self.mode}")
+        if self.packet_outcome_artifact_mode not in PACKET_OUTCOME_ARTIFACT_MODES:
+            raise ValueError(
+                "unsupported packet outcome artifact mode: "
+                f"{self.packet_outcome_artifact_mode}"
+            )
+        if type(self.collect_packet_outcomes) is not bool:
+            raise TypeError("collect_packet_outcomes must be boolean")
+        bounded = self.packet_outcome_artifact_mode == PACKET_OUTCOME_MODE_BOUNDED
+        if self.collect_packet_outcomes != bounded:
+            raise ValueError(
+                "collect_packet_outcomes is true only for bounded_memory mode"
+            )
+        if self.mode == "train" and self.packet_outcome_artifact_mode != (
+            PACKET_OUTCOME_MODE_DISABLED
+        ):
+            raise ValueError(
+                "formal training requires packet outcome artifact mode disabled"
+            )
+        if self.resume_dir is not None and self.packet_outcome_artifact_mode != (
+            PACKET_OUTCOME_MODE_DISABLED
+        ):
+            raise ValueError(
+                "full-resume training requires packet outcome artifact mode disabled"
+            )
+        if bounded:
+            if not (
+                1
+                <= int(self.packet_outcome_collection_limit)
+                <= MAX_BOUNDED_PACKET_OUTCOME_EPISODES
+            ):
+                raise ValueError(
+                    "bounded packet outcome collection requires a positive limit "
+                    f"no greater than {MAX_BOUNDED_PACKET_OUTCOME_EPISODES}"
+                )
+            if int(self.total_episodes) > int(
+                self.packet_outcome_collection_limit
+            ):
+                raise ValueError(
+                    "bounded packet outcome collection limit is below total episodes"
+                )
+        elif int(self.packet_outcome_collection_limit) != 0:
+            raise ValueError(
+                "packet outcome collection limit is valid only in bounded_memory mode"
+            )
         slots = 1.0 / float(self.routing_slot_seconds)
         if not np.isclose(slots, MOVEMENT_CONTROL_INTERVAL):
             raise ValueError("movement interval must contain exactly four routing slots")
@@ -980,6 +1036,17 @@ def _experiment_identity(
         "movement_interval_seconds": MOVEMENT_INTERVAL_SECONDS,
         "routing_slot_seconds": float(config.routing_slot_seconds),
         "num_uav": NUM_UAV,
+        "collect_packet_outcomes": bool(config.collect_packet_outcomes),
+        "packet_outcome_artifact_mode": config.packet_outcome_artifact_mode,
+        "packet_outcome_collection_limit": int(
+            config.packet_outcome_collection_limit
+        ),
+        "packet_outcome_artifact_schema_version": (
+            PACKET_OUTCOME_ARTIFACT_SCHEMA_VERSION
+            if config.packet_outcome_artifact_mode
+            != PACKET_OUTCOME_MODE_DISABLED
+            else None
+        ),
         "routing_slots_per_episode": resolved_exploration[
             "routing_slots_per_episode"
         ],
@@ -1335,6 +1402,7 @@ def train(
     evaluation_overrides=None,
     trajectory_snapshot_times=None,
     trajectory_target_uav_id=None,
+    packet_outcome_sink=None,
 ):
     if config is None:
         raise ValueError(
@@ -1351,6 +1419,16 @@ def train(
     formal_config = effective_training_config(config, method_spec)
     resolved_exploration = exploration_schedule_configuration(config, method_spec)
     resolved_routing = routing_agent_configuration(method_spec, config)
+    packet_outcome_mode = config.packet_outcome_artifact_mode
+    if packet_outcome_mode == PACKET_OUTCOME_MODE_STREAMING:
+        if packet_outcome_sink is None or not callable(packet_outcome_sink):
+            raise ValueError(
+                "stream_jsonl packet outcome mode requires a callable per-episode sink"
+            )
+    elif packet_outcome_sink is not None:
+        raise ValueError(
+            "a packet outcome sink is valid only in stream_jsonl mode"
+        )
     if scenario_manifest is not None:
         if scenario_manifest.episode_count < config.total_episodes:
             raise ValueError(
@@ -1595,7 +1673,10 @@ def train(
     lambda_cost_after_episode_log = []
     episode_metrics = []
     trajectory_artifacts = []
-    packet_outcome_artifacts = []
+    packet_outcome_artifacts = (
+        [] if packet_outcome_mode == PACKET_OUTCOME_MODE_BOUNDED else None
+    )
+    packet_outcome_streamed_episode_count = 0
     if config.resume_dir is not None:
         if not os.path.isdir(config.resume_dir):
             raise FileNotFoundError(f"centralized checkpoint not found: {config.resume_dir}")
@@ -2203,13 +2284,19 @@ def train(
             lambda_cost_after_episode_log.append(
                 float(lambda_cost_after_episode)
             )
-        packet_outcome_artifacts.append(
-            {
-                "scenario_id": scenario_id,
-                "packet_outcomes": copy.deepcopy(packet_engine.packet_outcomes),
-                "summary": copy.deepcopy(packet_metrics),
-            }
-        )
+        if packet_outcome_mode != PACKET_OUTCOME_MODE_DISABLED:
+            packet_outcome_record = packet_outcome_episode_record(
+                scenario_id,
+                packet_metrics,
+                packet_engine.packet_outcomes,
+            )
+            if packet_outcome_mode == PACKET_OUTCOME_MODE_BOUNDED:
+                packet_outcome_artifacts.append(
+                    copy.deepcopy(packet_outcome_record)
+                )
+            else:
+                packet_outcome_sink(packet_outcome_record)
+                packet_outcome_streamed_episode_count += 1
         if requested_snapshot_times:
             trajectory_artifacts.append(
                 {
@@ -2806,6 +2893,9 @@ def train(
         "scenario_ids": executed_scenario_ids,
         "episode_metrics": episode_metrics,
         "packet_outcome_artifacts": packet_outcome_artifacts,
+        "packet_outcome_streamed_episode_count": (
+            packet_outcome_streamed_episode_count
+        ),
         "trajectory_artifacts": [
             {
                 **artifact,
@@ -2919,6 +3009,9 @@ def train(
             },
             "evaluation": bool(evaluation),
             "checkpoint_required": checkpoint_required,
+            "packet_outcome_streamed_episode_count": (
+                packet_outcome_streamed_episode_count
+            ),
             "evaluation_overrides": (
                 resolved_evaluation if evaluation else None
             ),

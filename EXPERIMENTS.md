@@ -323,6 +323,17 @@ override `--expected-seed-count` and `--expected-episodes-per-seed` explicitly.
 Aggregation writes `cross_seed_summary.csv`, JSON, and Student-t methodology in
 `aggregation_metadata.json`.
 
+Formal training uses `packet_outcome_artifact_mode=disabled` and
+`collect_packet_outcomes=false`. It never retains a cross-episode list of raw
+packet dictionaries; episode-local outcomes are released after the existing
+QoS, timely-goodput, task diagnostic, reward, energy, and training-history
+aggregates have been computed. `run_metadata.json` and the resolved config
+record the mode, the in-memory collection flag, and the bounded collection
+limit. Full-resume and model checkpoints contain no raw packet-outcome list.
+The `bounded_memory` mode exists only as an explicit test/debug facility,
+requires `collect_packet_outcomes=true`, and accepts at most 16 episodes. It is
+rejected for formal or resumed training.
+
 Every canonical training run writes canonical `training_history.jsonl`, its
 derived tabular projection `training_history.csv`, and
 `training_history_commit.json`. They contain one identical row per completed
@@ -358,6 +369,16 @@ model. Learned methods require the completed formal `ep_1500` run. The pure
 random `kkm_random_action_random_routing` baseline must omit `--run-dir`; it
 loads no model, creates no fake `models.pt`, and records
 `checkpoint_required=false`.
+
+Each production paper sweep point streams its raw packet diagnostics directly
+to `packet_outcomes.jsonl`, flushing one complete episode before starting the
+next. The in-memory all-episode artifact field remains disabled. Every JSONL
+record contains `scenario_id`, the episode packet summary, the original raw
+`packet_outcomes`, and
+`artifact_schema_version=uav-hrl-packet-outcomes-jsonl-v1`. The collection
+mode, artifact schema, output path, and written episode count are recorded in
+metadata. Writer/open/serialization errors fail the evaluation, and the stream
+is closed on both successful and exceptional exits.
 
 The canonical evaluation suites are `training_ee_vs_episode`,
 `uav_trajectory_snapshots`, `task_type_delay_vs_arrival_rate`,

@@ -19,6 +19,12 @@ from experiment_config import (
 )
 from HRL_task_aware import TrainingConfig, train
 from Packet_scheduler_v1 import TASK_DEADLINE_SECONDS
+from packet_outcome_artifacts import (
+    PACKET_OUTCOME_ARTIFACT_SCHEMA_VERSION,
+    PACKET_OUTCOME_MODE_DISABLED,
+    PACKET_OUTCOME_MODE_STREAMING,
+    PacketOutcomeJsonlWriter,
+)
 from paper_figure_registry import FIGURE_REGISTRY, PAPER_METHOD_MAPPINGS
 from paper_metrics import (
     PAPER_AGGREGATE_SCHEMA_VERSION,
@@ -269,6 +275,8 @@ def _evaluation_config(episodes, episode_seconds, seed):
         enable_plots=False,
         enable_csv=False,
         random_seed=int(seed),
+        collect_packet_outcomes=False,
+        packet_outcome_artifact_mode=PACKET_OUTCOME_MODE_STREAMING,
     )
 
 
@@ -351,6 +359,9 @@ def run_paper_evaluation(
             "git_sha": git_sha,
             "training_history_only": True,
             "new_training_started": False,
+            "collect_packet_outcomes": False,
+            "packet_outcome_artifact_mode": PACKET_OUTCOME_MODE_DISABLED,
+            "packet_outcome_artifact_schema_version": None,
         }
         _write_json(output_dir / "paper_evaluation_metadata.json", metadata)
         return {"output_directory": str(output_dir), **metadata}
@@ -388,22 +399,39 @@ def run_paper_evaluation(
         point_dir = output_dir / point["point_id"]
         point_dir.mkdir()
         manifest.save(point_dir / "scenario_manifest.json")
-        result = train(
-            _evaluation_config(resolved_episodes, resolved_seconds, context["training_seed"]),
-            scenario_manifest=manifest,
-            method_spec=method,
-            evaluation=True,
-            checkpoint_dir=context["checkpoint"],
-            expected_checkpoint_episodes=(
-                FORMAL_CHECKPOINT_EPISODE if checkpoint_required else None
-            ),
-            expected_checkpoint_formal_config=context["expected_training_config"],
-            evaluation_overrides=point.get("overrides"),
-            trajectory_snapshot_times=point.get("snapshot_times_seconds"),
-            trajectory_target_uav_id=(
-                int(target_uav_id) if definition["kind"] == "trajectory" else None
-            ),
-        )
+        packet_outcomes_path = point_dir / "packet_outcomes.jsonl"
+        with PacketOutcomeJsonlWriter(packet_outcomes_path) as outcome_writer:
+            result = train(
+                _evaluation_config(
+                    resolved_episodes,
+                    resolved_seconds,
+                    context["training_seed"],
+                ),
+                scenario_manifest=manifest,
+                method_spec=method,
+                evaluation=True,
+                checkpoint_dir=context["checkpoint"],
+                expected_checkpoint_episodes=(
+                    FORMAL_CHECKPOINT_EPISODE if checkpoint_required else None
+                ),
+                expected_checkpoint_formal_config=(
+                    context["expected_training_config"]
+                ),
+                evaluation_overrides=point.get("overrides"),
+                trajectory_snapshot_times=point.get("snapshot_times_seconds"),
+                trajectory_target_uav_id=(
+                    int(target_uav_id)
+                    if definition["kind"] == "trajectory"
+                    else None
+                ),
+                packet_outcome_sink=outcome_writer.write_episode,
+            )
+        if outcome_writer.episode_count != resolved_episodes:
+            raise RuntimeError(
+                "paper packet outcome stream episode count mismatch: "
+                f"written={outcome_writer.episode_count}, "
+                f"expected={resolved_episodes}"
+            )
         run_metadata = {
             **result["run_metadata"],
             "semantic_suite": suite,
@@ -416,7 +444,7 @@ def run_paper_evaluation(
             "scenario_manifest": str((point_dir / "scenario_manifest.json").resolve()),
         }
         outputs = write_evaluation_outputs(point_dir, result["episode_metrics"], run_metadata)
-        _write_json(point_dir / "packet_outcomes.json", result["packet_outcome_artifacts"])
+        outputs["packet_outcomes_jsonl"] = packet_outcomes_path.resolve()
         trajectories = [
             {
                 **artifact,
@@ -452,6 +480,14 @@ def run_paper_evaluation(
                 "evaluation_seed": context["training_seed"],
                 "manifest_seed": manifest.manifest_seed,
                 "num_uav": NUM_UAV,
+                "collect_packet_outcomes": False,
+                "packet_outcome_artifact_mode": PACKET_OUTCOME_MODE_STREAMING,
+                "packet_outcome_artifact_schema_version": (
+                    PACKET_OUTCOME_ARTIFACT_SCHEMA_VERSION
+                ),
+                "packet_outcome_streamed_episode_count": (
+                    outcome_writer.episode_count
+                ),
                 "resolved_overrides": result["run_metadata"].get(
                     "evaluation_overrides"
                 ),
@@ -512,6 +548,11 @@ def run_paper_evaluation(
         "manifest_seed": requested_manifest_seed,
         "evaluation_episodes_per_point": resolved_episodes,
         "evaluation_horizon_seconds": resolved_seconds,
+        "collect_packet_outcomes": False,
+        "packet_outcome_artifact_mode": PACKET_OUTCOME_MODE_STREAMING,
+        "packet_outcome_artifact_schema_version": (
+            PACKET_OUTCOME_ARTIFACT_SCHEMA_VERSION
+        ),
         "target_uav_id": int(target_uav_id) if target_uav_id is not None else None,
         "git_sha": git_sha,
         "new_training_started": False,

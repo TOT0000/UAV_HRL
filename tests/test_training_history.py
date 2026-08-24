@@ -8,6 +8,8 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+import torch
+
 from experiment_config import MethodSpec
 from HRL_task_aware import TrainingConfig, train
 from scenario_manifest import generate_manifest
@@ -330,6 +332,31 @@ class TrainingHistoryResumeIntegrationTest(unittest.TestCase):
             checkpoint_one = checkpoint_root / "full" / "ep_0001"
             checkpoint_two = checkpoint_root / "full" / "ep_0002"
             shutil.rmtree(checkpoint_two)
+            checkpoint_payload = torch.load(
+                checkpoint_one / "training_state.pt",
+                map_location="cpu",
+                weights_only=False,
+            )
+
+            def nested_mapping_keys(value):
+                if isinstance(value, dict):
+                    return set(value).union(
+                        *(
+                            nested_mapping_keys(child)
+                            for child in value.values()
+                        )
+                    )
+                if isinstance(value, (list, tuple)):
+                    return set().union(
+                        *(nested_mapping_keys(child) for child in value)
+                    )
+                return set()
+
+            checkpoint_keys = nested_mapping_keys(
+                checkpoint_payload["training_state"]
+            )
+            self.assertNotIn("packet_outcomes", checkpoint_keys)
+            self.assertNotIn("packet_outcome_artifacts", checkpoint_keys)
 
             with (
                 mock.patch(
@@ -372,6 +399,19 @@ class TrainingHistoryResumeIntegrationTest(unittest.TestCase):
             ]
 
         self.assertEqual(resumed["episodes_run"], 1)
+        self.assertIsNone(first["packet_outcome_artifacts"])
+        self.assertIsNone(resumed["packet_outcome_artifacts"])
+        self.assertFalse(
+            resumed["run_metadata"]["formal_config"][
+                "collect_packet_outcomes"
+            ]
+        )
+        self.assertEqual(
+            resumed["run_metadata"]["formal_config"][
+                "packet_outcome_artifact_mode"
+            ],
+            "disabled",
+        )
         self.assertEqual(resumed["training_history_rows"], expected_history)
         self.assertEqual(persisted, expected_history)
         self.assertEqual([row["episode"] for row in persisted], [1, 2])
