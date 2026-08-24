@@ -33,8 +33,9 @@ from centralized_movement import (
     JOINT_ACTION_DIM,
     MOVEMENT_STATE_DIM,
     apply_joint_movement_proposals,
-    build_joint_movement_proposals,
+    build_velocity_substep_proposals,
     calculate_movement_potentials,
+    decode_joint_velocity_commands,
     get_global_movement_state,
     movement_mask_from_state,
     project_joint_action,
@@ -44,7 +45,7 @@ from exploration_schedules import movement_behavior_noise
 from evaluation_metrics import safe_energy_efficiency
 from experiment_config import (
     COM_PACKET_SIZE_BITS,
-    COM_REQUIRED_RATE_BPS,
+    COM_OFFERED_RATE_BPS,
     DEFAULT_TRAINING_SEED,
     FOV_EMA_LIFECYCLE_VERSION,
     FORMAL_CHECKPOINT_EPISODE,
@@ -438,7 +439,12 @@ def _trajectory_state(
                 "x": float(sr.x),
                 "y": float(sr.y),
                 "z": float(sr.z),
-                "active": bool(sr.active),
+                "assigned_gt_id": (
+                    int(sr.assigned_gt_id)
+                    if sr.assigned_gt_id is not None
+                    else None
+                ),
+                "arrived": bool(sr.arrived),
             }
             for sr in sorted(env.SR_teams, key=lambda item: item.id)
         ],
@@ -512,14 +518,23 @@ def _run_routing_slot(
         task_type = violation["task_type"]
         if task_type in violation_stats:
             violation_stats[task_type]["deadline_violated_packets"] += 1
+        sender = int(violation["attributed_sender"])
+        if write_replay:
+            if sender < 0 or not routing_buffer.attribute_latest_cost(sender, 1.0):
+                raise AssertionError(
+                    "slot-boundary violation lacks its latest routing replay transition"
+                )
+            packet_engine.replay_attributed_violation_cost_count += 1.0
     packet_engine.drop_expired_packets(env.current_time)
     backlog_before = _active_backlog(packet_engine)
     uavs_with_packets = packet_engine.nonempty_uav_ids()
+    s2u_receivers = set(packet_engine.active_s2u_links(env).values())
+    routing_decision_uav_ids = sorted(set(uavs_with_packets) | s2u_receivers)
     effective_masks = {
         uid: packet_engine.get_effective_action_mask(
             env, uid, env.get_routing_action_mask(uid).astype(bool)
         )
-        for uid in uavs_with_packets
+        for uid in routing_decision_uav_ids
     }
 
     physical_states = {
@@ -529,7 +544,7 @@ def _run_routing_slot(
             backlog_bits=backlog_before,
             action_mask=effective_masks[uid],
         )
-        for uid in uavs_with_packets
+        for uid in routing_decision_uav_ids
     }
     states = {
         uid: apply_observation_strategy(
@@ -564,16 +579,31 @@ def _run_routing_slot(
     )
     attributable_violation_count = sum(
         bool(outcome["violated"])
-        and int(outcome["attributed_sender"]) in next_hops
         for outcome in slot_result["outcomes"]
     )
-    attributed_cost = float(sum(slot_result["cost_by_sender"].values()))
+    deferred_cost = float(
+        sum(slot_result["deferred_cost_by_sender"].values())
+    )
+    attributed_cost = float(
+        sum(slot_result["cost_by_sender"].values()) + deferred_cost
+    )
     if not np.isclose(attributed_cost, float(attributable_violation_count)):
         raise AssertionError(
             "deadline violation cost attribution mismatch: "
             f"attributable_violations={attributable_violation_count}, "
             f"cost={attributed_cost}"
         )
+    if write_replay:
+        for sender, cost in sorted(
+            slot_result["deferred_cost_by_sender"].items()
+        ):
+            if sender < 0 or not routing_buffer.attribute_latest_cost(
+                sender, cost
+            ):
+                raise AssertionError(
+                    "deadline violation lacks its latest routing replay transition"
+                )
+        packet_engine.replay_attributed_violation_cost_count += attributed_cost
     env.current_time = float(current_time) + step_time
     for outcome in slot_result["outcomes"]:
         task_type = outcome["task_type"]
@@ -594,7 +624,7 @@ def _run_routing_slot(
                 env, uid, env.get_routing_action_mask(uid).astype(bool)
             ),
         )
-        for uid in uavs_with_packets
+        for uid in routing_decision_uav_ids
     }
     next_states = {
         uid: apply_observation_strategy(
@@ -603,7 +633,7 @@ def _run_routing_slot(
         for uid, state in physical_next_states.items()
     }
     if write_replay:
-        for uid in uavs_with_packets:
+        for uid in routing_decision_uav_ids:
             next_hol = packet_engine.get_hol_packet(uid)
             transition_done = _routing_transition_done(done, next_hol)
             routing_buffer.add(
@@ -614,6 +644,7 @@ def _run_routing_slot(
                 float(slot_result["cost_by_sender"][uid]),
                 transition_done,
                 tag_gt=env.num_GT,
+                agent_id=uid,
             )
     selected_links = [
         {
@@ -1789,7 +1820,7 @@ def train(
                 else float(scenario_rates.get("base_com_packets_per_second", 50.0))
             ),
         }
-        env.com_required_rate_bps = (
+        env.com_offered_rate_bps = (
             float(resolved_episode_rates["COM"]) * COM_PACKET_SIZE_BITS
         )
         latest_active_links = []
@@ -1882,38 +1913,28 @@ def train(
             projected_action = project_joint_action(
                 raw_joint_action, movement_mask=current_movement_mask
             )
-
-            # Phase 1 is read-only: every UAV proposal is built from one snapshot.
-            proposals = build_joint_movement_proposals(
-                env, movement_agent, projected_action
+            velocity_commands = decode_joint_velocity_commands(
+                movement_agent, projected_action
             )
-            proposal_batches += 1
-            # Phase 2 mutates positions only after every proposal exists.
-            interval_energies = apply_joint_movement_proposals(env, proposals)
-            energy_evaluations += int(interval_energies.size)
-            interval_energy = float(interval_energies.sum())
-
-            fov_transitions = _mark_search_observations(env)
-            if fov_transitions:
-                packet_engine.process_fov_transitions(
-                    env,
-                    transition_marker=f"episode={episode},interval={interval}",
-                    footprint_transitions=fov_transitions,
-                )
-            if getattr(env, "need_reassign", False):
-                env.assign_tasks()
-                env.need_reassign = False
-            if (
-                not getattr(env, "_search_phase_over", False)
-                and float(env.visited_bitmap.mean())
-                >= config.search_coverage_threshold
-            ):
-                env.convert_search_to_hovering()
             env.update_source_uavs()
-            env.update_u2u_channels()
-            env.update_u2g_channels()
+            interval_energies = np.zeros(env.num_UAV, dtype=np.float64)
             interval_delivered_bits = 0.0
             for routing_slot in range(MOVEMENT_CONTROL_INTERVAL):
+                # All UAV proposals come from one substep snapshot. The same
+                # decoded command is held across all four 0.25-second slots.
+                proposals = build_velocity_substep_proposals(
+                    env, velocity_commands, config.routing_slot_seconds
+                )
+                proposal_batches += 1
+                substep_energies = apply_joint_movement_proposals(
+                    env, proposals, step_time=config.routing_slot_seconds
+                )
+                interval_energies += substep_energies
+                energy_evaluations += int(substep_energies.size)
+                # Channel geometry is refreshed after each actual projected
+                # displacement and before that substep's routing decision.
+                env.update_u2u_channels()
+                env.update_u2g_channels()
                 slot_epsilon = (
                     0.0
                     if evaluation or not method_spec.learns_routing
@@ -1953,6 +1974,27 @@ def train(
                     routing_lifecycle.complete_slot(
                         ddqn, routing_replay, config.batch_size
                     )
+
+            interval_energy = float(interval_energies.sum())
+            # Search observation, RoI discovery, and task assignment remain
+            # one-second boundary events and therefore execute exactly once.
+            fov_transitions = _mark_search_observations(env)
+            if fov_transitions:
+                packet_engine.process_fov_transitions(
+                    env,
+                    transition_marker=f"episode={episode},interval={interval}",
+                    footprint_transitions=fov_transitions,
+                )
+            if getattr(env, "need_reassign", False):
+                env.assign_tasks()
+                env.need_reassign = False
+            if (
+                not getattr(env, "_search_phase_over", False)
+                and float(env.visited_bitmap.mean())
+                >= config.search_coverage_threshold
+            ):
+                env.convert_search_to_hovering()
+            env.update_source_uavs()
 
             interval_delivered_mbits = interval_delivered_bits / 1e6
             done = interval == config.episode_seconds - 1
@@ -2093,23 +2135,104 @@ def train(
                     task_potential_enabled=method_spec.task_potential_enabled,
                 )
 
+        if not evaluation and method_spec.learns_routing:
+            # Establish an explicit terminal Wait decision for any eligible
+            # packet that has not yet had a replayable routing action.  This is
+            # done while the packet is still queued so the critic sees the true
+            # terminal backlog and action mask.
+            terminal_wait_senders = set()
+            for packet in packet_engine.get_active_packets():
+                if not bool(packet.get("routing_eligible", False)):
+                    continue
+                credited_sender = packet.get("last_routing_sender")
+                if (
+                    credited_sender is not None
+                    and int(credited_sender)
+                    in routing_replay.latest_index_by_agent
+                ):
+                    continue
+                sender = int(packet.get("current", -1))
+                if not (0 <= sender < env.num_UAV):
+                    raise AssertionError(
+                        "terminal eligible packet has no routable sender"
+                    )
+                packet["last_routing_sender"] = sender
+                if (
+                    sender in routing_replay.latest_index_by_agent
+                    or sender in terminal_wait_senders
+                ):
+                    continue
+                physical_mask = env.get_routing_action_mask(sender).astype(bool)
+                effective_mask = packet_engine.get_effective_action_mask(
+                    env, sender, physical_mask
+                )
+                physical_terminal_state = packet_engine.get_state_ta(
+                    env,
+                    sender,
+                    backlog_bits=_active_backlog(packet_engine),
+                    action_mask=effective_mask,
+                )
+                terminal_state = apply_observation_strategy(
+                    physical_terminal_state,
+                    method_spec.task_observation,
+                    "routing",
+                )
+                routing_replay.add(
+                    terminal_state,
+                    sender,
+                    terminal_state,
+                    packet_engine.routing_local_reward(env, sender, sender, 0.0),
+                    0.0,
+                    True,
+                    tag_gt=env.num_GT,
+                    agent_id=sender,
+                )
+                terminal_wait_senders.add(sender)
         packet_metrics = packet_engine.finalize_episode(
             float(config.episode_seconds)
         )
+        if not evaluation and method_spec.learns_routing:
+            for sender, cost in sorted(
+                packet_engine.pending_terminal_cost_by_sender.items()
+            ):
+                if sender < 0:
+                    raise AssertionError(
+                        "terminal eligible violation has no routable sender"
+                    )
+                if not routing_replay.attribute_latest_cost(sender, cost):
+                    raise AssertionError(
+                        "terminal eligible violation lacks its terminal or "
+                        "latest routing replay transition"
+                    )
+                packet_engine.replay_attributed_violation_cost_count += float(cost)
         episode_routing_cost_sum = float(packet_engine.total_violated)
-        episode_routing_slot_steps = int(
-            round(float(config.episode_seconds) / config.routing_slot_seconds)
+        episode_eligible_packet_count = int(
+            sum(packet_engine.eligible_packet_counts.values())
         )
-        if episode_routing_slot_steps != (
-            int(config.episode_seconds) * MOVEMENT_CONTROL_INTERVAL
+        if episode_routing_cost_sum > episode_eligible_packet_count:
+            raise AssertionError("QoS violation count exceeds eligible packets")
+        if (
+            not evaluation
+            and method_spec.learns_routing
+            and not np.isclose(
+                packet_engine.replay_attributed_violation_cost_count,
+                episode_routing_cost_sum,
+            )
         ):
-            raise AssertionError("routing slot-step denominator is inconsistent")
+            raise AssertionError(
+                "replay-attributed cost count differs from canonical violations"
+            )
+        episode_violation_probability = (
+            episode_routing_cost_sum / float(episode_eligible_packet_count)
+            if episode_eligible_packet_count
+            else None
+        )
         lambda_cost_after_episode = episode_lambda_cost
         if method_spec.routing == "safe_ddqn":
             if not evaluation:
                 lambda_cost_after_episode = ddqn.update_cost_multiplier(
                     episode_routing_cost_sum,
-                    episode_routing_slot_steps,
+                    episode_eligible_packet_count,
                 )
             else:
                 lambda_cost_after_episode = float(ddqn.lambda_cost)
@@ -2275,7 +2398,15 @@ def train(
                 ),
                 "episode_horizon_seconds": float(config.episode_seconds),
                 "routing_cost_sum": episode_routing_cost_sum,
-                "routing_cost_slot_steps": episode_routing_slot_steps,
+                "eligible_packet_count": episode_eligible_packet_count,
+                "delay_violation_probability": episode_violation_probability,
+                "sr_admission_drop_count": int(
+                    packet_engine.sr_admission_drop_count
+                ),
+                "routing_cost_eligible_packets": episode_eligible_packet_count,
+                "replay_attributed_violation_cost_count": float(
+                    packet_engine.replay_attributed_violation_cost_count
+                ),
                 "lambda_cost_used": episode_lambda_cost,
                 "lambda_cost_after_episode": lambda_cost_after_episode,
                 "coverage": coverage,
@@ -2314,6 +2445,11 @@ def train(
                     reward=episode_reward,
                     timely_goodput_mbits=timely_goodput_mbits,
                     mobility_energy_j=episode_energy,
+                    eligible_packet_count=episode_eligible_packet_count,
+                    delay_violation_count=int(episode_routing_cost_sum),
+                    delay_violation_probability=episode_violation_probability,
+                    lambda_cost_used=episode_lambda_cost,
+                    lambda_cost_after_episode=lambda_cost_after_episode,
                     **dinkelbach_event,
                 )
             )
@@ -2808,12 +2944,12 @@ def train(
                 **copy.deepcopy(resolved_evaluation),
                 "episode_horizon_seconds": float(config.episode_seconds),
                 "com_packet_size_bits": COM_PACKET_SIZE_BITS,
-                "com_required_rate_bps": (
+                "com_offered_rate_bps": (
                     float(resolved_evaluation["traffic_rates_packets_per_second"]["COM"])
                     * COM_PACKET_SIZE_BITS
                     if resolved_evaluation["traffic_rates_packets_per_second"]["COM"]
                     is not None
-                    else COM_REQUIRED_RATE_BPS
+                    else COM_OFFERED_RATE_BPS
                 ),
                 "communication_bandwidth_pool_hz": 10e6,
                 "fdma_policy": "equal-across-active-S2U-U2U-U2G",
@@ -2830,8 +2966,10 @@ def train(
                         "that reached GS, in seconds"
                     ),
                     "violation_probability": (
-                        "(late delivered + expired/dropped + unfinished) / generated"
+                        "canonical eligible deadline violations / "
+                        "(generated FOV + S2U-admitted COM); missing when zero eligible"
                     ),
+                    "sr_admission_drop": "excluded from numerator and denominator",
                     "terminal_outcomes_mutually_exclusive": True,
                 }
                 if evaluation

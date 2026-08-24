@@ -42,9 +42,9 @@ class ExplorationScheduleTest(unittest.TestCase):
         self.assertEqual(ddqn_epsilon(0, 100, evaluation=True), 0.0)
 
     def test_formal_decay_horizons_are_fixed_at_one_thousand_episodes(self):
-        self.assertEqual(td3_decay_steps(2500, 60, 1000), 60000)
+        self.assertEqual(td3_decay_steps(1500, 60, 1000), 60000)
         self.assertEqual(ddqn_decay_steps(60, 0.25), 240000)
-        formal = formal_training_config(2500)
+        formal = formal_training_config(1500)
         resolved = exploration_schedule_configuration(
             formal, MethodSpec.parse("td3_dinkelbach")
         )

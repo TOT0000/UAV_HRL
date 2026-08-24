@@ -28,7 +28,7 @@ class AssignmentUtilityTest(unittest.TestCase):
         gt = self.env.gts[0]
         gt.is_found = True
         sr = self.env.SR_teams[0]
-        sr.active = True
+        sr.assigned_gt_id = 0
         tasks = [
             Task(0, "FOV", gt, gt.id),
             Task(1, "COM", sr, sr.id),
@@ -43,8 +43,8 @@ class AssignmentUtilityTest(unittest.TestCase):
             ),
             mock.patch.object(
                 self.env,
-                "get_sr_uav_reference_capacity_mbps",
-                side_effect=[0.0064, 0.0128],
+                "get_sr_uav_normalized_utility",
+                side_effect=[0.5, 1.0],
             ),
         ):
             problem = assigner.build_problem([0, 1], tasks)

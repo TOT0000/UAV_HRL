@@ -66,7 +66,7 @@ machine-readable in `paper_figure_registry.py`.
   from each point's per-episode JSONL through the shared `paper_metrics.py`
   implementation. Missing, duplicate, extra, numerically inconsistent, or
   semantically invalid rows fail closed.
-- Every learned method requires the formal `ep_2500` checkpoint. The
+- Every learned method requires the formal `ep_1500` checkpoint. The
   `kkm_random_action_random_routing` baseline learns neither component, creates
   no `models.pt`, and records `checkpoint_required=false`.
 - Figure builds inspect the actual `metadata.json` and `models.pt` without

@@ -17,7 +17,7 @@ class DinkelbachBlockUpdateTest(unittest.TestCase):
         self.assertEqual(state.current_lambda, 0.0)
         self.assertEqual(DINKELBACH_INITIAL_LAMBDA, 0.0)
         self.assertEqual(DINKELBACH_UPDATE_INTERVAL_EPISODES, 50)
-        self.assertEqual(dinkelbach_full_block_count(2500, 50), 50)
+        self.assertEqual(dinkelbach_full_block_count(1500, 50), 30)
 
     def test_episodes_1_through_49_hold_lambda_and_50_updates_once(self):
         state = DinkelbachBlockState()

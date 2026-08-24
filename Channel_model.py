@@ -15,6 +15,8 @@ A2G_NLOS_EXCESS_DB = 20.0
 S2U_TX_POWER_DBM = 23.0
 U2U_U2G_TX_POWER_DBM = 30.0
 NUMERICAL_CAPACITY_EPS_MBPS = np.finfo(np.float64).eps
+MINIMUM_A2A_DISTANCE_M = 1.0
+REFERENCE_UAV_MIN_AGL_M = 50.0
 
 
 def noise_power_dbm(bandwidth_hz):
@@ -77,7 +79,9 @@ def u2u_path_loss_db(sender_position, receiver_position):
     sender = np.asarray(sender_position, dtype=float)
     receiver = np.asarray(receiver_position, dtype=float)
     sender_altitude = np.maximum(sender[..., 2], 1e-3)
-    distance = np.maximum(np.linalg.norm(sender - receiver, axis=-1), 1.0)
+    distance = np.maximum(
+        np.linalg.norm(sender - receiver, axis=-1), MINIMUM_A2A_DISTANCE_M
+    )
     distance_coefficient = np.maximum(
         23.9 - 1.8 * np.log10(sender_altitude), 20.0
     )
@@ -90,6 +94,63 @@ def u2u_capacity_mbps(sender_position, receiver_position, bandwidth_hz):
         u2u_path_loss_db(sender_position, receiver_position),
         bandwidth_hz,
         U2U_U2G_TX_POWER_DBM,
+    )
+
+
+def reference_s2u_max_capacity_mbps(bandwidth_hz):
+    """Canonical best-feasible S2U capacity at 50 m AGL."""
+
+    return float(
+        a2g_capacity_mbps(
+            (0.0, 0.0, REFERENCE_UAV_MIN_AGL_M),
+            (0.0, 0.0, 0.0),
+            bandwidth_hz,
+            S2U_TX_POWER_DBM,
+        )
+    )
+
+
+def normalized_s2u_capacity_utility(
+    aerial_position, ground_position, bandwidth_hz
+):
+    """Normalize one physical S2U link by a fixed theoretical maximum."""
+
+    capacity = float(
+        a2g_capacity_mbps(
+            aerial_position,
+            ground_position,
+            bandwidth_hz,
+            S2U_TX_POWER_DBM,
+        )
+    )
+    maximum = reference_s2u_max_capacity_mbps(bandwidth_hz)
+    if not np.isfinite(capacity) or maximum <= 0.0 or not np.isfinite(maximum):
+        raise RuntimeError("canonical S2U reference capacity is invalid")
+    return float(np.clip(capacity / maximum, 0.0, 1.0))
+
+
+def reference_u2g_max_capacity_mbps(system_bandwidth_hz):
+    """Canonical U2G maximum at 50 m directly above the ground station."""
+
+    return float(
+        a2g_capacity_mbps(
+            (0.0, 0.0, REFERENCE_UAV_MIN_AGL_M),
+            (0.0, 0.0, 0.0),
+            system_bandwidth_hz,
+            U2U_U2G_TX_POWER_DBM,
+        )
+    )
+
+
+def reference_u2u_max_capacity_mbps(system_bandwidth_hz):
+    """Canonical U2U maximum at the numerical 3-D distance floor."""
+
+    return float(
+        u2u_capacity_mbps(
+            (0.0, 0.0, REFERENCE_UAV_MIN_AGL_M),
+            (MINIMUM_A2A_DISTANCE_M, 0.0, REFERENCE_UAV_MIN_AGL_M),
+            system_bandwidth_hz,
+        )
     )
 
 

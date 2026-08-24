@@ -15,6 +15,8 @@ from Channel_model import (
     a2g_path_loss_db,
     shannon_capacity_mbps,
     u2u_path_loss_db,
+    normalized_s2u_capacity_utility,
+    reference_s2u_max_capacity_mbps,
 )
 from Fov_model_phase import FovModel
 from collections import defaultdict
@@ -23,7 +25,7 @@ from Task_assignment import UAVAssigner, Task
 from object import UAV, SRTeam, GroundTarget
 from experiment_config import (
     FOV_COM_PAIR_MAX_DISTANCE_M,
-    COM_REQUIRED_RATE_BPS,
+    COM_OFFERED_RATE_BPS,
     NUM_UAV,
     REFERENCE_COM_BANDWIDTH_HZ,
     RESERVED_SEARCH_UAV_IDS,
@@ -110,19 +112,18 @@ class Simulator:
         self.x, self.y, self.z = 0, 0, 0
         self.uav_paths = {}  
 
-        # ===== Path-loss cache (for faster per-packet reward) =====
-        # These caches are refreshed whenever you update channels.
-        # PacketEngine.calculate_packet_reward_fast() can use them to avoid
-        # expensive geometry/path-loss recomputation per hop.
+        # ===== Path-loss diagnostics cache =====
+        # Refreshed with channel geometry. Canonical routing reward consumes
+        # allocated capacities; the legacy per-hop reward entry point fails fast.
         self.PL_uu_cache = np.zeros((self.num_UAV, self.num_UAV), dtype=float)
         self.PL_ug_cache = np.zeros(self.num_UAV, dtype=float)
-        self.mobility_params = {}
+        self.mobility_params = dict(self.energy_model.mobility_params)
         self.assignment_strategy = "k_km"
         self.assignment_rounds = 2
         self.fov_com_pair_max_distance_m = FOV_COM_PAIR_MAX_DISTANCE_M
         self.search_coverage_threshold = SEARCH_COVERAGE_THRESHOLD
         self.reserved_search_uav_ids = RESERVED_SEARCH_UAV_IDS
-        self.com_required_rate_bps = COM_REQUIRED_RATE_BPS
+        self.com_offered_rate_bps = COM_OFFERED_RATE_BPS
         self.search_release_time = None
         self.search_release_coverage = None
         self.assignment_invocations = 0
@@ -375,10 +376,14 @@ class Simulator:
         """
         gt_pos = np.array([gt.x, gt.y])
         sr_positions = np.array([
-            (sr.x, sr.y) for sr in self.SR_teams if not sr.active
+            (sr.x, sr.y)
+            for sr in self.SR_teams
+            if sr.assigned_gt_id is None
         ])
         available_indices = [
-            i for i, sr in enumerate(self.SR_teams) if not sr.active
+            i
+            for i, sr in enumerate(self.SR_teams)
+            if sr.assigned_gt_id is None
         ]
 
         # 找距離 GT 最近的 SR 成員
@@ -516,6 +521,19 @@ class Simulator:
         return capacity_mbps
 
     get_sr_uav_reference_capacity_mbps = get_sr_uav_capacity_mbps
+
+    def get_sr_uav_normalized_utility(self, uav_id, sr_id):
+        """Return the shared fixed-reference COM utility for one link."""
+
+        return normalized_s2u_capacity_utility(
+            self.uav_dict[int(uav_id)].get_position(),
+            self.SR_teams[int(sr_id)].get_position(),
+            REFERENCE_COM_BANDWIDTH_HZ,
+        )
+
+    @property
+    def reference_s2u_max_capacity_mbps(self):
+        return reference_s2u_max_capacity_mbps(REFERENCE_COM_BANDWIDTH_HZ)
 
     # =====================U2U channel model================================
     def update_u2u_channels(self):
@@ -1217,11 +1235,7 @@ class Simulator:
             x, y, z = map(float, initial["position"])
             sr = SRTeam(id=i)
             sr.x, sr.y, sr.z = x, y, z
-            sr.assigned_gt_id = None
-            sr.path = []
-            sr.active = False
-            sr.arrived = False
-            sr.current_step = 0
+            sr.reset_lifecycle()
             self.SR_teams.append(sr)
         self.sr_trajectory = {i: [] for i in range(self.num_SR_team)}
         for sr in self.SR_teams:

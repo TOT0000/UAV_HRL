@@ -25,7 +25,7 @@ class EvaluationMetricTest(unittest.TestCase):
             "scenario_id": scenario_id,
             "evaluation_manifest_hash": "evaluation-manifest-hash",
             "training_manifest_hash": "training-manifest-hash",
-            "checkpoint_completed_episodes": 2500,
+            "checkpoint_completed_episodes": 1500,
             "checkpoint_metadata_fingerprint": f"checkpoint-{training_seed}",
         }
         row.update({metric: float(value) for metric in METRIC_COLUMNS})

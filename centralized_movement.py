@@ -4,7 +4,7 @@ import numpy as np
 import torch
 from scipy.integrate import quad
 
-from experiment_config import COM_REQUIRED_RATE_BPS, NUM_UAV, ROI_COUNT_MAX
+from experiment_config import NUM_UAV, ROI_COUNT_MAX
 from Fov_model_phase import FovModel
 
 
@@ -20,7 +20,7 @@ BACKLOG_NORM_REF_BITS = 5e7
 GT_COUNT_MAX = ROI_COUNT_MAX
 VS_COVERAGE_EPS = 1e-6
 HOVER_ACTION = (-1.0, 0.0, 0.0)
-MOVEMENT_FEATURE_SCHEMA_VERSION = 2
+MOVEMENT_FEATURE_SCHEMA_VERSION = 3
 
 LOCAL_MOVEMENT_FEATURES = (
     ("task_search", "binary", 0.0, 1.0, "Search task is active"),
@@ -62,7 +62,7 @@ LOCAL_MOVEMENT_FEATURES = (
         "continuous",
         0.0,
         1.0,
-        "min(reference S2U capacity / current COM required rate, 1)",
+        "reference S2U capacity / fixed best-feasible S2U capacity",
     ),
 )
 
@@ -228,19 +228,12 @@ def _target_object_id(task, task_type):
     return int(task["target_obj_id"])
 
 
-def _com_requirement_satisfaction(env, uav_id, task, required_rate_bps=None):
+def normalized_com_link_quality(env, uav_id, task):
     sr_id = _target_object_id(task, "COM")
-    required = float(
-        getattr(env, "com_required_rate_bps", COM_REQUIRED_RATE_BPS)
-        if required_rate_bps is None
-        else required_rate_bps
-    )
-    if required <= 0.0:
-        return 1.0
-    capacity_bps = float(env.get_sr_uav_reference_capacity_mbps(uav_id, sr_id)) * 1e6
-    if not math.isfinite(capacity_bps):
-        return 0.0
-    return float(np.clip(max(capacity_bps, 0.0) / required, 0.0, 1.0))
+    utility = float(env.get_sr_uav_normalized_utility(uav_id, sr_id))
+    if not math.isfinite(utility) or not 0.0 <= utility <= 1.0:
+        raise RuntimeError("canonical normalized COM link quality is invalid")
+    return utility
 
 
 def get_global_movement_state(
@@ -311,7 +304,7 @@ def get_global_movement_state(
                 float(np.clip(ty / float(env.env_height), 0.0, 1.0)),
                 float(np.clip(tz / max(z_max, 1e-9), 0.0, 1.0)),
             ]
-            com_capacity_norm = _com_requirement_satisfaction(env, uav_id, task)
+            com_capacity_norm = normalized_com_link_quality(env, uav_id, task)
 
         uav_features = np.asarray(
             task_flags
@@ -555,23 +548,41 @@ def calculate_movement_potentials(env, c_ref_com):
             vs_progress.append(progress)
         for task in grouped["COM"]:
             com_progress.append(
-                _com_requirement_satisfaction(env, uav_id, task)
+                normalized_com_link_quality(env, uav_id, task)
             )
     phi_vs = float(np.mean(vs_progress)) if vs_progress else 0.0
     phi_com = float(np.mean(com_progress)) if com_progress else 0.0
     return phi_search, phi_vs, phi_com
 
 
-def build_joint_movement_proposals(env, model, projected_joint_action):
+def decode_joint_velocity_commands(model, projected_joint_action):
     action = np.asarray(projected_joint_action, dtype=np.float32)
     if action.shape != (JOINT_ACTION_DIM,):
         raise ValueError(f"joint action must have shape ({JOINT_ACTION_DIM},), got {action.shape}")
+    commands = np.asarray(
+        [
+            model.decode_action(action[uav_id * 3 : (uav_id + 1) * 3])
+            for uav_id in range(NUM_UAV)
+        ],
+        dtype=np.float64,
+    )
+    if commands.shape != (NUM_UAV, 3) or not np.isfinite(commands).all():
+        raise RuntimeError("decoded joint velocity command is invalid")
+    return commands
+
+
+def build_velocity_substep_proposals(env, velocity_commands, step_time):
+    commands = np.asarray(velocity_commands, dtype=np.float64)
+    if commands.shape != (NUM_UAV, 3) or not np.isfinite(commands).all():
+        raise ValueError(f"velocity commands must have shape ({NUM_UAV}, 3)")
+    step_time = float(step_time)
+    if not np.isfinite(step_time) or step_time <= 0.0:
+        raise ValueError("movement substep must be positive and finite")
     proposals = []
     for uav_id in range(NUM_UAV):
-        decoded = model.decode_action(action[uav_id * 3 : (uav_id + 1) * 3])
         proposal = env.uav_dict[uav_id].propose_movement(
-            *decoded,
-            step_time=1.0,
+            *commands[uav_id],
+            step_time=step_time,
             mobility_params=env.mobility_params,
             env_width=env.env_width,
             env_height=env.env_height,
@@ -580,13 +591,25 @@ def build_joint_movement_proposals(env, model, projected_joint_action):
     return proposals
 
 
-def apply_joint_movement_proposals(env, proposals):
+def build_joint_movement_proposals(
+    env, model, projected_joint_action, step_time=1.0
+):
+    """Compatibility facade for one proposal batch from a joint action."""
+
+    return build_velocity_substep_proposals(
+        env,
+        decode_joint_velocity_commands(model, projected_joint_action),
+        step_time,
+    )
+
+
+def apply_joint_movement_proposals(env, proposals, step_time=1.0):
     if len(proposals) != NUM_UAV:
         raise ValueError(f"expected {NUM_UAV} movement proposals, got {len(proposals)}")
     energies = []
     for uav_id, proposal in enumerate(proposals):
         energy = env.uav_dict[uav_id].apply_movement_proposal(
-            proposal, energy_model=env.energy_model, step_time=1.0
+            proposal, energy_model=env.energy_model, step_time=step_time
         )
         energies.append(float(energy))
     return np.asarray(energies, dtype=np.float64)

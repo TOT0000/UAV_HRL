@@ -20,10 +20,10 @@ class PaperCheckpointArtifactProvenanceTest(unittest.TestCase):
             archive.writestr("archive/data.pkl", marker)
             archive.writestr("archive/version", b"3\n")
 
-    def _checkpoint(self, root, name="ep_2500", marker=b"payload"):
+    def _checkpoint(self, root, name="ep_1500", marker=b"payload"):
         checkpoint = root / name
         checkpoint.mkdir()
-        metadata = {"episode": 2499, "experiment": {"method_id": "synthetic"}}
+        metadata = {"episode": 1499, "experiment": {"method_id": "synthetic"}}
         (checkpoint / "metadata.json").write_text(
             json.dumps(metadata), encoding="utf-8"
         )
@@ -59,8 +59,8 @@ class PaperCheckpointArtifactProvenanceTest(unittest.TestCase):
     def test_payload_mutation_and_checkpoint_payload_swap_change_or_fail_hash(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
-            first, metadata = self._checkpoint(root, "ep_2500", b"first")
-            second, _ = self._checkpoint(root, "ep_2499", b"second")
+            first, metadata = self._checkpoint(root, "ep_1500", b"first")
+            second, _ = self._checkpoint(root, "ep_1499", b"second")
             original = checkpoint_artifact_provenance(first, metadata=metadata)
 
             self._write_models(first / "models.pt", b"mutated")
@@ -94,7 +94,7 @@ class PaperCheckpointArtifactProvenanceTest(unittest.TestCase):
         }
         for name, payload in cases.items():
             with self.subTest(name=name), tempfile.TemporaryDirectory() as temp_dir:
-                checkpoint = Path(temp_dir) / "ep_2500"
+                checkpoint = Path(temp_dir) / "ep_1500"
                 checkpoint.mkdir()
                 if payload is not None:
                     (checkpoint / "models.pt").write_bytes(payload)

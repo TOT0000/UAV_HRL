@@ -149,11 +149,14 @@ class ComStateCalibrationAndDeliveryTest(unittest.TestCase):
         first = calibrate_com_capacity(self.env, seed=1234, sample_count=1000)
         second = calibrate_com_capacity(self.env, seed=1234, sample_count=1000)
         self.assertEqual(first, second)
-        self.assertEqual(first["schema"], "demand-satisfaction-v1")
+        self.assertEqual(first["schema"], "fixed-s2u-theoretical-maximum-v1")
         self.assertEqual(first["reference_bandwidth_denominator"], 18)
         self.assertAlmostEqual(first["reference_bandwidth_hz"], 10e6 / 18)
-        self.assertEqual(first["required_rate_bps"], 50 * 256)
-        self.assertEqual(first["c_ref_com"], 0.0128)
+        self.assertEqual(first["offered_rate_bps"], 50 * 256)
+        self.assertGreater(first["reference_s2u_max_capacity_mbps"], 0.0)
+        self.assertEqual(
+            first["c_ref_com"], first["reference_s2u_max_capacity_mbps"]
+        )
         self.assertEqual(self.env.uav_dict[0].get_position(), original_uav)
         self.assertEqual(self.env.SR_teams[0].get_position(), original_sr)
 
@@ -197,7 +200,7 @@ class ComStateCalibrationAndDeliveryTest(unittest.TestCase):
     def test_state_potential_and_assignment_share_helper_mbps_scale(self):
         uav = self.env.uav_dict[0]
         sr = self.env.SR_teams[0]
-        sr.active = True
+        sr.assigned_gt_id = 0
         task_dict = {
             "task_type": "COM",
             "target_id": 0,
@@ -208,8 +211,8 @@ class ComStateCalibrationAndDeliveryTest(unittest.TestCase):
         self.env.multi_tasks[0] = [task_dict]
         packet_engine = PacketEngine(num_uav=10, step_time=0.25)
         with patch.object(
-            self.env, "get_sr_uav_reference_capacity_mbps", return_value=0.0064
-        ) as capacity_helper:
+            self.env, "get_sr_uav_normalized_utility", return_value=0.5
+        ) as utility_helper:
             state = get_global_movement_state(
                 self.env,
                 packet_engine,
@@ -250,7 +253,7 @@ class ComStateCalibrationAndDeliveryTest(unittest.TestCase):
         self.assertEqual(phi_com, 0.5)
         self.assertEqual(problem.raw_com_utility[0, 0], 0.5)
         self.assertEqual(assignment[0][0][2], 0.5)
-        self.assertGreaterEqual(capacity_helper.call_count, 3)
+        self.assertGreaterEqual(utility_helper.call_count, 3)
         source = inspect.getsource(UAVAssigner.assign_uav_tasks_k_times)
         self.assertNotIn("capacity / 1e6", source)
 

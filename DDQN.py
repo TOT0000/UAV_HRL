@@ -12,7 +12,7 @@ import matplotlib.pyplot as plt
 from experiment_config import (
     SAFE_DDQN_ETA_C,
     SAFE_DDQN_INITIAL_LAMBDA_COST,
-    SAFE_DDQN_QOS_COST_BUDGET,
+    SAFE_DDQN_QOS_TARGET_PROBABILITY,
     ROUTING_GAMMA,
     ROUTING_LEARNING_RATE,
     ROUTING_TAU,
@@ -107,7 +107,7 @@ class DDQN:
         lr=ROUTING_LEARNING_RATE,
         lambda_cost=SAFE_DDQN_INITIAL_LAMBDA_COST,
         eta_c=SAFE_DDQN_ETA_C,
-        qos_cost_budget=SAFE_DDQN_QOS_COST_BUDGET,
+        qos_target_probability=SAFE_DDQN_QOS_TARGET_PROBABILITY,
     ):
         self.q_network = QNetwork(action_dim, state_dim, hidden_dim).to(device)
         self.target_q_network = copy.deepcopy(self.q_network)
@@ -125,19 +125,20 @@ class DDQN:
         self.lambda_cost = float(lambda_cost)
         self.initial_lambda_cost = float(SAFE_DDQN_INITIAL_LAMBDA_COST)
         self.eta_c = float(eta_c)
-        self.qos_cost_budget = float(qos_cost_budget)
+        self.qos_target_probability = float(qos_target_probability)
         if (
             not np.isfinite(self.lambda_cost)
             or self.lambda_cost < 0.0
             or not np.isfinite(self.eta_c)
             or self.eta_c <= 0.0
-            or not np.isfinite(self.qos_cost_budget)
-            or self.qos_cost_budget < 0.0
+            or not np.isfinite(self.qos_target_probability)
+            or not 0.0 <= self.qos_target_probability <= 1.0
         ):
             raise ValueError("safe-DDQN constraint parameters are invalid")
         self.cost_multiplier_update_count = 0
-        self.last_episode_cost_sum = None
-        self.last_episode_slot_steps = None
+        self.last_episode_violation_count = None
+        self.last_episode_eligible_packet_count = None
+        self.last_episode_violation_probability = None
         self.last_lambda_cost_used = None
         self.last_lambda_cost_after = None
 
@@ -224,26 +225,35 @@ class DDQN:
         )
         return target_q, target_c, next_actions
 
-    def update_cost_multiplier(self, episode_cost_sum, episode_slot_steps):
+    def update_cost_multiplier(
+        self, episode_violation_count, episode_eligible_packet_count
+    ):
         """Advance the network-wide QoS multiplier exactly once per episode."""
 
-        cost_sum = float(episode_cost_sum)
-        slot_steps = int(episode_slot_steps)
-        if not np.isfinite(cost_sum) or cost_sum < 0.0:
-            raise ValueError("episode routing cost must be finite and non-negative")
-        if slot_steps <= 0:
-            raise ValueError("episode routing slot-step denominator must be positive")
+        violation_count = float(episode_violation_count)
+        eligible_count = int(episode_eligible_packet_count)
+        if not np.isfinite(violation_count) or violation_count < 0.0:
+            raise ValueError("episode violation count must be finite and non-negative")
+        if eligible_count < 0 or violation_count > eligible_count:
+            raise ValueError("eligible-packet QoS counts are inconsistent")
         used = float(self.lambda_cost)
+        self.last_episode_violation_count = violation_count
+        self.last_episode_eligible_packet_count = eligible_count
+        if eligible_count == 0:
+            self.last_episode_violation_probability = None
+            self.last_lambda_cost_used = used
+            self.last_lambda_cost_after = used
+            return used
+        violation_probability = violation_count / float(eligible_count)
         updated = max(
             0.0,
             used
             + self.eta_c
-            * (cost_sum / float(slot_steps) - self.qos_cost_budget),
+            * (violation_probability - self.qos_target_probability),
         )
         self.lambda_cost = float(updated)
         self.cost_multiplier_update_count += 1
-        self.last_episode_cost_sum = cost_sum
-        self.last_episode_slot_steps = slot_steps
+        self.last_episode_violation_probability = violation_probability
         self.last_lambda_cost_used = used
         self.last_lambda_cost_after = float(updated)
         return float(updated)
@@ -253,17 +263,22 @@ class DDQN:
             "lambda_cost": float(self.lambda_cost),
             "initial_lambda_cost": float(self.initial_lambda_cost),
             "eta_c": float(self.eta_c),
-            "qos_cost_budget": float(self.qos_cost_budget),
+            "qos_target_probability": float(self.qos_target_probability),
             "lambda_update_scope": "episode_end",
-            "cost_denominator": "network_routing_slot_steps",
+            "cost_denominator": "eligible_packets",
             "cost_multiplier_update_count": int(
                 self.cost_multiplier_update_count
             ),
-            "episode_cost_accumulator": 0.0,
-            "episode_slot_step_accumulator": 0,
+            "episode_violation_accumulator": 0.0,
+            "episode_eligible_packet_accumulator": 0,
             "mid_episode_checkpoint_supported": False,
-            "last_episode_cost_sum": self.last_episode_cost_sum,
-            "last_episode_slot_steps": self.last_episode_slot_steps,
+            "last_episode_violation_count": self.last_episode_violation_count,
+            "last_episode_eligible_packet_count": (
+                self.last_episode_eligible_packet_count
+            ),
+            "last_episode_violation_probability": (
+                self.last_episode_violation_probability
+            ),
             "last_lambda_cost_used": self.last_lambda_cost_used,
             "last_lambda_cost_after": self.last_lambda_cost_after,
         }
@@ -273,12 +288,12 @@ class DDQN:
             "lambda_cost",
             "initial_lambda_cost",
             "eta_c",
-            "qos_cost_budget",
+            "qos_target_probability",
             "lambda_update_scope",
             "cost_denominator",
             "cost_multiplier_update_count",
-            "episode_cost_accumulator",
-            "episode_slot_step_accumulator",
+            "episode_violation_accumulator",
+            "episode_eligible_packet_accumulator",
             "mid_episode_checkpoint_supported",
         }
         missing = sorted(required.difference(state or {}))
@@ -290,12 +305,12 @@ class DDQN:
             float(state["initial_lambda_cost"])
             != SAFE_DDQN_INITIAL_LAMBDA_COST
             or float(state["eta_c"]) != SAFE_DDQN_ETA_C
-            or float(state["qos_cost_budget"])
-            != SAFE_DDQN_QOS_COST_BUDGET
+            or float(state["qos_target_probability"])
+            != SAFE_DDQN_QOS_TARGET_PROBABILITY
             or state["lambda_update_scope"] != "episode_end"
-            or state["cost_denominator"] != "network_routing_slot_steps"
-            or float(state["episode_cost_accumulator"]) != 0.0
-            or int(state["episode_slot_step_accumulator"]) != 0
+            or state["cost_denominator"] != "eligible_packets"
+            or float(state["episode_violation_accumulator"]) != 0.0
+            or int(state["episode_eligible_packet_accumulator"]) != 0
             or bool(state["mid_episode_checkpoint_supported"])
         ):
             raise RuntimeError(
@@ -306,13 +321,14 @@ class DDQN:
             raise RuntimeError("safe-DDQN checkpoint lambda_cost is invalid")
         self.initial_lambda_cost = SAFE_DDQN_INITIAL_LAMBDA_COST
         self.eta_c = SAFE_DDQN_ETA_C
-        self.qos_cost_budget = SAFE_DDQN_QOS_COST_BUDGET
+        self.qos_target_probability = SAFE_DDQN_QOS_TARGET_PROBABILITY
         self.cost_multiplier_update_count = int(
             state["cost_multiplier_update_count"]
         )
         for field in (
-            "last_episode_cost_sum",
-            "last_episode_slot_steps",
+            "last_episode_violation_count",
+            "last_episode_eligible_packet_count",
+            "last_episode_violation_probability",
             "last_lambda_cost_used",
             "last_lambda_cost_after",
         ):
@@ -392,7 +408,7 @@ class DDQN:
 #          num_episodes=3000, seed=42, max_memory_size=5000, lr_gamma=1, lr_step=100, measure_step=100,
 #          measure_repeats=100, hidden_dim=64, env_name='CartPole-v1', cnn=False, horizon=np.inf, render=True, render_step=50):
 #     """
-#     Remark: Convergence is slow. Wait until around episode 2500 to see good performance.
+#     Remark: Convergence is slow. Wait until around episode 1500 to see good performance.
 
 #     :param gamma: reward discount factor
 #     :param lr: learning rate for the Q-Network

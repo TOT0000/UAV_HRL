@@ -166,7 +166,7 @@ class RoutingCadenceTest(unittest.TestCase):
 
 class StrategyScopeTest(unittest.TestCase):
     def test_every_registry_method_uses_strategy_driven_scope(self):
-        config = formal_training_config(2500)
+        config = formal_training_config(1500)
         self.assertEqual(len(METHOD_REGISTRY), 16)
         for method_key in METHOD_REGISTRY:
             with self.subTest(method=method_key):
@@ -199,7 +199,7 @@ class StrategyScopeTest(unittest.TestCase):
                     self.assertEqual(method.routing, "safe_ddqn")
 
     def test_assignment_objective_and_observation_do_not_change_cadence(self):
-        config = formal_training_config(2500)
+        config = formal_training_config(1500)
         keys = (
             "td3_dinkelbach",
             "td3_ratio",

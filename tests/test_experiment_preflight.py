@@ -55,16 +55,16 @@ class ExperimentPreflightTest(unittest.TestCase):
     def _model_checkpoint(self, root, training_seed=17, mutate=None):
         _, calibration = load_com_capacity_reference()
         formal_config = effective_training_config(
-            formal_training_config(2500, random_seed=training_seed),
+            formal_training_config(1500, random_seed=training_seed),
             self.method,
         )
         dinkelbach_state = DinkelbachBlockState.from_config(formal_config)
-        for _ in range(2500):
+        for _ in range(1500):
             dinkelbach_state.record_episode(1.0, 2.0)
         metadata = {
             "checkpoint_schema_version": CHECKPOINT_SCHEMA_VERSION,
             "checkpoint_type": MODEL_CHECKPOINT_TYPE,
-            "episode": 2499,
+            "episode": 1499,
             "movement_state_dim": 429,
             "joint_action_dim": 30,
             "routing_state_dim": 90,
@@ -80,9 +80,9 @@ class ExperimentPreflightTest(unittest.TestCase):
                 "lambda_cost": 0.0,
                 "initial_lambda_cost": 0.0,
                 "eta_c": 0.01,
-                "qos_cost_budget": 12.0,
+                "qos_target_probability": 0.1,
                 "lambda_update_scope": "episode_end",
-                "cost_denominator": "network_routing_slot_steps",
+                "cost_denominator": "eligible_packets",
                 "mid_episode_checkpoint_supported": False,
             },
             "com_calibration_fingerprint": calibration_fingerprint(calibration),
@@ -107,13 +107,13 @@ class ExperimentPreflightTest(unittest.TestCase):
                 "method_id": self.method.method_id,
                 "method_spec": self.method.to_dict(),
                 "method_spec_fingerprint": self.method.fingerprint,
-                "training_episode_count": 2500,
+                "training_episode_count": 1500,
                 "training_seed": training_seed,
                 "checkpoint_schema_version": CHECKPOINT_SCHEMA_VERSION,
             }
         )
         metadata["training_provenance"] = {
-            "training_episode_count": 2500,
+            "training_episode_count": 1500,
             "training_git_sha": "fixture-training-sha",
             "resolved_training_config": resolved,
             "routing_lifecycle": lifecycle,
@@ -124,7 +124,7 @@ class ExperimentPreflightTest(unittest.TestCase):
         }
         if mutate is not None:
             mutate(metadata)
-        checkpoint = Path(root) / "checkpoints" / "models" / "ep_2500"
+        checkpoint = Path(root) / "checkpoints" / "models" / "ep_1500"
         checkpoint.mkdir(parents=True)
         (checkpoint / "metadata.json").write_text(
             json.dumps(metadata), encoding="utf-8"
@@ -356,9 +356,9 @@ class ExperimentPreflightTest(unittest.TestCase):
                     "lambda_cost": 0.0,
                     "initial_lambda_cost": 0.0,
                     "eta_c": 0.01,
-                    "qos_cost_budget": 12.0,
+                    "qos_target_probability": 0.1,
                     "lambda_update_scope": "episode_end",
-                    "cost_denominator": "network_routing_slot_steps",
+                    "cost_denominator": "eligible_packets",
                     "mid_episode_checkpoint_supported": False,
                 },
                 "com_calibration_fingerprint": calibration_fingerprint(

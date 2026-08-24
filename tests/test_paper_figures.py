@@ -119,7 +119,7 @@ class PooledMetricTest(unittest.TestCase):
 class SyntheticFigureBuildTest(unittest.TestCase):
     @staticmethod
     def _formal_config(method):
-        base = asdict(formal_training_config(2500, random_seed=TRAINING_SEED))
+        base = asdict(formal_training_config(1500, random_seed=TRAINING_SEED))
         return effective_training_config(base, method)
 
     @classmethod
@@ -138,7 +138,7 @@ class SyntheticFigureBuildTest(unittest.TestCase):
         }
         if method.uses_dinkelbach:
             state = DinkelbachBlockState.from_config(formal_config)
-            for _ in range(2500):
+            for _ in range(1500):
                 state.record_episode(1.0, 2.0)
             experiment.update(
                 {
@@ -150,7 +150,7 @@ class SyntheticFigureBuildTest(unittest.TestCase):
         metadata = {
             "checkpoint_schema_version": CHECKPOINT_SCHEMA_VERSION,
             "checkpoint_type": MODEL_CHECKPOINT_TYPE,
-            "episode": 2499,
+            "episode": 1499,
             "movement_agent_kind": method.agent,
             "movement_agent_configuration": formal_config[
                 "movement_agent_configuration"
@@ -163,9 +163,9 @@ class SyntheticFigureBuildTest(unittest.TestCase):
                 "lambda_cost": 0.0,
                 "initial_lambda_cost": 0.0,
                 "eta_c": 0.01,
-                "qos_cost_budget": 12.0,
+                "qos_target_probability": 0.1,
                 "lambda_update_scope": "episode_end",
-                "cost_denominator": "network_routing_slot_steps",
+                "cost_denominator": "eligible_packets",
                 "mid_episode_checkpoint_supported": False,
                 "routing_optimizer_update_count": 17,
                 "routing_target_update_count": 17,
@@ -188,13 +188,13 @@ class SyntheticFigureBuildTest(unittest.TestCase):
                 "method_id": method.method_id,
                 "method_spec": method.to_dict(),
                 "method_spec_fingerprint": method.fingerprint,
-                "training_episode_count": 2500,
+                "training_episode_count": 1500,
                 "training_seed": TRAINING_SEED,
                 "checkpoint_schema_version": CHECKPOINT_SCHEMA_VERSION,
             }
         )
         metadata["training_provenance"] = {
-            "training_episode_count": 2500,
+            "training_episode_count": 1500,
             "training_git_sha": "synthetic-training-sha",
             "resolved_training_config": resolved,
             "routing_lifecycle": lifecycle,
@@ -223,14 +223,14 @@ class SyntheticFigureBuildTest(unittest.TestCase):
             "method_spec": method.to_dict(),
             "seed": TRAINING_SEED,
             "training_manifest_hash": "a" * 64,
-            "formal_checkpoint_episode": 2500,
+            "formal_checkpoint_episode": 1500,
             "training_config": formal_config,
             "status": "COMPLETED",
         }
         (run_dir / "resolved_config.json").write_text(
             json.dumps(resolved), encoding="utf-8"
         )
-        checkpoint = run_dir / "checkpoints" / "models" / "ep_2500"
+        checkpoint = run_dir / "checkpoints" / "models" / "ep_1500"
         checkpoint.mkdir(parents=True)
         metadata = self._checkpoint_metadata(method, formal_config)
         (checkpoint / "metadata.json").write_text(
@@ -246,7 +246,7 @@ class SyntheticFigureBuildTest(unittest.TestCase):
                     "timely_goodput_mbits": episode * (1.0 + len(method_id) / 100),
                     "mobility_energy_j": 2.0,
                 }
-                for episode in range(1, 2501)
+                for episode in range(1, 1501)
             ]
             (run_dir / "training_history.jsonl").write_text(
                 "".join(json.dumps(row) + "\n" for row in rows),
@@ -429,7 +429,7 @@ class SyntheticFigureBuildTest(unittest.TestCase):
         checkpoint_required = method.learns_movement or method.learns_routing
         training_run = training_runs.get(method_id)
         checkpoint = (
-            training_run / "checkpoints" / "models" / "ep_2500"
+            training_run / "checkpoints" / "models" / "ep_1500"
             if checkpoint_required
             else None
         )
@@ -481,7 +481,7 @@ class SyntheticFigureBuildTest(unittest.TestCase):
                 "checkpoint_training_provenance": checkpoint_training,
                 "evaluation_runtime_provenance": runtime,
                 "checkpoint_training_episode_count": (
-                    2500 if checkpoint_training is not None else None
+                    1500 if checkpoint_training is not None else None
                 ),
                 "evaluation_episode_count": EVALUATION_EPISODES,
                 "checkpoint_training_git_sha": (
@@ -577,7 +577,7 @@ class SyntheticFigureBuildTest(unittest.TestCase):
             "method_spec": method.to_dict(),
             "training_run": str(training_run) if checkpoint_required else None,
             "checkpoint_required": checkpoint_required,
-            "checkpoint_episode": 2500 if checkpoint_required else None,
+            "checkpoint_episode": 1500 if checkpoint_required else None,
             "checkpoint_path": str(checkpoint) if checkpoint_required else None,
             **provenance,
             "formal_training_config": training_resolved["training_config"] if checkpoint_required else None,
@@ -795,13 +795,13 @@ class SyntheticFigureBuildTest(unittest.TestCase):
             evaluation_dir = evaluations["fixed_roi"][method]
             metadata_path = evaluation_dir / "paper_evaluation_metadata.json"
             metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-            metadata["checkpoint_path"] = str(root / "does-not-exist" / "ep_2500")
+            metadata["checkpoint_path"] = str(root / "does-not-exist" / "ep_1500")
             metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
             with self.assertRaisesRegex(IncompatiblePaperRunError, "checkpoint.*path"):
                 build_paper_figures(spec, figure="task_assignment_ee_vs_number_of_rois", output_root=root / "missing-checkpoint")
 
             spec, training, _ = self._fixture(root / "mutated-models")
-            checkpoint = training[method] / "checkpoints" / "models" / "ep_2500"
+            checkpoint = training[method] / "checkpoints" / "models" / "ep_1500"
             self._write_synthetic_models(checkpoint / "models.pt", "mutated-payload")
             with self.assertRaisesRegex(
                 IncompatiblePaperRunError, "checkpoint_models_sha256"
@@ -813,7 +813,7 @@ class SyntheticFigureBuildTest(unittest.TestCase):
                 )
 
             spec, training, _ = self._fixture(root / "missing-models")
-            checkpoint = training[method] / "checkpoints" / "models" / "ep_2500"
+            checkpoint = training[method] / "checkpoints" / "models" / "ep_1500"
             (checkpoint / "models.pt").rename(checkpoint / "models.unavailable")
             with self.assertRaisesRegex(
                 IncompatiblePaperRunError, "model payload is missing"
@@ -832,7 +832,7 @@ class SyntheticFigureBuildTest(unittest.TestCase):
             evaluation_dir = evaluations["fixed_roi"][method]
             metadata_path = evaluation_dir / "paper_evaluation_metadata.json"
             metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-            metadata["checkpoint_path"] = str(root / "fake" / "ep_2500")
+            metadata["checkpoint_path"] = str(root / "fake" / "ep_1500")
             metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
             with self.assertRaisesRegex(IncompatiblePaperRunError, "pure-random"):
                 build_paper_figures(spec, figure="hierarchical_architecture_ee_vs_number_of_rois", output_root=root / "random-checkpoint")
@@ -969,7 +969,7 @@ class SyntheticFigureBuildTest(unittest.TestCase):
             method = FIGURE_REGISTRY["training_ee_vs_episode"]["methods"][0]
             history = training[method] / "training_history.jsonl"
             history.write_text("\n".join(history.read_text(encoding="utf-8").splitlines()[:-1]) + "\n", encoding="utf-8")
-            with self.assertRaisesRegex(IncompatiblePaperRunError, "1..2500"):
+            with self.assertRaisesRegex(IncompatiblePaperRunError, "1..1500"):
                 build_paper_figures(spec, figure="training_ee_vs_episode", output_root=root / "short-out")
 
 

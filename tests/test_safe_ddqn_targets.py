@@ -147,25 +147,39 @@ class SafeDDQNTargetTest(unittest.TestCase):
 
     def test_constraint_defaults_and_episode_end_update_formula(self):
         model = DDQN(state_dim=42, action_dim=3, hidden_dim=8)
-        self.assertEqual(model.qos_cost_budget, 12.0)
+        self.assertEqual(model.qos_target_probability, 0.1)
         self.assertEqual(model.lambda_cost, 0.0)
         self.assertEqual(model.eta_c, 0.01)
 
-        increased = model.update_cost_multiplier(
-            episode_cost_sum=20.0 * 240,
-            episode_slot_steps=240,
+        unchanged = model.update_cost_multiplier(
+            episode_violation_count=2,
+            episode_eligible_packet_count=20,
         )
-        self.assertAlmostEqual(increased, 0.08)
+        self.assertEqual(unchanged, 0.0)
         self.assertEqual(model.cost_multiplier_update_count, 1)
+        increased = model.update_cost_multiplier(
+            episode_violation_count=3,
+            episode_eligible_packet_count=20,
+        )
+        self.assertAlmostEqual(increased, 0.01 * 0.05)
+        self.assertEqual(model.cost_multiplier_update_count, 2)
         decreased = model.update_cost_multiplier(
-            episode_cost_sum=0.0,
-            episode_slot_steps=240,
+            episode_violation_count=0,
+            episode_eligible_packet_count=20,
         )
         self.assertEqual(decreased, 0.0)
-        self.assertEqual(model.cost_multiplier_update_count, 2)
+        self.assertEqual(model.cost_multiplier_update_count, 3)
+        zero_eligible = model.update_cost_multiplier(
+            episode_violation_count=0,
+            episode_eligible_packet_count=0,
+        )
+        self.assertEqual(zero_eligible, 0.0)
+        self.assertEqual(model.cost_multiplier_update_count, 3)
         state = model.constraint_state()
         self.assertEqual(state["lambda_update_scope"], "episode_end")
-        self.assertEqual(state["cost_denominator"], "network_routing_slot_steps")
+        self.assertEqual(state["cost_denominator"], "eligible_packets")
+        self.assertEqual(state["last_episode_eligible_packet_count"], 0)
+        self.assertIsNone(state["last_episode_violation_probability"])
         self.assertFalse(state["mid_episode_checkpoint_supported"])
 
 

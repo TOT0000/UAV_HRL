@@ -45,7 +45,7 @@ from training_checkpoint import (
 )
 
 
-DESIGN_DATASET_SCHEMA_VERSION = 1
+DESIGN_DATASET_SCHEMA_VERSION = 2
 DESIGN_TRANSITIONS_FILENAME = "design_transitions.npz"
 DESIGN_METADATA_FILENAME = "design_dataset_metadata.json"
 DESIGN_EPISODES_CSV = "per_episode.csv"
@@ -96,6 +96,8 @@ INTEGER_EPISODE_COLUMNS = {
     "fov_deadline_violations",
     "com_deadline_violations",
     "total_deadline_violations",
+    "eligible_packet_count",
+    "sr_admission_drop_count",
     "routing_wait_count",
     "partial_transmission_count",
     "slot_budget_violation_count",

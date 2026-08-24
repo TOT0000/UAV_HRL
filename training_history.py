@@ -32,6 +32,11 @@ TRAINING_HISTORY_COLUMNS = (
     "dinkelbach_block_episode",
     "dinkelbach_block_timely_mbits_so_far",
     "dinkelbach_block_energy_joules_so_far",
+    "eligible_packet_count",
+    "delay_violation_count",
+    "delay_violation_probability",
+    "lambda_cost_used",
+    "lambda_cost_after_episode",
 )
 
 FLOAT_COLUMNS = (
@@ -43,18 +48,23 @@ FLOAT_COLUMNS = (
     "dinkelbach_lambda_after_episode",
     "dinkelbach_block_timely_mbits_so_far",
     "dinkelbach_block_energy_joules_so_far",
+    "delay_violation_probability",
+    "lambda_cost_used",
+    "lambda_cost_after_episode",
 )
 
 INTEGER_COLUMNS = (
     "dinkelbach_block_index",
     "dinkelbach_block_episode",
+    "eligible_packet_count",
+    "delay_violation_count",
 )
 
 BOOLEAN_COLUMNS = ("dinkelbach_lambda_updated",)
 
 STRING_COLUMNS = ("dinkelbach_update_status",)
 
-TRAINING_HISTORY_SCHEMA_VERSION = 3
+TRAINING_HISTORY_SCHEMA_VERSION = 4
 TRAINING_HISTORY_CSV = "training_history.csv"
 TRAINING_HISTORY_JSONL = "training_history.jsonl"
 TRAINING_HISTORY_COMMIT = "training_history_commit.json"
@@ -96,6 +106,11 @@ def build_training_history_row(
     dinkelbach_block_timely_mbits_so_far,
     dinkelbach_block_energy_joules_so_far,
     dinkelbach_block_completed=None,
+    eligible_packet_count=0,
+    delay_violation_count=0,
+    delay_violation_probability=None,
+    lambda_cost_used=None,
+    lambda_cost_after_episode=None,
 ):
     timely_goodput_mbits = float(timely_goodput_mbits)
     mobility_energy_j = float(mobility_energy_j)
@@ -118,6 +133,11 @@ def build_training_history_row(
         "dinkelbach_block_episode": dinkelbach_block_episode,
         "dinkelbach_block_timely_mbits_so_far": dinkelbach_block_timely_mbits_so_far,
         "dinkelbach_block_energy_joules_so_far": dinkelbach_block_energy_joules_so_far,
+        "eligible_packet_count": int(eligible_packet_count),
+        "delay_violation_count": int(delay_violation_count),
+        "delay_violation_probability": delay_violation_probability,
+        "lambda_cost_used": lambda_cost_used,
+        "lambda_cost_after_episode": lambda_cost_after_episode,
     }
     return normalize_training_history_row(row)
 
@@ -139,6 +159,9 @@ def normalize_training_history_row(row):
         "dinkelbach_block_episode",
         "dinkelbach_block_timely_mbits_so_far",
         "dinkelbach_block_energy_joules_so_far",
+        "delay_violation_probability",
+        "lambda_cost_used",
+        "lambda_cost_after_episode",
     }
     normalized.update(
         {

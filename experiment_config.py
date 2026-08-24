@@ -7,13 +7,19 @@ import hashlib
 import json
 from types import MappingProxyType
 
+from Channel_model import (
+    reference_s2u_max_capacity_mbps,
+    reference_u2g_max_capacity_mbps,
+    reference_u2u_max_capacity_mbps,
+)
+
 
 NUM_UAV = 10
 ROI_COUNT_MIN = 2
 ROI_COUNT_MAX = 8
 RESERVED_SEARCH_UAV_IDS = (0, NUM_UAV - 1)
 DEFAULT_TRAINING_SEED = 20260817
-FORMAL_TRAINING_EPISODES = 2500
+FORMAL_TRAINING_EPISODES = 1500
 FORMAL_CHECKPOINT_EPISODE = FORMAL_TRAINING_EPISODES
 SEARCH_COVERAGE_THRESHOLD = 0.99
 FOV_COM_PAIR_MAX_DISTANCE_M = 200.0
@@ -23,9 +29,10 @@ REFERENCE_COM_BANDWIDTH_HZ = TOTAL_COMMUNICATION_BANDWIDTH_HZ / (
 )
 COM_PACKET_RATE_PER_SECOND = 50.0
 COM_PACKET_SIZE_BITS = 256.0
-COM_REQUIRED_RATE_BPS = COM_PACKET_RATE_PER_SECOND * COM_PACKET_SIZE_BITS
+COM_OFFERED_RATE_BPS = COM_PACKET_RATE_PER_SECOND * COM_PACKET_SIZE_BITS
 ASSIGNMENT_DUMMY_UTILITY = -1e-9
-UTILITY_NORMALIZATION_MODE = "fov_global_minmax_com_demand_satisfaction-v1"
+UTILITY_NORMALIZATION_MODE = "fov_global_minmax_com_fixed_theoretical_capacity-v2"
+COM_UTILITY_CONTRACT_VERSION = "fixed-s2u-theoretical-maximum-v1"
 TASK_COMPATIBILITY_POLICY = "fov_com_only_with_distance_limit"
 FOV_ASSIGNMENT_UTILITY_VERSION = "coverage_times_reciprocal_image_quality-v1"
 FOV_QUALITY_TRANSFORM = (
@@ -35,7 +42,7 @@ FOV_COVERAGE_SOURCE = (
     "centralized_movement.fov_task_metrics circle-ROI/rectangular-FOV "
     "intersection ratio [0,1]"
 )
-SAFE_DDQN_QOS_COST_BUDGET = 12.0
+SAFE_DDQN_QOS_TARGET_PROBABILITY = 0.1
 SAFE_DDQN_INITIAL_LAMBDA_COST = 0.0
 SAFE_DDQN_ETA_C = 0.01
 SAFE_DDQN_LAMBDA_UPDATE_SCOPE = "episode_end"
@@ -56,7 +63,29 @@ ROUTING_GAMMA = 0.99
 ROUTING_TAU = 0.005
 ROUTING_OPTIMIZER_UPDATE_SCOPE = "every_4_routing_slots"
 FOV_EMA_LIFECYCLE_VERSION = "no-map-footprint-progression-v3"
-SR_ROUTE_LIFECYCLE_VERSION = "no-duplicate-start-exact-endpoint-v1"
+SR_ROUTE_LIFECYCLE_VERSION = "assigned-and-arrived-derived-state-v2"
+PACKET_QOS_CONTRACT_VERSION = "eligible-fov-plus-s2u-admitted-com-v2"
+ROUTING_REWARD_CONTRACT_VERSION = "capacity-minus-hol-delay-v2"
+ROUTING_REWARD_ALPHA_CAPACITY = 1.0
+ROUTING_REWARD_ALPHA_DELAY = 0.5
+ROUTING_CAPACITY_EPSILON_BPS = 1e-9
+MOVEMENT_CHANNEL_TIMING_VERSION = "held-command-four-synchronous-substeps-v2"
+PROPULSION_MODEL_ID = "canonical-3d-quadrotor-v1"
+PROPULSION_PARAMETERS = MappingProxyType(
+    {
+        "n_r": 4,
+        "rho": 1.293,
+        "S_FP": 0.01,
+        "g": 9.8,
+        "m": 2.0,
+        "delta": 0.012,
+        "c_T": 0.302,
+        "c_s": 0.0955,
+        "c_f": 0.131,
+        "A": 0.0314,
+        "d_0": 0.834,
+    }
+)
 PRODUCTION_TASK_DEADLINE_SECONDS = {"FOV": 1.5, "COM": 1.0}
 PRODUCTION_PACKET_INJECTION_CUTOFF_SECONDS = 58.5
 
@@ -602,14 +631,19 @@ def comparison_method_configuration(method_spec: MethodSpec) -> dict:
         "search_coverage_threshold": SEARCH_COVERAGE_THRESHOLD,
         "service_assignment_only": True,
         "utility_normalization_mode": UTILITY_NORMALIZATION_MODE,
+        "com_utility_contract_version": COM_UTILITY_CONTRACT_VERSION,
+        "reference_com_bandwidth_hz": REFERENCE_COM_BANDWIDTH_HZ,
+        "reference_s2u_max_capacity_mbps": (
+            reference_s2u_max_capacity_mbps(REFERENCE_COM_BANDWIDTH_HZ)
+        ),
         "task_compatibility_policy": TASK_COMPATIBILITY_POLICY,
         "hover_assignment_candidate": False,
         "assignment_dummy_utility": ASSIGNMENT_DUMMY_UTILITY,
         "fov_assignment_utility_version": FOV_ASSIGNMENT_UTILITY_VERSION,
         "fov_quality_transform": FOV_QUALITY_TRANSFORM,
         "fov_coverage_source": FOV_COVERAGE_SOURCE,
-        "safe_ddqn_qos_cost_budget": (
-            SAFE_DDQN_QOS_COST_BUDGET
+        "safe_ddqn_qos_target_probability": (
+            SAFE_DDQN_QOS_TARGET_PROBABILITY
             if method_spec.routing == "safe_ddqn"
             else None
         ),
@@ -634,6 +668,22 @@ def comparison_method_configuration(method_spec: MethodSpec) -> dict:
         "routing_mask_scope": ROUTING_MASK_SCOPE,
         "fov_ema_lifecycle_version": FOV_EMA_LIFECYCLE_VERSION,
         "sr_route_lifecycle_version": SR_ROUTE_LIFECYCLE_VERSION,
+        "packet_qos_contract_version": PACKET_QOS_CONTRACT_VERSION,
+        "routing_reward_contract_version": ROUTING_REWARD_CONTRACT_VERSION,
+        "routing_reward_alpha_capacity": ROUTING_REWARD_ALPHA_CAPACITY,
+        "routing_reward_alpha_delay": ROUTING_REWARD_ALPHA_DELAY,
+        "routing_capacity_epsilon_bps": ROUTING_CAPACITY_EPSILON_BPS,
+        "reference_u2u_max_capacity_mbps": (
+            reference_u2u_max_capacity_mbps(TOTAL_COMMUNICATION_BANDWIDTH_HZ)
+        ),
+        "reference_u2g_max_capacity_mbps": (
+            reference_u2g_max_capacity_mbps(TOTAL_COMMUNICATION_BANDWIDTH_HZ)
+        ),
+        "propulsion_model_id": PROPULSION_MODEL_ID,
+        "propulsion_parameters": dict(PROPULSION_PARAMETERS),
+        "movement_channel_timing_version": MOVEMENT_CHANNEL_TIMING_VERSION,
+        "movement_substeps_per_interval": 4,
+        "movement_substep_seconds": 0.25,
         "resolved_fov_deadline_seconds": PRODUCTION_TASK_DEADLINE_SECONDS["FOV"],
         "resolved_com_deadline_seconds": PRODUCTION_TASK_DEADLINE_SECONDS["COM"],
         "packet_injection_cutoff_seconds": (

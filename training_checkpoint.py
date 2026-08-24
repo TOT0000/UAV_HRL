@@ -20,7 +20,7 @@ from experiment_config import (
     NUM_UAV,
     SAFE_DDQN_ETA_C,
     SAFE_DDQN_INITIAL_LAMBDA_COST,
-    SAFE_DDQN_QOS_COST_BUDGET,
+    SAFE_DDQN_QOS_TARGET_PROBABILITY,
 )
 from fov_ema_lifecycle import validate_fov_ema_state
 
@@ -30,7 +30,7 @@ from dinkelbach_blocks import (
     dinkelbach_config_metadata,
 )
 
-CHECKPOINT_SCHEMA_VERSION = 8
+CHECKPOINT_SCHEMA_VERSION = 9
 ROUTING_LIFECYCLE_CHECKPOINT_SCHEMA_VERSION = 6
 PRE_ROUTING_LIFECYCLE_CHECKPOINT_SCHEMA_VERSION = 5
 PRE_ADAPTIVE_SAFE_DDQN_CHECKPOINT_SCHEMA_VERSION = 4
@@ -122,7 +122,10 @@ FORMAL_CORE_CONFIG_FIELDS = (
     "fov_assignment_utility_version",
     "fov_quality_transform",
     "fov_coverage_source",
-    "safe_ddqn_qos_cost_budget",
+    "safe_ddqn_qos_target_probability",
+    "com_utility_contract_version",
+    "reference_com_bandwidth_hz",
+    "reference_s2u_max_capacity_mbps",
     "safe_ddqn_initial_lambda_cost",
     "safe_ddqn_eta_c",
     "safe_ddqn_lambda_update_scope",
@@ -130,6 +133,18 @@ FORMAL_CORE_CONFIG_FIELDS = (
     "routing_mask_scope",
     "fov_ema_lifecycle_version",
     "sr_route_lifecycle_version",
+    "packet_qos_contract_version",
+    "routing_reward_contract_version",
+    "routing_reward_alpha_capacity",
+    "routing_reward_alpha_delay",
+    "routing_capacity_epsilon_bps",
+    "reference_u2u_max_capacity_mbps",
+    "reference_u2g_max_capacity_mbps",
+    "propulsion_model_id",
+    "propulsion_parameters",
+    "movement_channel_timing_version",
+    "movement_substeps_per_interval",
+    "movement_substep_seconds",
     "resolved_fov_deadline_seconds",
     "resolved_com_deadline_seconds",
     "packet_injection_cutoff_seconds",
@@ -648,9 +663,9 @@ def _validate_safe_ddqn_constraint_metadata(metadata):
     expected = {
         "initial_lambda_cost": SAFE_DDQN_INITIAL_LAMBDA_COST,
         "eta_c": SAFE_DDQN_ETA_C,
-        "qos_cost_budget": SAFE_DDQN_QOS_COST_BUDGET,
+        "qos_target_probability": SAFE_DDQN_QOS_TARGET_PROBABILITY,
         "lambda_update_scope": "episode_end",
-        "cost_denominator": "network_routing_slot_steps",
+        "cost_denominator": "eligible_packets",
         "mid_episode_checkpoint_supported": False,
     }
     mismatches = {
@@ -1049,7 +1064,7 @@ def _validate_checkpoint_schema(metadata):
         ):
             raise RuntimeError(
                 "legacy safe-DDQN checkpoint lacks adaptive lambda_cost, eta_c, "
-                "and QoS budget state"
+                "and canonical eligible-packet QoS target state"
             )
         return schema
     try:

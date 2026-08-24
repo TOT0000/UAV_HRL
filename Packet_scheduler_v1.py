@@ -2,7 +2,11 @@ import math
 from collections import defaultdict, deque
 from Energy_model import EnergyConsumptionModel
 from Fov_model_phase import FovModel
-from Channel_model import ChannelModel
+from Channel_model import (
+    ChannelModel,
+    reference_u2g_max_capacity_mbps,
+    reference_u2u_max_capacity_mbps,
+)
 from centralized_movement import vs_data_valid
 from experiment_config import (
     COM_PACKET_RATE_PER_SECOND,
@@ -10,6 +14,10 @@ from experiment_config import (
     FOV_EMA_LIFECYCLE_VERSION,
     PRODUCTION_PACKET_INJECTION_CUTOFF_SECONDS,
     PRODUCTION_TASK_DEADLINE_SECONDS,
+    ROUTING_CAPACITY_EPSILON_BPS,
+    ROUTING_REWARD_ALPHA_CAPACITY,
+    ROUTING_REWARD_ALPHA_DELAY,
+    TOTAL_COMMUNICATION_BANDWIDTH_HZ,
 )
 from fov_ema_lifecycle import validate_fov_ema_state
 import numpy as np
@@ -112,6 +120,10 @@ class PacketEngine:
         self.deadline_drops = 0
         self.link_slot_budget_violations = 0
         self.generated_packet_counts = {"FOV": 0, "COM": 0}
+        self.eligible_packet_counts = {"FOV": 0, "COM": 0}
+        self.sr_admission_drop_count = 0
+        self.replay_attributed_violation_cost_count = 0.0
+        self.pending_terminal_cost_by_sender = defaultdict(float)
         self.packet_outcomes = []
 
         self.bp_skip_inject_steps = 0
@@ -496,12 +508,21 @@ class PacketEngine:
             "final_hop_accum_bits": 0.0,
             "timely_goodput_counted": False,
             "violation_counted": False,
+            "routing_eligible": source_kind == "UAV",
             "terminal_outcome": None,
             "s2u_receiver": None,
             "s2u_bits_sent": 0.0,
-            "routing_eligible_time": generation_time,
+            "routing_eligible_time": (
+                generation_time if source_kind == "UAV" else None
+            ),
+            # Credit boundary/terminal violations to the packet's most recent
+            # routing decision, even after a just-completed relay hop changes
+            # ``current`` before the receiver has had a decision slot.
+            "last_routing_sender": None,
         }
         self.generated_packet_counts[task_type] += 1
+        if source_kind == "UAV":
+            self.eligible_packet_counts[task_type] += 1
         self.packet_pool.append(pkt)
         self._active_idx.add(pool_idx)
         self._next_pkt_id += 1
@@ -692,6 +713,8 @@ class PacketEngine:
         return ordered
 
     def _count_violation(self, pkt):
+        if not bool(pkt.get("routing_eligible", False)):
+            raise AssertionError("SR-admission packets cannot count as QoS violations")
         if pkt.get("violation_counted", False):
             return False
         pkt["violation_counted"] = True
@@ -715,7 +738,9 @@ class PacketEngine:
         if not self._count_violation(pkt):
             return None
         task_type = self._task_norm(pkt.get("task_type", "COM"))
-        owner = int(pkt.get("current", -1) if sender is None else sender)
+        fallback_owner = pkt.get("current", -1) if sender is None else sender
+        last_sender = pkt.get("last_routing_sender")
+        owner = int(fallback_owner if last_sender is None else last_sender)
         self.mark_packet_done(
             pkt,
             current_time=float(current_time),
@@ -728,6 +753,32 @@ class PacketEngine:
             "task_type": task_type,
             "packet_id": int(pkt["id"]),
             "packet": pkt,
+        }
+
+    def _mark_sr_admission_drop(self, pkt, current_time, remove_from_queue=True):
+        """Expire one non-admitted COM packet without entering the QoS set."""
+
+        if bool(pkt.get("routing_eligible", False)):
+            raise AssertionError("eligible COM packet cannot be an SR admission drop")
+        if pkt.get("terminal_outcome") is not None:
+            return None
+        remaining_bits = max(float(pkt.get("rem_bits", 0.0)), 0.0)
+        pkt["sr_waiting_seconds"] = max(
+            float(current_time) - float(pkt.get("generation_time", current_time)),
+            0.0,
+        )
+        pkt["sr_admission_remaining_bits"] = remaining_bits
+        self.sr_admission_drop_count += 1
+        self.mark_packet_done(
+            pkt,
+            current_time=float(current_time),
+            reason="sr_admission_drop",
+            remove_from_queue=remove_from_queue,
+        )
+        return {
+            "source_sr_id": int(pkt.get("source_id", -1)),
+            "packet_id": int(pkt["id"]),
+            "remaining_bits": remaining_bits,
         }
 
     def expire_packets(self, current_time, inclusive=True):
@@ -793,14 +844,9 @@ class PacketEngine:
                 if is_expired(pkt):
                     expired_bits += max(float(pkt.get("rem_bits", 0.0)), 0.0)
                     pkt["_queued_sr"] = None
-                    event = self._mark_deadline_violation(
-                        pkt,
-                        current_time,
-                        sender=-(int(sr_id) + 1),
-                        remove_from_queue=False,
+                    self._mark_sr_admission_drop(
+                        pkt, current_time, remove_from_queue=False
                     )
-                    if event is not None:
-                        violations.append(event)
                 else:
                     kept.append(pkt)
             self.sr_queues[sr_id] = kept
@@ -815,31 +861,78 @@ class PacketEngine:
                 continue
             pkt = self.packet_pool[pool_idx]
             if pkt is not None and not pkt.get("done", False) and is_expired(pkt):
-                event = self._mark_deadline_violation(
-                    pkt, current_time, remove_from_queue=False
-                )
-                if event is not None:
-                    violations.append(event)
+                if bool(pkt.get("routing_eligible", False)):
+                    event = self._mark_deadline_violation(
+                        pkt, current_time, remove_from_queue=False
+                    )
+                    if event is not None:
+                        violations.append(event)
+                else:
+                    self._mark_sr_admission_drop(
+                        pkt, current_time, remove_from_queue=False
+                    )
         return violations
 
-    def _routing_transmission_reward(
-        self, env, from_uav, to_target, timely_delivery=False
-    ):
-        uav_from = env.uav_dict[int(from_uav)]
-        gx, gy, _ = getattr(env, "GS_pos", (0.0, 0.0, 0.0))
-        previous_distance = math.hypot(uav_from.x_u - gx, uav_from.y_u - gy)
-        if int(to_target) == int(env.GS_ID):
-            new_distance = 0.0
-            next_backlog = 0.0
+    def _queue_bits_ahead(self, sender, pkt):
+        bits = 0.0
+        for queued in self.uav_queues[int(sender)]:
+            if queued is pkt:
+                return bits
+            if queued is not None and not queued.get("done", False):
+                bits += max(float(queued.get("rem_bits", 0.0)), 0.0)
+        raise AssertionError("reward packet is not owned by the sender FIFO")
+
+    def routing_local_reward(self, env, sender, receiver, capacity_mbps, pkt=None):
+        """Canonical factorized capacity-delay reward for one routing slot."""
+
+        sender, receiver = int(sender), int(receiver)
+        pkt = self.get_hol_packet(sender) if pkt is None else pkt
+        if pkt is None:
+            return 0.0
+        capacity_mbps = float(capacity_mbps)
+        service_available = (
+            receiver != sender
+            and np.isfinite(capacity_mbps)
+            and capacity_mbps > 0.0
+        )
+        if receiver == int(env.GS_ID):
+            maximum_mbps = reference_u2g_max_capacity_mbps(
+                TOTAL_COMMUNICATION_BANDWIDTH_HZ
+            )
         else:
-            uav_to = env.uav_dict[int(to_target)]
-            new_distance = math.hypot(uav_to.x_u - gx, uav_to.y_u - gy)
-            next_backlog = float(self.backlog_bits.get(int(to_target), 0.0))
-        progress = previous_distance - new_distance
-        congestion_penalty = math.log1p(next_backlog / 1e5)
-        reward = 0.02 * progress - 0.01 * congestion_penalty
-        if timely_delivery:
-            reward += 1.0
+            maximum_mbps = reference_u2u_max_capacity_mbps(
+                TOTAL_COMMUNICATION_BANDWIDTH_HZ
+            )
+        if service_available:
+            capacity_bps = capacity_mbps * 1e6
+            capacity_norm = float(
+                np.clip(capacity_mbps / maximum_mbps, 0.0, 1.0)
+            )
+            deadline = float(
+                self.task_deadlines_seconds[
+                    self._task_norm(pkt.get("task_type", "COM"))
+                ]
+            )
+            transmission_delay = max(float(pkt.get("rem_bits", 0.0)), 0.0) / max(
+                capacity_bps, ROUTING_CAPACITY_EPSILON_BPS
+            )
+            queue_delay = self._queue_bits_ahead(sender, pkt) / max(
+                capacity_bps, ROUTING_CAPACITY_EPSILON_BPS
+            )
+            transmission_norm = float(
+                np.clip(transmission_delay / deadline, 0.0, 1.0)
+            )
+            queue_norm = float(np.clip(queue_delay / deadline, 0.0, 1.0))
+        else:
+            capacity_norm = 0.0
+            transmission_norm = 1.0
+            queue_norm = 1.0
+        reward = (
+            ROUTING_REWARD_ALPHA_CAPACITY * capacity_norm
+            - ROUTING_REWARD_ALPHA_DELAY * (transmission_norm + queue_norm)
+        )
+        if not np.isfinite(reward):
+            raise RuntimeError("canonical routing reward is NaN or Inf")
         return float(reward)
 
     def serve_s2u_links(self, env, capacities, current_time):
@@ -918,6 +1011,13 @@ class PacketEngine:
                 pkt["rem_bits"] = float(pkt["size_bits"])
                 pkt["s2u_receiver"] = None
                 pkt["routing_eligible_time"] = slot_end
+                if completion_time > float(pkt["deadline_abs"]) + PACKET_EPS:
+                    self._mark_sr_admission_drop(
+                        pkt, completion_time, remove_from_queue=False
+                    )
+                    continue
+                pkt["routing_eligible"] = True
+                self.eligible_packet_counts["COM"] += 1
                 # Enqueue only after this routing slot's eligible packet snapshot.
                 self.enqueue_packet(pkt, receiver, slot_end)
                 self.s2u_completed_packets += 1
@@ -940,6 +1040,7 @@ class PacketEngine:
         result = {
             "reward_by_sender": defaultdict(float),
             "cost_by_sender": defaultdict(float),
+            "deferred_cost_by_sender": defaultdict(float),
             "timely_goodput_bits": 0.0,
             "raw_final_hop_bits": 0.0,
             "transmitted_bits_by_link": {},
@@ -954,6 +1055,18 @@ class PacketEngine:
         result["transmitted_bits_by_link"].update(
             s2u_result["transmitted_bits_by_link"]
         )
+
+        for sender in sorted(actions):
+            receiver = int(actions[sender])
+            hol = self.get_hol_packet(int(sender))
+            if hol is not None:
+                hol["last_routing_sender"] = int(sender)
+            result["reward_by_sender"][int(sender)] = self.routing_local_reward(
+                env,
+                int(sender),
+                receiver,
+                capacities.get((int(sender), receiver), 0.0),
+            )
 
         for sender in sorted(actions):
             sender = int(sender)
@@ -1099,11 +1212,23 @@ class PacketEngine:
                         and deadline_abs > slot_end + PACKET_EPS
                     ):
                         if int(pkt.get("hops", 0)) >= MAX_PACKET_HOPS:
-                            self.mark_packet_done(
+                            violation = self._mark_deadline_violation(
                                 pkt,
-                                current_time=completion_time,
+                                completion_time,
+                                sender=sender,
                                 reason="max_hops",
                             )
+                            if violation is not None:
+                                result["cost_by_sender"][sender] += 1.0
+                                result["outcomes"].append(
+                                    {
+                                        "attributed_sender": sender,
+                                        "task_type": violation["task_type"],
+                                        "packet_id": violation["packet_id"],
+                                        "violated": True,
+                                        "packet": pkt,
+                                    }
+                                )
                         else:
                             pending_relay_arrivals.append(arrival)
                     else:
@@ -1122,11 +1247,6 @@ class PacketEngine:
                                 }
                             )
 
-                result["reward_by_sender"][sender] += (
-                    self._routing_transmission_reward(
-                        env, sender, receiver, timely_delivery
-                    )
-                )
                 if not completed_hop:
                     break
 
@@ -1144,8 +1264,12 @@ class PacketEngine:
         )
         for violation in self.expire_packets(slot_end, inclusive=True):
             sender = int(violation["attributed_sender"])
-            if sender in actions:
-                result["cost_by_sender"][sender] += 1.0
+            cost_bucket = (
+                result["cost_by_sender"]
+                if sender in actions
+                else result["deferred_cost_by_sender"]
+            )
+            cost_bucket[sender] += 1.0
             result["outcomes"].append(
                 {
                     "attributed_sender": sender,
@@ -1255,7 +1379,7 @@ class PacketEngine:
         # COM data is generated at discovered/active SRs, never directly in a
         # UAV queue. Assignment controls S2U reception, not source generation.
         for sr in sorted(getattr(env, "SR_teams", ()), key=lambda item: item.id):
-            if not bool(sr.active):
+            if getattr(sr, "assigned_gt_id", None) is None:
                 continue
             key = f"SR_{int(sr.id)}_COM"
             self.inject_buffer[key] += base_ctrl_rate * step_time
@@ -1328,7 +1452,8 @@ class PacketEngine:
             "deadline": "expired_dropped",
             "max_hops": "expired_dropped",
             "dropped": "expired_dropped",
-            "unfinished": "unfinished",
+            "terminal_deadline": "expired_dropped",
+            "sr_admission_drop": "sr_admission_drop",
         }
         outcome = mapping.get(str(reason))
         if outcome is None:
@@ -1363,18 +1488,32 @@ class PacketEngine:
                 "e2e_delay_seconds": e2e_seconds,
                 "size_bits": float(pkt.get("size_bits", 0.0)),
                 "delivered_to_gs": delivered_to_gs,
+                "routing_eligible": bool(pkt.get("routing_eligible", False)),
+                "sr_waiting_seconds": pkt.get("sr_waiting_seconds"),
+                "remaining_bits_at_drop": pkt.get(
+                    "sr_admission_remaining_bits"
+                ),
             }
         )
 
     def finalize_episode(self, current_time):
-        """Classify every still-active packet as unfinished exactly once."""
+        """Close all packets using the canonical eligible/admission split."""
 
         for pkt in list(self.get_active_packets()):
-            self.mark_packet_done(
-                pkt,
-                current_time=float(current_time),
-                reason="unfinished",
-            )
+            if bool(pkt.get("routing_eligible", False)):
+                sender = int(pkt.get("current", -1))
+                event = self._mark_deadline_violation(
+                    pkt,
+                    float(current_time),
+                    sender=sender,
+                    reason="terminal_deadline",
+                )
+                if event is not None:
+                    self.pending_terminal_cost_by_sender[
+                        int(event["attributed_sender"])
+                    ] += 1.0
+            else:
+                self._mark_sr_admission_drop(pkt, float(current_time))
         return self.packet_metric_summary()
 
     def packet_metric_summary(self):
@@ -1393,15 +1532,25 @@ class PacketEngine:
                     "on_time_delivered",
                     "late_delivered",
                     "expired_dropped",
-                    "unfinished",
                 )
             }
-            generated = int(self.generated_packet_counts[task_type])
+            source_generated = int(self.generated_packet_counts[task_type])
+            eligible = int(self.eligible_packet_counts[task_type])
+            admission_drops = sum(
+                row["outcome"] == "sr_admission_drop" for row in rows
+            )
             conserved = sum(counts.values())
-            if generated != conserved:
+            expected_source_total = conserved + admission_drops
+            if source_generated != expected_source_total:
                 raise AssertionError(
                     f"packet outcome conservation failed for {task_type}: "
-                    f"generated={generated}, terminal={conserved}"
+                    f"source_generated={source_generated}, "
+                    f"terminal={expected_source_total}"
+                )
+            if eligible != conserved:
+                raise AssertionError(
+                    f"eligible packet conservation failed for {task_type}: "
+                    f"eligible={eligible}, terminal={conserved}"
                 )
             delivered_delays = [
                 float(row["e2e_delay_seconds"])
@@ -1413,10 +1562,14 @@ class PacketEngine:
             violations = (
                 counts["late_delivered"]
                 + counts["expired_dropped"]
-                + counts["unfinished"]
             )
             result[task_type] = {
-                "generated_packets": generated,
+                # The established paper column now carries the canonical
+                # denominator: FOV generated plus S2U-admitted COM.
+                "generated_packets": eligible,
+                "source_generated_packets": source_generated,
+                "eligible_packets": eligible,
+                "sr_admission_drop_packets": int(admission_drops),
                 **{
                     f"{name}_packets": int(value)
                     for name, value in counts.items()
@@ -1428,7 +1581,7 @@ class PacketEngine:
                 ),
                 "violation_packets": int(violations),
                 "violation_probability": (
-                    float(violations) / generated if generated else None
+                    float(violations) / eligible if eligible else None
                 ),
             }
         return result
@@ -1456,9 +1609,10 @@ class PacketEngine:
                 if int(pkt.get("hops", 0)) >= MAX_PACKET_HOPS:
                     dropped_bits += max(float(pkt.get("rem_bits", 0.0)), 0.0)
                     pkt["_queued_uav"] = None
-                    self.mark_packet_done(
+                    self._mark_deadline_violation(
                         pkt,
-                        current_time=current_time,
+                        current_time,
+                        sender=uav_id,
                         reason="max_hops",
                         remove_from_queue=False,
                     )
@@ -1475,9 +1629,11 @@ class PacketEngine:
                 continue
             pkt = self.packet_pool[pool_idx]
             if pkt is not None and int(pkt.get("hops", 0)) >= MAX_PACKET_HOPS:
-                self.mark_packet_done(
+                if not bool(pkt.get("routing_eligible", False)):
+                    raise AssertionError("detached non-eligible packet reached max hops")
+                self._mark_deadline_violation(
                     pkt,
-                    current_time=current_time,
+                    current_time,
                     reason="max_hops",
                     remove_from_queue=False,
                 )
@@ -1552,6 +1708,10 @@ class PacketEngine:
         self.deadline_drops = 0
         self.link_slot_budget_violations = 0
         self.generated_packet_counts = {"FOV": 0, "COM": 0}
+        self.eligible_packet_counts = {"FOV": 0, "COM": 0}
+        self.sr_admission_drop_count = 0
+        self.replay_attributed_violation_cost_count = 0.0
+        self.pending_terminal_cost_by_sender = defaultdict(float)
         self.packet_outcomes = []
         self.delay_log = []  # 每跳記錄
         self.type_delay_accum = {

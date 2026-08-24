@@ -65,20 +65,20 @@ class DesignDatasetIntegrationTest(unittest.TestCase):
         cls.manifest_path = cls.root / "validation.json"
         cls.manifest.save(cls.manifest_path)
         cls.formal_config = effective_training_config(
-            formal_training_config(2500, random_seed=cls.training_seed),
+            formal_training_config(1500, random_seed=cls.training_seed),
             cls.method,
         )
         cls.dinkelbach_state = DinkelbachBlockState.from_config(cls.formal_config)
-        for _ in range(2500):
+        for _ in range(1500):
             cls.dinkelbach_state.record_episode(1.0, 2.0)
 
         td3 = TD3(MOVEMENT_STATE_DIM, JOINT_ACTION_DIM, max_action=1.0, gamma=1.0)
         ddqn = DDQN(90, 11)
         _, calibration = load_com_capacity_reference()
-        cls.checkpoint = cls.root / "checkpoints" / "models" / "ep_2500"
+        cls.checkpoint = cls.root / "checkpoints" / "models" / "ep_1500"
         save_model_checkpoint(
             cls.checkpoint,
-            episode=2499,
+            episode=1499,
             td3=td3,
             ddqn=ddqn,
             movement_state_dim=429,
@@ -120,7 +120,7 @@ class DesignDatasetIntegrationTest(unittest.TestCase):
             method_spec=cls.method,
             evaluation=True,
             checkpoint_dir=cls.checkpoint,
-            expected_checkpoint_episodes=2500,
+            expected_checkpoint_episodes=1500,
             expected_checkpoint_formal_config=cls.formal_config,
         )
         cls.reference_dir = cls.root / "reference"
@@ -267,7 +267,7 @@ class DesignDatasetIntegrationTest(unittest.TestCase):
             split="validation",
             evaluation_manifest_hash=self.manifest.content_hash,
             training_manifest_hash="a" * 64,
-            checkpoint_completed_episodes=2500,
+            checkpoint_completed_episodes=1500,
             checkpoint_fingerprint=reference[0]["checkpoint_metadata_fingerprint"],
             expected_scenario_ids=[reference[0]["scenario_id"]],
         )

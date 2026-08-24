@@ -1,12 +1,19 @@
 {
-  "schema": "demand-satisfaction-v1",
-  "normalization": "min(reference_capacity_bps / required_rate_bps, 1)",
+  "schema": "fixed-s2u-theoretical-maximum-v1",
+  "normalization": "clip(candidate_capacity / fixed_theoretical_maximum, 0, 1)",
   "reference_bandwidth_hz": 555555.5555555555,
   "reference_bandwidth_denominator": 18,
   "total_bandwidth_hz": 10000000.0,
   "packet_rate_packets_per_second": 50.0,
   "packet_size_bits": 256.0,
-  "required_rate_bps": 12800.0,
-  "zero_demand_satisfaction": 1.0,
-  "c_ref_com": 0.0128
+  "offered_rate_bps": 12800.0,
+  "reference_geometry": {
+    "horizontal_distance_m": 0.0,
+    "uav_agl_m": 50.0,
+    "sr_agl_m": 0.0
+  },
+  "transmit_power_dbm": 23.0,
+  "reference_s2u_max_capacity_mbps": 11.092923740386324,
+  "c_ref_com": 11.092923740386324,
+  "rate_sweep_invariant": true
 }

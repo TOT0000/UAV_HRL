@@ -40,7 +40,7 @@ class ResumeRecoveryTest(unittest.TestCase):
         self.calibration = {"c_ref_com": 12.5, "seed": 7}
         self.method = MethodSpec()
         self.formal_config = effective_training_config(
-            formal_training_config(2500, random_seed=101), self.method
+            formal_training_config(1500, random_seed=101), self.method
         )
         self.experiment = {
             "method_id": self.method.method_id,
@@ -132,9 +132,9 @@ class ResumeRecoveryTest(unittest.TestCase):
                 "lambda_cost": 0.0,
                 "initial_lambda_cost": 0.0,
                 "eta_c": 0.01,
-                "qos_cost_budget": 12.0,
+                "qos_target_probability": 0.1,
                 "lambda_update_scope": "episode_end",
-                "cost_denominator": "network_routing_slot_steps",
+                "cost_denominator": "eligible_packets",
                 "mid_episode_checkpoint_supported": False,
             },
             "com_calibration_fingerprint": calibration_fingerprint(

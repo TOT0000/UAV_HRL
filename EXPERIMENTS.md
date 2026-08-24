@@ -25,7 +25,10 @@ All assignment solvers exclude Search and Hovering. Below 0.99 coverage UAVs
 and COM service tasks; unassigned UAVs fall back to Search. At release, all 10
 UAVs are immediately reassigned and only unassigned UAVs Hover. FOV raw utility
 uses global feasible-pair min/max normalization (equal values map to 0.5), while
-COM uses capped demand satisfaction. A separate feasibility mask and
+COM uses canonical S2U capacity at the candidate's actual 3-D geometry,
+computed with `10 MHz / 18`, divided by the same channel model's fixed
+best-feasible 50 m AGL capacity. This denominator is independent of candidates
+and traffic rate. A separate feasibility mask and
 explicit dummy choices keep rows unmatched when no service task is available;
 solver-only infinities never enter the domain utility matrix. K-KM uses at most
 two rounds, and FOV+COM is its only legal two-task combination, with current
@@ -63,8 +66,8 @@ python -X utf8 run_experiment.py resume results/<method>/<run-id>
 python -X utf8 run_experiment.py evaluate results/<method>/<run-id>
 ```
 
-Evaluation defaults to the formal `ep_2500` checkpoint. Each invocation creates
-`<run>/evaluation/ep_2500/<unique-eval-id>/`; results, metadata, its evaluation
+Evaluation defaults to the formal `ep_1500` checkpoint. Each invocation creates
+`<run>/evaluation/ep_1500/<unique-eval-id>/`; results, metadata, its evaluation
 manifest, and plots never overwrite a prior evaluation. `--smoke` explicitly
 marks a non-formal evaluation and may be combined with
 `--checkpoint-episode N` for lifecycle checks.
@@ -74,17 +77,23 @@ design-dataset collection, aggregation, and exact-resume workflows.
 
 ## Formal protocol
 
-- 2,500 training episodes for the centrally configured seed `20260817`
+- 1,500 training episodes for the centrally configured seed `20260817`
 - inclusive RoI count range 2 through 8
 - 60 seconds per episode
-- four 0.25-second routing slots per movement interval
+- one projected movement command held across four synchronous 0.25-second
+  movement/channel/routing substeps per one-second movement interval
 - physical and effective routing masks recomputed in every routing slot for
   safe-DDQN, controlled DQN, and random routing
-- safe-DDQN QoS budget `12`, initial `lambda_cost=0`, and `eta_c=0.01`; every
-  episode uses one frozen multiplier for both executed and target actions, then
-  updates it once with
-  `max(0, lambda_cost + eta_c * (network_violation_cost / TS - 12))`, where
-  `TS=240` routing slot-steps in a formal 60-second episode
+- safe-DDQN target violation probability `0.1`, initial `lambda_cost=0`, and
+  `eta_c=0.01`; every episode uses one frozen multiplier for both executed and
+  target actions, then updates it once with
+  `max(0, lambda_cost + eta_c * (violations / eligible_packets - 0.1))`.
+  Eligible packets are generated FOV plus S2U-admitted COM; an episode with no
+  eligible packets does not update the multiplier, and SR admission drops are
+  excluded from both numerator and denominator
+- learned routing uses the common local reward
+  `capacity_norm - 0.5 * (transmission_delay_norm + queue_delay_norm)` with
+  fixed canonical U2U/U2G reference capacities and no distance/progress bonus
 - production FOV/COM deadlines `1.5 s`/`1.0 s`; completion at the exact deadline
   is timely
 - production packet injection cutoff `58.5 s`
@@ -94,11 +103,14 @@ design-dataset collection, aggregation, and exact-resume workflows.
   getters are pure reads. Full checkpoints persist EMA values, initialization,
   previous footprints, footprint/EMA markers, and EMA update count.
   SR routes omit the duplicated start point, include the exact target, and mark
-  arrival on the update that consumes the final waypoint; both lifecycle states
-  remain episode-boundary snapshots in full checkpoints
+  arrival on the update that consumes the final waypoint. The only mutable SR
+  lifecycle fields are `assigned_gt_id` and `arrived`; movement and COM-source
+  enablement are read-only derived state, and assigned SRs keep generating COM
+  after arrival. These lifecycle fields remain episode-boundary snapshots in
+  full checkpoints
   mid-episode checkpointing is explicitly unsupported.
 - 100 evaluation episodes
-- formal model checkpoint `ep_2500`
+- formal model checkpoint `ep_1500`
 - TD3 noise, DDQN epsilon, and DDQN logits noise disabled in evaluation
 - no network, optimizer, target-network, replay, or Dinkelbach update in evaluation
 - direct-ratio methods store zero objective reward on every non-terminal
@@ -109,8 +121,11 @@ design-dataset collection, aggregation, and exact-resume workflows.
   50-episode outer block
 - after every complete block, lambda becomes
   `sum(timely delivered Mbit) / sum(all-UAV mobility energy J)`; no scaling,
-  clipping, or moving average is applied (2,500 episodes contain 50 complete
+  clipping, or moving average is applied (1,500 episodes contain 30 complete
   block updates)
+- propulsion energy uses the fixed `canonical-3d-quadrotor-v1` vector-power
+  model and actual boundary-projected displacement; communication energy is not
+  part of the EE denominator
 - model-only checkpoint every 50 episodes, including exactly one final checkpoint
 - full-resume checkpoint every 50 episodes, retaining only the latest two
 
@@ -160,7 +175,7 @@ and FOV state; the manifest stores only the underlying demand primitive.
 Generate separate manifests (runtime artifacts should remain outside Git):
 
 ```powershell
-python -X utf8 comparison_experiment.py generate-manifest --split train --manifest-seed 101 --episodes 2500 --manifest runs/comparison/manifests/train.json
+python -X utf8 comparison_experiment.py generate-manifest --split train --manifest-seed 101 --episodes 1500 --manifest runs/comparison/manifests/train.json
 python -X utf8 comparison_experiment.py generate-manifest --split validation --manifest-seed 202 --episodes 100 --manifest runs/comparison/manifests/validation.json
 python -X utf8 comparison_experiment.py generate-manifest --split test --manifest-seed 303 --episodes 100 --manifest runs/comparison/manifests/test.json
 python -X utf8 comparison_experiment.py generate-manifest --split test --manifest-seed 303 --episodes 100 --num-gt 4 --manifest runs/comparison/manifests/test-num-gt-4.json
@@ -178,7 +193,7 @@ supports only `td3_dinkelbach`; every other controlled method is rejected during
 preflight before checkpoint loading, Simulator construction, or output creation:
 
 ```powershell
-python -X utf8 comparison_experiment.py collect-design-dataset --method td3_dinkelbach --split validation --manifest runs/comparison/manifests/validation.json --training-seed 20260817 --episodes 100 --checkpoint runs/comparison/td3_dinkelbach/train/<train-hash-8>/seed-20260817/checkpoints/models/ep_2500 --output-dir runs/design --reference-per-episode runs/comparison/td3_dinkelbach/evaluate/validation/<validation-hash-8>/seed-20260817/per_episode.csv
+python -X utf8 comparison_experiment.py collect-design-dataset --method td3_dinkelbach --split validation --manifest runs/comparison/manifests/validation.json --training-seed 20260817 --episodes 100 --checkpoint runs/comparison/td3_dinkelbach/train/<train-hash-8>/seed-20260817/checkpoints/models/ep_1500 --output-dir runs/design --reference-per-episode runs/comparison/td3_dinkelbach/evaluate/validation/<validation-hash-8>/seed-20260817/per_episode.csv
 ```
 
 The collector writes to an isolated
@@ -208,8 +223,9 @@ old runtime output first.
 
 Train and evaluate commands complete a read-only preflight before creating the
 canonical run directory. The preflight validates the method, manifest
-schema/hash/split/count, requested episode count, formal configuration, COM
-demand-normalization metadata, canonical identity, and applicable checkpoint metadata. Evaluation
+schema/hash/split/count, requested episode count, formal configuration, fixed
+COM reference-capacity metadata, canonical identity, and applicable checkpoint
+metadata. Evaluation
 checks the model-only checkpoint metadata before loading weights. A failed
 preflight creates no run directory, identity marker, history, or checkpoint and
 does not initialize the simulator.
@@ -221,17 +237,17 @@ A matching exact resume of an interrupted/failed training run records
 `RESUMING`, then `RUNNING` and `COMPLETED`. Completed evaluation directories
 remain collision protected.
 
-Train the formal seed and evaluate its episode-2500 model-only checkpoint:
+Train the formal seed and evaluate its episode-1500 model-only checkpoint:
 
 ```powershell
-python -X utf8 comparison_experiment.py train --manifest runs/comparison/manifests/train.json --training-seed 20260817 --episodes 2500 --output-dir runs/comparison
-python -X utf8 comparison_experiment.py evaluate --split test --manifest runs/comparison/manifests/test.json --training-seed 20260817 --episodes 100 --checkpoint runs/comparison/<method>/train/<train-hash-8>/seed-20260817/checkpoints/models/ep_2500 --output-dir runs/comparison
+python -X utf8 comparison_experiment.py train --manifest runs/comparison/manifests/train.json --training-seed 20260817 --episodes 1500 --output-dir runs/comparison
+python -X utf8 comparison_experiment.py evaluate --split test --manifest runs/comparison/manifests/test.json --training-seed 20260817 --episodes 100 --checkpoint runs/comparison/<method>/train/<train-hash-8>/seed-20260817/checkpoints/models/ep_1500 --output-dir runs/comparison
 ```
 
 Resume uses a retained full checkpoint from the same canonical run:
 
 ```powershell
-python -X utf8 comparison_experiment.py train --manifest runs/comparison/manifests/train.json --training-seed 20260817 --episodes 2500 --resume runs/comparison/<method>/train/<train-hash-8>/seed-20260817/checkpoints/full/ep_2450 --output-dir runs/comparison
+python -X utf8 comparison_experiment.py train --manifest runs/comparison/manifests/train.json --training-seed 20260817 --episodes 1500 --resume runs/comparison/<method>/train/<train-hash-8>/seed-20260817/checkpoints/full/ep_1450 --output-dir runs/comparison
 ```
 
 Exact resume must select the latest valid full-resume checkpoint in the
@@ -254,9 +270,10 @@ python -X utf8 comparison_experiment.py aggregate --input-dir runs/comparison/ev
 
 Exact-resume checkpoints validate the method fingerprint, training-manifest
 hash, training seed, the complete Dinkelbach block state, and its configuration.
-Checkpoint schema v8 is the 10-UAV state/channel/packet contract. Every older
+Checkpoint schema v9 is the current utility/QoS/routing-reward/propulsion and
+four-substep movement-channel contract. Every older
 schema is rejected before weights or replay state are restored and must be
-retrained; no 16-UAV checkpoint migration is attempted. The current schema
+retrained; no legacy checkpoint migration is attempted. The current schema
 stores the 429/30/90 dimensions, movement feature schema, direct-ratio bit/J
 objective, shared channel/packet contracts, adaptive routing lifecycle, and
 FOV-EMA state. A partial Dinkelbach block is persisted exactly and resumes with
@@ -267,20 +284,20 @@ persists `lambda_used_log` and `lambda_after_episode_log`; a legacy ambiguous
 single-lambda log is rejected for exact resume without changing model-only
 checkpoint compatibility. Formal evaluation validates model-only type, schema,
 429/30/90 dimensions, movement-agent/DDQN gamma, COM normalization, method/seed,
-the formal core configuration, and exactly 2,500 completed training episodes before
+the formal core configuration, and exactly 1,500 completed training episodes before
 loading weights. A distinct validation/test manifest is expected; output
 metadata records both training/evaluation manifest hashes and checkpoint
 provenance, including the fixed Dinkelbach configuration and state. Evaluation
 does not mutate that state.
 
 Checkpoint directories are written through a same-parent temporary directory
-and atomically renamed only after every file succeeds. A 2,500-episode run has
-50 model-only checkpoints (`ep_0050` through `ep_2500`). Full-resume saves use
+and atomically renamed only after every file succeeds. A 1,500-episode run has
+30 model-only checkpoints (`ep_0050` through `ep_1500`). Full-resume saves use
 the same 50-episode schedule but retain only the latest two directories. If a
 custom run ends off schedule—for example at episode 75—it saves episodes 50 and
 75 exactly once. Retention never removes model-only checkpoints or files outside
 that run's `checkpoints/full` directory. Formal evaluation always uses
-`ep_2500`; test performance is not used to select a checkpoint.
+`ep_1500`; test performance is not used to select a checkpoint.
 
 ## Metrics and artifacts
 
@@ -289,7 +306,8 @@ Every evaluation episode writes method/seed/scenario identity plus:
 - timely goodput and raw final-hop throughput in Mbit
 - total mobility energy and `timely_goodput_mbits / mobility_energy_j`
 - FOV/COM timely deliveries and deadline violations
-- total violations, coverage, and found-GT ratio
+- canonical eligible count, violation count/probability, SR admission drops,
+  coverage, and found-GT ratio
 - routing Waits, partial transmissions, and slot-budget violations
 
 Zero or invalid energy produces an EE value of `0.0`, never NaN or infinity.
@@ -333,7 +351,7 @@ training CSV names the corresponding columns `lambda_used` and
 ## Semantic paper evaluation and figure build
 
 Paper evaluation remains one method per process and never trains or resumes a
-model. Learned methods require the completed formal `ep_2500` run. The pure
+model. Learned methods require the completed formal `ep_1500` run. The pure
 random `kkm_random_action_random_routing` baseline must omit `--run-dir`; it
 loads no model, creates no fake `models.pt`, and records
 `checkpoint_required=false`.
@@ -394,8 +412,9 @@ uses a scoped `57.0 s` packet-injection cutoff so its maximum `3.0 s` deadline
 can resolve within the 60-second horizon; other training and evaluation suites
 retain the production `58.5 s` cutoff.
 Delay is pooled as total delivered E2E delay divided by total delivered packet
-count. Violation probability is pooled violations divided by generated packet
-count. A delay with no delivered packets is `null` with `missing=true`. EE
+count. Violation probability is pooled canonical violations divided by eligible
+packet count. A delay with no delivered packets, or violation probability with
+no eligible packets, is `null` with `missing=true`. EE
 comparison points use pooled timely Mbit divided by pooled mobility joules.
 
 Every non-trajectory point has exactly the following five canonical aggregate
@@ -416,7 +435,7 @@ requested figure). It then requires exact canonical agreement among the
 top-level `aggregated_plot_data.json`, the union of all point-level aggregate
 files, and a fresh recomputation from every point's `per_episode.jsonl`.
 Numerator, denominator, value, unit, and missing status are all checked. Delay
-with no delivered packets and violation probability with no generated packets
+with no delivered packets and violation probability with no eligible packets
 remain missing rather than becoming fake zeros; violation numerators may not
 exceed their denominators.
 
@@ -443,7 +462,7 @@ For `--figure all`, include every required method mapping listed in
 `paper_figure_registry.py`. The builder validates exact methods, formal
 checkpoint/no-checkpoint provenance, sweep values, units, and common scenario
 manifest hashes before rendering. It reloads every manifest and inspects the
-actual `ep_2500/metadata.json` plus `models.pt` without loading weights, then
+actual `ep_1500/metadata.json` plus `models.pt` without loading weights, then
 recomputes and compares the canonical checkpoint fingerprint. It never starts
 training.
 

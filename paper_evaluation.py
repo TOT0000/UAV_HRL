@@ -504,7 +504,7 @@ def run_paper_evaluation(
         "new_training_started": False,
         "aggregation": {
             "delay": "sum delivered E2E delay / sum delivered packets",
-            "violation_probability": "sum violations / sum generated packets",
+            "violation_probability": "sum canonical violations / sum eligible packets",
             "energy_efficiency": "sum timely delivered Mbit / max(sum mobility J, epsilon)",
             "zero_delivered_delay": "null with missing=true",
         },

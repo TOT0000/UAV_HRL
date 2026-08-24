@@ -50,6 +50,9 @@ METRIC_COLUMNS = (
     "fov_deadline_violations",
     "com_deadline_violations",
     "total_deadline_violations",
+    "eligible_packet_count",
+    "delay_violation_probability",
+    "sr_admission_drop_count",
     "coverage",
     "found_GT_ratio",
     "routing_wait_count",
@@ -57,15 +60,19 @@ METRIC_COLUMNS = (
     "slot_budget_violation_count",
 )
 
+OPTIONAL_METRIC_COLUMNS = {"delay_violation_probability"}
+
 PACKET_METRIC_COLUMNS = tuple(
     f"{task}_{field}"
     for task in ("fov", "com")
     for field in (
         "generated_packets",
+        "source_generated_packets",
+        "eligible_packets",
+        "sr_admission_drop_packets",
         "on_time_delivered_packets",
         "late_delivered_packets",
         "expired_dropped_packets",
-        "unfinished_packets",
         "delivered_packets",
         "delivered_e2e_delay_sum_seconds",
         "average_e2e_delay_seconds",
@@ -178,7 +185,12 @@ def summarize_training_seeds(episode_rows):
             "evaluation_episode_count": len(rows),
         }
         for metric in METRIC_COLUMNS:
-            summary[metric] = fmean(float(row[metric]) for row in rows)
+            values = [
+                float(row[metric])
+                for row in rows
+                if row[metric] is not None
+            ]
+            summary[metric] = fmean(values) if values else None
         summaries.append(summary)
     return summaries
 
@@ -207,9 +219,15 @@ def aggregate_seed_means(seed_summaries):
             checkpoint_completed_episodes,
         ) = key
         for metric in METRIC_COLUMNS:
-            values = [float(row[metric]) for row in rows]
-            mean_value = fmean(values)
-            sample_stddev = stdev(values) if len(values) > 1 else 0.0
+            values = [
+                float(row[metric])
+                for row in rows
+                if row[metric] is not None
+            ]
+            mean_value = fmean(values) if values else None
+            sample_stddev = (
+                stdev(values) if len(values) > 1 else (0.0 if values else None)
+            )
             degrees_of_freedom = max(len(values) - 1, 0)
             t_critical = (
                 float(student_t.ppf(0.975, df=degrees_of_freedom))
@@ -218,6 +236,8 @@ def aggregate_seed_means(seed_summaries):
             )
             ci95_half_width = (
                 t_critical * sample_stddev / math.sqrt(len(values))
+                if values
+                else None
             )
             aggregates.append(
                 {
@@ -235,8 +255,12 @@ def aggregate_seed_means(seed_summaries):
                     "mean": mean_value,
                     "sample_stddev": sample_stddev,
                     "ci95_half_width": ci95_half_width,
-                    "ci95_lower": mean_value - ci95_half_width,
-                    "ci95_upper": mean_value + ci95_half_width,
+                    "ci95_lower": (
+                        mean_value - ci95_half_width if values else None
+                    ),
+                    "ci95_upper": (
+                        mean_value + ci95_half_width if values else None
+                    ),
                 }
             )
     return aggregates
@@ -304,6 +328,8 @@ def validate_formal_aggregation_rows(
 
     for row in episode_rows:
         for metric in METRIC_COLUMNS:
+            if row[metric] is None and metric in OPTIONAL_METRIC_COLUMNS:
+                continue
             try:
                 value = float(row[metric])
             except (TypeError, ValueError) as exc:

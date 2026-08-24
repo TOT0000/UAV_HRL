@@ -117,7 +117,8 @@ def _inspect_checkpoint(method_id, checkpoint_dir, training_seed, formal_config)
     checkpoint_dir = Path(checkpoint_dir).resolve()
     if checkpoint_dir.name != f"ep_{FORMAL_CHECKPOINT_EPISODE:04d}":
         raise IncompatiblePaperRunError(
-            f"{method_id} checkpoint is not the formal ep_2500 directory: {checkpoint_dir}"
+            f"{method_id} checkpoint is not the formal "
+            f"ep_{FORMAL_CHECKPOINT_EPISODE:04d} directory: {checkpoint_dir}"
         )
     try:
         inspected = inspect_model_checkpoint(
@@ -181,8 +182,16 @@ def _resolve_training_run(method_id, entry, spec_dir):
         raise IncompatiblePaperRunError(f"run method specification is stale for {method_id}")
     checkpoint_episode = int(resolved.get("formal_checkpoint_episode", -1))
     if checkpoint_episode != FORMAL_CHECKPOINT_EPISODE:
-        raise IncompatiblePaperRunError(f"{method_id} must resolve to formal ep_2500")
-    checkpoint_dir = run_dir / "checkpoints" / "models" / "ep_2500"
+        raise IncompatiblePaperRunError(
+            f"{method_id} must resolve to formal "
+            f"ep_{FORMAL_CHECKPOINT_EPISODE:04d}"
+        )
+    checkpoint_dir = (
+        run_dir
+        / "checkpoints"
+        / "models"
+        / f"ep_{FORMAL_CHECKPOINT_EPISODE:04d}"
+    )
     inspected = _inspect_checkpoint(
         method_id,
         checkpoint_dir,
@@ -554,7 +563,10 @@ def _resolve_evaluation_run(method_id, entry, spec_dir, expected_suite):
         raise IncompatiblePaperRunError(f"checkpoint requirement mismatch for {method_id}")
     if checkpoint_required:
         if int(metadata.get("checkpoint_episode", -1)) != FORMAL_CHECKPOINT_EPISODE:
-            raise IncompatiblePaperRunError(f"{method_id} evaluation is not from ep_2500")
+            raise IncompatiblePaperRunError(
+                f"{method_id} evaluation is not from "
+                f"ep_{FORMAL_CHECKPOINT_EPISODE:04d}"
+            )
         if not metadata.get("checkpoint_path"):
             raise IncompatiblePaperRunError(f"{method_id} lacks checkpoint provenance")
         training_run_value = metadata.get("training_run")
@@ -833,7 +845,8 @@ def _validate_training_compatibility(runs):
         expected = list(range(1, FORMAL_CHECKPOINT_EPISODE + 1))
         if episodes != expected:
             raise IncompatiblePaperRunError(
-                f"{method} training history must contain exactly episodes 1..2500"
+                f"{method} training history must contain exactly episodes "
+                f"1..{FORMAL_CHECKPOINT_EPISODE}"
             )
     if len({len(run["history_rows"]) for run in runs.values()}) != 1:
         raise IncompatiblePaperRunError("training convergence histories must have equal lengths")
@@ -1526,7 +1539,7 @@ def _build_violation(spec, spec_path, output_dir, git_sha):
             "source_spec": str(spec_path),
             "method_to_evaluation_run": _run_mapping(runs),
             **_validated_provenance(runs),
-            "aggregation": "pooled violation count / pooled generated-packet count",
+            "aggregation": "pooled canonical violations / pooled eligible-packet count",
             "zero_probability_log_handling": "omitted as non-representable on log scale; no epsilon fabricated",
             "git_sha": git_sha,
         },

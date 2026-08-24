@@ -126,7 +126,7 @@ class PacketQosFlowTest(unittest.TestCase):
         env = SimpleNamespace(
             source_uavs=set(),
             multi_tasks={},
-            SR_teams=[SimpleNamespace(id=0, active=True)],
+            SR_teams=[SimpleNamespace(id=0, assigned_gt_id=0, arrived=False)],
             load_factor=1.0,
         )
         engine = PacketEngine(num_uav=1, step_time=0.25)

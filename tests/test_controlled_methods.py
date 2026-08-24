@@ -101,8 +101,8 @@ class ControlledMethodRegistryTest(unittest.TestCase):
             parser.parse_args(["td3_ratio", "ddpg_ratio"])
 
     def test_formal_defaults_are_centralized(self):
-        self.assertEqual(FORMAL_EXPERIMENT_DEFAULTS["training_episodes_per_seed"], 2500)
-        self.assertEqual(FORMAL_EXPERIMENT_DEFAULTS["formal_checkpoint_episode"], 2500)
+        self.assertEqual(FORMAL_EXPERIMENT_DEFAULTS["training_episodes_per_seed"], 1500)
+        self.assertEqual(FORMAL_EXPERIMENT_DEFAULTS["formal_checkpoint_episode"], 1500)
         self.assertEqual(FORMAL_EXPERIMENT_DEFAULTS["training_seed_count"], 1)
         self.assertEqual(
             FORMAL_EXPERIMENT_DEFAULTS["movement_hyperparameters"]["replay_size"],
@@ -134,7 +134,7 @@ class ControlledMethodRegistryTest(unittest.TestCase):
                 self.assertEqual(result["movement_agent_kind"], spec.agent)
                 self.assertEqual(result["movement_state_dim"], 429)
                 self.assertEqual(result["joint_action_dim"], 30)
-                self.assertEqual(result["proposal_batches"], 1)
+                self.assertEqual(result["proposal_batches"], 4)
                 metadata = result["run_metadata"]
                 self.assertEqual(metadata["assignment_strategy"], spec.assignment)
                 self.assertEqual(metadata["assignment_rounds"], spec.assignment_rounds)
@@ -181,9 +181,20 @@ class ControlledMethodRegistryTest(unittest.TestCase):
                     self.assertEqual(result["ddqn_training_updates"], 0)
                     self.assertEqual(result["routing_target_update_count"], 0)
                 else:
-                    self.assertGreaterEqual(result["routing_replay_size"], 1)
-                    self.assertEqual(result["ddqn_training_updates"], 1)
-                    self.assertEqual(result["routing_target_update_count"], 1)
+                    self.assertGreaterEqual(result["routing_replay_size"], 0)
+                    self.assertEqual(result["routing_slots_executed"], 4)
+                    # A one-second scenario can legitimately have no admitted
+                    # routing packet under the canonical SR lifecycle. The
+                    # learner updates once only when replay was ready at the
+                    # fourth-slot optimizer boundary; terminal-only replay is
+                    # added after that boundary.
+                    self.assertIn(result["ddqn_training_updates"], {0, 1})
+                    if result["ddqn_training_updates"]:
+                        self.assertGreater(result["routing_replay_size"], 0)
+                    self.assertEqual(
+                        result["routing_target_update_count"],
+                        result["ddqn_training_updates"],
+                    )
                 if spec.reward_mode == "ratio":
                     self.assertEqual(result["dinkelbach_update_count"], 0)
                     self.assertIsNone(result["lambda"])

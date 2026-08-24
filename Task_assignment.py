@@ -290,16 +290,10 @@ class UAVAssigner:
                         fov_feasible[row, column] = True
                 elif task.task_type == "COM":
                     sr = self.env.SR_teams[int(task.target_obj_id)]
-                    if not bool(sr.active):
+                    if sr.assigned_gt_id is None:
                         continue
-                    capacity_bps = self.env.get_sr_uav_reference_capacity_mbps(
+                    raw = self.env.get_sr_uav_normalized_utility(
                         uav_id, int(task.target_obj_id)
-                    ) * 1e6
-                    required_bps = float(self.env.com_required_rate_bps)
-                    raw = (
-                        1.0
-                        if required_bps <= 0.0
-                        else min(max(float(capacity_bps), 0.0) / required_bps, 1.0)
                     )
                     if math.isfinite(raw):
                         raw_com[row, column] = raw

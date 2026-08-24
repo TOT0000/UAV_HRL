@@ -76,7 +76,7 @@ class Uav10ConfigurationContractTest(unittest.TestCase):
         data["schema_version"] = "uav-hrl-scenario-v2"
         with self.assertRaisesRegex(ValueError, "16-UAV.*incompatible"):
             ScenarioManifest.from_dict(data)
-        self.assertEqual(CHECKPOINT_SCHEMA_VERSION, 8)
+        self.assertEqual(CHECKPOINT_SCHEMA_VERSION, 9)
         with self.assertRaisesRegex(RuntimeError, "must be retrained"):
             _validate_checkpoint_schema({"checkpoint_schema_version": 7})
 
@@ -110,7 +110,7 @@ class StateAndAssignmentContractTest(unittest.TestCase):
         gt = self.env.gts[0]
         sr = self.env.SR_teams[0]
         gt.is_found = True
-        sr.active = True
+        sr.assigned_gt_id = 0
         self.env.task_list.extend(
             [
                 Task(0, "FOV", gt, gt.id),
@@ -147,7 +147,7 @@ class StateAndAssignmentContractTest(unittest.TestCase):
         gt = self.env.gts[0]
         sr = self.env.SR_teams[0]
         gt.is_found = True
-        sr.active = True
+        sr.assigned_gt_id = 0
         uav = self.env.uav_dict[uav_id]
         uav.x_u, uav.y_u = gt.x, gt.y
         fov = {
@@ -267,7 +267,7 @@ class ChannelAndPacketContractTest(unittest.TestCase):
     def test_sr_fifo_partial_lock_next_slot_causality_and_e2e(self):
         engine = PacketEngine(NUM_UAV, step_time=0.25)
         sr = self.env.SR_teams[0]
-        sr.active = True
+        sr.assigned_gt_id = 0
         receiver = 1
         self.env.multi_tasks[receiver] = [
             {

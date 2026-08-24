@@ -346,9 +346,13 @@ class ReplayBufferDiscrete:
         self.n_step = int(n_step)
         self.gamma = float(gamma)
         self.n_step_buffer = []
+        self.latest_index_by_agent = {}
 
     @torch.no_grad()
-    def add(self, state, action, next_state, reward, cost, done, tag_gt=None):
+    def add(
+        self, state, action, next_state, reward, cost, done, tag_gt=None,
+        agent_id=None,
+    ):
         s  = _to_np_float32(state)
         a  = _to_np_float32(action)
         ns = _to_np_float32(next_state)
@@ -383,6 +387,8 @@ class ReplayBufferDiscrete:
         self.cost[i, 0]     = C
         self.not_done[i, 0] = 1.0 - float(done_flag)
         self.tag_gt[i, 0]   = tg0  # ★ 寫入場景標籤
+        if agent_id is not None:
+            self.latest_index_by_agent[int(agent_id)] = i
 
         self.ptr  = (self.ptr + 1) % self.max_size
         self.size = min(self.size + 1, self.max_size)
@@ -391,6 +397,18 @@ class ReplayBufferDiscrete:
             self.n_step_buffer.clear()
         else:
             self.n_step_buffer.pop(0)
+
+    def attribute_latest_cost(self, agent_id, cost=1.0):
+        """Attach a boundary-cleanup violation to the latest agent transition."""
+
+        index = self.latest_index_by_agent.get(int(agent_id))
+        if index is None:
+            return False
+        value = float(cost)
+        if not np.isfinite(value) or value < 0.0:
+            raise ValueError("attributed replay cost must be finite and non-negative")
+        self.cost[index, 0] += value
+        return True
 
 
     def sample(self, batch_size, include_cost=False):

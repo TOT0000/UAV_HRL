@@ -264,7 +264,7 @@ class FullResumeCheckpointTest(unittest.TestCase):
     def test_full_resume_round_trip_restores_exact_training_state_and_rng(self):
         td3, ddqn, joint, routing = self._components()
         self._populate_and_train(td3, ddqn, joint, routing)
-        ddqn.update_cost_multiplier(20.0 * 240, 240)
+        ddqn.update_cost_multiplier(3.0, 20)
         calibration = {"seed": 20260817, "c_ref_com": 32.5, "unit": "Mbps"}
         training_state = {
             "completed_episode_index": 6,
@@ -760,7 +760,7 @@ class TrainingCliTest(unittest.TestCase):
         with contextlib.redirect_stderr(stderr):
             with self.assertRaises(SystemExit):
                 parse_training_config(
-                    ["--mode", "train", "--episodes", "2500"]
+                    ["--mode", "train", "--episodes", "1500"]
                 )
         self.assertIn("formal train mode requires --seed", stderr.getvalue())
 
@@ -774,19 +774,19 @@ class TrainingCliTest(unittest.TestCase):
                 "--mode",
                 "train",
                 "--episodes",
-                "2500",
+                "1500",
                 "--seed",
                 "20260817",
             ]
         )
         self.assertEqual(formal.mode, "train")
-        self.assertEqual(formal.total_episodes, 2500)
+        self.assertEqual(formal.total_episodes, 1500)
         self.assertEqual(formal.random_seed, 20260817)
         self.assertEqual(formal.warmup_joint_transitions, 1000)
         self.assertEqual(formal.model_checkpoint_every, 50)
         self.assertEqual(formal.full_resume_every, 50)
         self.assertEqual(formal.full_resume_keep_last, 2)
-        self.assertEqual(formal.formal_evaluation_episode, 2500)
+        self.assertEqual(formal.formal_evaluation_episode, 1500)
         self.assertEqual(formal.dinkelbach_initial_lambda, 0.0)
         self.assertEqual(formal.dinkelbach_update_interval_episodes, 50)
         self.assertEqual(formal.dinkelbach_update_rule, "ratio_of_block_sums")
@@ -804,7 +804,7 @@ class TrainingCliTest(unittest.TestCase):
         )
 
     def test_checkpoint_schema_is_explicit(self):
-        self.assertEqual(CHECKPOINT_SCHEMA_VERSION, 8)
+        self.assertEqual(CHECKPOINT_SCHEMA_VERSION, 9)
 
 
 if __name__ == "__main__":

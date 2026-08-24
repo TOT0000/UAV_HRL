@@ -132,7 +132,15 @@ class UAV:
         v_v = float(actual_dz / max(step_time, 1e-9))
         energy = float(
             energy_model.compute_mobility_energy(
-                uav_idx=self.id, v_h=v_h, v_v=v_v, t=step_time
+                uav_idx=self.id,
+                v_h=v_h,
+                v_v=v_v,
+                t=step_time,
+                velocity_vector=(
+                    actual_dx / max(step_time, 1e-9),
+                    actual_dy / max(step_time, 1e-9),
+                    actual_dz / max(step_time, 1e-9),
+                ),
             )
         )
         self.last_energy = self.energy
@@ -200,7 +208,13 @@ class UAV:
         v_v = actual_dz / step_time
 
         if energy_model is not None:
-            E_mob = energy_model.compute_mobility_energy(uav_idx=self.id, v_h=v_h, v_v=v_v, t=step_time)
+            E_mob = energy_model.compute_mobility_energy(
+                uav_idx=self.id,
+                v_h=v_h,
+                v_v=v_v,
+                t=step_time,
+                velocity_vector=(actual_dx / step_time, actual_dy / step_time, v_v),
+            )
             self.last_energy = self.energy
             self.energy = max(self.energy - E_mob, 0)
             self.move_energy_step = E_mob
@@ -259,26 +273,48 @@ class SRTeam:
         self.id = id
         self.assigned_gt_id = None
         self.path = []           # 儲存從目前到 GT 的移動路徑
-        self.active = False      # 是否出動中
         self.arrived = False
         self.current_step = 0
         self.x, self.y, self.z = 0.0, 0.0, 0.0
+
+    @property
+    def is_moving(self):
+        return self.assigned_gt_id is not None and not self.arrived
+
+    @property
+    def com_source_enabled(self):
+        return self.assigned_gt_id is not None
+
+    @property
+    def active(self):
+        """Read-only compatibility alias for the derived moving state."""
+
+        return self.is_moving
+
+    def reset_lifecycle(self):
+        self.assigned_gt_id = None
+        self.arrived = False
+        self.path = []
+        self.current_step = 0
     def get_position(self):
         return self.x, self.y, self.z
     def assign_mission(self, gt_id, gt_pos, speed=1.0):
         """
         ✅ 由環境分派 GT 任務並啟動移動
         """
-        self.assigned_gt_id = gt_id
+        if self.assigned_gt_id is not None:
+            raise RuntimeError(
+                f"SR {self.id} is permanently assigned to GT "
+                f"{self.assigned_gt_id} for this episode"
+            )
+        self.assigned_gt_id = int(gt_id)
         self.path = straight_line_route(self.get_position(), gt_pos, speed)
-        self.active = bool(self.path)
         self.arrived = not self.path
         self.current_step = 0
     def step_forward(self):
-        if not self.active:
+        if not self.is_moving:
             return
         if self.path is None or len(self.path) == 0:
-            self.active = False
             self.arrived = True
             return
         if self.current_step < len(self.path):
@@ -287,7 +323,6 @@ class SRTeam:
             self.z = 0.0
             self.current_step += 1
         if self.current_step >= len(self.path):
-            self.active = False
             self.arrived = True
 
     def route_state(self):
@@ -299,7 +334,6 @@ class SRTeam:
             "path": [[float(x), float(y)] for x, y in self.path],
             "current_step": int(self.current_step),
             "position": [float(self.x), float(self.y), float(self.z)],
-            "active": bool(self.active),
             "arrived": bool(self.arrived),
         }
 
@@ -317,20 +351,17 @@ class SRTeam:
         position = np.asarray(state.get("position", []), dtype=float)
         if position.shape != (3,) or not np.isfinite(position).all():
             raise RuntimeError("SR route checkpoint position is invalid")
-        active = bool(state.get("active", False))
         arrived = bool(state.get("arrived", False))
         assigned_gt_id = state.get("assigned_gt_id")
-        expected_active = current_step < len(path)
-        idle = assigned_gt_id is None and not path and current_step == 0
+        idle = assigned_gt_id is None
+        expected_arrived = bool(assigned_gt_id is not None and current_step >= len(path))
         if (
-            active != expected_active
-            or (arrived and active)
-            or (not active and not arrived and not idle)
+            (idle and (arrived or path or current_step != 0))
+            or (not idle and arrived != expected_arrived)
         ):
             raise RuntimeError("SR route checkpoint lifecycle flags are inconsistent")
         self.assigned_gt_id = assigned_gt_id
         self.path = path
         self.current_step = current_step
         self.x, self.y, self.z = position.tolist()
-        self.active = active
         self.arrived = arrived

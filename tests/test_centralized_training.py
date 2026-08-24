@@ -87,7 +87,9 @@ class CentralizedTrainingFlowTest(unittest.TestCase):
 
     def test_one_actor_call_and_one_transition_per_interval(self):
         self.assertEqual(self.result["environment_actor_calls"], 2)
-        self.assertEqual(self.result["proposal_batches"], 2)
+        self.assertEqual(
+            self.result["proposal_batches"], 2 * MOVEMENT_CONTROL_INTERVAL
+        )
         self.assertEqual(self.result["joint_transitions"], 2)
         self.assertEqual(self.result["joint_replay_size"], 2)
         self.assertEqual(
@@ -96,7 +98,9 @@ class CentralizedTrainingFlowTest(unittest.TestCase):
         )
 
     def test_energy_terminal_and_update_counts(self):
-        self.assertEqual(self.result["energy_evaluations"], 2 * 10)
+        self.assertEqual(
+            self.result["energy_evaluations"], 2 * 10 * MOVEMENT_CONTROL_INTERVAL
+        )
         self.assertEqual(self.result["terminal_joint_transitions"], 1)
         self.assertEqual(self.result["critic_updates"], 2)
         self.assertEqual(self.result["actor_updates"], 1)

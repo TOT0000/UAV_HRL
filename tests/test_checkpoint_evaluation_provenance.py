@@ -35,7 +35,7 @@ class CheckpointEvaluationProvenanceTest(unittest.TestCase):
     def _metadata(cls, method_id):
         method = MethodSpec.parse(method_id)
         formal = effective_training_config(
-            formal_training_config(2500, random_seed=17), method
+            formal_training_config(1500, random_seed=17), method
         )
         lifecycle = cls._lifecycle() if method.learns_routing else None
         routing = deepcopy(formal["routing_agent_configuration"])
@@ -48,9 +48,9 @@ class CheckpointEvaluationProvenanceTest(unittest.TestCase):
                 lambda_cost=2.75,
                 initial_lambda_cost=0.0,
                 eta_c=0.01,
-                qos_cost_budget=12.0,
+                qos_target_probability=0.1,
                 lambda_update_scope="episode_end",
-                cost_denominator="network_routing_slot_steps",
+                cost_denominator="eligible_packets",
                 mid_episode_checkpoint_supported=False,
             )
         experiment = {
@@ -64,7 +64,7 @@ class CheckpointEvaluationProvenanceTest(unittest.TestCase):
         metadata = {
             "checkpoint_schema_version": CHECKPOINT_SCHEMA_VERSION,
             "checkpoint_type": MODEL_CHECKPOINT_TYPE,
-            "episode": 2499,
+            "episode": 1499,
             "movement_state_dim": 429,
             "joint_action_dim": 30,
             "routing_state_dim": 90,
@@ -87,13 +87,13 @@ class CheckpointEvaluationProvenanceTest(unittest.TestCase):
                 "method_id": method.method_id,
                 "method_spec": method.to_dict(),
                 "method_spec_fingerprint": method.fingerprint,
-                "training_episode_count": 2500,
+                "training_episode_count": 1500,
                 "training_seed": 17,
                 "checkpoint_schema_version": CHECKPOINT_SCHEMA_VERSION,
             }
         )
         metadata["training_provenance"] = {
-            "training_episode_count": 2500,
+            "training_episode_count": 1500,
             "training_git_sha": "training-git-sha",
             "resolved_training_config": resolved,
             "routing_lifecycle": lifecycle,
@@ -148,7 +148,7 @@ class CheckpointEvaluationProvenanceTest(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "incompatible.*must be retrained"):
             validate_model_checkpoint_metadata(metadata)
 
-    def test_formal_2500_training_and_100_evaluation_aliases_do_not_mix(self):
+    def test_formal_1500_training_and_100_evaluation_aliases_do_not_mix(self):
         training = self._metadata("td3_dinkelbach")["training_provenance"]
         runtime = {
             "evaluation_episode_count": 100,
@@ -156,8 +156,8 @@ class CheckpointEvaluationProvenanceTest(unittest.TestCase):
             "routing_lifecycle": RoutingLearnerLifecycle().state_dict(),
         }
         aliases = _evaluation_provenance_aliases(training, runtime)
-        self.assertEqual(aliases["training_episode_count"], 2500)
-        self.assertEqual(aliases["checkpoint_training_episode_count"], 2500)
+        self.assertEqual(aliases["training_episode_count"], 1500)
+        self.assertEqual(aliases["checkpoint_training_episode_count"], 1500)
         self.assertEqual(aliases["evaluation_episode_count"], 100)
         self.assertEqual(
             aliases["checkpoint_training_git_sha"], "training-git-sha"
