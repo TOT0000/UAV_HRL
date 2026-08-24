@@ -8,14 +8,17 @@ import math
 PAPER_EE_EPSILON_J = 1e-12
 AGGREGATE_REL_TOL = 1e-12
 AGGREGATE_ABS_TOL = 1e-15
+PAPER_AGGREGATE_SCHEMA_VERSION = "uav-hrl-paper-aggregate-v2"
 CANONICAL_AGGREGATE_ROWS = (
     ("energy_efficiency_mbit_per_j", None),
     ("average_e2e_delay_seconds", "FOV"),
     ("average_e2e_delay_seconds", "COM"),
     ("violation_probability", "FOV"),
     ("violation_probability", "COM"),
+    ("violation_probability", "ALL"),
 )
 AGGREGATE_COMPARE_FIELDS = (
+    "aggregate_schema_version",
     "semantic_suite",
     "method_id",
     "point_id",
@@ -106,7 +109,7 @@ def normalize_episode_ee(method_id, history_rows, window=50):
 
 
 def aggregate_paper_point_metrics(method_id, suite, point, episode_rows):
-    """Pool production packet numerators and denominators into five rows."""
+    """Pool production packet numerators and denominators into canonical rows."""
 
     rows = list(episode_rows)
     if not rows:
@@ -115,6 +118,7 @@ def aggregate_paper_point_metrics(method_id, suite, point, episode_rows):
             f"point={point.get('point_id')}"
         )
     common = {
+        "aggregate_schema_version": PAPER_AGGREGATE_SCHEMA_VERSION,
         "semantic_suite": str(suite),
         "method_id": str(method_id),
         "point_id": str(point["point_id"]),
@@ -141,6 +145,8 @@ def aggregate_paper_point_metrics(method_id, suite, point, episode_rows):
             "missing": False,
         }
     ]
+    pooled_violations = 0
+    pooled_eligible = 0
     for task_type in ("FOV", "COM"):
         prefix = task_type.lower()
         delivered = sum(int(row[f"{prefix}_delivered_packets"]) for row in rows)
@@ -148,8 +154,10 @@ def aggregate_paper_point_metrics(method_id, suite, point, episode_rows):
             float(row[f"{prefix}_delivered_e2e_delay_sum_seconds"])
             for row in rows
         )
-        generated = sum(int(row[f"{prefix}_generated_packets"]) for row in rows)
+        eligible = sum(int(row[f"{prefix}_eligible_packets"]) for row in rows)
         violations = sum(int(row[f"{prefix}_violation_packets"]) for row in rows)
+        pooled_violations += violations
+        pooled_eligible += eligible
         result.extend(
             (
                 {
@@ -172,14 +180,33 @@ def aggregate_paper_point_metrics(method_id, suite, point, episode_rows):
                     "display_task_type": "VS" if task_type == "FOV" else "COM",
                     "numerator": violations,
                     "numerator_unit": "violation_packets",
-                    "denominator": generated,
-                    "denominator_unit": "generated_packets",
-                    "value": violations / generated if generated else None,
+                    "denominator": eligible,
+                    "denominator_unit": "eligible_packets",
+                    "value": violations / eligible if eligible else None,
                     "value_unit": "probability",
-                    "missing": generated == 0,
+                    "missing": eligible == 0,
                 },
             )
         )
+    result.append(
+        {
+            **common,
+            "metric": "violation_probability",
+            "task_type": "ALL",
+            "display_task_type": "ALL",
+            "numerator": pooled_violations,
+            "numerator_unit": "violation_packets",
+            "denominator": pooled_eligible,
+            "denominator_unit": "eligible_packets",
+            "value": (
+                pooled_violations / pooled_eligible
+                if pooled_eligible
+                else None
+            ),
+            "value_unit": "probability",
+            "missing": pooled_eligible == 0,
+        }
+    )
     validate_canonical_aggregate_rows(result, method_id, point["point_id"])
     return result
 
@@ -250,6 +277,12 @@ def validate_canonical_aggregate_rows(rows, method_id, point_id):
         metric = row.get("metric")
         task_type = row.get("task_type")
         identity = _identity(method_id, point_id, metric, task_type)
+        _require_value(
+            PAPER_AGGREGATE_SCHEMA_VERSION,
+            row.get("aggregate_schema_version"),
+            "aggregate_schema_version",
+            identity,
+        )
         _require_value(str(method_id), row.get("method_id"), "method_id", identity)
         _require_value(str(point_id), row.get("point_id"), "point_id", identity)
         pair = (metric, task_type)
@@ -270,7 +303,7 @@ def validate_canonical_aggregate_rows(rows, method_id, point_id):
     if len(rows) != len(CANONICAL_AGGREGATE_ROWS):
         raise ValueError(
             f"method={method_id}, point={point_id}: aggregate row count mismatch: "
-            f"expected=5, actual={len(rows)}"
+            f"expected={len(CANONICAL_AGGREGATE_ROWS)}, actual={len(rows)}"
         )
     for metric, task_type in CANONICAL_AGGREGATE_ROWS:
         row = seen[(metric, task_type)]
@@ -308,7 +341,7 @@ def validate_canonical_aggregate_rows(rows, method_id, point_id):
             expected_value = numerator / denominator if denominator else None
             expected_units = (
                 "violation_packets",
-                "generated_packets",
+                "eligible_packets",
                 "probability",
             )
             expected_missing = denominator == 0
@@ -322,6 +355,26 @@ def validate_canonical_aggregate_rows(rows, method_id, point_id):
             raise ValueError(
                 f"{identity}: violation probability outside [0,1]: actual={expected_value}"
             )
+    combined = seen[("violation_probability", "ALL")]
+    task_rows = [
+        seen[("violation_probability", task_type)]
+        for task_type in ("FOV", "COM")
+    ]
+    combined_identity = _identity(
+        method_id, point_id, "violation_probability", "ALL"
+    )
+    _require_value(
+        sum(int(row["numerator"]) for row in task_rows),
+        combined["numerator"],
+        "pooled_task_numerator",
+        combined_identity,
+    )
+    _require_value(
+        sum(int(row["denominator"]) for row in task_rows),
+        combined["denominator"],
+        "pooled_task_denominator",
+        combined_identity,
+    )
     return rows
 
 

@@ -17,7 +17,9 @@ from experiment_config import (
     FORMAL_TRAINING_EPISODES,
     METHOD_REGISTRY,
     MOVEMENT_CHANNEL_TIMING_VERSION,
+    PACKET_ROUTING_CAUSALITY_CONTRACT_VERSION,
     PROPULSION_MODEL_ID,
+    QOS_AGGREGATE_CONTRACT_VERSION,
     REFERENCE_COM_BANDWIDTH_HZ,
     SAFE_DDQN_QOS_TARGET_PROBABILITY,
     TOTAL_COMMUNICATION_BANDWIDTH_HZ,
@@ -35,7 +37,7 @@ class FormalContractTest(unittest.TestCase):
         self.assertEqual(FORMAL_CHECKPOINT_EPISODE, 1500)
         self.assertEqual(FORMAL_EXPERIMENT_DEFAULTS["training_episodes_per_seed"], 1500)
         self.assertEqual(checkpoint_episode_schedule(1500, 50), list(range(50, 1501, 50)))
-        self.assertEqual(CHECKPOINT_SCHEMA_VERSION, 9)
+        self.assertEqual(CHECKPOINT_SCHEMA_VERSION, 10)
 
     def test_all_methods_publish_the_same_physical_contracts(self):
         shared_fields = (
@@ -43,6 +45,8 @@ class FormalContractTest(unittest.TestCase):
             "reference_com_bandwidth_hz",
             "reference_s2u_max_capacity_mbps",
             "packet_qos_contract_version",
+            "packet_routing_causality_contract_version",
+            "qos_aggregate_contract_version",
             "routing_reward_contract_version",
             "reference_u2u_max_capacity_mbps",
             "reference_u2g_max_capacity_mbps",
@@ -63,6 +67,14 @@ class FormalContractTest(unittest.TestCase):
             )
         self.assertEqual(expected["utility_normalization_mode"], UTILITY_NORMALIZATION_MODE)
         self.assertEqual(expected["propulsion_model_id"], PROPULSION_MODEL_ID)
+        self.assertEqual(
+            expected["packet_routing_causality_contract_version"],
+            PACKET_ROUTING_CAUSALITY_CONTRACT_VERSION,
+        )
+        self.assertEqual(
+            expected["qos_aggregate_contract_version"],
+            QOS_AGGREGATE_CONTRACT_VERSION,
+        )
         self.assertEqual(
             expected["movement_channel_timing_version"],
             MOVEMENT_CHANNEL_TIMING_VERSION,
@@ -236,14 +248,96 @@ class QoSAndRoutingRewardContractTest(unittest.TestCase):
         capacity = 10.0
         maximum = reference_u2g_max_capacity_mbps(TOTAL_COMMUNICATION_BANDWIDTH_HZ)
         expected = capacity / maximum - 0.5 * ((0.1 / 2.0) + 0.0)
-        first = engine.routing_local_reward(env, 0, env.GS_ID, capacity, packet)
+        first = engine.routing_local_reward(
+            env,
+            0,
+            env.GS_ID,
+            capacity,
+            pkt=packet,
+            current_time=0.0,
+        )
         self.assertAlmostEqual(first, expected, places=12)
         # The reward API reads no GS geometry; changing a diagnostic distance
         # cannot reintroduce progress-to-GS shaping.
         env.gs_distance_m = 10_000.0
-        second = engine.routing_local_reward(env, 0, env.GS_ID, capacity, packet)
+        second = engine.routing_local_reward(
+            env,
+            0,
+            env.GS_ID,
+            capacity,
+            pkt=packet,
+            current_time=0.0,
+        )
         self.assertEqual(first, second)
-        self.assertEqual(engine.routing_local_reward(env, 0, 0, 0.0, packet), -1.0)
+        self.assertEqual(
+            engine.routing_local_reward(
+                env, 0, 0, 0.0, pkt=packet, current_time=0.0
+            ),
+            -0.5,
+        )
+        self.assertEqual(
+            engine.routing_local_reward(
+                env, 0, 0, 0.0, pkt=packet, current_time=1.0
+            ),
+            -0.75,
+        )
+
+    def test_partial_hop_reward_keeps_service_start_queue_wait_fixed(self):
+        class Environment:
+            GS_ID = 2
+
+        env = Environment()
+        engine = PacketEngine(2, task_deadlines_seconds={"FOV": 2.0, "COM": 1.0})
+        packet = engine.create_packet(0, "COM", 1_000_000.0, 0.0)
+        packet["hop_service_start_time"] = 0.25
+        first = engine.routing_local_reward(
+            env, 0, 0, 0.0, pkt=packet, current_time=0.5
+        )
+        second = engine.routing_local_reward(
+            env, 0, 0, 0.0, pkt=packet, current_time=0.75
+        )
+        self.assertEqual(first, -0.625)
+        self.assertEqual(second, first)
+
+    def test_next_hol_preserves_historical_wait_and_clips_at_deadline(self):
+        class Environment:
+            GS_ID = 2
+
+        env = Environment()
+        engine = PacketEngine(2, task_deadlines_seconds={"FOV": 2.0, "COM": 1.0})
+        first_packet = engine.create_packet(0, "COM", 100.0, 0.0)
+        second_packet = engine.create_packet(0, "COM", 100.0, 0.0)
+        engine.serve_active_links(
+            env,
+            {0: env.GS_ID},
+            {(0, env.GS_ID): 0.0004},
+            current_time=0.5,
+        )
+        self.assertTrue(first_packet["done"])
+        self.assertIs(engine.get_hol_packet(0), second_packet)
+        self.assertEqual(second_packet["queue_enter_time"], 0.0)
+        self.assertEqual(
+            engine.routing_local_reward(
+                env,
+                0,
+                0,
+                0.0,
+                pkt=second_packet,
+                current_time=0.75,
+            ),
+            -0.875,
+        )
+        self.assertEqual(
+            engine.routing_local_reward(
+                env,
+                0,
+                0,
+                0.0,
+                pkt=second_packet,
+                current_time=2.0,
+            ),
+            -1.0,
+        )
 
 
 if __name__ == "__main__":

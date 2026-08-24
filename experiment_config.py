@@ -64,8 +64,10 @@ ROUTING_TAU = 0.005
 ROUTING_OPTIMIZER_UPDATE_SCOPE = "every_4_routing_slots"
 FOV_EMA_LIFECYCLE_VERSION = "no-map-footprint-progression-v3"
 SR_ROUTE_LIFECYCLE_VERSION = "assigned-and-arrived-derived-state-v2"
-PACKET_QOS_CONTRACT_VERSION = "eligible-fov-plus-s2u-admitted-com-v2"
-ROUTING_REWARD_CONTRACT_VERSION = "capacity-minus-hol-delay-v2"
+PACKET_QOS_CONTRACT_VERSION = "eligible-fov-plus-next-slot-s2u-admitted-com-v3"
+PACKET_ROUTING_CAUSALITY_CONTRACT_VERSION = "start-of-slot-hol-routing-v1"
+QOS_AGGREGATE_CONTRACT_VERSION = "pooled-fov-com-eligible-v1"
+ROUTING_REWARD_CONTRACT_VERSION = "capacity-minus-actual-hol-wait-v3"
 ROUTING_REWARD_ALPHA_CAPACITY = 1.0
 ROUTING_REWARD_ALPHA_DELAY = 0.5
 ROUTING_CAPACITY_EPSILON_BPS = 1e-9
@@ -669,6 +671,10 @@ def comparison_method_configuration(method_spec: MethodSpec) -> dict:
         "fov_ema_lifecycle_version": FOV_EMA_LIFECYCLE_VERSION,
         "sr_route_lifecycle_version": SR_ROUTE_LIFECYCLE_VERSION,
         "packet_qos_contract_version": PACKET_QOS_CONTRACT_VERSION,
+        "packet_routing_causality_contract_version": (
+            PACKET_ROUTING_CAUSALITY_CONTRACT_VERSION
+        ),
+        "qos_aggregate_contract_version": QOS_AGGREGATE_CONTRACT_VERSION,
         "routing_reward_contract_version": ROUTING_REWARD_CONTRACT_VERSION,
         "routing_reward_alpha_capacity": ROUTING_REWARD_ALPHA_CAPACITY,
         "routing_reward_alpha_delay": ROUTING_REWARD_ALPHA_DELAY,

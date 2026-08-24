@@ -183,8 +183,8 @@ class PacketQosFlowTest(unittest.TestCase):
 
         repeated = engine.serve_active_links(
             env,
-            actions={0: env.GS_ID},
-            capacities={(0, env.GS_ID): 0.0002},
+            actions={},
+            capacities={},
             current_time=0.5,
         )
         self.assertEqual(repeated["timely_goodput_bits"], 0.0)
@@ -198,15 +198,13 @@ class PacketQosFlowTest(unittest.TestCase):
 
         result = engine.serve_active_links(
             env,
-            actions={0: 2, 2: env.GS_ID},
-            capacities={(0, 2): 0.001, (2, env.GS_ID): 0.001},
+            actions={0: 2},
+            capacities={(0, 2): 0.001},
             current_time=0.0,
         )
 
         self.assertEqual(result["transmitted_bits_by_link"][(0, 2)], 100.0)
-        self.assertEqual(
-            result["transmitted_bits_by_link"][(2, env.GS_ID)], 0.0
-        )
+        self.assertNotIn((2, env.GS_ID), result["transmitted_bits_by_link"])
         self.assertIs(engine.get_hol_packet(2), packet)
         self.assertEqual(packet["current"], 2)
         self.assertFalse(packet["done"])

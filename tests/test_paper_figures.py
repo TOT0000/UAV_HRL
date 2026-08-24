@@ -24,11 +24,12 @@ from paper_evaluation import (
     aggregate_paper_point_metrics,
     evaluation_sweep_points,
 )
-from paper_figure_registry import FIGURE_REGISTRY
+from paper_figure_registry import FIGURE_REGISTRY, PAPER_METHOD_MAPPINGS
 from paper_figures import (
     AmbiguousPaperRunError,
     IncompatiblePaperRunError,
     PaperFigureSpecError,
+    _build_violation,
     build_paper_figures,
     causal_trailing_average,
     normalize_episode_ee,
@@ -88,10 +89,12 @@ class PooledMetricTest(unittest.TestCase):
             "fov_delivered_packets": 1,
             "fov_delivered_e2e_delay_sum_seconds": 1.0,
             "fov_generated_packets": 2,
+            "fov_eligible_packets": 2,
             "fov_violation_packets": 1,
             "com_delivered_packets": 0,
             "com_delivered_e2e_delay_sum_seconds": 0.0,
             "com_generated_packets": 0,
+            "com_eligible_packets": 0,
             "com_violation_packets": 0,
         }
         second = {
@@ -99,6 +102,7 @@ class PooledMetricTest(unittest.TestCase):
             "fov_delivered_packets": 9,
             "fov_delivered_e2e_delay_sum_seconds": 0.9,
             "fov_generated_packets": 18,
+            "fov_eligible_packets": 18,
             "fov_violation_packets": 3,
         }
         rows = aggregate_paper_point_metrics(
@@ -114,6 +118,70 @@ class PooledMetricTest(unittest.TestCase):
         self.assertAlmostEqual(violation["value"], 4 / 20)
         self.assertIsNone(missing["value"])
         self.assertTrue(missing["missing"])
+
+    def test_violation_figure_reads_only_combined_all_rows(self):
+        figure_id = "task_type_delay_violation_vs_target_delay"
+        methods = tuple(PAPER_METHOD_MAPPINGS[figure_id])
+        aggregate_rows = []
+        for method in methods:
+            for swept_task in ("COM", "FOV"):
+                for threshold in (0.5, 1.0, 1.5, 2.0, 2.5, 3.0):
+                    point_id = (
+                        f"{swept_task.lower()}_deadline_{threshold:g}s"
+                    )
+                    aggregate_rows.extend(
+                        (
+                            {
+                                "method_id": method,
+                                "point_id": point_id,
+                                "metric": "violation_probability",
+                                "task_type": "ALL",
+                                "swept_task": swept_task,
+                                "x_value": threshold,
+                                "value": 0.9,
+                                "missing": False,
+                            },
+                            {
+                                "method_id": method,
+                                "point_id": point_id,
+                                "metric": "violation_probability",
+                                "task_type": swept_task,
+                                "swept_task": swept_task,
+                                "x_value": threshold,
+                                "value": 0.1,
+                                "missing": False,
+                            },
+                        )
+                    )
+        runs = {
+            method: {
+                "evaluation_dir": "synthetic",
+                "aggregate_rows": [
+                    row for row in aggregate_rows if row["method_id"] == method
+                ],
+                "checkpoint_provenance": {},
+                "point_provenance": {},
+            }
+            for method in methods
+        }
+        with mock.patch(
+            "paper_figures._resolve_suite_runs", return_value=runs
+        ), mock.patch("paper_figures._emit", return_value={}) as emit:
+            _build_violation({}, Path("synthetic.json"), Path("."), "sha")
+
+        figure = emit.call_args.args[1]
+        plotted = emit.call_args.args[3]
+        try:
+            self.assertEqual(
+                figure.axes[0].get_ylabel(), "Delay Violation Probability"
+            )
+            self.assertTrue(plotted)
+            self.assertTrue(all(row["task_type"] == "ALL" for row in plotted))
+            self.assertTrue(all(row["value"] == 0.9 for row in plotted))
+        finally:
+            import matplotlib.pyplot as plt
+
+            plt.close(figure)
 
 
 class SyntheticFigureBuildTest(unittest.TestCase):
@@ -272,11 +340,13 @@ class SyntheticFigureBuildTest(unittest.TestCase):
                     "fov_delivered_e2e_delay_sum_seconds": fov_delivered
                     * (0.01 + point_index / 1000),
                     "fov_generated_packets": fov_generated,
+                    "fov_eligible_packets": fov_generated,
                     "fov_violation_packets": 1 + episode,
                     "com_delivered_packets": com_delivered,
                     "com_delivered_e2e_delay_sum_seconds": com_delivered
                     * (0.02 + point_index / 1000),
                     "com_generated_packets": com_generated,
+                    "com_eligible_packets": com_generated,
                     "com_violation_packets": 2 + episode,
                 }
             )

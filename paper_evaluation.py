@@ -15,11 +15,13 @@ from experiment_config import (
     FORMAL_EXPERIMENT_DEFAULTS,
     MethodSpec,
     NUM_UAV,
+    comparison_method_configuration,
 )
 from HRL_task_aware import TrainingConfig, train
 from Packet_scheduler_v1 import TASK_DEADLINE_SECONDS
 from paper_figure_registry import FIGURE_REGISTRY, PAPER_METHOD_MAPPINGS
 from paper_metrics import (
+    PAPER_AGGREGATE_SCHEMA_VERSION,
     aggregate_paper_point_metrics,
     normalize_episode_ee,
     validate_canonical_aggregate_rows,
@@ -473,7 +475,18 @@ def run_paper_evaluation(
         )
     _write_json(output_dir / "aggregated_plot_data.json", all_aggregates)
     _write_csv(output_dir / "aggregated_plot_data.csv", all_aggregates)
+    method_contracts = comparison_method_configuration(method)
     metadata = {
+        "aggregate_schema_version": PAPER_AGGREGATE_SCHEMA_VERSION,
+        **{
+            field: method_contracts[field]
+            for field in (
+                "packet_qos_contract_version",
+                "packet_routing_causality_contract_version",
+                "routing_reward_contract_version",
+                "qos_aggregate_contract_version",
+            )
+        },
         "semantic_suite": suite,
         "method_id": method.method_id,
         "method_spec": method.to_dict(),
@@ -504,7 +517,10 @@ def run_paper_evaluation(
         "new_training_started": False,
         "aggregation": {
             "delay": "sum delivered E2E delay / sum delivered packets",
-            "violation_probability": "sum canonical violations / sum eligible packets",
+            "violation_probability": (
+                "task diagnostics and ALL each pool raw canonical violations / "
+                "raw eligible packets across episodes; ALL pools FOV+COM"
+            ),
             "energy_efficiency": "sum timely delivered Mbit / max(sum mobility J, epsilon)",
             "zero_delivered_delay": "null with missing=true",
         },

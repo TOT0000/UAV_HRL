@@ -27,6 +27,7 @@ from paper_figure_registry import (
     resolve_figure_ids,
 )
 from paper_metrics import (
+    PAPER_AGGREGATE_SCHEMA_VERSION,
     aggregate_paper_point_metrics,
     causal_trailing_average as _causal_trailing_average,
     compare_aggregate_collections,
@@ -990,6 +991,7 @@ def _metric_rows(
     point_ids,
     task_types=(None,),
     swept_only=False,
+    allow_other_task_types=False,
 ):
     expected_points = tuple(point_ids)
     expected_tasks = tuple(task_types)
@@ -1027,6 +1029,8 @@ def _metric_rows(
             if swept_only and task_type != source.get("swept_task"):
                 continue
             if task_type not in expected_tasks:
+                if allow_other_task_types and task_type in {"FOV", "COM"}:
+                    continue
                 if swept_only and task_type in {"FOV", "COM"}:
                     continue
                 raise IncompatiblePaperRunError(
@@ -1498,8 +1502,9 @@ def _build_violation(spec, spec_path, output_dir, git_sha):
         runs,
         "violation_probability",
         point_ids=point_ids,
-        task_types=("FOV", "COM"),
-        swept_only=True,
+        task_types=("ALL",),
+        swept_only=False,
+        allow_other_task_types=True,
     )
     import matplotlib.pyplot as plt
     import numpy as np
@@ -1510,7 +1515,13 @@ def _build_violation(spec, spec_path, output_dir, git_sha):
         style = PLOT_STYLES[figure_id][method]
         for task_type in ("FOV", "COM"):
             selected = sorted(
-                (row for row in rows if row["method_id"] == method and row["task_type"] == task_type and row["swept_task"] == task_type),
+                (
+                    row
+                    for row in rows
+                    if row["method_id"] == method
+                    and row["task_type"] == "ALL"
+                    and row["swept_task"] == task_type
+                ),
                 key=lambda row: float(row["x_value"]),
             )
             y_values = [
@@ -1527,7 +1538,7 @@ def _build_violation(spec, spec_path, output_dir, git_sha):
             )
             plotted.extend({**row, "display_name": style["label"], "plot_value": (row["value"] if row["value"] and row["value"] > 0 else None), "log_zero_omitted": row["value"] == 0} for row in selected)
     axis.set_xlabel("Delay threshold (s)")
-    axis.set_ylabel("Violation probability")
+    axis.set_ylabel("Delay Violation Probability")
     axis.set_yscale("log")
     axis.set_xticks((0.5, 1.0, 1.5, 2.0, 2.5, 3.0))
     axis.grid(True, which="both", linestyle="--", alpha=0.5)
@@ -1539,7 +1550,11 @@ def _build_violation(spec, spec_path, output_dir, git_sha):
             "source_spec": str(spec_path),
             "method_to_evaluation_run": _run_mapping(runs),
             **_validated_provenance(runs),
-            "aggregation": "pooled canonical violations / pooled eligible-packet count",
+            "aggregate_schema_version": PAPER_AGGREGATE_SCHEMA_VERSION,
+            "aggregation": (
+                "ALL = pooled (FOV violations + COM violations) / pooled "
+                "(FOV eligible packets + COM eligible packets) across episodes"
+            ),
             "zero_probability_log_handling": "omitted as non-representable on log scale; no epsilon fabricated",
             "git_sha": git_sha,
         },

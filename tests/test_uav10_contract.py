@@ -76,9 +76,9 @@ class Uav10ConfigurationContractTest(unittest.TestCase):
         data["schema_version"] = "uav-hrl-scenario-v2"
         with self.assertRaisesRegex(ValueError, "16-UAV.*incompatible"):
             ScenarioManifest.from_dict(data)
-        self.assertEqual(CHECKPOINT_SCHEMA_VERSION, 9)
+        self.assertEqual(CHECKPOINT_SCHEMA_VERSION, 10)
         with self.assertRaisesRegex(RuntimeError, "must be retrained"):
-            _validate_checkpoint_schema({"checkpoint_schema_version": 7})
+            _validate_checkpoint_schema({"checkpoint_schema_version": 9})
 
 
 class StateAndAssignmentContractTest(unittest.TestCase):
@@ -297,7 +297,9 @@ class ChannelAndPacketContractTest(unittest.TestCase):
         ]
         self.assertEqual(engine.active_s2u_links(self.env), {0: receiver})
         self.env.active_s2u_capacities = {(0, receiver): 0.001024}
-        engine.serve_active_links(self.env, {}, {}, current_time=0.25)
+        arrival_slot = engine.serve_active_links(
+            self.env, {}, {}, current_time=0.25
+        )
         self.assertIs(engine.get_sr_hol_packet(0), next_packet)
         self.assertEqual(next_packet["rem_bits"], 256.0)
         self.assertIsNone(next_packet["s2u_receiver"])
@@ -306,6 +308,9 @@ class ChannelAndPacketContractTest(unittest.TestCase):
         self.assertEqual(packet["routing_eligible_time"], 0.5)
         self.assertEqual(packet["generation_time"], 0.0)
         self.assertIsNone(packet["_queued_sr"])
+        self.assertIsNone(packet["last_routing_sender"])
+        self.assertEqual(arrival_slot["reward_by_sender"], {})
+        self.assertEqual(arrival_slot["start_of_slot_routing_sender_ids"], ())
 
         engine.serve_active_links(
             self.env,
@@ -317,6 +322,67 @@ class ChannelAndPacketContractTest(unittest.TestCase):
         self.assertGreaterEqual(packet["e2e_delay_ms"], 500.0)
         self.assertEqual(engine.generated_packet_counts["COM"], 2)
         self.assertEqual(engine.total_delivered, 1)
+
+    def test_s2u_arrival_appends_behind_frozen_hol_without_credit(self):
+        engine = PacketEngine(NUM_UAV, step_time=0.25)
+        sr = self.env.SR_teams[0]
+        sr.assigned_gt_id = 0
+        receiver = 1
+        self.env.multi_tasks[receiver] = [
+            {
+                "task_type": "COM",
+                "target_id": 0,
+                "target_obj_id": 0,
+                "target_pos": sr.get_position(),
+            }
+        ]
+        resident = engine.create_packet(receiver, "FOV", 100.0, 0.0)
+        arrival = engine.create_sr_packet(0, 100.0, generation_time=0.0)
+        self.env.active_s2u_capacities = {(0, receiver): 0.001}
+
+        result = engine.serve_active_links(
+            self.env,
+            {receiver: receiver},
+            {},
+            current_time=0.0,
+        )
+
+        self.assertIs(engine.get_hol_packet(receiver), resident)
+        self.assertEqual(engine.get_queue_packets(receiver), [resident, arrival])
+        self.assertEqual(resident["last_routing_sender"], receiver)
+        self.assertIsNone(arrival["last_routing_sender"])
+        self.assertEqual(result["reward_by_sender"][receiver], -0.5)
+        self.assertEqual(result["cost_by_sender"], {})
+
+    def test_s2u_completion_at_deadline_is_sr_admission_drop(self):
+        engine = PacketEngine(NUM_UAV, step_time=0.25)
+        sr = self.env.SR_teams[0]
+        sr.assigned_gt_id = 0
+        receiver = 1
+        self.env.multi_tasks[receiver] = [
+            {
+                "task_type": "COM",
+                "target_id": 0,
+                "target_obj_id": 0,
+                "target_pos": sr.get_position(),
+            }
+        ]
+        packet = engine.create_sr_packet(0, 256.0, generation_time=0.0)
+        self.env.active_s2u_capacities = {(0, receiver): 0.001024}
+
+        result = engine.serve_active_links(
+            self.env, {}, {}, current_time=0.75
+        )
+
+        self.assertTrue(packet["done"])
+        self.assertEqual(packet["reason"], "sr_admission_drop")
+        self.assertFalse(packet["routing_eligible"])
+        self.assertIsNone(packet["routing_eligible_time"])
+        self.assertIsNone(packet["last_routing_sender"])
+        self.assertEqual(engine.eligible_packet_counts["COM"], 0)
+        self.assertEqual(engine.total_violated, 0)
+        self.assertEqual(result["outcomes"], [])
+        self.assertEqual(result["cost_by_sender"], {})
 
     def test_direct_ratio_is_terminal_bit_per_j(self):
         self.assertEqual(terminal_ratio_objective("ratio", False, 1.0, 200000.0), 0.0)

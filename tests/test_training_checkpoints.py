@@ -483,7 +483,7 @@ class FullResumeCheckpointTest(unittest.TestCase):
                     calibration=calibration,
                 )
 
-    def test_pre_adaptive_safe_ddqn_checkpoint_is_rejected_explicitly(self):
+    def test_schema_9_checkpoint_is_rejected_before_network_restore(self):
         td3, ddqn, _joint, _routing = self._components()
         with tempfile.TemporaryDirectory() as temp_dir:
             checkpoint_dir = Path(temp_dir) / "model"
@@ -501,7 +501,7 @@ class FullResumeCheckpointTest(unittest.TestCase):
             )
             metadata_path = checkpoint_dir / "metadata.json"
             metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-            metadata["checkpoint_schema_version"] = 4
+            metadata["checkpoint_schema_version"] = 9
             metadata_path.write_text(
                 json.dumps(metadata, indent=2) + "\n", encoding="utf-8"
             )
@@ -804,7 +804,7 @@ class TrainingCliTest(unittest.TestCase):
         )
 
     def test_checkpoint_schema_is_explicit(self):
-        self.assertEqual(CHECKPOINT_SCHEMA_VERSION, 9)
+        self.assertEqual(CHECKPOINT_SCHEMA_VERSION, 10)
 
 
 if __name__ == "__main__":

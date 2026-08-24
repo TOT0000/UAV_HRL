@@ -873,23 +873,46 @@ class PacketEngine:
                     )
         return violations
 
-    def _queue_bits_ahead(self, sender, pkt):
-        bits = 0.0
-        for queued in self.uav_queues[int(sender)]:
-            if queued is pkt:
-                return bits
-            if queued is not None and not queued.get("done", False):
-                bits += max(float(queued.get("rem_bits", 0.0)), 0.0)
-        raise AssertionError("reward packet is not owned by the sender FIFO")
+    @staticmethod
+    def _actual_hol_queue_wait_seconds(pkt, current_time):
+        """Return elapsed queue wait, frozen once this hop starts service."""
 
-    def routing_local_reward(self, env, sender, receiver, capacity_mbps, pkt=None):
-        """Canonical factorized capacity-delay reward for one routing slot."""
+        current_time = float(current_time)
+        queue_enter_time = float(pkt.get("queue_enter_time", current_time))
+        service_start_time = pkt.get("hop_service_start_time")
+        wait_end = (
+            current_time
+            if service_start_time is None
+            else float(service_start_time)
+        )
+        wait_seconds = max(wait_end - queue_enter_time, 0.0)
+        if not np.isfinite(wait_seconds):
+            raise RuntimeError("HOL queue wait is NaN or Inf")
+        return float(wait_seconds)
+
+    def routing_local_reward(
+        self,
+        env,
+        sender,
+        receiver,
+        capacity_mbps,
+        *,
+        pkt,
+        current_time,
+    ):
+        """Canonical capacity reward minus transmission and actual HOL wait."""
 
         sender, receiver = int(sender), int(receiver)
-        pkt = self.get_hol_packet(sender) if pkt is None else pkt
         if pkt is None:
-            return 0.0
+            raise ValueError("routing reward requires the frozen start-of-slot HOL")
         capacity_mbps = float(capacity_mbps)
+        deadline = float(
+            self.task_deadlines_seconds[
+                self._task_norm(pkt.get("task_type", "COM"))
+            ]
+        )
+        queue_delay = self._actual_hol_queue_wait_seconds(pkt, current_time)
+        queue_norm = float(np.clip(queue_delay / deadline, 0.0, 1.0))
         service_available = (
             receiver != sender
             and np.isfinite(capacity_mbps)
@@ -908,25 +931,15 @@ class PacketEngine:
             capacity_norm = float(
                 np.clip(capacity_mbps / maximum_mbps, 0.0, 1.0)
             )
-            deadline = float(
-                self.task_deadlines_seconds[
-                    self._task_norm(pkt.get("task_type", "COM"))
-                ]
-            )
             transmission_delay = max(float(pkt.get("rem_bits", 0.0)), 0.0) / max(
-                capacity_bps, ROUTING_CAPACITY_EPSILON_BPS
-            )
-            queue_delay = self._queue_bits_ahead(sender, pkt) / max(
                 capacity_bps, ROUTING_CAPACITY_EPSILON_BPS
             )
             transmission_norm = float(
                 np.clip(transmission_delay / deadline, 0.0, 1.0)
             )
-            queue_norm = float(np.clip(queue_delay / deadline, 0.0, 1.0))
         else:
             capacity_norm = 0.0
             transmission_norm = 1.0
-            queue_norm = 1.0
         reward = (
             ROUTING_REWARD_ALPHA_CAPACITY * capacity_norm
             - ROUTING_REWARD_ALPHA_DELAY * (transmission_norm + queue_norm)
@@ -1010,13 +1023,19 @@ class PacketEngine:
                 pkt["path"].append(receiver)
                 pkt["rem_bits"] = float(pkt["size_bits"])
                 pkt["s2u_receiver"] = None
-                pkt["routing_eligible_time"] = slot_end
-                if completion_time > float(pkt["deadline_abs"]) + PACKET_EPS:
+                deadline_abs = float(pkt["deadline_abs"])
+                if (
+                    completion_time >= deadline_abs - PACKET_EPS
+                    or slot_end >= deadline_abs - PACKET_EPS
+                ):
+                    # Admission is useful only if the packet survives to its
+                    # first legal routing decision at the next slot boundary.
                     self._mark_sr_admission_drop(
                         pkt, completion_time, remove_from_queue=False
                     )
                     continue
                 pkt["routing_eligible"] = True
+                pkt["routing_eligible_time"] = slot_end
                 self.eligible_packet_counts["COM"] += 1
                 # Enqueue only after this routing slot's eligible packet snapshot.
                 self.enqueue_packet(pkt, receiver, slot_end)
@@ -1028,15 +1047,53 @@ class PacketEngine:
                 raise AssertionError("S2U transmitted beyond its slot bit budget")
         return result
 
-    def serve_active_links(self, env, actions, capacities, current_time):
+    def serve_active_links(
+        self,
+        env,
+        actions,
+        capacities,
+        current_time,
+        *,
+        start_of_slot_hol_by_sender=None,
+        start_of_slot_eligible_packet_ids=None,
+    ):
         """Serve each sender FIFO with one shared bit budget for its active link."""
 
         current_time = float(current_time)
         slot_end = current_time + float(self.step_time)
-        eligible_packet_ids = {
-            int(sender): {int(pkt["id"]) for pkt in self.get_queue_packets(sender)}
-            for sender in actions
+        actions = {int(sender): int(receiver) for sender, receiver in actions.items()}
+        if start_of_slot_hol_by_sender is None:
+            start_of_slot_hol_by_sender = {
+                sender: self.get_hol_packet(sender) for sender in actions
+            }
+        frozen_hol = {
+            int(sender): pkt
+            for sender, pkt in start_of_slot_hol_by_sender.items()
+            if pkt is not None
         }
+        if set(actions) != set(frozen_hol):
+            raise AssertionError(
+                "routing actions must match frozen start-of-slot HOL senders"
+            )
+        if start_of_slot_eligible_packet_ids is None:
+            eligible_packet_ids = {
+                sender: {
+                    int(pkt["id"]) for pkt in self.get_queue_packets(sender)
+                }
+                for sender in frozen_hol
+            }
+        else:
+            eligible_packet_ids = {
+                int(sender): {int(packet_id) for packet_id in packet_ids}
+                for sender, packet_ids in start_of_slot_eligible_packet_ids.items()
+            }
+            if set(eligible_packet_ids) != set(frozen_hol):
+                raise AssertionError(
+                    "eligible packet snapshots must match frozen HOL senders"
+                )
+        for sender, pkt in frozen_hol.items():
+            if int(pkt["id"]) not in eligible_packet_ids[sender]:
+                raise AssertionError("frozen HOL is absent from its eligible snapshot")
         result = {
             "reward_by_sender": defaultdict(float),
             "cost_by_sender": defaultdict(float),
@@ -1046,6 +1103,7 @@ class PacketEngine:
             "transmitted_bits_by_link": {},
             "relay_arrivals": [],
             "outcomes": [],
+            "start_of_slot_routing_sender_ids": tuple(sorted(frozen_hol)),
         }
         pending_relay_arrivals = []
         s2u_result = self.serve_s2u_links(
@@ -1058,14 +1116,15 @@ class PacketEngine:
 
         for sender in sorted(actions):
             receiver = int(actions[sender])
-            hol = self.get_hol_packet(int(sender))
-            if hol is not None:
-                hol["last_routing_sender"] = int(sender)
+            hol = frozen_hol[int(sender)]
+            hol["last_routing_sender"] = int(sender)
             result["reward_by_sender"][int(sender)] = self.routing_local_reward(
                 env,
                 int(sender),
                 receiver,
                 capacities.get((int(sender), receiver), 0.0),
+                pkt=hol,
+                current_time=current_time,
             )
 
         for sender in sorted(actions):
@@ -1100,6 +1159,7 @@ class PacketEngine:
                 bits_used = min(remaining_budget, remaining_before)
                 if bits_used <= PACKET_EPS:
                     break
+                pkt["last_routing_sender"] = sender
                 if float(pkt.get("hop_bits_sent", 0.0)) <= PACKET_EPS:
                     service_start = current_time + (
                         transmitted_on_link / capacity_bps

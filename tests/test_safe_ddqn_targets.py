@@ -5,6 +5,7 @@ import torch
 from torch import nn
 
 from DDQN import DDQN
+from paper_metrics import aggregate_paper_point_metrics
 from utils_update_v2 import ReplayBufferDiscrete
 
 
@@ -181,6 +182,49 @@ class SafeDDQNTargetTest(unittest.TestCase):
         self.assertEqual(state["last_episode_eligible_packet_count"], 0)
         self.assertIsNone(state["last_episode_violation_probability"])
         self.assertFalse(state["mid_episode_checkpoint_supported"])
+
+    def test_paper_all_row_matches_episode_safe_ddqn_inputs(self):
+        episode = {
+            "timely_goodput_mbits": 1.0,
+            "total_mobility_energy_j": 2.0,
+            "fov_delivered_packets": 3,
+            "fov_delivered_e2e_delay_sum_seconds": 0.3,
+            "fov_generated_packets": 7,
+            "fov_eligible_packets": 4,
+            "fov_violation_packets": 1,
+            "com_delivered_packets": 4,
+            "com_delivered_e2e_delay_sum_seconds": 0.4,
+            "com_generated_packets": 9,
+            "com_eligible_packets": 6,
+            "com_violation_packets": 2,
+            "total_deadline_violations": 3,
+            "eligible_packet_count": 10,
+            "delay_violation_probability": 0.3,
+        }
+        rows = aggregate_paper_point_metrics(
+            "td3_dinkelbach",
+            "fixed_roi",
+            {"point_id": "roi_2", "x_value": 2},
+            [episode],
+        )
+        combined = next(
+            row
+            for row in rows
+            if row["metric"] == "violation_probability"
+            and row["task_type"] == "ALL"
+        )
+        self.assertEqual(combined["numerator"], episode["total_deadline_violations"])
+        self.assertEqual(combined["denominator"], episode["eligible_packet_count"])
+        self.assertEqual(combined["value"], episode["delay_violation_probability"])
+
+        model = DDQN(state_dim=42, action_dim=3, hidden_dim=8)
+        model.update_cost_multiplier(
+            combined["numerator"], combined["denominator"]
+        )
+        state = model.constraint_state()
+        self.assertEqual(
+            state["last_episode_violation_probability"], combined["value"]
+        )
 
 
 if __name__ == "__main__":

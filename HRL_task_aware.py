@@ -527,9 +527,23 @@ def _run_routing_slot(
             packet_engine.replay_attributed_violation_cost_count += 1.0
     packet_engine.drop_expired_packets(env.current_time)
     backlog_before = _active_backlog(packet_engine)
-    uavs_with_packets = packet_engine.nonempty_uav_ids()
-    s2u_receivers = set(packet_engine.active_s2u_links(env).values())
-    routing_decision_uav_ids = sorted(set(uavs_with_packets) | s2u_receivers)
+    start_of_slot_hol_by_sender = {
+        int(uid): packet_engine.get_hol_packet(uid)
+        for uid in packet_engine.nonempty_uav_ids()
+    }
+    start_of_slot_hol_by_sender = {
+        uid: pkt
+        for uid, pkt in start_of_slot_hol_by_sender.items()
+        if pkt is not None
+    }
+    routing_decision_uav_ids = sorted(start_of_slot_hol_by_sender)
+    start_of_slot_eligible_packet_ids = {
+        uid: {
+            int(pkt["id"])
+            for pkt in packet_engine.get_queue_packets(uid)
+        }
+        for uid in routing_decision_uav_ids
+    }
     effective_masks = {
         uid: packet_engine.get_effective_action_mask(
             env, uid, env.get_routing_action_mask(uid).astype(bool)
@@ -566,7 +580,7 @@ def _run_routing_slot(
     proposed_links = {
         sender: receiver
         for sender, receiver in next_hops.items()
-        if receiver != sender and packet_engine.get_hol_packet(sender) is not None
+        if receiver != sender and sender in start_of_slot_hol_by_sender
     }
     active_capacities, _ = env.allocate_active_link_capacities(
         proposed_links, s2u_links=packet_engine.active_s2u_links(env)
@@ -576,6 +590,8 @@ def _run_routing_slot(
         next_hops,
         active_capacities,
         current_time=env.current_time,
+        start_of_slot_hol_by_sender=start_of_slot_hol_by_sender,
+        start_of_slot_eligible_packet_ids=start_of_slot_eligible_packet_ids,
     )
     attributable_violation_count = sum(
         bool(outcome["violated"])
@@ -2135,59 +2151,6 @@ def train(
                     task_potential_enabled=method_spec.task_potential_enabled,
                 )
 
-        if not evaluation and method_spec.learns_routing:
-            # Establish an explicit terminal Wait decision for any eligible
-            # packet that has not yet had a replayable routing action.  This is
-            # done while the packet is still queued so the critic sees the true
-            # terminal backlog and action mask.
-            terminal_wait_senders = set()
-            for packet in packet_engine.get_active_packets():
-                if not bool(packet.get("routing_eligible", False)):
-                    continue
-                credited_sender = packet.get("last_routing_sender")
-                if (
-                    credited_sender is not None
-                    and int(credited_sender)
-                    in routing_replay.latest_index_by_agent
-                ):
-                    continue
-                sender = int(packet.get("current", -1))
-                if not (0 <= sender < env.num_UAV):
-                    raise AssertionError(
-                        "terminal eligible packet has no routable sender"
-                    )
-                packet["last_routing_sender"] = sender
-                if (
-                    sender in routing_replay.latest_index_by_agent
-                    or sender in terminal_wait_senders
-                ):
-                    continue
-                physical_mask = env.get_routing_action_mask(sender).astype(bool)
-                effective_mask = packet_engine.get_effective_action_mask(
-                    env, sender, physical_mask
-                )
-                physical_terminal_state = packet_engine.get_state_ta(
-                    env,
-                    sender,
-                    backlog_bits=_active_backlog(packet_engine),
-                    action_mask=effective_mask,
-                )
-                terminal_state = apply_observation_strategy(
-                    physical_terminal_state,
-                    method_spec.task_observation,
-                    "routing",
-                )
-                routing_replay.add(
-                    terminal_state,
-                    sender,
-                    terminal_state,
-                    packet_engine.routing_local_reward(env, sender, sender, 0.0),
-                    0.0,
-                    True,
-                    tag_gt=env.num_GT,
-                    agent_id=sender,
-                )
-                terminal_wait_senders.add(sender)
         packet_metrics = packet_engine.finalize_episode(
             float(config.episode_seconds)
         )

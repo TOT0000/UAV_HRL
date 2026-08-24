@@ -56,11 +56,15 @@ machine-readable in `paper_figure_registry.py`.
 - EE comparison points use `sum(timely delivered Mbit) /
   max(sum(mobility J), 1e-12 J)`.
 - Task delay uses `sum(delivered E2E delay seconds) / sum(delivered packets)`.
-- Violation probability uses `sum(violation packets) / sum(generated packets)`.
+- Task violation diagnostics use `sum(violation packets) / sum(eligible packets)`.
+  The canonical `ALL` row pools raw FOV and COM violation numerators and eligible
+  denominators across episodes; Fig. 6 reads only this `ALL` row while retaining
+  the swept task in each line label.
 - Per-episode values, pooled numerators/denominators, aggregate values, and
   missing flags are persisted together.
-- Every non-trajectory point has exactly five rows: EE with no task type, FOV
-  and COM delay, and FOV and COM violation probability. Before any
+- Every non-trajectory point has exactly six rows: EE with no task type, FOV
+  and COM delay, FOV and COM violation diagnostics, and combined `ALL`
+  violation probability. Before any
   figure-specific filtering, the builder validates that exact Cartesian set
   and cross-checks top-level rows, point-level rows, and a fresh recomputation
   from each point's per-episode JSONL through the shared `paper_metrics.py`

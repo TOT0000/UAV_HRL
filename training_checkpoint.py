@@ -30,7 +30,7 @@ from dinkelbach_blocks import (
     dinkelbach_config_metadata,
 )
 
-CHECKPOINT_SCHEMA_VERSION = 9
+CHECKPOINT_SCHEMA_VERSION = 10
 ROUTING_LIFECYCLE_CHECKPOINT_SCHEMA_VERSION = 6
 PRE_ROUTING_LIFECYCLE_CHECKPOINT_SCHEMA_VERSION = 5
 PRE_ADAPTIVE_SAFE_DDQN_CHECKPOINT_SCHEMA_VERSION = 4
@@ -134,6 +134,8 @@ FORMAL_CORE_CONFIG_FIELDS = (
     "fov_ema_lifecycle_version",
     "sr_route_lifecycle_version",
     "packet_qos_contract_version",
+    "packet_routing_causality_contract_version",
+    "qos_aggregate_contract_version",
     "routing_reward_contract_version",
     "routing_reward_alpha_capacity",
     "routing_reward_alpha_delay",

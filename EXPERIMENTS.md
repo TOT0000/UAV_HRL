@@ -270,13 +270,16 @@ python -X utf8 comparison_experiment.py aggregate --input-dir runs/comparison/ev
 
 Exact-resume checkpoints validate the method fingerprint, training-manifest
 hash, training seed, the complete Dinkelbach block state, and its configuration.
-Checkpoint schema v9 is the current utility/QoS/routing-reward/propulsion and
-four-substep movement-channel contract. Every older
+Checkpoint schema v10 is the current utility/QoS/routing-causality,
+actual-HOL-wait reward, pooled-QoS aggregation, propulsion, and four-substep
+movement-channel contract. Schema v9 and every older
 schema is rejected before weights or replay state are restored and must be
 retrained; no legacy checkpoint migration is attempted. The current schema
 stores the 429/30/90 dimensions, movement feature schema, direct-ratio bit/J
 objective, shared channel/packet contracts, adaptive routing lifecycle, and
-FOV-EMA state. A partial Dinkelbach block is persisted exactly and resumes with
+FOV-EMA state. The movement feature schema remains unchanged, and scenario
+manifests remain `uav-hrl-scenario-v3`. A partial Dinkelbach block is persisted
+exactly and resumes with
 the same lambda, completed-episode count, numerator sum, denominator sum, block
 index, input-validity status, and successful-update count. An incomplete final
 block never triggers a forced update. Full-resume logging schema v1 separately
@@ -399,10 +402,11 @@ evaluation point, each point's `run_metadata.json`, and every trajectory
 artifact. The figure builder recomputes all three from the selected checkpoint
 and requires exact agreement in those layers, the resolved specification, the
 method-to-checkpoint map, and final figure metadata. Pure-random methods require
-the checkpoint path and all three fields to be null. Existing training
-checkpoints need no migration or retraining: evaluation derives the payload and
-combined hashes from their actual `models.pt`; newly generated paper artifacts
-without the complete provenance triplet are intentionally rejected.
+the checkpoint path and all three fields to be null. For schema-v10
+checkpoints, evaluation derives the payload and combined hashes from the actual
+`models.pt`; schema-v9 checkpoints are rejected under the causality/QoS
+contract above. Newly generated paper artifacts without the complete
+provenance triplet are intentionally rejected.
 
 Each sweep point writes per-episode data plus `aggregated_plot_data.csv/json`.
 Its metadata also persists the actual manifest path and canonical hash,
@@ -412,12 +416,14 @@ uses a scoped `57.0 s` packet-injection cutoff so its maximum `3.0 s` deadline
 can resolve within the 60-second horizon; other training and evaluation suites
 retain the production `58.5 s` cutoff.
 Delay is pooled as total delivered E2E delay divided by total delivered packet
-count. Violation probability is pooled canonical violations divided by eligible
-packet count. A delay with no delivered packets, or violation probability with
-no eligible packets, is `null` with `missing=true`. EE
+count. FOV and COM violation rows remain diagnostics. The formal `ALL` row pools
+the two raw violation counts over the two raw eligible counts, and Fig. 6 reads
+only `ALL` while labeling the task whose deadline is swept. A delay with no
+delivered packets, or violation probability with no eligible packets, is
+`null` with `missing=true`. EE
 comparison points use pooled timely Mbit divided by pooled mobility joules.
 
-Every non-trajectory point has exactly the following five canonical aggregate
+Every non-trajectory point has exactly the following six canonical aggregate
 rows, keyed by `(method_id, point_id, metric, task_type)`:
 
 ```text
@@ -426,6 +432,7 @@ average_e2e_delay_seconds   / FOV
 average_e2e_delay_seconds   / COM
 violation_probability       / FOV
 violation_probability       / COM
+violation_probability       / ALL
 ```
 
 The shared production helper in `paper_metrics.py` both computes and validates

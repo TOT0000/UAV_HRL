@@ -40,7 +40,9 @@ class RoutingTransitionTerminalTest(unittest.TestCase):
             },
         }
 
-    def run_slot(self, actions, capacities, episode_done=False):
+    def run_slot(
+        self, actions, capacities, episode_done=False, current_time=0.0
+    ):
         self.env.allocate_active_link_capacities = (
             lambda proposed, s2u_links=None: (
                 {
@@ -57,11 +59,12 @@ class RoutingTransitionTerminalTest(unittest.TestCase):
             FixedRoutingPolicy(actions),
             replay,
             self.masks,
-            current_time=0.0,
+            current_time=current_time,
             done=episode_done,
             delay_bound_steps=20,
             violation_stats=self.stats,
             epsilon=0.0,
+            traffic_rate_overrides={"FOV": 0.0, "COM": 0.0},
         )
         return replay
 
@@ -132,6 +135,40 @@ class RoutingTransitionTerminalTest(unittest.TestCase):
         replay = self.run_slot({}, {})
 
         self.assertEqual(replay.size, 0)
+
+    def test_s2u_receiver_gets_no_same_slot_decision_or_replay(self):
+        sr = self.env.SR_teams[0]
+        sr.assigned_gt_id = 0
+        receiver = 1
+        self.env.multi_tasks[receiver] = [
+            {
+                "task_type": "COM",
+                "target_id": 0,
+                "target_obj_id": 0,
+                "target_pos": sr.get_position(),
+            }
+        ]
+        packet = self.engine.create_sr_packet(0, 100.0, generation_time=0.0)
+        self.env.active_s2u_capacities = {(0, receiver): 0.001}
+
+        replay = self.run_slot({}, {})
+
+        self.assertEqual(replay.size, 0)
+        self.assertIs(self.engine.get_hol_packet(receiver), packet)
+        self.assertIsNone(packet["last_routing_sender"])
+        self.assertEqual(packet["routing_eligible_time"], 0.25)
+        self.assertEqual(packet["rem_bits"], packet["size_bits"])
+
+        self.env.active_s2u_capacities = {}
+        next_replay = self.run_slot(
+            {receiver: self.env.GS_ID},
+            {(receiver, self.env.GS_ID): 0.001},
+            current_time=0.25,
+        )
+        self.assertEqual(next_replay.size, 1)
+        self.assertEqual(next_replay.latest_index_by_agent, {receiver: 0})
+        self.assertEqual(packet["last_routing_sender"], receiver)
+        self.assertTrue(packet["done"])
 
 
 if __name__ == "__main__":
