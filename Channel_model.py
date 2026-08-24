@@ -1,99 +1,137 @@
-import math
+"""Canonical deterministic channel model shared by every experiment method."""
+
+from __future__ import annotations
+
 import numpy as np
-from scipy.integrate import quad
-from scipy.special import iv  # Modified Bessel function of the first kind
-import scipy.io
 
 
+NOISE_PSD_DBM_PER_HZ = -169.0
+A2G_CARRIER_GHZ = 2.0
+A2A_CARRIER_GHZ = 2.4
+A2G_LOS_A = 11.95
+A2G_LOS_B = 0.136
+A2G_LOS_EXCESS_DB = 2.0
+A2G_NLOS_EXCESS_DB = 20.0
+S2U_TX_POWER_DBM = 23.0
+U2U_U2G_TX_POWER_DBM = 30.0
+NUMERICAL_CAPACITY_EPS_MBPS = np.finfo(np.float64).eps
 
-# 讀取 MATLAB .mat 檔案
-# mat_data = scipy.io.loadmat('Rician_fading.mat')
-# # 提取 b_values 和 g_small_scale
-# b_values = mat_data['b_values']  
-# g_small_scale = mat_data['g_small_scale']
+
+def noise_power_dbm(bandwidth_hz):
+    bandwidth = np.asarray(bandwidth_hz, dtype=float)
+    if np.any(bandwidth <= 0.0) or not np.all(np.isfinite(bandwidth)):
+        raise ValueError("bandwidth must be positive and finite")
+    return NOISE_PSD_DBM_PER_HZ + 10.0 * np.log10(bandwidth)
+
+
+def shannon_capacity_mbps(path_loss_db, bandwidth_hz, transmit_power_dbm):
+    bandwidth = np.asarray(bandwidth_hz, dtype=float)
+    path_loss = np.asarray(path_loss_db, dtype=float)
+    if np.any(bandwidth <= 0.0) or not np.all(np.isfinite(bandwidth)):
+        raise ValueError("bandwidth must be positive and finite")
+    snr = 10.0 ** (
+        (float(transmit_power_dbm) - path_loss - noise_power_dbm(bandwidth)) / 10.0
+    )
+    capacity = bandwidth * np.log2(1.0 + np.maximum(snr, 0.0)) / 1e6
+    return np.where(np.isfinite(capacity), np.maximum(capacity, 0.0), 0.0)
+
+
+def a2g_path_loss_db(aerial_position, ground_position):
+    """Expected A2G loss using distance in metres and frequency in GHz."""
+
+    aerial = np.asarray(aerial_position, dtype=float)
+    ground = np.asarray(ground_position, dtype=float)
+    delta = aerial - ground
+    distance = np.maximum(np.linalg.norm(delta, axis=-1), 1e-3)
+    altitude = np.maximum(delta[..., 2], 0.0)
+    elevation = np.degrees(np.arcsin(np.clip(altitude / distance, -1.0, 1.0)))
+    los_probability = 1.0 / (
+        1.0
+        + A2G_LOS_A * np.exp(-A2G_LOS_B * (elevation - A2G_LOS_A))
+    )
+    free_space = (
+        20.0 * np.log10(distance)
+        + 20.0 * np.log10(A2G_CARRIER_GHZ)
+        + 32.44
+    )
+    return (
+        free_space
+        + los_probability * A2G_LOS_EXCESS_DB
+        + (1.0 - los_probability) * A2G_NLOS_EXCESS_DB
+    )
+
+
+def a2g_capacity_mbps(
+    aerial_position, ground_position, bandwidth_hz, transmit_power_dbm
+):
+    return shannon_capacity_mbps(
+        a2g_path_loss_db(aerial_position, ground_position),
+        bandwidth_hz,
+        transmit_power_dbm,
+    )
+
+
+def u2u_path_loss_db(sender_position, receiver_position):
+    """Directed paper A2A loss using the sender's absolute AGL altitude."""
+
+    sender = np.asarray(sender_position, dtype=float)
+    receiver = np.asarray(receiver_position, dtype=float)
+    sender_altitude = np.maximum(sender[..., 2], 1e-3)
+    distance = np.maximum(np.linalg.norm(sender - receiver, axis=-1), 1.0)
+    distance_coefficient = np.maximum(
+        23.9 - 1.8 * np.log10(sender_altitude), 20.0
+    )
+    frequency_term = 20.0 * np.log10(40.0 * np.pi * A2A_CARRIER_GHZ / 3.0)
+    return distance_coefficient * np.log10(distance) + frequency_term
+
+
+def u2u_capacity_mbps(sender_position, receiver_position, bandwidth_hz):
+    return shannon_capacity_mbps(
+        u2u_path_loss_db(sender_position, receiver_position),
+        bandwidth_hz,
+        U2U_U2G_TX_POWER_DBM,
+    )
+
 
 class ChannelModel:
-    def __init__(self):
-        pass
-    
-    @staticmethod
-    def PL_uu(H_u, d_3D, f_c):
-        """
-        向量化計算 UAV-to-UAV 路徑損耗
-        支援單值或 NumPy 陣列輸入
-        :param H_u: 無人機間高度差 (m)，可為 scalar 或矩陣
-        :param d_3D: UAV-to-UAV 3D 距離 (m)，可為 scalar 或矩陣
-        :param f_c: 無人機通信頻率 (GHz)
-        :return: PL_uu (dB)
-        """
-        H_u = np.asarray(H_u)
-        d_3D = np.asarray(d_3D)
-
-        # term1 根據 H_u 是否大於 0 選擇
-        term1 = np.where(H_u > 0, 23.9 - 1.8 * np.log10(np.maximum(H_u, 1e-3)), 20)
-        term1 = np.maximum(term1, 20)
-        term2 = 20 * np.log10(40 * np.pi * f_c / 3)
-        # 完整公式
-        PL = term1 * np.log10(np.maximum(d_3D, 1.0)) + term2
-        return PL
+    """Compatibility facade; canonical code calls the functions above."""
 
     @staticmethod
-    def SNR_uu(P_u, sigma_sq, PL_uu_t, B_uu):
-        """
-        向量化計算 UAV-to-UAV SNR (線性值)
-        :param P_u: 發射功率 (dBm)
-        :param sigma_sq: 雜訊功率 (dBm/Hz)
-        :param PL_uu_t: UAV-to-UAV 路徑損耗 (dB)
-        :param B_uu: 頻寬 (Hz)
-        :return: SNR_uu (線性值)
-        """
-        PL_uu_t = np.asarray(PL_uu_t)
-        signal_linear = 10 ** ((P_u - PL_uu_t) / 10)
-        noise_linear = 10 ** ((sigma_sq + 10 * np.log10(B_uu)) / 10)
-        return signal_linear / noise_linear
+    def PL_uu(sender_altitude_agl, d_3d, f_c=A2A_CARRIER_GHZ):
+        altitude = np.asarray(sender_altitude_agl, dtype=float)
+        distance = np.asarray(d_3d, dtype=float)
+        coefficient = np.maximum(
+            23.9 - 1.8 * np.log10(np.maximum(altitude, 1e-3)), 20.0
+        )
+        return coefficient * np.log10(np.maximum(distance, 1.0)) + 20.0 * np.log10(
+            40.0 * np.pi * float(f_c) / 3.0
+        )
 
     @staticmethod
-    
-    def C_uu(B_uu, SNR_uu_t):
-        """
-        向量化計算 UAV-to-UAV 通道容量 (Mbps)
-        :param B_uu: 頻寬 (Hz)
-        :param SNR_uu_t: SNR (線性值)
-        :return: C_uu (Mbps)
-        """
-        SNR_uu_t = np.asarray(SNR_uu_t)
-        C = B_uu * np.log2(1 + np.maximum(SNR_uu_t, 0))
-        return C / 1e6  # Mbps
+    def PL_ug(distances_ug, f_c=A2G_CARRIER_GHZ):
+        distance = np.maximum(np.asarray(distances_ug, dtype=float), 1e-3)
+        return 20.0 * np.log10(distance) + 20.0 * np.log10(float(f_c)) + 32.44
 
     @staticmethod
-    def PL_ug(distances_ug, f_c):
-        """Return UAV-to-ground path loss in dB.
+    def SNR_uu(power_dbm, noise_psd_dbm_hz, path_loss_db, bandwidth_hz):
+        del noise_psd_dbm_hz
+        return 10.0 ** (
+            (
+                float(power_dbm)
+                - np.asarray(path_loss_db)
+                - noise_power_dbm(bandwidth_hz)
+            )
+            / 10.0
+        )
 
-        ``distances_ug`` is measured in metres and ``f_c`` is measured in GHz.
-        """
-
-        distances_ug = np.asarray(distances_ug, dtype=float)
-        f_c = np.asarray(f_c, dtype=float)
-        term1 = 20 * np.log10(distances_ug)
-        term2 = 20 * np.log10(f_c)
-        return 32.44 + term1 + term2
-
-    @staticmethod
-    def SNR_ug(P_u, sigma_sq, PL_ug_t, B_ug):
-        """Return UAV-to-ground SNR as a linear ratio (not dB)."""
-
-        PL_ug_t = np.asarray(PL_ug_t)
-        signal_linear = 10 ** ((P_u - PL_ug_t) / 10)
-        noise_linear = 10 ** ((sigma_sq + 10 * np.log10(B_ug)) / 10)
-        return signal_linear / noise_linear
+    SNR_ug = SNR_uu
 
     @staticmethod
-    def C_ug(B_ug, SNR_ug_t):
-        """Return UAV-to-ground Shannon capacity in Mbps."""
+    def C_uu(bandwidth_hz, snr):
+        return (
+            np.asarray(bandwidth_hz)
+            * np.log2(1.0 + np.maximum(snr, 0.0))
+            / 1e6
+        )
 
-        SNR_ug_t = np.asarray(SNR_ug_t)
-        SNR_ug_t = np.maximum(SNR_ug_t, 0)
-        C = B_ug * np.log2(1.0 + SNR_ug_t)
-        return C / 1e6  # Mbps
-
-
+    C_ug = C_uu

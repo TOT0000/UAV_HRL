@@ -1,37 +1,12 @@
 {
-  "seed": 20260817,
-  "sample_count": 20000,
-  "candidate_attempts": 255361,
-  "feasible_only": true,
-  "capacity_unit": "Mbps",
-  "carrier_frequency_ghz": 2.0,
-  "bandwidth_hz": 2000000.0,
-  "transmit_power_dbm": 23.0,
-  "noise_density_dbm_per_hz": -169.0,
-  "maximum_link_range_m": 200.0,
-  "sampled_distance_range_m": [
-    50.76509328773171,
-    199.99905406828995
-  ],
-  "x_range_m": [
-    0.0,
-    1000.0
-  ],
-  "y_range_m": [
-    0.0,
-    1000.0
-  ],
-  "uav_altitude_range_m": [
-    50.0,
-    150.0
-  ],
-  "sr_altitude_m": 0.0,
-  "percentile": 95.0,
-  "c_ref_com": 32.69458312458853,
-  "capacity_statistics": {
-    "min_mbps": 28.235343657074274,
-    "median_mbps": 29.624240744867425,
-    "p95_mbps": 32.69458312458853,
-    "max_mbps": 36.154411750167355
-  }
+  "schema": "demand-satisfaction-v1",
+  "normalization": "min(reference_capacity_bps / required_rate_bps, 1)",
+  "reference_bandwidth_hz": 555555.5555555555,
+  "reference_bandwidth_denominator": 18,
+  "total_bandwidth_hz": 10000000.0,
+  "packet_rate_packets_per_second": 50.0,
+  "packet_size_bits": 256.0,
+  "required_rate_bps": 12800.0,
+  "zero_demand_satisfaction": 1.0,
+  "c_ref_com": 0.0128
 }

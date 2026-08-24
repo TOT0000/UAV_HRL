@@ -496,7 +496,7 @@ def _build_metadata(preflight, arrays, result, run_dir, reference_rows):
         ),
         "transition_definition": (
             "movement-boundary state -> one deterministic actor call -> projected "
-            "48-D raw action -> synchronous proposals and movement -> four routing "
+            "derived joint raw action -> synchronous proposals and movement -> four routing "
             "slots -> next movement-boundary state"
         ),
         "git_commit_sha": _git_commit_sha(),

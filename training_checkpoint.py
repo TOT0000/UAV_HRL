@@ -11,7 +11,11 @@ import zipfile
 import numpy as np
 import torch
 
-from centralized_movement import MOVEMENT_STATE_DIM, movement_mask_from_state
+from centralized_movement import (
+    MOVEMENT_STATE_DIM,
+    MOVEMENT_FEATURE_SCHEMA_VERSION,
+    movement_mask_from_state,
+)
 from experiment_config import (
     NUM_UAV,
     SAFE_DDQN_ETA_C,
@@ -26,7 +30,7 @@ from dinkelbach_blocks import (
     dinkelbach_config_metadata,
 )
 
-CHECKPOINT_SCHEMA_VERSION = 7
+CHECKPOINT_SCHEMA_VERSION = 8
 ROUTING_LIFECYCLE_CHECKPOINT_SCHEMA_VERSION = 6
 PRE_ROUTING_LIFECYCLE_CHECKPOINT_SCHEMA_VERSION = 5
 PRE_ADAPTIVE_SAFE_DDQN_CHECKPOINT_SCHEMA_VERSION = 4
@@ -109,7 +113,8 @@ FORMAL_CORE_CONFIG_FIELDS = (
     "routing_policy",
     "task_observation_mode",
     "fov_com_pair_max_distance_m",
-    "search_utility",
+    "reserved_search_uav_ids",
+    "service_assignment_only",
     "utility_normalization_mode",
     "task_compatibility_policy",
     "hover_assignment_candidate",
@@ -845,6 +850,11 @@ def _base_metadata(
         "movement_state_dim": int(movement_state_dim),
         "joint_action_dim": int(joint_action_dim),
         "routing_state_dim": int(routing_state_dim),
+        "num_uav": NUM_UAV,
+        "movement_feature_schema_version": MOVEMENT_FEATURE_SCHEMA_VERSION,
+        "state_contract": "10-uav-no-hidden-num-gt-v1",
+        "packet_lifecycle_contract": "sr-fifo-s2u-next-slot-routing-v1",
+        "channel_contract": "single-10mhz-fdma-canonical-a2g-u2u-v1",
         "movement_agent_kind": kind,
         "movement_agent_gamma": float(td3.gamma),
         "movement_agent_configuration": _movement_agent_configuration(
@@ -857,6 +867,17 @@ def _base_metadata(
         ),
         "com_calibration_fingerprint": calibration_fingerprint(calibration),
     }
+    reward_mode = (
+        ((experiment.get("method_spec") or {}).get("reward_mode"))
+        or experiment.get("reward_mode")
+    )
+    if reward_mode == "ratio":
+        metadata["movement_objective"] = {
+            "objective_unit": "bit_per_j",
+            "numerator": "episode timely delivered bits",
+            "denominator": "episode mobility energy joules",
+            "semantics": "terminal-only ratio of sums",
+        }
     if kind == "td3":
         metadata["centralized_td3_gamma"] = float(td3.gamma)
     if experiment_metadata is not None:
@@ -1007,6 +1028,13 @@ def _checkpoint_uses_dinkelbach(metadata):
 
 def _validate_checkpoint_schema(metadata):
     schema = metadata.get("checkpoint_schema_version")
+    if schema != CHECKPOINT_SCHEMA_VERSION:
+        raise RuntimeError(
+            "checkpoint_schema_version is incompatible with the 10-UAV "
+            "state/channel/packet "
+            "contract and must be retrained: "
+            f"checkpoint={schema}, expected={CHECKPOINT_SCHEMA_VERSION}"
+        )
     if schema in {
         CHECKPOINT_SCHEMA_VERSION,
         ROUTING_LIFECYCLE_CHECKPOINT_SCHEMA_VERSION,
@@ -1930,7 +1958,9 @@ def validate_checkpoint_experiment_metadata(metadata, expected):
     mismatches = {}
     for key, value in expected.items():
         actual_value = actual.get(key)
-        if isinstance(value, (tuple, list, set, frozenset)):
+        if isinstance(value, list):
+            matches = actual_value == value
+        elif isinstance(value, (tuple, set, frozenset)):
             matches = actual_value in value
         else:
             matches = actual_value == value

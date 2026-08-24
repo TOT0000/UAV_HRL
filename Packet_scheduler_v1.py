@@ -5,6 +5,8 @@ from Fov_model_phase import FovModel
 from Channel_model import ChannelModel
 from centralized_movement import vs_data_valid
 from experiment_config import (
+    COM_PACKET_RATE_PER_SECOND,
+    COM_PACKET_SIZE_BITS,
     FOV_EMA_LIFECYCLE_VERSION,
     PRODUCTION_PACKET_INJECTION_CUTOFF_SECONDS,
     PRODUCTION_TASK_DEADLINE_SECONDS,
@@ -68,6 +70,10 @@ class PacketEngine:
         # The global pool is only a lifecycle/statistics index. Forwarding order
         # is owned by one aggregate FIFO per UAV and may mix FOV and COM packets.
         self.uav_queues = {uav_id: deque() for uav_id in range(num_uav)}
+        self.sr_queues = defaultdict(deque)
+        self.s2u_backlog_bits = defaultdict(float)
+        self.s2u_partial_transmissions = 0
+        self.s2u_completed_packets = 0
 
         # === Dual-Queue backlog tracking (no weights) ===
         # backlog_bits_by_task[node_id][task] stores SUM of remaining bits at that node for that task.
@@ -414,6 +420,29 @@ class PacketEngine:
             pkt["_queued_uav"] = None
         return removed
 
+    def _remove_from_sr_queue(self, pkt):
+        sr_id = pkt.get("_queued_sr")
+        if sr_id is None:
+            return False
+        sr_id = int(sr_id)
+        queue = self.sr_queues[sr_id]
+        if queue and queue[0] is pkt:
+            queue.popleft()
+            removed = True
+        else:
+            filtered = deque(item for item in queue if item is not pkt)
+            removed = len(filtered) != len(queue)
+            if removed:
+                self.sr_queues[sr_id] = filtered
+        if removed:
+            self.s2u_backlog_bits[sr_id] = max(
+                self.s2u_backlog_bits[sr_id]
+                - max(float(pkt.get("rem_bits", 0.0)), 0.0),
+                0.0,
+            )
+            pkt["_queued_sr"] = None
+        return removed
+
     def enqueue_packet(self, pkt, uav_id, queue_enter_time):
         """Append a fully arrived packet to a UAV's aggregate FIFO."""
 
@@ -428,9 +457,7 @@ class PacketEngine:
         self.uav_queues[uav_id].append(pkt)
         self.backlog_bits[uav_id] += max(float(pkt.get("rem_bits", 0.0)), 0.0)
 
-    def create_packet(self, source, task_type, size_bits, generation_time):
-        """Create and enqueue one packet; shared by injection and unit tests."""
-
+    def _new_packet(self, source, task_type, size_bits, generation_time, source_kind):
         source = int(source)
         task_type = self._task_norm(task_type)
         size_bits = float(size_bits)
@@ -442,7 +469,10 @@ class PacketEngine:
             "id": self._next_pkt_id,
             "_pool_idx": pool_idx,
             "_queued_uav": None,
+            "_queued_sr": None,
             "source": source,
+            "source_kind": str(source_kind),
+            "source_id": source,
             "current": source,
             "arrival_time": generation_time,
             "generation_time": generation_time,
@@ -467,13 +497,71 @@ class PacketEngine:
             "timely_goodput_counted": False,
             "violation_counted": False,
             "terminal_outcome": None,
+            "s2u_receiver": None,
+            "s2u_bits_sent": 0.0,
+            "routing_eligible_time": generation_time,
         }
         self.generated_packet_counts[task_type] += 1
         self.packet_pool.append(pkt)
         self._active_idx.add(pool_idx)
-        self.enqueue_packet(pkt, source, generation_time)
         self._next_pkt_id += 1
         return pkt
+
+    def create_packet(self, source, task_type, size_bits, generation_time):
+        """Create a UAV-origin FOV packet and enqueue it at its source UAV."""
+
+        pkt = self._new_packet(
+            source, task_type, size_bits, generation_time, source_kind="UAV"
+        )
+        self.enqueue_packet(pkt, source, generation_time)
+        return pkt
+
+    def create_sr_packet(self, sr_id, size_bits, generation_time):
+        """Create COM data at an SR FIFO; it is not yet routable by a UAV."""
+
+        sr_id = int(sr_id)
+        pkt = self._new_packet(
+            sr_id, "COM", size_bits, generation_time, source_kind="SR"
+        )
+        pkt["current"] = -(sr_id + 1)
+        pkt["path"] = [f"SR:{sr_id}"]
+        pkt["_queued_sr"] = sr_id
+        self.sr_queues[sr_id].append(pkt)
+        self.s2u_backlog_bits[sr_id] += float(size_bits)
+        return pkt
+
+    def get_sr_hol_packet(self, sr_id):
+        queue = self.sr_queues[int(sr_id)]
+        return next(
+            (pkt for pkt in queue if pkt is not None and not pkt.get("done", False)),
+            None,
+        )
+
+    def assigned_com_uav(self, env, sr_id):
+        matches = []
+        for uav_id, tasks in env.multi_tasks.items():
+            if any(
+                task.get("task_type") == "COM"
+                and int(task.get("target_obj_id", -1)) == int(sr_id)
+                for task in tasks
+            ):
+                matches.append(int(uav_id))
+        if len(matches) > 1:
+            raise AssertionError(f"SR {sr_id} is assigned to multiple COM UAVs")
+        return matches[0] if matches else None
+
+    def active_s2u_links(self, env):
+        links = {}
+        for sr_id in sorted(self.sr_queues):
+            hol = self.get_sr_hol_packet(sr_id)
+            if hol is None or self.s2u_backlog_bits[sr_id] <= PACKET_EPS:
+                continue
+            receiver = hol.get("s2u_receiver")
+            if receiver is None:
+                receiver = self.assigned_com_uav(env, sr_id)
+            if receiver is not None:
+                links[int(sr_id)] = int(receiver)
+        return links
 
     def get_queue_packets(self, uav_id):
         return [
@@ -689,6 +777,37 @@ class PacketEngine:
             self.uav_queues[uav_id] = kept
             self._decrease_backlog(uav_id, expired_bits)
 
+        for sr_id in sorted(self.sr_queues):
+            kept = deque()
+            expired_bits = 0.0
+            for pkt in self.sr_queues[sr_id]:
+                if pkt is None:
+                    continue
+                pool_idx = int(pkt.get("_pool_idx", -1))
+                if pool_idx >= 0:
+                    queued_indices.add(pool_idx)
+                if pkt.get("done", False):
+                    pkt["_queued_sr"] = None
+                    expired_bits += max(float(pkt.get("rem_bits", 0.0)), 0.0)
+                    continue
+                if is_expired(pkt):
+                    expired_bits += max(float(pkt.get("rem_bits", 0.0)), 0.0)
+                    pkt["_queued_sr"] = None
+                    event = self._mark_deadline_violation(
+                        pkt,
+                        current_time,
+                        sender=-(int(sr_id) + 1),
+                        remove_from_queue=False,
+                    )
+                    if event is not None:
+                        violations.append(event)
+                else:
+                    kept.append(pkt)
+            self.sr_queues[sr_id] = kept
+            self.s2u_backlog_bits[sr_id] = max(
+                self.s2u_backlog_bits[sr_id] - expired_bits, 0.0
+            )
+
         detached_indices = set(self._active_idx).difference(queued_indices)
         for pool_idx in sorted(detached_indices):
             if not (0 <= pool_idx < len(self.packet_pool)):
@@ -723,6 +842,92 @@ class PacketEngine:
             reward += 1.0
         return float(reward)
 
+    def serve_s2u_links(self, env, capacities, current_time):
+        """Serve SR FIFO uploads with partial HOL locks and next-slot causality."""
+
+        current_time = float(current_time)
+        slot_end = current_time + float(self.step_time)
+        result = {"transmitted_bits_by_link": {}, "arrivals": []}
+        for (sr_id, receiver), capacity_mbps in sorted(capacities.items()):
+            sr_id, receiver = int(sr_id), int(receiver)
+            capacity_mbps = float(capacity_mbps)
+            if not np.isfinite(capacity_mbps) or capacity_mbps <= 0.0:
+                continue
+            capacity_bps = capacity_mbps * 1e6
+            initial_budget = capacity_bps * self.step_time
+            remaining_budget = initial_budget
+            transmitted = 0.0
+            eligible_ids = {int(pkt["id"]) for pkt in self.sr_queues[sr_id]}
+            while remaining_budget > PACKET_EPS:
+                pkt = self.get_sr_hol_packet(sr_id)
+                if pkt is None or int(pkt["id"]) not in eligible_ids:
+                    break
+                locked = pkt.get("s2u_receiver")
+                if locked is None:
+                    assigned_receiver = self.assigned_com_uav(env, sr_id)
+                    if (
+                        assigned_receiver is None
+                        or int(assigned_receiver) != receiver
+                    ):
+                        # The slot's S2U link was selected for an older locked
+                        # HOL packet. Reassignment applies to the next unstarted
+                        # packet, which receives bandwidth starting next slot.
+                        break
+                if locked is not None and int(locked) != receiver:
+                    raise AssertionError("S2U partial packet receiver lock was violated")
+                if locked is None:
+                    pkt["s2u_receiver"] = receiver
+                remaining_before = max(float(pkt["rem_bits"]), 0.0)
+                bits_used = min(remaining_budget, remaining_before)
+                if bits_used <= PACKET_EPS:
+                    break
+                pkt["rem_bits"] = max(remaining_before - bits_used, 0.0)
+                pkt["s2u_bits_sent"] = float(pkt.get("s2u_bits_sent", 0.0)) + bits_used
+                self.s2u_backlog_bits[sr_id] = max(
+                    self.s2u_backlog_bits[sr_id] - bits_used, 0.0
+                )
+                remaining_budget -= bits_used
+                transmitted += bits_used
+                if pkt["rem_bits"] > PACKET_EPS:
+                    self.s2u_partial_transmissions += 1
+                    break
+
+                completion_time = current_time + transmitted / capacity_bps
+                queue = self.sr_queues[sr_id]
+                if not queue or queue[0] is not pkt:
+                    raise AssertionError("completed S2U packet was not SR FIFO HOL")
+                queue.popleft()
+                pkt["_queued_sr"] = None
+                pkt["s2u_completion_time"] = completion_time
+                pkt.setdefault("per_hop", []).append(
+                    {
+                        "from": f"SR:{sr_id}",
+                        "to": receiver,
+                        "queue_s": max(
+                            current_time - float(pkt["generation_time"]), 0.0
+                        ),
+                        "tx_s": float(pkt["size_bits"]) / capacity_bps,
+                        "delay_ms": max(
+                            completion_time - float(pkt["generation_time"]), 0.0
+                        )
+                        * 1e3,
+                        "link_type": "S2U",
+                    }
+                )
+                pkt["path"].append(receiver)
+                pkt["rem_bits"] = float(pkt["size_bits"])
+                pkt["s2u_receiver"] = None
+                pkt["routing_eligible_time"] = slot_end
+                # Enqueue only after this routing slot's eligible packet snapshot.
+                self.enqueue_packet(pkt, receiver, slot_end)
+                self.s2u_completed_packets += 1
+                result["arrivals"].append(pkt)
+            result["transmitted_bits_by_link"][("S2U", sr_id, receiver)] = transmitted
+            if transmitted > initial_budget + PACKET_EPS:
+                self.link_slot_budget_violations += 1
+                raise AssertionError("S2U transmitted beyond its slot bit budget")
+        return result
+
     def serve_active_links(self, env, actions, capacities, current_time):
         """Serve each sender FIFO with one shared bit budget for its active link."""
 
@@ -742,6 +947,13 @@ class PacketEngine:
             "outcomes": [],
         }
         pending_relay_arrivals = []
+        s2u_result = self.serve_s2u_links(
+            env, getattr(env, "active_s2u_capacities", {}), current_time
+        )
+        result["s2u_arrivals"] = list(s2u_result["arrivals"])
+        result["transmitted_bits_by_link"].update(
+            s2u_result["transmitted_bits_by_link"]
+        )
 
         for sender in sorted(actions):
             sender = int(sender)
@@ -952,7 +1164,7 @@ class PacketEngine:
         current_time,
         step_time=0.25,
         base_fov_rate=5,
-        base_ctrl_rate=50,
+        base_ctrl_rate=COM_PACKET_RATE_PER_SECOND,
         rate_overrides=None,
     ):
         if float(current_time) >= self.injection_cutoff_seconds:
@@ -995,13 +1207,13 @@ class PacketEngine:
             task_list = env.multi_tasks.get(uav_id, [])
             for task in task_list:
                 task_type = task["task_type"]
-                if task_type not in ["FOV", "COM"]:
+                if task_type != "FOV":
                     continue
                 if task_type == "FOV" and not vs_data_valid(env, uav_id, task):
                     # Existing queued/relayed VS packets remain untouched; only new
                     # source generation is gated by current geometry and full ROI coverage.
                     continue
-                rate = (base_fov_rate if task_type == "FOV" else base_ctrl_rate)
+                rate = base_fov_rate
                 
                 # === 基於速率積分的封包計數 ===
                 key = f"{uav_id}_{task_type}"
@@ -1019,24 +1231,17 @@ class PacketEngine:
                 #     if num_packets > remain:
                 #         num_packets = remain
 
-                if task_type == "FOV":
-                    uav = env.uav_dict[uav_id]
-                    x_tgt, y_tgt, z_tgt = task["target_pos"]
-                    # 確保有 FovModel
-                    if not hasattr(self, "FovModel"):
-                        self.FovModel = FovModel(f=0.004, wl=0.008, i_l=0.012, z_u=uav.z_u, gamma_g=80)
-                    self.FovModel.z_u = uav.z_u
-
-                    # 依當下幾何關係計算 FOV 面積（地面投影像素/覆蓋）
-                    current_fov, _ = self.FovModel.calculate_fov_single(
-                        uav.x_u, uav.y_u, uav.z_u, x_tgt, y_tgt, z_tgt
-                    )
-                    max_fov = min (1, current_fov)
-                    # 你的 FOV→bits 公式（與 backlog 現用一致，以免前後不一）
-                    wl, i_l, tau = 0.008, 0.012, 3.9e-6
-                    pkt_bits = 0.005 * (wl * i_l / (tau ** 2)) * max_fov
-                else:
-                    pkt_bits = 256
+                uav = env.uav_dict[uav_id]
+                x_tgt, y_tgt, z_tgt = task["target_pos"]
+                if not hasattr(self, "FovModel"):
+                    self.FovModel = FovModel(f=0.004, wl=0.008, i_l=0.012, z_u=uav.z_u, gamma_g=80)
+                self.FovModel.z_u = uav.z_u
+                current_fov, _ = self.FovModel.calculate_fov_single(
+                    uav.x_u, uav.y_u, uav.z_u, x_tgt, y_tgt, z_tgt
+                )
+                max_fov = min (1, current_fov)
+                wl, i_l, tau = 0.008, 0.012, 3.9e-6
+                pkt_bits = 0.005 * (wl * i_l / (tau ** 2)) * max_fov
 
                 for _ in range(num_packets):
                     self.create_packet(
@@ -1046,6 +1251,22 @@ class PacketEngine:
                     # if self.total_injected_packets >= self.target_total_packets:
                     #     print(f"✅ Packet quota reached: {self.total_injected_packets}")
                     #     return
+
+        # COM data is generated at discovered/active SRs, never directly in a
+        # UAV queue. Assignment controls S2U reception, not source generation.
+        for sr in sorted(getattr(env, "SR_teams", ()), key=lambda item: item.id):
+            if not bool(sr.active):
+                continue
+            key = f"SR_{int(sr.id)}_COM"
+            self.inject_buffer[key] += base_ctrl_rate * step_time
+            num_packets = int(self.inject_buffer[key])
+            if num_packets <= 0:
+                continue
+            self.inject_buffer[key] -= num_packets
+            for _ in range(num_packets):
+                self.create_sr_packet(
+                    int(sr.id), COM_PACKET_SIZE_BITS, current_time
+                )
 
     def mark_packet_done(
         self, pkt, current_time=None, reason=None, remove_from_queue=True
@@ -1080,7 +1301,8 @@ class PacketEngine:
 
         # 2) remove the packet from whichever per-UAV FIFO currently owns it.
         if remove_from_queue:
-            self._remove_from_queue(pkt)
+            if not self._remove_from_queue(pkt):
+                self._remove_from_sr_queue(pkt)
 
         # 3) remove from active indices
         pi = pkt.get("_pool_idx", None)
@@ -1122,7 +1344,17 @@ class PacketEngine:
         self.packet_outcomes.append(
             {
                 "packet_id": int(pkt["id"]),
-                "source_uav_id": int(pkt.get("source", -1)),
+                "source_uav_id": (
+                    int(pkt.get("source", -1))
+                    if pkt.get("source_kind") == "UAV"
+                    else None
+                ),
+                "source_sr_id": (
+                    int(pkt.get("source", -1))
+                    if pkt.get("source_kind") == "SR"
+                    else None
+                ),
+                "source_kind": pkt.get("source_kind", "UAV"),
                 "task_type": task_type,
                 "outcome": outcome,
                 "generation_time_seconds": generation_time,
@@ -1299,6 +1531,10 @@ class PacketEngine:
         self.uav_queues = {
             uav_id: deque() for uav_id in range(self.num_UAV)
         }
+        self.sr_queues = defaultdict(deque)
+        self.s2u_backlog_bits = defaultdict(float)
+        self.s2u_partial_transmissions = 0
+        self.s2u_completed_packets = 0
         # 其他快取
         self.buffer_info = {}
         self.actual_backlog = {}
@@ -1332,8 +1568,11 @@ class PacketEngine:
         # 總延遲時間
     def log_hop_delay(self, env, pkt, current_node, next_hop, link_capacity_mbps, current_time, pkt_bits, backlog_bits):
         """用這顆封包的 bits 計算該 hop 的 queue + tx 延遲，並記錄（不在這裡加 GS +0.1）。"""
+        raise RuntimeError(
+            "legacy hop-delay training flow is disabled; use serve_active_links()"
+        )
         # slot_time = getattr(self, "step_time", 0.25)
-        if link_capacity_mbps <= 0.1:
+        if not np.isfinite(link_capacity_mbps) or link_capacity_mbps <= 0.0:
             return 0.0
         service_bps = max(float(link_capacity_mbps) * 1e6 , 1e-6)
         # print(backlog_bits)
@@ -1455,7 +1694,7 @@ class PacketEngine:
 
     def get_state(self, env, uav_id, visited_nodes=None, backlog_bits=None):
         """
-        Task-aware routing state with dimension 6N+30 (N=16 gives 126).
+        Task-aware routing state with dimension 6N+30.
 
         The original 6N+26 fields keep their order. Four HOL packet fields
         [is_FOV, is_COM, normalized_slack, normalized_remaining] are appended.
@@ -1472,6 +1711,12 @@ class PacketEngine:
         N = env.num_UAV
         L = N + 1                           # 含 GS（GS 索引固定為 env.GS_ID）
         uav = env.uav_dict[uav_id]
+        assigned_tasks = list(env.multi_tasks.get(uav_id, []))
+        assigned_types = {task.get("task_type") for task in assigned_tasks}
+        fov_task = next(
+            (task for task in assigned_tasks if task.get("task_type") == "FOV"),
+            None,
+        )
         x_u, y_u, z_u = uav.get_position()
         uav_position = np.array([x_u, y_u, z_u], dtype=float)
 
@@ -1593,7 +1838,7 @@ class PacketEngine:
         action_mask=None,
     ):
         """
-        State v2 (維度 = 5N + 19, N=num_UAV, L=N+1(含GS)):
+        Canonical task-aware state (dimension = 6N + 30, L=N+1 including GS):
         A 個體/任務: [uav_one_hot(N), energy(1), my_backlog(1), task_flags(4), fov_task_flag(1)]
         B 通訊(逐鏈路; 含GS): [link_valid_mask(L), link_delay_norm(L), link_capacity_norm(L), next_hop_backlog_log_norm(L)]
         C 幾何/回傳緊迫度: [uav_position(3), dist_to_GS_norm(1), eta_to_GS_slots_norm(1)]
@@ -1612,6 +1857,12 @@ class PacketEngine:
         N = env.num_UAV
         L = N + 1                           # 含 GS（GS 索引固定為 env.GS_ID）
         uav = env.uav_dict[uav_id]
+        assigned_tasks = list(env.multi_tasks.get(uav_id, []))
+        assigned_types = {task.get("task_type") for task in assigned_tasks}
+        fov_task = next(
+            (task for task in assigned_tasks if task.get("task_type") == "FOV"),
+            None,
+        )
         x_u, y_u, z_u = uav.get_position()
         uav_position = np.array([x_u, y_u, z_u], dtype=float)
 
@@ -1629,9 +1880,9 @@ class PacketEngine:
         z_vel_norm = float(np.clip(dz / max(dz_cap_state, 1e-6), -1.0, 1.0))
 
         # Task-dependent target altitude (Search higher, FOV lower)
-        if getattr(uav, "task_type", None) == "FOV":
+        if "FOV" in assigned_types:
             z_tgt_norm = 0.2
-        elif getattr(uav, "task_type", None) == "Search":
+        elif "Search" in assigned_types:
             z_tgt_norm = 0.8
         else:
             z_tgt_norm = 0.5
@@ -1641,8 +1892,8 @@ class PacketEngine:
         fov_now_clip = 0.0
         fov_err_clip = 0.0
         try:
-            if getattr(uav, "task_type", None) == "FOV" and hasattr(uav, "target_position"):
-                tx, ty, tz = uav.target_position
+            if fov_task is not None:
+                tx, ty, tz = fov_task["target_pos"]
                 state_fov_model = FovModel(
                     f=0.004,
                     wl=0.008,
@@ -1672,10 +1923,10 @@ class PacketEngine:
         # ---------- 任務旗標 ----------
         task_types = ["Search", "FOV", "COM", "Hovering"]
         task_flags = np.zeros(len(task_types), dtype=float)
-        for task in env.multi_tasks.get(uav_id, []):
+        for task in assigned_tasks:
             if task["task_type"] in task_types:
                 task_flags[task_types.index(task["task_type"])] = 1.0
-        fov_task_flag = 1.0 if uav.task_type == "FOV" else 0.0  # 原本的 "Current FOV: 0/1"
+        fov_task_flag = task_flags[1]
         # 新增：是否為來源 UAV
         is_source_flag = 1.0 if uav_id in env.source_uavs else 0.0
         overlap_ema, unvisited_ema, frontier_ema = self._fov_ema_values(uav_id)
@@ -1781,7 +2032,7 @@ class PacketEngine:
             uav_id_one_hot,                                    # N
             np.array([energy_norm, my_bits]),      # 2
             task_flags,                                        # 4
-            np.array([fov_task_flag, is_source_flag]),         # 2       => A: N+7
+            np.array([fov_task_flag, is_source_flag]),         # 2
 
             link_valid_mask,                                   # L
             link_delay_norm,                                   # L
@@ -1793,10 +2044,10 @@ class PacketEngine:
             np.array([z_err_norm, z_vel_norm], dtype=float),      # 2 (altitude error & vertical speed)
             np.array([fov_now_clip, fov_err_clip], dtype=float),  # 2 (FOV quality)
 
-            np.array([dist_to_GS_norm, eta_to_GS_slots_norm]), # 2       => C: 5
+            np.array([dist_to_GS_norm, eta_to_GS_slots_norm]), # 2
             np.array([lambda_norm], dtype=float),
 
-            np.array([overlap_ema, unvisited_ema, frontier_ema]), # 3     => D: 3
+            np.array([overlap_ema, unvisited_ema, frontier_ema]), # 3
             hol_context,                                        # 4
         ], dtype=float)
 
@@ -1809,10 +2060,13 @@ class PacketEngine:
     self, env, pkt, hop_delay_ms, from_uav, to_target, t, backlog, mode="uav",
     channel_capacity=None
     ):
+        raise RuntimeError(
+            "legacy per-hop reward flow is disabled; use the canonical "
+            "serve_active_links() E2E lifecycle"
+        )
         # -----------------------
         # Constants / thresholds
         # -----------------------
-        cap_eps = 0.1      # Mbps, link too weak threshold
         f_c = 2e9
         d_0 = 1
         sigma_sq = -169    # dBm/Hz
@@ -1841,7 +2095,7 @@ class PacketEngine:
             else:
                 channel_capacity = 0.0
 
-        if channel_capacity < cap_eps:
+        if not np.isfinite(channel_capacity) or channel_capacity <= 0.0:
             # 注意：你的 e2e 欄位是 e2e_delay_ms
             return task_type, 0.0, False, float(pkt.get("e2e_delay_ms", 0.0)), False, 0.0, 0.0, 0.0, False
 
@@ -1880,7 +2134,7 @@ class PacketEngine:
 
                 LOSPL  = ChannelModel.PL_ug(d_3D, d_0, f_c=f_c, mu=2.0)
                 NLOSPL = ChannelModel.PL_ug(d_3D, d_0, f_c=f_c, mu=2.4)
-                Los_prob = 1.0 / (1.0 + 4.88 * math.exp(-0.429 * (angle - 4.88)))
+                Los_prob = 1.0 / (1.0 + 11.95 * math.exp(-0.136 * (angle - 11.95)))
                 PL = Los_prob * LOSPL + (1.0 - Los_prob) * NLOSPL
             else:
                 uav_to = env.uav_dict[to_target]

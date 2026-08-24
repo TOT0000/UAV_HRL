@@ -20,7 +20,7 @@ from Task_assignment import (
 
 class AssignmentUtilityTest(unittest.TestCase):
     def setUp(self):
-        self.env = Simulator(num_UAV=16)
+        self.env = Simulator(num_UAV=10)
         self.env.num_GT = 2
         self.env.reset_environment()
 
@@ -43,16 +43,15 @@ class AssignmentUtilityTest(unittest.TestCase):
             ),
             mock.patch.object(
                 self.env,
-                "get_sr_uav_capacity_mbps",
-                side_effect=[10.0, 30.0],
+                "get_sr_uav_reference_capacity_mbps",
+                side_effect=[0.0064, 0.0128],
             ),
         ):
             problem = assigner.build_problem([0, 1], tasks)
 
-        self.assertEqual([task.task_type for task in problem.tasks], ["FOV", "COM", "Search"])
+        self.assertEqual([task.task_type for task in problem.tasks], ["FOV", "COM"])
         np.testing.assert_allclose(problem.utility_matrix[:, 0], [0.0, 1.0])
-        np.testing.assert_allclose(problem.utility_matrix[:, 1], [0.0, 1.0])
-        np.testing.assert_allclose(problem.utility_matrix[:, 2], [0.05, 0.05])
+        np.testing.assert_allclose(problem.utility_matrix[:, 1], [0.5, 1.0])
         self.assertTrue(problem.feasible_mask.all())
         np.testing.assert_allclose(problem.raw_fov_utility[:, 0], [0.25, 1.0])
         np.testing.assert_allclose(problem.raw_fov_coverage[:, 0], [0.25, 1.0])
@@ -216,11 +215,11 @@ class AssignmentCompatibilityTest(unittest.TestCase):
 
 class AssignmentLifecycleTest(unittest.TestCase):
     def setUp(self):
-        self.env = Simulator(num_UAV=16)
+        self.env = Simulator(num_UAV=10)
         self.env.num_GT = 2
         self.env.reset_environment()
 
-    def test_search_to_hover_is_threshold_only_and_does_not_reassign(self):
+    def test_search_release_immediately_reassigns(self):
         before = self.env.assignment_invocations
         for gt in self.env.gts:
             gt.is_found = True
@@ -229,7 +228,7 @@ class AssignmentLifecycleTest(unittest.TestCase):
 
         self.env.visited_bitmap[:] = True
         self.env.convert_search_to_hovering()
-        self.assertEqual(self.env.assignment_invocations, before)
+        self.assertEqual(self.env.assignment_invocations, before + 1)
         self.assertEqual(self.env.search_to_hover_conversions, 1)
         self.assertTrue(self.env._search_phase_over)
         self.assertTrue(
@@ -238,10 +237,10 @@ class AssignmentLifecycleTest(unittest.TestCase):
                 for tasks in self.env.multi_tasks.values()
             )
         )
-        self.assertTrue(all(task.task_type == "Hovering" for task in self.env.task_list))
+        self.assertFalse(any(task.task_type == "Search" for task in self.env.task_list))
 
         self.env.assign_tasks()
-        self.assertEqual(self.env.assignment_invocations, before + 1)
+        self.assertEqual(self.env.assignment_invocations, before + 2)
         self.assertEqual(self.env.last_assignment.last_round_problems, [])
 
     def test_phase_fallback_is_search_below_threshold_and_hover_after(self):
@@ -254,7 +253,7 @@ class AssignmentLifecycleTest(unittest.TestCase):
         before = self.env.assignment_invocations
         self.env.visited_bitmap[:] = True
         self.env.convert_search_to_hovering()
-        self.assertEqual(self.env.assignment_invocations, before)
+        self.assertEqual(self.env.assignment_invocations, before + 1)
         self.assertTrue(
             all(tasks[0]["task_type"] == "Hovering" for tasks in self.env.multi_tasks.values())
         )

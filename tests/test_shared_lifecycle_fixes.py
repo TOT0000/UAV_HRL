@@ -8,9 +8,9 @@ from Packet_scheduler_v1 import PacketEngine
 from Simulator import Simulator
 
 
-class CommunicationSafetyLifecycleTest(unittest.TestCase):
-    def test_identical_physical_states_apply_identical_safety_for_all_uav_ids(self):
-        mobility = {
+class UnconstrainedGsDistanceLifecycleTest(unittest.TestCase):
+    def test_retired_gs_projection_metadata_does_not_rewrite_movement(self):
+        retired_mobility_metadata = {
             "comm_safety": {
                 "enable": True,
                 "mode": "gs_only",
@@ -20,29 +20,30 @@ class CommunicationSafetyLifecycleTest(unittest.TestCase):
             }
         }
         proposals = []
-        for uav_id in (0, 2, 7, 15):
+        for uav_id in (0, 2, 7, 9):
             uav = UAV(uav_id, 190.0, 0.0, 50.0)
             proposals.append(
                 uav.propose_movement(
                     10.0,
                     0.0,
                     0.0,
-                    mobility_params=mobility,
+                    mobility_params=retired_mobility_metadata,
                 )["new_position"]
             )
         for proposal in proposals[1:]:
             np.testing.assert_allclose(proposal, proposals[0])
+        self.assertEqual(proposals[0], (200.0, 0.0, 50.0))
 
 
 class FovEmaLifecycleTest(unittest.TestCase):
     def setUp(self):
-        self.env = Simulator(num_UAV=16)
+        self.env = Simulator(num_UAV=10)
         self.env.num_GT = 2
         self.env.reset_environment()
         self.env.update_source_uavs()
         self.env.update_u2u_channels()
         self.env.update_u2g_channels()
-        self.engine = PacketEngine(num_uav=16)
+        self.engine = PacketEngine(num_uav=10)
 
     def _state(self, engine=None):
         engine = engine or self.engine
@@ -72,14 +73,14 @@ class FovEmaLifecycleTest(unittest.TestCase):
         self.env.visited_bitmap[0, 0] = True
         self.engine.update_fov_ema(self.env, "map-transition-1")
         saved = self.engine.fov_ema_state()
-        restored = PacketEngine(num_uav=16)
+        restored = PacketEngine(num_uav=10)
         restored.load_fov_ema_state(saved)
         self.assertEqual(restored.fov_ema_state(), saved)
         np.testing.assert_array_equal(self._state(self.engine), self._state(restored))
 
     def test_hol_slack_uses_instance_deadline_override(self):
         overridden = PacketEngine(
-            num_uav=16,
+            num_uav=10,
             task_deadlines_seconds={"FOV": 0.5, "COM": 1.0},
         )
         overridden.create_packet(0, "FOV", 100.0, 0.0)
@@ -90,7 +91,7 @@ class FovEmaLifecycleTest(unittest.TestCase):
 
 class SrRouteLifecycleTest(unittest.TestCase):
     def test_common_simulator_uses_the_shared_route_and_no_duplicate_samples(self):
-        env = Simulator(num_UAV=16)
+        env = Simulator(num_UAV=10)
         env.num_GT = 2
         env.reset_environment()
         for index, team in enumerate(env.SR_teams):
@@ -102,7 +103,7 @@ class SrRouteLifecycleTest(unittest.TestCase):
         self.assertEqual(assigned.path[-1], (2.5, 0.0))
         env.advance_sr_teams()
         saved = env.sr_route_state()
-        restored = Simulator(num_UAV=16)
+        restored = Simulator(num_UAV=10)
         restored.num_GT = 2
         restored.reset_environment()
         restored.load_sr_route_state(saved)

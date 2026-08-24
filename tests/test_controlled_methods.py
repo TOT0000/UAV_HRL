@@ -19,7 +19,6 @@ from experiment_config import (
     ROI_COUNT_MAX,
     ROI_COUNT_MIN,
     SEARCH_COVERAGE_THRESHOLD,
-    SEARCH_UTILITY,
     effective_training_config,
     exploration_schedule_configuration,
     movement_agent_configuration,
@@ -83,7 +82,7 @@ class ControlledMethodRegistryTest(unittest.TestCase):
             spec = MethodSpec.parse(key)
             self.assertEqual(spec.assignment, "k_km")
             self.assertEqual(spec.routing, "safe_ddqn")
-        self.assertEqual(NUM_UAV, 16)
+        self.assertEqual(NUM_UAV, 10)
         self.assertEqual((ROI_COUNT_MIN, ROI_COUNT_MAX), (2, 8))
         environment = Simulator(num_UAV=NUM_UAV)
         environment.num_GT = ROI_COUNT_MAX + 1
@@ -133,8 +132,8 @@ class ControlledMethodRegistryTest(unittest.TestCase):
                     method_spec=spec,
                 )
                 self.assertEqual(result["movement_agent_kind"], spec.agent)
-                self.assertEqual(result["movement_state_dim"], 532)
-                self.assertEqual(result["joint_action_dim"], 48)
+                self.assertEqual(result["movement_state_dim"], 429)
+                self.assertEqual(result["joint_action_dim"], 30)
                 self.assertEqual(result["proposal_batches"], 1)
                 metadata = result["run_metadata"]
                 self.assertEqual(metadata["assignment_strategy"], spec.assignment)
@@ -163,7 +162,7 @@ class ControlledMethodRegistryTest(unittest.TestCase):
                     metadata["fov_com_pair_max_distance_m"],
                     FOV_COM_PAIR_MAX_DISTANCE_M,
                 )
-                self.assertEqual(metadata["search_utility"], SEARCH_UTILITY)
+                self.assertTrue(metadata["service_assignment_only"])
                 self.assertEqual(
                     metadata["search_coverage_threshold"],
                     SEARCH_COVERAGE_THRESHOLD,
@@ -306,24 +305,24 @@ class ControlledRewardTest(unittest.TestCase):
                     ratio_objective_reward=objective,
                 )
             )
-        self.assertEqual(objectives, [0.0, 2.5])
+        self.assertEqual(objectives, [0.0, 2_500_000.0])
         self.assertAlmostEqual(
             objectives[-1],
-            (1.0 + 9.0) / (1.0 + 3.0),
+            (1.0 + 9.0) * 1e6 / (1.0 + 3.0),
         )
         unshaped = replay._reward_numpy(
             np.asarray([0, 1]), current_lambda=0.0, gamma=1.0,
             reward_mode="ratio", task_potential_enabled=False,
         ).ravel()
-        self.assertTrue(np.allclose(unshaped, [0.0, 2.5]))
-        self.assertAlmostEqual(float(unshaped.sum()), 2.5)
+        self.assertTrue(np.allclose(unshaped, [0.0, 2_500_000.0]))
+        self.assertAlmostEqual(float(unshaped.sum()), 2_500_000.0)
         self.assertNotAlmostEqual(float(unshaped.sum()), 1.0 / 1.0 + 9.0 / 3.0)
 
         shaped = replay._reward_numpy(
             np.asarray([0, 1]), current_lambda=999.0, gamma=1.0,
             reward_mode="ratio", task_potential_enabled=True,
         ).ravel()
-        self.assertTrue(np.allclose(shaped, [-1.25, 3.25]))
+        self.assertTrue(np.allclose(shaped, [-1.25, 2_500_000.75]))
         self.assertTrue(np.allclose(online_rewards, shaped))
         self.assertAlmostEqual(
             sum(online_rewards),
@@ -490,8 +489,7 @@ class ControlledDDPGCheckpointTest(unittest.TestCase):
         }
         with self.assertRaisesRegex(
             RuntimeError,
-            "legacy ratio checkpoint uses per-transition B/E and cannot be resumed "
-            "under the terminal ratio-of-sums reward contract",
+            "incompatible.*must be retrained",
         ):
             validate_model_checkpoint_metadata(legacy)
 

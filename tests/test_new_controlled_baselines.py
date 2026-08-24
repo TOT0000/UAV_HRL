@@ -69,17 +69,17 @@ class MaskedTaskObservationTest(unittest.TestCase):
             movement, "masked", "movement"
         )
         masked_routing = apply_observation_strategy(routing, "masked", "routing")
-        self.assertEqual(masked_movement.shape, (532,))
-        self.assertEqual(masked_routing.shape, (126,))
+        self.assertEqual(masked_movement.shape, (429,))
+        self.assertEqual(masked_routing.shape, (90,))
         np.testing.assert_array_equal(
             masked_movement[list(MOVEMENT_TASK_ASSIGNMENT_INDICES)], 0.0
         )
         np.testing.assert_array_equal(
             masked_routing[list(ROUTING_TASK_ASSIGNMENT_INDICES)], 0.0
         )
-        movement_keep = np.ones(532, dtype=bool)
+        movement_keep = np.ones(429, dtype=bool)
         movement_keep[list(MOVEMENT_TASK_ASSIGNMENT_INDICES)] = False
-        routing_keep = np.ones(126, dtype=bool)
+        routing_keep = np.ones(90, dtype=bool)
         routing_keep[list(ROUTING_TASK_ASSIGNMENT_INDICES)] = False
         np.testing.assert_array_equal(masked_movement[movement_keep], movement[movement_keep])
         np.testing.assert_array_equal(masked_routing[routing_keep], routing[routing_keep])
@@ -109,15 +109,15 @@ class MaskedTaskObservationTest(unittest.TestCase):
             train(config, scenario_manifest=manifest, method_spec=method)
             checkpoint = root / "full" / "ep_0001"
             with np.load(checkpoint / "joint_replay.npz", allow_pickle=False) as replay:
-                self.assertEqual(replay["state"].shape, (1, 532))
+                self.assertEqual(replay["state"].shape, (1, 429))
                 np.testing.assert_array_equal(
                     replay["state"][:, list(MOVEMENT_TASK_ASSIGNMENT_INDICES)], 0.0
                 )
                 np.testing.assert_array_equal(
                     replay["next_state"][:, list(MOVEMENT_TASK_ASSIGNMENT_INDICES)], 0.0
                 )
-                self.assertEqual(replay["current_movement_mask"].shape, (1, 16))
-                self.assertEqual(replay["next_movement_mask"].shape, (1, 16))
+                self.assertEqual(replay["current_movement_mask"].shape, (1, 10))
+                self.assertEqual(replay["next_movement_mask"].shape, (1, 10))
                 self.assertTrue(replay["movement_mask_valid"].all())
                 self.assertTrue(replay["current_movement_mask"].any())
             with np.load(checkpoint / "routing_replay.npz", allow_pickle=False) as replay:
@@ -246,12 +246,12 @@ class ControlledDQNTest(unittest.TestCase):
                 )
             return original_effective_mask(engine, env, uav_id, physical_mask)
 
-        def track_physical_mask(env, uav_id, cap_eps=0.1):
+        def track_physical_mask(env, uav_id):
             if active_slot[0] is not None:
                 physical_mask_calls[active_slot[0]] = (
                     physical_mask_calls.get(active_slot[0], 0) + 1
                 )
-            return original_physical_mask(env, uav_id, cap_eps)
+            return original_physical_mask(env, uav_id)
 
         config = TrainingConfig(
             total_episodes=1,
@@ -285,8 +285,10 @@ class ControlledDQNTest(unittest.TestCase):
                 scenario_manifest=manifest,
                 method_spec=MethodSpec.parse("td3_dinkelbach_dqn"),
             )
-        self.assertEqual(set(effective_mask_calls), {0.0, 0.25, 0.5, 0.75})
-        self.assertEqual(set(physical_mask_calls), {0.0, 0.25, 0.5, 0.75})
+        # Slot-zero COM packets are still at the SR; S2U arrivals become
+        # routing-eligible in the following slot.
+        self.assertEqual(set(effective_mask_calls), {0.25, 0.5, 0.75})
+        self.assertEqual(set(physical_mask_calls), {0.25, 0.5, 0.75})
         self.assertTrue(all(count > 0 for count in effective_mask_calls.values()))
         self.assertTrue(all(count > 0 for count in physical_mask_calls.values()))
 
@@ -442,10 +444,10 @@ class RandomMovementRoutingTest(unittest.TestCase):
         self.assertTrue(np.all(first >= -1.0))
         self.assertTrue(np.all(first <= 1.0))
 
-        env = Simulator(num_UAV=16)
+        env = Simulator(num_UAV=10)
         env.num_GT = 2
         env.reset_environment()
-        packet_engine = PacketEngine(num_uav=16, step_time=0.25)
+        packet_engine = PacketEngine(num_uav=10, step_time=0.25)
         state = get_global_movement_state(
             env, packet_engine, packet_engine.backlog_bits, 1.0, 1.0
         )

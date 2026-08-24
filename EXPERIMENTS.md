@@ -8,23 +8,25 @@ process. The registry keys are `td3_dinkelbach`, `ddpg_dinkelbach`,
 `td3_dinkelbach_dqn`, `kkm_random_action_random_routing`,
 `km_td3_dinkelbach`, `random_assignment_td3_dinkelbach`,
 `km_ddpg_dinkelbach`, `ddpg_dinkelbach_wo_ta`,
-`td3_dinkelbach_random_routing`, and `td3_dinkelbach_dqn_wo_ta`. All sixteen share
-16 UAVs, the common Simulator and synchronous projection/movement flow,
+`td3_dinkelbach_random_routing`, and `td3_dinkelbach_dqn_wo_ta`. All sixteen methods share
+10 UAVs, the common Simulator and synchronous movement flow,
 energy/delivery accounting, evaluation, and logging.
 
 The added baselines are orthogonal configurations of that shared flow. The
-`wo_ta` method keeps the 532-D/126-D layouts but zeros named task-assignment
+`wo_ta` method keeps the 429-D/90-D layouts but zeros named task-assignment
 observation fields. The controlled DQN method replaces safe-DDQN with a masked
 standard DQN. The combined random baseline uses K-KM, the common projected
 continuous movement domain, and uniform random routing over each slot's current
 effective mask. The assignment baselines use one KM round and one seeded
 shuffle-and-pair random round, respectively.
 
-All assignment solvers exclude Hovering. Below 0.99 coverage the candidates are
-FOV, COM, and Search; at or above 0.99 they are FOV and COM only. FOV and COM
-raw utilities are normalized separately with a global feasible-pair min/max per
-type (equal values map to 0.5), while Search utility is 0.05. A separate
-feasibility mask and zero-utility dummy choices prevent forced assignments;
+All assignment solvers exclude Search and Hovering. Below 0.99 coverage UAVs
+0 and 9 are reserved for Search, while the other UAVs solve only discovered FOV
+and COM service tasks; unassigned UAVs fall back to Search. At release, all 10
+UAVs are immediately reassigned and only unassigned UAVs Hover. FOV raw utility
+uses global feasible-pair min/max normalization (equal values map to 0.5), while
+COM uses capped demand satisfaction. A separate feasibility mask and
+explicit dummy choices keep rows unmatched when no service task is available;
 solver-only infinities never enter the domain utility matrix. K-KM uses at most
 two rounds, and FOV+COM is its only legal two-task combination, with current
 horizontal targets no more than 200 m apart.
@@ -185,7 +187,7 @@ uses the ordinary deterministic evaluation dataflow with no exploration or
 action perturbation and never updates learning or Dinkelbach state. Its atomic
 artifacts are `design_transitions.npz`, `design_dataset_metadata.json`, and a
 design-local `per_episode.csv`/`per_episode.jsonl`. The NPZ stores each complete
-532-D state, projected 48-D raw actor action, 532-D next state, terminal flags,
+429-D state, projected 30-D raw actor action, 429-D next state, terminal flags,
 delivery/energy and potential reward components, checkpoint lambda, and
 episode/step/scenario identity. Metadata records the authoritative state/action
 schema from `centralized_movement.py`; it deliberately does not select
@@ -207,7 +209,7 @@ old runtime output first.
 Train and evaluate commands complete a read-only preflight before creating the
 canonical run directory. The preflight validates the method, manifest
 schema/hash/split/count, requested episode count, formal configuration, COM
-calibration, canonical identity, and applicable checkpoint metadata. Evaluation
+demand-normalization metadata, canonical identity, and applicable checkpoint metadata. Evaluation
 checks the model-only checkpoint metadata before loading weights. A failed
 preflight creates no run directory, identity marker, history, or checkpoint and
 does not initialize the simulator.
@@ -252,23 +254,19 @@ python -X utf8 comparison_experiment.py aggregate --input-dir runs/comparison/ev
 
 Exact-resume checkpoints validate the method fingerprint, training-manifest
 hash, training seed, the complete Dinkelbach block state, and its configuration.
-Checkpoint schema v5 stores adaptive safe-DDQN constraint state and the shared
-FOV-EMA lifecycle state. Schema-v4 safe-DDQN checkpoints are explicitly rejected
-because they do not contain `lambda_cost`, `eta_c`, and the QoS budget; other
-older routing types remain subject to their existing type and formal-config
-compatibility validation. Checkpoint schema v3 stores the terminal direct-ratio
-objective in joint replay.
-Schema-v2 Dinkelbach TD3/DDPG checkpoints remain loadable; schema-v2 ratio
-checkpoints are explicitly rejected because their per-transition `B/E` values
-cannot be migrated without episode-boundary information. A partial Dinkelbach
-block is persisted exactly and resumes with
+Checkpoint schema v8 is the 10-UAV state/channel/packet contract. Every older
+schema is rejected before weights or replay state are restored and must be
+retrained; no 16-UAV checkpoint migration is attempted. The current schema
+stores the 429/30/90 dimensions, movement feature schema, direct-ratio bit/J
+objective, shared channel/packet contracts, adaptive routing lifecycle, and
+FOV-EMA state. A partial Dinkelbach block is persisted exactly and resumes with
 the same lambda, completed-episode count, numerator sum, denominator sum, block
 index, input-validity status, and successful-update count. An incomplete final
 block never triggers a forced update. Full-resume logging schema v1 separately
 persists `lambda_used_log` and `lambda_after_episode_log`; a legacy ambiguous
 single-lambda log is rejected for exact resume without changing model-only
 checkpoint compatibility. Formal evaluation validates model-only type, schema,
-532/48/126 dimensions, movement-agent/DDQN gamma, COM calibration, method/seed,
+429/30/90 dimensions, movement-agent/DDQN gamma, COM normalization, method/seed,
 the formal core configuration, and exactly 2,500 completed training episodes before
 loading weights. A distinct validation/test manifest is expected; output
 metadata records both training/evaluation manifest hashes and checkpoint
@@ -355,7 +353,7 @@ python -X utf8 run_paper_evaluation.py kkm_random_action_random_routing --suite 
 ```
 
 The trajectory manifest contains exactly the requested evaluation episode
-count (one by default). Its artifact records all 16 UAVs and paths, explicit
+count (one by default). Its artifact records all 10 UAVs and paths, explicit
 target UAV and phase, RoIs/detection, SR paths, GS, actual selected U2U/U2G
 links, sensing footprint geometry, requested/actual times, scenario identity,
 method configuration, checkpoint provenance, and Git SHA.
@@ -390,7 +388,7 @@ without the complete provenance triplet are intentionally rejected.
 
 Each sweep point writes per-episode data plus `aggregated_plot_data.csv/json`.
 Its metadata also persists the actual manifest path and canonical hash,
-scenario IDs, evaluation count/horizon/seed, 16-UAV count, and fully resolved
+scenario IDs, evaluation count/horizon/seed, 10-UAV count, and fully resolved
 traffic-rate/deadline/cutoff overrides. The deadline-violation (Fig. 6) sweep
 uses a scoped `57.0 s` packet-injection cutoff so its maximum `3.0 s` deadline
 can resolve within the 60-second horizon; other training and evaluation suites
@@ -466,7 +464,7 @@ screenshot references, visual contracts, and intentional changes.
 Each standalone trajectory JSON uses schema
 `uav-hrl-standalone-trajectory-v1` and contains the complete scene needed for
 an independent redraw: requested/actual time and phase, scenario/manifest and
-checkpoint provenance, Git SHA, GS and ground targets, all 16 UAV snapshots and
+checkpoint provenance, Git SHA, GS and ground targets, all 10 UAV snapshots and
 their assignments, every UAV path truncated at the selected actual time, SR
 snapshots and truncated paths, active links, sensing coverage, camera, axes,
 labels, and registry style. Its long-form CSV uses `record_type` values

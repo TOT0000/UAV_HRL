@@ -8,10 +8,10 @@ from Simulator import Simulator
 
 class ActiveLinkBandwidthTest(unittest.TestCase):
     def setUp(self):
-        self.env = Simulator(num_UAV=4)
-        self.env.PL_uu_cache = np.full((4, 4), 100.0, dtype=float)
+        self.env = Simulator(num_UAV=10)
+        self.env.PL_uu_cache = np.full((10, 10), 100.0, dtype=float)
         np.fill_diagonal(self.env.PL_uu_cache, 0.0)
-        self.env.PL_ug_cache = np.full(4, 105.0, dtype=float)
+        self.env.PL_ug_cache = np.full(10, 105.0, dtype=float)
 
     def test_two_active_u2u_links_each_receive_five_mhz(self):
         capacities, bandwidths = self.env.allocate_active_link_capacities(

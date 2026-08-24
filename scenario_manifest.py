@@ -11,11 +11,22 @@ from typing import Any, Iterable
 
 import numpy as np
 
-from experiment_config import NUM_UAV, ROI_COUNT_MAX, ROI_COUNT_MIN
+from experiment_config import (
+    NUM_UAV,
+    RESERVED_SEARCH_UAV_IDS,
+    ROI_COUNT_MAX,
+    ROI_COUNT_MIN,
+)
 
 
-SCENARIO_SCHEMA_VERSION = "uav-hrl-scenario-v2"
-OBSOLETE_SCHEMA_VERSION = "uav-hrl-scenario-v1"
+SCENARIO_SCHEMA_VERSION = "uav-hrl-scenario-v3"
+OBSOLETE_SCHEMA_VERSIONS = frozenset(
+    {"uav-hrl-scenario-v1", "uav-hrl-scenario-v2"}
+)
+# Singular compatibility name used by callers that construct an obsolete
+# manifest explicitly for fail-fast tests.
+OBSOLETE_SCHEMA_VERSION = "uav-hrl-scenario-v2"
+UAV_INITIAL_LAYOUT = "fixed-2x5-grid-v1"
 SUPPORTED_SPLITS = frozenset({"train", "validation", "test"})
 POLICY_DEPENDENT_KEYS = frozenset(
     {
@@ -58,6 +69,8 @@ def current_environment_config() -> dict[str, Any]:
         "bit_resolution_m": 2,
         "uav_energy_max_j": 10000.0,
         "active_link_bandwidth_hz": 10e6,
+        "uav_initial_layout": UAV_INITIAL_LAYOUT,
+        "reserved_search_uav_ids": list(RESERVED_SEARCH_UAV_IDS),
         "gt_radius_m": 80.0,
         "com_deadline_seconds": 1.0,
         "fov_deadline_seconds": 1.5,
@@ -123,8 +136,8 @@ def _split_seed(
 def _uav_initial_data(py_rng: random.Random) -> list[dict[str, Any]]:
     xy_positions = [
         (x, y)
-        for y in (100.0, 300.0, 500.0, 700.0)
-        for x in (100.0, 300.0, 500.0, 700.0)
+        for y in (250.0, 750.0)
+        for x in (100.0, 300.0, 500.0, 700.0, 900.0)
     ]
     return [
         {
@@ -232,7 +245,9 @@ def generate_scenario_entry(
         "exogenous_primitives": {
             "channel_randomness": "none",
             "gt_placement_model": "nonoverlap-away-from-gs-v1",
-            "uav_xy_layout": "fixed-4x4-grid-v1",
+            "uav_xy_layout": UAV_INITIAL_LAYOUT,
+            "num_uav": NUM_UAV,
+            "reserved_search_uav_ids": list(RESERVED_SEARCH_UAV_IDS),
         },
     }
     validate_scenario_entry(entry)
@@ -267,6 +282,13 @@ def validate_scenario_entry(entry: dict[str, Any]) -> None:
         )
     if len(entry["uavs"]) != NUM_UAV:
         raise ValueError(f"scenario must contain exactly {NUM_UAV} UAVs")
+    metadata = dict(entry["exogenous_primitives"])
+    if metadata.get("uav_xy_layout") != UAV_INITIAL_LAYOUT:
+        raise ValueError("scenario UAV initial layout is incompatible")
+    if int(metadata.get("num_uav", -1)) != NUM_UAV:
+        raise ValueError("scenario UAV count metadata is incompatible")
+    if tuple(metadata.get("reserved_search_uav_ids", ())) != RESERVED_SEARCH_UAV_IDS:
+        raise ValueError("scenario reserved Search UAV IDs are incompatible")
     if len(entry["sr_teams"]) != int(entry["num_GT"]):
         raise ValueError("scenario SR team count must equal num_GT")
 
@@ -311,9 +333,10 @@ class ScenarioManifest:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "ScenarioManifest":
-        if data.get("schema_version") == OBSOLETE_SCHEMA_VERSION:
+        if data.get("schema_version") in OBSOLETE_SCHEMA_VERSIONS:
             raise ValueError(
-                "scenario schema v1 is obsolete; regenerate the manifest with v2"
+                "legacy 16-UAV scenario schema is incompatible; regenerate the "
+                "manifest with the 10-UAV v3 generator"
             )
         if data.get("schema_version") != SCENARIO_SCHEMA_VERSION:
             raise ValueError(
@@ -398,6 +421,9 @@ def generate_manifest(
             "generator": "local-python-and-numpy-rng-v1",
             "numpy_bit_generator": "PCG64",
             "policy_dependent_outcomes_excluded": True,
+            "uav_initial_layout": UAV_INITIAL_LAYOUT,
+            "num_uav": NUM_UAV,
+            "reserved_search_uav_ids": list(RESERVED_SEARCH_UAV_IDS),
         },
         "config_fingerprint": environment_config_fingerprint(),
     }

@@ -11,7 +11,7 @@ from td3 import Actor, Critic, device
 
 
 class CentralizedDDPG:
-    """Single-critic DDPG with the same 532/48 architecture as centralized TD3."""
+    """Single-critic DDPG with the shared derived centralized architecture."""
 
     agent_kind = "ddpg"
 

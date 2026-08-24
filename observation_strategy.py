@@ -27,7 +27,7 @@ _MOVEMENT_TASK_SUFFIXES = {
 
 
 def routing_state_feature_names():
-    """Return the authoritative 126-D task-aware routing layout."""
+    """Return the authoritative derived task-aware routing layout."""
 
     names = [f"uav_id_one_hot[{index}]" for index in range(NUM_UAV)]
     names.extend(
@@ -38,7 +38,7 @@ def routing_state_feature_names():
             "assigned_task_fov",
             "assigned_task_com",
             "assigned_task_hovering",
-            "primary_task_fov",
+            "assigned_task_contains_fov",
             "assigned_source_uav",
         ]
     )
@@ -72,7 +72,9 @@ def routing_state_feature_names():
         ]
     )
     if len(names) != ROUTING_STATE_DIM:
-        raise AssertionError("routing feature layout does not cover 126 dimensions")
+        raise AssertionError(
+            f"routing feature layout does not cover {ROUTING_STATE_DIM} dimensions"
+        )
     return tuple(names)
 
 

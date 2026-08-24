@@ -45,11 +45,11 @@ class DesignSchemaTest(unittest.TestCase):
         continuous = set(state["continuous_indices"])
         discrete = set(state["discrete_indices"])
         self.assertFalse(continuous.intersection(discrete))
-        self.assertEqual(continuous | discrete, set(range(532)))
-        self.assertEqual([item["index"] for item in state["features"]], list(range(532)))
-        self.assertEqual(len(action["features"]), 48)
+        self.assertEqual(continuous | discrete, set(range(429)))
+        self.assertEqual([item["index"] for item in state["features"]], list(range(429)))
+        self.assertEqual(len(action["features"]), 30)
         self.assertEqual(
-            {item["index"] for item in action["features"]}, set(range(48))
+            {item["index"] for item in action["features"]}, set(range(30))
         )
         self.assertEqual(action["range"], [-1.0, 1.0])
 
@@ -73,7 +73,7 @@ class DesignDatasetIntegrationTest(unittest.TestCase):
             cls.dinkelbach_state.record_episode(1.0, 2.0)
 
         td3 = TD3(MOVEMENT_STATE_DIM, JOINT_ACTION_DIM, max_action=1.0, gamma=1.0)
-        ddqn = DDQN(126, 17)
+        ddqn = DDQN(90, 11)
         _, calibration = load_com_capacity_reference()
         cls.checkpoint = cls.root / "checkpoints" / "models" / "ep_2500"
         save_model_checkpoint(
@@ -81,9 +81,9 @@ class DesignDatasetIntegrationTest(unittest.TestCase):
             episode=2499,
             td3=td3,
             ddqn=ddqn,
-            movement_state_dim=532,
-            joint_action_dim=48,
-            routing_state_dim=126,
+            movement_state_dim=429,
+            joint_action_dim=30,
+            routing_state_dim=90,
             calibration=calibration,
             experiment_metadata={
                 "method_id": cls.method.method_id,
@@ -184,9 +184,9 @@ class DesignDatasetIntegrationTest(unittest.TestCase):
     def test_two_episodes_produce_120_ordered_joint_transitions(self):
         arrays = self.arrays_one
         self.assertEqual(set(arrays), set(ARRAY_NAMES))
-        self.assertEqual(arrays["state"].shape, (120, 532))
-        self.assertEqual(arrays["projected_joint_action"].shape, (120, 48))
-        self.assertEqual(arrays["next_state"].shape, (120, 532))
+        self.assertEqual(arrays["state"].shape, (120, 429))
+        self.assertEqual(arrays["projected_joint_action"].shape, (120, 30))
+        self.assertEqual(arrays["next_state"].shape, (120, 429))
         self.assertEqual(int(arrays["done"].sum()), 2)
         self.assertEqual(self.metadata_one["centralized_actor_calls"], 120)
         np.testing.assert_array_equal(arrays["global_transition_index"], np.arange(120))

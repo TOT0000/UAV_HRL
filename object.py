@@ -96,16 +96,6 @@ class UAV:
         raw_y = float(self.y_u) + dy_m
         raw_z = float(self.z_u) + dz_m
 
-        comm_safe = mobility_params.get("comm_safety", {}) if mobility_params else {}
-        apply_safe = bool(comm_safe.get("enable", False))
-        is_stationary = bool(
-            np.isclose(dx_m, 0.0) and np.isclose(dy_m, 0.0) and np.isclose(dz_m, 0.0)
-        )
-        if apply_safe and not is_stationary:
-            raw_x, raw_y, raw_z = self._project_to_comm_safe_region(
-                raw_x, raw_y, raw_z, mobility_params
-            )
-
         new_x = float(np.clip(raw_x, 0.0, float(env_width)))
         new_y = float(np.clip(raw_y, 0.0, float(env_height)))
         new_z = float(np.clip(raw_z, self.min_AGL, self.max_AGL))
@@ -192,22 +182,9 @@ class UAV:
         raw_y = self.y_u + dy_m
         raw_z = self.z_u + dz_m
 
-        comm_safe = mobility_params.get("comm_safety", {}) if mobility_params else {}
-        apply_safe = bool(comm_safe.get("enable", False))
-
-        if apply_safe:
-            # 原本的投影邏輯不變
-            proj_x, proj_y, proj_z = self._project_to_comm_safe_region(raw_x, raw_y, raw_z, mobility_params)
-        else:
-            proj_x, proj_y, proj_z = raw_x, raw_y, raw_z
-        # proj_x, proj_y = raw_x, raw_y  # 預設不投影
-
-
-        # 更新位置
-        self.x_u, self.y_u = proj_x, proj_y
-        self.z_u = proj_z
-
-        new_x, new_y, new_z = proj_x, proj_y, raw_z
+        new_x = float(np.clip(raw_x, 0.0, 1000.0))
+        new_y = float(np.clip(raw_y, 0.0, 1000.0))
+        new_z = float(np.clip(raw_z, self.min_AGL, self.max_AGL))
 
         terrain_uav_z = terrain_func(new_x, new_y) if terrain_func else 0.0
         self.min_AGL = terrain_uav_z + 50
@@ -216,8 +193,11 @@ class UAV:
         self.move_to(new_x, new_y, new_z)
 
         # 能耗用「實際位移 / step_time」計
-        v_h = np.hypot(dx_m, dy_m) / step_time
-        v_v = dz_m / step_time
+        actual_dx = float(self.x_u) - float(old_x)
+        actual_dy = float(self.y_u) - float(old_y)
+        actual_dz = float(self.z_u) - float(old_z)
+        v_h = np.hypot(actual_dx, actual_dy) / step_time
+        v_v = actual_dz / step_time
 
         if energy_model is not None:
             E_mob = energy_model.compute_mobility_energy(uav_idx=self.id, v_h=v_h, v_v=v_v, t=step_time)
@@ -237,81 +217,6 @@ class UAV:
     def is_on_task(self):
         return self.task_type is not None
     
-    def _project_to_comm_safe_region(self, x, y, z, mobility_params=None):
-
-        if mobility_params is None:
-            return x, y, z
-
-        cs = mobility_params.get("comm_safety", None)
-        if not cs or not cs.get("enable", False):
-            return x, y, z
-
-        mode = cs.get("mode", "gs_only")
-
-        def project_to_sphere(cx, cy, cz, r_soft, r_hard, px, py, pz):
-            vx, vy, vz = px - cx, py - cy, pz - cz
-            d = float(np.sqrt(vx**2 + vy**2 + vz**2))
-
-            if d < 1e-9:
-                return px, py, pz
-
-            # hard bound: 超過就直接投影到球面上
-            if d >= r_hard:
-                s = r_hard / d
-                return cx + vx * s, cy + vy * s, cz + vz * s
-
-            # soft band: 接近邊界就漸進縮放
-            if d > r_soft:
-                alpha = (d - r_soft) / max(r_hard - r_soft, 1e-9)
-                target = (1 - alpha) * d + alpha * r_soft
-                s = target / d
-                return cx + vx * s, cy + vy * s, cz + vz * s
-
-            return px, py, pz
-
-        def within(cx, cy, cz, r, px, py, pz):
-            return (px - cx) ** 2 + (py - cy) ** 2 + (pz - cz) ** 2 <= r ** 2
-
-        gs_pos = cs.get("gs_pos", (0.0, 0.0, 0.0))
-        r_soft = float(cs.get("r_soft", 180.0))
-        r_hard = float(cs.get("r_hard", 200.0))
-
-        # --- GS only：強制留在 GS 安全球內 ---
-        if mode == "gs_only":
-            return project_to_sphere(
-                gs_pos[0], gs_pos[1], gs_pos[2],
-                r_soft, r_hard,
-                x, y, z
-            )
-
-        # --- GS or Relay：只要能連 GS 或至少一個 relay 就 OK ---
-        relay_positions = cs.get("relay_positions", []) or []
-        rrs = float(cs.get("r_relay_soft", 360.0))
-        rrh = float(cs.get("r_relay_hard", 400.0))
-
-        # 先檢查是否已經在任何可行球內
-        if within(gs_pos[0], gs_pos[1], gs_pos[2], r_hard, x, y, z):
-            return x, y, z
-
-        for (rx, ry, rz) in relay_positions:
-            if within(rx, ry, rz, rrh, x, y, z):
-                return x, y, z
-
-        # 不滿足 -> 投影到最近的一個可行球（GS 或 relay）
-        px, py, pz = project_to_sphere(
-            gs_pos[0], gs_pos[1], gs_pos[2],
-            r_soft, r_hard,
-            x, y, z
-        )
-        best = (px, py, pz, (x - px) ** 2 + (y - py) ** 2 + (z - pz) ** 2)
-
-        for (rx, ry, rz) in relay_positions:
-            qx, qy, qz = project_to_sphere(rx, ry, rz, rrs, rrh, x, y, z)
-            cost = (x - qx) ** 2 + (y - qy) ** 2 + (z - qz) ** 2
-            if cost < best[3]:
-                best = (qx, qy, qz, cost)
-
-        return best[0], best[1], best[2]
     # ============將封包加入buffer=====================
     def add_packet_to_buffer(self, pkt, pkt_bits):
         current_bits = sum(p['bits'] for p in self.buffer)

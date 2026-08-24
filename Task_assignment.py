@@ -13,12 +13,12 @@ from centralized_movement import fov_task_metrics
 from experiment_config import (
     ASSIGNMENT_DUMMY_UTILITY,
     FOV_COM_PAIR_MAX_DISTANCE_M,
+    RESERVED_SEARCH_UAV_IDS,
     SEARCH_COVERAGE_THRESHOLD,
-    SEARCH_UTILITY,
 )
 
 
-ASSIGNMENT_TASK_TYPES = ("FOV", "COM", "Search")
+ASSIGNMENT_TASK_TYPES = ("FOV", "COM")
 
 
 @dataclass(frozen=True)
@@ -204,7 +204,6 @@ class UAVAssigner:
         mode="KM",
         strategy=None,
         max_distance_m=None,
-        search_utility=None,
         coverage_threshold=None,
     ):
         """Dispatch one centralized assignment strategy.
@@ -224,9 +223,6 @@ class UAVAssigner:
             if max_distance_m is None
             else max_distance_m
         )
-        search_utility = float(
-            SEARCH_UTILITY if search_utility is None else search_utility
-        )
         coverage_threshold = float(
             SEARCH_COVERAGE_THRESHOLD
             if coverage_threshold is None
@@ -244,23 +240,15 @@ class UAVAssigner:
             task_list,
             K=rounds,
             max_distance_m=max_distance_m,
-            search_utility=search_utility,
             coverage_threshold=coverage_threshold,
         )
 
     def _candidate_tasks(self, task_list, coverage_threshold):
-        search_active = (
-            not bool(getattr(self.env, "_search_phase_over", False))
-            and float(np.asarray(self.env.visited_bitmap, dtype=bool).mean())
-            < float(coverage_threshold)
-        )
         candidates = []
         for index, task in enumerate(task_list):
             if task.task_type == "Hovering":
                 continue
             if task.task_type not in ASSIGNMENT_TASK_TYPES:
-                continue
-            if task.task_type == "Search" and not search_active:
                 continue
             candidates.append((index, task))
         return candidates
@@ -270,7 +258,6 @@ class UAVAssigner:
         uav_ids,
         task_list,
         *,
-        search_utility=SEARCH_UTILITY,
         coverage_threshold=SEARCH_COVERAGE_THRESHOLD,
     ):
         candidates = self._candidate_tasks(task_list, coverage_threshold)
@@ -284,7 +271,6 @@ class UAVAssigner:
         raw_fov_image_quality = np.zeros(shape, dtype=float)
         fov_feasible = np.zeros(shape, dtype=bool)
         com_feasible = np.zeros(shape, dtype=bool)
-        search_feasible = np.zeros(shape, dtype=bool)
 
         for row, uav_id in enumerate(uav_ids):
             for column, task in enumerate(tasks):
@@ -306,22 +292,24 @@ class UAVAssigner:
                     sr = self.env.SR_teams[int(task.target_obj_id)]
                     if not bool(sr.active):
                         continue
-                    raw = self.env.get_sr_uav_capacity_mbps(
+                    capacity_bps = self.env.get_sr_uav_reference_capacity_mbps(
                         uav_id, int(task.target_obj_id)
+                    ) * 1e6
+                    required_bps = float(self.env.com_required_rate_bps)
+                    raw = (
+                        1.0
+                        if required_bps <= 0.0
+                        else min(max(float(capacity_bps), 0.0) / required_bps, 1.0)
                     )
-                    if math.isfinite(float(raw)):
-                        raw_com[row, column] = max(float(raw), 0.0)
+                    if math.isfinite(raw):
+                        raw_com[row, column] = raw
                         com_feasible[row, column] = True
-                elif task.task_type == "Search":
-                    search_feasible[row, column] = True
 
         normalized_fov = normalize_feasible_values(raw_fov, fov_feasible)
-        normalized_com = normalize_feasible_values(raw_com, com_feasible)
         utility = np.zeros(shape, dtype=float)
         utility[fov_feasible] = normalized_fov[fov_feasible]
-        utility[com_feasible] = normalized_com[com_feasible]
-        utility[search_feasible] = float(search_utility)
-        feasible = fov_feasible | com_feasible | search_feasible
+        utility[com_feasible] = raw_com[com_feasible]
+        feasible = fov_feasible | com_feasible
         if not np.isfinite(utility).all():
             raise AssertionError("production assignment utility contains NaN or Inf")
         return AssignmentProblem(
@@ -373,7 +361,6 @@ class UAVAssigner:
         K=2,
         *,
         max_distance_m=FOV_COM_PAIR_MAX_DISTANCE_M,
-        search_utility=SEARCH_UTILITY,
         coverage_threshold=SEARCH_COVERAGE_THRESHOLD,
     ):
         rounds = min(max(int(K), 0), 2)
@@ -381,7 +368,6 @@ class UAVAssigner:
         problem = self.build_problem(
             uav_list,
             task_list,
-            search_utility=search_utility,
             coverage_threshold=coverage_threshold,
         )
         available = set(problem.original_task_indices)
@@ -451,7 +437,8 @@ class UAVAssigner:
             < coverage_threshold
         )
         self.env.multi_tasks = {}
-        for uav_id, assigned in self.assignments.items():
+        for uav_id in range(self.env.num_UAV):
+            assigned = self.assignments.get(uav_id, [])
             uav = self.env.uav_dict[uav_id]
             entries = []
             for task_index, task_type, _ in assigned:
@@ -464,9 +451,6 @@ class UAVAssigner:
                     target = self.env.SR_teams[int(task.target_obj_id)]
                     position = target.get_position()
                     target_object_id = int(task.target_obj_id)
-                elif task_type == "Search":
-                    position = uav.get_position()
-                    target_object_id = int(uav_id)
                 else:
                     raise AssertionError(f"non-candidate task was assigned: {task_type}")
                 entries.append(
@@ -477,7 +461,21 @@ class UAVAssigner:
                         "target_pos": tuple(position),
                     }
                 )
-            if not entries:
+            if search_active and uav_id in tuple(
+                getattr(self.env, "reserved_search_uav_ids", RESERVED_SEARCH_UAV_IDS)
+            ):
+                if entries:
+                    raise AssertionError("reserved Search UAV entered service assignment")
+                entries.append(
+                    {
+                        "task_type": "Search",
+                        "target_id": None,
+                        "target_obj_id": int(uav_id),
+                        "target_pos": tuple(uav.get_position()),
+                        "reserved_search": True,
+                    }
+                )
+            elif not entries:
                 fallback_type = "Search" if search_active else "Hovering"
                 entries.append(
                     {
@@ -489,7 +487,19 @@ class UAVAssigner:
                     }
                 )
             self.env.multi_tasks[uav_id] = entries
-            primary = entries[0]
+            if not search_active and any(
+                entry["task_type"] == "Search" for entry in entries
+            ):
+                raise AssertionError("Search assignment created after coverage release")
+            primary = sorted(
+                entries,
+                key=lambda item: (
+                    {"FOV": 0, "COM": 1, "Search": 2, "Hovering": 3}[
+                        item["task_type"]
+                    ],
+                    -1 if item.get("target_obj_id") is None else item["target_obj_id"],
+                ),
+            )[0]
             uav.active_task_index = 0
             uav.task_type = primary["task_type"]
             uav.assigned_target_id = primary["target_id"]

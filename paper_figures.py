@@ -1165,6 +1165,7 @@ def render_standalone_trajectory_source(source):
     actual = float(source["actual_time_seconds"])
     target_uav_id = int(source["target_uav_id"])
     uavs = {int(item["uav_id"]): item for item in source["uavs"]}
+    sr_teams = {int(item["sr_id"]): item for item in source["sr_teams"]}
     target = uavs[target_uav_id]
     target_path = source["uav_paths"][str(target_uav_id)]
     axis.plot(
@@ -1259,13 +1260,19 @@ def render_standalone_trajectory_source(source):
             )
         )
     for link in source["active_links"]:
-        sender = uavs[int(link["sender_id"])]
-        receiver = (
-            ground_station
-            if int(link["receiver_id"]) == int(ground_station["gs_id"])
-            else uavs[int(link["receiver_id"])]
-        )
-        color = "red" if link["link_type"] == "U2U" else "purple"
+        link_type = str(link["link_type"])
+        if link_type == "S2U":
+            sender = sr_teams[int(link["sender_id"])]
+            receiver = uavs[int(link["receiver_id"])]
+            color = "#243BFF"
+        else:
+            sender = uavs[int(link["sender_id"])]
+            receiver = (
+                ground_station
+                if link_type == "U2G"
+                else uavs[int(link["receiver_id"])]
+            )
+            color = "red" if link_type == "U2U" else "purple"
         axis.plot(
             [sender["x"], receiver["x"]],
             [sender["y"], receiver["y"]],

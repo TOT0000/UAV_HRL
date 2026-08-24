@@ -44,8 +44,8 @@ class ScenarioManifestTest(unittest.TestCase):
 
     def test_same_entry_reproduces_exogenous_initial_state(self):
         entry = generate_manifest("test", 303, 1).episodes[0]
-        first = Simulator(num_UAV=16)
-        second = Simulator(num_UAV=16)
+        first = Simulator(num_UAV=10)
+        second = Simulator(num_UAV=10)
 
         first.apply_scenario_entry(entry)
         second.apply_scenario_entry(entry)
@@ -68,7 +68,7 @@ class ScenarioManifestTest(unittest.TestCase):
         entry = generate_manifest("test", 404, 1).episodes[0]
         trajectories = []
         for _ in range(2):
-            env = Simulator(num_UAV=16)
+            env = Simulator(num_UAV=10)
             env.apply_scenario_entry(entry)
             env.SR_team_gogo(env.gts[0])
             for _ in range(5):
@@ -152,7 +152,7 @@ class ScenarioManifestTest(unittest.TestCase):
             },
         )
         self.assertEqual({entry["num_GT"] for entry in manifest.episodes}, {4})
-        env = Simulator(num_UAV=16)
+        env = Simulator(num_UAV=10)
         env.apply_scenario_entry(manifest.episodes[0])
         self.assertEqual(env.num_GT, 4)
         self.assertEqual(len(env.gts), 4)
@@ -202,7 +202,7 @@ class ScenarioManifestTest(unittest.TestCase):
         data = generate_manifest("test", 912, 1).to_dict()
         data["schema_version"] = OBSOLETE_SCHEMA_VERSION
 
-        with self.assertRaisesRegex(ValueError, "v1 is obsolete"):
+        with self.assertRaisesRegex(ValueError, "16-UAV.*incompatible"):
             ScenarioManifest.from_dict(data)
 
 

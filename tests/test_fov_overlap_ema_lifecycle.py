@@ -28,7 +28,7 @@ class FovOverlapEmaLifecycleTest(unittest.TestCase):
         cls.scenario = generate_manifest("test", 7319, 1).episodes[0]
 
     def _environment(self):
-        env = Simulator(num_UAV=16)
+        env = Simulator(num_UAV=10)
         env.apply_scenario_entry(self.scenario)
         env._search_phase_over = False
         env.multi_tasks = {uav_id: [] for uav_id in range(env.num_UAV)}
@@ -79,7 +79,7 @@ class FovOverlapEmaLifecycleTest(unittest.TestCase):
 
     def test_production_order_preserves_disjoint_previous_footprint(self):
         env = self._environment()
-        engine = PacketEngine(num_uav=16)
+        engine = PacketEngine(num_uav=10)
         uav = env.uav_dict[0]
         previous = (0, 4, 0, 4)
         uav.last_box_idx = previous
@@ -137,7 +137,7 @@ class FovOverlapEmaLifecycleTest(unittest.TestCase):
 
         for label, env, previous, current, expected_sample in cases:
             with self.subTest(label=label):
-                engine = PacketEngine(num_uav=16)
+                engine = PacketEngine(num_uav=10)
                 transition = FovCoverageTransition(
                     uav_id=0,
                     previous_footprint=previous,
@@ -166,7 +166,7 @@ class FovOverlapEmaLifecycleTest(unittest.TestCase):
             "target_pos": [target.x, target.y, target.z],
         }
         before = fov_task_metrics(env, 0, task)
-        engine = PacketEngine(num_uav=16)
+        engine = PacketEngine(num_uav=10)
         transitions, updated = self._apply_production_transition(
             env, engine, "utility-invariance"
         )
@@ -180,7 +180,7 @@ class FovOverlapEmaLifecycleTest(unittest.TestCase):
 
     def test_getters_are_pure_and_masking_preserves_the_real_ema(self):
         env = self._environment()
-        engine = PacketEngine(num_uav=16)
+        engine = PacketEngine(num_uav=10)
         engine.update_fov_ema(env, "episode=0,map_reset")
         ema_indices = [
             routing_state_feature_names().index(name)
@@ -220,7 +220,7 @@ class FovOverlapEmaLifecycleTest(unittest.TestCase):
         env = self._environment()
         uav = env.uav_dict[0]
         uav.x_u, uav.y_u = 100.0, 100.0
-        engine = PacketEngine(num_uav=16)
+        engine = PacketEngine(num_uav=10)
         engine.update_fov_ema(env, "episode=0,map_reset")
 
         _, updated = self._apply_production_transition(env, engine, "transition=1")
@@ -282,7 +282,7 @@ class FovOverlapEmaLifecycleTest(unittest.TestCase):
         uav1 = env.uav_dict[1]
         uav0.x_u, uav0.y_u = 100.0, 100.0
         uav1.x_u, uav1.y_u = 800.0, 800.0
-        engine = PacketEngine(num_uav=16)
+        engine = PacketEngine(num_uav=10)
         engine.update_fov_ema(env, "episode=0,map_reset")
         uav1.x_u -= 20.0
         uav1_current = env.fov_footprint_indices(1)
@@ -310,7 +310,7 @@ class FovOverlapEmaLifecycleTest(unittest.TestCase):
         env = self._environment()
         uav = env.uav_dict[0]
         uav.x_u, uav.y_u = 300.0, 500.0
-        engine = PacketEngine(num_uav=16)
+        engine = PacketEngine(num_uav=10)
         engine.update_fov_ema(env, "episode=0,map_reset")
         footprint_a = env.fov_footprint_indices(0)
         width = footprint_a[1] - footprint_a[0] + 1
@@ -346,8 +346,8 @@ class FovOverlapEmaLifecycleTest(unittest.TestCase):
     def test_checkpoint_resume_matches_uninterrupted_next_transition(self):
         env_a = self._environment()
         env_b = self._environment()
-        engine_a = PacketEngine(num_uav=16)
-        engine_b = PacketEngine(num_uav=16)
+        engine_a = PacketEngine(num_uav=10)
+        engine_b = PacketEngine(num_uav=10)
         for env, engine in ((env_a, engine_a), (env_b, engine_b)):
             uav = env.uav_dict[0]
             uav.x_u, uav.y_u = 300.0, 500.0
@@ -371,7 +371,7 @@ class FovOverlapEmaLifecycleTest(unittest.TestCase):
         saved = engine_b.fov_ema_state()
         expected_previous = saved["previous_footprints"]["0"]
         env_b.uav_dict[0].last_box_idx = None
-        restored = PacketEngine(num_uav=16)
+        restored = PacketEngine(num_uav=10)
         restored.load_fov_ema_state(saved, env=env_b)
         self.assertEqual(
             list(env_b.uav_dict[0].last_box_idx), expected_previous
@@ -404,25 +404,25 @@ class FovOverlapEmaLifecycleTest(unittest.TestCase):
 
     def test_missing_checkpoint_previous_footprints_is_rejected(self):
         env = self._environment()
-        engine = PacketEngine(num_uav=16)
+        engine = PacketEngine(num_uav=10)
         engine.update_fov_ema(env, "episode=0,map_reset")
         incomplete = engine.fov_ema_state()
         del incomplete["previous_footprints"]
         with self.assertRaisesRegex(RuntimeError, "previous.*footprint"):
-            PacketEngine(num_uav=16).load_fov_ema_state(incomplete)
+            PacketEngine(num_uav=10).load_fov_ema_state(incomplete)
 
     def test_partial_checkpoint_previous_footprints_is_rejected(self):
         env = self._environment()
-        engine = PacketEngine(num_uav=16)
+        engine = PacketEngine(num_uav=10)
         engine.update_fov_ema(env, "episode=0,map_reset")
         incomplete = engine.fov_ema_state()
-        del incomplete["previous_footprints"]["15"]
+        del incomplete["previous_footprints"]["9"]
         with self.assertRaisesRegex(RuntimeError, "previous.*footprint"):
-            PacketEngine(num_uav=16).load_fov_ema_state(incomplete)
+            PacketEngine(num_uav=10).load_fov_ema_state(incomplete)
 
     def test_checkpoint_validation_rejects_malformed_lifecycle_states(self):
         env = self._environment()
-        engine = PacketEngine(num_uav=16)
+        engine = PacketEngine(num_uav=10)
         engine.update_fov_ema(env, "episode=0,map_reset")
         valid = engine.fov_ema_state()
         invalid_states = {}
@@ -449,10 +449,10 @@ class FovOverlapEmaLifecycleTest(unittest.TestCase):
         state["previous_footprints"][0] = state["previous_footprints"]["0"]
         invalid_states["duplicate normalized UAV ID"] = state
         state = copy.deepcopy(valid)
-        del state["values"]["15"]
+        del state["values"]["9"]
         invalid_states["partial EMA values"] = state
         state = copy.deepcopy(valid)
-        state["initialized_uav_ids"][-1] = 16
+        state["initialized_uav_ids"][-1] = 10
         invalid_states["out-of-range initialized UAV"] = state
         state = copy.deepcopy(valid)
         state["initialized_uav_ids"][-1] = 0
@@ -464,16 +464,16 @@ class FovOverlapEmaLifecycleTest(unittest.TestCase):
         for label, state in invalid_states.items():
             with self.subTest(label=label):
                 with self.assertRaises(RuntimeError):
-                    validate_fov_ema_state(state, num_uav=16)
+                    validate_fov_ema_state(state, num_uav=10)
                 with self.assertRaises(RuntimeError):
-                    PacketEngine(num_uav=16).load_fov_ema_state(state)
+                    PacketEngine(num_uav=10).load_fov_ema_state(state)
 
     def test_training_checkpoint_uses_the_same_strict_fov_validator(self):
         env = self._environment()
-        engine = PacketEngine(num_uav=16)
+        engine = PacketEngine(num_uav=10)
         engine.update_fov_ema(env, "episode=0,map_reset")
         partial = engine.fov_ema_state()
-        del partial["previous_footprints"]["15"]
+        del partial["previous_footprints"]["9"]
         training_state = {
             "full_resume_logging_schema_version": (
                 FULL_RESUME_LOGGING_SCHEMA_VERSION
@@ -506,8 +506,8 @@ class FovOverlapEmaLifecycleTest(unittest.TestCase):
             "footprint_transition_marker": None,
             "update_count": 0,
         }
-        validate_fov_ema_state(empty, num_uav=16)
-        engine = PacketEngine(num_uav=16)
+        validate_fov_ema_state(empty, num_uav=10)
+        engine = PacketEngine(num_uav=10)
         engine.load_fov_ema_state(empty)
         self.assertEqual(engine.fov_ema_state(), empty)
         completed_training_state = {
@@ -552,7 +552,7 @@ class FovOverlapEmaLifecycleTest(unittest.TestCase):
                 spec = MethodSpec.parse(method_id)
                 self.assertEqual((spec.routing, spec.task_observation), expected)
                 env = self._environment()
-                engine = PacketEngine(num_uav=16)
+                engine = PacketEngine(num_uav=10)
                 engine.update_fov_ema(env, "episode=0,map_reset")
                 physical = self._routing_state(env, engine)
                 observed = apply_observation_strategy(
@@ -561,7 +561,7 @@ class FovOverlapEmaLifecycleTest(unittest.TestCase):
                 np.testing.assert_array_equal(
                     observed[ema_indices], physical[ema_indices]
                 )
-                self.assertEqual(observed.shape, (126,))
+                self.assertEqual(observed.shape, (90,))
 
 
 if __name__ == "__main__":

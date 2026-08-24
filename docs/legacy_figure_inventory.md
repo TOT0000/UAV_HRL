@@ -80,13 +80,13 @@ machine-readable in `paper_figure_registry.py`.
   hashes from the existing payload.
 - Every point reloads its actual `scenario_manifest.json` through
   `ScenarioManifest.load()`, verifies the canonical hash, scenario IDs,
-  episode count, 60-second horizon, seeds, 16 UAV entries, fixed-RoI content,
+  episode count, 60-second horizon, seeds, 10 UAV entries, fixed-RoI content,
   and resolved arrival/deadline overrides.
 - Deprecated `fig*` names exist only as internal compatibility aliases. CLI
   choices, metadata, directories, and filenames use semantic names. Family
   aliases expand to standalone outputs and never render a composite.
 - Each trajectory source JSON is a self-contained
-  `uav-hrl-standalone-trajectory-v1` scene: all 16 UAV snapshots, assignments
+  `uav-hrl-standalone-trajectory-v1` scene: all 10 UAV snapshots, assignments
   and time-truncated paths; every SR snapshot/path; GS, targets, links,
   coverage geometry; actual time/phase; complete provenance; and the camera,
   axes, labels, and style contract. The companion long-form CSV distinguishes

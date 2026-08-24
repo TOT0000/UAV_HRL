@@ -2,7 +2,20 @@ import numpy as np
 import random
 import math
 from dataclasses import dataclass
-from Channel_model import ChannelModel
+from Channel_model import (
+    A2G_CARRIER_GHZ,
+    A2G_LOS_A,
+    A2G_LOS_B,
+    A2G_LOS_EXCESS_DB,
+    A2G_NLOS_EXCESS_DB,
+    NOISE_PSD_DBM_PER_HZ,
+    S2U_TX_POWER_DBM,
+    U2U_U2G_TX_POWER_DBM,
+    a2g_capacity_mbps,
+    a2g_path_loss_db,
+    shannon_capacity_mbps,
+    u2u_path_loss_db,
+)
 from Fov_model_phase import FovModel
 from collections import defaultdict
 from Energy_model import EnergyConsumptionModel
@@ -10,11 +23,15 @@ from Task_assignment import UAVAssigner, Task
 from object import UAV, SRTeam, GroundTarget
 from experiment_config import (
     FOV_COM_PAIR_MAX_DISTANCE_M,
+    COM_REQUIRED_RATE_BPS,
+    NUM_UAV,
+    REFERENCE_COM_BANDWIDTH_HZ,
+    RESERVED_SEARCH_UAV_IDS,
     ROI_COUNT_MAX,
     ROI_COUNT_MIN,
     SR_ROUTE_LIFECYCLE_VERSION,
     SEARCH_COVERAGE_THRESHOLD,
-    SEARCH_UTILITY,
+    TOTAL_COMMUNICATION_BANDWIDTH_HZ,
 )
 
 
@@ -29,19 +46,23 @@ class FovCoverageTransition:
 
 
 class Simulator:
-    SR_UAV_CARRIER_GHZ = 2.0
-    SR_UAV_BANDWIDTH_HZ = 2e6
-    SR_UAV_TX_POWER_DBM = 23.0
-    SR_UAV_NOISE_DBM_PER_HZ = -169.0
-    SR_UAV_MAX_RANGE_M = 200.0
-    SR_UAV_LOS_EXCESS_DB = 2.0
-    SR_UAV_NLOS_EXCESS_DB = 2.4
+    SR_UAV_CARRIER_GHZ = A2G_CARRIER_GHZ
+    SR_UAV_TX_POWER_DBM = S2U_TX_POWER_DBM
+    SR_UAV_NOISE_DBM_PER_HZ = NOISE_PSD_DBM_PER_HZ
+    A2G_LOS_A = A2G_LOS_A
+    A2G_LOS_B = A2G_LOS_B
+    SR_UAV_LOS_EXCESS_DB = A2G_LOS_EXCESS_DB
+    SR_UAV_NLOS_EXCESS_DB = A2G_NLOS_EXCESS_DB
 
     def __init__(self, num_UAV, p_u = 30): #初始化
         self.dt = 0.25
         self.sr_update_interval = int(1.0 / self.dt)
         self.sim_step_count = 0
-        self.B_tot = 10e6
+        if int(num_UAV) != NUM_UAV:
+            raise ValueError(
+                f"canonical Simulator requires exactly {NUM_UAV} UAVs, got {num_UAV}"
+            )
+        self.B_tot = TOTAL_COMMUNICATION_BANDWIDTH_HZ
         self.E_max = 10000
         self.num_UAV = num_UAV
         self.p_u = np.full(num_UAV, p_u)
@@ -55,6 +76,8 @@ class Simulator:
         self.u2g_nominal_capacity = self.gs_capacity.copy()
         self.active_link_capacities = {}
         self.active_link_bandwidths = {}
+        self.active_s2u_capacities = {}
+        self.active_link_diagnostics = []
         self.GS_pos = (0, 0, 0)
         self.GS_ID = self.num_UAV
         self.num_GT = None
@@ -93,20 +116,15 @@ class Simulator:
         # expensive geometry/path-loss recomputation per hop.
         self.PL_uu_cache = np.zeros((self.num_UAV, self.num_UAV), dtype=float)
         self.PL_ug_cache = np.zeros(self.num_UAV, dtype=float)
-        self.mobility_params = {
-            "comm_safety": {
-                "enable": True,
-                "mode": "gs_only",
-                "gs_pos": (0.0, 0.0, 0.0),
-                "r_soft": 180.0,
-                "r_hard": 200.0,
-            }
-            }
+        self.mobility_params = {}
         self.assignment_strategy = "k_km"
         self.assignment_rounds = 2
         self.fov_com_pair_max_distance_m = FOV_COM_PAIR_MAX_DISTANCE_M
-        self.assignment_search_utility = SEARCH_UTILITY
         self.search_coverage_threshold = SEARCH_COVERAGE_THRESHOLD
+        self.reserved_search_uav_ids = RESERVED_SEARCH_UAV_IDS
+        self.com_required_rate_bps = COM_REQUIRED_RATE_BPS
+        self.search_release_time = None
+        self.search_release_coverage = None
         self.assignment_invocations = 0
         self.search_to_hover_conversions = 0
 
@@ -116,7 +134,6 @@ class Simulator:
         self.assignment_strategy = str(method_spec.assignment)
         self.assignment_rounds = int(method_spec.assignment_rounds)
         self.fov_com_pair_max_distance_m = FOV_COM_PAIR_MAX_DISTANCE_M
-        self.assignment_search_utility = SEARCH_UTILITY
         self.search_coverage_threshold = SEARCH_COVERAGE_THRESHOLD
 
     def add_uav_path(self, uav_id, path): # 記錄 UAV 路徑
@@ -134,7 +151,12 @@ class Simulator:
 
     # ==================任務分配===========================
     def assign_tasks(self):
-        uav_id_list = self.get_available_uav_ids() #建立左邊的頂點
+        coverage = float(np.asarray(self.visited_bitmap, dtype=bool).mean())
+        search_active = not self._search_phase_over and coverage < self.search_coverage_threshold
+        reserved = set(self.reserved_search_uav_ids) if search_active else set()
+        uav_id_list = [
+            uav_id for uav_id in self.get_available_uav_ids() if uav_id not in reserved
+        ]
         assigner = UAVAssigner(self)
         assigner.assign_tasks(
             uav_id_list,
@@ -142,13 +164,13 @@ class Simulator:
             K=self.assignment_rounds,
             strategy=self.assignment_strategy,
             max_distance_m=self.fov_com_pair_max_distance_m,
-            search_utility=self.assignment_search_utility,
             coverage_threshold=self.search_coverage_threshold,
         )
         assigner.build_uav_tasks_from_assignment()# 分配結果改成任務列表
     # ====================更新探索區域=====================
         self.assignment_invocations += 1
         self.last_assignment = assigner
+        self.last_assignment_metadata = self.assignment_metadata()
 
     def update_visited_grid(self, uav_id):
         """
@@ -171,19 +193,6 @@ class Simulator:
                     gt.rewarded = True
                     uav.explore_reward_bonus = getattr(uav, "explore_reward_bonus", 0) + 10.0
 
-                # #  K-KM方法: 移除 task_list 中最早的 Search 任務（任選一個）
-            #     for i, t in enumerate(self.task_list):
-            #         if t.task_type == "Search":
-            #             del self.task_list[i]
-            #             break
-                #  KM方法: 移除 task_list 中最早的兩個 Search 任務
-                removed = 0
-                for i, t in enumerate(list(self.task_list)):
-                    if t.task_type == "Search":
-                        del self.task_list[i]
-                        removed += 1
-                        if removed >= 1:
-                            break
                 # 新增 FOV 與 COM 任務
                 self.task_list.append(Task(
                                     task_id = len(self.task_list),
@@ -325,34 +334,35 @@ class Simulator:
         self._search_phase_over = True
         self.search_completed = True
         self.search_to_hover_conversions += 1
-        for task in self.task_list:
-            if task.task_type == "Search":
-                task.task_type = "Hovering"
-                uav = self.uav_dict[int(task.target_obj_id)]
-                task.target_obj = uav
-                task.target_obj_id = uav.id
-        for uav_id in range(self.num_UAV):
-            uav = self.uav_dict[uav_id]
-            retained = [
-                dict(task)
-                for task in self.multi_tasks.get(uav_id, [])
-                if task["task_type"] in {"FOV", "COM"}
-            ]
-            if not retained:
-                retained = [
-                    {
-                        "task_type": "Hovering",
-                        "target_id": None,
-                        "target_obj_id": uav_id,
-                        "target_pos": uav.get_position(),
-                        "phase_fallback": True,
-                    }
-                ]
-            self.multi_tasks[uav_id] = retained
-            uav.active_task_index = 0
-            uav.task_type = retained[0]["task_type"]
-            uav.assigned_target_id = retained[0]["target_id"]
-            uav.target_position = retained[0]["target_pos"]
+        self.search_release_time = float(getattr(self, "current_time", 0.0))
+        self.search_release_coverage = float(self.visited_bitmap.mean())
+        self.task_list = [task for task in self.task_list if task.task_type != "Search"]
+        self.assign_tasks()
+        if any(
+            task["task_type"] == "Search"
+            for entries in self.multi_tasks.values()
+            for task in entries
+        ):
+            raise AssertionError("Search assignment survived the 99% release event")
+
+    def assignment_metadata(self):
+        return {
+            "strategy": self.assignment_strategy,
+            "invocation": int(self.assignment_invocations),
+            "reserved_search_uav_ids": list(self.reserved_search_uav_ids),
+            "search_release_time_seconds": self.search_release_time,
+            "search_release_coverage": self.search_release_coverage,
+            "assignments": {
+                str(uav_id): sorted(
+                    [dict(task) for task in self.multi_tasks.get(uav_id, [])],
+                    key=lambda task: (
+                        task["task_type"],
+                        -1 if task.get("target_obj_id") is None else task["target_obj_id"],
+                    ),
+                )
+                for uav_id in range(self.num_UAV)
+            },
+        }
 
     def convert_search_to_hovering(self):
         """Apply the guarded Search-to-Hover phase conversion exactly once."""
@@ -472,53 +482,26 @@ class Simulator:
         return unexplored / total if total > 0 else 0.0
 
     #=====================通訊如何======================== 
-    def _get_sr_uav_link_metrics(self, uav_id, sr_id):
-        uav = self.uav_dict[uav_id]
-        sr = self.SR_teams[sr_id]
+    def _get_sr_uav_link_metrics(self, uav_id, sr_id, bandwidth_hz=None):
+        """Return canonical S2U SNR/capacity without an arbitrary range cutoff."""
 
-        # 位置
-        uav_pos = np.array([uav.x_u, uav.y_u, uav.z_u])
-        sr_pos = np.array([sr.x, sr.y, sr.z])
-        vec = uav_pos - sr_pos
-        d_3d = float(np.linalg.norm(vec))
-        
-        # 距離與高度
-        d_safe = max(d_3d, 1e-3)
-        H_u = float(abs(vec[2]))                      # 垂直距離（基本上就是 UAV 高度）
-
-        # 通訊半徑：超出半徑時 SNR 與容量皆為零。
-        if d_safe > self.SR_UAV_MAX_RANGE_M:
-            return 0.0, 0.0
-
-        # 仰角
-        ratio = np.clip(H_u / d_safe, -1.0, 1.0)
-        elevation_angle = np.degrees(np.arcsin(ratio))
-
-        # LoS 機率
-        LoS_prob = 1.0 / (1.0 + 4.88 * np.exp(-0.429 * (elevation_angle - 4.88)))
-
-        # ===== Path Loss（向量化） =====
-        FSPL = ChannelModel.PL_ug(d_safe, self.SR_UAV_CARRIER_GHZ)
-
-        expected_pl = (
-            FSPL
-            + LoS_prob * self.SR_UAV_LOS_EXCESS_DB
-            + (1 - LoS_prob) * self.SR_UAV_NLOS_EXCESS_DB
+        bandwidth_hz = float(
+            REFERENCE_COM_BANDWIDTH_HZ if bandwidth_hz is None else bandwidth_hz
         )
-
-        # ===== SNR + Capacity =====
-        snr_us = float(
-            ChannelModel.SNR_ug(
-                self.SR_UAV_TX_POWER_DBM,
-                self.SR_UAV_NOISE_DBM_PER_HZ,
-                expected_pl,
-                self.SR_UAV_BANDWIDTH_HZ,
+        uav_position = self.uav_dict[int(uav_id)].get_position()
+        sr_position = self.SR_teams[int(sr_id)].get_position()
+        path_loss = float(a2g_path_loss_db(uav_position, sr_position))
+        capacity_mbps = float(
+            a2g_capacity_mbps(
+                uav_position,
+                sr_position,
+                bandwidth_hz,
+                S2U_TX_POWER_DBM,
             )
         )
-        capacity_mbps = float(
-            ChannelModel.C_ug(self.SR_UAV_BANDWIDTH_HZ, snr_us)
-        )
-        return snr_us, capacity_mbps
+        noise_dbm = NOISE_PSD_DBM_PER_HZ + 10.0 * math.log10(bandwidth_hz)
+        snr = 10.0 ** ((S2U_TX_POWER_DBM - path_loss - noise_dbm) / 10.0)
+        return float(snr), capacity_mbps
 
     def get_snr(self, uav_id, sr_id):
         """Return the SR-UAV link SNR as a linear ratio."""
@@ -527,176 +510,132 @@ class Simulator:
         return snr_us
 
     def get_sr_uav_capacity_mbps(self, uav_id, sr_id):
-        """Return the canonical SR-UAV link capacity in Mbps."""
+        """Return reference-bandwidth S2U capacity for decision features."""
 
         _, capacity_mbps = self._get_sr_uav_link_metrics(uav_id, sr_id)
         return capacity_mbps
 
+    get_sr_uav_reference_capacity_mbps = get_sr_uav_capacity_mbps
+
     # =====================U2U channel model================================
     def update_u2u_channels(self):
-        P_u = 30
-        sigma_sq = -169  # 噪聲功率 (dBm/Hz)
-        self.B_tot = 10e6       # 頻寬 10 MHz
-        f_c = 2.4        # GHz
-        d_a2a = 400.0
-        cap_eps_mbps = 0.1  # 可行的鏈路
-        # =====  收集所有 UAV 的 (x, y, z) 位置 =====
-        pos = np.array([[u.x_u, u.y_u, u.z_u] for u in self.UAVs])  # shape (N, 3)
-        N = pos.shape[0]
-
-        # =====  批次計算所有配對間距 =====
-        diff = pos[:, np.newaxis, :] - pos[np.newaxis, :, :]  # (N, N, 3)
-        d_3D = np.linalg.norm(diff, axis=2)                   # (N, N)
-        dx = diff[:, :, 0]
-        dy = diff[:, :, 1]
-        dz = diff[:, :, 2]
-        d_2D = np.sqrt(dx*dx + dy*dy)          # (N, N) 水平距離
-        d_3D = np.sqrt(dx*dx + dy*dy + dz*dz)  # (N, N) 3D 距離
-        # A2A 通訊半徑遮罩
-        in_range = d_2D<= d_a2a         
-
-        d_safe = np.maximum(d_3D, 1e-3)
-        H_u = np.abs(diff[:, :, 2])                           # 垂直距離 (N, N)
-
-        # 避免對角線為 0 導致除以零
-        np.fill_diagonal(d_safe, 1e6)
-        np.fill_diagonal(H_u, 0)
-
-
-        # =====  批次計算路徑損耗 / SNR / 通道容量 =====
-        PL = ChannelModel.PL_uu(H_u, d_safe, f_c)
-        SNR = ChannelModel.SNR_uu(P_u, sigma_sq, PL, self.B_tot)
-        capacity = ChannelModel.C_uu(self.B_tot, SNR)
-
-        try:
-            self.PL_uu_cache = np.array(PL, dtype=float)
-            np.fill_diagonal(self.PL_uu_cache, 0.0)
-        except Exception:
-            # If PL is not array-like for any reason, skip caching.
-            pass
-
-        # =====  對角線容量設為 0，自身不通訊 =====
-        np.fill_diagonal(capacity, 0.0)
-
-        # 半徑外的 link 容量設為 0
-        capacity[~in_range] = 0.0
-
-        # ========計算可行的連接================
-        feasible = (capacity > cap_eps_mbps)
-        # 不算自己
+        positions = np.asarray([uav.get_position() for uav in self.UAVs], dtype=float)
+        count = len(positions)
+        path_loss = np.zeros((count, count), dtype=float)
+        capacity = np.zeros((count, count), dtype=float)
+        for sender in range(count):
+            for receiver in range(count):
+                if sender == receiver:
+                    continue
+                path_loss[sender, receiver] = float(
+                    u2u_path_loss_db(positions[sender], positions[receiver])
+                )
+                capacity[sender, receiver] = float(
+                    shannon_capacity_mbps(
+                        path_loss[sender, receiver],
+                        self.B_tot,
+                        U2U_U2G_TX_POWER_DBM,
+                    )
+                )
+        self.PL_uu_cache = path_loss
+        feasible = np.isfinite(capacity) & (capacity > 0.0)
         np.fill_diagonal(feasible, False)
-        # 每台 UAV 的可行鄰居數 k_u(t)
-        k_u = feasible.sum(axis=1)  
-        self.k_u_u2u = k_u 
-        # 平均可行鄰居數 k_bar(t)
-        k_bar = float(k_u.mean())
-        # 存到 env
-        self.k_bar_u2u = k_bar
-        # Candidate actions use nominal full-pool quality. Actual slot capacity
-        # is computed only after all proposed links are known.
-        self.B_eff_u2u = np.full(N, self.B_tot, dtype=float)
-        self.u2u_nominal_capacity = np.array(capacity, dtype=float)
-        self.Capacity_matrix = self.u2u_nominal_capacity.copy()
+        self.k_u_u2u = feasible.sum(axis=1)
+        self.k_bar_u2u = float(self.k_u_u2u.mean())
+        self.B_eff_u2u = np.full(count, self.B_tot, dtype=float)
+        self.u2u_nominal_capacity = capacity
+        self.Capacity_matrix = capacity.copy()
 
     # ==========================U2G channel model============================
     # 無人機與地面站
     def update_u2g_channels(self):
-        P_u = 30
-        sigma_sq = -169  # dBm/Hz
-        B_ug = 10e6
-        f_c = 2
-        d_A2G = 200.0 
-        eta_LoS = 2
-        eta_NLoS = 2.4
-
-        # UAV positions (N, 3)
-        pos = np.array([[u.x_u, u.y_u, u.z_u] for u in self.UAVs])
-        gs_pos = np.array([self.x, self.y, self.z])
-
-        # ===== 計算距離 =====
-        diff = pos - gs_pos                 # (N, 3)
-
-        # 3D 距離
-        d_3D = np.linalg.norm(diff, axis=1)
-        d_safe = np.maximum(d_3D, 1e-3)
-
-        # 水平距離
-        # d_2D = np.linalg.norm(diff[:, :2], axis=1)  # (N,)
-        # 高度（仍可用於仰角、LoS 機率）
-        H_u = np.abs(diff[:, 2])
-
-        # 用3D距離判斷是否可通訊
-        in_range = d_3D <= d_A2G
-
-        # 仰角
-        elevation_angle = np.degrees(
-            np.arcsin(np.clip(H_u / d_safe, -1.0, 1.0))
+        positions = np.asarray([uav.get_position() for uav in self.UAVs], dtype=float)
+        gs_position = np.asarray(self.GS_pos, dtype=float)
+        self.Expected_PL = np.asarray(
+            [a2g_path_loss_db(position, gs_position) for position in positions],
+            dtype=float,
         )
-
-        # ===== LoS 機率（向量化） =====
-        LoS_prob = 1.0 / (1.0 + 4.88 * np.exp(-0.429 * (elevation_angle - 4.88)))
-
-        # ===== Path Loss（向量化） =====
-        FSPL = ChannelModel.PL_ug(d_safe, f_c)
-
-        self.Expected_PL = FSPL + LoS_prob * eta_LoS + (1-LoS_prob) * eta_NLoS
-        self.PL_ug_cache = np.array(self.Expected_PL, dtype=float)
-
-        # ===== SNR + Capacity =====
-        SNR_ug = ChannelModel.SNR_ug(P_u, sigma_sq, self.Expected_PL,  B_ug)
-        C_mix = ChannelModel.C_ug(B_ug, SNR_ug)
-
-        # 半徑外的 UAV 容量設為 0
-        C_mix[~in_range] = 0.0
-
-        self.u2g_nominal_capacity = np.array(C_mix, dtype=float)
+        self.PL_ug_cache = self.Expected_PL.copy()
+        self.u2g_nominal_capacity = np.asarray(
+            [
+                shannon_capacity_mbps(
+                    loss, self.B_tot, U2U_U2G_TX_POWER_DBM
+                )
+                for loss in self.Expected_PL
+            ],
+            dtype=float,
+        )
         self.gs_capacity = self.u2g_nominal_capacity.copy()
-        # print(self.gs_capacity)
 
-    def allocate_active_link_capacities(self, proposed_links):
-        """Allocate independent 10 MHz pools across actual U2U/U2G links."""
+    def allocate_active_link_capacities(self, proposed_links, s2u_links=None):
+        """Equal-FDMA allocation over one shared S2U/U2U/U2G 10 MHz pool."""
 
         active_links = [
             (int(sender), int(receiver))
             for sender, receiver in sorted(proposed_links.items())
             if int(receiver) != int(sender)
         ]
-        u2u_links = [link for link in active_links if link[1] < self.num_UAV]
-        u2g_links = [link for link in active_links if link[1] == self.GS_ID]
-        u2u_bandwidth = self.B_tot / len(u2u_links) if u2u_links else 0.0
-        u2g_bandwidth = self.B_tot / len(u2g_links) if u2g_links else 0.0
+        s2u_links = {
+            int(sr_id): int(uav_id)
+            for sr_id, uav_id in dict(s2u_links or {}).items()
+        }
+        total_links = len(active_links) + len(s2u_links)
+        shared_bandwidth = self.B_tot / total_links if total_links else 0.0
 
         capacities = {}
         bandwidths = {}
-        for sender, receiver in u2u_links:
-            bandwidths[(sender, receiver)] = float(u2u_bandwidth)
-            snr = ChannelModel.SNR_uu(
-                float(self.p_u[sender]),
-                -169.0,
-                float(self.PL_uu_cache[sender, receiver]),
-                u2u_bandwidth,
+        diagnostics = []
+        for sender, receiver in active_links:
+            link_type = "U2G" if receiver == self.GS_ID else "U2U"
+            path_loss = (
+                float(self.PL_ug_cache[sender])
+                if link_type == "U2G"
+                else float(self.PL_uu_cache[sender, receiver])
             )
+            bandwidths[(sender, receiver)] = float(shared_bandwidth)
             capacities[(sender, receiver)] = float(
-                ChannelModel.C_uu(u2u_bandwidth, snr)
+                shannon_capacity_mbps(
+                    path_loss, shared_bandwidth, U2U_U2G_TX_POWER_DBM
+                )
             )
-        for sender, receiver in u2g_links:
-            bandwidths[(sender, receiver)] = float(u2g_bandwidth)
-            snr = ChannelModel.SNR_ug(
-                float(self.p_u[sender]),
-                -169.0,
-                float(self.PL_ug_cache[sender]),
-                u2g_bandwidth,
+            diagnostics.append(
+                {
+                    "link_type": link_type,
+                    "sender_id": sender,
+                    "receiver_id": receiver,
+                    "bandwidth_hz": float(shared_bandwidth),
+                    "capacity_mbps": capacities[(sender, receiver)],
+                }
             )
-            capacities[(sender, receiver)] = float(
-                ChannelModel.C_ug(u2g_bandwidth, snr)
+        s2u_capacities = {}
+        for sr_id, uav_id in sorted(s2u_links.items()):
+            _, capacity = self._get_sr_uav_link_metrics(
+                uav_id, sr_id, bandwidth_hz=shared_bandwidth
             )
+            key = ("S2U", sr_id, uav_id)
+            bandwidths[key] = float(shared_bandwidth)
+            s2u_capacities[(sr_id, uav_id)] = float(capacity)
+            diagnostics.append(
+                {
+                    "link_type": "S2U",
+                    "sender_id": sr_id,
+                    "receiver_id": uav_id,
+                    "bandwidth_hz": float(shared_bandwidth),
+                    "capacity_mbps": float(capacity),
+                }
+            )
+
+        if sum(bandwidths.values()) > self.B_tot + 1e-6:
+            raise AssertionError("active link bandwidth exceeds the shared 10 MHz pool")
 
         self.active_link_capacities = capacities
         self.active_link_bandwidths = bandwidths
+        self.active_s2u_capacities = s2u_capacities
+        self.active_link_diagnostics = diagnostics
         return capacities, bandwidths
 
     #===========回傳不可選擇的節點======================== 
-    def get_routing_action_mask(self, from_uav_id, cap_eps=0.1):
+    def get_routing_action_mask(self, from_uav_id):
 
         num_uav = self.num_UAV
         num_actions = num_uav + 1
@@ -710,13 +649,13 @@ class Simulator:
                 if to_id == from_uav_id:
                     continue
                 cap = float(self.Capacity_matrix[from_uav_id, to_id])
-                if cap > cap_eps:
+                if np.isfinite(cap) and cap > 0.0:
                     mask[to_id] = 1.0
 
         # UAV → GS
         if self.gs_capacity is not None:
             cap_gs = float(self.gs_capacity[from_uav_id])
-            if cap_gs > cap_eps:
+            if np.isfinite(cap_gs) and cap_gs > 0.0:
                 mask[num_uav] = 1.0
 
         return mask
@@ -729,7 +668,9 @@ class Simulator:
             uav_id = uav.id
             task_list = self.multi_tasks.get(uav_id, [])
             for task in task_list:
-                if task["task_type"] in ["FOV", "COM"]:
+                # FOV data originates at the UAV. COM data originates at its SR
+                # and enters a UAV queue only after a complete S2U upload.
+                if task["task_type"] == "FOV":
                     self.source_uavs.add(uav_id)
                     break  # 一旦有一個符合就可以加入，跳出這台 UAV 的任務迴圈
         # print(f"[DEBUG] Source UAVs: {sorted(self.source_uavs)}")
@@ -1137,6 +1078,8 @@ class Simulator:
         self.need_reassign = True   
         self.assignment_invocations = 0
         self.search_to_hover_conversions = 0
+        self.search_release_time = None
+        self.search_release_coverage = None
         self.UAVs.clear()
         self.current_time = 0
         self.uav_tasks = {}
@@ -1167,8 +1110,8 @@ class Simulator:
                 }
                 for index, (x_u, y_u) in enumerate(
                     (x, y)
-                    for y in (100, 300, 500, 700)
-                    for x in (100, 300, 500, 700)
+                    for y in (250, 750)
+                    for x in (100, 300, 500, 700, 900)
                 )
             ]
         else:
@@ -1287,15 +1230,8 @@ class Simulator:
             uav.task_type = None
             uav.assigned_target_id = None
         
+        # Search is orchestration fallback, not a solver candidate or utility.
         self.task_list = []
-        for uav in self.UAVs:
-            task = Task(
-                task_id=len(self.task_list),
-                task_type="Search",
-                target_obj=uav,
-                target_obj_id = uav.id
-            )
-            self.task_list.append(task)
         self.assign_tasks()
 
     def generate_scenario_entry(self, split, manifest_seed, episode_index):
@@ -1308,9 +1244,9 @@ class Simulator:
     def apply_scenario_entry(self, scenario_entry):
         """Reset the corrected environment from one manifest episode entry."""
 
-        if self.num_UAV != 16:
+        if self.num_UAV != NUM_UAV:
             raise RuntimeError(
-                "scenario manifest requires the corrected 16-UAV environment"
+                f"scenario manifest requires the corrected {NUM_UAV}-UAV environment"
             )
         self.reset_environment(scenario_entry=scenario_entry)
         self.validate_applied_scenario(scenario_entry)

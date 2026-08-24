@@ -47,10 +47,10 @@ class MovementMaskCheckpointTest(unittest.TestCase):
     def _components():
         return (
             TD3(MOVEMENT_STATE_DIM, JOINT_ACTION_DIM, 1.0, gamma=1.0),
-            DDQN(ROUTING_STATE_DIM, 17, hidden_dim=16),
+            DDQN(ROUTING_STATE_DIM, 11, hidden_dim=16),
             ReplayBufferJoint(MOVEMENT_STATE_DIM, JOINT_ACTION_DIM, max_size=4),
             ReplayBufferDiscrete(
-                ROUTING_STATE_DIM, 17, max_size=4, n_step=1, gamma=0.99
+                ROUTING_STATE_DIM, 11, max_size=4, n_step=1, gamma=0.99
             ),
         )
 
@@ -224,7 +224,7 @@ class MovementMaskCheckpointTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             saved = self._save_checkpoint(temp_dir, "td3_dinkelbach")
             self._downgrade_to_pre_mask_schema(saved["checkpoint"])
-            with self.assertRaisesRegex(RuntimeError, "legacy safe-DDQN"):
+            with self.assertRaisesRegex(RuntimeError, "incompatible.*must be retrained"):
                 self._load(saved)
 
     def test_legacy_masked_checkpoint_is_rejected_before_network_restore(self):
@@ -238,7 +238,7 @@ class MovementMaskCheckpointTest(unittest.TestCase):
             }
             with self.assertRaisesRegex(
                 RuntimeError,
-                "legacy safe-DDQN",
+                "incompatible.*must be retrained",
             ):
                 load_full_resume_checkpoint(
                     saved["checkpoint"],
@@ -297,7 +297,7 @@ class MovementMaskCheckpointTest(unittest.TestCase):
                 json.dumps(metadata, indent=2) + "\n", encoding="utf-8"
             )
             restored_movement, restored_routing, _, _ = self._components()
-            with self.assertRaisesRegex(RuntimeError, "legacy safe-DDQN"):
+            with self.assertRaisesRegex(RuntimeError, "incompatible.*must be retrained"):
                 load_model_checkpoint(
                     checkpoint,
                     restored_movement,

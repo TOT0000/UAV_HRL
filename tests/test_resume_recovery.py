@@ -117,9 +117,9 @@ class ResumeRecoveryTest(unittest.TestCase):
             "checkpoint_schema_version": CHECKPOINT_SCHEMA_VERSION,
             "checkpoint_type": checkpoint_type,
             "episode": completed_episode - 1,
-            "movement_state_dim": 532,
-            "joint_action_dim": 48,
-            "routing_state_dim": 126,
+            "movement_state_dim": 429,
+            "joint_action_dim": 30,
+            "routing_state_dim": 90,
             "movement_agent_kind": "td3",
             "movement_agent_gamma": 1.0,
             "movement_agent_configuration": self.formal_config[
@@ -203,8 +203,8 @@ class ResumeRecoveryTest(unittest.TestCase):
             )
             np.savez_compressed(
                 path / "joint_replay.npz",
-                current_movement_mask=np.zeros((0, 16), dtype=bool),
-                next_movement_mask=np.zeros((0, 16), dtype=bool),
+                current_movement_mask=np.zeros((0, 10), dtype=bool),
+                next_movement_mask=np.zeros((0, 10), dtype=bool),
                 movement_mask_valid=np.zeros((0, 1), dtype=bool),
             )
             (path / "routing_replay.npz").write_bytes(b"routing")
@@ -230,9 +230,9 @@ class ResumeRecoveryTest(unittest.TestCase):
 
     def _inspectors(self):
         common = {
-            "movement_state_dim": 532,
-            "joint_action_dim": 48,
-            "routing_state_dim": 126,
+            "movement_state_dim": 429,
+            "joint_action_dim": 30,
+            "routing_state_dim": 90,
             "td3_gamma": 1.0,
             "ddqn_gamma": 0.99,
             "calibration": self.calibration,

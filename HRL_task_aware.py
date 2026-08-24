@@ -43,6 +43,8 @@ from com_capacity_calibration import load_com_capacity_reference
 from exploration_schedules import movement_behavior_noise
 from evaluation_metrics import safe_energy_efficiency
 from experiment_config import (
+    COM_PACKET_SIZE_BITS,
+    COM_REQUIRED_RATE_BPS,
     DEFAULT_TRAINING_SEED,
     FOV_EMA_LIFECYCLE_VERSION,
     FORMAL_CHECKPOINT_EPISODE,
@@ -66,6 +68,7 @@ from experiment_config import (
 )
 from movement_agents import create_movement_agent, sample_random_joint_action
 from observation_strategy import (
+    ROUTING_STATE_DIM,
     apply_observation_strategy,
     masked_observation_metadata,
 )
@@ -95,7 +98,6 @@ import utils_update_v2
 
 
 MOVEMENT_CONTROL_INTERVAL = 4
-ROUTING_STATE_DIM = 126
 PRODUCTION_WARMUP_TRANSITIONS = FORMAL_EXPERIMENT_DEFAULTS[
     "movement_hyperparameters"
 ]["warmup_joint_transitions"]
@@ -461,6 +463,7 @@ def _trajectory_state(
             "z": float(env.GS_pos[2]),
         },
         "active_links": copy.deepcopy(list(active_links or [])),
+        "assignment_metadata": copy.deepcopy(env.assignment_metadata()),
         "sensing_coverage": (
             [_sensing_footprint(env, target_uav_id)]
             if target_uav_id is not None
@@ -502,7 +505,13 @@ def _run_routing_slot(
         step_time=step_time,
         rate_overrides=traffic_rate_overrides,
     )
-    packet_engine.expire_packets(env.current_time, inclusive=True)
+    pre_slot_violations = packet_engine.expire_packets(
+        env.current_time, inclusive=True
+    )
+    for violation in pre_slot_violations:
+        task_type = violation["task_type"]
+        if task_type in violation_stats:
+            violation_stats[task_type]["deadline_violated_packets"] += 1
     packet_engine.drop_expired_packets(env.current_time)
     backlog_before = _active_backlog(packet_engine)
     uavs_with_packets = packet_engine.nonempty_uav_ids()
@@ -545,7 +554,7 @@ def _run_routing_slot(
         if receiver != sender and packet_engine.get_hol_packet(sender) is not None
     }
     active_capacities, _ = env.allocate_active_link_capacities(
-        proposed_links
+        proposed_links, s2u_links=packet_engine.active_s2u_links(env)
     )
     slot_result = packet_engine.serve_active_links(
         env,
@@ -553,14 +562,17 @@ def _run_routing_slot(
         active_capacities,
         current_time=env.current_time,
     )
-    violation_count = sum(
-        bool(outcome["violated"]) for outcome in slot_result["outcomes"]
+    attributable_violation_count = sum(
+        bool(outcome["violated"])
+        and int(outcome["attributed_sender"]) in next_hops
+        for outcome in slot_result["outcomes"]
     )
     attributed_cost = float(sum(slot_result["cost_by_sender"].values()))
-    if not np.isclose(attributed_cost, float(violation_count)):
+    if not np.isclose(attributed_cost, float(attributable_violation_count)):
         raise AssertionError(
             "deadline violation cost attribution mismatch: "
-            f"violations={violation_count}, cost={attributed_cost}"
+            f"attributable_violations={attributable_violation_count}, "
+            f"cost={attributed_cost}"
         )
     env.current_time = float(current_time) + step_time
     for outcome in slot_result["outcomes"]:
@@ -605,13 +617,10 @@ def _run_routing_slot(
             )
     selected_links = [
         {
-            "sender_id": int(sender),
-            "receiver_id": int(receiver),
-            "link_type": "U2G" if int(receiver) == int(env.GS_ID) else "U2U",
-            "capacity_bits_per_second": float(capacity),
+            **dict(item),
+            "capacity_bits_per_second": float(item["capacity_mbps"]) * 1e6,
         }
-        for (sender, receiver), capacity in sorted(active_capacities.items())
-        if float(capacity) > 0.0
+        for item in env.active_link_diagnostics
     ]
     return (
         float(slot_result["timely_goodput_bits"]),
@@ -682,10 +691,12 @@ def terminal_ratio_objective(
         raise ValueError(f"unsupported reward mode: {reward_mode}")
     if reward_mode != "ratio" or not done:
         return 0.0
+    # safe_energy_efficiency is an evaluation Mbit/J metric.  The learning
+    # objective is explicitly bit/J and therefore converts its numerator.
     return safe_energy_efficiency(
         cumulative_delivered_mbits,
         cumulative_energy_j,
-    )
+    ) * 1e6
 
 
 def _interval_reward(
@@ -921,6 +932,7 @@ def _experiment_identity(
         "episode_horizon_seconds": int(config.episode_seconds),
         "movement_interval_seconds": MOVEMENT_INTERVAL_SECONDS,
         "routing_slot_seconds": float(config.routing_slot_seconds),
+        "num_uav": NUM_UAV,
         "routing_slots_per_episode": resolved_exploration[
             "routing_slots_per_episode"
         ],
@@ -935,6 +947,20 @@ def _experiment_identity(
         ),
         "exploration_schedule_configuration": resolved_exploration,
         "reward_mode": method_spec.reward_mode,
+        "movement_objective_definition": (
+            {
+                "objective_unit": "bit_per_j",
+                "numerator": "sum of episode timely delivered bits",
+                "denominator": "sum of episode mobility energy joules",
+                "semantics": "terminal-only ratio of sums",
+            }
+            if method_spec.reward_mode == "ratio"
+            else {
+                "objective_unit": "Mbit_minus_lambda_Mbit_per_J_times_J",
+                "numerator": "timely delivered Mbit",
+                "semantics": "Dinkelbach residual",
+            }
+        ),
         "task_potential_enabled": bool(method_spec.task_potential_enabled),
         **comparison,
         "masked_state_fields": (
@@ -1763,6 +1789,9 @@ def train(
                 else float(scenario_rates.get("base_com_packets_per_second", 50.0))
             ),
         }
+        env.com_required_rate_bps = (
+            float(resolved_episode_rates["COM"]) * COM_PACKET_SIZE_BITS
+        )
         latest_active_links = []
         trajectory_history = [
             _trajectory_state(
@@ -1854,7 +1883,7 @@ def train(
                 raw_joint_action, movement_mask=current_movement_mask
             )
 
-            # Phase 1 is read-only: all sixteen proposals are built from one snapshot.
+            # Phase 1 is read-only: every UAV proposal is built from one snapshot.
             proposals = build_joint_movement_proposals(
                 env, movement_agent, projected_action
             )
@@ -1879,7 +1908,6 @@ def train(
                 and float(env.visited_bitmap.mean())
                 >= config.search_coverage_threshold
             ):
-                env._search_phase_over = True
                 env.convert_search_to_hovering()
             env.update_source_uavs()
             env.update_u2u_channels()
@@ -2577,6 +2605,11 @@ def train(
         "routing_state_dim": ROUTING_STATE_DIM,
         "movement_state_dim": MOVEMENT_STATE_DIM,
         "joint_action_dim": JOINT_ACTION_DIM,
+        "num_uav": NUM_UAV,
+        "reserved_search_uav_ids": list(env.reserved_search_uav_ids),
+        "search_release_time_seconds": env.search_release_time,
+        "search_release_coverage": env.search_release_coverage,
+        "assignment_invocations": int(env.assignment_invocations),
         "movement_agent_kind": movement_agent.agent_kind,
         "movement_agent_gamma": movement_agent.gamma,
         "movement_agent_configuration": movement_agent_configuration(
@@ -2774,6 +2807,16 @@ def train(
             "resolved_packet_configuration": {
                 **copy.deepcopy(resolved_evaluation),
                 "episode_horizon_seconds": float(config.episode_seconds),
+                "com_packet_size_bits": COM_PACKET_SIZE_BITS,
+                "com_required_rate_bps": (
+                    float(resolved_evaluation["traffic_rates_packets_per_second"]["COM"])
+                    * COM_PACKET_SIZE_BITS
+                    if resolved_evaluation["traffic_rates_packets_per_second"]["COM"]
+                    is not None
+                    else COM_REQUIRED_RATE_BPS
+                ),
+                "communication_bandwidth_pool_hz": 10e6,
+                "fdma_policy": "equal-across-active-S2U-U2U-U2G",
             },
             "evaluation": bool(evaluation),
             "checkpoint_required": checkpoint_required,

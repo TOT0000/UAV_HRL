@@ -8,17 +8,24 @@ import json
 from types import MappingProxyType
 
 
-NUM_UAV = 16
+NUM_UAV = 10
 ROI_COUNT_MIN = 2
 ROI_COUNT_MAX = 8
+RESERVED_SEARCH_UAV_IDS = (0, NUM_UAV - 1)
 DEFAULT_TRAINING_SEED = 20260817
 FORMAL_TRAINING_EPISODES = 2500
 FORMAL_CHECKPOINT_EPISODE = FORMAL_TRAINING_EPISODES
-SEARCH_UTILITY = 0.05
 SEARCH_COVERAGE_THRESHOLD = 0.99
 FOV_COM_PAIR_MAX_DISTANCE_M = 200.0
-ASSIGNMENT_DUMMY_UTILITY = 0.0
-UTILITY_NORMALIZATION_MODE = "per_task_type_global_minmax_feasible_only"
+TOTAL_COMMUNICATION_BANDWIDTH_HZ = 10e6
+REFERENCE_COM_BANDWIDTH_HZ = TOTAL_COMMUNICATION_BANDWIDTH_HZ / (
+    NUM_UAV + ROI_COUNT_MAX
+)
+COM_PACKET_RATE_PER_SECOND = 50.0
+COM_PACKET_SIZE_BITS = 256.0
+COM_REQUIRED_RATE_BPS = COM_PACKET_RATE_PER_SECOND * COM_PACKET_SIZE_BITS
+ASSIGNMENT_DUMMY_UTILITY = -1e-9
+UTILITY_NORMALIZATION_MODE = "fov_global_minmax_com_demand_satisfaction-v1"
 TASK_COMPATIBILITY_POLICY = "fov_com_only_with_distance_limit"
 FOV_ASSIGNMENT_UTILITY_VERSION = "coverage_times_reciprocal_image_quality-v1"
 FOV_QUALITY_TRANSFORM = (
@@ -336,8 +343,10 @@ FORMAL_EXPERIMENT_DEFAULTS = {
     "checkpoint_interval_episodes": 50,
     "output_root": "results",
     "movement_hyperparameters": {
-        "state_dim": 532,
-        "joint_action_dim": 48,
+        # Derived from the authoritative feature/action schemas.  These values
+        # are asserted against centralized_movement at experiment preflight.
+        "state_dim": NUM_UAV * 17 + 16 * 16 + 3,
+        "joint_action_dim": NUM_UAV * 3,
         "max_action": 1.0,
         "hidden_layers": [256, 256, 256, 256],
         "actor_learning_rate": 6e-5,
@@ -589,8 +598,9 @@ def comparison_method_configuration(method_spec: MethodSpec) -> dict:
         "routing_policy": method_spec.routing,
         "task_observation_mode": method_spec.task_observation,
         "fov_com_pair_max_distance_m": FOV_COM_PAIR_MAX_DISTANCE_M,
-        "search_utility": SEARCH_UTILITY,
+        "reserved_search_uav_ids": list(RESERVED_SEARCH_UAV_IDS),
         "search_coverage_threshold": SEARCH_COVERAGE_THRESHOLD,
+        "service_assignment_only": True,
         "utility_normalization_mode": UTILITY_NORMALIZATION_MODE,
         "task_compatibility_policy": TASK_COMPATIBILITY_POLICY,
         "hover_assignment_candidate": False,

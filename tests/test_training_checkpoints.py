@@ -44,8 +44,8 @@ from utils_update_v2 import ReplayBufferDiscrete, ReplayBufferJoint
 from fov_ema_fixtures import initialized_fov_ema_state
 
 
-ROUTING_STATE_DIM = 126
-ROUTING_ACTION_DIM = 17
+ROUTING_STATE_DIM = 90
+ROUTING_ACTION_DIM = 11
 
 
 def _model_provenance_fixture(episode_count):
@@ -216,7 +216,7 @@ class FullResumeCheckpointTest(unittest.TestCase):
     def _populate_and_train(self, td3, ddqn, joint, routing):
         state = np.zeros(MOVEMENT_STATE_DIM, dtype=np.float32)
         state[0] = 1.0
-        state[531] = 0.5
+        state[428] = 0.5
         action = np.zeros(JOINT_ACTION_DIM, dtype=np.float32)
         for index, done in enumerate((False, True)):
             joint.add(
@@ -329,15 +329,6 @@ class FullResumeCheckpointTest(unittest.TestCase):
                     "dinkelbach_state": dinkelbach_state.training_state(),
                 },
             )
-            metadata_path = checkpoint_dir / "metadata.json"
-            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-            metadata["checkpoint_schema_version"] = (
-                ROUTING_LIFECYCLE_CHECKPOINT_SCHEMA_VERSION
-            )
-            metadata_path.write_text(
-                json.dumps(metadata, indent=2) + "\n", encoding="utf-8"
-            )
-
             with np.load(checkpoint_dir / "joint_replay.npz") as saved_joint:
                 self.assertEqual(saved_joint["state"].shape[0], joint.size)
             with np.load(checkpoint_dir / "routing_replay.npz") as saved_routing:
@@ -517,7 +508,7 @@ class FullResumeCheckpointTest(unittest.TestCase):
             with mock.patch(
                 "training_checkpoint._load_network_states"
             ) as load_networks:
-                with self.assertRaisesRegex(RuntimeError, "legacy safe-DDQN"):
+                with self.assertRaisesRegex(RuntimeError, "incompatible.*must be retrained"):
                     load_model_checkpoint(checkpoint_dir, td3, ddqn)
                 load_networks.assert_not_called()
 
@@ -744,7 +735,7 @@ class FullResumeCheckpointTest(unittest.TestCase):
             )
             metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
             with self.assertRaisesRegex(
-                RuntimeError, "lacks unambiguous routing cadence"
+                RuntimeError, "incompatible.*must be retrained"
             ):
                 load_full_resume_checkpoint(**common)
 
@@ -813,7 +804,7 @@ class TrainingCliTest(unittest.TestCase):
         )
 
     def test_checkpoint_schema_is_explicit(self):
-        self.assertEqual(CHECKPOINT_SCHEMA_VERSION, 7)
+        self.assertEqual(CHECKPOINT_SCHEMA_VERSION, 8)
 
 
 if __name__ == "__main__":

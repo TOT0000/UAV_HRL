@@ -27,8 +27,8 @@ from training_checkpoint import (
 )
 
 
-ROUTING_STATE_DIM = 126
-ROUTING_ACTION_DIM = 17
+ROUTING_STATE_DIM = 90
+ROUTING_ACTION_DIM = 11
 
 
 class FormalCheckpointMetadataTest(unittest.TestCase):

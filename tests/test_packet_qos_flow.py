@@ -66,26 +66,17 @@ class PacketQosFlowTest(unittest.TestCase):
         engine = PacketEngine(num_uav=3, step_time=0.25)
         packet = engine.create_packet(0, "COM", 100.0, 0.0)
 
-        engine.log_hop_delay(
-            env,
-            packet,
-            current_node=0,
-            next_hop=env.GS_ID,
-            link_capacity_mbps=1.0,
-            current_time=0.5,
-            pkt_bits=100.0,
-            backlog_bits=1000.0,
-        )
-        engine.log_hop_delay(
-            env,
-            packet,
-            current_node=0,
-            next_hop=env.GS_ID,
-            link_capacity_mbps=1.0,
-            current_time=0.5,
-            pkt_bits=100.0,
-            backlog_bits=1000.0,
-        )
+        with self.assertRaisesRegex(RuntimeError, "legacy hop-delay.*disabled"):
+            engine.log_hop_delay(
+                env,
+                packet,
+                current_node=0,
+                next_hop=env.GS_ID,
+                link_capacity_mbps=1.0,
+                current_time=0.5,
+                pkt_bits=100.0,
+                backlog_bits=1000.0,
+            )
         self.assertEqual(packet["e2e_delay_ms"], 0.0)
 
         engine.serve_active_links(
@@ -133,8 +124,9 @@ class PacketQosFlowTest(unittest.TestCase):
 
     def test_injection_cutoff_is_strictly_before_58_5_seconds(self):
         env = SimpleNamespace(
-            source_uavs={0},
-            multi_tasks={0: [{"task_type": "COM"}]},
+            source_uavs=set(),
+            multi_tasks={},
+            SR_teams=[SimpleNamespace(id=0, active=True)],
             load_factor=1.0,
         )
         engine = PacketEngine(num_uav=1, step_time=0.25)

@@ -4,20 +4,23 @@ import numpy as np
 import torch
 from scipy.integrate import quad
 
-from experiment_config import NUM_UAV, ROI_COUNT_MAX
+from experiment_config import COM_REQUIRED_RATE_BPS, NUM_UAV, ROI_COUNT_MAX
 from Fov_model_phase import FovModel
 
 
 TASK_TYPES = ("Search", "FOV", "COM", "Hovering")
 LOCAL_MOVEMENT_DIM = 17
-MOVEMENT_STATE_DIM = 532
+COVERAGE_GRID_SIZE = 16
+GLOBAL_MOVEMENT_DIM = 3
+MOVEMENT_STATE_DIM = (
+    NUM_UAV * LOCAL_MOVEMENT_DIM + COVERAGE_GRID_SIZE**2 + GLOBAL_MOVEMENT_DIM
+)
 JOINT_ACTION_DIM = NUM_UAV * 3
 BACKLOG_NORM_REF_BITS = 5e7
 GT_COUNT_MAX = ROI_COUNT_MAX
-COVERAGE_GRID_SIZE = 16
 VS_COVERAGE_EPS = 1e-6
 HOVER_ACTION = (-1.0, 0.0, 0.0)
-MOVEMENT_FEATURE_SCHEMA_VERSION = 1
+MOVEMENT_FEATURE_SCHEMA_VERSION = 2
 
 LOCAL_MOVEMENT_FEATURES = (
     ("task_search", "binary", 0.0, 1.0, "Search task is active"),
@@ -59,7 +62,7 @@ LOCAL_MOVEMENT_FEATURES = (
         "continuous",
         0.0,
         1.0,
-        "non-negative COM capacity Mbps / calibrated c_ref_com",
+        "min(reference S2U capacity / current COM required rate, 1)",
     ),
 )
 
@@ -99,8 +102,7 @@ def movement_state_feature_schema():
     for offset, (name, normalization) in enumerate(
         (
             ("global_coverage", "mean of boolean visited bitmap"),
-            ("found_gt_ratio", "found GT count / current GT count"),
-            ("num_gt", f"clip(current GT count / {GT_COUNT_MAX}, 0, 1)"),
+            ("found_gt_ratio", f"discovered GT count / {GT_COUNT_MAX}"),
             ("remaining_time", "remaining movement intervals / episode duration"),
         )
     ):
@@ -115,13 +117,19 @@ def movement_state_feature_schema():
             }
         )
     if len(features) != MOVEMENT_STATE_DIM:
-        raise AssertionError("movement feature schema does not cover 532 dimensions")
+        raise AssertionError(
+            f"movement feature schema does not cover {MOVEMENT_STATE_DIM} dimensions"
+        )
     continuous = [item["index"] for item in features if item["kind"] == "continuous"]
     discrete = [item["index"] for item in features if item["kind"] == "binary"]
     return {
         "schema_version": MOVEMENT_FEATURE_SCHEMA_VERSION,
         "dimension": MOVEMENT_STATE_DIM,
-        "ordering": "16 UAV blocks x 17, 16x16 coverage macro map row-major, 4 globals",
+        "ordering": (
+            f"{NUM_UAV} UAV blocks x {LOCAL_MOVEMENT_DIM}, "
+            f"{COVERAGE_GRID_SIZE}x{COVERAGE_GRID_SIZE} coverage macro map "
+            f"row-major, {GLOBAL_MOVEMENT_DIM} globals"
+        ),
         "features": features,
         "continuous_indices": continuous,
         "discrete_indices": discrete,
@@ -129,7 +137,7 @@ def movement_state_feature_schema():
 
 
 def projected_joint_action_schema():
-    """Return the authoritative 16-by-3 projected raw actor-action ordering."""
+    """Return the authoritative NUM_UAV-by-3 actor-action ordering."""
 
     components = (
         ("speed_scalar", "decoded to horizontal speed in [0, 10] m/s"),
@@ -220,12 +228,19 @@ def _target_object_id(task, task_type):
     return int(task["target_obj_id"])
 
 
-def _com_capacity_mbps(env, uav_id, task):
+def _com_requirement_satisfaction(env, uav_id, task, required_rate_bps=None):
     sr_id = _target_object_id(task, "COM")
-    capacity = float(env.get_sr_uav_capacity_mbps(uav_id, sr_id))
-    if not math.isfinite(capacity):
+    required = float(
+        getattr(env, "com_required_rate_bps", COM_REQUIRED_RATE_BPS)
+        if required_rate_bps is None
+        else required_rate_bps
+    )
+    if required <= 0.0:
+        return 1.0
+    capacity_bps = float(env.get_sr_uav_reference_capacity_mbps(uav_id, sr_id)) * 1e6
+    if not math.isfinite(capacity_bps):
         return 0.0
-    return max(capacity, 0.0)
+    return float(np.clip(max(capacity_bps, 0.0) / required, 0.0, 1.0))
 
 
 def get_global_movement_state(
@@ -296,9 +311,7 @@ def get_global_movement_state(
                 float(np.clip(ty / float(env.env_height), 0.0, 1.0)),
                 float(np.clip(tz / max(z_max, 1e-9), 0.0, 1.0)),
             ]
-            com_capacity_norm = float(
-                np.clip(_com_capacity_mbps(env, uav_id, task) / float(c_ref_com), 0.0, 1.0)
-            )
+            com_capacity_norm = _com_requirement_satisfaction(env, uav_id, task)
 
         uav_features = np.asarray(
             task_flags
@@ -316,8 +329,7 @@ def get_global_movement_state(
         local_features.append(uav_features)
 
     compressed_map = aggregate_coverage_map(env.visited_bitmap)
-    num_gt = int(getattr(env, "num_GT", len(getattr(env, "gts", []))) or 0)
-    found_count = int(env.count_found_targets()) if num_gt > 0 else 0
+    found_count = int(env.count_found_targets())
     remaining_time = float(remaining_time)
     if not math.isfinite(remaining_time) or not 0.0 <= remaining_time <= 1.0:
         raise ValueError(
@@ -326,8 +338,7 @@ def get_global_movement_state(
     global_scalars = np.asarray(
         [
             float(np.asarray(env.visited_bitmap, dtype=bool).mean()),
-            float(found_count / num_gt) if num_gt > 0 else 0.0,
-            float(np.clip(num_gt / GT_COUNT_MAX, 0.0, 1.0)),
+            float(np.clip(found_count / GT_COUNT_MAX, 0.0, 1.0)),
             remaining_time,
         ],
         dtype=np.float32,
@@ -411,8 +422,8 @@ def validate_movement_mask(movement_mask):
 def project_joint_action(raw_action, movement_state=None, *, movement_mask=None):
     """Apply the authoritative task constraint to raw joint movement actions.
 
-    Existing callers may provide an unmasked 532-D ``movement_state``. Training
-    callers should provide the explicit 16-D true ``movement_mask`` stored with
+    Existing callers may provide an unmasked movement state. Training callers
+    should provide the explicit per-UAV true ``movement_mask`` stored with
     the transition. Exactly one control source is required.
     """
 
@@ -544,7 +555,7 @@ def calculate_movement_potentials(env, c_ref_com):
             vs_progress.append(progress)
         for task in grouped["COM"]:
             com_progress.append(
-                float(np.clip(_com_capacity_mbps(env, uav_id, task) / float(c_ref_com), 0.0, 1.0))
+                _com_requirement_satisfaction(env, uav_id, task)
             )
     phi_vs = float(np.mean(vs_progress)) if vs_progress else 0.0
     phi_com = float(np.mean(com_progress)) if com_progress else 0.0

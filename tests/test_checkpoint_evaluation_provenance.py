@@ -65,9 +65,9 @@ class CheckpointEvaluationProvenanceTest(unittest.TestCase):
             "checkpoint_schema_version": CHECKPOINT_SCHEMA_VERSION,
             "checkpoint_type": MODEL_CHECKPOINT_TYPE,
             "episode": 2499,
-            "movement_state_dim": 532,
-            "joint_action_dim": 48,
-            "routing_state_dim": 126,
+            "movement_state_dim": 429,
+            "joint_action_dim": 30,
+            "routing_state_dim": 90,
             "movement_agent_kind": method.agent,
             "movement_agent_gamma": 1.0,
             "movement_agent_configuration": deepcopy(
@@ -136,17 +136,8 @@ class CheckpointEvaluationProvenanceTest(unittest.TestCase):
             ROUTING_LIFECYCLE_CHECKPOINT_SCHEMA_VERSION
         )
         metadata.pop("training_provenance")
-        with self.assertRaisesRegex(RuntimeError, "schema-6 learned-routing"):
+        with self.assertRaisesRegex(RuntimeError, "incompatible.*must be retrained"):
             validate_model_checkpoint_metadata(metadata)
-
-        validate_model_checkpoint_metadata(
-            metadata, allow_incomplete_provenance=True
-        )
-        inferred = checkpoint_training_provenance(
-            metadata, allow_incomplete=True
-        )
-        self.assertFalse(inferred["provenance_complete"])
-        self.assertIsNone(inferred["routing_lifecycle"])
 
     def test_schema6_random_routing_needs_no_learner_lifecycle(self):
         metadata = self._metadata("td3_dinkelbach_random_routing")
@@ -154,10 +145,8 @@ class CheckpointEvaluationProvenanceTest(unittest.TestCase):
             ROUTING_LIFECYCLE_CHECKPOINT_SCHEMA_VERSION
         )
         metadata.pop("training_provenance")
-        validate_model_checkpoint_metadata(metadata)
-        inferred = checkpoint_training_provenance(metadata)
-        self.assertTrue(inferred["provenance_complete"])
-        self.assertIsNone(inferred["routing_lifecycle"])
+        with self.assertRaisesRegex(RuntimeError, "incompatible.*must be retrained"):
+            validate_model_checkpoint_metadata(metadata)
 
     def test_formal_2500_training_and_100_evaluation_aliases_do_not_mix(self):
         training = self._metadata("td3_dinkelbach")["training_provenance"]

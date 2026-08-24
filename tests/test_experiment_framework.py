@@ -115,9 +115,9 @@ class ExperimentFrameworkTest(unittest.TestCase):
         self.assertEqual(
             result["run_metadata"]["manifest_hash"], manifest.content_hash
         )
-        self.assertEqual(result["movement_state_dim"], 532)
-        self.assertEqual(result["joint_action_dim"], 48)
-        self.assertEqual(result["routing_state_dim"], 126)
+        self.assertEqual(result["movement_state_dim"], 429)
+        self.assertEqual(result["joint_action_dim"], 30)
+        self.assertEqual(result["routing_state_dim"], 90)
 
 
 if __name__ == "__main__":

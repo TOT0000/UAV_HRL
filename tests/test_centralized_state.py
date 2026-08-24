@@ -42,12 +42,12 @@ class CoverageAggregationTest(unittest.TestCase):
 
 class CentralizedMovementStateTest(unittest.TestCase):
     def setUp(self):
-        self.env = Simulator(num_UAV=16)
+        self.env = Simulator(num_UAV=10)
         self.env.num_GT = 2
         self.env.reset_environment()
-        self.packet_engine = PacketEngine(num_uav=16, step_time=0.25)
+        self.packet_engine = PacketEngine(num_uav=10, step_time=0.25)
 
-    def test_state_is_532_finite_side_effect_free_and_routing_is_126(self):
+    def test_state_is_429_finite_side_effect_free_and_routing_is_90(self):
         positions_before = [uav.get_position() for uav in self.env.UAVs]
         tasks_before = {
             uid: [dict(task) for task in tasks]
@@ -66,7 +66,7 @@ class CentralizedMovementStateTest(unittest.TestCase):
 
         self.assertEqual(state.shape, (MOVEMENT_STATE_DIM,))
         self.assertTrue(np.isfinite(state).all())
-        self.assertEqual(state[531], 0.75)
+        self.assertEqual(state[428], 0.75)
         self.assertEqual(positions_before, [uav.get_position() for uav in self.env.UAVs])
         self.assertEqual(tasks_before, self.env.multi_tasks)
         np.testing.assert_array_equal(bitmap_before, self.env.visited_bitmap)
@@ -78,7 +78,7 @@ class CentralizedMovementStateTest(unittest.TestCase):
         routing_state = self.packet_engine.get_state_ta(
             self.env, 0, backlog_bits=self.packet_engine.backlog_bits
         )
-        self.assertEqual(routing_state.shape, (126,))
+        self.assertEqual(routing_state.shape, (90,))
 
     def test_search_potential_is_full_boolean_map_mean(self):
         self.env.visited_bitmap[:] = False
@@ -127,8 +127,8 @@ class CentralizedMovementStateTest(unittest.TestCase):
             1.0,
             remaining_time=0.0,
         )
-        self.assertEqual(start[531], 1.0)
-        self.assertEqual(terminal[531], 0.0)
+        self.assertEqual(start[428], 1.0)
+        self.assertEqual(terminal[428], 0.0)
         with self.assertRaisesRegex(ValueError, "remaining_time"):
             get_global_movement_state(
                 self.env,
