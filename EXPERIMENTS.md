@@ -364,8 +364,10 @@ training CSV names the corresponding columns `lambda_used` and
 
 ## Semantic paper evaluation and figure build
 
-Paper evaluation remains one method per process and never trains or resumes a
-model. Learned methods require the completed formal `ep_1500` run. The pure
+The single-run paper CLI remains one method per invocation and never trains or
+resumes a model. Learned methods use the completed formal `ep_1500` checkpoint by
+default; explicit diagnostic selectors may use an existing intermediate
+checkpoint from a longer completed run. The pure
 random `kkm_random_action_random_routing` baseline must omit `--run-dir`; it
 loads no model, creates no fake `models.pt`, and records
 `checkpoint_required=false`.
@@ -393,6 +395,49 @@ python -X utf8 run_paper_evaluation.py td3_dinkelbach --run-dir results/td3_dink
 python -X utf8 run_paper_evaluation.py td3_dinkelbach --run-dir results/td3_dinkelbach/<run-id> --suite fixed_roi
 python -X utf8 run_paper_evaluation.py kkm_random_action_random_routing --suite fixed_roi --manifest-seed 20260817
 ```
+
+Fixed-RoI evaluation remains backward compatible: without checkpoint or RoI
+selectors it loads `FORMAL_CHECKPOINT_EPISODE` and evaluates RoI 2 through 8.
+Explicit selectors enable diagnostic checkpoint-progress evaluation without
+changing simulator, frozen-policy, packet, energy, or aggregation semantics:
+
+```powershell
+python -X utf8 run_paper_evaluation.py td3_dinkelbach --run-dir results/td3_dinkelbach/<run-id> --suite fixed_roi --checkpoint-episode 500 --roi-count 4
+python -X utf8 run_paper_evaluation.py td3_dinkelbach --run-dir results/td3_dinkelbach/<run-id> --suite fixed_roi --checkpoint-episodes 500 1000 1500 --roi-counts 2 4 8
+```
+
+The singular and plural forms are mutually exclusive. Selected checkpoints
+must exist below `checkpoints/models/ep_NNNN`, match their metadata episode and
+method/model contracts, and satisfy `N <= training_config.total_episodes`.
+Only `N == FORMAL_CHECKPOINT_EPISODE` is marked formal; earlier checkpoints are
+labelled `diagnostic_checkpoint_progress_evaluation` and still use frozen
+weights, disabled exploration, and no replay or optimizer updates.
+
+Use the generic batch CLI for multiple training runs. It infers every method
+from each run's resolved config and builds the full dynamic Cartesian product:
+
+```powershell
+python -X utf8 run_checkpoint_roi_sweep.py `
+  --run-dir results/td3_dinkelbach/<run-id> `
+  --run-dir results/ddpg_dinkelbach/<run-id> `
+  --checkpoint-episodes 500 1000 1500 `
+  --roi-counts 2 4 8 `
+  --episodes 100 `
+  --episode-seconds 60 `
+  --manifest-seed 20260817 `
+  --output-root results/checkpoint_roi_sweeps
+```
+
+The runner validates all runs, checkpoints, fingerprints, RoIs, and output
+paths before starting the first simulation, prints the complete plan and total
+point count, then executes sequentially. It generates exactly one canonical
+test manifest per selected RoI and reuses that manifest hash and scenario-ID
+set across every method and checkpoint at that RoI. Different RoIs intentionally
+have different manifests. Each batch directory contains
+`checkpoint_roi_sweep_metadata.json`, `checkpoint_roi_sweep_summary.csv`, and
+`checkpoint_roi_sweep_summary.json`; point paths include method, training-run
+ID, checkpoint episode, and RoI. A failed point is marked failed, later points
+remain pending, and already completed point outputs are preserved.
 
 The trajectory manifest contains exactly the requested evaluation episode
 count (one by default). Its artifact records all 10 UAVs and paths, explicit

@@ -9,6 +9,13 @@ from pathlib import Path
 import subprocess
 
 from evaluation_metrics import write_evaluation_outputs
+from evaluation_selection import (
+    DEFAULT_FIXED_ROI_COUNTS,
+    resolve_checkpoint_episodes,
+    resolve_roi_counts,
+    resolve_training_run_checkpoint,
+    validate_fixed_roi_manifest,
+)
 from experiment_config import (
     DEFAULT_TRAINING_SEED,
     FORMAL_CHECKPOINT_EPISODE,
@@ -40,7 +47,7 @@ from training_checkpoint import (
 
 
 TRAJECTORY_SNAPSHOT_SECONDS = (5.0, 10.0, 15.0, 25.0)
-FIXED_ROI_VALUES = tuple(range(2, 9))
+FIXED_ROI_VALUES = DEFAULT_FIXED_ROI_COUNTS
 ARRIVAL_RATE_SWEEPS = {
     "COM": {"values": (50.0, 100.0, 150.0, 200.0), "fixed": {"FOV": 5.0}},
     "FOV": {"values": (10.0, 20.0, 30.0, 40.0), "fixed": {"COM": 50.0}},
@@ -115,9 +122,11 @@ def validate_production_deadlines():
     return actual
 
 
-def evaluation_sweep_points(suite):
+def evaluation_sweep_points(suite, roi_counts=None):
     suite = resolve_evaluation_suite(suite)
     kind = PAPER_EVALUATION_SUITES[suite]["kind"]
+    if roi_counts is not None and kind != "fixed_roi":
+        raise ValueError("RoI selectors are available only for the fixed_roi suite")
     if kind == "training_history":
         return ({"point_id": "training_history", "overrides": {}},)
     if kind == "trajectory":
@@ -172,6 +181,11 @@ def evaluation_sweep_points(suite):
                 )
         return tuple(points)
     if kind == "fixed_roi":
+        resolved_roi_counts = (
+            FIXED_ROI_VALUES
+            if roi_counts is None
+            else resolve_roi_counts(roi_counts=roi_counts)
+        )
         return tuple(
             {
                 "point_id": f"roi_{num_gt}",
@@ -180,7 +194,7 @@ def evaluation_sweep_points(suite):
                 "x_value": num_gt,
                 "x_unit": "RoIs",
             }
-            for num_gt in FIXED_ROI_VALUES
+            for num_gt in resolved_roi_counts
         )
     raise RuntimeError(f"unsupported paper suite kind: {kind}")
 
@@ -216,34 +230,16 @@ def _unique_directory(root, git_sha):
     raise FileExistsError(f"could not allocate a unique directory below {root}")
 
 
-def _load_training_run(run_directory, expected_method):
-    if run_directory is None:
-        raise ValueError(f"{expected_method} requires --run-dir")
-    run_dir = Path(run_directory).resolve()
-    resolved = _read_json(run_dir / "resolved_config.json")
-    method = MethodSpec.parse(expected_method)
-    if resolved.get("method") != method.method_id:
-        raise RuntimeError(
-            f"paper method/run mismatch: requested={method.method_id}, run={resolved.get('method')}"
-        )
-    if resolved.get("method_spec") != method.to_dict():
-        raise RuntimeError("training run method metadata is incompatible")
-    if resolved.get("status") != "COMPLETED":
-        raise RuntimeError("paper evaluation requires a completed training run")
-    checkpoint = run_dir / "checkpoints" / "models" / f"ep_{FORMAL_CHECKPOINT_EPISODE:04d}"
-    if not checkpoint.is_dir():
-        raise FileNotFoundError(
-            f"formal ep_{FORMAL_CHECKPOINT_EPISODE} checkpoint is missing: {checkpoint}"
-        )
-    return {
-        "run_dir": run_dir,
-        "resolved": resolved,
-        "method": method,
-        "training_seed": int(resolved["seed"]),
-        "checkpoint": checkpoint.resolve(),
-        "expected_training_config": dict(resolved["training_config"]),
-        "checkpoint_required": True,
-    }
+def _load_training_run(
+    run_directory,
+    expected_method,
+    checkpoint_episode=FORMAL_CHECKPOINT_EPISODE,
+):
+    return resolve_training_run_checkpoint(
+        run_directory,
+        checkpoint_episode,
+        expected_method=expected_method,
+    )
 
 
 def _no_checkpoint_context(method, evaluation_seed, run_directory):
@@ -257,6 +253,9 @@ def _no_checkpoint_context(method, evaluation_seed, run_directory):
         "method": method,
         "training_seed": int(evaluation_seed),
         "checkpoint": None,
+        "checkpoint_episode": None,
+        "training_run_id": None,
+        "training_total_episodes": None,
         "expected_training_config": None,
         "checkpoint_required": False,
     }
@@ -321,25 +320,72 @@ def run_paper_evaluation(
     episode_seconds=None,
     target_uav_id=None,
     output_root="results/paper_evaluations",
+    checkpoint_episode=None,
+    roi_counts=None,
+    output_directory=None,
+    fixed_roi_manifests=None,
+    allow_registered_fixed_roi_method=False,
+    flatten_single_point=False,
 ):
     validate_production_deadlines()
     suite = resolve_evaluation_suite(suite)
     definition = PAPER_EVALUATION_SUITES[suite]
     method = MethodSpec.parse(method_id)
-    if method.method_id not in definition["methods"]:
+    registry_fixed_roi = bool(
+        suite == "fixed_roi"
+        and allow_registered_fixed_roi_method
+        and (method.learns_movement or method.learns_routing)
+    )
+    if method.method_id not in definition["methods"] and not registry_fixed_roi:
         raise ValueError(f"{method.method_id} is not part of {suite}: {definition['methods']}")
+
+    selected_checkpoint_episode = resolve_checkpoint_episodes(
+        checkpoint_episode=checkpoint_episode
+    )[0]
+    selected_roi_counts = (
+        resolve_roi_counts(roi_counts=roi_counts)
+        if suite == "fixed_roi"
+        else None
+    )
+    if suite != "fixed_roi" and (
+        roi_counts is not None or fixed_roi_manifests is not None
+    ):
+        raise ValueError("RoI selectors are available only for the fixed_roi suite")
 
     requested_manifest_seed = int(
         DEFAULT_TRAINING_SEED if manifest_seed is None else manifest_seed
     )
     checkpoint_required = bool(method.learns_movement or method.learns_routing)
     context = (
-        _load_training_run(run_directory, method.method_id)
+        _load_training_run(
+            run_directory,
+            method.method_id,
+            selected_checkpoint_episode,
+        )
         if checkpoint_required
         else _no_checkpoint_context(method, requested_manifest_seed, run_directory)
     )
+    is_formal_checkpoint = bool(
+        checkpoint_required
+        and context["checkpoint_episode"] == FORMAL_CHECKPOINT_EPISODE
+    )
+    evaluation_purpose = (
+        "formal_checkpoint_evaluation"
+        if is_formal_checkpoint
+        else (
+            "diagnostic_checkpoint_progress_evaluation"
+            if checkpoint_required
+            else "random_policy_baseline_evaluation"
+        )
+    )
     git_sha = _git_sha()
-    output_dir = _unique_directory(Path(output_root) / suite / method.method_id, git_sha)
+    if output_directory is None:
+        output_dir = _unique_directory(
+            Path(output_root) / suite / method.method_id, git_sha
+        )
+    else:
+        output_dir = Path(output_directory).resolve()
+        output_dir.mkdir(parents=True, exist_ok=False)
 
     if definition["kind"] == "training_history":
         history_path = context["run_dir"] / "training_history.jsonl"
@@ -356,6 +402,19 @@ def run_paper_evaluation(
             "training_run": str(context["run_dir"]),
             "training_history": str(history_path.resolve()),
             "checkpoint_required": True,
+            "checkpoint_episode": context["checkpoint_episode"],
+            "checkpoint_path": str(context["checkpoint"]),
+            "training_run_id": context["training_run_id"],
+            "training_total_episodes": context["training_total_episodes"],
+            "formal_checkpoint_episode": FORMAL_CHECKPOINT_EPISODE,
+            "is_formal_checkpoint": bool(
+                context["checkpoint_episode"] == FORMAL_CHECKPOINT_EPISODE
+            ),
+            "evaluation_purpose": (
+                "formal_checkpoint_evaluation"
+                if context["checkpoint_episode"] == FORMAL_CHECKPOINT_EPISODE
+                else "diagnostic_checkpoint_progress_evaluation"
+            ),
             "git_sha": git_sha,
             "training_history_only": True,
             "new_training_started": False,
@@ -387,17 +446,56 @@ def run_paper_evaluation(
     if definition["kind"] == "trajectory" and target_uav_id is None:
         raise ValueError("uav_trajectory_snapshots requires --target-uav-id")
 
+    points = evaluation_sweep_points(suite, selected_roi_counts)
+    if flatten_single_point and len(points) != 1:
+        raise ValueError("flatten_single_point requires exactly one evaluation point")
+    shared_manifests = dict(fixed_roi_manifests or {})
+    if shared_manifests:
+        expected_keys = {int(point["fixed_num_gt"]) for point in points}
+        actual_keys = {int(key) for key in shared_manifests}
+        if actual_keys != expected_keys:
+            raise ValueError(
+                "shared fixed-RoI manifest keys disagree with selected RoIs: "
+                f"expected={sorted(expected_keys)}, actual={sorted(actual_keys)}"
+            )
+        shared_manifests = {
+            int(key): validate_fixed_roi_manifest(
+                manifest,
+                int(key),
+                resolved_episodes,
+                requested_manifest_seed,
+            )
+            for key, manifest in shared_manifests.items()
+        }
+
     point_results = []
     all_aggregates = []
-    for point in evaluation_sweep_points(suite):
-        manifest = _manifest_for_point(
-            point,
-            base_manifest=base_manifest,
-            manifest_seed=requested_manifest_seed,
-            episodes=resolved_episodes,
+    for point in points:
+        fixed_num_gt = point.get("fixed_num_gt")
+        manifest = (
+            shared_manifests[int(fixed_num_gt)]
+            if fixed_num_gt is not None and shared_manifests
+            else _manifest_for_point(
+                point,
+                base_manifest=base_manifest,
+                manifest_seed=requested_manifest_seed,
+                episodes=resolved_episodes,
+            )
         )
-        point_dir = output_dir / point["point_id"]
-        point_dir.mkdir()
+        if fixed_num_gt is not None:
+            validate_fixed_roi_manifest(
+                manifest,
+                int(fixed_num_gt),
+                resolved_episodes,
+                requested_manifest_seed,
+            )
+        point_dir = (
+            output_dir
+            if flatten_single_point
+            else output_dir / point["point_id"]
+        )
+        if not flatten_single_point:
+            point_dir.mkdir()
         manifest.save(point_dir / "scenario_manifest.json")
         packet_outcomes_path = point_dir / "packet_outcomes.jsonl"
         with PacketOutcomeJsonlWriter(packet_outcomes_path) as outcome_writer:
@@ -412,7 +510,7 @@ def run_paper_evaluation(
                 evaluation=True,
                 checkpoint_dir=context["checkpoint"],
                 expected_checkpoint_episodes=(
-                    FORMAL_CHECKPOINT_EPISODE if checkpoint_required else None
+                    context["checkpoint_episode"] if checkpoint_required else None
                 ),
                 expected_checkpoint_formal_config=(
                     context["expected_training_config"]
@@ -426,6 +524,13 @@ def run_paper_evaluation(
                 ),
                 packet_outcome_sink=outcome_writer.write_episode,
             )
+        if fixed_num_gt is not None and any(
+            int(row["num_GT"]) != int(fixed_num_gt)
+            for row in result["episode_metrics"]
+        ):
+            raise RuntimeError(
+                "evaluation episode actual RoI count differs from the selected value"
+            )
         if outcome_writer.episode_count != resolved_episodes:
             raise RuntimeError(
                 "paper packet outcome stream episode count mismatch: "
@@ -437,10 +542,27 @@ def run_paper_evaluation(
             "semantic_suite": suite,
             "paper_sweep_point": point,
             "git_sha": git_sha,
+            "training_run_id": context["training_run_id"],
+            "training_run_directory": (
+                str(context["run_dir"]) if context["run_dir"] else None
+            ),
+            "training_total_episodes": context["training_total_episodes"],
             "checkpoint_required": checkpoint_required,
+            "checkpoint_episode": context["checkpoint_episode"],
             "checkpoint_path": (
                 str(context["checkpoint"]) if checkpoint_required else None
             ),
+            "roi_count": (
+                int(fixed_num_gt) if fixed_num_gt is not None else None
+            ),
+            "evaluation_episode_count": resolved_episodes,
+            "episode_seconds": resolved_seconds,
+            "manifest_seed": int(manifest.manifest_seed),
+            "manifest_hash": manifest.content_hash,
+            "scenario_ids": list(result["scenario_ids"]),
+            "formal_checkpoint_episode": FORMAL_CHECKPOINT_EPISODE,
+            "is_formal_checkpoint": is_formal_checkpoint,
+            "evaluation_purpose": evaluation_purpose,
             "scenario_manifest": str((point_dir / "scenario_manifest.json").resolve()),
         }
         outputs = write_evaluation_outputs(point_dir, result["episode_metrics"], run_metadata)
@@ -492,9 +614,24 @@ def run_paper_evaluation(
                     "evaluation_overrides"
                 ),
                 "checkpoint_required": checkpoint_required,
+                "training_run_id": context["training_run_id"],
+                "training_run_directory": (
+                    str(context["run_dir"]) if context["run_dir"] else None
+                ),
+                "training_total_episodes": context[
+                    "training_total_episodes"
+                ],
+                "checkpoint_episode": context["checkpoint_episode"],
                 "checkpoint_path": (
                     str(context["checkpoint"]) if checkpoint_required else None
                 ),
+                "roi_count": (
+                    int(fixed_num_gt) if fixed_num_gt is not None else None
+                ),
+                "episode_seconds": resolved_seconds,
+                "formal_checkpoint_episode": FORMAL_CHECKPOINT_EPISODE,
+                "is_formal_checkpoint": is_formal_checkpoint,
+                "evaluation_purpose": evaluation_purpose,
                 **{
                     field: result["run_metadata"].get(field)
                     for field in (
@@ -527,9 +664,17 @@ def run_paper_evaluation(
         "method_id": method.method_id,
         "method_spec": method.to_dict(),
         "training_run": str(context["run_dir"]) if context["run_dir"] else None,
+        "training_run_id": context["training_run_id"],
+        "training_run_directory": (
+            str(context["run_dir"]) if context["run_dir"] else None
+        ),
+        "training_total_episodes": context["training_total_episodes"],
         "checkpoint_required": checkpoint_required,
         "checkpoint_path": str(context["checkpoint"]) if context["checkpoint"] else None,
-        "checkpoint_episode": FORMAL_CHECKPOINT_EPISODE if checkpoint_required else None,
+        "checkpoint_episode": context["checkpoint_episode"],
+        "formal_checkpoint_episode": FORMAL_CHECKPOINT_EPISODE,
+        "is_formal_checkpoint": is_formal_checkpoint,
+        "evaluation_purpose": evaluation_purpose,
         **{
             field: point_results[0].get(field) if point_results else None
             for field in (
