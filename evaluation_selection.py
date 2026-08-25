@@ -14,7 +14,7 @@ from experiment_config import (
     MethodSpec,
 )
 from HRL_task_aware import ROUTING_STATE_DIM
-from scenario_manifest import ScenarioManifest
+from scenario_manifest import ScenarioManifest, resolve_training_manifest
 from training_checkpoint import (
     checkpoint_artifact_provenance,
     inspect_model_checkpoint,
@@ -177,6 +177,13 @@ def resolve_training_run_checkpoint(
             f"{method.method_id} has no learned checkpoint to evaluate"
         )
     training_total, expected_training_config = _training_total_episodes(resolved)
+    training_manifest_path, training_manifest = resolve_training_manifest(
+        run_dir, resolved
+    )
+    if training_manifest.episode_count != training_total:
+        raise RuntimeError(
+            "training manifest length disagrees with resolved training horizon"
+        )
     checkpoint_episode = resolve_checkpoint_episodes(
         checkpoint_episode=checkpoint_episode
     )[0]
@@ -210,6 +217,7 @@ def resolve_training_run_checkpoint(
         },
         expected_completed_episodes=checkpoint_episode,
         expected_formal_config=expected_training_config,
+        current_training_manifest=training_manifest,
         require_episode_directory=True,
         movement_agent_kind=method.agent,
     )
@@ -234,6 +242,9 @@ def resolve_training_run_checkpoint(
         "checkpoint": checkpoint.resolve(),
         "checkpoint_metadata": inspected["metadata"],
         "checkpoint_artifact_provenance": artifact_provenance,
+        "training_manifest": training_manifest,
+        "training_manifest_path": training_manifest_path,
+        **(inspected.get("horizon_compatibility") or {}),
         "expected_training_config": expected_training_config,
         "checkpoint_required": True,
     }

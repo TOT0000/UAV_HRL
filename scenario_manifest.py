@@ -5,9 +5,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 import hashlib
 import json
+import os
 from pathlib import Path
 import random
 from typing import Any, Iterable
+import uuid
 
 import numpy as np
 
@@ -331,6 +333,27 @@ class ScenarioManifest:
         path.write_text(self.to_json(), encoding="utf-8")
         return path
 
+    def save_atomic(self, path: str | Path, *, overwrite: bool = False) -> Path:
+        """Persist one complete manifest without exposing a partial JSON file."""
+
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if path.exists() and not overwrite:
+            raise FileExistsError(f"scenario manifest already exists: {path}")
+        temporary = path.parent / f".{path.name}.tmp-{uuid.uuid4().hex}"
+        try:
+            with temporary.open("w", encoding="utf-8", newline="\n") as handle:
+                handle.write(self.to_json())
+                handle.flush()
+                os.fsync(handle.fileno())
+            if path.exists() and not overwrite:
+                raise FileExistsError(f"scenario manifest already exists: {path}")
+            temporary.replace(path)
+        finally:
+            if temporary.exists():
+                temporary.unlink()
+        return path
+
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "ScenarioManifest":
         if data.get("schema_version") in OBSOLETE_SCHEMA_VERSIONS:
@@ -430,6 +453,114 @@ def generate_manifest(
     return ScenarioManifest.from_dict(
         {**unsigned, "content_hash": sha256_json(unsigned)}
     )
+
+
+def manifest_prefix(manifest: ScenarioManifest, episode_count: int) -> ScenarioManifest:
+    """Return the canonical manifest represented by the requested leading episodes."""
+
+    if not isinstance(manifest, ScenarioManifest):
+        raise TypeError("manifest prefix validation requires a ScenarioManifest")
+    episode_count = int(episode_count)
+    if episode_count <= 0 or episode_count > manifest.episode_count:
+        raise ValueError(
+            "manifest prefix length must be positive and no greater than the manifest"
+        )
+    if episode_count == manifest.episode_count:
+        return manifest
+    unsigned = manifest.unsigned_dict()
+    unsigned["episode_count"] = episode_count
+    unsigned["episodes"] = list(manifest.episodes[:episode_count])
+    return ScenarioManifest.from_dict(
+        {**unsigned, "content_hash": sha256_json(unsigned)}
+    )
+
+
+def validate_manifest_prefix_extension(
+    previous: ScenarioManifest,
+    extended: ScenarioManifest,
+) -> dict[str, Any]:
+    """Validate a deterministic training-manifest extension and report provenance."""
+
+    if previous.split != "train" or extended.split != "train":
+        raise ValueError("horizon extension requires training scenario manifests")
+    if extended.episode_count <= previous.episode_count:
+        raise ValueError("extended training manifest must contain additional episodes")
+    administrative_fields = {"episode_count", "episodes", "content_hash"}
+    previous_contract = {
+        key: value
+        for key, value in previous.to_dict().items()
+        if key not in administrative_fields
+    }
+    extended_contract = {
+        key: value
+        for key, value in extended.to_dict().items()
+        if key not in administrative_fields
+    }
+    if previous_contract != extended_contract:
+        raise ValueError("extended training manifest contract is incompatible")
+    if tuple(extended.episodes[: previous.episode_count]) != previous.episodes:
+        raise ValueError(
+            "extended training manifest does not preserve the exact scenario prefix"
+        )
+    canonical_prefix = manifest_prefix(extended, previous.episode_count)
+    if canonical_prefix.content_hash != previous.content_hash:
+        raise ValueError(
+            "extended training manifest canonical prefix hash is incompatible"
+        )
+    return {
+        "previous_manifest_hash": previous.content_hash,
+        "extended_manifest_hash": extended.content_hash,
+        "preserved_prefix_length": previous.episode_count,
+        "manifest_prefix_compatible": True,
+    }
+
+
+def extend_training_manifest(
+    previous: ScenarioManifest,
+    target_episode_count: int,
+) -> tuple[ScenarioManifest, dict[str, Any]]:
+    """Deterministically extend a training manifest after validating its prefix."""
+
+    target_episode_count = int(target_episode_count)
+    if target_episode_count <= previous.episode_count:
+        raise ValueError("target manifest episode count must exceed the current count")
+    fixed_num_gt = (
+        previous.generation_profile.get("fixed_num_gt")
+        if previous.generation_profile.get("num_gt_mode") == "fixed"
+        else None
+    )
+    extended = generate_manifest(
+        "train",
+        manifest_seed=previous.manifest_seed,
+        episode_count=target_episode_count,
+        num_gt=fixed_num_gt,
+    )
+    provenance = validate_manifest_prefix_extension(previous, extended)
+    return extended, provenance
+
+
+def resolve_training_manifest(run_directory, resolved_config) -> tuple[Path, ScenarioManifest]:
+    """Load the active immutable training manifest declared by a run."""
+
+    run_directory = Path(run_directory).resolve()
+    configured = resolved_config.get(
+        "training_manifest_path", "scenario_manifest.json"
+    )
+    configured_path = Path(str(configured))
+    path = (
+        configured_path.resolve()
+        if configured_path.is_absolute()
+        else (run_directory / configured_path).resolve()
+    )
+    if not path.is_relative_to(run_directory):
+        raise RuntimeError("training manifest path escapes the run directory")
+    manifest = ScenarioManifest.load(path)
+    if manifest.split != "train":
+        raise RuntimeError("run scenario manifest is not a training manifest")
+    expected_hash = resolved_config.get("training_manifest_hash")
+    if expected_hash is not None and expected_hash != manifest.content_hash:
+        raise RuntimeError("run training manifest hash disagrees with resolved config")
+    return path, manifest
 
 
 def validate_disjoint_manifests(manifests: Iterable[ScenarioManifest]) -> None:

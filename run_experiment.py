@@ -7,6 +7,7 @@ from dataclasses import fields
 from datetime import datetime, timezone
 from functools import partial
 import json
+import os
 from pathlib import Path
 import re
 import subprocess
@@ -40,10 +41,19 @@ from resume_recovery import (
     execute_resume_reconciliation,
     plan_resume_reconciliation,
 )
-from scenario_manifest import ScenarioManifest, generate_manifest
+from scenario_manifest import (
+    ScenarioManifest,
+    extend_training_manifest,
+    generate_manifest,
+    resolve_training_manifest,
+)
 from training_checkpoint import (
     inspect_full_resume_checkpoint,
     inspect_model_checkpoint,
+)
+from training_history import (
+    preflight_resume_training_history,
+    training_history_identity,
 )
 
 
@@ -115,6 +125,11 @@ def build_parser():
 
     resume = commands.add_parser("resume", help="exactly resume one run directory")
     resume.add_argument("run_directory")
+    resume.add_argument(
+        "--target-episodes",
+        type=int,
+        help="explicitly extend the planned training horizon before exact resume",
+    )
     resume.set_defaults(method=None)
 
     evaluate = commands.add_parser(
@@ -170,6 +185,23 @@ def _write_json(path, value):
     )
 
 
+def _write_json_atomic(path, value):
+    path = Path(path)
+    temporary = path.parent / f".{path.name}.tmp-{uuid.uuid4().hex}"
+    payload = (
+        json.dumps(value, indent=2, ensure_ascii=False, allow_nan=False) + "\n"
+    )
+    try:
+        with temporary.open("w", encoding="utf-8", newline="\n") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        temporary.replace(path)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+
+
 def _read_json(path):
     path = Path(path)
     if not path.is_file():
@@ -186,9 +218,7 @@ def _load_run_context(run_directory):
     method = MethodSpec.parse(resolved["method"])
     if resolved.get("method_spec") != method.to_dict():
         raise RuntimeError("run method metadata is incompatible with the registry")
-    manifest = ScenarioManifest.load(run_dir / "scenario_manifest.json")
-    if manifest.split != "train":
-        raise RuntimeError("run scenario manifest is not a training manifest")
+    _, manifest = resolve_training_manifest(run_dir, resolved)
     if int(resolved["seed"]) != int(manifest.manifest_seed):
         raise RuntimeError("run seed is incompatible with its scenario manifest")
     return run_dir, resolved, method, manifest
@@ -238,6 +268,8 @@ def _base_resolved(run_dir, method, manifest, config, values, args, git_sha):
         ),
         "training_config": effective_training_config(config, method),
         "training_manifest_hash": manifest.content_hash,
+        "training_manifest_path": "scenario_manifest.json",
+        "training_history_manifest_hash": manifest.content_hash,
         "started_at": datetime.now(timezone.utc).isoformat(),
         "git_sha": git_sha,
         "run_directory": str(run_dir),
@@ -326,8 +358,57 @@ def _episode_directories(root):
 
 def run_resume(args):
     run_dir, resolved, method, manifest = _load_run_context(args.run_directory)
+    try:
+        previous_total = int(resolved["training_config"]["total_episodes"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise RuntimeError("run training horizon is invalid") from exc
+    if previous_total <= 0 or manifest.episode_count != previous_total:
+        raise RuntimeError(
+            "run training manifest length disagrees with its planned horizon"
+        )
+
+    target_episodes = args.target_episodes
+    extension_provenance = None
+    active_manifest = manifest
+    active_manifest_path, _ = resolve_training_manifest(run_dir, resolved)
+    if target_episodes is not None:
+        target_episodes = int(target_episodes)
+        if target_episodes <= previous_total:
+            raise ValueError(
+                "target-episodes must exceed the current planned training horizon: "
+                f"target={target_episodes}, current={previous_total}"
+            )
+        active_manifest, manifest_provenance = extend_training_manifest(
+            manifest, target_episodes
+        )
+        relative_manifest_path = Path("scenario_manifests") / (
+            f"train_ep_{target_episodes:04d}_{active_manifest.content_hash[:12]}.json"
+        )
+        active_manifest_path = (run_dir / relative_manifest_path).resolve()
+        if active_manifest_path.exists():
+            recovered = ScenarioManifest.load(active_manifest_path)
+            if recovered.content_hash != active_manifest.content_hash:
+                raise FileExistsError(
+                    "existing extended manifest path has incompatible content: "
+                    f"{active_manifest_path}"
+                )
+        extension_provenance = {
+            "previous_total_episodes": previous_total,
+            "target_total_episodes": target_episodes,
+            **manifest_provenance,
+            "previous_manifest_path": str(
+                resolve_training_manifest(run_dir, resolved)[0]
+            ),
+            "extended_manifest_path": str(active_manifest_path),
+        }
+
     config = _training_config_from_resolved(
         resolved,
+        **(
+            {"total_episodes": target_episodes}
+            if target_episodes is not None
+            else {}
+        ),
         resume_dir=None,
         checkpoint_root=str(run_dir / "checkpoints"),
         run_directory=str(run_dir),
@@ -338,7 +419,7 @@ def run_resume(args):
     _, calibration = load_com_capacity_reference()
     expected_experiment = {
         "method_spec_fingerprint": method.compatible_fingerprints,
-        "manifest_hash": manifest.content_hash,
+        "manifest_hash": active_manifest.content_hash,
         "training_seed": int(resolved["seed"]),
     }
     inspect_full = partial(
@@ -351,6 +432,7 @@ def run_resume(args):
         calibration=calibration,
         expected_experiment_metadata=expected_experiment,
         expected_formal_config=formal_config,
+        current_training_manifest=active_manifest,
         require_episode_directory=True,
         movement_agent_kind=method.agent,
     )
@@ -364,6 +446,7 @@ def run_resume(args):
         calibration=calibration,
         expected_experiment_metadata=expected_experiment,
         expected_formal_config=formal_config,
+        current_training_manifest=active_manifest,
         require_episode_directory=True,
         movement_agent_kind=method.agent,
     )
@@ -388,19 +471,64 @@ def run_resume(args):
         inspect_full=inspect_full,
         inspect_model=inspect_model,
     )
+    if target_episodes is not None and target_episodes <= plan.resume_episode:
+        raise ValueError(
+            "target-episodes must exceed the latest completed episode: "
+            f"target={target_episodes}, completed={plan.resume_episode}"
+        )
+    history_manifest_hash = str(
+        resolved.get("training_history_manifest_hash", manifest.content_hash)
+    )
+    preflight_resume_training_history(
+        run_dir,
+        training_history_identity(
+            method.method_id,
+            int(resolved["seed"]),
+            history_manifest_hash,
+        ),
+        checkpoint_rows=plan.resume_training_state.get(
+            "training_history_rows", ()
+        ),
+    )
     reconciliation = execute_resume_reconciliation(plan)
+    if extension_provenance is not None:
+        if not active_manifest_path.exists():
+            active_manifest.save_atomic(active_manifest_path)
+        extension_provenance.update(
+            extended_at=datetime.now(timezone.utc).isoformat(),
+            resume_checkpoint=str(checkpoint),
+            resume_episode=plan.resume_episode,
+        )
     config.resume_dir = str(checkpoint)
     resolved.update(
         status="RUNNING",
         resumed_at=datetime.now(timezone.utc).isoformat(),
         resume_checkpoint=str(checkpoint),
         resume_episode=plan.resume_episode,
+        episodes=int(config.total_episodes),
         training_config=formal_config,
-        effective_movement_agent_configuration=movement_agent_configuration(method),
+        training_manifest_hash=active_manifest.content_hash,
+        training_manifest_path=str(active_manifest_path.relative_to(run_dir)),
+        training_history_manifest_hash=history_manifest_hash,
+        effective_movement_agent_configuration=movement_agent_configuration(
+            method, config
+        ),
     )
-    _write_json(run_dir / "resolved_config.json", resolved)
+    if extension_provenance is not None:
+        history = list(resolved.get("horizon_extension_history") or ())
+        history.append(extension_provenance)
+        resolved.update(
+            horizon_extension_provenance=extension_provenance,
+            horizon_extension_history=history,
+        )
+    _write_json_atomic(run_dir / "resolved_config.json", resolved)
     try:
-        result = train(config, scenario_manifest=manifest, method_spec=method)
+        result = train(
+            config,
+            scenario_manifest=active_manifest,
+            method_spec=method,
+            training_history_manifest_hash=history_manifest_hash,
+        )
         resolved.update(
             status="COMPLETED",
             completed_at=datetime.now(timezone.utc).isoformat(),
@@ -409,14 +537,14 @@ def run_resume(args):
             resume_reconciliation=reconciliation,
         )
         _write_json(run_dir / "run_metadata.json", {**result["run_metadata"], **resolved})
-        _write_json(run_dir / "resolved_config.json", resolved)
+        _write_json_atomic(run_dir / "resolved_config.json", resolved)
     except BaseException as exc:
         resolved.update(
             status="FAILED",
             completed_at=datetime.now(timezone.utc).isoformat(),
             error={"type": type(exc).__name__, "message": str(exc)},
         )
-        _write_json(run_dir / "resolved_config.json", resolved)
+        _write_json_atomic(run_dir / "resolved_config.json", resolved)
         raise
     print(json.dumps({"run_directory": str(run_dir), "status": "COMPLETED", "resumed_from": str(checkpoint)}))
     return 0
@@ -482,7 +610,7 @@ def run_evaluate(args):
     )
     expected_training_config = dict(resolved["training_config"])
     _, calibration = load_com_capacity_reference()
-    inspect_model_checkpoint(
+    inspected = inspect_model_checkpoint(
         checkpoint,
         movement_state_dim=MOVEMENT_STATE_DIM,
         joint_action_dim=JOINT_ACTION_DIM,
@@ -496,6 +624,7 @@ def run_evaluate(args):
         },
         expected_completed_episodes=checkpoint_episode,
         expected_formal_config=expected_training_config,
+        current_training_manifest=training_manifest,
         require_episode_directory=True,
         movement_agent_kind=method.agent,
     )
@@ -524,6 +653,7 @@ def run_evaluate(args):
         checkpoint_dir=checkpoint,
         expected_checkpoint_episodes=checkpoint_episode,
         expected_checkpoint_formal_config=expected_training_config,
+        expected_checkpoint_training_manifest=training_manifest,
     )
     formal_evaluation = bool(
         not args.smoke
@@ -536,6 +666,7 @@ def run_evaluate(args):
         **result["run_metadata"],
         "checkpoint": str(checkpoint.resolve()),
         "checkpoint_episode": checkpoint_episode,
+        **inspected["horizon_compatibility"],
         "evaluation_invariants": result["evaluation_invariants"],
         "evaluation_manifest": str((output_dir / "scenario_manifest.json").resolve()),
         "evaluation_run_directory": str(output_dir),

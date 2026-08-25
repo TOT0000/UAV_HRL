@@ -23,6 +23,7 @@ from experiment_config import (
     SAFE_DDQN_QOS_TARGET_PROBABILITY,
 )
 from fov_ema_lifecycle import validate_fov_ema_state
+from scenario_manifest import ScenarioManifest, manifest_prefix
 
 from dinkelbach_blocks import (
     DINKELBACH_CONFIG_FIELDS,
@@ -168,6 +169,17 @@ FULL_RESUME_CONFIG_FIELDS = (
     "full_resume_keep_last",
     "formal_evaluation_episode",
     "random_seed",
+)
+HORIZON_EXTENSION_ADMINISTRATIVE_FIELDS = ("total_episodes",)
+CHECKPOINT_HORIZON_COMPATIBILITY_FIELDS = (
+    "checkpoint_episode",
+    "checkpoint_planned_total_episodes",
+    "current_training_run_total_episodes",
+    "horizon_extension_compatible",
+    "allowed_horizon_differences",
+    "checkpoint_training_manifest_hash",
+    "current_training_manifest_hash",
+    "manifest_prefix_compatible",
 )
 
 
@@ -988,6 +1000,124 @@ def _validate_formal_config(actual_config, expected_config, fields):
         )
 
 
+def _positive_horizon(config, label):
+    if not isinstance(config, dict):
+        raise RuntimeError(f"{label} formal training configuration is missing")
+    raw_total = config.get("total_episodes")
+    try:
+        total = int(raw_total)
+    except (KeyError, TypeError, ValueError) as exc:
+        raise RuntimeError(f"{label} total_episodes is invalid") from exc
+    if isinstance(raw_total, bool) or total != raw_total or total <= 0:
+        raise RuntimeError(f"{label} total_episodes must be a positive integer")
+    return total
+
+
+def validate_checkpoint_run_compatibility(
+    checkpoint_formal_config,
+    current_formal_config,
+    *,
+    checkpoint_episode,
+    config_fields=FORMAL_CORE_CONFIG_FIELDS,
+    checkpoint_training_manifest_hash=None,
+    current_training_manifest=None,
+):
+    """Apply the canonical monotonic horizon-extension compatibility policy."""
+
+    checkpoint_total = _positive_horizon(
+        checkpoint_formal_config, "checkpoint planned"
+    )
+    current_total = _positive_horizon(current_formal_config, "current run")
+    try:
+        checkpoint_episode = int(checkpoint_episode)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("checkpoint episode is invalid") from exc
+    if checkpoint_episode <= 0:
+        raise RuntimeError("checkpoint episode must be positive")
+    if checkpoint_episode > checkpoint_total:
+        raise RuntimeError(
+            "checkpoint episode exceeds its planned training horizon: "
+            f"checkpoint={checkpoint_episode}, planned={checkpoint_total}"
+        )
+    if checkpoint_episode > current_total:
+        raise RuntimeError(
+            "checkpoint episode exceeds the current run horizon: "
+            f"checkpoint={checkpoint_episode}, current={current_total}"
+        )
+    if checkpoint_total > current_total:
+        raise RuntimeError(
+            "checkpoint planned horizon exceeds the current run horizon: "
+            f"checkpoint={checkpoint_total}, current={current_total}"
+        )
+
+    strict_fields = tuple(
+        field
+        for field in config_fields
+        if field not in HORIZON_EXTENSION_ADMINISTRATIVE_FIELDS
+    )
+    _validate_formal_config(
+        checkpoint_formal_config,
+        current_formal_config,
+        strict_fields,
+    )
+    allowed_differences = [
+        field
+        for field in HORIZON_EXTENSION_ADMINISTRATIVE_FIELDS
+        if not _metadata_value_matches(
+            checkpoint_formal_config.get(field), current_formal_config.get(field)
+        )
+    ]
+    horizon_extension = bool(allowed_differences)
+    if horizon_extension and checkpoint_total >= current_total:
+        raise RuntimeError("checkpoint horizon difference is not a monotonic extension")
+
+    current_manifest_hash = None
+    manifest_prefix_compatible = None
+    if current_training_manifest is not None:
+        if not isinstance(current_training_manifest, ScenarioManifest):
+            raise TypeError("current training manifest must be a ScenarioManifest")
+        if current_training_manifest.split != "train":
+            raise RuntimeError("current run manifest is not a training manifest")
+        if current_training_manifest.episode_count != current_total:
+            raise RuntimeError(
+                "current training manifest length disagrees with the run horizon: "
+                f"manifest={current_training_manifest.episode_count}, "
+                f"current={current_total}"
+            )
+        current_manifest_hash = current_training_manifest.content_hash
+        if not checkpoint_training_manifest_hash:
+            raise RuntimeError("checkpoint training manifest hash is missing")
+        expected_manifest = (
+            manifest_prefix(current_training_manifest, checkpoint_total)
+            if horizon_extension
+            else current_training_manifest
+        )
+        if checkpoint_training_manifest_hash != expected_manifest.content_hash:
+            relationship = "prefix" if horizon_extension else "current manifest"
+            raise RuntimeError(
+                "checkpoint training manifest is incompatible with the "
+                f"{relationship}: checkpoint={checkpoint_training_manifest_hash}, "
+                f"expected={expected_manifest.content_hash}"
+            )
+        manifest_prefix_compatible = True
+    elif horizon_extension:
+        raise RuntimeError(
+            "checkpoint horizon extension requires canonical training manifest "
+            "prefix validation"
+        )
+
+    return {
+        "checkpoint_episode": checkpoint_episode,
+        "checkpoint_planned_total_episodes": checkpoint_total,
+        "current_training_run_total_episodes": current_total,
+        "horizon_extension_compatible": horizon_extension,
+        "allowed_horizon_differences": allowed_differences,
+        "checkpoint_training_manifest_hash": checkpoint_training_manifest_hash,
+        "current_training_manifest_hash": current_manifest_hash,
+        "manifest_prefix_compatible": manifest_prefix_compatible,
+    }
+
+
 def _validate_dinkelbach_checkpoint_metadata(metadata, expected_formal_config):
     experiment = metadata.get("experiment") or {}
     actual_formal_config = experiment.get("formal_config")
@@ -1122,6 +1252,37 @@ def _formal_config_for_validation(metadata, actual_config, expected_config):
     return actual_config
 
 
+def checkpoint_run_compatibility_from_metadata(
+    metadata,
+    current_formal_config,
+    *,
+    checkpoint_episode=None,
+    config_fields=FORMAL_CORE_CONFIG_FIELDS,
+    current_training_manifest=None,
+):
+    """Validate one checkpoint against its current run and return provenance."""
+
+    experiment = metadata.get("experiment") or {}
+    checkpoint_formal_config = _formal_config_for_validation(
+        metadata,
+        experiment.get("formal_config"),
+        current_formal_config,
+    )
+    resolved_episode = (
+        int(metadata["episode"]) + 1
+        if checkpoint_episode is None
+        else int(checkpoint_episode)
+    )
+    return validate_checkpoint_run_compatibility(
+        checkpoint_formal_config,
+        current_formal_config,
+        checkpoint_episode=resolved_episode,
+        config_fields=config_fields,
+        checkpoint_training_manifest_hash=experiment.get("manifest_hash"),
+        current_training_manifest=current_training_manifest,
+    )
+
+
 def _movement_gamma_key(metadata, schema):
     kind = metadata.get("movement_agent_kind", "td3")
     if kind == "td3" and "centralized_td3_gamma" in metadata:
@@ -1159,6 +1320,7 @@ def validate_model_checkpoint_metadata(
     expected_experiment_metadata=None,
     expected_completed_episodes=None,
     expected_formal_config=None,
+    current_training_manifest=None,
     movement_agent_kind=None,
     allow_incomplete_provenance=False,
 ):
@@ -1206,7 +1368,9 @@ def validate_model_checkpoint_metadata(
 
     if expected_experiment_metadata is not None:
         validate_checkpoint_experiment_metadata(
-            metadata, expected_experiment_metadata
+            metadata,
+            expected_experiment_metadata,
+            current_training_manifest=current_training_manifest,
         )
 
     if expected_completed_episodes is not None:
@@ -1222,18 +1386,25 @@ def validate_model_checkpoint_metadata(
             )
 
     if expected_formal_config is not None:
-        experiment = metadata.get("experiment") or {}
-        _validate_formal_config(
-            _formal_config_for_validation(
-                metadata, experiment.get("formal_config"), expected_formal_config
-            ),
+        checkpoint_run_compatibility_from_metadata(
+            metadata,
             expected_formal_config,
-            FORMAL_CORE_CONFIG_FIELDS,
+            checkpoint_episode=(
+                int(metadata["episode"]) + 1
+                if expected_completed_episodes is None
+                else int(expected_completed_episodes)
+            ),
+            config_fields=FORMAL_CORE_CONFIG_FIELDS,
+            current_training_manifest=current_training_manifest,
         )
         if _checkpoint_uses_dinkelbach(metadata):
             _validate_dinkelbach_checkpoint_metadata(
                 metadata, expected_formal_config
             )
+    elif current_training_manifest is not None:
+        raise ValueError(
+            "current training manifest validation requires the current formal config"
+        )
     experiment = metadata.get("experiment") or {}
     if (
         schema >= PRE_MOVEMENT_MASK_CHECKPOINT_SCHEMA_VERSION
@@ -1261,6 +1432,7 @@ def inspect_model_checkpoint(
     expected_experiment_metadata=None,
     expected_completed_episodes=None,
     expected_formal_config=None,
+    current_training_manifest=None,
     require_episode_directory=False,
     movement_agent_kind=None,
     allow_incomplete_provenance=False,
@@ -1284,6 +1456,7 @@ def inspect_model_checkpoint(
         expected_experiment_metadata=expected_experiment_metadata,
         expected_completed_episodes=expected_completed_episodes,
         expected_formal_config=expected_formal_config,
+        current_training_manifest=current_training_manifest,
         movement_agent_kind=movement_agent_kind,
         allow_incomplete_provenance=allow_incomplete_provenance,
     )
@@ -1294,10 +1467,22 @@ def inspect_model_checkpoint(
         if require_episode_directory
         else int(metadata["episode"]) + 1
     )
+    horizon_compatibility = (
+        checkpoint_run_compatibility_from_metadata(
+            metadata,
+            expected_formal_config,
+            checkpoint_episode=completed_episode,
+            config_fields=FORMAL_CORE_CONFIG_FIELDS,
+            current_training_manifest=current_training_manifest,
+        )
+        if expected_formal_config is not None
+        else None
+    )
     return {
         "checkpoint_dir": checkpoint_dir,
         "completed_episode": completed_episode,
         "metadata": metadata,
+        "horizon_compatibility": horizon_compatibility,
     }
 
 
@@ -1313,6 +1498,7 @@ def load_model_checkpoint(
     expected_experiment_metadata=None,
     expected_completed_episodes=None,
     expected_formal_config=None,
+    current_training_manifest=None,
     allow_incomplete_provenance=False,
 ):
     checkpoint_dir = Path(checkpoint_dir).resolve()
@@ -1327,6 +1513,7 @@ def load_model_checkpoint(
         expected_experiment_metadata=expected_experiment_metadata,
         expected_completed_episodes=expected_completed_episodes,
         expected_formal_config=expected_formal_config,
+        current_training_manifest=current_training_manifest,
         movement_agent_kind=_agent_kind(td3),
         allow_incomplete_provenance=allow_incomplete_provenance,
     )
@@ -1914,6 +2101,7 @@ def _validate_full_metadata(
     ddqn_gamma,
     calibration,
     expected_experiment_metadata=None,
+    current_training_manifest=None,
     movement_agent_kind=None,
 ):
     if metadata.get("checkpoint_type") != FULL_CHECKPOINT_TYPE:
@@ -1961,12 +2149,19 @@ def _validate_full_metadata(
         raise RuntimeError("checkpoint COM calibration fingerprint is incompatible")
     if expected_experiment_metadata is not None:
         validate_checkpoint_experiment_metadata(
-            metadata, expected_experiment_metadata
+            metadata,
+            expected_experiment_metadata,
+            current_training_manifest=current_training_manifest,
         )
     _validate_safe_ddqn_constraint_metadata(metadata)
 
 
-def validate_checkpoint_experiment_metadata(metadata, expected):
+def validate_checkpoint_experiment_metadata(
+    metadata,
+    expected,
+    *,
+    current_training_manifest=None,
+):
     """Validate only requested experiment identity fields for compatibility."""
 
     actual = metadata.get("experiment")
@@ -1974,6 +2169,8 @@ def validate_checkpoint_experiment_metadata(metadata, expected):
         raise RuntimeError("checkpoint has no experiment identity metadata")
     mismatches = {}
     for key, value in expected.items():
+        if key == "manifest_hash" and current_training_manifest is not None:
+            continue
         actual_value = actual.get(key)
         if isinstance(value, list):
             matches = actual_value == value
@@ -2000,6 +2197,7 @@ def inspect_full_resume_checkpoint(
     calibration,
     expected_experiment_metadata=None,
     expected_formal_config=None,
+    current_training_manifest=None,
     require_episode_directory=False,
     movement_agent_kind=None,
 ):
@@ -2019,6 +2217,10 @@ def inspect_full_resume_checkpoint(
             )
         raise FileNotFoundError(f"checkpoint metadata is missing: {metadata_path}")
     metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    if current_training_manifest is not None and expected_formal_config is None:
+        raise ValueError(
+            "current training manifest validation requires the current formal config"
+        )
     _validate_full_metadata(
         metadata,
         movement_state_dim=movement_state_dim,
@@ -2028,6 +2230,7 @@ def inspect_full_resume_checkpoint(
         ddqn_gamma=ddqn_gamma,
         calibration=calibration,
         expected_experiment_metadata=expected_experiment_metadata,
+        current_training_manifest=current_training_manifest,
         movement_agent_kind=movement_agent_kind,
     )
     completed_episode = (
@@ -2075,21 +2278,24 @@ def inspect_full_resume_checkpoint(
             f"completed={state_completed}, next={state_next}, "
             f"metadata={completed_episode}"
         )
-    if expected_formal_config is not None:
-        experiment = metadata.get("experiment") or {}
+    experiment = metadata.get("experiment") or {}
+    experiment_formal_config = experiment.get("formal_config")
+    if isinstance(experiment_formal_config, dict):
         _validate_formal_config(
             _formal_config_for_validation(
-                metadata, experiment.get("formal_config"), expected_formal_config
+                metadata, formal_config, experiment_formal_config
             ),
-            expected_formal_config,
+            experiment_formal_config,
             FULL_RESUME_CONFIG_FIELDS,
         )
-        _validate_formal_config(
-            _formal_config_for_validation(
-                metadata, formal_config, expected_formal_config
-            ),
+    horizon_compatibility = None
+    if expected_formal_config is not None:
+        horizon_compatibility = checkpoint_run_compatibility_from_metadata(
+            metadata,
             expected_formal_config,
-            FULL_RESUME_CONFIG_FIELDS,
+            checkpoint_episode=completed_episode,
+            config_fields=FULL_RESUME_CONFIG_FIELDS,
+            current_training_manifest=current_training_manifest,
         )
         if _checkpoint_uses_dinkelbach(metadata):
             _validate_dinkelbach_checkpoint_metadata(
@@ -2184,6 +2390,7 @@ def inspect_full_resume_checkpoint(
         "training_state": training_state,
         "formal_config": formal_config,
         "payload": payload,
+        "horizon_compatibility": horizon_compatibility,
     }
 
 
@@ -2200,6 +2407,7 @@ def load_full_resume_checkpoint(
     calibration,
     expected_experiment_metadata=None,
     expected_formal_config=None,
+    current_training_manifest=None,
 ):
     checkpoint_dir = Path(checkpoint_dir).resolve()
     inspected = inspect_full_resume_checkpoint(
@@ -2212,6 +2420,7 @@ def load_full_resume_checkpoint(
         calibration=calibration,
         expected_experiment_metadata=expected_experiment_metadata,
         expected_formal_config=expected_formal_config,
+        current_training_manifest=current_training_manifest,
         movement_agent_kind=_agent_kind(td3),
     )
     metadata = inspected["metadata"]
@@ -2260,4 +2469,5 @@ def load_full_resume_checkpoint(
         "metadata": metadata,
         "training_state": payload["training_state"],
         "formal_config": payload["formal_config"],
+        "horizon_compatibility": inspected["horizon_compatibility"],
     }

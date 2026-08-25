@@ -90,6 +90,7 @@ from training_checkpoint import (
     checkpoint_artifact_provenance,
     checkpoint_episode_schedule,
     checkpoint_training_provenance,
+    checkpoint_run_compatibility_from_metadata,
     load_full_resume_checkpoint,
     load_model_checkpoint,
     save_full_resume_checkpoint,
@@ -1397,6 +1398,8 @@ def train(
     checkpoint_dir=None,
     expected_checkpoint_episodes=None,
     expected_checkpoint_formal_config=None,
+    expected_checkpoint_training_manifest=None,
+    training_history_manifest_hash=None,
     transition_observer=None,
     episode_observer=None,
     evaluation_overrides=None,
@@ -1541,7 +1544,11 @@ def train(
         history_identity = training_history_identity(
             method_spec.method_id,
             config.random_seed,
-            scenario_manifest.content_hash,
+            (
+                scenario_manifest.content_hash
+                if training_history_manifest_hash is None
+                else str(training_history_manifest_hash)
+            ),
         )
     loaded_checkpoint_metadata = None
     checkpoint_provenance = {}
@@ -1560,6 +1567,7 @@ def train(
             },
             expected_completed_episodes=expected_checkpoint_episodes,
             expected_formal_config=expected_checkpoint_formal_config,
+            current_training_manifest=expected_checkpoint_training_manifest,
         )
         checkpoint_experiment = loaded_checkpoint_metadata["experiment"]
         loaded_training_provenance = checkpoint_training_provenance(
@@ -1567,6 +1575,16 @@ def train(
         )
         artifact_provenance = checkpoint_artifact_provenance(
             checkpoint_dir, metadata=loaded_checkpoint_metadata
+        )
+        horizon_compatibility = (
+            checkpoint_run_compatibility_from_metadata(
+                loaded_checkpoint_metadata,
+                expected_checkpoint_formal_config,
+                checkpoint_episode=expected_checkpoint_episodes,
+                current_training_manifest=expected_checkpoint_training_manifest,
+            )
+            if expected_checkpoint_formal_config is not None
+            else {}
         )
         checkpoint_provenance = {
             "training_manifest_hash": checkpoint_experiment.get("manifest_hash"),
@@ -1585,6 +1603,7 @@ def train(
             "checkpoint_training_git_sha": loaded_training_provenance[
                 "training_git_sha"
             ],
+            **horizon_compatibility,
             "checkpoint_schema_version": loaded_checkpoint_metadata.get(
                 "checkpoint_schema_version"
             ),
@@ -1677,6 +1696,7 @@ def train(
         [] if packet_outcome_mode == PACKET_OUTCOME_MODE_BOUNDED else None
     )
     packet_outcome_streamed_episode_count = 0
+    resume_checkpoint_compatibility = None
     if config.resume_dir is not None:
         if not os.path.isdir(config.resume_dir):
             raise FileNotFoundError(f"centralized checkpoint not found: {config.resume_dir}")
@@ -1704,8 +1724,10 @@ def train(
                 ),
             },
             expected_formal_config=formal_config,
+            current_training_manifest=scenario_manifest,
         )
         training_state = restored["training_state"]
+        resume_checkpoint_compatibility = restored["horizon_compatibility"]
         start_episode = int(training_state["next_episode_index"])
         if method_spec.uses_dinkelbach:
             dinkelbach_state = DinkelbachBlockState.from_training_state(
@@ -2929,6 +2951,7 @@ def train(
         "run_metadata": {
             **experiment_identity,
             **checkpoint_provenance,
+            "resume_checkpoint_compatibility": resume_checkpoint_compatibility,
             "checkpoint_training_provenance": copy.deepcopy(
                 checkpoint_training
             ),

@@ -41,6 +41,7 @@ from paper_metrics import (
 )
 from scenario_manifest import ScenarioManifest, generate_manifest
 from training_checkpoint import (
+    CHECKPOINT_HORIZON_COMPATIBILITY_FIELDS,
     CHECKPOINT_PROVENANCE_FIELDS,
     EVALUATION_PROVENANCE_FIELDS,
 )
@@ -515,6 +516,9 @@ def run_paper_evaluation(
                 expected_checkpoint_formal_config=(
                     context["expected_training_config"]
                 ),
+                expected_checkpoint_training_manifest=context.get(
+                    "training_manifest"
+                ),
                 evaluation_overrides=point.get("overrides"),
                 trajectory_snapshot_times=point.get("snapshot_times_seconds"),
                 trajectory_target_uav_id=(
@@ -563,6 +567,10 @@ def run_paper_evaluation(
             "formal_checkpoint_episode": FORMAL_CHECKPOINT_EPISODE,
             "is_formal_checkpoint": is_formal_checkpoint,
             "evaluation_purpose": evaluation_purpose,
+            **{
+                field: context.get(field)
+                for field in CHECKPOINT_HORIZON_COMPATIBILITY_FIELDS
+            },
             "scenario_manifest": str((point_dir / "scenario_manifest.json").resolve()),
         }
         outputs = write_evaluation_outputs(point_dir, result["episode_metrics"], run_metadata)
@@ -633,6 +641,10 @@ def run_paper_evaluation(
                 "is_formal_checkpoint": is_formal_checkpoint,
                 "evaluation_purpose": evaluation_purpose,
                 **{
+                    field: context.get(field)
+                    for field in CHECKPOINT_HORIZON_COMPATIBILITY_FIELDS
+                },
+                **{
                     field: result["run_metadata"].get(field)
                     for field in (
                         *CHECKPOINT_PROVENANCE_FIELDS,
@@ -675,6 +687,10 @@ def run_paper_evaluation(
         "formal_checkpoint_episode": FORMAL_CHECKPOINT_EPISODE,
         "is_formal_checkpoint": is_formal_checkpoint,
         "evaluation_purpose": evaluation_purpose,
+        **{
+            field: context.get(field)
+            for field in CHECKPOINT_HORIZON_COMPATIBILITY_FIELDS
+        },
         **{
             field: point_results[0].get(field) if point_results else None
             for field in (

@@ -8,11 +8,149 @@ import numpy as np
 import torch
 
 from observation_strategy import MOVEMENT_TASK_ASSIGNMENT_INDICES
+from evaluation_selection import resolve_training_run_checkpoint
 from run_experiment import main
+from scenario_manifest import ScenarioManifest, manifest_prefix
 from Simulator import Simulator
 
 
 class SimpleRunnerLifecycleIntegrationTest(unittest.TestCase):
+    def test_explicit_horizon_extension_preserves_old_checkpoint_and_history(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output = Path(temp_dir) / "results"
+            self.assertEqual(
+                main(
+                    [
+                        "td3_ratio",
+                        "--episodes",
+                        "1",
+                        "--episode-seconds",
+                        "1",
+                        "--checkpoint-interval",
+                        "1",
+                        "--roi-count",
+                        "2",
+                        "--output-root",
+                        str(output),
+                    ]
+                ),
+                0,
+            )
+            run_dir = next((output / "td3_ratio").iterdir())
+            original_manifest_path = run_dir / "scenario_manifest.json"
+            original_manifest_bytes = original_manifest_path.read_bytes()
+            original_manifest = ScenarioManifest.load(original_manifest_path)
+            old_checkpoint = run_dir / "checkpoints" / "models" / "ep_0001"
+            old_models_bytes = (old_checkpoint / "models.pt").read_bytes()
+            old_metadata_bytes = (old_checkpoint / "metadata.json").read_bytes()
+            history_before = [
+                json.loads(line)
+                for line in (run_dir / "training_history.jsonl")
+                .read_text(encoding="utf-8")
+                .splitlines()
+                if line
+            ]
+            evaluation_marker = run_dir / "evaluation" / "existing.txt"
+            evaluation_marker.parent.mkdir()
+            evaluation_marker.write_text("preserve", encoding="utf-8")
+
+            self.assertEqual(
+                main(["resume", str(run_dir), "--target-episodes", "3"]), 0
+            )
+
+            resolved = json.loads(
+                (run_dir / "resolved_config.json").read_text(encoding="utf-8")
+            )
+            active_manifest = ScenarioManifest.load(
+                run_dir / resolved["training_manifest_path"]
+            )
+            self.assertEqual(resolved["episodes"], 3)
+            self.assertEqual(resolved["training_config"]["total_episodes"], 3)
+            self.assertEqual(active_manifest.episode_count, 3)
+            self.assertEqual(
+                manifest_prefix(active_manifest, 1).content_hash,
+                original_manifest.content_hash,
+            )
+            provenance = resolved["horizon_extension_provenance"]
+            self.assertEqual(provenance["previous_total_episodes"], 1)
+            self.assertEqual(provenance["target_total_episodes"], 3)
+            self.assertEqual(provenance["preserved_prefix_length"], 1)
+            self.assertEqual(original_manifest_path.read_bytes(), original_manifest_bytes)
+            self.assertEqual((old_checkpoint / "models.pt").read_bytes(), old_models_bytes)
+            self.assertEqual(
+                (old_checkpoint / "metadata.json").read_bytes(), old_metadata_bytes
+            )
+            self.assertEqual(evaluation_marker.read_text(encoding="utf-8"), "preserve")
+            self.assertTrue(
+                (run_dir / "checkpoints" / "models" / "ep_0002").is_dir()
+            )
+            self.assertTrue(
+                (run_dir / "checkpoints" / "models" / "ep_0003").is_dir()
+            )
+            self.assertTrue(
+                (run_dir / "checkpoints" / "full" / "ep_0003").is_dir()
+            )
+            history_after = [
+                json.loads(line)
+                for line in (run_dir / "training_history.jsonl")
+                .read_text(encoding="utf-8")
+                .splitlines()
+                if line
+            ]
+            self.assertEqual([row["episode"] for row in history_after], [1, 2, 3])
+            self.assertEqual(history_after[0], history_before[0])
+            self.assertEqual(
+                {row["training_manifest_hash"] for row in history_after},
+                {original_manifest.content_hash},
+            )
+
+            old_context = resolve_training_run_checkpoint(run_dir, 1)
+            self.assertEqual(old_context["checkpoint_planned_total_episodes"], 1)
+            self.assertEqual(old_context["current_training_run_total_episodes"], 3)
+            self.assertTrue(old_context["horizon_extension_compatible"])
+            self.assertEqual(
+                old_context["allowed_horizon_differences"], ["total_episodes"]
+            )
+            self.assertTrue(old_context["manifest_prefix_compatible"])
+            new_context = resolve_training_run_checkpoint(run_dir, 3)
+            self.assertEqual(new_context["checkpoint_planned_total_episodes"], 3)
+            self.assertFalse(new_context["horizon_extension_compatible"])
+            self.assertEqual(new_context["allowed_horizon_differences"], [])
+
+            self.assertEqual(
+                main(
+                    [
+                        "evaluate",
+                        str(run_dir),
+                        "--checkpoint-episode",
+                        "1",
+                        "--smoke",
+                    ]
+                ),
+                0,
+            )
+            evaluation_dir = next(
+                (run_dir / "evaluation" / "ep_1").iterdir()
+            )
+            evaluation_metadata = json.loads(
+                (evaluation_dir / "run_metadata.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(
+                evaluation_metadata["checkpoint_planned_total_episodes"], 1
+            )
+            self.assertEqual(
+                evaluation_metadata["current_training_run_total_episodes"], 3
+            )
+            self.assertTrue(
+                evaluation_metadata["horizon_extension_compatible"]
+            )
+            self.assertTrue(evaluation_metadata["manifest_prefix_compatible"])
+
+            with self.assertRaisesRegex(ValueError, "planned training horizon"):
+                main(["resume", str(run_dir), "--target-episodes", "3"])
+
     def test_masked_td3_exact_resume_preserves_true_projection_masks(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             output = Path(temp_dir) / "results"

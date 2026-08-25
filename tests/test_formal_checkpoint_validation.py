@@ -15,7 +15,7 @@ from com_capacity_calibration import load_com_capacity_reference
 from comparison_experiment import main as comparison_main
 from experiment_config import MethodSpec, effective_training_config
 from routing_lifecycle import RoutingLearnerLifecycle
-from scenario_manifest import generate_manifest
+from scenario_manifest import extend_training_manifest, generate_manifest
 from td3 import TD3
 from training_checkpoint import (
     CHECKPOINT_SCHEMA_VERSION,
@@ -23,6 +23,7 @@ from training_checkpoint import (
     calibration_fingerprint,
     load_model_checkpoint,
     save_model_checkpoint,
+    checkpoint_run_compatibility_from_metadata,
     validate_model_checkpoint_metadata,
 )
 
@@ -130,11 +131,138 @@ class FormalCheckpointMetadataTest(unittest.TestCase):
             expected_formal_config=self.formal_config,
         )
 
+    def _metadata_at_episode(self, completed_episodes, formal_config=None):
+        formal_config = deepcopy(formal_config or self.formal_config)
+        metadata = deepcopy(self.metadata)
+        metadata["episode"] = int(completed_episodes) - 1
+        metadata["experiment"]["formal_config"] = formal_config
+        metadata["movement_agent_configuration"] = deepcopy(
+            formal_config["movement_agent_configuration"]
+        )
+        state = DinkelbachBlockState.from_config(formal_config)
+        for _ in range(int(completed_episodes)):
+            state.record_episode(1.0, 2.0)
+        metadata["experiment"].update(
+            lambda_ee=state.current_lambda,
+            dinkelbach_state=state.training_state(),
+            **dinkelbach_config_metadata(formal_config),
+        )
+        resolved = metadata["training_provenance"]["resolved_training_config"]
+        resolved.update(formal_config)
+        resolved["training_episode_count"] = int(completed_episodes)
+        metadata["training_provenance"]["training_episode_count"] = int(
+            completed_episodes
+        )
+        return metadata
+
     def test_synthetic_1500_episode_metadata_is_accepted(self):
         validated = self._validate()
 
         self.assertIs(validated, self.metadata)
         self.assertEqual(validated["episode"] + 1, 1500)
+
+    def test_1500_checkpoint_metadata_accepts_only_monotonic_3000_horizon(self):
+        previous_manifest = generate_manifest("train", self.training_seed, 1500)
+        extended_manifest, _ = extend_training_manifest(previous_manifest, 3000)
+        current_config = deepcopy(self.formal_config)
+        current_config["total_episodes"] = 3000
+
+        for completed in (1000, 1500):
+            with self.subTest(completed=completed):
+                metadata = self._metadata_at_episode(completed)
+                metadata["experiment"]["manifest_hash"] = (
+                    previous_manifest.content_hash
+                )
+                validated = validate_model_checkpoint_metadata(
+                    metadata,
+                    expected_experiment_metadata={
+                        "method_spec_fingerprint": self.method.fingerprint,
+                        "training_seed": self.training_seed,
+                        "manifest_hash": extended_manifest.content_hash,
+                    },
+                    expected_completed_episodes=completed,
+                    expected_formal_config=current_config,
+                    current_training_manifest=extended_manifest,
+                )
+                self.assertIs(validated, metadata)
+                compatibility = checkpoint_run_compatibility_from_metadata(
+                    metadata,
+                    current_config,
+                    current_training_manifest=extended_manifest,
+                )
+                self.assertTrue(
+                    compatibility["horizon_extension_compatible"]
+                )
+                self.assertEqual(
+                    compatibility["allowed_horizon_differences"],
+                    ["total_episodes"],
+                )
+                self.assertTrue(compatibility["manifest_prefix_compatible"])
+                self.assertEqual(
+                    compatibility["checkpoint_planned_total_episodes"], 1500
+                )
+                self.assertEqual(
+                    compatibility["current_training_run_total_episodes"], 3000
+                )
+
+    def test_native_3000_checkpoint_has_no_extension_difference(self):
+        native_config = effective_training_config(
+            formal_training_config(3000, random_seed=self.training_seed),
+            self.method,
+        )
+        native_manifest = generate_manifest("train", self.training_seed, 3000)
+        metadata = self._metadata_at_episode(1000, native_config)
+        metadata["experiment"]["manifest_hash"] = native_manifest.content_hash
+        compatibility = checkpoint_run_compatibility_from_metadata(
+            metadata,
+            native_config,
+            current_training_manifest=native_manifest,
+        )
+        self.assertFalse(compatibility["horizon_extension_compatible"])
+        self.assertEqual(compatibility["allowed_horizon_differences"], [])
+        self.assertTrue(compatibility["manifest_prefix_compatible"])
+
+    def test_horizon_policy_rejects_every_non_administrative_change(self):
+        previous_manifest = generate_manifest("train", self.training_seed, 1500)
+        extended_manifest, _ = extend_training_manifest(previous_manifest, 3000)
+        current_config = deepcopy(self.formal_config)
+        current_config["total_episodes"] = 3000
+        cases = {
+            "reward": ("movement_objective", "wrong-reward"),
+            "energy": ("propulsion_model_id", "wrong-energy"),
+            "qos": ("packet_qos_contract_version", "wrong-qos"),
+            "warmup": ("warmup_joint_transitions", 999),
+            "exploration": ("movement_exploration_decay_episodes", 999),
+        }
+        for label, (field, value) in cases.items():
+            with self.subTest(label=label):
+                metadata = self._metadata_at_episode(1500)
+                metadata["experiment"]["manifest_hash"] = (
+                    previous_manifest.content_hash
+                )
+                metadata["experiment"]["formal_config"][field] = value
+                with self.assertRaisesRegex(RuntimeError, field):
+                    validate_model_checkpoint_metadata(
+                        metadata,
+                        expected_completed_episodes=1500,
+                        expected_formal_config=current_config,
+                        current_training_manifest=extended_manifest,
+                    )
+
+        for key, value in (
+            ("training_seed", self.training_seed + 1),
+            ("method_spec_fingerprint", "wrong-method"),
+        ):
+            metadata = self._metadata_at_episode(1500)
+            metadata["experiment"]["manifest_hash"] = previous_manifest.content_hash
+            with self.assertRaisesRegex(RuntimeError, key):
+                validate_model_checkpoint_metadata(
+                    metadata,
+                    expected_experiment_metadata={key: value},
+                    expected_completed_episodes=1500,
+                    expected_formal_config=current_config,
+                    current_training_manifest=extended_manifest,
+                )
 
     def test_training_and_evaluation_manifest_hashes_may_differ(self):
         metadata = deepcopy(self.metadata)

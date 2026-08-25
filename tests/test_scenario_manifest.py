@@ -12,9 +12,12 @@ from scenario_manifest import (
     POLICY_DEPENDENT_KEYS,
     SCENARIO_SCHEMA_VERSION,
     ScenarioManifest,
+    extend_training_manifest,
     generate_manifest,
+    manifest_prefix,
     sha256_json,
     validate_disjoint_manifests,
+    validate_manifest_prefix_extension,
 )
 
 
@@ -204,6 +207,37 @@ class ScenarioManifestTest(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "16-UAV.*incompatible"):
             ScenarioManifest.from_dict(data)
+
+    def test_training_manifest_extension_preserves_exact_canonical_prefix(self):
+        previous = generate_manifest("train", 913, 3, num_gt=4)
+        extended, provenance = extend_training_manifest(previous, 6)
+
+        self.assertEqual(extended.episodes[:3], previous.episodes)
+        self.assertEqual(
+            manifest_prefix(extended, 3).content_hash,
+            previous.content_hash,
+        )
+        self.assertEqual(provenance["preserved_prefix_length"], 3)
+        self.assertEqual(
+            provenance["previous_manifest_hash"], previous.content_hash
+        )
+        self.assertEqual(
+            provenance["extended_manifest_hash"], extended.content_hash
+        )
+
+    def test_training_manifest_extension_rejects_one_changed_prefix_episode(self):
+        previous = generate_manifest("train", 914, 3)
+        extended, _ = extend_training_manifest(previous, 6)
+        changed = extended.to_dict()
+        changed["episodes"][1]["traffic_primitives"]["load_factor"] = 2.0
+        unsigned = {
+            key: value for key, value in changed.items() if key != "content_hash"
+        }
+        changed["content_hash"] = sha256_json(unsigned)
+        changed_manifest = ScenarioManifest.from_dict(changed)
+
+        with self.assertRaisesRegex(ValueError, "exact scenario prefix"):
+            validate_manifest_prefix_extension(previous, changed_manifest)
 
 
 if __name__ == "__main__":

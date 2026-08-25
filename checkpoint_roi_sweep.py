@@ -23,6 +23,7 @@ from experiment_config import (
 from paper_evaluation import run_paper_evaluation
 from paper_metrics import validate_canonical_aggregate_rows
 from scenario_manifest import generate_manifest
+from training_checkpoint import CHECKPOINT_HORIZON_COMPATIBILITY_FIELDS
 
 
 CHECKPOINT_ROI_SWEEP_SCHEMA_VERSION = "uav-hrl-checkpoint-roi-sweep-v1"
@@ -30,6 +31,13 @@ SUMMARY_FIELDS = (
     "method_id",
     "training_run_id",
     "checkpoint_episode",
+    "checkpoint_planned_total_episodes",
+    "current_training_run_total_episodes",
+    "horizon_extension_compatible",
+    "allowed_horizon_differences",
+    "checkpoint_training_manifest_hash",
+    "current_training_manifest_hash",
+    "manifest_prefix_compatible",
     "training_total_episodes",
     "roi_count",
     "evaluation_episode_count",
@@ -259,6 +267,10 @@ def build_checkpoint_roi_sweep_plan(
                         ],
                         "checkpoint_episode": selected_checkpoint,
                         "checkpoint_path": str(context["checkpoint"]),
+                        **{
+                            field: context.get(field)
+                            for field in CHECKPOINT_HORIZON_COMPATIBILITY_FIELDS
+                        },
                         **context["checkpoint_artifact_provenance"],
                         "roi_count": roi,
                         "evaluation_episode_count": evaluation_episodes,
@@ -341,6 +353,10 @@ def _summary_identity(point, *, status, result_directory=None):
         "method_id": point["method_id"],
         "training_run_id": point["training_run_id"],
         "checkpoint_episode": point["checkpoint_episode"],
+        **{
+            field: point.get(field)
+            for field in CHECKPOINT_HORIZON_COMPATIBILITY_FIELDS
+        },
         "training_total_episodes": point["training_total_episodes"],
         "roi_count": point["roi_count"],
         "evaluation_episode_count": point["evaluation_episode_count"],

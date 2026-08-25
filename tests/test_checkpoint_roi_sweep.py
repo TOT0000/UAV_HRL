@@ -21,6 +21,7 @@ from paper_evaluation import _load_training_run, evaluation_sweep_points
 from paper_metrics import aggregate_paper_point_metrics
 from run_checkpoint_roi_sweep import build_parser as build_batch_parser
 from run_paper_evaluation import build_parser as build_paper_parser
+from scenario_manifest import generate_manifest
 
 
 PROVENANCE = {
@@ -137,6 +138,8 @@ class TrainingRunCheckpointSelectorTest(unittest.TestCase):
             "mode": "train",
             "random_seed": 17,
         }
+        manifest = generate_manifest("train", 17, 1500)
+        manifest.save(run_dir / "scenario_manifest.json")
         resolved = {
             "status": "COMPLETED",
             "method": method.method_id,
@@ -144,6 +147,8 @@ class TrainingRunCheckpointSelectorTest(unittest.TestCase):
             "seed": 17,
             "episodes": 1500,
             "training_config": training_config,
+            "training_manifest_hash": manifest.content_hash,
+            "training_manifest_path": "scenario_manifest.json",
         }
         (run_dir / "resolved_config.json").write_text(
             json.dumps(resolved), encoding="utf-8"
@@ -163,10 +168,22 @@ class TrainingRunCheckpointSelectorTest(unittest.TestCase):
     @staticmethod
     def _inspect(checkpoint, **kwargs):
         episode = int(Path(checkpoint).name.removeprefix("ep_"))
+        current_manifest = kwargs["current_training_manifest"]
+        current_total = int(kwargs["expected_formal_config"]["total_episodes"])
         return {
             "checkpoint_dir": Path(checkpoint),
             "completed_episode": episode,
             "metadata": {"episode": episode - 1},
+            "horizon_compatibility": {
+                "checkpoint_episode": episode,
+                "checkpoint_planned_total_episodes": current_total,
+                "current_training_run_total_episodes": current_total,
+                "horizon_extension_compatible": False,
+                "allowed_horizon_differences": [],
+                "checkpoint_training_manifest_hash": current_manifest.content_hash,
+                "current_training_manifest_hash": current_manifest.content_hash,
+                "manifest_prefix_compatible": True,
+            },
         }
 
     def test_intermediate_checkpoint_uses_run_total_and_full_validation(self):
@@ -304,6 +321,12 @@ class CheckpointRoiBatchPlanTest(unittest.TestCase):
             len({point["result_directory"] for point in plan["points"]}),
             len(plan["points"]),
         )
+        for point in plan["points"]:
+            self.assertEqual(point["checkpoint_planned_total_episodes"], 1500)
+            self.assertEqual(point["current_training_run_total_episodes"], 1500)
+            self.assertFalse(point["horizon_extension_compatible"])
+            self.assertEqual(point["allowed_horizon_differences"], [])
+            self.assertTrue(point["manifest_prefix_compatible"])
 
     def _fake_evaluator(self, calls):
         def evaluate(method_id, **kwargs):

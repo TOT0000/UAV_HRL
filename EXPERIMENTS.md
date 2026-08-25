@@ -63,8 +63,27 @@ manifest, and formal configuration from an existing run:
 
 ```powershell
 python -X utf8 run_experiment.py resume results/<method>/<run-id>
+python -X utf8 run_experiment.py resume results/<method>/<run-id> --target-episodes 3000
 python -X utf8 run_experiment.py evaluate results/<method>/<run-id>
 ```
+
+Without `--target-episodes`, resume retains its exact existing horizon and
+behavior. The option is the only supported horizon-extension entry point: its
+value must exceed both the current planned horizon and the latest completed
+full-resume checkpoint. The registry-selected method, seed, hyperparameters,
+warmup, fixed exploration-decay contract, optimizer/replay state, Dinkelbach
+state, safe-DDQN constraint state, RNG state, counters, and training-history
+prefix are restored unchanged. The new horizon does not rescale either
+exploration schedule.
+
+An extension deterministically generates a new immutable training manifest
+under `<run>/scenario_manifests/`. Before activation, its first N scenarios
+must reproduce the previous N-entry manifest and canonical prefix hash exactly.
+`resolved_config.json` switches to that manifest atomically and records the old
+and new horizons, both manifest hashes, preserved prefix length, checkpoint,
+and timestamp. The original manifest remains untouched. Existing model
+checkpoints and evaluation outputs are never rewritten; periodic checkpointing
+continues at the configured cadence and always includes the new target episode.
 
 Evaluation defaults to the formal `ep_1500` checkpoint. Each invocation creates
 `<run>/evaluation/ep_1500/<unique-eval-id>/`; results, metadata, its evaluation
@@ -269,7 +288,7 @@ python -X utf8 comparison_experiment.py aggregate --input-dir runs/comparison/ev
 ```
 
 Exact-resume checkpoints validate the method fingerprint, training-manifest
-hash, training seed, the complete Dinkelbach block state, and its configuration.
+relationship, training seed, the complete Dinkelbach block state, and its configuration.
 Checkpoint schema v10 is the current utility/QoS/routing-causality,
 actual-HOL-wait reward, pooled-QoS aggregation, propulsion, and four-substep
 movement-channel contract. Schema v9 and every older
@@ -287,8 +306,13 @@ persists `lambda_used_log` and `lambda_after_episode_log`; a legacy ambiguous
 single-lambda log is rejected for exact resume without changing model-only
 checkpoint compatibility. Formal evaluation validates model-only type, schema,
 429/30/90 dimensions, movement-agent/DDQN gamma, COM normalization, method/seed,
-the formal core configuration, and exactly 1,500 completed training episodes before
-loading weights. A distinct validation/test manifest is expected; output
+the formal core configuration before loading weights. The checkpoint's own
+planned horizon may be smaller than the current run horizon only when
+`total_episodes` is the sole formal-config difference, the checkpoint episode is
+within both horizons, and its training-manifest hash equals the canonical prefix
+of the current training manifest at the old planned horizon. All non-horizon
+method, seed, model, optimizer, warmup, exploration, reward, QoS, energy,
+channel, routing, and task contracts remain strict. A distinct validation/test manifest is expected; output
 metadata records both training/evaluation manifest hashes and checkpoint
 provenance, including the fixed Dinkelbach configuration and state. Evaluation
 does not mutate that state.
@@ -408,7 +432,12 @@ python -X utf8 run_paper_evaluation.py td3_dinkelbach --run-dir results/td3_dink
 
 The singular and plural forms are mutually exclusive. Selected checkpoints
 must exist below `checkpoints/models/ep_NNNN`, match their metadata episode and
-method/model contracts, and satisfy `N <= training_config.total_episodes`.
+method/model contracts, and satisfy checkpoint episode <= checkpoint planned
+horizon <= current run horizon. An older planned horizon additionally requires
+canonical training-manifest prefix compatibility.
+Evaluation and sweep metadata expose the checkpoint/current planned totals,
+whether the monotonic extension policy was used, its allowed field list, both
+training-manifest hashes, and the prefix-compatibility result.
 Only `N == FORMAL_CHECKPOINT_EPISODE` is marked formal; earlier checkpoints are
 labelled `diagnostic_checkpoint_progress_evaluation` and still use frozen
 weights, disabled exploration, and no replay or optimizer updates.
