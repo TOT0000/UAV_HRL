@@ -18,24 +18,25 @@ class SimpleRunnerLifecycleIntegrationTest(unittest.TestCase):
     def test_explicit_horizon_extension_preserves_old_checkpoint_and_history(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             output = Path(temp_dir) / "results"
-            self.assertEqual(
-                main(
-                    [
-                        "td3_ratio",
-                        "--episodes",
-                        "1",
-                        "--episode-seconds",
-                        "1",
-                        "--checkpoint-interval",
-                        "1",
-                        "--roi-count",
-                        "2",
-                        "--output-root",
-                        str(output),
-                    ]
-                ),
-                0,
-            )
+            with mock.patch("run_experiment._git_short_sha", return_value="sha-A"):
+                self.assertEqual(
+                    main(
+                        [
+                            "td3_ratio",
+                            "--episodes",
+                            "1",
+                            "--episode-seconds",
+                            "1",
+                            "--checkpoint-interval",
+                            "1",
+                            "--roi-count",
+                            "2",
+                            "--output-root",
+                            str(output),
+                        ]
+                    ),
+                    0,
+                )
             run_dir = next((output / "td3_ratio").iterdir())
             original_manifest_path = run_dir / "scenario_manifest.json"
             original_manifest_bytes = original_manifest_path.read_bytes()
@@ -54,9 +55,10 @@ class SimpleRunnerLifecycleIntegrationTest(unittest.TestCase):
             evaluation_marker.parent.mkdir()
             evaluation_marker.write_text("preserve", encoding="utf-8")
 
-            self.assertEqual(
-                main(["resume", str(run_dir), "--target-episodes", "3"]), 0
-            )
+            with mock.patch("run_experiment._git_short_sha", return_value="sha-B"):
+                self.assertEqual(
+                    main(["resume", str(run_dir), "--target-episodes", "3"]), 0
+                )
 
             resolved = json.loads(
                 (run_dir / "resolved_config.json").read_text(encoding="utf-8")
@@ -75,6 +77,32 @@ class SimpleRunnerLifecycleIntegrationTest(unittest.TestCase):
             self.assertEqual(provenance["previous_total_episodes"], 1)
             self.assertEqual(provenance["target_total_episodes"], 3)
             self.assertEqual(provenance["preserved_prefix_length"], 1)
+            self.assertEqual(provenance["extension_git_sha"], "sha-B")
+            self.assertEqual(resolved["initial_training_git_sha"], "sha-A")
+            self.assertEqual(resolved["latest_training_git_sha"], "sha-B")
+            self.assertEqual(resolved["git_sha"], "sha-B")
+            self.assertEqual(
+                resolved["training_history_identity_manifest_hash"],
+                original_manifest.content_hash,
+            )
+            self.assertEqual(
+                resolved["training_history_manifest_hash"],
+                resolved["training_history_identity_manifest_hash"],
+            )
+            self.assertIn(
+                "not_active_manifest",
+                resolved["training_history_manifest_hash_semantics"],
+            )
+            segments = resolved["training_manifest_segments"]
+            self.assertEqual(
+                [(item["episode_start"], item["episode_end"]) for item in segments],
+                [(1, 1), (2, 3)],
+            )
+            self.assertEqual(segments[0]["manifest_hash"], original_manifest.content_hash)
+            self.assertEqual(segments[1]["manifest_hash"], active_manifest.content_hash)
+            self.assertEqual(
+                segments[1]["parent_manifest_hash"], original_manifest.content_hash
+            )
             self.assertEqual(original_manifest_path.read_bytes(), original_manifest_bytes)
             self.assertEqual((old_checkpoint / "models.pt").read_bytes(), old_models_bytes)
             self.assertEqual(
@@ -102,6 +130,23 @@ class SimpleRunnerLifecycleIntegrationTest(unittest.TestCase):
             self.assertEqual(
                 {row["training_manifest_hash"] for row in history_after},
                 {original_manifest.content_hash},
+            )
+            checkpoint_three_metadata = json.loads(
+                (
+                    run_dir
+                    / "checkpoints"
+                    / "full"
+                    / "ep_0003"
+                    / "metadata.json"
+                ).read_text(encoding="utf-8")
+            )
+            self.assertEqual(
+                checkpoint_three_metadata["experiment"]["latest_training_git_sha"],
+                "sha-B",
+            )
+            self.assertEqual(
+                checkpoint_three_metadata["training_provenance"]["training_git_sha"],
+                "sha-B",
             )
 
             old_context = resolve_training_run_checkpoint(run_dir, 1)
@@ -148,8 +193,71 @@ class SimpleRunnerLifecycleIntegrationTest(unittest.TestCase):
             )
             self.assertTrue(evaluation_metadata["manifest_prefix_compatible"])
 
+            with mock.patch("run_experiment._git_short_sha", return_value="sha-C"):
+                self.assertEqual(
+                    main(["resume", str(run_dir), "--target-episodes", "5"]), 0
+                )
+            repeated = json.loads(
+                (run_dir / "resolved_config.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(repeated["initial_training_git_sha"], "sha-A")
+            self.assertEqual(repeated["latest_training_git_sha"], "sha-C")
+            self.assertEqual(repeated["git_sha"], "sha-C")
+            repeated_run_metadata = json.loads(
+                (run_dir / "run_metadata.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(
+                repeated_run_metadata["initial_training_git_sha"], "sha-A"
+            )
+            self.assertEqual(
+                repeated_run_metadata["latest_training_git_sha"], "sha-C"
+            )
+            self.assertEqual(repeated_run_metadata["git_sha"], "sha-C")
+            self.assertEqual(
+                [record["extension_git_sha"] for record in repeated["horizon_extension_history"]],
+                ["sha-B", "sha-C"],
+            )
+            repeated_segments = repeated["training_manifest_segments"]
+            self.assertEqual(
+                [
+                    (segment["episode_start"], segment["episode_end"])
+                    for segment in repeated_segments
+                ],
+                [(1, 1), (2, 3), (4, 5)],
+            )
+            self.assertEqual(
+                repeated_segments[2]["parent_manifest_hash"],
+                repeated_segments[1]["manifest_hash"],
+            )
+            checkpoint_five_metadata = json.loads(
+                (
+                    run_dir
+                    / "checkpoints"
+                    / "full"
+                    / "ep_0005"
+                    / "metadata.json"
+                ).read_text(encoding="utf-8")
+            )
+            self.assertEqual(
+                checkpoint_five_metadata["experiment"]["initial_training_git_sha"],
+                "sha-A",
+            )
+            self.assertEqual(
+                checkpoint_five_metadata["experiment"]["latest_training_git_sha"],
+                "sha-C",
+            )
+            self.assertEqual(
+                [
+                    record["extension_git_sha"]
+                    for record in checkpoint_five_metadata["experiment"][
+                        "horizon_extension_history"
+                    ]
+                ],
+                ["sha-B", "sha-C"],
+            )
+
             with self.assertRaisesRegex(ValueError, "planned training horizon"):
-                main(["resume", str(run_dir), "--target-episodes", "3"])
+                main(["resume", str(run_dir), "--target-episodes", "5"])
 
     def test_masked_td3_exact_resume_preserves_true_projection_masks(self):
         with tempfile.TemporaryDirectory() as temp_dir:

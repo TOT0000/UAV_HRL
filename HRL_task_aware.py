@@ -1400,6 +1400,7 @@ def train(
     expected_checkpoint_formal_config=None,
     expected_checkpoint_training_manifest=None,
     training_history_manifest_hash=None,
+    training_run_provenance=None,
     transition_observer=None,
     episode_observer=None,
     evaluation_overrides=None,
@@ -1534,6 +1535,43 @@ def train(
         config,
         evaluation=evaluation,
     )
+    if training_run_provenance is not None:
+        if evaluation:
+            raise ValueError(
+                "training run provenance cannot be supplied during evaluation"
+            )
+        if not isinstance(training_run_provenance, dict):
+            raise TypeError("training run provenance must be an object")
+        required_provenance = {
+            "training_manifest_segments",
+            "training_history_identity_manifest_hash",
+            "training_history_manifest_hash",
+            "initial_training_git_sha",
+            "latest_training_git_sha",
+            "git_sha",
+        }
+        missing_provenance = sorted(
+            required_provenance.difference(training_run_provenance)
+        )
+        if missing_provenance:
+            raise ValueError(
+                f"training run provenance is incomplete: {missing_provenance}"
+            )
+        if (
+            training_run_provenance["training_history_manifest_hash"]
+            != training_run_provenance[
+                "training_history_identity_manifest_hash"
+            ]
+        ):
+            raise ValueError(
+                "legacy training history manifest hash must alias its stable identity"
+            )
+        if (
+            training_run_provenance["git_sha"]
+            != training_run_provenance["latest_training_git_sha"]
+        ):
+            raise ValueError("legacy training Git SHA must identify the latest invocation")
+        experiment_identity.update(copy.deepcopy(training_run_provenance))
     history_identity = None
     training_history_rows = []
     if config.run_directory is not None:
@@ -1725,6 +1763,10 @@ def train(
             },
             expected_formal_config=formal_config,
             current_training_manifest=scenario_manifest,
+            current_training_manifest_segments=experiment_identity.get(
+                "training_manifest_segments"
+            ),
+            training_run_directory=config.run_directory,
         )
         training_state = restored["training_state"]
         resume_checkpoint_compatibility = restored["horizon_compatibility"]

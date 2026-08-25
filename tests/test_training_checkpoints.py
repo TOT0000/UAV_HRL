@@ -30,6 +30,7 @@ from HRL_task_aware import (
 from centralized_movement import JOINT_ACTION_DIM, MOVEMENT_STATE_DIM
 from td3 import TD3
 from routing_lifecycle import RoutingLearnerLifecycle
+from scenario_manifest import extend_training_manifest, generate_manifest
 from training_checkpoint import (
     CHECKPOINT_SCHEMA_VERSION,
     FULL_RESUME_LOGGING_SCHEMA_VERSION,
@@ -37,6 +38,7 @@ from training_checkpoint import (
     ROUTING_LIFECYCLE_CHECKPOINT_SCHEMA_VERSION,
     load_full_resume_checkpoint,
     load_model_checkpoint,
+    inspect_full_resume_checkpoint,
     save_full_resume_checkpoint,
     save_model_checkpoint,
 )
@@ -212,6 +214,161 @@ class FullResumeCheckpointTest(unittest.TestCase):
             gamma=0.99,
         )
         return td3, ddqn, joint, routing
+
+    def _preflight_checkpoint(self, root, *, planned=1, completed=1):
+        td3, ddqn, joint, routing = self._components()
+        calibration = {"seed": 77, "c_ref_com": 10.0}
+        formal_config = asdict(
+            formal_training_config(planned, random_seed=77)
+        )
+        dinkelbach_state = DinkelbachBlockState.from_config(formal_config)
+        used_log = []
+        after_log = []
+        for _ in range(completed):
+            event = dinkelbach_state.record_episode(1.0, 2.0)
+            used_log.append(event["dinkelbach_lambda_used"])
+            after_log.append(event["dinkelbach_lambda_after_episode"])
+        training_state = {
+            "completed_episode_index": completed - 1,
+            "next_episode_index": completed,
+            "full_resume_logging_schema_version": FULL_RESUME_LOGGING_SCHEMA_VERSION,
+            "reward_log": [0.0] * completed,
+            "delivered_log": [1.0] * completed,
+            "energy_log": [2.0] * completed,
+            "lambda_used_log": used_log,
+            "lambda_after_episode_log": after_log,
+            "total_joint_transitions": 0,
+            **_lifecycle_training_state(completed),
+            **dinkelbach_state.training_state(),
+        }
+        manifest = generate_manifest("train", 77, planned)
+        manifest.save(Path(root) / "scenario_manifest.json")
+        checkpoint_dir = Path(root) / "checkpoints" / "full" / f"ep_{completed:04d}"
+        save_full_resume_checkpoint(
+            checkpoint_dir,
+            episode=completed - 1,
+            td3=td3,
+            ddqn=ddqn,
+            joint_replay=joint,
+            routing_replay=routing,
+            training_state=training_state,
+            formal_config=formal_config,
+            movement_state_dim=MOVEMENT_STATE_DIM,
+            joint_action_dim=JOINT_ACTION_DIM,
+            routing_state_dim=ROUTING_STATE_DIM,
+            calibration=calibration,
+            experiment_metadata={
+                "training_seed": 77,
+                "git_sha": "fixture-sha",
+                "manifest_hash": manifest.content_hash,
+                "formal_config": formal_config,
+                **dinkelbach_config_metadata(formal_config),
+                "lambda_ee": dinkelbach_state.current_lambda,
+                "dinkelbach_state": dinkelbach_state.training_state(),
+            },
+        )
+        return {
+            "checkpoint_dir": checkpoint_dir,
+            "td3": td3,
+            "ddqn": ddqn,
+            "joint": joint,
+            "routing": routing,
+            "calibration": calibration,
+            "formal_config": formal_config,
+            "manifest": manifest,
+        }
+
+    def _inspect_preflight_fixture(self, fixture, current_config, current_manifest):
+        return inspect_full_resume_checkpoint(
+            fixture["checkpoint_dir"],
+            movement_state_dim=MOVEMENT_STATE_DIM,
+            joint_action_dim=JOINT_ACTION_DIM,
+            routing_state_dim=ROUTING_STATE_DIM,
+            td3_gamma=1.0,
+            ddqn_gamma=0.99,
+            calibration=fixture["calibration"],
+            expected_formal_config=current_config,
+            current_training_manifest=current_manifest,
+            require_episode_directory=True,
+        )
+
+    def test_full_resume_metadata_incompatibilities_precede_torch_load(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            fixture = self._preflight_checkpoint(temp_dir, planned=1, completed=1)
+            extended, _ = extend_training_manifest(fixture["manifest"], 3)
+            extended_config = dict(fixture["formal_config"], total_episodes=3)
+
+            wrong_field = dict(extended_config, batch_size=999)
+            with mock.patch("training_checkpoint.torch.load") as torch_load:
+                with self.assertRaisesRegex(RuntimeError, "batch_size"):
+                    self._inspect_preflight_fixture(
+                        fixture, wrong_field, extended
+                    )
+                torch_load.assert_not_called()
+
+            wrong_manifest = generate_manifest("train", 78, 3)
+            with mock.patch("training_checkpoint.torch.load") as torch_load:
+                with self.assertRaisesRegex(RuntimeError, "manifest"):
+                    self._inspect_preflight_fixture(
+                        fixture, extended_config, wrong_manifest
+                    )
+                torch_load.assert_not_called()
+
+            with mock.patch(
+                "training_checkpoint.torch.load",
+                side_effect=RuntimeError("payload-load-marker"),
+            ) as torch_load:
+                with self.assertRaisesRegex(RuntimeError, "payload-load-marker"):
+                    self._inspect_preflight_fixture(
+                        fixture, extended_config, extended
+                    )
+                torch_load.assert_called_once()
+
+    def test_target_below_completed_episode_precedes_torch_load(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            fixture = self._preflight_checkpoint(temp_dir, planned=3, completed=2)
+            shorter = generate_manifest("train", 77, 1)
+            shorter_config = dict(fixture["formal_config"], total_episodes=1)
+            with mock.patch("training_checkpoint.torch.load") as torch_load:
+                with self.assertRaisesRegex(RuntimeError, "current run horizon"):
+                    self._inspect_preflight_fixture(
+                        fixture, shorter_config, shorter
+                    )
+                torch_load.assert_not_called()
+
+    def test_payload_formal_config_conflict_does_not_mutate_live_agents(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            fixture = self._preflight_checkpoint(temp_dir, planned=1, completed=1)
+            payload_path = fixture["checkpoint_dir"] / "training_state.pt"
+            payload = torch.load(
+                payload_path, map_location="cpu", weights_only=False
+            )
+            payload["formal_config"]["batch_size"] = 999
+            torch.save(payload, payload_path)
+
+            live_td3, live_ddqn, live_joint, live_routing = self._components()
+            actor_before = {
+                key: value.detach().clone()
+                for key, value in live_td3.actor.state_dict().items()
+            }
+            with self.assertRaisesRegex(RuntimeError, "batch_size"):
+                load_full_resume_checkpoint(
+                    fixture["checkpoint_dir"],
+                    td3=live_td3,
+                    ddqn=live_ddqn,
+                    joint_replay=live_joint,
+                    routing_replay=live_routing,
+                    movement_state_dim=MOVEMENT_STATE_DIM,
+                    joint_action_dim=JOINT_ACTION_DIM,
+                    routing_state_dim=ROUTING_STATE_DIM,
+                    calibration=fixture["calibration"],
+                    expected_formal_config=fixture["formal_config"],
+                    current_training_manifest=fixture["manifest"],
+                )
+            for key, expected in actor_before.items():
+                self.assertTrue(
+                    torch.equal(live_td3.actor.state_dict()[key], expected)
+                )
 
     def _populate_and_train(self, td3, ddqn, joint, routing):
         state = np.zeros(MOVEMENT_STATE_DIM, dtype=np.float32)

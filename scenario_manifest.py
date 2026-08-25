@@ -539,6 +539,212 @@ def extend_training_manifest(
     return extended, provenance
 
 
+def _manifest_path_within_run(run_directory, manifest_path) -> tuple[Path, str]:
+    """Resolve one provenance path without allowing it to escape the run."""
+
+    run_directory = Path(run_directory).resolve()
+    configured = Path(str(manifest_path))
+    resolved = (
+        configured.resolve()
+        if configured.is_absolute()
+        else (run_directory / configured).resolve()
+    )
+    if not resolved.is_relative_to(run_directory):
+        raise RuntimeError("training manifest segment path escapes the run directory")
+    return resolved, resolved.relative_to(run_directory).as_posix()
+
+
+def initial_training_manifest_segments(
+    run_directory,
+    manifest_path,
+    manifest: ScenarioManifest,
+) -> list[dict[str, Any]]:
+    """Build the canonical first segment for a new training run."""
+
+    if not isinstance(manifest, ScenarioManifest) or manifest.split != "train":
+        raise ValueError("training manifest segments require a training manifest")
+    _, relative_path = _manifest_path_within_run(run_directory, manifest_path)
+    return [
+        {
+            "episode_start": 1,
+            "episode_end": int(manifest.episode_count),
+            "manifest_hash": manifest.content_hash,
+            "manifest_path": relative_path,
+            "parent_manifest_hash": None,
+        }
+    ]
+
+
+def append_training_manifest_segment(
+    run_directory,
+    segments,
+    previous_manifest: ScenarioManifest,
+    extended_manifest: ScenarioManifest,
+    extended_manifest_path,
+) -> list[dict[str, Any]]:
+    """Append, never merge, one monotonic manifest-extension segment."""
+
+    canonical = validate_training_manifest_segments(
+        run_directory,
+        segments,
+        current_total_episodes=previous_manifest.episode_count,
+    )
+    if canonical[-1]["manifest_hash"] != previous_manifest.content_hash:
+        raise RuntimeError(
+            "training manifest segment tail disagrees with the active manifest"
+        )
+    validate_manifest_prefix_extension(previous_manifest, extended_manifest)
+    _, relative_path = _manifest_path_within_run(
+        run_directory, extended_manifest_path
+    )
+    return [
+        *canonical,
+        {
+            "episode_start": int(previous_manifest.episode_count) + 1,
+            "episode_end": int(extended_manifest.episode_count),
+            "manifest_hash": extended_manifest.content_hash,
+            "manifest_path": relative_path,
+            "parent_manifest_hash": previous_manifest.content_hash,
+        },
+    ]
+
+
+def validate_training_manifest_segments(
+    run_directory,
+    segments,
+    *,
+    current_total_episodes,
+) -> list[dict[str, Any]]:
+    """Validate complete, gap-free episode-to-manifest provenance."""
+
+    try:
+        current_total_episodes = int(current_total_episodes)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("training manifest segment horizon is invalid") from exc
+    if current_total_episodes <= 0:
+        raise RuntimeError("training manifest segment horizon must be positive")
+    if not isinstance(segments, (list, tuple)) or not segments:
+        raise RuntimeError("training_manifest_segments is missing")
+
+    canonical = []
+    previous_manifest = None
+    expected_start = 1
+    for index, raw_segment in enumerate(segments):
+        if not isinstance(raw_segment, dict):
+            raise RuntimeError("training manifest segment must be an object")
+        required = {
+            "episode_start",
+            "episode_end",
+            "manifest_hash",
+            "manifest_path",
+            "parent_manifest_hash",
+        }
+        missing = sorted(required.difference(raw_segment))
+        if missing:
+            raise RuntimeError(
+                f"training manifest segment is incomplete: {missing}"
+            )
+        try:
+            episode_start = int(raw_segment["episode_start"])
+            episode_end = int(raw_segment["episode_end"])
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("training manifest segment episode range is invalid") from exc
+        if episode_start != expected_start or episode_end < episode_start:
+            raise RuntimeError(
+                "training manifest segments contain a gap, overlap, or invalid range: "
+                f"index={index}, expected_start={expected_start}, "
+                f"actual={episode_start}..{episode_end}"
+            )
+        path, relative_path = _manifest_path_within_run(
+            run_directory, raw_segment["manifest_path"]
+        )
+        manifest = ScenarioManifest.load(path)
+        manifest_hash = str(raw_segment["manifest_hash"])
+        if manifest.content_hash != manifest_hash:
+            raise RuntimeError(
+                "training manifest segment hash disagrees with manifest content: "
+                f"segment={manifest_hash}, manifest={manifest.content_hash}"
+            )
+        if manifest.split != "train":
+            raise RuntimeError("training manifest segment references a non-training manifest")
+        if manifest.episode_count != episode_end:
+            raise RuntimeError(
+                "training manifest segment end disagrees with manifest length: "
+                f"segment={episode_end}, manifest={manifest.episode_count}"
+            )
+        parent_hash = raw_segment["parent_manifest_hash"]
+        if index == 0:
+            if parent_hash is not None:
+                raise RuntimeError(
+                    "initial training manifest segment must not have a parent"
+                )
+        else:
+            if parent_hash != previous_manifest.content_hash:
+                raise RuntimeError(
+                    "training manifest segment parent hash is incompatible"
+                )
+            try:
+                validate_manifest_prefix_extension(previous_manifest, manifest)
+            except ValueError as exc:
+                raise RuntimeError(
+                    "training manifest segment prefix is incompatible"
+                ) from exc
+        canonical.append(
+            {
+                "episode_start": episode_start,
+                "episode_end": episode_end,
+                "manifest_hash": manifest_hash,
+                "manifest_path": relative_path,
+                "parent_manifest_hash": parent_hash,
+            }
+        )
+        previous_manifest = manifest
+        expected_start = episode_end + 1
+
+    if expected_start != current_total_episodes + 1:
+        raise RuntimeError(
+            "training manifest segments do not completely cover the current horizon: "
+            f"covered_through={expected_start - 1}, "
+            f"current={current_total_episodes}"
+        )
+    return canonical
+
+
+def resolve_training_manifest_segment(
+    run_directory,
+    segments,
+    episode,
+    *,
+    current_total_episodes=None,
+) -> dict[str, Any]:
+    """Resolve exactly one canonical active-manifest segment for an episode."""
+
+    if current_total_episodes is None:
+        if not isinstance(segments, (list, tuple)) or not segments:
+            raise RuntimeError("training_manifest_segments is missing")
+        current_total_episodes = segments[-1].get("episode_end")
+    canonical = validate_training_manifest_segments(
+        run_directory,
+        segments,
+        current_total_episodes=current_total_episodes,
+    )
+    try:
+        episode = int(episode)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("training manifest segment episode is invalid") from exc
+    matches = [
+        segment
+        for segment in canonical
+        if segment["episode_start"] <= episode <= segment["episode_end"]
+    ]
+    if len(matches) != 1:
+        raise RuntimeError(
+            "episode does not resolve to exactly one training manifest segment: "
+            f"episode={episode}, matches={len(matches)}"
+        )
+    return dict(matches[0])
+
+
 def resolve_training_manifest(run_directory, resolved_config) -> tuple[Path, ScenarioManifest]:
     """Load the active immutable training manifest declared by a run."""
 
@@ -561,6 +767,67 @@ def resolve_training_manifest(run_directory, resolved_config) -> tuple[Path, Sce
     if expected_hash is not None and expected_hash != manifest.content_hash:
         raise RuntimeError("run training manifest hash disagrees with resolved config")
     return path, manifest
+
+
+def resolve_training_manifest_segments_from_metadata(
+    run_directory,
+    resolved_config,
+) -> tuple[Path, ScenarioManifest, list[dict[str, Any]]]:
+    """Resolve canonical segments, including legacy extension metadata."""
+
+    run_directory = Path(run_directory).resolve()
+    manifest_path, manifest = resolve_training_manifest(
+        run_directory, resolved_config
+    )
+    try:
+        current_total = int(resolved_config["training_config"]["total_episodes"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise RuntimeError("run training horizon is invalid") from exc
+    stored = resolved_config.get("training_manifest_segments")
+    if stored is not None:
+        segments = stored
+    else:
+        history = list(resolved_config.get("horizon_extension_history") or ())
+        if not history:
+            segments = initial_training_manifest_segments(
+                run_directory, manifest_path, manifest
+            )
+        else:
+            first = history[0]
+            segments = [
+                {
+                    "episode_start": 1,
+                    "episode_end": int(first["previous_total_episodes"]),
+                    "manifest_hash": str(first["previous_manifest_hash"]),
+                    "manifest_path": str(first["previous_manifest_path"]),
+                    "parent_manifest_hash": None,
+                }
+            ]
+            for record in history:
+                previous_total = int(record["previous_total_episodes"])
+                if previous_total != int(segments[-1]["episode_end"]):
+                    raise RuntimeError(
+                        "legacy horizon extension provenance is not consecutive"
+                    )
+                segments.append(
+                    {
+                        "episode_start": previous_total + 1,
+                        "episode_end": int(record["target_total_episodes"]),
+                        "manifest_hash": str(record["extended_manifest_hash"]),
+                        "manifest_path": str(record["extended_manifest_path"]),
+                        "parent_manifest_hash": str(
+                            record["previous_manifest_hash"]
+                        ),
+                    }
+                )
+    canonical = validate_training_manifest_segments(
+        run_directory, segments, current_total_episodes=current_total
+    )
+    if canonical[-1]["manifest_hash"] != manifest.content_hash:
+        raise RuntimeError(
+            "training manifest segment tail disagrees with the active manifest"
+        )
+    return manifest_path, manifest, canonical
 
 
 def validate_disjoint_manifests(manifests: Iterable[ScenarioManifest]) -> None:

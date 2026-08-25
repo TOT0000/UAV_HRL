@@ -23,7 +23,12 @@ from experiment_config import (
     SAFE_DDQN_QOS_TARGET_PROBABILITY,
 )
 from fov_ema_lifecycle import validate_fov_ema_state
-from scenario_manifest import ScenarioManifest, manifest_prefix
+from scenario_manifest import (
+    ScenarioManifest,
+    manifest_prefix,
+    resolve_training_manifest_segment,
+    validate_training_manifest_segments,
+)
 
 from dinkelbach_blocks import (
     DINKELBACH_CONFIG_FIELDS,
@@ -530,6 +535,46 @@ def _validate_complete_training_provenance(metadata, provenance):
         raise RuntimeError(
             "checkpoint training provenance Git SHA disagrees with experiment metadata"
         )
+    latest_training_git_sha = experiment.get("latest_training_git_sha")
+    if (
+        latest_training_git_sha is not None
+        and latest_training_git_sha != training_git_sha
+    ):
+        raise RuntimeError(
+            "checkpoint latest training Git SHA disagrees with training provenance"
+        )
+    initial_training_git_sha = experiment.get("initial_training_git_sha")
+    if initial_training_git_sha is not None and (
+        not isinstance(initial_training_git_sha, str)
+        or not initial_training_git_sha.strip()
+    ):
+        raise RuntimeError("checkpoint initial training Git SHA is invalid")
+    history_identity_hash = experiment.get(
+        "training_history_identity_manifest_hash"
+    )
+    legacy_history_hash = experiment.get("training_history_manifest_hash")
+    if (
+        history_identity_hash is not None
+        and legacy_history_hash != history_identity_hash
+    ):
+        raise RuntimeError(
+            "checkpoint legacy training history manifest hash is not its identity alias"
+        )
+    for field in (
+        "training_manifest_segments",
+        "training_history_identity_manifest_hash",
+        "training_history_manifest_hash",
+        "training_history_manifest_hash_semantics",
+        "training_manifest_segments_semantics",
+        "initial_training_git_sha",
+        "latest_training_git_sha",
+        "horizon_extension_provenance",
+        "horizon_extension_history",
+    ):
+        if field in provenance and provenance[field] != experiment.get(field):
+            raise RuntimeError(
+                f"checkpoint training provenance disagrees with experiment metadata: {field}"
+            )
     resolved = provenance.get("resolved_training_config")
     required_config = {
         "method_id",
@@ -596,6 +641,20 @@ def _build_training_provenance(metadata, routing_lifecycle_state):
         ),
         "provenance_complete": True,
     }
+    experiment = metadata.get("experiment") or {}
+    for field in (
+        "training_manifest_segments",
+        "training_history_identity_manifest_hash",
+        "training_history_manifest_hash",
+        "training_history_manifest_hash_semantics",
+        "training_manifest_segments_semantics",
+        "initial_training_git_sha",
+        "latest_training_git_sha",
+        "horizon_extension_provenance",
+        "horizon_extension_history",
+    ):
+        if field in experiment:
+            provenance[field] = deepcopy(experiment[field])
     return _validate_complete_training_provenance(metadata, provenance)
 
 
@@ -1123,6 +1182,8 @@ def _validate_dinkelbach_checkpoint_metadata(metadata, expected_formal_config):
     actual_formal_config = experiment.get("formal_config")
     if not isinstance(actual_formal_config, dict):
         raise RuntimeError("checkpoint has no formal training configuration")
+    if not isinstance(experiment.get("dinkelbach_state"), dict):
+        raise RuntimeError("checkpoint is missing Dinkelbach block state")
     config = expected_formal_config or actual_formal_config
     try:
         expected_config = dinkelbach_config_metadata(config)
@@ -1433,6 +1494,8 @@ def inspect_model_checkpoint(
     expected_completed_episodes=None,
     expected_formal_config=None,
     current_training_manifest=None,
+    current_training_manifest_segments=None,
+    training_run_directory=None,
     require_episode_directory=False,
     movement_agent_kind=None,
     allow_incomplete_provenance=False,
@@ -1478,6 +1541,15 @@ def inspect_model_checkpoint(
         if expected_formal_config is not None
         else None
     )
+    _validate_checkpoint_manifest_segments(
+        checkpoint_dir,
+        metadata,
+        (metadata.get("experiment") or {}).get("formal_config"),
+        completed_episode,
+        current_training_manifest_segments=current_training_manifest_segments,
+        current_formal_config=expected_formal_config,
+        training_run_directory=training_run_directory,
+    )
     return {
         "checkpoint_dir": checkpoint_dir,
         "completed_episode": completed_episode,
@@ -1499,6 +1571,8 @@ def load_model_checkpoint(
     expected_completed_episodes=None,
     expected_formal_config=None,
     current_training_manifest=None,
+    current_training_manifest_segments=None,
+    training_run_directory=None,
     allow_incomplete_provenance=False,
 ):
     checkpoint_dir = Path(checkpoint_dir).resolve()
@@ -1514,6 +1588,8 @@ def load_model_checkpoint(
         expected_completed_episodes=expected_completed_episodes,
         expected_formal_config=expected_formal_config,
         current_training_manifest=current_training_manifest,
+        current_training_manifest_segments=current_training_manifest_segments,
+        training_run_directory=training_run_directory,
         movement_agent_kind=_agent_kind(td3),
         allow_incomplete_provenance=allow_incomplete_provenance,
     )
@@ -1539,7 +1615,9 @@ def _save_replay(path, replay, fields):
     }
 
 
-def _load_replay(path, replay, fields, metadata):
+def _validate_replay_payload(path, replay, fields, metadata):
+    if not isinstance(metadata, dict):
+        raise RuntimeError("checkpoint replay metadata is invalid")
     expected = {
         "max_size": int(replay.max_size),
         "n_step": int(replay.n_step),
@@ -1563,6 +1641,8 @@ def _load_replay(path, replay, fields, metadata):
         raise RuntimeError(f"invalid replay size/ptr in checkpoint: {size}/{ptr}")
     with np.load(path, allow_pickle=False) as arrays:
         for field in fields:
+            if field not in arrays:
+                raise RuntimeError(f"replay field is missing from checkpoint: {field}")
             saved = arrays[field]
             target = getattr(replay, field)
             if saved.shape != target[:size].shape:
@@ -1570,7 +1650,18 @@ def _load_replay(path, replay, fields, metadata):
                     f"replay field {field} shape mismatch: "
                     f"checkpoint={saved.shape}, current={target[:size].shape}"
                 )
-            target[:size] = saved
+    if not isinstance(metadata.get("n_step_buffer"), (list, tuple)):
+        raise RuntimeError("checkpoint replay n-step buffer is invalid")
+
+
+def _load_replay(path, replay, fields, metadata):
+    _validate_replay_payload(path, replay, fields, metadata)
+    size = int(metadata["size"])
+    ptr = int(metadata["ptr"])
+    with np.load(path, allow_pickle=False) as arrays:
+        for field in fields:
+            target = getattr(replay, field)
+            target[:size] = arrays[field]
     replay.size = size
     replay.ptr = ptr
     replay.n_step_buffer = list(metadata.get("n_step_buffer", []))
@@ -1861,6 +1952,40 @@ def _restore_rng_state(state):
         torch.cuda.set_rng_state_all(state["torch_cuda"])
 
 
+def _validate_rng_state_payload(state):
+    if not isinstance(state, dict):
+        raise RuntimeError("checkpoint RNG state is invalid")
+    missing = sorted({"python", "numpy", "torch_cpu", "torch_cuda"}.difference(state))
+    if missing:
+        raise RuntimeError(f"checkpoint RNG state is incomplete: {missing}")
+    try:
+        random.Random().setstate(state["python"])
+        np.random.RandomState().set_state(state["numpy"])
+        torch.Generator(device="cpu").set_state(state["torch_cpu"])
+    except (TypeError, ValueError, RuntimeError) as exc:
+        raise RuntimeError("checkpoint RNG state is incompatible") from exc
+    cuda_state = state["torch_cuda"]
+    if cuda_state is not None:
+        if not (
+            isinstance(cuda_state, (list, tuple))
+            and all(
+                isinstance(value, torch.Tensor)
+                and value.dtype == torch.uint8
+                and value.ndim == 1
+                for value in cuda_state
+            )
+        ):
+            raise RuntimeError("checkpoint CUDA RNG state is invalid")
+        if torch.cuda.is_available():
+            if len(cuda_state) != torch.cuda.device_count():
+                raise RuntimeError("checkpoint CUDA RNG device count is incompatible")
+            try:
+                for index, value in enumerate(cuda_state):
+                    torch.Generator(device=f"cuda:{index}").set_state(value)
+            except RuntimeError as exc:
+                raise RuntimeError("checkpoint CUDA RNG state is incompatible") from exc
+
+
 def save_full_resume_checkpoint(
     checkpoint_dir,
     *,
@@ -1885,6 +2010,23 @@ def save_full_resume_checkpoint(
         _routing_agent_kind(ddqn),
         CHECKPOINT_SCHEMA_VERSION,
     )
+    resolved_experiment_metadata = dict(experiment_metadata or {})
+    resolved_experiment_metadata.setdefault("formal_config", dict(formal_config))
+    if experiment_metadata is None:
+        try:
+            dinkelbach_state = DinkelbachBlockState.from_training_state(
+                training_state,
+                formal_config,
+                expected_completed_episodes=int(episode) + 1,
+            )
+        except (KeyError, TypeError, ValueError, RuntimeError):
+            pass
+        else:
+            resolved_experiment_metadata.update(
+                dinkelbach_config_metadata(formal_config),
+                lambda_ee=dinkelbach_state.current_lambda,
+                dinkelbach_state=dinkelbach_state.training_state(),
+            )
     metadata = _base_metadata(
         FULL_CHECKPOINT_TYPE,
         episode,
@@ -1894,7 +2036,7 @@ def save_full_resume_checkpoint(
         td3,
         ddqn,
         calibration,
-        experiment_metadata,
+        resolved_experiment_metadata,
     )
     _validate_effective_formal_movement_config(
         formal_config, _agent_kind(td3), metadata
@@ -2186,7 +2328,75 @@ def validate_checkpoint_experiment_metadata(
         )
 
 
-def inspect_full_resume_checkpoint(
+def _infer_training_run_directory(checkpoint_dir):
+    checkpoint_dir = Path(checkpoint_dir).resolve()
+    if (
+        checkpoint_dir.parent.name in {"full", "models"}
+        and checkpoint_dir.parent.parent.name == "checkpoints"
+    ):
+        return checkpoint_dir.parent.parent.parent
+    return None
+
+
+def _validate_checkpoint_manifest_segments(
+    checkpoint_dir,
+    metadata,
+    checkpoint_formal_config,
+    completed_episode,
+    *,
+    current_training_manifest_segments=None,
+    current_formal_config=None,
+    training_run_directory=None,
+):
+    experiment = metadata.get("experiment") or {}
+    checkpoint_segments = experiment.get("training_manifest_segments")
+    run_directory = (
+        Path(training_run_directory).resolve()
+        if training_run_directory is not None
+        else _infer_training_run_directory(checkpoint_dir)
+    )
+    if checkpoint_segments is not None:
+        if run_directory is None:
+            raise RuntimeError(
+                "checkpoint manifest segment paths require the training run directory"
+            )
+        checkpoint_total = _positive_horizon(
+            checkpoint_formal_config, "checkpoint planned"
+        )
+        canonical = validate_training_manifest_segments(
+            run_directory,
+            checkpoint_segments,
+            current_total_episodes=checkpoint_total,
+        )
+        active_segment = resolve_training_manifest_segment(
+            run_directory,
+            canonical,
+            completed_episode,
+            current_total_episodes=checkpoint_total,
+        )
+        if active_segment["manifest_hash"] != experiment.get("manifest_hash"):
+            raise RuntimeError(
+                "checkpoint active manifest segment disagrees with experiment metadata"
+            )
+    if current_training_manifest_segments is not None:
+        if run_directory is None:
+            raise RuntimeError(
+                "current manifest segment paths require the training run directory"
+            )
+        if current_formal_config is None:
+            raise RuntimeError(
+                "current manifest segments require the current formal config"
+            )
+        validate_training_manifest_segments(
+            run_directory,
+            current_training_manifest_segments,
+            current_total_episodes=_positive_horizon(
+                current_formal_config, "current run"
+            ),
+        )
+
+
+def preflight_full_resume_checkpoint_metadata(
     checkpoint_dir,
     *,
     movement_state_dim,
@@ -2198,10 +2408,12 @@ def inspect_full_resume_checkpoint(
     expected_experiment_metadata=None,
     expected_formal_config=None,
     current_training_manifest=None,
+    current_training_manifest_segments=None,
+    training_run_directory=None,
     require_episode_directory=False,
     movement_agent_kind=None,
 ):
-    """Validate an exact-resume checkpoint without mutating training state."""
+    """Metadata-only exact-resume preflight; never deserializes torch payloads."""
 
     checkpoint_dir = Path(checkpoint_dir).resolve()
     metadata_path = checkpoint_dir / "metadata.json"
@@ -2238,6 +2450,51 @@ def inspect_full_resume_checkpoint(
         if require_episode_directory
         else int(metadata["episode"]) + 1
     )
+    experiment = metadata.get("experiment") or {}
+    checkpoint_formal_config = experiment.get("formal_config")
+    if not isinstance(checkpoint_formal_config, dict):
+        raise RuntimeError("checkpoint has no formal training configuration")
+    if expected_formal_config is not None:
+        horizon_compatibility = checkpoint_run_compatibility_from_metadata(
+            metadata,
+            expected_formal_config,
+            checkpoint_episode=completed_episode,
+            config_fields=FULL_RESUME_CONFIG_FIELDS,
+            current_training_manifest=current_training_manifest,
+        )
+    else:
+        checkpoint_total = _positive_horizon(
+            checkpoint_formal_config, "checkpoint planned"
+        )
+        if completed_episode > checkpoint_total:
+            raise RuntimeError(
+                "checkpoint episode exceeds its planned training horizon: "
+                f"checkpoint={completed_episode}, planned={checkpoint_total}"
+            )
+        horizon_compatibility = None
+    if _checkpoint_uses_dinkelbach(metadata):
+        _validate_dinkelbach_checkpoint_metadata(
+            metadata, expected_formal_config or checkpoint_formal_config
+        )
+    if "training_provenance" in metadata:
+        _validate_complete_training_provenance(
+            metadata, metadata["training_provenance"]
+        )
+    if metadata["checkpoint_schema_version"] >= PRE_MOVEMENT_MASK_CHECKPOINT_SCHEMA_VERSION:
+        _validate_effective_formal_movement_config(
+            checkpoint_formal_config,
+            metadata.get("movement_agent_kind", "td3"),
+            metadata,
+        )
+    _validate_checkpoint_manifest_segments(
+        checkpoint_dir,
+        metadata,
+        checkpoint_formal_config,
+        completed_episode,
+        current_training_manifest_segments=current_training_manifest_segments,
+        current_formal_config=expected_formal_config,
+        training_run_directory=training_run_directory,
+    )
     required_paths = [
         checkpoint_dir / "training_state.pt",
         checkpoint_dir / "joint_replay.npz",
@@ -2249,6 +2506,56 @@ def inspect_full_resume_checkpoint(
         raise RuntimeError(
             f"checkpoint has incomplete full-resume state; missing={missing}"
         )
+    return {
+        "checkpoint_dir": checkpoint_dir,
+        "completed_episode": completed_episode,
+        "metadata": metadata,
+        "checkpoint_formal_config": checkpoint_formal_config,
+        "horizon_compatibility": horizon_compatibility,
+    }
+
+
+def inspect_full_resume_checkpoint(
+    checkpoint_dir,
+    *,
+    movement_state_dim,
+    joint_action_dim,
+    routing_state_dim,
+    td3_gamma,
+    ddqn_gamma,
+    calibration,
+    expected_experiment_metadata=None,
+    expected_formal_config=None,
+    current_training_manifest=None,
+    current_training_manifest_segments=None,
+    training_run_directory=None,
+    require_episode_directory=False,
+    movement_agent_kind=None,
+):
+    """Validate an exact-resume checkpoint without mutating training state."""
+
+    preflight = preflight_full_resume_checkpoint_metadata(
+        checkpoint_dir,
+        movement_state_dim=movement_state_dim,
+        joint_action_dim=joint_action_dim,
+        routing_state_dim=routing_state_dim,
+        td3_gamma=td3_gamma,
+        ddqn_gamma=ddqn_gamma,
+        calibration=calibration,
+        expected_experiment_metadata=expected_experiment_metadata,
+        expected_formal_config=expected_formal_config,
+        current_training_manifest=current_training_manifest,
+        current_training_manifest_segments=current_training_manifest_segments,
+        training_run_directory=training_run_directory,
+        require_episode_directory=require_episode_directory,
+        movement_agent_kind=movement_agent_kind,
+    )
+    checkpoint_dir = preflight["checkpoint_dir"]
+    metadata = preflight["metadata"]
+    completed_episode = preflight["completed_episode"]
+    horizon_compatibility = preflight["horizon_compatibility"]
+
+    # Phase two begins here. No torch payload is touched before preflight passes.
     _validate_joint_replay_projection_masks(checkpoint_dir, metadata)
     payload = torch.load(
         checkpoint_dir / "training_state.pt",
@@ -2278,31 +2585,15 @@ def inspect_full_resume_checkpoint(
             f"completed={state_completed}, next={state_next}, "
             f"metadata={completed_episode}"
         )
-    experiment = metadata.get("experiment") or {}
-    experiment_formal_config = experiment.get("formal_config")
-    if isinstance(experiment_formal_config, dict):
-        _validate_formal_config(
-            _formal_config_for_validation(
-                metadata, formal_config, experiment_formal_config
-            ),
-            experiment_formal_config,
-            FULL_RESUME_CONFIG_FIELDS,
-        )
-    horizon_compatibility = None
-    if expected_formal_config is not None:
-        horizon_compatibility = checkpoint_run_compatibility_from_metadata(
-            metadata,
-            expected_formal_config,
-            checkpoint_episode=completed_episode,
-            config_fields=FULL_RESUME_CONFIG_FIELDS,
-            current_training_manifest=current_training_manifest,
-        )
-        if _checkpoint_uses_dinkelbach(metadata):
-            _validate_dinkelbach_checkpoint_metadata(
-                metadata, expected_formal_config
-            )
     if not isinstance(formal_config, dict):
         raise RuntimeError("checkpoint formal training configuration is invalid")
+    experiment = metadata.get("experiment") or {}
+    experiment_formal_config = experiment["formal_config"]
+    _validate_formal_config(
+        formal_config,
+        experiment_formal_config,
+        FULL_RESUME_CONFIG_FIELDS,
+    )
     if (
         metadata["checkpoint_schema_version"]
         >= PRE_MOVEMENT_MASK_CHECKPOINT_SCHEMA_VERSION
@@ -2408,6 +2699,8 @@ def load_full_resume_checkpoint(
     expected_experiment_metadata=None,
     expected_formal_config=None,
     current_training_manifest=None,
+    current_training_manifest_segments=None,
+    training_run_directory=None,
 ):
     checkpoint_dir = Path(checkpoint_dir).resolve()
     inspected = inspect_full_resume_checkpoint(
@@ -2421,36 +2714,35 @@ def load_full_resume_checkpoint(
         expected_experiment_metadata=expected_experiment_metadata,
         expected_formal_config=expected_formal_config,
         current_training_manifest=current_training_manifest,
+        current_training_manifest_segments=current_training_manifest_segments,
+        training_run_directory=training_run_directory,
         movement_agent_kind=_agent_kind(td3),
     )
     metadata = inspected["metadata"]
     payload = inspected["payload"]
-    _load_network_states(payload["networks"], td3, ddqn)
-    _restore_movement_training_payload(td3, payload)
-    _restore_routing_training_payload(ddqn, payload)
-
     replay_metadata = payload["replay_metadata"]
-    _load_replay(
+    if not isinstance(replay_metadata.get("joint"), dict):
+        raise RuntimeError("checkpoint joint replay metadata is missing")
+    if not isinstance(payload.get("networks"), dict):
+        raise RuntimeError("checkpoint network payload is invalid")
+    _validate_rng_state_payload(payload.get("rng_state"))
+    joint_fields = (
+        JOINT_REPLAY_FIELDS
+        if metadata["checkpoint_schema_version"]
+        >= ROUTING_LIFECYCLE_CHECKPOINT_SCHEMA_VERSION
+        else (
+            PRE_MOVEMENT_MASK_JOINT_REPLAY_FIELDS
+            if metadata["checkpoint_schema_version"]
+            >= PRE_MOVEMENT_MASK_CHECKPOINT_SCHEMA_VERSION
+            else LEGACY_JOINT_REPLAY_FIELDS
+        )
+    )
+    _validate_replay_payload(
         checkpoint_dir / "joint_replay.npz",
         joint_replay,
-        (
-            JOINT_REPLAY_FIELDS
-            if metadata["checkpoint_schema_version"]
-            >= ROUTING_LIFECYCLE_CHECKPOINT_SCHEMA_VERSION
-            else (
-                PRE_MOVEMENT_MASK_JOINT_REPLAY_FIELDS
-                if metadata["checkpoint_schema_version"]
-                >= PRE_MOVEMENT_MASK_CHECKPOINT_SCHEMA_VERSION
-                else LEGACY_JOINT_REPLAY_FIELDS
-            )
-        ),
+        joint_fields,
         replay_metadata["joint"],
     )
-    if (
-        metadata["checkpoint_schema_version"]
-        < ROUTING_LIFECYCLE_CHECKPOINT_SCHEMA_VERSION
-    ):
-        _reconstruct_legacy_full_observation_masks(joint_replay, metadata)
     routing_kind = metadata.get("routing_agent_kind", "safe_ddqn")
     if routing_kind == "random":
         if routing_replay is not None or replay_metadata.get("routing") is not None:
@@ -2458,6 +2750,36 @@ def load_full_resume_checkpoint(
     else:
         if routing_replay is None:
             raise RuntimeError(f"{routing_kind} routing requires a replay")
+        _validate_replay_payload(
+            checkpoint_dir / "routing_replay.npz",
+            routing_replay,
+            ROUTING_REPLAY_FIELDS,
+            replay_metadata["routing"],
+        )
+
+    # Validate networks, optimizers and constraint state on isolated agents. Live
+    # agents remain untouched until every payload and replay contract has passed.
+    td3_probe = deepcopy(td3)
+    ddqn_probe = deepcopy(ddqn)
+    _load_network_states(payload["networks"], td3_probe, ddqn_probe)
+    _restore_movement_training_payload(td3_probe, payload)
+    _restore_routing_training_payload(ddqn_probe, payload)
+
+    _load_network_states(payload["networks"], td3, ddqn)
+    _restore_movement_training_payload(td3, payload)
+    _restore_routing_training_payload(ddqn, payload)
+    _load_replay(
+        checkpoint_dir / "joint_replay.npz",
+        joint_replay,
+        joint_fields,
+        replay_metadata["joint"],
+    )
+    if (
+        metadata["checkpoint_schema_version"]
+        < ROUTING_LIFECYCLE_CHECKPOINT_SCHEMA_VERSION
+    ):
+        _reconstruct_legacy_full_observation_masks(joint_replay, metadata)
+    if routing_kind != "random":
         _load_replay(
             checkpoint_dir / "routing_replay.npz",
             routing_replay,

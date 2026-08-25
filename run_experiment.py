@@ -43,9 +43,14 @@ from resume_recovery import (
 )
 from scenario_manifest import (
     ScenarioManifest,
+    append_training_manifest_segment,
     extend_training_manifest,
     generate_manifest,
+    initial_training_manifest_segments,
     resolve_training_manifest,
+    resolve_training_manifest_segment,
+    resolve_training_manifest_segments_from_metadata,
+    validate_training_manifest_segments,
 )
 from training_checkpoint import (
     inspect_full_resume_checkpoint,
@@ -54,6 +59,14 @@ from training_checkpoint import (
 from training_history import (
     preflight_resume_training_history,
     training_history_identity,
+)
+
+
+TRAINING_HISTORY_MANIFEST_HASH_SEMANTICS = (
+    "legacy_alias_of_training_history_identity_manifest_hash_not_active_manifest"
+)
+TRAINING_MANIFEST_SEGMENTS_SEMANTICS = (
+    "unique_episode_to_active_training_manifest_mapping"
 )
 
 
@@ -224,6 +237,67 @@ def _load_run_context(run_directory):
     return run_dir, resolved, method, manifest
 
 
+def _training_manifest_segments_from_resolved(
+    run_dir, resolved, active_manifest_path, active_manifest
+):
+    """Load canonical segments, upgrading legacy extension metadata in memory."""
+
+    resolved_path, resolved_manifest, segments = (
+        resolve_training_manifest_segments_from_metadata(run_dir, resolved)
+    )
+    if (
+        resolved_path != Path(active_manifest_path).resolve()
+        or resolved_manifest.content_hash != active_manifest.content_hash
+    ):
+        raise RuntimeError("resolved training manifest changed during segment loading")
+    return segments
+
+
+def _training_run_provenance(resolved):
+    provenance = {
+        key: resolved[key]
+        for key in (
+            "training_manifest_segments",
+            "training_history_identity_manifest_hash",
+            "training_history_manifest_hash",
+            "training_history_manifest_hash_semantics",
+            "training_manifest_segments_semantics",
+            "initial_training_git_sha",
+            "latest_training_git_sha",
+            "git_sha",
+        )
+    }
+    for key in (
+        "horizon_extension_provenance",
+        "horizon_extension_history",
+    ):
+        if key in resolved:
+            provenance[key] = resolved[key]
+    return provenance
+
+
+def _merge_training_run_metadata(run_metadata, resolved):
+    """Merge final metadata while pinning invocation-sensitive provenance."""
+
+    merged = {**run_metadata, **resolved}
+    for key in (
+        "git_sha",
+        "initial_training_git_sha",
+        "latest_training_git_sha",
+        "training_manifest_segments",
+        "training_manifest_segments_semantics",
+        "training_history_identity_manifest_hash",
+        "training_history_manifest_hash",
+        "training_history_manifest_hash_semantics",
+    ):
+        if key in run_metadata and run_metadata[key] != resolved[key]:
+            raise RuntimeError(
+                f"training result provenance disagrees with resolved config: {key}"
+            )
+        merged[key] = resolved[key]
+    return merged
+
+
 def _training_config_from_resolved(resolved, **overrides):
     allowed = {field.name for field in fields(TrainingConfig)}
     values = {
@@ -237,6 +311,9 @@ def _training_config_from_resolved(resolved, **overrides):
 
 def _base_resolved(run_dir, method, manifest, config, values, args, git_sha):
     comparison = comparison_method_configuration(method)
+    manifest_segments = initial_training_manifest_segments(
+        run_dir, run_dir / "scenario_manifest.json", manifest
+    )
     return {
         "status": "RUNNING",
         "method": method.method_key,
@@ -269,8 +346,16 @@ def _base_resolved(run_dir, method, manifest, config, values, args, git_sha):
         "training_config": effective_training_config(config, method),
         "training_manifest_hash": manifest.content_hash,
         "training_manifest_path": "scenario_manifest.json",
+        "training_manifest_segments": manifest_segments,
+        "training_manifest_segments_semantics": TRAINING_MANIFEST_SEGMENTS_SEMANTICS,
+        "training_history_identity_manifest_hash": manifest.content_hash,
         "training_history_manifest_hash": manifest.content_hash,
+        "training_history_manifest_hash_semantics": (
+            TRAINING_HISTORY_MANIFEST_HASH_SEMANTICS
+        ),
         "started_at": datetime.now(timezone.utc).isoformat(),
+        "initial_training_git_sha": git_sha,
+        "latest_training_git_sha": git_sha,
         "git_sha": git_sha,
         "run_directory": str(run_dir),
     }
@@ -324,14 +409,22 @@ def run(args):
     resolved = _base_resolved(run_dir, method, manifest, config, values, args, git_sha)
     _write_json(run_dir / "resolved_config.json", resolved)
     try:
-        result = train(config, scenario_manifest=manifest, method_spec=method)
+        result = train(
+            config,
+            scenario_manifest=manifest,
+            method_spec=method,
+            training_run_provenance=_training_run_provenance(resolved),
+        )
         resolved.update(
             status="COMPLETED",
             completed_at=datetime.now(timezone.utc).isoformat(),
             history_rows=len(result["training_history_rows"]),
             dinkelbach_update_count=result["dinkelbach_update_count"],
         )
-        _write_json(run_dir / "run_metadata.json", {**result["run_metadata"], **resolved})
+        _write_json(
+            run_dir / "run_metadata.json",
+            _merge_training_run_metadata(result["run_metadata"], resolved),
+        )
         _write_json(run_dir / "resolved_config.json", resolved)
     except BaseException as exc:
         resolved.update(
@@ -358,6 +451,7 @@ def _episode_directories(root):
 
 def run_resume(args):
     run_dir, resolved, method, manifest = _load_run_context(args.run_directory)
+    invocation_git_sha = _git_short_sha()
     try:
         previous_total = int(resolved["training_config"]["total_episodes"])
     except (KeyError, TypeError, ValueError) as exc:
@@ -367,10 +461,29 @@ def run_resume(args):
             "run training manifest length disagrees with its planned horizon"
         )
 
+    active_manifest_path, _ = resolve_training_manifest(run_dir, resolved)
+    manifest_segments = _training_manifest_segments_from_resolved(
+        run_dir, resolved, active_manifest_path, manifest
+    )
+    history_identity_manifest_hash = str(
+        resolved.get(
+            "training_history_identity_manifest_hash",
+            resolved.get("training_history_manifest_hash", manifest_segments[0]["manifest_hash"]),
+        )
+    )
+    if (
+        resolved.get("training_history_manifest_hash") is not None
+        and str(resolved["training_history_manifest_hash"])
+        != history_identity_manifest_hash
+    ):
+        raise RuntimeError(
+            "legacy training_history_manifest_hash must alias the stable history identity"
+        )
+
     target_episodes = args.target_episodes
     extension_provenance = None
     active_manifest = manifest
-    active_manifest_path, _ = resolve_training_manifest(run_dir, resolved)
+    active_manifest_segments = manifest_segments
     if target_episodes is not None:
         target_episodes = int(target_episodes)
         if target_episodes <= previous_total:
@@ -400,7 +513,15 @@ def run_resume(args):
                 resolve_training_manifest(run_dir, resolved)[0]
             ),
             "extended_manifest_path": str(active_manifest_path),
+            "extension_git_sha": invocation_git_sha,
         }
+        active_manifest_segments = append_training_manifest_segment(
+            run_dir,
+            manifest_segments,
+            manifest,
+            active_manifest,
+            active_manifest_path,
+        )
 
     config = _training_config_from_resolved(
         resolved,
@@ -433,6 +554,7 @@ def run_resume(args):
         expected_experiment_metadata=expected_experiment,
         expected_formal_config=formal_config,
         current_training_manifest=active_manifest,
+        training_run_directory=run_dir,
         require_episode_directory=True,
         movement_agent_kind=method.agent,
     )
@@ -447,14 +569,16 @@ def run_resume(args):
         expected_experiment_metadata=expected_experiment,
         expected_formal_config=formal_config,
         current_training_manifest=active_manifest,
+        training_run_directory=run_dir,
         require_episode_directory=True,
         movement_agent_kind=method.agent,
     )
     checkpoint = None
+    checkpoint_inspection = None
     failures = []
     for _, candidate in _episode_directories(run_dir / "checkpoints" / "full"):
         try:
-            inspect_full(candidate)
+            checkpoint_inspection = inspect_full(candidate)
             checkpoint = candidate
             break
         except RuntimeError as exc:
@@ -476,15 +600,12 @@ def run_resume(args):
             "target-episodes must exceed the latest completed episode: "
             f"target={target_episodes}, completed={plan.resume_episode}"
         )
-    history_manifest_hash = str(
-        resolved.get("training_history_manifest_hash", manifest.content_hash)
-    )
     preflight_resume_training_history(
         run_dir,
         training_history_identity(
             method.method_id,
             int(resolved["seed"]),
-            history_manifest_hash,
+            history_identity_manifest_hash,
         ),
         checkpoint_rows=plan.resume_training_state.get(
             "training_history_rows", ()
@@ -498,6 +619,19 @@ def run_resume(args):
             extended_at=datetime.now(timezone.utc).isoformat(),
             resume_checkpoint=str(checkpoint),
             resume_episode=plan.resume_episode,
+            source_checkpoint_training_git_sha=(
+                (checkpoint_inspection["metadata"].get("experiment") or {}).get(
+                    "latest_training_git_sha",
+                    (checkpoint_inspection["metadata"].get("experiment") or {}).get(
+                        "git_sha"
+                    ),
+                )
+            ),
+        )
+        active_manifest_segments = validate_training_manifest_segments(
+            run_dir,
+            active_manifest_segments,
+            current_total_episodes=active_manifest.episode_count,
         )
     config.resume_dir = str(checkpoint)
     resolved.update(
@@ -509,7 +643,18 @@ def run_resume(args):
         training_config=formal_config,
         training_manifest_hash=active_manifest.content_hash,
         training_manifest_path=str(active_manifest_path.relative_to(run_dir)),
-        training_history_manifest_hash=history_manifest_hash,
+        training_manifest_segments=active_manifest_segments,
+        training_manifest_segments_semantics=TRAINING_MANIFEST_SEGMENTS_SEMANTICS,
+        training_history_identity_manifest_hash=history_identity_manifest_hash,
+        training_history_manifest_hash=history_identity_manifest_hash,
+        training_history_manifest_hash_semantics=(
+            TRAINING_HISTORY_MANIFEST_HASH_SEMANTICS
+        ),
+        initial_training_git_sha=resolved.get(
+            "initial_training_git_sha", resolved.get("git_sha")
+        ),
+        latest_training_git_sha=invocation_git_sha,
+        git_sha=invocation_git_sha,
         effective_movement_agent_configuration=movement_agent_configuration(
             method, config
         ),
@@ -527,7 +672,8 @@ def run_resume(args):
             config,
             scenario_manifest=active_manifest,
             method_spec=method,
-            training_history_manifest_hash=history_manifest_hash,
+            training_history_manifest_hash=history_identity_manifest_hash,
+            training_run_provenance=_training_run_provenance(resolved),
         )
         resolved.update(
             status="COMPLETED",
@@ -536,7 +682,10 @@ def run_resume(args):
             dinkelbach_update_count=result["dinkelbach_update_count"],
             resume_reconciliation=reconciliation,
         )
-        _write_json(run_dir / "run_metadata.json", {**result["run_metadata"], **resolved})
+        _write_json(
+            run_dir / "run_metadata.json",
+            _merge_training_run_metadata(result["run_metadata"], resolved),
+        )
         _write_json_atomic(run_dir / "resolved_config.json", resolved)
     except BaseException as exc:
         resolved.update(
@@ -580,6 +729,13 @@ def _write_evaluation_plots(output_dir, rows):
 
 def run_evaluate(args):
     run_dir, resolved, method, training_manifest = _load_run_context(args.run_directory)
+    training_manifest_path, _ = resolve_training_manifest(run_dir, resolved)
+    training_manifest_segments = _training_manifest_segments_from_resolved(
+        run_dir,
+        resolved,
+        training_manifest_path,
+        training_manifest,
+    )
     checkpoint_episode = int(args.checkpoint_episode)
     if checkpoint_episode <= 0:
         raise ValueError("checkpoint episode must be positive")
@@ -625,6 +781,8 @@ def run_evaluate(args):
         expected_completed_episodes=checkpoint_episode,
         expected_formal_config=expected_training_config,
         current_training_manifest=training_manifest,
+        current_training_manifest_segments=training_manifest_segments,
+        training_run_directory=run_dir,
         require_episode_directory=True,
         movement_agent_kind=method.agent,
     )
@@ -672,6 +830,13 @@ def run_evaluate(args):
         "evaluation_run_directory": str(output_dir),
         "formal_evaluation": formal_evaluation,
         "smoke_evaluation": bool(args.smoke),
+        "training_manifest_segments": training_manifest_segments,
+        "checkpoint_training_manifest_segment": resolve_training_manifest_segment(
+            run_dir,
+            training_manifest_segments,
+            checkpoint_episode,
+            current_total_episodes=int(resolved["training_config"]["total_episodes"]),
+        ),
     }
     paths = write_evaluation_outputs(output_dir, result["episode_metrics"], metadata)
     plot_paths = _write_evaluation_plots(output_dir, result["episode_metrics"])

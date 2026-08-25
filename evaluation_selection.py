@@ -14,7 +14,11 @@ from experiment_config import (
     MethodSpec,
 )
 from HRL_task_aware import ROUTING_STATE_DIM
-from scenario_manifest import ScenarioManifest, resolve_training_manifest
+from scenario_manifest import (
+    ScenarioManifest,
+    resolve_training_manifest_segment,
+    resolve_training_manifest_segments_from_metadata,
+)
 from training_checkpoint import (
     checkpoint_artifact_provenance,
     inspect_model_checkpoint,
@@ -177,9 +181,11 @@ def resolve_training_run_checkpoint(
             f"{method.method_id} has no learned checkpoint to evaluate"
         )
     training_total, expected_training_config = _training_total_episodes(resolved)
-    training_manifest_path, training_manifest = resolve_training_manifest(
-        run_dir, resolved
-    )
+    (
+        training_manifest_path,
+        training_manifest,
+        training_manifest_segments,
+    ) = resolve_training_manifest_segments_from_metadata(run_dir, resolved)
     if training_manifest.episode_count != training_total:
         raise RuntimeError(
             "training manifest length disagrees with resolved training horizon"
@@ -218,6 +224,8 @@ def resolve_training_run_checkpoint(
         expected_completed_episodes=checkpoint_episode,
         expected_formal_config=expected_training_config,
         current_training_manifest=training_manifest,
+        current_training_manifest_segments=training_manifest_segments,
+        training_run_directory=run_dir,
         require_episode_directory=True,
         movement_agent_kind=method.agent,
     )
@@ -244,6 +252,13 @@ def resolve_training_run_checkpoint(
         "checkpoint_artifact_provenance": artifact_provenance,
         "training_manifest": training_manifest,
         "training_manifest_path": training_manifest_path,
+        "training_manifest_segments": training_manifest_segments,
+        "checkpoint_training_manifest_segment": resolve_training_manifest_segment(
+            run_dir,
+            training_manifest_segments,
+            checkpoint_episode,
+            current_total_episodes=training_total,
+        ),
         **(inspected.get("horizon_compatibility") or {}),
         "expected_training_config": expected_training_config,
         "checkpoint_required": True,

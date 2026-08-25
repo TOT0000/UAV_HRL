@@ -1,3 +1,4 @@
+from copy import deepcopy
 import json
 from pathlib import Path
 import random
@@ -13,8 +14,12 @@ from scenario_manifest import (
     SCENARIO_SCHEMA_VERSION,
     ScenarioManifest,
     extend_training_manifest,
+    append_training_manifest_segment,
     generate_manifest,
+    initial_training_manifest_segments,
     manifest_prefix,
+    resolve_training_manifest_segment,
+    validate_training_manifest_segments,
     sha256_json,
     validate_disjoint_manifests,
     validate_manifest_prefix_extension,
@@ -238,6 +243,112 @@ class ScenarioManifestTest(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "exact scenario prefix"):
             validate_manifest_prefix_extension(previous, changed_manifest)
+
+    def test_manifest_segments_preserve_repeated_extension_provenance(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            run_dir = Path(temp_dir)
+            original_path = run_dir / "scenario_manifest.json"
+            original = generate_manifest("train", 915, 1)
+            original.save(original_path)
+            segments = initial_training_manifest_segments(
+                run_dir, original_path, original
+            )
+
+            extended_three, _ = extend_training_manifest(original, 3)
+            three_path = run_dir / "scenario_manifests" / "train_ep_0003.json"
+            extended_three.save_atomic(three_path)
+            segments = append_training_manifest_segment(
+                run_dir, segments, original, extended_three, three_path
+            )
+
+            extended_five, _ = extend_training_manifest(extended_three, 5)
+            five_path = run_dir / "scenario_manifests" / "train_ep_0005.json"
+            extended_five.save_atomic(five_path)
+            segments = append_training_manifest_segment(
+                run_dir, segments, extended_three, extended_five, five_path
+            )
+            canonical = validate_training_manifest_segments(
+                run_dir, segments, current_total_episodes=5
+            )
+
+            self.assertEqual(
+                [(item["episode_start"], item["episode_end"]) for item in canonical],
+                [(1, 1), (2, 3), (4, 5)],
+            )
+            self.assertEqual(
+                [item["parent_manifest_hash"] for item in canonical],
+                [None, original.content_hash, extended_three.content_hash],
+            )
+            self.assertEqual(
+                [
+                    resolve_training_manifest_segment(
+                        run_dir, canonical, episode, current_total_episodes=5
+                    )["manifest_hash"]
+                    for episode in range(1, 6)
+                ],
+                [
+                    original.content_hash,
+                    extended_three.content_hash,
+                    extended_three.content_hash,
+                    extended_five.content_hash,
+                    extended_five.content_hash,
+                ],
+            )
+
+    def test_manifest_segments_fail_on_gap_overlap_hash_and_prefix_errors(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            run_dir = Path(temp_dir)
+            original = generate_manifest("train", 916, 1)
+            extended, _ = extend_training_manifest(original, 3)
+            original.save(run_dir / "original.json")
+            extended.save(run_dir / "extended.json")
+            valid = [
+                {
+                    "episode_start": 1,
+                    "episode_end": 1,
+                    "manifest_hash": original.content_hash,
+                    "manifest_path": "original.json",
+                    "parent_manifest_hash": None,
+                },
+                {
+                    "episode_start": 2,
+                    "episode_end": 3,
+                    "manifest_hash": extended.content_hash,
+                    "manifest_path": "extended.json",
+                    "parent_manifest_hash": original.content_hash,
+                },
+            ]
+
+            for label, mutate, message in (
+                ("gap", lambda value: value[1].update(episode_start=3), "gap"),
+                ("overlap", lambda value: value[1].update(episode_start=1), "overlap"),
+                ("hash", lambda value: value[1].update(manifest_hash="bad"), "hash"),
+            ):
+                broken = deepcopy(valid)
+                mutate(broken)
+                with self.subTest(label=label), self.assertRaisesRegex(
+                    RuntimeError, message
+                ):
+                    validate_training_manifest_segments(
+                        run_dir, broken, current_total_episodes=3
+                    )
+
+            incompatible = generate_manifest("train", 917, 3)
+            incompatible.save(run_dir / "incompatible.json")
+            bad_prefix = deepcopy(valid)
+            bad_prefix[1].update(
+                manifest_hash=incompatible.content_hash,
+                manifest_path="incompatible.json",
+            )
+            with self.assertRaisesRegex(RuntimeError, "prefix"):
+                validate_training_manifest_segments(
+                    run_dir, bad_prefix, current_total_episodes=3
+                )
+
+            with self.assertRaisesRegex(RuntimeError, "completely cover"):
+                validate_training_manifest_segments(
+                    run_dir, valid[:1], current_total_episodes=3
+                )
 
 
 if __name__ == "__main__":
