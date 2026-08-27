@@ -10,7 +10,7 @@ import numpy as np
 import torch
 
 
-RNG_CONTRACT_VERSION = "named-subsystem-streams-v1"
+RNG_CONTRACT_VERSION = "named-subsystem-streams-v2-channel-fading"
 
 # These identifiers are persistent compatibility data.  Never renumber an
 # existing stream: append a new identifier when a new stochastic subsystem is
@@ -39,7 +39,18 @@ RNG_STREAM_IDS = MappingProxyType(
         "evaluation_random_assignment": 50,
         "evaluation_random_movement": 51,
         "evaluation_random_routing": 52,
+        "channel_large_scale_state": 60,
+        "channel_small_scale_fading": 61,
+        "evaluation_channel_large_scale_state": 62,
+        "evaluation_channel_small_scale_fading": 63,
     }
+)
+
+CHANNEL_RNG_STREAMS = (
+    "channel_large_scale_state",
+    "channel_small_scale_fading",
+    "evaluation_channel_large_scale_state",
+    "evaluation_channel_small_scale_fading",
 )
 
 
@@ -151,6 +162,14 @@ class NamedRNGStreams:
                 "random_routing": [
                     "random_routing",
                     "evaluation_random_routing",
+                ],
+                "channel_large_scale_state": [
+                    "channel_large_scale_state",
+                    "evaluation_channel_large_scale_state",
+                ],
+                "channel_small_scale_fading": [
+                    "channel_small_scale_fading",
+                    "evaluation_channel_small_scale_fading",
                 ],
             },
             "global_rng_policy": "not used by formal executable operations",

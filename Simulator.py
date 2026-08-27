@@ -8,12 +8,21 @@ from Channel_model import (
     A2G_LOS_B,
     A2G_LOS_EXCESS_DB,
     A2G_NLOS_EXCESS_DB,
+    ChannelLifecycle,
+    FADING_BLOCKS_PER_ROUTING_SLOT,
     NOISE_PSD_DBM_PER_HZ,
+    ROUTING_SLOT_SECONDS,
     S2U_TX_POWER_DBM,
     U2U_U2G_TX_POWER_DBM,
-    a2g_capacity_mbps,
-    a2g_path_loss_db,
-    shannon_capacity_mbps,
+    a2g_conditional_path_loss_db,
+    a2g_expected_capacity_mbps,
+    average_snr_linear,
+    block_capacity_profile_mbps,
+    effective_capacity_mbps,
+    expected_fading_capacity_mbps,
+    reference_u2g_max_capacity_mbps,
+    reference_u2u_max_capacity_mbps,
+    slot_service_bits,
     u2u_path_loss_db,
     normalized_s2u_capacity_utility,
     reference_s2u_max_capacity_mbps,
@@ -57,7 +66,7 @@ class Simulator:
     SR_UAV_NLOS_EXCESS_DB = A2G_NLOS_EXCESS_DB
 
     def __init__(self, num_UAV, p_u=30, rng_streams=None, evaluation=False): #初始化
-        self.dt = 0.25
+        self.dt = ROUTING_SLOT_SECONDS
         self.rng_streams = rng_streams
         environment_stream = (
             "evaluation_environment" if evaluation else "environment_dynamics"
@@ -75,6 +84,27 @@ class Simulator:
             if rng_streams is not None
             else np.random.default_rng(0)
         )
+        channel_large_scale_stream = (
+            "evaluation_channel_large_scale_state"
+            if evaluation
+            else "channel_large_scale_state"
+        )
+        channel_small_scale_stream = (
+            "evaluation_channel_small_scale_fading"
+            if evaluation
+            else "channel_small_scale_fading"
+        )
+        self.channel_large_scale_rng = (
+            rng_streams.numpy(channel_large_scale_stream)
+            if rng_streams is not None
+            else np.random.default_rng(60)
+        )
+        self.channel_small_scale_rng = (
+            rng_streams.numpy(channel_small_scale_stream)
+            if rng_streams is not None
+            else np.random.default_rng(61)
+        )
+        self.channel_namespace = "evaluation" if evaluation else "training"
         self.sr_update_interval = int(1.0 / self.dt)
         self.sim_step_count = 0
         if int(num_UAV) != NUM_UAV:
@@ -96,9 +126,18 @@ class Simulator:
         self.active_link_capacities = {}
         self.active_link_bandwidths = {}
         self.active_s2u_capacities = {}
+        self.active_link_capacity_profiles_mbps = {}
+        self.active_s2u_capacity_profiles_mbps = {}
         self.active_link_diagnostics = []
         self.GS_pos = (0, 0, 0)
         self.GS_ID = self.num_UAV
+        self.channel = ChannelLifecycle(
+            self.num_UAV,
+            self.GS_ID,
+            large_scale_rng=self.channel_large_scale_rng,
+            small_scale_rng=self.channel_small_scale_rng,
+            namespace=self.channel_namespace,
+        )
         self.num_GT = None
         self.N_u = self.num_UAV
         self.UAVs = []
@@ -504,25 +543,59 @@ class Simulator:
         return unexplored / total if total > 0 else 0.0
 
     #=====================通訊如何======================== 
+    def _channel_geometry(self):
+        return (
+            np.asarray([uav.get_position() for uav in self.UAVs], dtype=float),
+            np.asarray([sr.get_position() for sr in self.SR_teams], dtype=float),
+            np.asarray(self.GS_pos, dtype=float),
+        )
+
+    def begin_channel_movement_interval(self, interval_index):
+        """Sample every potential A2G large-scale state once per second."""
+
+        uav_positions, sr_positions, gs_position = self._channel_geometry()
+        return self.channel.begin_movement_interval(
+            interval_index,
+            uav_positions=uav_positions,
+            sr_positions=sr_positions,
+            gs_position=gs_position,
+        )
+
+    def prepare_channel_routing_slot(self, routing_slot_index):
+        """Privately generate all potential-link gains in fixed CRN order."""
+
+        return self.channel.prepare_routing_slot(routing_slot_index)
+
+    def channel_state_dict(self):
+        return self.channel.state_dict()
+
+    def load_channel_state_dict(self, state):
+        self.channel.load_state_dict(state)
+
     def _get_sr_uav_link_metrics(self, uav_id, sr_id, bandwidth_hz=None):
-        """Return canonical S2U SNR/capacity without an arbitrary range cutoff."""
+        """Return conditional mean SNR and deterministic expected S2U capacity."""
 
         bandwidth_hz = float(
             REFERENCE_COM_BANDWIDTH_HZ if bandwidth_hz is None else bandwidth_hz
         )
         uav_position = self.uav_dict[int(uav_id)].get_position()
         sr_position = self.SR_teams[int(sr_id)].get_position()
-        path_loss = float(a2g_path_loss_db(uav_position, sr_position))
+        los_state = self.channel.a2g_state("S2U", int(sr_id), int(uav_id))
+        path_loss = float(
+            a2g_conditional_path_loss_db(
+                uav_position, sr_position, los_state
+            )
+        )
         capacity_mbps = float(
-            a2g_capacity_mbps(
+            a2g_expected_capacity_mbps(
                 uav_position,
                 sr_position,
                 bandwidth_hz,
                 S2U_TX_POWER_DBM,
+                los_state,
             )
         )
-        noise_dbm = NOISE_PSD_DBM_PER_HZ + 10.0 * math.log10(bandwidth_hz)
-        snr = 10.0 ** ((S2U_TX_POWER_DBM - path_loss - noise_dbm) / 10.0)
+        snr = float(average_snr_linear(path_loss, bandwidth_hz, S2U_TX_POWER_DBM))
         return float(snr), capacity_mbps
 
     def get_snr(self, uav_id, sr_id):
@@ -546,6 +619,7 @@ class Simulator:
             self.uav_dict[int(uav_id)].get_position(),
             self.SR_teams[int(sr_id)].get_position(),
             REFERENCE_COM_BANDWIDTH_HZ,
+            los_state=self.channel.a2g_state("S2U", int(sr_id), int(uav_id)),
         )
 
     @property
@@ -566,10 +640,11 @@ class Simulator:
                     u2u_path_loss_db(positions[sender], positions[receiver])
                 )
                 capacity[sender, receiver] = float(
-                    shannon_capacity_mbps(
+                    expected_fading_capacity_mbps(
                         path_loss[sender, receiver],
                         self.B_tot,
                         U2U_U2G_TX_POWER_DBM,
+                        fading="rician",
                     )
                 )
         self.PL_uu_cache = path_loss
@@ -586,24 +661,38 @@ class Simulator:
     def update_u2g_channels(self):
         positions = np.asarray([uav.get_position() for uav in self.UAVs], dtype=float)
         gs_position = np.asarray(self.GS_pos, dtype=float)
-        self.Expected_PL = np.asarray(
-            [a2g_path_loss_db(position, gs_position) for position in positions],
+        los_state = np.asarray(self.channel.u2g_los_state, dtype=bool)
+        self.Conditional_PL_ug = np.asarray(
+            a2g_conditional_path_loss_db(positions, gs_position, los_state),
             dtype=float,
         )
-        self.PL_ug_cache = self.Expected_PL.copy()
+        self.PL_ug_cache = self.Conditional_PL_ug.copy()
         self.u2g_nominal_capacity = np.asarray(
             [
-                shannon_capacity_mbps(
-                    loss, self.B_tot, U2U_U2G_TX_POWER_DBM
+                a2g_expected_capacity_mbps(
+                    positions[index],
+                    gs_position,
+                    self.B_tot,
+                    U2U_U2G_TX_POWER_DBM,
+                    bool(los_state[index]),
                 )
-                for loss in self.Expected_PL
+                for index in range(len(positions))
             ],
             dtype=float,
         )
         self.gs_capacity = self.u2g_nominal_capacity.copy()
 
     def allocate_active_link_capacities(self, proposed_links, s2u_links=None):
-        """Equal-FDMA allocation over one shared S2U/U2U/U2G 10 MHz pool."""
+        """Equal-FDMA then recompute 50 capacities using one cached gain profile."""
+
+        if self.channel._gain_matrix is None:
+            if self.channel.u2g_los_state is None:
+                raise RuntimeError(
+                    "channel state must be initialized before bandwidth allocation"
+                )
+            self.prepare_channel_routing_slot(
+                0 if self.channel.routing_slot_index is None else self.channel.routing_slot_index
+            )
 
         active_links = [
             (int(sender), int(receiver))
@@ -618,6 +707,7 @@ class Simulator:
         shared_bandwidth = self.B_tot / total_links if total_links else 0.0
 
         capacities = {}
+        capacity_profiles = {}
         bandwidths = {}
         diagnostics = []
         for sender, receiver in active_links:
@@ -628,11 +718,18 @@ class Simulator:
                 else float(self.PL_uu_cache[sender, receiver])
             )
             bandwidths[(sender, receiver)] = float(shared_bandwidth)
-            capacities[(sender, receiver)] = float(
-                shannon_capacity_mbps(
-                    path_loss, shared_bandwidth, U2U_U2G_TX_POWER_DBM
-                )
+            gains = self.channel.gain_profile(link_type, sender, receiver)
+            profile = np.asarray(
+                block_capacity_profile_mbps(
+                    path_loss,
+                    shared_bandwidth,
+                    U2U_U2G_TX_POWER_DBM,
+                    gains,
+                ),
+                dtype=float,
             )
+            capacity_profiles[(sender, receiver)] = profile
+            capacities[(sender, receiver)] = float(effective_capacity_mbps(profile))
             diagnostics.append(
                 {
                     "link_type": link_type,
@@ -640,16 +737,37 @@ class Simulator:
                     "receiver_id": receiver,
                     "bandwidth_hz": float(shared_bandwidth),
                     "capacity_mbps": capacities[(sender, receiver)],
+                    "fading_blocks": FADING_BLOCKS_PER_ROUTING_SLOT,
+                    "slot_service_bits": float(slot_service_bits(profile)),
+                    "gain_profile_reused": True,
                 }
             )
         s2u_capacities = {}
+        s2u_capacity_profiles = {}
         for sr_id, uav_id in sorted(s2u_links.items()):
-            _, capacity = self._get_sr_uav_link_metrics(
-                uav_id, sr_id, bandwidth_hz=shared_bandwidth
+            uav_position = self.uav_dict[int(uav_id)].get_position()
+            sr_position = self.SR_teams[int(sr_id)].get_position()
+            los_state = self.channel.a2g_state("S2U", sr_id, uav_id)
+            path_loss = float(
+                a2g_conditional_path_loss_db(
+                    uav_position, sr_position, los_state
+                )
             )
+            gains = self.channel.gain_profile("S2U", sr_id, uav_id)
+            profile = np.asarray(
+                block_capacity_profile_mbps(
+                    path_loss,
+                    shared_bandwidth,
+                    S2U_TX_POWER_DBM,
+                    gains,
+                ),
+                dtype=float,
+            )
+            capacity = float(effective_capacity_mbps(profile))
             key = ("S2U", sr_id, uav_id)
             bandwidths[key] = float(shared_bandwidth)
             s2u_capacities[(sr_id, uav_id)] = float(capacity)
+            s2u_capacity_profiles[(sr_id, uav_id)] = profile
             diagnostics.append(
                 {
                     "link_type": "S2U",
@@ -657,6 +775,9 @@ class Simulator:
                     "receiver_id": uav_id,
                     "bandwidth_hz": float(shared_bandwidth),
                     "capacity_mbps": float(capacity),
+                    "fading_blocks": FADING_BLOCKS_PER_ROUTING_SLOT,
+                    "slot_service_bits": float(slot_service_bits(profile)),
+                    "gain_profile_reused": True,
                 }
             )
 
@@ -664,10 +785,18 @@ class Simulator:
             raise AssertionError("active link bandwidth exceeds the shared 10 MHz pool")
 
         self.active_link_capacities = capacities
+        self.active_link_capacity_profiles_mbps = capacity_profiles
         self.active_link_bandwidths = bandwidths
         self.active_s2u_capacities = s2u_capacities
+        self.active_s2u_capacity_profiles_mbps = s2u_capacity_profiles
         self.active_link_diagnostics = diagnostics
         return capacities, bandwidths
+
+    def routing_capacity_reference_mbps(self, sender_id, receiver_id):
+        del sender_id
+        if int(receiver_id) == self.GS_ID:
+            return reference_u2g_max_capacity_mbps(self.B_tot)
+        return reference_u2u_max_capacity_mbps(self.B_tot)
 
     #===========回傳不可選擇的節點======================== 
     def get_routing_action_mask(self, from_uav_id):
@@ -1131,6 +1260,12 @@ class Simulator:
         self.source_uavs = set()  #  清除封包來源
         self.forwarding_rate = {uav_id: 0 for uav_id in range(self.num_UAV)}  # if needed
         self.source_buffer = defaultdict(float)  #  封包累積用 buffer 重置
+        self.active_link_capacities = {}
+        self.active_link_bandwidths = {}
+        self.active_s2u_capacities = {}
+        self.active_link_capacity_profiles_mbps = {}
+        self.active_s2u_capacity_profiles_mbps = {}
+        self.active_link_diagnostics = []
         self.num_SR_team=self.num_GT
         # ==================初始化無人機位置=============================
         self.UAVs = []           # UAV list（順序）
@@ -1260,7 +1395,18 @@ class Simulator:
         for uav in self.UAVs:
             uav.task_type = None
             uav.assigned_target_id = None
-        
+
+        # A2G state must exist before the first assignment/COM-utility query.
+        uav_positions, sr_positions, gs_position = self._channel_geometry()
+        self.channel.reset_episode(
+            uav_positions=uav_positions,
+            sr_positions=sr_positions,
+            gs_position=gs_position,
+            episode_identity=self.active_scenario_id,
+        )
+        self.update_u2u_channels()
+        self.update_u2g_channels()
+
         # Search is orchestration fallback, not a solver candidate or utility.
         self.task_list = []
         self.assign_tasks()

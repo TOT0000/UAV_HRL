@@ -26,9 +26,10 @@ and COM service tasks; unassigned UAVs fall back to Search. At release, all 10
 UAVs are immediately reassigned and only unassigned UAVs Hover. FOV raw utility
 uses global feasible-pair min/max normalization (equal values map to 0.5), while
 COM uses canonical S2U capacity at the candidate's actual 3-D geometry,
-computed with `10 MHz / 18`, divided by the same channel model's fixed
-best-feasible 50 m AGL capacity. This denominator is independent of candidates
-and traffic rate. A separate feasibility mask and
+computed with `10 MHz / 18` from the sampled one-second A2G LoS/NLoS state and
+the corresponding deterministic Rician/Rayleigh expected capacity. It is
+divided by the fixed 50 m AGL LoS-Rician expected-capacity reference. This
+denominator is independent of candidates and traffic rate. A separate feasibility mask and
 explicit dummy choices keep rows unmatched when no service task is available;
 solver-only infinities never enter the domain utility matrix. K-KM uses at most
 two rounds, and FOV+COM is its only legal two-task combination, with current
@@ -100,7 +101,8 @@ design-dataset collection, aggregation, and exact-resume workflows.
 - inclusive RoI count range 2 through 8
 - 60 seconds per episode
 - one projected movement command held across four synchronous 0.25-second
-  movement/channel/routing substeps per one-second movement interval
+  movement/channel/routing substeps per one-second movement interval; each
+  routing slot contains exactly fifty 5 ms fading blocks
 - physical and effective routing masks recomputed in every routing slot for
   safe-DDQN, controlled DQN, and random routing
 - safe-DDQN target violation probability `0.1`, initial `lambda_cost=0`, and
@@ -148,6 +150,50 @@ design-dataset collection, aggregation, and exact-resume workflows.
 - model-only checkpoint every 50 episodes, including exactly one final checkpoint
 - full-resume checkpoint every 50 episodes, retaining only the latest two
 
+## Stochastic channel contract
+
+Every registered method uses the same `Simulator`-owned channel lifecycle.
+Equation (13), with `a=11.95`, `b=0.136`, elevation in degrees, and the 2 GHz
+A2G carrier, supplies the Bernoulli LoS probability. At episode reset the state
+is initialized before task assignment; it is then updated only at explicit
+one-second movement boundaries. The sampled state selects conditional
+`FSPL + 2 dB` LoS or `FSPL + 20 dB` NLoS loss. Equation (14)'s expected path
+loss is retained only as a deterministic reference/diagnostic and is not used
+after a state has been sampled. This is a one-second large-scale block-state
+Monte Carlo approximation, not a claim that buildings physically change every
+second.
+
+U2U links retain the directed sender-absolute-AGL, 3-D-distance, 2.4 GHz paper
+path-loss model and are always LoS. U2U and sampled A2G LoS links use normalized
+Rician fading with linear `K=10` (`10 dB`); sampled A2G NLoS links use normalized
+Rayleigh fading. No distance cutoff, `C_min`, outage/PER, HARQ, shadowing, or
+retransmission model is added.
+
+Routing decisions remain every 0.25 seconds. Before each decision the private
+channel lifecycle vectorizes fifty 5 ms gains for every potential directed U2U,
+U2G, and S2U link in fixed type/sender/receiver order, whether or not the link
+will be selected. Separate named training/evaluation channel RNG streams make
+these common random numbers independent of policy action counts. The routing
+agent, task assignment, and movement observation never receive those future
+samples: their CSI is the deterministic distributional expectation
+`B E_G[log2(1 + mean_snr*G)]`, evaluated with cached order-64 Gauss-Laguerre
+quadrature and normalized by link-type physical LoS-Rician reference capacity.
+
+After all routing actions are chosen, active S2U/U2U/U2G links share the common
+10 MHz pool by equal FDMA. Noise and capacity are recomputed with the allocated
+bandwidth while reusing the slot's cached gains; full-band capacity is never
+linearly scaled. Packet service consumes the fifty block budgets in order. A
+packet that finishes inside a block is timestamped at the block start plus its
+remaining bits divided by that block's capacity. FIFO, start-of-slot
+eligibility, next-slot S2U relay causality, partial-hop receiver locking, Wait,
+deadlines, and the communication-energy model are unchanged.
+
+The 5 ms duration follows Ghazikor et al., *IEEE Transactions on
+Communications* (2026), DOI `10.1109/TCOMM.2025.3650376`, for block-duration
+scale only; its interference, queue, threshold, bandwidth, and K-factor models
+are not adopted. Five milliseconds is a fixed block-fading approximation, not
+an asserted exact coherence time for every link.
+
 Run one method and the configured training seed per training/evaluation job.
 Evaluation episodes are averaged within the seed; additional explicitly run
 seeds may be aggregated as independent trained-policy seed means
@@ -182,6 +228,8 @@ The randomness audit separates:
   initial state/motion primitive, and traffic/load primitives.
 - Agent/training randomness: network initialization, exploration, replay
   sampling/minibatch order, target-policy smoothing, and PyTorch/CUDA RNG.
+- Channel randomness: one-second A2G state and 5 ms small-scale fading, with
+  independent named training/evaluation streams and fixed potential-link draws.
 - Policy-dependent outcomes, which are never stored in a manifest: task
   assignment, actions, coverage, discovery, FOV validity, sources, packets,
   routing decisions, and delivered bits.
@@ -289,9 +337,9 @@ python -X utf8 comparison_experiment.py aggregate --input-dir runs/comparison/ev
 
 Exact-resume checkpoints validate the method fingerprint, training-manifest
 relationship, training seed, the complete Dinkelbach block state, and its configuration.
-Checkpoint schema v10 is the current utility/QoS/routing-causality,
-actual-HOL-wait reward, pooled-QoS aggregation, propulsion, and four-substep
-movement-channel contract. Schema v9 and every older
+Checkpoint schema v12 is the current stochastic-channel, utility/QoS,
+routing-causality, actual-HOL-wait reward, pooled-QoS aggregation, propulsion,
+and four-slot/fifty-block movement-channel contract. Schema v11 and every older
 schema is rejected before weights or replay state are restored and must be
 retrained; no legacy checkpoint migration is attempted. The current schema
 stores the 429/30/90 dimensions, movement feature schema, direct-ratio bit/J
@@ -301,7 +349,7 @@ manifests remain `uav-hrl-scenario-v3`. A partial Dinkelbach block is persisted
 exactly and resumes with
 the same lambda, completed-episode count, numerator sum, denominator sum, block
 index, input-validity status, and successful-update count. An incomplete final
-block never triggers a forced update. Full-resume logging schema v1 separately
+block never triggers a forced update. Full-resume logging schema v2 separately
 persists `lambda_used_log` and `lambda_after_episode_log`; a legacy ambiguous
 single-lambda log is rejected for exact resume without changing model-only
 checkpoint compatibility. Formal evaluation validates model-only type, schema,

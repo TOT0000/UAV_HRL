@@ -11,6 +11,12 @@ import zipfile
 import numpy as np
 import torch
 
+from Channel_model import (
+    CHANNEL_ENVIRONMENT_CONTRACT_VERSION,
+    CHANNEL_MODEL_VERSION,
+    validate_channel_lifecycle_state,
+)
+
 from centralized_movement import (
     MOVEMENT_STATE_DIM,
     MOVEMENT_FEATURE_SCHEMA_VERSION,
@@ -25,7 +31,12 @@ from experiment_config import (
     SAFE_DDQN_INITIAL_LAMBDA_COST,
     SAFE_DDQN_QOS_TARGET_PROBABILITY,
 )
-from rng_contract import NamedRNGStreams, RNG_CONTRACT_VERSION, RNG_STREAM_IDS
+from rng_contract import (
+    CHANNEL_RNG_STREAMS,
+    NamedRNGStreams,
+    RNG_CONTRACT_VERSION,
+    RNG_STREAM_IDS,
+)
 from fov_ema_lifecycle import validate_fov_ema_state
 from scenario_manifest import (
     ScenarioManifest,
@@ -40,7 +51,7 @@ from dinkelbach_blocks import (
     dinkelbach_config_metadata,
 )
 
-CHECKPOINT_SCHEMA_VERSION = 11
+CHECKPOINT_SCHEMA_VERSION = 12
 ROUTING_LIFECYCLE_CHECKPOINT_SCHEMA_VERSION = 6
 PRE_ROUTING_LIFECYCLE_CHECKPOINT_SCHEMA_VERSION = 5
 PRE_ADAPTIVE_SAFE_DDQN_CHECKPOINT_SCHEMA_VERSION = 4
@@ -48,7 +59,7 @@ PRE_MOVEMENT_MASK_CHECKPOINT_SCHEMA_VERSION = 3
 LEGACY_DINKELBACH_CHECKPOINT_SCHEMA_VERSION = 2
 MODEL_CHECKPOINT_TYPE = "model-only"
 FULL_CHECKPOINT_TYPE = "full-resume"
-FULL_RESUME_LOGGING_SCHEMA_VERSION = 1
+FULL_RESUME_LOGGING_SCHEMA_VERSION = 2
 
 FULL_RESUME_LOGGING_STATE_FIELDS = (
     "full_resume_logging_schema_version",
@@ -145,6 +156,7 @@ FORMAL_CORE_CONFIG_FIELDS = (
     "sr_route_lifecycle_version",
     "packet_qos_contract_version",
     "packet_routing_causality_contract_version",
+    "packet_service_contract_version",
     "qos_aggregate_contract_version",
     "routing_reward_contract_version",
     "routing_reward_alpha_capacity",
@@ -157,6 +169,16 @@ FORMAL_CORE_CONFIG_FIELDS = (
     "movement_channel_timing_version",
     "movement_substeps_per_interval",
     "movement_substep_seconds",
+    "channel_model_version",
+    "channel_environment_contract_version",
+    "channel_fairness_contract_version",
+    "channel_normalization_version",
+    "channel_configuration",
+    "large_scale_state_seconds",
+    "fading_block_seconds",
+    "fading_blocks_per_routing_slot",
+    "rician_k_linear",
+    "rician_k_db",
     "resolved_fov_deadline_seconds",
     "resolved_com_deadline_seconds",
     "packet_injection_cutoff_seconds",
@@ -946,7 +968,11 @@ def _base_metadata(
         "movement_feature_schema_version": MOVEMENT_FEATURE_SCHEMA_VERSION,
         "state_contract": "10-uav-no-hidden-num-gt-v1",
         "packet_lifecycle_contract": "sr-fifo-s2u-next-slot-routing-v1",
-        "channel_contract": "single-10mhz-fdma-canonical-a2g-u2u-v1",
+        "channel_contract": CHANNEL_ENVIRONMENT_CONTRACT_VERSION,
+        "channel_model_version": CHANNEL_MODEL_VERSION,
+        "channel_configuration": deepcopy(
+            formal_config.get("channel_configuration")
+        ),
         "movement_agent_kind": kind,
         "movement_agent_gamma": float(td3.gamma),
         "movement_agent_configuration": _movement_agent_configuration(
@@ -1263,8 +1289,8 @@ def _validate_checkpoint_schema(metadata):
     schema = metadata.get("checkpoint_schema_version")
     if schema != CHECKPOINT_SCHEMA_VERSION:
         raise RuntimeError(
-            "checkpoint_schema_version is incompatible with the named-RNG, "
-            "projected-action and replay "
+            "checkpoint_schema_version is incompatible with the stochastic "
+            "channel, named-RNG, projected-action and replay "
             "contract and must be retrained: "
             f"checkpoint={schema}, expected={CHECKPOINT_SCHEMA_VERSION}"
         )
@@ -1286,6 +1312,7 @@ def _validate_checkpoint_schema(metadata):
             )
         required_contracts = {
             "rng_contract_version": RNG_CONTRACT_VERSION,
+            "channel_model_version": CHANNEL_MODEL_VERSION,
             "movement_action_projection_contract_version": (
                 MOVEMENT_ACTION_PROJECTION_CONTRACT_VERSION
             ),
@@ -2052,6 +2079,14 @@ def _validate_named_rng_state_payload(state, expected_master_seed):
         ):
             raise RuntimeError("checkpoint named RNG master seed is incompatible")
         NamedRNGStreams(master_seed).load_state_dict(state)
+        missing_channel_streams = set(CHANNEL_RNG_STREAMS).difference(
+            (state.get("numpy") or {}).keys()
+        )
+        if missing_channel_streams:
+            raise RuntimeError(
+                "checkpoint named channel RNG states are missing: "
+                f"{sorted(missing_channel_streams)}"
+            )
     except (KeyError, TypeError, ValueError, RuntimeError) as exc:
         if isinstance(exc, RuntimeError) and str(exc).startswith("checkpoint named"):
             raise
@@ -2079,9 +2114,10 @@ def save_full_resume_checkpoint(
     if not isinstance(training_state, dict):
         raise TypeError("training_state must be an object")
     if not isinstance(training_state.get("named_rng_state"), dict):
-        training_state["named_rng_state"] = NamedRNGStreams(
-            int(formal_config.get("random_seed") or 0)
-        ).state_dict()
+        rng_streams = NamedRNGStreams(int(formal_config.get("random_seed") or 0))
+        for stream_name in CHANNEL_RNG_STREAMS:
+            rng_streams.numpy(stream_name)
+        training_state["named_rng_state"] = rng_streams.state_dict()
     _validate_full_resume_logging_state(
         training_state,
         int(episode) + 1,
@@ -2254,6 +2290,10 @@ def _validate_full_resume_logging_state(
         and not isinstance(training_state.get("sr_route_state"), dict)
     ):
         raise RuntimeError("checkpoint lacks SR route lifecycle state")
+    if int(checkpoint_schema_version) >= CHECKPOINT_SCHEMA_VERSION:
+        validate_channel_lifecycle_state(
+            training_state.get("channel_lifecycle_state"), num_uav=NUM_UAV
+        )
     if (
         int(checkpoint_schema_version)
         >= ROUTING_LIFECYCLE_CHECKPOINT_SCHEMA_VERSION

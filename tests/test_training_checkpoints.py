@@ -44,6 +44,7 @@ from training_checkpoint import (
 )
 from utils_update_v2 import ReplayBufferDiscrete, ReplayBufferJoint
 from fov_ema_fixtures import initialized_fov_ema_state
+from channel_fixtures import initialized_channel_lifecycle_state
 
 
 ROUTING_STATE_DIM = 90
@@ -103,6 +104,7 @@ def _lifecycle_training_state(
             "checkpoint_scope": "episode_boundary_terminal_snapshot",
             "mid_episode_checkpoint_supported": False,
         },
+        "channel_lifecycle_state": initialized_channel_lifecycle_state(),
         "routing_lifecycle_state": lifecycle,
         "routing_epsilon_decay_start_slot": lifecycle[
             "routing_epsilon_decay_start_slot"
@@ -566,7 +568,21 @@ class FullResumeCheckpointTest(unittest.TestCase):
         np.testing.assert_array_equal(
             restored_routing.cost[: routing.size], routing.cost[: routing.size]
         )
-        self.assertEqual(restored["training_state"], training_state)
+        restored_state = dict(restored["training_state"])
+        expected_state = dict(training_state)
+        restored_channel = restored_state.pop("channel_lifecycle_state")
+        expected_channel = expected_state.pop("channel_lifecycle_state")
+        for field in (
+            "u2g_los_state",
+            "s2u_los_state",
+            "u2g_los_probability",
+            "s2u_los_probability",
+        ):
+            np.testing.assert_array_equal(
+                restored_channel.pop(field), expected_channel.pop(field)
+            )
+        self.assertEqual(restored_channel, expected_channel)
+        self.assertEqual(restored_state, expected_state)
         self.assertEqual(restored["formal_config"], formal_config)
         self.assertEqual(restored["training_state"]["next_episode_index"], 7)
         self.assertLess(
@@ -955,7 +971,7 @@ class TrainingCliTest(unittest.TestCase):
         )
 
     def test_checkpoint_schema_is_explicit(self):
-        self.assertEqual(CHECKPOINT_SCHEMA_VERSION, 11)
+        self.assertEqual(CHECKPOINT_SCHEMA_VERSION, 12)
 
 
 if __name__ == "__main__":

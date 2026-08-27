@@ -4,6 +4,9 @@ from Energy_model import EnergyConsumptionModel
 from Fov_model_phase import FovModel
 from Channel_model import (
     ChannelModel,
+    FADING_BLOCK_SECONDS,
+    FADING_BLOCKS_PER_ROUTING_SLOT,
+    ROUTING_SLOT_SECONDS,
     reference_u2g_max_capacity_mbps,
     reference_u2u_max_capacity_mbps,
 )
@@ -35,6 +38,82 @@ TASK_DEADLINE_SECONDS = dict(PRODUCTION_TASK_DEADLINE_SECONDS)
 EPISODE_INJECTION_CUTOFF_SECONDS = PRODUCTION_PACKET_INJECTION_CUTOFF_SECONDS
 
 
+class BlockServiceCursor:
+    """Consume one link's capacity profile in physical block/time order."""
+
+    def __init__(self, capacity_profile_mbps, slot_start_time):
+        profile = np.asarray(capacity_profile_mbps, dtype=np.float64)
+        if profile.shape != (FADING_BLOCKS_PER_ROUTING_SLOT,):
+            raise ValueError("link service profile must contain exactly 50 blocks")
+        if np.any(profile < 0.0) or not np.all(np.isfinite(profile)):
+            raise ValueError("link service profile must be finite and non-negative")
+        self.profile_mbps = profile
+        self.capacity_bps = profile * 1e6
+        self.slot_start_time = float(slot_start_time)
+        self.block_index = 0
+        self.used_bits_in_block = 0.0
+        self.total_consumed_bits = 0.0
+        self.total_budget_bits = float(
+            np.sum(self.capacity_bps * FADING_BLOCK_SECONDS)
+        )
+
+    def _advance_empty_or_exhausted(self):
+        while self.block_index < FADING_BLOCKS_PER_ROUTING_SLOT:
+            block_budget = (
+                self.capacity_bps[self.block_index] * FADING_BLOCK_SECONDS
+            )
+            if block_budget - self.used_bits_in_block > PACKET_EPS:
+                break
+            self.block_index += 1
+            self.used_bits_in_block = 0.0
+
+    def current_time(self):
+        self._advance_empty_or_exhausted()
+        if self.block_index >= FADING_BLOCKS_PER_ROUTING_SLOT:
+            return self.slot_start_time + ROUTING_SLOT_SECONDS
+        capacity_bps = float(self.capacity_bps[self.block_index])
+        offset = (
+            self.used_bits_in_block / capacity_bps
+            if capacity_bps > 0.0
+            else 0.0
+        )
+        return (
+            self.slot_start_time
+            + self.block_index * FADING_BLOCK_SECONDS
+            + offset
+        )
+
+    @property
+    def remaining_bits(self):
+        return max(self.total_budget_bits - self.total_consumed_bits, 0.0)
+
+    def consume(self, requested_bits):
+        requested = max(float(requested_bits), 0.0)
+        consumed = 0.0
+        completion_time = self.current_time()
+        while requested - consumed > PACKET_EPS:
+            self._advance_empty_or_exhausted()
+            if self.block_index >= FADING_BLOCKS_PER_ROUTING_SLOT:
+                break
+            capacity_bps = float(self.capacity_bps[self.block_index])
+            block_budget = capacity_bps * FADING_BLOCK_SECONDS
+            available = max(block_budget - self.used_bits_in_block, 0.0)
+            if available <= PACKET_EPS or capacity_bps <= 0.0:
+                self.block_index += 1
+                self.used_bits_in_block = 0.0
+                continue
+            used = min(requested - consumed, available)
+            self.used_bits_in_block += used
+            consumed += used
+            self.total_consumed_bits += used
+            completion_time = (
+                self.slot_start_time
+                + self.block_index * FADING_BLOCK_SECONDS
+                + self.used_bits_in_block / capacity_bps
+            )
+        return float(consumed), float(completion_time)
+
+
 
 class PacketEngine:
     def __init__(
@@ -45,7 +124,11 @@ class PacketEngine:
         task_deadlines_seconds=None,
         injection_cutoff_seconds=EPISODE_INJECTION_CUTOFF_SECONDS,
     ):
-        self.step_time = step_time
+        self.step_time = float(step_time)
+        if not np.isclose(
+            self.step_time, ROUTING_SLOT_SECONDS, rtol=0.0, atol=1e-12
+        ):
+            raise ValueError("packet service slot is fixed at 0.25 seconds")
         self.num_UAV = num_uav
         deadlines = dict(TASK_DEADLINE_SECONDS)
         if task_deadlines_seconds is not None:
@@ -147,7 +230,6 @@ class PacketEngine:
         self.fov_footprint_transition_marker = None
         self.fov_ema_update_count = 0
         self.norm_cfg = dict(
-            C_MAX=200.0,
             D_MAX=3.0,
             B_MAX=2e6,
             ETA_MAX=60.0,
@@ -948,23 +1030,51 @@ class PacketEngine:
             raise RuntimeError("canonical routing reward is NaN or Inf")
         return float(reward)
 
-    def serve_s2u_links(self, env, capacities, current_time):
+    def _block_service_profile(self, capacity_mbps, profile):
+        """Resolve a formal profile; scalar fallback keeps unit-test APIs stable."""
+
+        capacity_mbps = float(capacity_mbps)
+        if profile is None:
+            profile = np.full(
+                FADING_BLOCKS_PER_ROUTING_SLOT,
+                max(capacity_mbps, 0.0),
+                dtype=np.float64,
+            )
+        profile = np.asarray(profile, dtype=np.float64)
+        if profile.shape != (FADING_BLOCKS_PER_ROUTING_SLOT,):
+            raise ValueError("packet service requires an exact 50-block profile")
+        if np.any(profile < 0.0) or not np.all(np.isfinite(profile)):
+            raise ValueError("packet service profile must be finite and non-negative")
+        return profile
+
+    def serve_s2u_links(
+        self,
+        env,
+        capacities,
+        current_time,
+        *,
+        block_capacity_profiles=None,
+    ):
         """Serve SR FIFO uploads with partial HOL locks and next-slot causality."""
 
         current_time = float(current_time)
         slot_end = current_time + float(self.step_time)
+        block_capacity_profiles = dict(block_capacity_profiles or {})
         result = {"transmitted_bits_by_link": {}, "arrivals": []}
         for (sr_id, receiver), capacity_mbps in sorted(capacities.items()):
             sr_id, receiver = int(sr_id), int(receiver)
             capacity_mbps = float(capacity_mbps)
             if not np.isfinite(capacity_mbps) or capacity_mbps <= 0.0:
                 continue
-            capacity_bps = capacity_mbps * 1e6
-            initial_budget = capacity_bps * self.step_time
-            remaining_budget = initial_budget
+            profile = self._block_service_profile(
+                capacity_mbps,
+                block_capacity_profiles.get((sr_id, receiver)),
+            )
+            cursor = BlockServiceCursor(profile, current_time)
+            initial_budget = cursor.total_budget_bits
             transmitted = 0.0
             eligible_ids = {int(pkt["id"]) for pkt in self.sr_queues[sr_id]}
-            while remaining_budget > PACKET_EPS:
+            while cursor.remaining_bits > PACKET_EPS:
                 pkt = self.get_sr_hol_packet(sr_id)
                 if pkt is None or int(pkt["id"]) not in eligible_ids:
                     break
@@ -984,7 +1094,13 @@ class PacketEngine:
                 if locked is None:
                     pkt["s2u_receiver"] = receiver
                 remaining_before = max(float(pkt["rem_bits"]), 0.0)
-                bits_used = min(remaining_budget, remaining_before)
+                if float(pkt.get("s2u_bits_sent", 0.0)) <= PACKET_EPS:
+                    service_start = cursor.current_time()
+                    pkt["s2u_service_start_time"] = service_start
+                    pkt["s2u_queue_delay_s"] = max(
+                        service_start - float(pkt["generation_time"]), 0.0
+                    )
+                bits_used, completion_time = cursor.consume(remaining_before)
                 if bits_used <= PACKET_EPS:
                     break
                 pkt["rem_bits"] = max(remaining_before - bits_used, 0.0)
@@ -992,27 +1108,28 @@ class PacketEngine:
                 self.s2u_backlog_bits[sr_id] = max(
                     self.s2u_backlog_bits[sr_id] - bits_used, 0.0
                 )
-                remaining_budget -= bits_used
                 transmitted += bits_used
                 if pkt["rem_bits"] > PACKET_EPS:
                     self.s2u_partial_transmissions += 1
                     break
 
-                completion_time = current_time + transmitted / capacity_bps
                 queue = self.sr_queues[sr_id]
                 if not queue or queue[0] is not pkt:
                     raise AssertionError("completed S2U packet was not SR FIFO HOL")
                 queue.popleft()
                 pkt["_queued_sr"] = None
                 pkt["s2u_completion_time"] = completion_time
+                service_start = float(
+                    pkt.get("s2u_service_start_time", completion_time)
+                )
+                queue_delay_s = float(pkt.get("s2u_queue_delay_s", 0.0))
+                tx_elapsed_s = max(completion_time - service_start, 0.0)
                 pkt.setdefault("per_hop", []).append(
                     {
                         "from": f"SR:{sr_id}",
                         "to": receiver,
-                        "queue_s": max(
-                            current_time - float(pkt["generation_time"]), 0.0
-                        ),
-                        "tx_s": float(pkt["size_bits"]) / capacity_bps,
+                        "queue_s": queue_delay_s,
+                        "tx_s": tx_elapsed_s,
                         "delay_ms": max(
                             completion_time - float(pkt["generation_time"]), 0.0
                         )
@@ -1023,6 +1140,8 @@ class PacketEngine:
                 pkt["path"].append(receiver)
                 pkt["rem_bits"] = float(pkt["size_bits"])
                 pkt["s2u_receiver"] = None
+                pkt["s2u_service_start_time"] = None
+                pkt["s2u_queue_delay_s"] = 0.0
                 deadline_abs = float(pkt["deadline_abs"])
                 if (
                     completion_time >= deadline_abs - PACKET_EPS
@@ -1056,11 +1175,15 @@ class PacketEngine:
         *,
         start_of_slot_hol_by_sender=None,
         start_of_slot_eligible_packet_ids=None,
+        block_capacity_profiles=None,
+        s2u_block_capacity_profiles=None,
     ):
         """Serve each sender FIFO with one shared bit budget for its active link."""
 
         current_time = float(current_time)
         slot_end = current_time + float(self.step_time)
+        block_capacity_profiles = dict(block_capacity_profiles or {})
+        s2u_block_capacity_profiles = dict(s2u_block_capacity_profiles or {})
         actions = {int(sender): int(receiver) for sender, receiver in actions.items()}
         if start_of_slot_hol_by_sender is None:
             start_of_slot_hol_by_sender = {
@@ -1107,7 +1230,10 @@ class PacketEngine:
         }
         pending_relay_arrivals = []
         s2u_result = self.serve_s2u_links(
-            env, getattr(env, "active_s2u_capacities", {}), current_time
+            env,
+            getattr(env, "active_s2u_capacities", {}),
+            current_time,
+            block_capacity_profiles=s2u_block_capacity_profiles,
         )
         result["s2u_arrivals"] = list(s2u_result["arrivals"])
         result["transmitted_bits_by_link"].update(
@@ -1137,12 +1263,14 @@ class PacketEngine:
             capacity_mbps = float(capacities.get(link, 0.0))
             if not np.isfinite(capacity_mbps) or capacity_mbps <= 0.0:
                 continue
-            capacity_bps = capacity_mbps * 1e6
-            initial_budget = capacity_bps * float(self.step_time)
-            remaining_budget = initial_budget
+            profile = self._block_service_profile(
+                capacity_mbps, block_capacity_profiles.get(link)
+            )
+            cursor = BlockServiceCursor(profile, current_time)
+            initial_budget = cursor.total_budget_bits
             transmitted_on_link = 0.0
 
-            while remaining_budget > PACKET_EPS:
+            while cursor.remaining_bits > PACKET_EPS:
                 pkt = self.get_hol_packet(sender)
                 if pkt is None or int(pkt["id"]) not in eligible_packet_ids[sender]:
                     break
@@ -1156,24 +1284,21 @@ class PacketEngine:
                     )
 
                 remaining_before = float(pkt.get("rem_bits", 0.0))
-                bits_used = min(remaining_budget, remaining_before)
-                if bits_used <= PACKET_EPS:
-                    break
                 pkt["last_routing_sender"] = sender
                 if float(pkt.get("hop_bits_sent", 0.0)) <= PACKET_EPS:
-                    service_start = current_time + (
-                        transmitted_on_link / capacity_bps
-                    )
+                    service_start = cursor.current_time()
                     pkt["hop_service_start_time"] = service_start
                     pkt["hop_queue_delay_s"] = max(
                         service_start
                         - float(pkt.get("queue_enter_time", service_start)),
                         0.0,
                     )
+                bits_used, completion_time = cursor.consume(remaining_before)
+                if bits_used <= PACKET_EPS:
+                    break
                 completed_hop = self.record_hop_transmission(
                     pkt, sender, receiver, bits_used
                 )
-                remaining_budget = max(remaining_budget - bits_used, 0.0)
                 transmitted_on_link += bits_used
                 if receiver == env.GS_ID:
                     pkt["final_hop_accum_bits"] = float(
@@ -1184,9 +1309,6 @@ class PacketEngine:
 
                 timely_delivery = False
                 if completed_hop:
-                    completion_time = current_time + (
-                        transmitted_on_link / capacity_bps
-                    )
                     queue_delay_s = float(pkt.get("hop_queue_delay_s", 0.0))
                     service_start = float(
                         pkt.get("hop_service_start_time", completion_time)
@@ -1310,7 +1432,7 @@ class PacketEngine:
                 if not completed_hop:
                     break
 
-            transmitted = initial_budget - remaining_budget
+            transmitted = transmitted_on_link
             result["transmitted_bits_by_link"][link] = transmitted
             if transmitted > initial_budget + PACKET_EPS:
                 self.link_slot_budget_violations += 1
@@ -1922,7 +2044,6 @@ class PacketEngine:
         
 
         # ---------- 常數/正規化上限（建構時固定；getter 為 pure read） ----------
-        C_MAX = float(self.norm_cfg["C_MAX"])
         D_MAX = float(self.norm_cfg["D_MAX"])
         B_MAX = float(self.norm_cfg["B_MAX"])
         ETA_MAX = float(self.norm_cfg["ETA_MAX"])
@@ -1974,7 +2095,12 @@ class PacketEngine:
 
             link_valid_mask[nh]    = 1.0
             link_delay_norm[nh]    = min(max(delay, 0.0), D_MAX) / D_MAX
-            link_capacity_norm[nh] = min(max(cap,   0.0), C_MAX) / C_MAX
+            cap_reference = float(
+                env.routing_capacity_reference_mbps(uav_id, nh)
+            )
+            link_capacity_norm[nh] = np.clip(
+                max(cap, 0.0) / cap_reference, 0.0, 1.0
+            )
 
             if nh < N:
                 if backlog_bits is None:
@@ -1990,7 +2116,12 @@ class PacketEngine:
             cap_gs = float(env.gs_capacity[uav_id])
             if cap_gs > 0:
                 link_valid_mask[GS]    = 1.0
-                link_capacity_norm[GS] = min(cap_gs, C_MAX) / C_MAX
+                cap_reference = float(
+                    env.routing_capacity_reference_mbps(uav_id, GS)
+                )
+                link_capacity_norm[GS] = np.clip(
+                    max(cap_gs, 0.0) / cap_reference, 0.0, 1.0
+                )
                 # 若沒有明確的GS延遲估計，給一個保守上限（不偏好也不懲罰）
                 if hasattr(env, "gs_delay"):
                     d_gs = float(env.gs_delay[uav_id])
@@ -2068,7 +2199,6 @@ class PacketEngine:
         
 
         # ---------- 常數/正規化上限（建構時固定；getter 為 pure read） ----------
-        C_MAX = float(self.norm_cfg["C_MAX"])
         D_MAX = float(self.norm_cfg["D_MAX"])
         B_MAX = float(self.norm_cfg["B_MAX"])
         ETA_MAX = float(self.norm_cfg["ETA_MAX"])
@@ -2174,7 +2304,12 @@ class PacketEngine:
             if nh == uav_id:
                 continue
             cap = float(env.Capacity_matrix[uav_id, nh])
-            link_capacity_norm[nh] = min(max(cap, 0.0), C_MAX) / C_MAX
+            cap_reference = float(
+                env.routing_capacity_reference_mbps(uav_id, nh)
+            )
+            link_capacity_norm[nh] = np.clip(
+                max(cap, 0.0) / cap_reference, 0.0, 1.0
+            )
             if effective_mask[nh] and cap > 0.0 and hol_rem_bits > 0.0:
                 tx_delay_s = hol_rem_bits / (cap * 1e6)
                 link_delay_norm[nh] = np.clip(tx_delay_s / D_MAX, 0.0, 1.0)
@@ -2194,7 +2329,12 @@ class PacketEngine:
         GS = env.GS_ID
         if hasattr(env, "gs_capacity"):
             cap_gs = float(env.gs_capacity[uav_id])
-            link_capacity_norm[GS] = min(max(cap_gs, 0.0), C_MAX) / C_MAX
+            cap_reference = float(
+                env.routing_capacity_reference_mbps(uav_id, GS)
+            )
+            link_capacity_norm[GS] = np.clip(
+                max(cap_gs, 0.0) / cap_reference, 0.0, 1.0
+            )
             if effective_mask[GS] and cap_gs > 0.0 and hol_rem_bits > 0.0:
                 tx_delay_s = hol_rem_bits / (cap_gs * 1e6)
                 link_delay_norm[GS] = np.clip(tx_delay_s / D_MAX, 0.0, 1.0)

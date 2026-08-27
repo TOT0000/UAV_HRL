@@ -33,6 +33,7 @@ from training_checkpoint import (
     inspect_model_checkpoint,
 )
 from fov_ema_fixtures import initialized_fov_ema_state
+from channel_fixtures import initialized_channel_lifecycle_state
 
 
 class ResumeRecoveryTest(unittest.TestCase):
@@ -95,6 +96,7 @@ class ResumeRecoveryTest(unittest.TestCase):
                 "checkpoint_scope": "episode_boundary_terminal_snapshot",
                 "mid_episode_checkpoint_supported": False,
             },
+            "channel_lifecycle_state": initialized_channel_lifecycle_state(),
             "routing_lifecycle_state": lifecycle,
             "routing_epsilon_decay_start_slot": None,
             "exploration_schedule_version": EXPLORATION_SCHEDULE_VERSION,

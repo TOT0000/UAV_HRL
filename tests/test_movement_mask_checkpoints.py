@@ -38,6 +38,7 @@ from training_checkpoint import (
 )
 from utils_update_v2 import ReplayBufferDiscrete, ReplayBufferJoint
 from fov_ema_fixtures import initialized_fov_ema_state
+from channel_fixtures import initialized_channel_lifecycle_state
 
 
 class MovementMaskCheckpointTest(unittest.TestCase):
@@ -119,6 +120,7 @@ class MovementMaskCheckpointTest(unittest.TestCase):
                 global_slot_count=4
             ).state_dict(),
             exploration_state=exploration_schedule_configuration(config, method),
+            channel_lifecycle_state=initialized_channel_lifecycle_state(),
         )
         checkpoint = Path(root) / method_key / "ep_0001"
         experiment = {

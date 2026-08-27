@@ -64,7 +64,7 @@ BOOLEAN_COLUMNS = ("dinkelbach_lambda_updated",)
 
 STRING_COLUMNS = ("dinkelbach_update_status",)
 
-TRAINING_HISTORY_SCHEMA_VERSION = 4
+TRAINING_HISTORY_SCHEMA_VERSION = 5
 TRAINING_HISTORY_CSV = "training_history.csv"
 TRAINING_HISTORY_JSONL = "training_history.jsonl"
 TRAINING_HISTORY_COMMIT = "training_history_commit.json"

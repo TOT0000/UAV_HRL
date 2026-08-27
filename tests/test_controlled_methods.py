@@ -43,6 +43,7 @@ from training_checkpoint import (
 )
 from utils_update_v2 import ReplayBufferDiscrete, ReplayBufferJoint
 from fov_ema_fixtures import initialized_fov_ema_state
+from channel_fixtures import initialized_channel_lifecycle_state
 
 
 EXISTING_METHODS = (
@@ -444,6 +445,7 @@ class ControlledDDPGCheckpointTest(unittest.TestCase):
             exploration_state=exploration_schedule_configuration(
                 config, MethodSpec.parse("ddpg_dinkelbach")
             ),
+            channel_lifecycle_state=initialized_channel_lifecycle_state(),
         )
         expected_actor = {
             key: value.detach().cpu().clone()

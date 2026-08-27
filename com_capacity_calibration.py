@@ -33,7 +33,10 @@ def fixed_reference_capacity_metadata(offered_rate_packets_per_second=None):
     )
     return {
         "schema": COM_NORMALIZATION_SCHEMA,
-        "normalization": "clip(candidate_capacity / fixed_theoretical_maximum, 0, 1)",
+        "normalization": (
+            "clip(conditional expected capacity / fixed LoS-Rician expected "
+            "theoretical maximum, 0, 1)"
+        ),
         "reference_bandwidth_hz": REFERENCE_COM_BANDWIDTH_HZ,
         "reference_bandwidth_denominator": NUM_UAV + ROI_COUNT_MAX,
         "total_bandwidth_hz": 10e6,
@@ -46,6 +49,9 @@ def fixed_reference_capacity_metadata(offered_rate_packets_per_second=None):
             "sr_agl_m": 0.0,
         },
         "transmit_power_dbm": 23.0,
+        "reference_large_scale_state": "LoS",
+        "reference_small_scale_fading": "Rician-K-linear-10",
+        "routing_csi": "deterministic-distributional-expected-capacity",
         "reference_s2u_max_capacity_mbps": reference_maximum_mbps,
         "c_ref_com": reference_maximum_mbps,
         "rate_sweep_invariant": True,

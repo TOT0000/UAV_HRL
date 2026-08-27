@@ -1,6 +1,6 @@
 {
-  "schema": "fixed-s2u-theoretical-maximum-v1",
-  "normalization": "clip(candidate_capacity / fixed_theoretical_maximum, 0, 1)",
+  "schema": "fixed-s2u-los-rician-expected-maximum-v2",
+  "normalization": "clip(conditional expected capacity / fixed LoS-Rician expected theoretical maximum, 0, 1)",
   "reference_bandwidth_hz": 555555.5555555555,
   "reference_bandwidth_denominator": 18,
   "total_bandwidth_hz": 10000000.0,
@@ -13,7 +13,10 @@
     "sr_agl_m": 0.0
   },
   "transmit_power_dbm": 23.0,
-  "reference_s2u_max_capacity_mbps": 11.092923740386324,
-  "c_ref_com": 11.092923740386324,
+  "reference_large_scale_state": "LoS",
+  "reference_small_scale_fading": "Rician-K-linear-10",
+  "routing_csi": "deterministic-distributional-expected-capacity",
+  "reference_s2u_max_capacity_mbps": 11.017511028833846,
+  "c_ref_com": 11.017511028833846,
   "rate_sweep_invariant": true
 }

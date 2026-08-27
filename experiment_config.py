@@ -8,6 +8,17 @@ import json
 from types import MappingProxyType
 
 from Channel_model import (
+    CHANNEL_ENVIRONMENT_CONTRACT_VERSION,
+    CHANNEL_FAIRNESS_CONTRACT_VERSION,
+    CHANNEL_MODEL_VERSION,
+    CHANNEL_NORMALIZATION_VERSION,
+    FADING_BLOCK_SECONDS,
+    FADING_BLOCKS_PER_ROUTING_SLOT,
+    LARGE_SCALE_STATE_SECONDS,
+    RICIAN_K_DB,
+    RICIAN_K_LINEAR,
+    ROUTING_SLOT_SECONDS,
+    channel_configuration_metadata,
     reference_s2u_max_capacity_mbps,
     reference_u2g_max_capacity_mbps,
     reference_u2u_max_capacity_mbps,
@@ -31,8 +42,8 @@ COM_PACKET_RATE_PER_SECOND = 50.0
 COM_PACKET_SIZE_BITS = 256.0
 COM_OFFERED_RATE_BPS = COM_PACKET_RATE_PER_SECOND * COM_PACKET_SIZE_BITS
 ASSIGNMENT_DUMMY_UTILITY = -1e-9
-UTILITY_NORMALIZATION_MODE = "fov_global_minmax_com_fixed_theoretical_capacity-v2"
-COM_UTILITY_CONTRACT_VERSION = "fixed-s2u-theoretical-maximum-v1"
+UTILITY_NORMALIZATION_MODE = "fov-global-minmax-com-fading-aware-reference-v3"
+COM_UTILITY_CONTRACT_VERSION = "fixed-s2u-los-rician-expected-maximum-v2"
 TASK_COMPATIBILITY_POLICY = "fov_com_only_with_distance_limit"
 FOV_ASSIGNMENT_UTILITY_VERSION = "coverage_times_reciprocal_image_quality-v1"
 FOV_QUALITY_TRANSFORM = (
@@ -69,14 +80,15 @@ ROUTING_TAU = 0.005
 ROUTING_OPTIMIZER_UPDATE_SCOPE = "every_4_routing_slots"
 FOV_EMA_LIFECYCLE_VERSION = "no-map-footprint-progression-v3"
 SR_ROUTE_LIFECYCLE_VERSION = "assigned-and-arrived-derived-state-v2"
-PACKET_QOS_CONTRACT_VERSION = "eligible-fov-plus-next-slot-s2u-admitted-com-v3"
+PACKET_QOS_CONTRACT_VERSION = "eligible-fov-plus-next-slot-s2u-admitted-com-v4"
 PACKET_ROUTING_CAUSALITY_CONTRACT_VERSION = "start-of-slot-hol-routing-v1"
+PACKET_SERVICE_CONTRACT_VERSION = "fifty-5ms-block-cumulative-service-v1"
 QOS_AGGREGATE_CONTRACT_VERSION = "pooled-fov-com-eligible-v1"
-ROUTING_REWARD_CONTRACT_VERSION = "capacity-minus-actual-hol-wait-v3"
+ROUTING_REWARD_CONTRACT_VERSION = "fading-effective-capacity-minus-actual-hol-wait-v4"
 ROUTING_REWARD_ALPHA_CAPACITY = 1.0
 ROUTING_REWARD_ALPHA_DELAY = 0.5
 ROUTING_CAPACITY_EPSILON_BPS = 1e-9
-MOVEMENT_CHANNEL_TIMING_VERSION = "held-command-four-synchronous-substeps-v2"
+MOVEMENT_CHANNEL_TIMING_VERSION = "held-command-four-slots-fifty-fading-blocks-v3"
 PROPULSION_MODEL_ID = "canonical-3d-quadrotor-v1"
 MOVEMENT_ACTION_PROJECTION_CONTRACT_VERSION = "fieldwise-clamp-heading-wrap-mask-v1"
 MOVEMENT_REPLAY_CONTRACT_VERSION = "executed-projected-action-capacity-50000-v1"
@@ -377,7 +389,7 @@ FORMAL_EXPERIMENT_DEFAULTS = {
     "roi_count_min": ROI_COUNT_MIN,
     "roi_count_max": ROI_COUNT_MAX,
     "episode_seconds": 60,
-    "routing_slot_seconds": 0.25,
+    "routing_slot_seconds": ROUTING_SLOT_SECONDS,
     "evaluation_episodes_per_trained_seed": 100,
     "checkpoint_interval_episodes": 50,
     "output_root": "results",
@@ -706,6 +718,7 @@ def comparison_method_configuration(method_spec: MethodSpec) -> dict:
         "packet_routing_causality_contract_version": (
             PACKET_ROUTING_CAUSALITY_CONTRACT_VERSION
         ),
+        "packet_service_contract_version": PACKET_SERVICE_CONTRACT_VERSION,
         "qos_aggregate_contract_version": QOS_AGGREGATE_CONTRACT_VERSION,
         "routing_reward_contract_version": ROUTING_REWARD_CONTRACT_VERSION,
         "routing_reward_alpha_capacity": ROUTING_REWARD_ALPHA_CAPACITY,
@@ -721,7 +734,19 @@ def comparison_method_configuration(method_spec: MethodSpec) -> dict:
         "propulsion_parameters": dict(PROPULSION_PARAMETERS),
         "movement_channel_timing_version": MOVEMENT_CHANNEL_TIMING_VERSION,
         "movement_substeps_per_interval": 4,
-        "movement_substep_seconds": 0.25,
+        "movement_substep_seconds": ROUTING_SLOT_SECONDS,
+        "channel_model_version": CHANNEL_MODEL_VERSION,
+        "channel_environment_contract_version": (
+            CHANNEL_ENVIRONMENT_CONTRACT_VERSION
+        ),
+        "channel_fairness_contract_version": CHANNEL_FAIRNESS_CONTRACT_VERSION,
+        "channel_normalization_version": CHANNEL_NORMALIZATION_VERSION,
+        "channel_configuration": channel_configuration_metadata(),
+        "large_scale_state_seconds": LARGE_SCALE_STATE_SECONDS,
+        "fading_block_seconds": FADING_BLOCK_SECONDS,
+        "fading_blocks_per_routing_slot": FADING_BLOCKS_PER_ROUTING_SLOT,
+        "rician_k_linear": RICIAN_K_LINEAR,
+        "rician_k_db": RICIAN_K_DB,
         "resolved_fov_deadline_seconds": PRODUCTION_TASK_DEADLINE_SECONDS["FOV"],
         "resolved_com_deadline_seconds": PRODUCTION_TASK_DEADLINE_SECONDS["COM"],
         "packet_injection_cutoff_seconds": (

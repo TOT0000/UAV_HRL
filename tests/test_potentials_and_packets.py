@@ -4,7 +4,7 @@ from unittest.mock import patch
 
 import numpy as np
 
-from Channel_model import a2g_capacity_mbps
+from Channel_model import a2g_expected_capacity_mbps
 from Packet_scheduler_v1 import PacketEngine, final_hop_delivered_bits
 from Simulator import Simulator
 from Task_assignment import Task, UAVAssigner
@@ -149,7 +149,9 @@ class ComStateCalibrationAndDeliveryTest(unittest.TestCase):
         first = calibrate_com_capacity(self.env, seed=1234, sample_count=1000)
         second = calibrate_com_capacity(self.env, seed=1234, sample_count=1000)
         self.assertEqual(first, second)
-        self.assertEqual(first["schema"], "fixed-s2u-theoretical-maximum-v1")
+        self.assertEqual(
+            first["schema"], "fixed-s2u-los-rician-expected-maximum-v2"
+        )
         self.assertEqual(first["reference_bandwidth_denominator"], 18)
         self.assertAlmostEqual(first["reference_bandwidth_hz"], 10e6 / 18)
         self.assertEqual(first["offered_rate_bps"], 50 * 256)
@@ -169,11 +171,12 @@ class ComStateCalibrationAndDeliveryTest(unittest.TestCase):
         snr = self.env.get_snr(0, 0)
         capacity = self.env.get_sr_uav_capacity_mbps(0, 0)
         expected = float(
-            a2g_capacity_mbps(
+            a2g_expected_capacity_mbps(
                 uav.get_position(),
                 sr.get_position(),
                 10e6 / 18,
                 23.0,
+                self.env.channel.a2g_state("S2U", 0, 0),
             )
         )
         self.assertGreater(snr, 0.0)

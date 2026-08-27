@@ -60,6 +60,7 @@ from experiment_config import (
     ROUTING_EPSILON_DECAY_EPISODES,
     ROUTING_GRADIENT_STEPS_PER_UPDATE,
     ROUTING_REPLAY_CAPACITY,
+    ROUTING_SLOT_SECONDS,
     ROUTING_UPDATE_INTERVAL_SLOTS,
     ROUTING_WARMUP_TRANSITIONS,
     SR_ROUTE_LIFECYCLE_VERSION,
@@ -108,10 +109,17 @@ from training_history import (
     write_training_history,
 )
 import utils_update_v2
-from rng_contract import NamedRNGStreams, RNG_CONTRACT_VERSION
+from rng_contract import CHANNEL_RNG_STREAMS, NamedRNGStreams, RNG_CONTRACT_VERSION
 
 
-MOVEMENT_CONTROL_INTERVAL = 4
+MOVEMENT_CONTROL_INTERVAL = int(round(MOVEMENT_INTERVAL_SECONDS / ROUTING_SLOT_SECONDS))
+if not np.isclose(
+    MOVEMENT_CONTROL_INTERVAL * ROUTING_SLOT_SECONDS,
+    MOVEMENT_INTERVAL_SECONDS,
+    rtol=0.0,
+    atol=1e-12,
+):
+    raise RuntimeError("movement interval must contain an integer routing-slot count")
 PRODUCTION_WARMUP_TRANSITIONS = FORMAL_EXPERIMENT_DEFAULTS[
     "movement_hyperparameters"
 ]["warmup_joint_transitions"]
@@ -127,7 +135,12 @@ SMOKE_RANDOM_SEED = DEFAULT_TRAINING_SEED
 def _seed_training_rng(seed):
     """Return the local RNG registry; formal execution never seeds globals."""
 
-    return NamedRNGStreams(0 if seed is None else int(seed))
+    streams = NamedRNGStreams(0 if seed is None else int(seed))
+    # Materialization consumes no draws and guarantees full-resume captures
+    # both training and evaluation channel generator states explicitly.
+    for stream_name in CHANNEL_RNG_STREAMS:
+        streams.numpy(stream_name)
+    return streams
 
 
 def _git_commit_sha():
@@ -189,7 +202,7 @@ class TrainingConfig:
     total_episodes: int
     mode: str = "train"
     episode_seconds: int = 60
-    routing_slot_seconds: float = 0.25
+    routing_slot_seconds: float = ROUTING_SLOT_SECONDS
     warmup_joint_transitions: int = PRODUCTION_WARMUP_TRANSITIONS
     batch_size: int = PRODUCTION_BATCH_SIZE
     policy_delay: int = PRODUCTION_POLICY_DELAY
@@ -275,7 +288,14 @@ class TrainingConfig:
             raise ValueError(
                 "packet outcome collection limit is valid only in bounded_memory mode"
             )
-        slots = 1.0 / float(self.routing_slot_seconds)
+        if not np.isclose(
+            float(self.routing_slot_seconds),
+            ROUTING_SLOT_SECONDS,
+            rtol=0.0,
+            atol=1e-12,
+        ):
+            raise ValueError("routing slot duration is fixed at 0.25 seconds")
+        slots = MOVEMENT_INTERVAL_SECONDS / float(self.routing_slot_seconds)
         if not np.isclose(slots, MOVEMENT_CONTROL_INTERVAL):
             raise ValueError("movement interval must contain exactly four routing slots")
         if self.episode_seconds <= 0 or self.total_episodes <= 0:
@@ -334,7 +354,7 @@ def smoke_training_config():
         total_episodes=1,
         mode="smoke",
         episode_seconds=60,
-        routing_slot_seconds=0.25,
+        routing_slot_seconds=ROUTING_SLOT_SECONDS,
         warmup_joint_transitions=0,
         routing_warmup_transitions=1,
         batch_size=1,
@@ -578,6 +598,8 @@ def _run_routing_slot(
     del routing_masks
     step_time = float(packet_engine.step_time)
     env.current_time = float(current_time)
+    absolute_slot = int(round(env.current_time / step_time))
+    env.prepare_channel_routing_slot(absolute_slot)
     # Source generation precedes cleanup by contract. Prior-slot expirations are
     # normally already gone; this makes the boundary explicit and idempotent.
     packet_engine.inject_packets(
@@ -668,6 +690,8 @@ def _run_routing_slot(
         current_time=env.current_time,
         start_of_slot_hol_by_sender=start_of_slot_hol_by_sender,
         start_of_slot_eligible_packet_ids=start_of_slot_eligible_packet_ids,
+        block_capacity_profiles=env.active_link_capacity_profiles_mbps,
+        s2u_block_capacity_profiles=env.active_s2u_capacity_profiles_mbps,
     )
     attributable_violation_count = sum(
         bool(outcome["violated"])
@@ -945,6 +969,7 @@ def _full_training_state(
     routing_lifecycle_state=None,
     exploration_state,
     named_rng_state=None,
+    channel_lifecycle_state=None,
 ):
     completed_episode_count = int(episode) + 1
     if lambda_cost_used_log is None:
@@ -1020,6 +1045,7 @@ def _full_training_state(
         "sr_route_state": copy.deepcopy(sr_route_state),
         "training_history_rows": list(training_history_rows),
         "named_rng_state": copy.deepcopy(named_rng_state),
+        "channel_lifecycle_state": copy.deepcopy(channel_lifecycle_state),
     }
 
 
@@ -1822,6 +1848,14 @@ def train(
             raise RuntimeError(
                 "resume checkpoint lacks named subsystem RNG state"
             ) from exc
+        try:
+            env.load_channel_state_dict(
+                training_state["channel_lifecycle_state"]
+            )
+        except KeyError as exc:
+            raise RuntimeError(
+                "resume checkpoint lacks channel lifecycle state"
+            ) from exc
         resume_checkpoint_compatibility = restored["horizon_compatibility"]
         start_episode = int(training_state["next_episode_index"])
         if method_spec.uses_dinkelbach:
@@ -2075,6 +2109,7 @@ def train(
                 # Match the existing slot-0 SR update. Later SR updates are part
                 # of the preceding one-second transition so S_{t+1} == S_t next.
                 env.advance_sr_teams()
+            env.begin_channel_movement_interval(interval)
             if getattr(env, "need_reassign", False):
                 env.assign_tasks()
                 env.need_reassign = False
@@ -2774,6 +2809,7 @@ def train(
                     training_history_rows=training_history_rows,
                     dinkelbach_active=method_spec.uses_dinkelbach,
                     named_rng_state=rng_streams.state_dict(),
+                    channel_lifecycle_state=env.channel_state_dict(),
                 ),
                 formal_config=formal_config,
                 movement_state_dim=MOVEMENT_STATE_DIM,
@@ -3006,6 +3042,10 @@ def train(
         "lambda_cost_after_episode_log": lambda_cost_after_episode_log,
         "fov_ema_state": packet_engine.fov_ema_state(),
         "sr_route_state": env.sr_route_state(),
+        "channel_lifecycle_state": env.channel_state_dict(),
+        "channel_profile_generation_seconds": (
+            env.channel.last_profile_generation_seconds
+        ),
         "td3_noise_log": td3_noise_log,
         "movement_noise_log": td3_noise_log,
         "routing_epsilon_log": routing_epsilon_log,

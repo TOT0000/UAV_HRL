@@ -254,7 +254,8 @@ class CentralizedTrainingFlowTest(unittest.TestCase):
         self.assertEqual(metadata["checkpoint_type"], "full-resume")
         self.assertEqual(state["completed_episode_index"], 0)
         self.assertEqual(state["next_episode_index"], 1)
-        self.assertEqual(state["full_resume_logging_schema_version"], 1)
+        self.assertEqual(state["full_resume_logging_schema_version"], 2)
+        self.assertIn("channel_lifecycle_state", state)
         self.assertEqual(state["lambda_used_log"], result["lambda_used_log"])
         self.assertEqual(
             state["lambda_after_episode_log"],
