@@ -15,10 +15,13 @@ from DDQN import DDQN
 from dinkelbach_blocks import DinkelbachBlockState, dinkelbach_config_metadata
 from experiment_config import (
     EXPLORATION_SCHEDULE_VERSION,
+    GROUND_STATION_POSITION_M,
+    INITIAL_COMMUNICATION_TOPOLOGY_CONTRACT_VERSION,
     MethodSpec,
     MOVEMENT_EXPLORATION_DECAY_EPISODES,
     ROUTING_EPSILON_DECAY_EPISODES,
     SR_ROUTE_LIFECYCLE_VERSION,
+    UAV_INITIAL_LAYOUT_VERSION,
     effective_training_config,
 )
 from HRL_task_aware import (
@@ -34,6 +37,7 @@ from scenario_manifest import extend_training_manifest, generate_manifest
 from training_checkpoint import (
     CHECKPOINT_SCHEMA_VERSION,
     FULL_RESUME_LOGGING_SCHEMA_VERSION,
+    PRE_INITIAL_TOPOLOGY_CHECKPOINT_SCHEMA_VERSION,
     PRE_ROUTING_LIFECYCLE_CHECKPOINT_SCHEMA_VERSION,
     ROUTING_LIFECYCLE_CHECKPOINT_SCHEMA_VERSION,
     load_full_resume_checkpoint,
@@ -623,6 +627,20 @@ class FullResumeCheckpointTest(unittest.TestCase):
                 (checkpoint_dir / "metadata.json").read_text(encoding="utf-8")
             )
             self.assertEqual(metadata["checkpoint_type"], "model-only")
+            self.assertEqual(
+                metadata["ground_station_position_m"],
+                list(GROUND_STATION_POSITION_M),
+            )
+            self.assertEqual(
+                metadata["uav_initial_layout_version"],
+                UAV_INITIAL_LAYOUT_VERSION,
+            )
+            self.assertEqual(
+                metadata[
+                    "initial_communication_topology_contract_version"
+                ],
+                INITIAL_COMMUNICATION_TOPOLOGY_CONTRACT_VERSION,
+            )
             models = torch.load(
                 checkpoint_dir / "models.pt", weights_only=False
             )
@@ -659,7 +677,7 @@ class FullResumeCheckpointTest(unittest.TestCase):
                     calibration=calibration,
                 )
 
-    def test_schema_9_checkpoint_is_rejected_before_network_restore(self):
+    def test_schema_15_checkpoint_is_rejected_before_network_restore(self):
         td3, ddqn, _joint, _routing = self._components()
         with tempfile.TemporaryDirectory() as temp_dir:
             checkpoint_dir = Path(temp_dir) / "model"
@@ -677,7 +695,9 @@ class FullResumeCheckpointTest(unittest.TestCase):
             )
             metadata_path = checkpoint_dir / "metadata.json"
             metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-            metadata["checkpoint_schema_version"] = 9
+            metadata["checkpoint_schema_version"] = (
+                PRE_INITIAL_TOPOLOGY_CHECKPOINT_SCHEMA_VERSION
+            )
             metadata_path.write_text(
                 json.dumps(metadata, indent=2) + "\n", encoding="utf-8"
             )
@@ -980,7 +1000,7 @@ class TrainingCliTest(unittest.TestCase):
         )
 
     def test_checkpoint_schema_is_explicit(self):
-        self.assertEqual(CHECKPOINT_SCHEMA_VERSION, 15)
+        self.assertEqual(CHECKPOINT_SCHEMA_VERSION, 16)
 
 
 if __name__ == "__main__":

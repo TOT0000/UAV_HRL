@@ -54,7 +54,7 @@ class Uav10ConfigurationContractTest(unittest.TestCase):
         self.assertEqual(
             positions,
             [
-                (100.0, 250.0),
+                (50.0, 50.0),
                 (300.0, 250.0),
                 (500.0, 250.0),
                 (700.0, 250.0),
@@ -76,7 +76,7 @@ class Uav10ConfigurationContractTest(unittest.TestCase):
         data["schema_version"] = "uav-hrl-scenario-v2"
         with self.assertRaisesRegex(ValueError, "16-UAV.*incompatible"):
             ScenarioManifest.from_dict(data)
-        self.assertEqual(CHECKPOINT_SCHEMA_VERSION, 15)
+        self.assertEqual(CHECKPOINT_SCHEMA_VERSION, 16)
         with self.assertRaisesRegex(RuntimeError, "must be retrained"):
             _validate_checkpoint_schema({"checkpoint_schema_version": 9})
 

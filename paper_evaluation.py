@@ -39,7 +39,11 @@ from paper_metrics import (
     normalize_episode_ee,
     validate_canonical_aggregate_rows,
 )
-from scenario_manifest import ScenarioManifest, generate_manifest
+from scenario_manifest import (
+    ScenarioManifest,
+    generate_manifest,
+    validate_manifest_initial_topologies,
+)
 from training_checkpoint import (
     CHECKPOINT_HORIZON_COMPATIBILITY_FIELDS,
     CHECKPOINT_PROVENANCE_FIELDS,
@@ -380,15 +384,15 @@ def run_paper_evaluation(
         )
     )
     git_sha = _git_sha()
-    if output_directory is None:
-        output_dir = _unique_directory(
-            Path(output_root) / suite / method.method_id, git_sha
-        )
-    else:
-        output_dir = Path(output_directory).resolve()
-        output_dir.mkdir(parents=True, exist_ok=False)
 
     if definition["kind"] == "training_history":
+        if output_directory is None:
+            output_dir = _unique_directory(
+                Path(output_root) / suite / method.method_id, git_sha
+            )
+        else:
+            output_dir = Path(output_directory).resolve()
+            output_dir.mkdir(parents=True, exist_ok=False)
         history_path = context["run_dir"] / "training_history.jsonl"
         rows = [
             json.loads(line)
@@ -469,8 +473,7 @@ def run_paper_evaluation(
             for key, manifest in shared_manifests.items()
         }
 
-    point_results = []
-    all_aggregates = []
+    resolved_point_manifests = []
     for point in points:
         fixed_num_gt = point.get("fixed_num_gt")
         manifest = (
@@ -490,6 +493,23 @@ def run_paper_evaluation(
                 resolved_episodes,
                 requested_manifest_seed,
             )
+        validate_manifest_initial_topologies(
+            manifest, episode_count=resolved_episodes
+        )
+        resolved_point_manifests.append((point, manifest))
+
+    if output_directory is None:
+        output_dir = _unique_directory(
+            Path(output_root) / suite / method.method_id, git_sha
+        )
+    else:
+        output_dir = Path(output_directory).resolve()
+        output_dir.mkdir(parents=True, exist_ok=False)
+
+    point_results = []
+    all_aggregates = []
+    for point, manifest in resolved_point_manifests:
+        fixed_num_gt = point.get("fixed_num_gt")
         point_dir = (
             output_dir
             if flatten_single_point

@@ -206,11 +206,11 @@ class ScenarioManifestTest(unittest.TestCase):
                 self.assertTrue(left_ids.isdisjoint(right_ids))
                 self.assertTrue(left_seeds.isdisjoint(right_seeds))
 
-    def test_v1_manifest_is_explicitly_obsolete(self):
+    def test_previous_geometry_manifest_is_explicitly_obsolete(self):
         data = generate_manifest("test", 912, 1).to_dict()
         data["schema_version"] = OBSOLETE_SCHEMA_VERSION
 
-        with self.assertRaisesRegex(ValueError, "16-UAV.*incompatible"):
+        with self.assertRaisesRegex(ValueError, "disconnected-GS.*incompatible"):
             ScenarioManifest.from_dict(data)
 
     def test_training_manifest_extension_preserves_exact_canonical_prefix(self):

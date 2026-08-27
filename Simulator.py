@@ -35,8 +35,10 @@ from object import UAV, SRTeam, GroundTarget
 from experiment_config import (
     A2A_COMMUNICATION_RANGE_M,
     A2G_COMMUNICATION_RANGE_M,
+    CANONICAL_UAV_INITIAL_XY_M,
     FOV_COM_PAIR_MAX_DISTANCE_M,
     COM_OFFERED_RATE_BPS,
+    GROUND_STATION_POSITION_M,
     NUM_UAV,
     REFERENCE_COM_BANDWIDTH_HZ,
     RESERVED_SEARCH_UAV_IDS,
@@ -140,7 +142,7 @@ class Simulator:
         self.active_link_capacity_profiles_mbps = {}
         self.active_s2u_capacity_profiles_mbps = {}
         self.active_link_diagnostics = []
-        self.GS_pos = (0, 0, 0)
+        self.GS_pos = GROUND_STATION_POSITION_M
         self.GS_ID = self.num_UAV
         self.channel = ChannelLifecycle(
             self.num_UAV,
@@ -1488,15 +1490,24 @@ class Simulator:
                     "energy_j": self.E_max,
                 }
                 for index, (x_u, y_u) in enumerate(
-                    (x, y)
-                    for y in (250, 750)
-                    for x in (100, 300, 500, 700, 900)
+                    CANONICAL_UAV_INITIAL_XY_M
                 )
             ]
         else:
             uav_initial_data = sorted(
                 scenario_entry["uavs"], key=lambda item: int(item["uav_id"])
             )
+        from scenario_manifest import validate_initial_communication_topology
+
+        validate_initial_communication_topology(
+            uav_initial_data,
+            scenario_id=(
+                self.active_scenario_id
+                if self.active_scenario_id is not None
+                else "simulator-fallback"
+            ),
+            gs_position=self.GS_pos,
+        )
         for initial in uav_initial_data:
             i = int(initial["uav_id"])
             x_u, y_u, z_u = map(float, initial["position"])

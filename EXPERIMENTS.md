@@ -255,11 +255,32 @@ seeds, the critical value is approximately `2.776`.
 
 ## Scenario manifests
 
-The `uav-hrl-scenario-v2` JSON schema records the split, manifest seed, episode
+The `uav-hrl-scenario-v4` JSON schema records the split, manifest seed, episode
 count, generation profile, generator/config fingerprint, content hash, and one
-entry per scenario. Schema v1 is obsolete and must be regenerated. Each entry
-contains its profile-aware ID and seed, GT/RoI data, UAV initial state, SR
-initial state and deterministic motion primitive, and traffic/load primitives.
+entry per scenario. Schemas v1-v3 are obsolete and must be regenerated. Each
+entry contains its profile-aware ID and seed, GT/RoI data, UAV initial state,
+SR initial state and deterministic motion primitive, and traffic/load
+primitives.
+
+The ground station is fixed at `(0, 0, 0)`. Canonical UAV 0 starts at
+`(50, 50, z)` while UAVs 1-9 retain `(300,250)`, `(500,250)`, `(700,250)`,
+`(900,250)`, `(100,750)`, `(300,750)`, `(500,750)`, `(700,750)`, and
+`(900,750)` respectively. Every UAV still consumes exactly one deterministic
+`z ~ Uniform(80,120)` draw and starts with 10,000 J. This is only an initial
+geometry contract: UAV 0 receives no fixed relay task, is not range-projected,
+and may leave GS range after movement begins. The fixed movement warm-up remains
+10,000 joint transitions.
+
+Every manifest entry and formal preflight validates the finite 3-D initial
+range graph using inclusive boundaries: U2G/S2U are 200 m and U2U is 400 m.
+At least one UAV must have a U2G edge and the GS connected component must
+contain at least two UAVs. Validation uses range geometry, never positive
+capacity, and runs before run-directory creation or learned-weight loading.
+Failure reports the scenario ID, nearest U2G distance, U2G range, and the UAV
+IDs in the GS component. The manifest generator and Simulator fallback share
+the same canonical XY layout. Training, validation, test, and all 16 methods
+therefore receive identical initial-geometry rules, although later movement
+may disconnect the component.
 
 Manifest generation uses local `random.Random` and
 `numpy.random.Generator` instances. It does not consume global RNG state.
@@ -270,7 +291,7 @@ validates both the canonical content hash and the current environment
 fingerprint.
 
 Without `--num-gt`, a mixed manifest draws `num_GT` in the inclusive range
-2–9. With `--num-gt N`, every episode uses the same supported value. Use one
+2–8. With `--num-gt N`, every episode uses the same supported value. Use one
 fixed manifest across every compared method and trained seed for a Figure whose
 x-axis is RoI/GT count.
 
@@ -389,17 +410,20 @@ python -X utf8 comparison_experiment.py aggregate --input-dir runs/comparison/ev
 
 Exact-resume checkpoints validate the method fingerprint, training-manifest
 relationship, training seed, the complete Dinkelbach block state, and its configuration.
-Checkpoint schema v15 is the current boundary-aligned stochastic-channel,
+Checkpoint schema v16 is the current boundary-aligned stochastic-channel,
 movement/routing replay, utility/QoS, routing-ID causality/credit,
-frozen-backlog reward, hard-range/COM-session, atomic-FOV, seed-ratio
+frozen-backlog reward, GS-reachable initial topology, hard-range/COM-session,
+atomic-FOV, seed-ratio
 aggregation, propulsion, and four-slot/fifty-block movement-channel contract.
-Schema v14 and every older
+Schema v15 and every older
 schema is rejected before weights or replay state are restored and must be
 retrained; no legacy checkpoint migration is attempted. The current schema
 stores the 429/30/90 dimensions, movement feature schema, direct-ratio bit/J
 objective, shared channel/packet contracts, adaptive routing lifecycle, and
-FOV-EMA state. The movement feature schema remains unchanged, and scenario
-manifests remain `uav-hrl-scenario-v3`. A partial Dinkelbach block is persisted
+FOV-EMA state. The movement feature schema remains unchanged. Scenario v3 and
+schema-15 checkpoints are incompatible because their canonical initial grid
+has no legal 200 m U2G edge; they are never silently migrated. A partial
+Dinkelbach block is persisted
 exactly and resumes with
 the same lambda, completed-episode count, numerator sum, denominator sum, block
 index, input-validity status, and successful-update count. An incomplete final

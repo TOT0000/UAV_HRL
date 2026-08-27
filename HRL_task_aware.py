@@ -113,6 +113,7 @@ from training_history import (
 )
 import utils_update_v2
 from rng_contract import CHANNEL_RNG_STREAMS, NamedRNGStreams, RNG_CONTRACT_VERSION
+from scenario_manifest import validate_manifest_initial_topologies
 
 
 MOVEMENT_CONTROL_INTERVAL = int(round(MOVEMENT_INTERVAL_SECONDS / ROUTING_SLOT_SECONDS))
@@ -1698,6 +1699,9 @@ def train(
             raise ValueError("formal training requires a train scenario manifest")
         if evaluation and scenario_manifest.split not in {"validation", "test"}:
             raise ValueError("evaluation requires validation or test scenarios")
+        validate_manifest_initial_topologies(
+            scenario_manifest, episode_count=config.total_episodes
+        )
     checkpoint_required = bool(
         method_spec.learns_movement or method_spec.learns_routing
     )

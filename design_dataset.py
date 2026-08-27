@@ -38,7 +38,10 @@ from experiment_paths import (
     validate_run_directory_preflight,
     write_run_status,
 )
-from scenario_manifest import ScenarioManifest
+from scenario_manifest import (
+    ScenarioManifest,
+    validate_manifest_initial_topologies,
+)
 from training_checkpoint import (
     checkpoint_metadata_fingerprint,
     inspect_model_checkpoint,
@@ -609,6 +612,9 @@ def design_dataset_preflight(args):
     episode_count = int(args.episodes)
     if episode_count <= 0 or manifest.episode_count < episode_count:
         raise ValueError("manifest has fewer entries than requested design episodes")
+    validate_manifest_initial_topologies(
+        manifest, episode_count=episode_count
+    )
     expected_training_config = effective_training_config(
         formal_training_config(
             FORMAL_EXPERIMENT_DEFAULTS["training_episodes_per_seed"],

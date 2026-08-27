@@ -24,7 +24,10 @@ from experiment_paths import (
     validate_run_directory_preflight,
     write_run_status,
 )
-from scenario_manifest import ScenarioManifest
+from scenario_manifest import (
+    ScenarioManifest,
+    validate_manifest_initial_topologies,
+)
 from training_checkpoint import inspect_model_checkpoint
 from evaluation_aggregation import (
     CANONICAL_METRICS,
@@ -864,6 +867,9 @@ def _evaluation_preflight(args):
         raise ValueError(
             "scenario manifest has fewer entries than requested episodes"
         )
+    validate_manifest_initial_topologies(
+        manifest, episode_count=episode_count
+    )
     identity = evaluation_run_identity(method, manifest, args.training_seed)
     run_dir = evaluation_run_directory(
         args.output_dir, method, manifest, args.training_seed

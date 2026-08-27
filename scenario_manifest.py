@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import random
@@ -16,22 +17,30 @@ import numpy as np
 from experiment_config import (
     A2A_COMMUNICATION_RANGE_M,
     A2G_COMMUNICATION_RANGE_M,
+    CANONICAL_UAV_INITIAL_XY_M,
     COMMUNICATION_RANGE_CONTRACT_VERSION,
+    GROUND_STATION_POSITION_M,
+    INITIAL_COMMUNICATION_TOPOLOGY_CONTRACT_VERSION,
     NUM_UAV,
     RESERVED_SEARCH_UAV_IDS,
     ROI_COUNT_MAX,
     ROI_COUNT_MIN,
+    UAV_INITIAL_LAYOUT_VERSION,
 )
 
 
-SCENARIO_SCHEMA_VERSION = "uav-hrl-scenario-v3"
+SCENARIO_SCHEMA_VERSION = "uav-hrl-scenario-v4"
 OBSOLETE_SCHEMA_VERSIONS = frozenset(
-    {"uav-hrl-scenario-v1", "uav-hrl-scenario-v2"}
+    {
+        "uav-hrl-scenario-v1",
+        "uav-hrl-scenario-v2",
+        "uav-hrl-scenario-v3",
+    }
 )
 # Singular compatibility name used by callers that construct an obsolete
 # manifest explicitly for fail-fast tests.
-OBSOLETE_SCHEMA_VERSION = "uav-hrl-scenario-v2"
-UAV_INITIAL_LAYOUT = "fixed-2x5-grid-v1"
+OBSOLETE_SCHEMA_VERSION = "uav-hrl-scenario-v3"
+UAV_INITIAL_LAYOUT = UAV_INITIAL_LAYOUT_VERSION
 SUPPORTED_SPLITS = frozenset({"train", "validation", "test"})
 POLICY_DEPENDENT_KEYS = frozenset(
     {
@@ -62,6 +71,172 @@ def sha256_json(value: Any) -> str:
     return hashlib.sha256(canonical_json(value).encode("utf-8")).hexdigest()
 
 
+def _topology_error(
+    scenario_id,
+    reason,
+    *,
+    nearest_u2g_distance_m,
+    u2g_range_m,
+    gs_component_uav_ids,
+):
+    nearest = (
+        f"{float(nearest_u2g_distance_m):.12g}"
+        if nearest_u2g_distance_m is not None
+        and math.isfinite(float(nearest_u2g_distance_m))
+        else "non-finite"
+    )
+    return ValueError(
+        "initial communication topology is invalid: "
+        f"scenario_id={scenario_id}; reason={reason}; "
+        f"nearest_u2g_3d_distance_m={nearest}; "
+        f"u2g_range_m={float(u2g_range_m):.12g}; "
+        f"gs_component_uav_ids={list(gs_component_uav_ids)}"
+    )
+
+
+def validate_initial_communication_topology(
+    uavs,
+    *,
+    scenario_id,
+    gs_position=GROUND_STATION_POSITION_M,
+    u2g_range_m=A2G_COMMUNICATION_RANGE_M,
+    u2u_range_m=A2A_COMMUNICATION_RANGE_M,
+):
+    """Validate the finite inclusive 3-D range graph at episode start."""
+
+    try:
+        u2g_range_m = float(u2g_range_m)
+        u2u_range_m = float(u2u_range_m)
+        gs = tuple(float(value) for value in gs_position)
+    except (TypeError, ValueError) as exc:
+        raise _topology_error(
+            scenario_id,
+            "range or GS coordinate is not numeric",
+            nearest_u2g_distance_m=None,
+            u2g_range_m=A2G_COMMUNICATION_RANGE_M,
+            gs_component_uav_ids=(),
+        ) from exc
+    if (
+        len(gs) != 3
+        or not all(math.isfinite(value) for value in gs)
+        or not math.isfinite(u2g_range_m)
+        or not math.isfinite(u2u_range_m)
+        or u2g_range_m < 0.0
+        or u2u_range_m < 0.0
+    ):
+        raise _topology_error(
+            scenario_id,
+            "range or GS coordinate is non-finite or invalid",
+            nearest_u2g_distance_m=None,
+            u2g_range_m=u2g_range_m,
+            gs_component_uav_ids=(),
+        )
+
+    positions = {}
+    try:
+        for item in uavs:
+            uav_id = int(item["uav_id"])
+            if uav_id in positions:
+                raise ValueError(f"duplicate UAV ID {uav_id}")
+            position = tuple(float(value) for value in item["position"])
+            if len(position) != 3 or not all(
+                math.isfinite(value) for value in position
+            ):
+                raise ValueError(f"UAV {uav_id} has non-finite 3-D coordinates")
+            positions[uav_id] = position
+    except (KeyError, TypeError, ValueError) as exc:
+        raise _topology_error(
+            scenario_id,
+            str(exc),
+            nearest_u2g_distance_m=None,
+            u2g_range_m=u2g_range_m,
+            gs_component_uav_ids=(),
+        ) from exc
+    if not positions:
+        raise _topology_error(
+            scenario_id,
+            "scenario has no UAV positions",
+            nearest_u2g_distance_m=None,
+            u2g_range_m=u2g_range_m,
+            gs_component_uav_ids=(),
+        )
+
+    u2g_distances = {
+        uav_id: math.dist(position, gs)
+        for uav_id, position in positions.items()
+    }
+    if not all(math.isfinite(distance) for distance in u2g_distances.values()):
+        raise _topology_error(
+            scenario_id,
+            "U2G distance is non-finite",
+            nearest_u2g_distance_m=None,
+            u2g_range_m=u2g_range_m,
+            gs_component_uav_ids=(),
+        )
+    nearest_u2g_distance_m = min(u2g_distances.values())
+    u2g_uav_ids = sorted(
+        uav_id
+        for uav_id, distance in u2g_distances.items()
+        if distance <= u2g_range_m
+    )
+    adjacency = {uav_id: set() for uav_id in positions}
+    u2u_edges = []
+    ordered_ids = sorted(positions)
+    for index, sender in enumerate(ordered_ids):
+        for receiver in ordered_ids[index + 1 :]:
+            distance = math.dist(positions[sender], positions[receiver])
+            if not math.isfinite(distance):
+                raise _topology_error(
+                    scenario_id,
+                    f"U2U distance is non-finite for UAVs {sender} and {receiver}",
+                    nearest_u2g_distance_m=nearest_u2g_distance_m,
+                    u2g_range_m=u2g_range_m,
+                    gs_component_uav_ids=u2g_uav_ids,
+                )
+            if distance <= u2u_range_m:
+                adjacency[sender].add(receiver)
+                adjacency[receiver].add(sender)
+                u2u_edges.append((sender, receiver))
+
+    component = set(u2g_uav_ids)
+    frontier = list(u2g_uav_ids)
+    while frontier:
+        sender = frontier.pop()
+        for receiver in adjacency[sender]:
+            if receiver not in component:
+                component.add(receiver)
+                frontier.append(receiver)
+    gs_component_uav_ids = sorted(component)
+    if not u2g_uav_ids:
+        raise _topology_error(
+            scenario_id,
+            "no UAV has an inclusive U2G range edge",
+            nearest_u2g_distance_m=nearest_u2g_distance_m,
+            u2g_range_m=u2g_range_m,
+            gs_component_uav_ids=gs_component_uav_ids,
+        )
+    if len(gs_component_uav_ids) < 2:
+        raise _topology_error(
+            scenario_id,
+            "GS component must contain at least two UAVs",
+            nearest_u2g_distance_m=nearest_u2g_distance_m,
+            u2g_range_m=u2g_range_m,
+            gs_component_uav_ids=gs_component_uav_ids,
+        )
+    return {
+        "scenario_id": str(scenario_id),
+        "topology_contract_version": (
+            INITIAL_COMMUNICATION_TOPOLOGY_CONTRACT_VERSION
+        ),
+        "u2g_range_m": u2g_range_m,
+        "u2u_range_m": u2u_range_m,
+        "nearest_u2g_3d_distance_m": nearest_u2g_distance_m,
+        "u2g_uav_ids": u2g_uav_ids,
+        "u2u_edges": [list(edge) for edge in u2u_edges],
+        "gs_component_uav_ids": gs_component_uav_ids,
+    }
+
+
 def current_environment_config() -> dict[str, Any]:
     return {
         "num_uav": NUM_UAV,
@@ -79,7 +254,14 @@ def current_environment_config() -> dict[str, Any]:
         "communication_range_contract_version": (
             COMMUNICATION_RANGE_CONTRACT_VERSION
         ),
+        "ground_station_position_m": list(GROUND_STATION_POSITION_M),
         "uav_initial_layout": UAV_INITIAL_LAYOUT,
+        "canonical_uav_initial_xy_m": [
+            list(position) for position in CANONICAL_UAV_INITIAL_XY_M
+        ],
+        "initial_communication_topology_contract_version": (
+            INITIAL_COMMUNICATION_TOPOLOGY_CONTRACT_VERSION
+        ),
         "reserved_search_uav_ids": list(RESERVED_SEARCH_UAV_IDS),
         "gt_radius_m": 80.0,
         "com_deadline_seconds": 1.0,
@@ -144,18 +326,13 @@ def _split_seed(
 
 
 def _uav_initial_data(py_rng: random.Random) -> list[dict[str, Any]]:
-    xy_positions = [
-        (x, y)
-        for y in (250.0, 750.0)
-        for x in (100.0, 300.0, 500.0, 700.0, 900.0)
-    ]
     return [
         {
             "uav_id": uav_id,
             "position": [x, y, py_rng.uniform(80.0, 120.0)],
             "energy_j": 10000.0,
         }
-        for uav_id, (x, y) in enumerate(xy_positions)
+        for uav_id, (x, y) in enumerate(CANONICAL_UAV_INITIAL_XY_M)
     ]
 
 
@@ -256,6 +433,10 @@ def generate_scenario_entry(
             "channel_randomness": "none",
             "gt_placement_model": "nonoverlap-away-from-gs-v1",
             "uav_xy_layout": UAV_INITIAL_LAYOUT,
+            "ground_station_position_m": list(GROUND_STATION_POSITION_M),
+            "initial_communication_topology_contract_version": (
+                INITIAL_COMMUNICATION_TOPOLOGY_CONTRACT_VERSION
+            ),
             "num_uav": NUM_UAV,
             "reserved_search_uav_ids": list(RESERVED_SEARCH_UAV_IDS),
         },
@@ -264,7 +445,7 @@ def generate_scenario_entry(
     return entry
 
 
-def validate_scenario_entry(entry: dict[str, Any]) -> None:
+def validate_scenario_entry(entry: dict[str, Any]) -> dict[str, Any]:
     required = {
         "scenario_id",
         "scenario_seed",
@@ -292,15 +473,64 @@ def validate_scenario_entry(entry: dict[str, Any]) -> None:
         )
     if len(entry["uavs"]) != NUM_UAV:
         raise ValueError(f"scenario must contain exactly {NUM_UAV} UAVs")
+    topology = validate_initial_communication_topology(
+        entry["uavs"], scenario_id=entry["scenario_id"]
+    )
     metadata = dict(entry["exogenous_primitives"])
     if metadata.get("uav_xy_layout") != UAV_INITIAL_LAYOUT:
-        raise ValueError("scenario UAV initial layout is incompatible")
+        raise ValueError(
+            "scenario UAV initial layout is incompatible: "
+            f"scenario_id={entry['scenario_id']}; "
+            f"declared={metadata.get('uav_xy_layout')}; "
+            f"expected={UAV_INITIAL_LAYOUT}; "
+            f"nearest_u2g_3d_distance_m="
+            f"{topology['nearest_u2g_3d_distance_m']:.12g}; "
+            f"u2g_range_m={topology['u2g_range_m']:.12g}; "
+            f"gs_component_uav_ids={topology['gs_component_uav_ids']}"
+        )
+    if metadata.get("ground_station_position_m") != list(
+        GROUND_STATION_POSITION_M
+    ):
+        raise ValueError("scenario ground-station position metadata is incompatible")
+    if metadata.get(
+        "initial_communication_topology_contract_version"
+    ) != INITIAL_COMMUNICATION_TOPOLOGY_CONTRACT_VERSION:
+        raise ValueError("scenario initial topology contract metadata is incompatible")
     if int(metadata.get("num_uav", -1)) != NUM_UAV:
         raise ValueError("scenario UAV count metadata is incompatible")
     if tuple(metadata.get("reserved_search_uav_ids", ())) != RESERVED_SEARCH_UAV_IDS:
         raise ValueError("scenario reserved Search UAV IDs are incompatible")
+    uav_ids = [int(item["uav_id"]) for item in entry["uavs"]]
+    if uav_ids != list(range(NUM_UAV)):
+        raise ValueError("scenario UAV IDs and order are incompatible")
+    for item, expected_xy in zip(entry["uavs"], CANONICAL_UAV_INITIAL_XY_M):
+        x, y, z = map(float, item["position"])
+        energy = float(item["energy_j"])
+        if (x, y) != tuple(expected_xy):
+            raise ValueError(
+                "scenario UAV coordinates disagree with declared initial layout: "
+                f"scenario_id={entry['scenario_id']}; uav_id={item['uav_id']}"
+            )
+        if not 80.0 <= z <= 120.0:
+            raise ValueError("scenario UAV initial altitude must be in [80, 120] m")
+        if not math.isfinite(energy) or energy != 10000.0:
+            raise ValueError("scenario UAV initial energy is incompatible")
     if len(entry["sr_teams"]) != int(entry["num_GT"]):
         raise ValueError("scenario SR team count must equal num_GT")
+    return topology
+
+
+def validate_manifest_initial_topologies(manifest, episode_count=None):
+    """Revalidate formal manifest entries before run or checkpoint side effects."""
+
+    if not isinstance(manifest, ScenarioManifest):
+        raise TypeError("initial topology preflight requires a ScenarioManifest")
+    count = manifest.episode_count if episode_count is None else int(episode_count)
+    if count <= 0 or count > manifest.episode_count:
+        raise ValueError("initial topology preflight episode count is invalid")
+    return tuple(
+        validate_scenario_entry(entry) for entry in manifest.episodes[:count]
+    )
 
 
 @dataclass(frozen=True)
@@ -364,10 +594,17 @@ class ScenarioManifest:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "ScenarioManifest":
-        if data.get("schema_version") in OBSOLETE_SCHEMA_VERSIONS:
+        if data.get("schema_version") in {
+            "uav-hrl-scenario-v1", "uav-hrl-scenario-v2"
+        }:
             raise ValueError(
                 "legacy 16-UAV scenario schema is incompatible; regenerate the "
-                "manifest with the 10-UAV v3 generator"
+                "manifest with the 10-UAV v4 generator"
+            )
+        if data.get("schema_version") == "uav-hrl-scenario-v3":
+            raise ValueError(
+                "legacy disconnected-GS scenario geometry is incompatible; "
+                "regenerate the manifest with the v4 reachable-gateway layout"
             )
         if data.get("schema_version") != SCENARIO_SCHEMA_VERSION:
             raise ValueError(
@@ -453,6 +690,12 @@ def generate_manifest(
             "numpy_bit_generator": "PCG64",
             "policy_dependent_outcomes_excluded": True,
             "uav_initial_layout": UAV_INITIAL_LAYOUT,
+            "ground_station_position_m": list(GROUND_STATION_POSITION_M),
+            "initial_communication_topology_contract_version": (
+                INITIAL_COMMUNICATION_TOPOLOGY_CONTRACT_VERSION
+            ),
+            "a2g_communication_range_m": A2G_COMMUNICATION_RANGE_M,
+            "a2a_communication_range_m": A2A_COMMUNICATION_RANGE_M,
             "num_uav": NUM_UAV,
             "reserved_search_uav_ids": list(RESERVED_SEARCH_UAV_IDS),
         },

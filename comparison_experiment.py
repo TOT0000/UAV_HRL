@@ -36,7 +36,11 @@ from resume_recovery import (
     execute_resume_reconciliation,
     plan_resume_reconciliation,
 )
-from scenario_manifest import ScenarioManifest, generate_manifest
+from scenario_manifest import (
+    ScenarioManifest,
+    generate_manifest,
+    validate_manifest_initial_topologies,
+)
 from training_checkpoint import (
     FULL_RESUME_LOGGING_STATE_FIELDS,
     inspect_full_resume_checkpoint,
@@ -74,6 +78,7 @@ def _load_manifest(path, expected_split=None):
     if path is None:
         raise ValueError("this command requires --manifest")
     manifest = ScenarioManifest.load(path)
+    validate_manifest_initial_topologies(manifest)
     if expected_split is not None and manifest.split != expected_split:
         raise ValueError(
             f"manifest split mismatch: manifest={manifest.split}, "

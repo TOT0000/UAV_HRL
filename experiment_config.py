@@ -31,6 +31,23 @@ NUM_UAV = 10
 ROI_COUNT_MIN = 2
 ROI_COUNT_MAX = 8
 RESERVED_SEARCH_UAV_IDS = (0, NUM_UAV - 1)
+GROUND_STATION_POSITION_M = (0.0, 0.0, 0.0)
+CANONICAL_UAV_INITIAL_XY_M = (
+    (50.0, 50.0),
+    (300.0, 250.0),
+    (500.0, 250.0),
+    (700.0, 250.0),
+    (900.0, 250.0),
+    (100.0, 750.0),
+    (300.0, 750.0),
+    (500.0, 750.0),
+    (700.0, 750.0),
+    (900.0, 750.0),
+)
+UAV_INITIAL_LAYOUT_VERSION = "gs-reachable-gateway-grid-v2"
+INITIAL_COMMUNICATION_TOPOLOGY_CONTRACT_VERSION = (
+    "finite-3d-inclusive-gs-component-min-two-uavs-v1"
+)
 DEFAULT_TRAINING_SEED = 20260817
 FORMAL_TRAINING_EPISODES = 1500
 FORMAL_CHECKPOINT_EPISODE = FORMAL_TRAINING_EPISODES
@@ -696,6 +713,11 @@ def comparison_method_configuration(method_spec: MethodSpec) -> dict:
         "movement_objective": method_spec.reward_mode,
         "routing_policy": method_spec.routing,
         "task_observation_mode": method_spec.task_observation,
+        "ground_station_position_m": list(GROUND_STATION_POSITION_M),
+        "uav_initial_layout_version": UAV_INITIAL_LAYOUT_VERSION,
+        "initial_communication_topology_contract_version": (
+            INITIAL_COMMUNICATION_TOPOLOGY_CONTRACT_VERSION
+        ),
         "fov_com_pair_max_distance_m": FOV_COM_PAIR_MAX_DISTANCE_M,
         "reserved_search_uav_ids": list(RESERVED_SEARCH_UAV_IDS),
         "search_coverage_threshold": SEARCH_COVERAGE_THRESHOLD,

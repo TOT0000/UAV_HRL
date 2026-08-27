@@ -50,6 +50,7 @@ from scenario_manifest import (
     resolve_training_manifest,
     resolve_training_manifest_segment,
     resolve_training_manifest_segments_from_metadata,
+    validate_manifest_initial_topologies,
     validate_training_manifest_segments,
 )
 from training_checkpoint import (
@@ -367,6 +368,15 @@ def run(args):
     values = _resolved_values(args)
     method = args.method
     git_sha = _git_short_sha()
+    manifest = generate_manifest(
+        "train",
+        manifest_seed=values["seed"],
+        episode_count=values["episodes"],
+        num_gt=args.roi_count,
+    )
+    validate_manifest_initial_topologies(
+        manifest, episode_count=values["episodes"]
+    )
     run_dir = create_unique_run_directory(
         values["output_root"], method.method_key, values["seed"], git_sha
     )
@@ -398,12 +408,6 @@ def run(args):
         enable_plots=False,
         enable_csv=False,
         run_directory=str(run_dir),
-    )
-    manifest = generate_manifest(
-        "train",
-        manifest_seed=values["seed"],
-        episode_count=values["episodes"],
-        num_gt=args.roi_count,
     )
     manifest.save(run_dir / "scenario_manifest.json")
     resolved = _base_resolved(run_dir, method, manifest, config, values, args, git_sha)
@@ -763,6 +767,9 @@ def run_evaluate(args):
         manifest_seed=manifest_seed,
         episode_count=evaluation_episodes,
         num_gt=fixed_num_gt,
+    )
+    validate_manifest_initial_topologies(
+        manifest, episode_count=evaluation_episodes
     )
     expected_training_config = dict(resolved["training_config"])
     _, calibration = load_com_capacity_reference()
