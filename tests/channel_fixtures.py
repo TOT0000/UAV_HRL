@@ -1,6 +1,9 @@
 import numpy as np
 
-from Channel_model import CHANNEL_MODEL_VERSION
+from Channel_model import (
+    CHANNEL_ENVIRONMENT_CONTRACT_VERSION,
+    CHANNEL_MODEL_VERSION,
+)
 
 
 def initialized_channel_lifecycle_state(num_uav=10, num_sr=2):
@@ -8,6 +11,9 @@ def initialized_channel_lifecycle_state(num_uav=10, num_sr=2):
 
     return {
         "channel_model_version": CHANNEL_MODEL_VERSION,
+        "channel_environment_contract_version": (
+            CHANNEL_ENVIRONMENT_CONTRACT_VERSION
+        ),
         "namespace": "training",
         "episode_identity": "fixture",
         "num_uav": int(num_uav),

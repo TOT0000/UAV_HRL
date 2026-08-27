@@ -138,6 +138,7 @@ class Simulator:
             small_scale_rng=self.channel_small_scale_rng,
             namespace=self.channel_namespace,
         )
+        self.defer_initial_channel_boundary = False
         self.num_GT = None
         self.N_u = self.num_UAV
         self.UAVs = []
@@ -208,6 +209,10 @@ class Simulator:
 
     # ==================任務分配===========================
     def assign_tasks(self):
+        if self.channel.movement_interval_index is None:
+            raise RuntimeError(
+                "task assignment requires an initialized movement-interval channel state"
+            )
         coverage = float(np.asarray(self.visited_bitmap, dtype=bool).mean())
         search_active = not self._search_phase_over and coverage < self.search_coverage_threshold
         reserved = set(self.reserved_search_uav_ids) if search_active else set()
@@ -385,7 +390,7 @@ class Simulator:
 
         self.sim_step_count += 1
 
-    def _convert_search_to_hovering_phase(self):
+    def _convert_search_to_hovering_phase(self, *, defer_assignment=False):
         if self._search_phase_over and self.search_completed:
             return
         self._search_phase_over = True
@@ -394,7 +399,10 @@ class Simulator:
         self.search_release_time = float(getattr(self, "current_time", 0.0))
         self.search_release_coverage = float(self.visited_bitmap.mean())
         self.task_list = [task for task in self.task_list if task.task_type != "Search"]
-        self.assign_tasks()
+        self.need_reassign = True
+        if not defer_assignment:
+            self.assign_tasks()
+            self.need_reassign = False
         if any(
             task["task_type"] == "Search"
             for entries in self.multi_tasks.values()
@@ -406,6 +414,11 @@ class Simulator:
         return {
             "strategy": self.assignment_strategy,
             "invocation": int(self.assignment_invocations),
+            "channel_movement_interval_index": (
+                None
+                if self.channel.movement_interval_index is None
+                else int(self.channel.movement_interval_index)
+            ),
             "reserved_search_uav_ids": list(self.reserved_search_uav_ids),
             "search_release_time_seconds": self.search_release_time,
             "search_release_coverage": self.search_release_coverage,
@@ -421,10 +434,12 @@ class Simulator:
             },
         }
 
-    def convert_search_to_hovering(self):
+    def convert_search_to_hovering(self, *, defer_assignment=False):
         """Apply the guarded Search-to-Hover phase conversion exactly once."""
 
-        return self._convert_search_to_hovering_phase()
+        return self._convert_search_to_hovering_phase(
+            defer_assignment=defer_assignment
+        )
     # =============搜救隊出發===============================
     def SR_team_gogo(self, gt):
         """
@@ -560,6 +575,59 @@ class Simulator:
             sr_positions=sr_positions,
             gs_position=gs_position,
         )
+
+    def initialize_channel_episode_boundary(self):
+        """Sample interval zero after episode geometry and slot-0 SR movement."""
+
+        if self.channel.movement_interval_index is not None:
+            raise RuntimeError("episode channel boundary is already initialized")
+        uav_positions, sr_positions, gs_position = self._channel_geometry()
+        self.channel.reset_episode(
+            uav_positions=uav_positions,
+            sr_positions=sr_positions,
+            gs_position=gs_position,
+            episode_identity=self.active_scenario_id,
+        )
+        self.update_u2u_channels()
+        self.update_u2g_channels()
+        self.assign_tasks()
+        self.need_reassign = False
+
+    def prepare_initial_movement_interval(self):
+        """Apply slot-0 SR movement, then sample/assign interval zero once."""
+
+        if self.channel.movement_interval_index is not None:
+            raise RuntimeError("initial movement interval is already prepared")
+        self.advance_sr_teams()
+        self.initialize_channel_episode_boundary()
+
+    def advance_channel_boundary(self, next_interval_index):
+        """Install the next interval state before assignment and observations."""
+
+        next_interval_index = int(next_interval_index)
+        if self.channel.movement_interval_index != next_interval_index - 1:
+            raise RuntimeError(
+                "channel boundary interval is not the successor of the active interval"
+            )
+        changed = self.begin_channel_movement_interval(next_interval_index)
+        if not changed:
+            raise RuntimeError("channel boundary failed to sample exactly once")
+        # U2U geometry is already current after the fourth movement substep;
+        # U2G expected CSI must be refreshed for the newly sampled A2G state.
+        self.update_u2g_channels()
+        return True
+
+    def prepare_next_movement_interval(self, next_interval_index):
+        """Authoritative non-terminal one-second geometry/channel boundary."""
+
+        self.advance_sr_teams()
+        self.advance_channel_boundary(next_interval_index)
+        assignment_performed = False
+        if self.need_reassign:
+            self.assign_tasks()
+            self.need_reassign = False
+            assignment_performed = True
+        return assignment_performed
 
     def prepare_channel_routing_slot(self, routing_slot_index):
         """Privately generate all potential-link gains in fixed CRN order."""
@@ -1396,20 +1464,16 @@ class Simulator:
             uav.task_type = None
             uav.assigned_target_id = None
 
-        # A2G state must exist before the first assignment/COM-utility query.
-        uav_positions, sr_positions, gs_position = self._channel_geometry()
-        self.channel.reset_episode(
-            uav_positions=uav_positions,
-            sr_positions=sr_positions,
-            gs_position=gs_position,
-            episode_identity=self.active_scenario_id,
+        # Clear prior-episode profiles without consuming channel RNG. Formal
+        # training completes slot-0 SR movement before sampling interval zero.
+        self.channel.clear_episode(
+            num_sr=len(self.SR_teams), episode_identity=self.active_scenario_id
         )
-        self.update_u2u_channels()
-        self.update_u2g_channels()
 
         # Search is orchestration fallback, not a solver candidate or utility.
         self.task_list = []
-        self.assign_tasks()
+        if not self.defer_initial_channel_boundary:
+            self.initialize_channel_episode_boundary()
 
     def generate_scenario_entry(self, split, manifest_seed, episode_index):
         """Generate exogenous episode data without consuming global RNG state."""

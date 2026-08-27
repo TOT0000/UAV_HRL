@@ -14,7 +14,9 @@ import numpy as np
 
 
 CHANNEL_MODEL_VERSION = "sampled-a2g-conditional-5ms-block-fading-v1"
-CHANNEL_ENVIRONMENT_CONTRACT_VERSION = "one-second-a2g-state-fifty-block-service-v1"
+CHANNEL_ENVIRONMENT_CONTRACT_VERSION = (
+    "boundary-aligned-one-second-a2g-state-fifty-block-service-v2"
+)
 CHANNEL_FAIRNESS_CONTRACT_VERSION = "all-potential-links-fixed-order-crn-v1"
 CHANNEL_NORMALIZATION_VERSION = "link-type-fading-aware-physical-reference-v1"
 ROUTING_CSI_CONTRACT = "deterministic-distributional-expected-capacity-v1"
@@ -404,6 +406,15 @@ def channel_configuration_metadata():
         "a2g_large_scale_state_model": (
             "one-second large-scale block-state Monte Carlo approximation"
         ),
+        "large_scale_state_sampling_geometry": (
+            "post-boundary UAV/SR geometry before interval policy observation"
+        ),
+        "movement_replay_boundary_semantics": (
+            "next_state equals the next movement policy observation"
+        ),
+        "routing_replay_boundary_semantics": (
+            "bootstrap next_state finalized at the next start-of-slot decision observation"
+        ),
         "a2g_path_loss_mode": "conditional-after-sampled-state",
         "fading_block_seconds": FADING_BLOCK_SECONDS,
         "routing_slot_seconds": ROUTING_SLOT_SECONDS,
@@ -433,6 +444,13 @@ def validate_channel_lifecycle_state(state, *, num_uav=None):
         raise RuntimeError("checkpoint channel lifecycle state is missing")
     if state.get("channel_model_version") != CHANNEL_MODEL_VERSION:
         raise RuntimeError("checkpoint channel lifecycle contract is incompatible")
+    if (
+        state.get("channel_environment_contract_version")
+        != CHANNEL_ENVIRONMENT_CONTRACT_VERSION
+    ):
+        raise RuntimeError(
+            "checkpoint channel boundary lifecycle contract is incompatible"
+        )
     if state.get("checkpoint_scope") != "current-channel-lifecycle-snapshot":
         raise RuntimeError("checkpoint channel lifecycle scope is incompatible")
     resolved_num_uav = int(state.get("num_uav", -1))
@@ -495,6 +513,28 @@ class ChannelLifecycle:
         self.profile_generation_count = 0
         self.last_profile_generation_seconds = None
 
+    def clear_episode(self, *, num_sr, episode_identity=None):
+        """Clear episode-local channel state without consuming either RNG.
+
+        Simulator uses this phase while constructing episode geometry.  Interval
+        zero is sampled only after the canonical slot-0 SR boundary movement.
+        """
+
+        self.episode_identity = episode_identity
+        self.num_sr = int(num_sr)
+        if self.num_sr < 0:
+            raise ValueError("channel lifecycle SR count must be non-negative")
+        self.movement_interval_index = None
+        self.routing_slot_index = None
+        self.u2g_los_state = None
+        self.s2u_los_state = None
+        self.u2g_los_probability = None
+        self.s2u_los_probability = None
+        self._profile_keys = ()
+        self._profile_index = {}
+        self._gain_matrix = None
+        self.last_profile_generation_seconds = None
+
     def reset_episode(
         self,
         *,
@@ -503,16 +543,9 @@ class ChannelLifecycle:
         gs_position,
         episode_identity=None,
     ):
-        self.episode_identity = episode_identity
-        self.num_sr = int(len(sr_positions))
-        self.movement_interval_index = None
-        self.routing_slot_index = None
-        self.u2g_los_state = None
-        self.s2u_los_state = None
-        self._profile_keys = ()
-        self._profile_index = {}
-        self._gain_matrix = None
-        self.last_profile_generation_seconds = None
+        self.clear_episode(
+            num_sr=len(sr_positions), episode_identity=episode_identity
+        )
         self.begin_movement_interval(
             0,
             uav_positions=uav_positions,
@@ -644,6 +677,9 @@ class ChannelLifecycle:
     def state_dict(self):
         return {
             "channel_model_version": CHANNEL_MODEL_VERSION,
+            "channel_environment_contract_version": (
+                CHANNEL_ENVIRONMENT_CONTRACT_VERSION
+            ),
             "namespace": self.namespace,
             "episode_identity": self.episode_identity,
             "num_uav": self.num_uav,
@@ -670,6 +706,11 @@ class ChannelLifecycle:
             raise TypeError("channel lifecycle state must be an object")
         if state.get("channel_model_version") != CHANNEL_MODEL_VERSION:
             raise RuntimeError("channel lifecycle contract is incompatible")
+        if (
+            state.get("channel_environment_contract_version")
+            != CHANNEL_ENVIRONMENT_CONTRACT_VERSION
+        ):
+            raise RuntimeError("channel boundary lifecycle contract is incompatible")
         if (
             int(state.get("num_uav", -1)) != self.num_uav
             or int(state.get("gs_id", -1)) != self.gs_id

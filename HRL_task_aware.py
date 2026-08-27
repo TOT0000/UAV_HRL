@@ -580,6 +580,54 @@ def _routing_transition_done(episode_done, next_hol):
     return bool(episode_done or next_hol is None)
 
 
+def _attribute_routing_transition_cost(
+    routing_buffer, pending_transitions, sender, cost
+):
+    """Attribute cleanup cost before a pending transition enters replay."""
+
+    sender = int(sender)
+    value = float(cost)
+    if pending_transitions is not None and sender in pending_transitions:
+        pending_transitions[sender]["cost"] += value
+        return True
+    return routing_buffer.attribute_latest_cost(sender, value)
+
+
+def _finalize_pending_routing_transitions(
+    routing_buffer,
+    pending_transitions,
+    states,
+    start_of_slot_hol_by_sender,
+):
+    """Finalize prior-slot transitions at the next real decision snapshot.
+
+    Injection, expiration, HOL eligibility, masks, and observations have already
+    been resolved when this function is called.  A sender without a decision is
+    truncated according to the existing routing-transition terminal contract.
+    """
+
+    if pending_transitions is None:
+        return 0
+    finalized = 0
+    for uid in sorted(tuple(pending_transitions)):
+        transition = pending_transitions.pop(uid)
+        next_hol = start_of_slot_hol_by_sender.get(uid)
+        transition_done = _routing_transition_done(False, next_hol)
+        next_state = states.get(uid, transition["state"])
+        routing_buffer.add(
+            transition["state"],
+            transition["action"],
+            next_state,
+            transition["reward"],
+            transition["cost"],
+            transition_done,
+            tag_gt=transition["tag_gt"],
+            agent_id=uid,
+        )
+        finalized += 1
+    return finalized
+
+
 def _run_routing_slot(
     env,
     packet_engine,
@@ -594,6 +642,7 @@ def _run_routing_slot(
     write_replay=True,
     task_observation_mode="full",
     traffic_rate_overrides=None,
+    pending_routing_transitions=None,
 ):
     del routing_masks
     step_time = float(packet_engine.step_time)
@@ -618,7 +667,9 @@ def _run_routing_slot(
             violation_stats[task_type]["deadline_violated_packets"] += 1
         sender = int(violation["attributed_sender"])
         if write_replay:
-            if sender < 0 or not routing_buffer.attribute_latest_cost(sender, 1.0):
+            if sender < 0 or not _attribute_routing_transition_cost(
+                routing_buffer, pending_routing_transitions, sender, 1.0
+            ):
                 raise AssertionError(
                     "slot-boundary violation lacks its latest routing replay transition"
                 )
@@ -659,8 +710,9 @@ def _run_routing_slot(
         for uid in routing_decision_uav_ids
     }
     states = {
-        uid: apply_observation_strategy(
-            state, task_observation_mode, "routing"
+        uid: np.asarray(
+            apply_observation_strategy(state, task_observation_mode, "routing"),
+            dtype=np.float32,
         )
         for uid, state in physical_states.items()
     }
@@ -670,6 +722,14 @@ def _run_routing_slot(
                 f"routing state for UAV {uid} has shape {state.shape}, "
                 f"expected ({ROUTING_STATE_DIM},)"
             )
+
+    if write_replay:
+        _finalize_pending_routing_transitions(
+            routing_buffer,
+            pending_routing_transitions,
+            states,
+            start_of_slot_hol_by_sender,
+        )
 
     next_hops = _select_routing_actions(
         ddqn, states, effective_masks, epsilon=epsilon
@@ -730,38 +790,52 @@ def _run_routing_slot(
         else:
             violation_stats[task_type]["timely_delivered_packets"] += 1
 
-    backlog_after = _active_backlog(packet_engine)
-    physical_next_states = {
-        uid: packet_engine.get_state_ta(
-            env,
-            uid,
-            backlog_bits=backlog_after,
-            action_mask=packet_engine.get_effective_action_mask(
-                env, uid, env.get_routing_action_mask(uid).astype(bool)
-            ),
-        )
-        for uid in routing_decision_uav_ids
-    }
-    next_states = {
-        uid: apply_observation_strategy(
-            state, task_observation_mode, "routing"
-        )
-        for uid, state in physical_next_states.items()
-    }
     if write_replay:
+        immediate_next_states = {}
+        if pending_routing_transitions is None:
+            backlog_after = _active_backlog(packet_engine)
+            physical_next_states = {
+                uid: packet_engine.get_state_ta(
+                    env,
+                    uid,
+                    backlog_bits=backlog_after,
+                    action_mask=packet_engine.get_effective_action_mask(
+                        env, uid, env.get_routing_action_mask(uid).astype(bool)
+                    ),
+                )
+                for uid in routing_decision_uav_ids
+            }
+            immediate_next_states = {
+                uid: apply_observation_strategy(
+                    state, task_observation_mode, "routing"
+                )
+                for uid, state in physical_next_states.items()
+            }
         for uid in routing_decision_uav_ids:
             next_hol = packet_engine.get_hol_packet(uid)
             transition_done = _routing_transition_done(done, next_hol)
-            routing_buffer.add(
-                states[uid],
-                int(next_hops.get(uid, uid)),
-                next_states.get(uid, states[uid]),
-                float(slot_result["reward_by_sender"][uid]),
-                float(slot_result["cost_by_sender"][uid]),
-                transition_done,
-                tag_gt=env.num_GT,
-                agent_id=uid,
-            )
+            transition = {
+                "state": states[uid].copy(),
+                "action": int(next_hops.get(uid, uid)),
+                "reward": float(slot_result["reward_by_sender"][uid]),
+                "cost": float(slot_result["cost_by_sender"][uid]),
+                "tag_gt": int(env.num_GT),
+            }
+            if pending_routing_transitions is not None and not transition_done:
+                if uid in pending_routing_transitions:
+                    raise AssertionError("routing transition was staged twice")
+                pending_routing_transitions[uid] = transition
+            else:
+                routing_buffer.add(
+                    transition["state"],
+                    transition["action"],
+                    immediate_next_states.get(uid, transition["state"]),
+                    transition["reward"],
+                    transition["cost"],
+                    transition_done,
+                    tag_gt=transition["tag_gt"],
+                    agent_id=uid,
+                )
     selected_links = [
         {
             **dict(item),
@@ -1542,6 +1616,10 @@ def train(
         num_UAV=NUM_UAV, rng_streams=rng_streams, evaluation=evaluation
     )
     env.configure_method(method_spec)
+    # Formal execution initializes interval zero only after the canonical
+    # slot-0 SR boundary movement. Direct Simulator callers retain the eager
+    # reset behavior unless they explicitly opt into this two-phase lifecycle.
+    env.defer_initial_channel_boundary = True
     packet_engine = PacketEngine(
         num_uav=NUM_UAV,
         step_time=config.routing_slot_seconds,
@@ -2042,6 +2120,7 @@ def train(
             env.apply_scenario_entry(scenario_entry)
             scenario_id = str(scenario_entry["scenario_id"])
         executed_scenario_ids.append(scenario_id)
+        env.prepare_initial_movement_interval()
         packet_engine.reset_packet_state()
         packet_engine.update_fov_ema(
             env, transition_marker=f"episode={episode},map_reset"
@@ -2103,16 +2182,16 @@ def train(
                 "deadline_violated_packets": 0,
             },
         }
+        pending_routing_transitions = {}
+        expected_next_movement_state = None
+        expected_next_movement_mask = None
+        expected_next_movement_potentials = None
 
         for interval in range(config.episode_seconds):
-            if interval == 0:
-                # Match the existing slot-0 SR update. Later SR updates are part
-                # of the preceding one-second transition so S_{t+1} == S_t next.
-                env.advance_sr_teams()
-            env.begin_channel_movement_interval(interval)
-            if getattr(env, "need_reassign", False):
-                env.assign_tasks()
-                env.need_reassign = False
+            if env.channel.movement_interval_index != interval:
+                raise AssertionError(
+                    "movement decision does not reuse its boundary-prepared channel state"
+                )
 
             backlog_before = _active_backlog(packet_engine)
             try:
@@ -2135,6 +2214,24 @@ def train(
                 if "duplicate" in str(exc):
                     duplicate_target_assertions += 1
                 raise
+            if expected_next_movement_state is not None:
+                if not np.array_equal(state, expected_next_movement_state):
+                    raise AssertionError(
+                        "movement replay next_state differs from the next policy observation"
+                    )
+                if not np.array_equal(
+                    current_movement_mask, expected_next_movement_mask
+                ):
+                    raise AssertionError(
+                        "movement replay next mask differs from the next policy mask"
+                    )
+                if tuple(potentials_t) != tuple(expected_next_movement_potentials):
+                    raise AssertionError(
+                        "movement replay next potentials differ from the next transition"
+                    )
+                expected_next_movement_state = None
+                expected_next_movement_mask = None
+                expected_next_movement_potentials = None
 
             if method_spec.agent == "random":
                 raw_joint_action = sample_random_joint_action(
@@ -2221,6 +2318,7 @@ def train(
                     write_replay=(not evaluation and method_spec.learns_routing),
                     task_observation_mode=method_spec.task_observation,
                     traffic_rate_overrides=resolved_episode_rates,
+                    pending_routing_transitions=pending_routing_transitions,
                 )
                 ddqn_action_selections += action_selections
                 interval_delivered_bits += delivered_bits
@@ -2241,21 +2339,18 @@ def train(
                     transition_marker=f"episode={episode},interval={interval}",
                     footprint_transitions=fov_transitions,
                 )
-            if getattr(env, "need_reassign", False):
-                env.assign_tasks()
-                env.need_reassign = False
             if (
                 not getattr(env, "_search_phase_over", False)
                 and float(env.visited_bitmap.mean())
                 >= config.search_coverage_threshold
             ):
-                env.convert_search_to_hovering()
-            env.update_source_uavs()
+                env.convert_search_to_hovering(defer_assignment=True)
 
             interval_delivered_mbits = interval_delivered_bits / 1e6
             done = interval == config.episode_seconds - 1
             if not done:
-                env.advance_sr_teams()
+                env.prepare_next_movement_interval(interval + 1)
+            env.update_source_uavs()
             actual_time_seconds = float(interval + 1)
             trajectory_history.append(
                 _trajectory_state(
@@ -2292,6 +2387,10 @@ def train(
                 "movement",
             )
             next_movement_mask = movement_mask_from_state(physical_next_state)
+            if not done:
+                expected_next_movement_state = next_state.copy()
+                expected_next_movement_mask = next_movement_mask.copy()
+                expected_next_movement_potentials = tuple(potentials_t1)
             terminal_joint_transitions += int(done)
             episode_delivered_mbits += interval_delivered_mbits
             episode_energy += interval_energy
@@ -2391,6 +2490,8 @@ def train(
                     task_potential_enabled=method_spec.task_potential_enabled,
                 )
 
+        if pending_routing_transitions:
+            raise AssertionError("terminal routing transitions remained pending")
         packet_metrics = packet_engine.finalize_episode(
             float(config.episode_seconds)
         )

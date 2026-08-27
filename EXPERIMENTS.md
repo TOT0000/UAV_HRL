@@ -194,6 +194,28 @@ scale only; its interference, queue, threshold, bandwidth, and K-factor models
 are not adopted. Five milliseconds is a fixed block-fading approximation, not
 an asserted exact coherence time for every link.
 
+Episode initialization and every non-terminal one-second boundary use one
+authoritative ordering. Episode objects and geometry are created first; the
+canonical slot-0 SR movement then completes before interval-0 A2G state is
+sampled exactly once and initial task assignment runs. At a later boundary, the
+fourth routing slot and packet service finish, boundary UAV/SR geometry is made
+current, and the next interval's complete A2G state is sampled once. The expired
+slot profile is cleared by that state transition. Boundary task assignment,
+movement potentials, and movement `next_state` are then built from the new
+geometry/state. The next loop iteration reuses this prepared state, so every
+non-terminal movement replay `next_state`, projection mask, and `phi_*_t1`
+exactly equal the next policy observation, mask, and `phi_*_t`.
+
+Routing transitions that still have a next HOL decision remain pending instead
+of recording an end-of-slot observation. At the next slot, packet injection,
+expiration/cleanup, start-of-slot HOL eligibility, effective masks, and routing
+observations are resolved in their canonical order. Boundary expiration cost is
+first attached to the pending transition, which is then finalized using that
+actual decision observation. A sender without a next decision is truncated;
+the fourth slot is not unconditionally terminal. The episode-terminal slot is
+finalized immediately and does not sample a nonexistent next-episode channel
+state.
+
 Run one method and the configured training seed per training/evaluation job.
 Evaluation episodes are averaged within the seed; additional explicitly run
 seeds may be aggregated as independent trained-policy seed means
@@ -337,9 +359,10 @@ python -X utf8 comparison_experiment.py aggregate --input-dir runs/comparison/ev
 
 Exact-resume checkpoints validate the method fingerprint, training-manifest
 relationship, training seed, the complete Dinkelbach block state, and its configuration.
-Checkpoint schema v12 is the current stochastic-channel, utility/QoS,
+Checkpoint schema v13 is the current boundary-aligned stochastic-channel,
+movement/routing replay, utility/QoS,
 routing-causality, actual-HOL-wait reward, pooled-QoS aggregation, propulsion,
-and four-slot/fifty-block movement-channel contract. Schema v11 and every older
+and four-slot/fifty-block movement-channel contract. Schema v12 and every older
 schema is rejected before weights or replay state are restored and must be
 retrained; no legacy checkpoint migration is attempted. The current schema
 stores the 429/30/90 dimensions, movement feature schema, direct-ratio bit/J

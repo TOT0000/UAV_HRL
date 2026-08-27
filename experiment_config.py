@@ -81,17 +81,23 @@ ROUTING_OPTIMIZER_UPDATE_SCOPE = "every_4_routing_slots"
 FOV_EMA_LIFECYCLE_VERSION = "no-map-footprint-progression-v3"
 SR_ROUTE_LIFECYCLE_VERSION = "assigned-and-arrived-derived-state-v2"
 PACKET_QOS_CONTRACT_VERSION = "eligible-fov-plus-next-slot-s2u-admitted-com-v4"
-PACKET_ROUTING_CAUSALITY_CONTRACT_VERSION = "start-of-slot-hol-routing-v1"
+PACKET_ROUTING_CAUSALITY_CONTRACT_VERSION = (
+    "start-of-slot-hol-pending-next-observation-v2"
+)
 PACKET_SERVICE_CONTRACT_VERSION = "fifty-5ms-block-cumulative-service-v1"
 QOS_AGGREGATE_CONTRACT_VERSION = "pooled-fov-com-eligible-v1"
 ROUTING_REWARD_CONTRACT_VERSION = "fading-effective-capacity-minus-actual-hol-wait-v4"
 ROUTING_REWARD_ALPHA_CAPACITY = 1.0
 ROUTING_REWARD_ALPHA_DELAY = 0.5
 ROUTING_CAPACITY_EPSILON_BPS = 1e-9
-MOVEMENT_CHANNEL_TIMING_VERSION = "held-command-four-slots-fifty-fading-blocks-v3"
+MOVEMENT_CHANNEL_TIMING_VERSION = (
+    "boundary-prepared-held-command-four-slots-fifty-fading-blocks-v4"
+)
 PROPULSION_MODEL_ID = "canonical-3d-quadrotor-v1"
 MOVEMENT_ACTION_PROJECTION_CONTRACT_VERSION = "fieldwise-clamp-heading-wrap-mask-v1"
-MOVEMENT_REPLAY_CONTRACT_VERSION = "executed-projected-action-capacity-50000-v1"
+MOVEMENT_REPLAY_CONTRACT_VERSION = (
+    "executed-projected-action-boundary-aligned-next-state-capacity-50000-v2"
+)
 MOVEMENT_WARMUP_CONTRACT_VERSION = "global-joint-transition-boundary-10000-v1"
 PROPULSION_PARAMETERS = MappingProxyType(
     {
@@ -733,6 +739,7 @@ def comparison_method_configuration(method_spec: MethodSpec) -> dict:
         "propulsion_model_id": PROPULSION_MODEL_ID,
         "propulsion_parameters": dict(PROPULSION_PARAMETERS),
         "movement_channel_timing_version": MOVEMENT_CHANNEL_TIMING_VERSION,
+        "movement_replay_contract_version": MOVEMENT_REPLAY_CONTRACT_VERSION,
         "movement_substeps_per_interval": 4,
         "movement_substep_seconds": ROUTING_SLOT_SECONDS,
         "channel_model_version": CHANNEL_MODEL_VERSION,

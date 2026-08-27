@@ -971,7 +971,7 @@ class TrainingCliTest(unittest.TestCase):
         )
 
     def test_checkpoint_schema_is_explicit(self):
-        self.assertEqual(CHECKPOINT_SCHEMA_VERSION, 12)
+        self.assertEqual(CHECKPOINT_SCHEMA_VERSION, 13)
 
 
 if __name__ == "__main__":

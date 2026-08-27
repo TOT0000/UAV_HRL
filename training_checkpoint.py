@@ -51,7 +51,7 @@ from dinkelbach_blocks import (
     dinkelbach_config_metadata,
 )
 
-CHECKPOINT_SCHEMA_VERSION = 12
+CHECKPOINT_SCHEMA_VERSION = 13
 ROUTING_LIFECYCLE_CHECKPOINT_SCHEMA_VERSION = 6
 PRE_ROUTING_LIFECYCLE_CHECKPOINT_SCHEMA_VERSION = 5
 PRE_ADAPTIVE_SAFE_DDQN_CHECKPOINT_SCHEMA_VERSION = 4
@@ -167,6 +167,7 @@ FORMAL_CORE_CONFIG_FIELDS = (
     "propulsion_model_id",
     "propulsion_parameters",
     "movement_channel_timing_version",
+    "movement_replay_contract_version",
     "movement_substeps_per_interval",
     "movement_substep_seconds",
     "channel_model_version",
@@ -1289,8 +1290,8 @@ def _validate_checkpoint_schema(metadata):
     schema = metadata.get("checkpoint_schema_version")
     if schema != CHECKPOINT_SCHEMA_VERSION:
         raise RuntimeError(
-            "checkpoint_schema_version is incompatible with the stochastic "
-            "channel, named-RNG, projected-action and replay "
+            "checkpoint_schema_version is incompatible with the boundary-aligned "
+            "stochastic channel, named-RNG, projected-action and replay "
             "contract and must be retrained: "
             f"checkpoint={schema}, expected={CHECKPOINT_SCHEMA_VERSION}"
         )
