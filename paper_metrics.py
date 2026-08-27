@@ -13,7 +13,7 @@ from evaluation_aggregation import (
 PAPER_EE_EPSILON_J = 1e-12
 AGGREGATE_REL_TOL = 1e-12
 AGGREGATE_ABS_TOL = 1e-15
-PAPER_AGGREGATE_SCHEMA_VERSION = "uav-hrl-paper-aggregate-v3"
+PAPER_AGGREGATE_SCHEMA_VERSION = "uav-hrl-paper-aggregate-v4"
 CANONICAL_AGGREGATE_ROWS = (
     ("energy_efficiency_mbit_per_j", None),
     ("average_e2e_delay_seconds", "FOV"),

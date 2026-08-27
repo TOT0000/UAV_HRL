@@ -22,7 +22,13 @@ def terminal_packet_engine_state(*, next_packet_id=0):
             "sessions": {},
         },
         "pending_terminal_violation_events": [],
+        "system_qos_eligible_packet_count": 0,
+        "system_qos_violation_count": 0,
+        "routing_credit_eligible_packet_count": 0,
+        "routing_credit_violation_count": 0,
+        "replay_attributed_violation_cost_count": 0.0,
         "unattributed_transition_violation_count": 0,
+        "unattributed_pre_routing_violation_count": 0,
     }
 
 

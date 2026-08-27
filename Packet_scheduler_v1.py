@@ -1,6 +1,7 @@
 import math
 from copy import deepcopy
 from collections import defaultdict, deque
+from dataclasses import replace
 from Energy_model import EnergyConsumptionModel
 from Fov_model_phase import FovModel
 from Channel_model import (
@@ -28,7 +29,7 @@ import numpy as np
 
 
 PACKET_ENGINE_CHECKPOINT_SCHEMA_VERSION = (
-    "episode-boundary-packet-reference-session-v1"
+    "episode-boundary-packet-qos-credit-session-v2"
 )
 
 
@@ -211,8 +212,11 @@ class PacketEngine:
         self.generated_packet_counts = {"FOV": 0, "COM": 0}
         self.eligible_packet_counts = {"FOV": 0, "COM": 0}
         self.sr_admission_drop_count = 0
+        self.routing_credit_eligible_packet_count = 0
+        self.routing_credit_violation_count = 0
         self.replay_attributed_violation_cost_count = 0.0
         self.unattributed_transition_violation_count = 0
+        self.unattributed_pre_routing_violation_count = 0
         self.pending_terminal_cost_by_sender = defaultdict(float)
         self.pending_terminal_violation_events = []
         self.routing_transition_refcounts = defaultdict(int)
@@ -253,13 +257,21 @@ class PacketEngine:
         *,
         previous_footprint,
         current_footprint,
+        visited_snapshot=None,
     ):
         """Compute one physical-map sample without mutating engine or environment."""
 
         if current_footprint is None:
             return {"overlap": 0.0, "unvisited": 0.0, "frontier": 0.0}
         bx_min, bx_max, by_min, by_max = current_footprint
-        patch = env.visited_bitmap[bx_min : bx_max + 1, by_min : by_max + 1]
+        bitmap = (
+            env.visited_bitmap
+            if visited_snapshot is None
+            else np.asarray(visited_snapshot, dtype=bool)
+        )
+        if bitmap.shape != env.visited_bitmap.shape:
+            raise ValueError("FOV observation snapshot shape is incompatible")
+        patch = bitmap[bx_min : bx_max + 1, by_min : by_max + 1]
         fov_cells = max(1, (bx_max - bx_min + 1) * (by_max - by_min + 1))
         unvisited = float((~patch).mean()) if patch.size else 0.0
         if patch.size:
@@ -342,7 +354,7 @@ class PacketEngine:
         *,
         force_ema=False,
     ):
-        """Commit Search footprints and conditionally advance the shared EMA."""
+        """Consume one complete immutable participant batch after map commit."""
 
         marker = str(transition_marker)
         if marker in {
@@ -354,9 +366,15 @@ class PacketEngine:
             footprint_transitions
         )
         should_advance_ema = bool(force_ema) or any(
-            bool(transition.map_changed)
+            bool(transition.coverage_contributor)
+            and bool(transition.map_changed)
             for transition in transitions_by_uav.values()
         )
+        expected_participants = set(range(self.num_UAV))
+        if set(transitions_by_uav) != expected_participants:
+            raise RuntimeError(
+                "FOV boundary requires one pre-commit sample for every UAV"
+            )
 
         if not should_advance_ema:
             current_footprints = {}
@@ -372,36 +390,28 @@ class PacketEngine:
         samples = {}
         current_footprints = {}
         for uav_id in range(self.num_UAV):
-            transition = transitions_by_uav.get(uav_id)
-            if transition is None:
-                previous = self.fov_previous_footprints.get(uav_id)
-                if previous is None:
-                    previous = getattr(env.uav_dict[uav_id], "last_box_idx", None)
-                current = env.fov_footprint_indices(uav_id)
-            else:
-                previous, current = self._resolved_transition_footprints(
-                    transition
-                )
+            transition = transitions_by_uav[uav_id]
+            previous, current = self._resolved_transition_footprints(
+                transition
+            )
             previous = self._copy_footprint(previous)
             current = self._copy_footprint(current)
-            if (
-                transition is not None
-                and transition.raw_overlap is not None
-                and transition.raw_unvisited is not None
-                and transition.raw_frontier is not None
-            ):
-                samples[uav_id] = {
-                    "overlap": float(transition.raw_overlap),
-                    "unvisited": float(transition.raw_unvisited),
-                    "frontier": float(transition.raw_frontier),
-                }
-            else:
-                samples[uav_id] = self._fov_observation_sample(
-                    env,
-                    uav_id,
-                    previous_footprint=previous,
-                    current_footprint=current,
+            if any(
+                value is None
+                for value in (
+                    transition.raw_overlap,
+                    transition.raw_unvisited,
+                    transition.raw_frontier,
                 )
+            ):
+                raise RuntimeError(
+                    "FOV EMA transition lacks an immutable pre-commit sample"
+                )
+            samples[uav_id] = {
+                "overlap": float(transition.raw_overlap),
+                "unvisited": float(transition.raw_unvisited),
+                "frontier": float(transition.raw_frontier),
+            }
             current_footprints[uav_id] = current
 
         alpha = float(self.norm_cfg["ema_alpha"])
@@ -425,10 +435,47 @@ class PacketEngine:
     def update_fov_ema(self, env, transition_marker, footprint_transitions=()):
         """Compatibility entry point for a known map-changing/reset transition."""
 
+        snapshot = env.visited_bitmap.copy()
+        supplied = self._fov_transitions_by_uav(footprint_transitions)
+        frozen = []
+        for uav_id in range(self.num_UAV):
+            transition = supplied.get(uav_id)
+            if transition is None:
+                transition = env.mark_search_coverage(
+                    uav_id,
+                    visited_snapshot=snapshot,
+                    commit=False,
+                    coverage_contributor=False,
+                )
+            if any(
+                value is None
+                for value in (
+                    transition.raw_overlap,
+                    transition.raw_unvisited,
+                    transition.raw_frontier,
+                )
+            ):
+                previous, current = self._resolved_transition_footprints(
+                    transition
+                )
+                sample = self._fov_observation_sample(
+                    env,
+                    uav_id,
+                    previous_footprint=previous,
+                    current_footprint=current,
+                    visited_snapshot=snapshot,
+                )
+                transition = replace(
+                    transition,
+                    raw_overlap=sample["overlap"],
+                    raw_unvisited=sample["unvisited"],
+                    raw_frontier=sample["frontier"],
+                )
+            frozen.append(transition)
         return self.process_fov_transitions(
             env,
             transition_marker,
-            footprint_transitions,
+            frozen,
             force_ema=True,
         )
 
@@ -573,7 +620,16 @@ class PacketEngine:
         self.uav_queues[uav_id].append(pkt)
         self.backlog_bits[uav_id] += max(float(pkt.get("rem_bits", 0.0)), 0.0)
 
-    def _new_packet(self, source, task_type, size_bits, generation_time, source_kind):
+    def _new_packet(
+        self,
+        source,
+        task_type,
+        size_bits,
+        generation_time,
+        source_kind,
+        *,
+        qos_eligible,
+    ):
         source = int(source)
         task_type = self._task_norm(task_type)
         size_bits = float(size_bits)
@@ -612,7 +668,9 @@ class PacketEngine:
             "final_hop_accum_bits": 0.0,
             "timely_goodput_counted": False,
             "violation_counted": False,
+            "qos_eligible": bool(qos_eligible),
             "routing_eligible": source_kind == "UAV",
+            "routing_credit_eligible": False,
             "terminal_outcome": None,
             "s2u_receiver": None,
             "s2u_bits_sent": 0.0,
@@ -626,7 +684,7 @@ class PacketEngine:
             "last_routing_transition_id": None,
         }
         self.generated_packet_counts[task_type] += 1
-        if source_kind == "UAV":
+        if bool(qos_eligible):
             self.eligible_packet_counts[task_type] += 1
         self.packet_pool.append(pkt)
         self._active_idx.add(pool_idx)
@@ -637,17 +695,29 @@ class PacketEngine:
         """Create a UAV-origin FOV packet and enqueue it at its source UAV."""
 
         pkt = self._new_packet(
-            source, task_type, size_bits, generation_time, source_kind="UAV"
+            source,
+            task_type,
+            size_bits,
+            generation_time,
+            source_kind="UAV",
+            qos_eligible=True,
         )
         self.enqueue_packet(pkt, source, generation_time)
         return pkt
 
-    def create_sr_packet(self, sr_id, size_bits, generation_time):
-        """Create COM data at an SR FIFO; it is not yet routable by a UAV."""
+    def create_sr_packet(
+        self, sr_id, size_bits, generation_time, *, qos_eligible=True
+    ):
+        """Create activated COM data at an SR FIFO before it is routable."""
 
         sr_id = int(sr_id)
         pkt = self._new_packet(
-            sr_id, "COM", size_bits, generation_time, source_kind="SR"
+            sr_id,
+            "COM",
+            size_bits,
+            generation_time,
+            source_kind="SR",
+            qos_eligible=bool(qos_eligible),
         )
         pkt["current"] = -(sr_id + 1)
         pkt["path"] = [f"SR:{sr_id}"]
@@ -714,6 +784,13 @@ class PacketEngine:
                 self.routing_transition_refcounts.pop(previous, None)
         pkt["last_routing_transition_id"] = resolved
         if resolved is not None:
+            if not bool(pkt.get("routing_eligible", False)):
+                raise AssertionError(
+                    "non-routable packet cannot reference a routing transition"
+                )
+            if not bool(pkt.get("routing_credit_eligible", False)):
+                pkt["routing_credit_eligible"] = True
+                self.routing_credit_eligible_packet_count += 1
             self.routing_transition_refcounts[resolved] += 1
         return True
 
@@ -725,6 +802,42 @@ class PacketEngine:
             )
             if int(count) > 0
         }
+
+    def system_qos_counts(self):
+        """Return the formal E2E system numerator and denominator."""
+
+        return (
+            int(self.total_violated),
+            int(sum(self.eligible_packet_counts.values())),
+        )
+
+    def routing_constraint_counts(self):
+        """Return only stable-ID-controllable cost numerator and denominator."""
+
+        return (
+            int(self.routing_credit_violation_count),
+            int(self.routing_credit_eligible_packet_count),
+        )
+
+    def assert_violation_credit_conservation(self):
+        system_violations, system_eligible = self.system_qos_counts()
+        routing_violations, routing_eligible = self.routing_constraint_counts()
+        if system_violations > system_eligible:
+            raise AssertionError("QoS violation count exceeds eligible packets")
+        if routing_violations > routing_eligible:
+            raise AssertionError(
+                "routing-attributable violations exceed credit-eligible packets"
+            )
+        if (
+            routing_violations
+            + int(self.unattributed_transition_violation_count)
+            != system_violations
+        ):
+            raise AssertionError(
+                "system violations differ from routing-attributed plus "
+                "unattributed violations"
+            )
+        return True
 
     def get_hol_packet(self, uav_id):
         queue = self.uav_queues[int(uav_id)]
@@ -848,8 +961,8 @@ class PacketEngine:
         return ordered
 
     def _count_violation(self, pkt):
-        if not bool(pkt.get("routing_eligible", False)):
-            raise AssertionError("SR-admission packets cannot count as QoS violations")
+        if not bool(pkt.get("qos_eligible", False)):
+            raise AssertionError("non-QoS packet cannot count as a violation")
         if pkt.get("violation_counted", False):
             return False
         pkt["violation_counted"] = True
@@ -860,6 +973,12 @@ class PacketEngine:
             self.fov_violated += 1
         else:
             self.com_violated += 1
+        if pkt.get("last_routing_transition_id") is None:
+            self.unattributed_transition_violation_count += 1
+            if not bool(pkt.get("routing_eligible", False)):
+                self.unattributed_pre_routing_violation_count += 1
+        else:
+            self.routing_credit_violation_count += 1
         return True
 
     def _mark_deadline_violation(
@@ -896,10 +1015,10 @@ class PacketEngine:
         }
 
     def _mark_sr_admission_drop(self, pkt, current_time, remove_from_queue=True):
-        """Expire one non-admitted COM packet without entering the QoS set."""
+        """Close an explicitly non-formal internal SR packet diagnostically."""
 
-        if bool(pkt.get("routing_eligible", False)):
-            raise AssertionError("eligible COM packet cannot be an SR admission drop")
+        if bool(pkt.get("qos_eligible", False)):
+            raise AssertionError("formal COM packet cannot be an SR admission drop")
         if pkt.get("terminal_outcome") is not None:
             return None
         remaining_bits = max(float(pkt.get("rem_bits", 0.0)), 0.0)
@@ -984,9 +1103,18 @@ class PacketEngine:
                 if is_expired(pkt):
                     expired_bits += max(float(pkt.get("rem_bits", 0.0)), 0.0)
                     pkt["_queued_sr"] = None
-                    self._mark_sr_admission_drop(
-                        pkt, current_time, remove_from_queue=False
-                    )
+                    if bool(pkt.get("qos_eligible", False)):
+                        event = self._mark_deadline_violation(
+                            pkt,
+                            current_time,
+                            remove_from_queue=False,
+                        )
+                        if event is not None:
+                            violations.append(event)
+                    else:
+                        self._mark_sr_admission_drop(
+                            pkt, current_time, remove_from_queue=False
+                        )
                 else:
                     kept.append(pkt)
             self.sr_queues[sr_id] = kept
@@ -1001,7 +1129,7 @@ class PacketEngine:
                 continue
             pkt = self.packet_pool[pool_idx]
             if pkt is not None and not pkt.get("done", False) and is_expired(pkt):
-                if bool(pkt.get("routing_eligible", False)):
+                if bool(pkt.get("qos_eligible", False)):
                     event = self._mark_deadline_violation(
                         pkt, current_time, remove_from_queue=False
                     )
@@ -1133,7 +1261,11 @@ class PacketEngine:
         current_time = float(current_time)
         slot_end = current_time + float(self.step_time)
         block_capacity_profiles = dict(block_capacity_profiles or {})
-        result = {"transmitted_bits_by_link": {}, "arrivals": []}
+        result = {
+            "transmitted_bits_by_link": {},
+            "arrivals": [],
+            "violations": [],
+        }
         for (sr_id, receiver), capacity_mbps in sorted(capacities.items()):
             sr_id, receiver = int(sr_id), int(receiver)
             capacity_mbps = float(capacity_mbps)
@@ -1220,15 +1352,16 @@ class PacketEngine:
                     completion_time >= deadline_abs - PACKET_EPS
                     or slot_end >= deadline_abs - PACKET_EPS
                 ):
-                    # Admission is useful only if the packet survives to its
-                    # first legal routing decision at the next slot boundary.
-                    self._mark_sr_admission_drop(
-                        pkt, completion_time, remove_from_queue=False
+                    event = self._mark_deadline_violation(
+                        pkt,
+                        completion_time,
+                        remove_from_queue=False,
                     )
+                    if event is not None:
+                        result["violations"].append(event)
                     continue
                 pkt["routing_eligible"] = True
                 pkt["routing_eligible_time"] = slot_end
-                self.eligible_packet_counts["COM"] += 1
                 # Enqueue only after this routing slot's eligible packet snapshot.
                 self.enqueue_packet(pkt, receiver, slot_end)
                 self.s2u_completed_packets += 1
@@ -1340,6 +1473,21 @@ class PacketEngine:
         result["transmitted_bits_by_link"].update(
             s2u_result["transmitted_bits_by_link"]
         )
+        for violation in s2u_result["violations"]:
+            sender = int(violation["attributed_sender"])
+            result["deferred_cost_by_sender"][sender] += 1.0
+            result["outcomes"].append(
+                {
+                    "attributed_sender": sender,
+                    "routing_transition_id": violation[
+                        "routing_transition_id"
+                    ],
+                    "task_type": violation["task_type"],
+                    "packet_id": violation["packet_id"],
+                    "violated": True,
+                    "packet": violation["packet"],
+                }
+            )
 
         reward_capacity_by_sender = {}
         for sender in sorted(actions):
@@ -1772,8 +1920,24 @@ class PacketEngine:
             "pending_terminal_violation_events": deepcopy(
                 self.pending_terminal_violation_events
             ),
+            "system_qos_eligible_packet_count": int(
+                sum(self.eligible_packet_counts.values())
+            ),
+            "system_qos_violation_count": int(self.total_violated),
+            "routing_credit_eligible_packet_count": int(
+                self.routing_credit_eligible_packet_count
+            ),
+            "routing_credit_violation_count": int(
+                self.routing_credit_violation_count
+            ),
+            "replay_attributed_violation_cost_count": float(
+                self.replay_attributed_violation_cost_count
+            ),
             "unattributed_transition_violation_count": int(
                 self.unattributed_transition_violation_count
+            ),
+            "unattributed_pre_routing_violation_count": int(
+                self.unattributed_pre_routing_violation_count
             ),
         }
 
@@ -1874,7 +2038,11 @@ class PacketEngine:
                 "e2e_delay_seconds": e2e_seconds,
                 "size_bits": float(pkt.get("size_bits", 0.0)),
                 "delivered_to_gs": delivered_to_gs,
+                "qos_eligible": bool(pkt.get("qos_eligible", False)),
                 "routing_eligible": bool(pkt.get("routing_eligible", False)),
+                "routing_credit_eligible": bool(
+                    pkt.get("routing_credit_eligible", False)
+                ),
                 "sr_waiting_seconds": pkt.get("sr_waiting_seconds"),
                 "remaining_bits_at_drop": pkt.get(
                     "sr_admission_remaining_bits"
@@ -1883,10 +2051,10 @@ class PacketEngine:
         )
 
     def finalize_episode(self, current_time):
-        """Close all packets using the canonical eligible/admission split."""
+        """Close all packets using the canonical QoS/routing split."""
 
         for pkt in list(self.get_active_packets()):
-            if bool(pkt.get("routing_eligible", False)):
+            if bool(pkt.get("qos_eligible", False)):
                 sender = int(pkt.get("current", -1))
                 event = self._mark_deadline_violation(
                     pkt,
@@ -1952,7 +2120,7 @@ class PacketEngine:
             )
             result[task_type] = {
                 # The established paper column now carries the canonical
-                # denominator: FOV generated plus S2U-admitted COM.
+                # denominator: FOV plus every activated/generated COM packet.
                 "generated_packets": eligible,
                 "source_generated_packets": source_generated,
                 "eligible_packets": eligible,
@@ -1978,7 +2146,7 @@ class PacketEngine:
     def drop_expired_packets(self, current_time):
         """Drop max-hop packets with one filtering pass per UAV queue."""
 
-        dropped = 0
+        violations = []
         queued_indices = set()
         for uav_id in range(self.num_UAV):
             kept = deque()
@@ -1996,14 +2164,15 @@ class PacketEngine:
                 if int(pkt.get("hops", 0)) >= MAX_PACKET_HOPS:
                     dropped_bits += max(float(pkt.get("rem_bits", 0.0)), 0.0)
                     pkt["_queued_uav"] = None
-                    self._mark_deadline_violation(
+                    event = self._mark_deadline_violation(
                         pkt,
                         current_time,
                         sender=uav_id,
                         reason="max_hops",
                         remove_from_queue=False,
                     )
-                    dropped += 1
+                    if event is not None:
+                        violations.append(event)
                 else:
                     kept.append(pkt)
             self.uav_queues[uav_id] = kept
@@ -2018,14 +2187,15 @@ class PacketEngine:
             if pkt is not None and int(pkt.get("hops", 0)) >= MAX_PACKET_HOPS:
                 if not bool(pkt.get("routing_eligible", False)):
                     raise AssertionError("detached non-eligible packet reached max hops")
-                self._mark_deadline_violation(
+                event = self._mark_deadline_violation(
                     pkt,
                     current_time,
                     reason="max_hops",
                     remove_from_queue=False,
                 )
-                dropped += 1
-        return dropped
+                if event is not None:
+                    violations.append(event)
+        return violations
 
     # ===== Dual-Queue helpers (no weights) =====
     def _task_norm(self, task_type) -> str:
@@ -2097,8 +2267,11 @@ class PacketEngine:
         self.generated_packet_counts = {"FOV": 0, "COM": 0}
         self.eligible_packet_counts = {"FOV": 0, "COM": 0}
         self.sr_admission_drop_count = 0
+        self.routing_credit_eligible_packet_count = 0
+        self.routing_credit_violation_count = 0
         self.replay_attributed_violation_cost_count = 0.0
         self.unattributed_transition_violation_count = 0
+        self.unattributed_pre_routing_violation_count = 0
         self.pending_terminal_cost_by_sender = defaultdict(float)
         self.pending_terminal_violation_events = []
         self.routing_transition_refcounts = defaultdict(int)

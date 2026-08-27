@@ -6,11 +6,12 @@ from pathlib import Path
 
 from evaluation_metrics import (
     METRIC_COLUMNS,
-    aggregate_seed_means,
+    canonical_cross_seed_artifact_rows,
     safe_energy_efficiency,
     summarize_training_seeds,
     write_evaluation_outputs,
 )
+from evaluation_aggregation import canonical_aggregation
 from experiment_config import MethodSpec
 from HRL_task_aware import TrainingConfig, train
 from scenario_manifest import generate_manifest
@@ -56,21 +57,33 @@ class EvaluationMetricTest(unittest.TestCase):
             )
 
         seed_summaries = summarize_training_seeds(episodes)
-        aggregate = aggregate_seed_means(seed_summaries)
+        _per_seed, aggregate = canonical_aggregation(episodes)
         ee = next(
             row
             for row in aggregate
             if row["metric"] == "energy_efficiency_mbit_per_j"
         )
+        artifact_rows = canonical_cross_seed_artifact_rows(
+            aggregate, episodes
+        )
+        artifact_ee = next(
+            row
+            for row in artifact_rows
+            if row["metric"] == "energy_efficiency_mbit_per_j"
+        )
 
         self.assertEqual(len(seed_summaries), 5)
-        self.assertEqual(ee["training_seed_count"], 5)
+        self.assertEqual(ee["valid_training_seed_count"], 5)
         self.assertAlmostEqual(ee["mean"], 3.0)
         self.assertAlmostEqual(ee["sample_stddev"], math.sqrt(2.5))
         self.assertAlmostEqual(ee["t_critical_975"], 2.7764451051977987)
         self.assertAlmostEqual(
             ee["ci95_half_width"],
             ee["t_critical_975"] * math.sqrt(2.5) / math.sqrt(5),
+        )
+        self.assertEqual(artifact_ee["mean"], ee["mean"])
+        self.assertEqual(
+            artifact_ee["per_seed_numerators"], ee["per_seed_numerators"]
         )
 
     def test_evaluation_outputs_are_structured_and_finite(self):

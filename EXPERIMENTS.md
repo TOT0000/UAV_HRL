@@ -109,9 +109,10 @@ design-dataset collection, aggregation, and exact-resume workflows.
   `eta_c=0.01`; every episode uses one frozen multiplier for both executed and
   target actions, then updates it once with
   `max(0, lambda_cost + eta_c * (violations / eligible_packets - 0.1))`.
-  Eligible packets are generated FOV plus S2U-admitted COM; an episode with no
-  eligible packets does not update the multiplier, and SR admission drops are
-  excluded from both numerator and denominator
+  This multiplier uses only packets that received a stable routing transition
+  ID and their routing-attributable violations. Pre-routing S2U failures remain
+  formal system QoS violations but cannot update the multiplier or replay cost;
+  an episode with no routing-credit-eligible packets does not update it
 - learned routing uses the common local reward
   `capacity_norm - 0.5 * (transmission_delay_norm + queue_delay_norm)` with
   fixed canonical U2U/U2G reference capacities and no distance/progress bonus.
@@ -122,10 +123,13 @@ design-dataset collection, aggregation, and exact-resume workflows.
 - production FOV/COM deadlines `1.5 s`/`1.0 s`; completion at the exact deadline
   is timely
 - production packet injection cutoff `58.5 s`
-- At each one-second Search boundary all Search UAVs compute raw unvisited,
-  frontier, overlap, and `map_changed` values from one immutable pre-commit
-  bitmap. Their footprint union is committed atomically before the single EMA
-  update, Search-to-Hover conversion, or assignment. Routing state
+- At each one-second Search boundary every FOV-observation participant computes
+  raw unvisited, frontier, overlap, and `map_changed` from the same immutable
+  pre-commit bitmap. Observation participation is separate from coverage
+  contribution: only Search-UAV footprints enter the atomic coverage union.
+  The frozen all-UAV samples update EMA after coverage commit and before
+  Search-to-Hover conversion, assignment, or state construction. No post-commit
+  bitmap fallback is permitted. Routing state
   getters are pure reads. Full checkpoints persist EMA values, initialization,
   previous footprints, footprint/EMA markers, and EMA update count.
   SR routes omit the duplicated start point, include the exact target, and mark
@@ -133,7 +137,13 @@ design-dataset collection, aggregation, and exact-resume workflows.
   lifecycle fields are `assigned_gt_id` and `arrived`. A COM session produces
   no packets until its assigned UAV first enters the inclusive 200 m S2U
   range; activation is permanent for the episode and packet generation then
-  continues at 50 packets/s even while the UAV is out of range. These lifecycle
+  continues at 50 packets/s even while the UAV is out of range. Each activated
+  COM packet is immediately `qos_eligible=True` at SR generation, while
+  `routing_eligible=False` until S2U completes. S2U completion changes only
+  routing eligibility and never increments the QoS denominator again. SR
+  timeout or terminal settlement is one formal E2E violation measured from
+  generation time; without a routing transition ID it increments the explicit
+  unattributed diagnostic and never writes safe-DDQN replay. These lifecycle
   fields remain episode-boundary snapshots in
   full checkpoints
   mid-episode checkpointing is explicitly unsupported.
@@ -229,6 +239,10 @@ while any active packet still references it and is not sampleable. Delivery,
 expiration, or replacement by a newer action releases that reference. Packets
 with no routing transition still contribute to system QoS and increment an
 explicit missing-ID diagnostic without receiving fabricated replay credit.
+System violations therefore equal routing-attributable violations plus
+unattributed pre-routing violations. System evaluation uses every activated
+COM sample, while the safe-DDQN constraint uses only stable-ID credit-eligible
+samples.
 Formal routing replay is one-step. Episode-terminal packet outcomes and costs
 are settled before the ledger is drained.
 
@@ -375,11 +389,11 @@ python -X utf8 comparison_experiment.py aggregate --input-dir runs/comparison/ev
 
 Exact-resume checkpoints validate the method fingerprint, training-manifest
 relationship, training seed, the complete Dinkelbach block state, and its configuration.
-Checkpoint schema v14 is the current boundary-aligned stochastic-channel,
+Checkpoint schema v15 is the current boundary-aligned stochastic-channel,
 movement/routing replay, utility/QoS, routing-ID causality/credit,
 frozen-backlog reward, hard-range/COM-session, atomic-FOV, seed-ratio
 aggregation, propulsion, and four-slot/fifty-block movement-channel contract.
-Schema v13 and every older
+Schema v14 and every older
 schema is rejected before weights or replay state are restored and must be
 retrained; no legacy checkpoint migration is attempted. The current schema
 stores the 429/30/90 dimensions, movement feature schema, direct-ratio bit/J
@@ -421,8 +435,8 @@ Every evaluation episode writes method/seed/scenario identity plus:
 - timely goodput and raw final-hop throughput in Mbit
 - total mobility energy and `timely_goodput_mbits / mobility_energy_j`
 - FOV/COM timely deliveries and deadline violations
-- canonical eligible count, violation count/probability, SR admission drops,
-  coverage, and found-GT ratio
+- canonical system-QoS eligible count, violation count/probability, isolated
+  non-formal SR admission diagnostics, coverage, and found-GT ratio
 - routing Waits, partial transmissions, and slot-budget violations
 
 Zero or invalid per-episode energy produces an episode diagnostic EE value of
@@ -437,7 +451,10 @@ override `--expected-seed-count` and `--expected-episodes-per-seed` explicitly.
 Canonical within-seed aggregation uses numerator/denominator sums for EE,
 FOV/COM/ALL violation probability, and FOV/COM delay. Valid seed ratios receive
 equal weight across seeds with sample SD and Student-t 95% CI; zero-denominator
-seeds are missing. Generic and paper paths share `evaluation_aggregation.py`.
+seeds are missing. `canonical_aggregation()` in
+`evaluation_aggregation.py` is the only statistical implementation. Generic
+CSV/JSON and paper JSON serialize or adapt the same returned rows; writers do
+not recompute means, sample SD, valid-seed counts, or Student-t intervals.
 Artifacts include per-seed numerator, denominator, units, schema, valid seed
 count, and CI provenance. Aggregation also writes `cross_seed_summary.csv`,
 JSON, and Student-t methodology in `aggregation_metadata.json`.
@@ -496,7 +513,7 @@ to `packet_outcomes.jsonl`, flushing one complete episode before starting the
 next. The in-memory all-episode artifact field remains disabled. Every JSONL
 record contains `scenario_id`, the episode packet summary, the original raw
 `packet_outcomes`, and
-`artifact_schema_version=uav-hrl-packet-outcomes-jsonl-v1`. The collection
+`artifact_schema_version=uav-hrl-packet-outcomes-jsonl-v2`. The collection
 mode, artifact schema, output path, and written episode count are recorded in
 metadata. Writer/open/serialization errors fail the evaluation, and the stream
 is closed on both successful and exceptional exits.

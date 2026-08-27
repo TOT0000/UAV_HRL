@@ -58,7 +58,7 @@ from dinkelbach_blocks import (
     dinkelbach_config_metadata,
 )
 
-CHECKPOINT_SCHEMA_VERSION = 14
+CHECKPOINT_SCHEMA_VERSION = 15
 ROUTING_LIFECYCLE_CHECKPOINT_SCHEMA_VERSION = 6
 PRE_ROUTING_LIFECYCLE_CHECKPOINT_SCHEMA_VERSION = 5
 PRE_ADAPTIVE_SAFE_DDQN_CHECKPOINT_SCHEMA_VERSION = 4
@@ -1304,7 +1304,8 @@ def _validate_checkpoint_schema(metadata):
     if schema != CHECKPOINT_SCHEMA_VERSION:
         raise RuntimeError(
             "checkpoint_schema_version is incompatible with the boundary-aligned "
-            "stochastic channel, named-RNG, projected-action and replay "
+            "stochastic channel, COM QoS/routing-credit, all-participant FOV, "
+            "named-RNG, projected-action and replay "
             "contract and must be retrained: "
             f"checkpoint={schema}, expected={CHECKPOINT_SCHEMA_VERSION}"
         )
@@ -2334,6 +2335,51 @@ def _validate_full_resume_logging_state(
             raise RuntimeError("episode-boundary checkpoint has packet routing references")
         if packet_state.get("pending_terminal_violation_events"):
             raise RuntimeError("checkpoint has unprocessed terminal violation events")
+        packet_qos_fields = (
+            "system_qos_eligible_packet_count",
+            "system_qos_violation_count",
+            "routing_credit_eligible_packet_count",
+            "routing_credit_violation_count",
+            "unattributed_transition_violation_count",
+            "unattributed_pre_routing_violation_count",
+        )
+        if any(
+            type(packet_state.get(field)) is not int
+            or int(packet_state[field]) < 0
+            for field in packet_qos_fields
+        ):
+            raise RuntimeError("checkpoint packet QoS/credit counters are invalid")
+        system_eligible = packet_state["system_qos_eligible_packet_count"]
+        system_violations = packet_state["system_qos_violation_count"]
+        routing_eligible = packet_state[
+            "routing_credit_eligible_packet_count"
+        ]
+        routing_violations = packet_state["routing_credit_violation_count"]
+        unattributed = packet_state[
+            "unattributed_transition_violation_count"
+        ]
+        if (
+            routing_eligible > system_eligible
+            or system_violations > system_eligible
+            or routing_violations > routing_eligible
+            or system_violations != routing_violations + unattributed
+            or packet_state["unattributed_pre_routing_violation_count"]
+            > unattributed
+        ):
+            raise RuntimeError(
+                "checkpoint packet system-QoS/routing-credit conservation failed"
+            )
+        replay_cost = packet_state.get(
+            "replay_attributed_violation_cost_count"
+        )
+        if (
+            not isinstance(replay_cost, (int, float))
+            or not np.isfinite(float(replay_cost))
+            or not np.isclose(float(replay_cost), routing_violations)
+        ):
+            raise RuntimeError(
+                "checkpoint replay-attributed routing cost is inconsistent"
+            )
         com_state = packet_state.get("com_session_state")
         if (
             not isinstance(com_state, dict)

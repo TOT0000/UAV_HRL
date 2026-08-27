@@ -237,7 +237,13 @@ class FovOverlapEmaLifecycleTest(unittest.TestCase):
             env, engine, "transition=1-no-map-change"
         )
         self.assertTrue(transitions)
-        self.assertFalse(any(item.map_changed for item in transitions))
+        self.assertFalse(
+            any(
+                item.map_changed
+                for item in transitions
+                if item.coverage_contributor
+            )
+        )
         self.assertFalse(updated)
         state_after_no_map_change = engine.fov_ema_state()
         self.assertEqual(
@@ -323,7 +329,13 @@ class FovOverlapEmaLifecycleTest(unittest.TestCase):
         transitions_b, updated_b = self._apply_production_transition(
             env, engine, "transition=B-no-map-change"
         )
-        self.assertFalse(any(item.map_changed for item in transitions_b))
+        self.assertFalse(
+            any(
+                item.map_changed
+                for item in transitions_b
+                if item.coverage_contributor
+            )
+        )
         self.assertFalse(updated_b)
 
         uav.x_u += shift_cells * env.bit_resolution
@@ -335,7 +347,13 @@ class FovOverlapEmaLifecycleTest(unittest.TestCase):
         transitions_c, updated_c = self._apply_production_transition(
             env, engine, "transition=C-map-change"
         )
-        self.assertTrue(any(item.map_changed for item in transitions_c))
+        self.assertTrue(
+            any(
+                item.map_changed
+                for item in transitions_c
+                if item.coverage_contributor
+            )
+        )
         self.assertTrue(updated_c)
         alpha = engine.norm_cfg["ema_alpha"]
         actual_sample = (engine.fov_ema[0]["overlap"] - alpha * overlap_before) / (
@@ -363,7 +381,13 @@ class FovOverlapEmaLifecycleTest(unittest.TestCase):
                 env, engine, "transition=2-no-map-change"
             )
             self.assertFalse(updated)
-            self.assertFalse(any(item.map_changed for item in transitions))
+            self.assertFalse(
+                any(
+                    item.map_changed
+                    for item in transitions
+                    if item.coverage_contributor
+                )
+            )
             self.assertEqual(
                 engine.fov_previous_footprints[0], footprint_b
             )

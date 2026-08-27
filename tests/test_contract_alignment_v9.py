@@ -37,7 +37,7 @@ class FormalContractTest(unittest.TestCase):
         self.assertEqual(FORMAL_CHECKPOINT_EPISODE, 1500)
         self.assertEqual(FORMAL_EXPERIMENT_DEFAULTS["training_episodes_per_seed"], 1500)
         self.assertEqual(checkpoint_episode_schedule(1500, 50), list(range(50, 1501, 50)))
-        self.assertEqual(CHECKPOINT_SCHEMA_VERSION, 14)
+        self.assertEqual(CHECKPOINT_SCHEMA_VERSION, 15)
 
     def test_all_methods_publish_the_same_physical_contracts(self):
         shared_fields = (
@@ -217,15 +217,17 @@ class QoSAndRoutingRewardContractTest(unittest.TestCase):
         self.assertEqual(agent.update_cost_multiplier(0, 0), 0.0)
         self.assertEqual(agent.cost_multiplier_update_count, updates)
 
-    def test_sr_admission_drop_is_not_eligible_or_a_violation(self):
+    def test_activated_sr_packet_is_immediately_qos_eligible_and_terminal_violation(self):
         engine = PacketEngine(2)
         engine.create_sr_packet(9, 256.0, 0.0)
         summary = engine.finalize_episode(1.0)
         self.assertEqual(summary["COM"]["source_generated_packets"], 1)
-        self.assertEqual(summary["COM"]["eligible_packets"], 0)
-        self.assertEqual(summary["COM"]["sr_admission_drop_packets"], 1)
-        self.assertEqual(summary["COM"]["violation_packets"], 0)
-        self.assertIsNone(summary["COM"]["violation_probability"])
+        self.assertEqual(summary["COM"]["eligible_packets"], 1)
+        self.assertEqual(summary["COM"]["sr_admission_drop_packets"], 0)
+        self.assertEqual(summary["COM"]["violation_packets"], 1)
+        self.assertEqual(summary["COM"]["violation_probability"], 1.0)
+        self.assertEqual(engine.replay_attributed_violation_cost_count, 0.0)
+        self.assertEqual(engine.unattributed_pre_routing_violation_count, 1)
 
     def test_eligible_violation_counts_once_and_cost_is_one(self):
         engine = PacketEngine(2)

@@ -9,7 +9,7 @@ from scipy.stats import t as student_t
 
 
 EVALUATION_AGGREGATION_SCHEMA_VERSION = (
-    "seed-ratio-of-sums-equal-weight-student-t-v1"
+    "canonical-result-single-artifact-source-v2"
 )
 
 CANONICAL_METRICS = (

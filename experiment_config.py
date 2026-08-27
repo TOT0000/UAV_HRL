@@ -49,7 +49,7 @@ COMMUNICATION_RANGE_CONTRACT_VERSION = (
     "slot-start-3d-inclusive-a2g-200m-a2a-400m-v1"
 )
 COM_SESSION_LIFECYCLE_VERSION = (
-    "assigned-first-in-range-activation-persistent-generation-v1"
+    "activated-generation-immediate-e2e-qos-persistent-v2"
 )
 ASSIGNMENT_DUMMY_UTILITY = -1e-9
 UTILITY_NORMALIZATION_MODE = "fov-global-minmax-com-fading-aware-reference-v3"
@@ -88,17 +88,21 @@ ROUTING_LEARNING_RATE = 1e-3
 ROUTING_GAMMA = 0.99
 ROUTING_TAU = 0.005
 ROUTING_OPTIMIZER_UPDATE_SCOPE = "every_4_routing_slots"
-FOV_EMA_LIFECYCLE_VERSION = "atomic-precommit-search-snapshot-v4"
+FOV_EMA_LIFECYCLE_VERSION = "all-participant-precommit-search-union-v5"
 SR_ROUTE_LIFECYCLE_VERSION = "assigned-and-arrived-derived-state-v2"
-PACKET_QOS_CONTRACT_VERSION = "activated-com-plus-next-slot-s2u-admitted-v5"
+PACKET_QOS_CONTRACT_VERSION = (
+    "activated-com-immediate-qos-versus-routing-eligibility-v6"
+)
 PACKET_ROUTING_CAUSALITY_CONTRACT_VERSION = (
     "transition-id-causality-credit-pending-one-step-v3"
 )
 ROUTING_COST_ATTRIBUTION_CONTRACT_VERSION = (
-    "packet-stable-transition-id-reference-count-v1"
+    "system-qos-versus-routing-credit-stable-id-v2"
 )
 PACKET_SERVICE_CONTRACT_VERSION = "fifty-5ms-block-cumulative-service-v1"
-QOS_AGGREGATE_CONTRACT_VERSION = "seed-pooled-ratio-of-sums-student-t-v2"
+QOS_AGGREGATE_CONTRACT_VERSION = (
+    "canonical-single-result-seed-ratio-of-sums-student-t-v3"
+)
 ROUTING_REWARD_CONTRACT_VERSION = (
     "slot-start-other-backlog-over-fading-effective-capacity-v5"
 )

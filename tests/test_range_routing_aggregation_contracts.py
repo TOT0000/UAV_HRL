@@ -188,6 +188,10 @@ class RoutingCreditAndRewardContractTest(unittest.TestCase):
             pkt, 0.25, sender=0, reason="deadline"
         )
         self.assertEqual(event["routing_transition_id"], transition_id)
+        self.assertEqual(engine.routing_constraint_counts(), (1, 1))
+        self.assertEqual(engine.system_qos_counts(), (1, 1))
+        self.assertTrue(engine.assert_violation_credit_conservation())
+        self.assertEqual(engine.unattributed_transition_violation_count, 0)
         self.assertTrue(ledger.add_cost(event["routing_transition_id"], 1.0))
         self.assertEqual(
             ledger.commit_ready(
@@ -247,6 +251,20 @@ class RoutingCreditAndRewardContractTest(unittest.TestCase):
             engine.routing_transition_reference_counts(), {transition_id: 1, 8: 1}
         )
 
+    def test_max_hop_violation_returns_its_stable_transition_event(self):
+        engine = PacketEngine(num_uav=1)
+        packet = engine.create_packet(0, "COM", 100.0, 0.0)
+        packet["hops"] = 20
+        engine._set_packet_routing_transition(packet, 12)
+
+        events = engine.drop_expired_packets(0.25)
+
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["routing_transition_id"], 12)
+        self.assertEqual(engine.system_qos_counts(), (1, 1))
+        self.assertEqual(engine.routing_constraint_counts(), (1, 1))
+        self.assertTrue(engine.assert_violation_credit_conservation())
+
 
 class AtomicFovAndAggregationContractTest(unittest.TestCase):
     def test_search_uavs_observe_same_precommit_bitmap(self):
@@ -263,7 +281,7 @@ class AtomicFovAndAggregationContractTest(unittest.TestCase):
         env.uav_dict[1].y_u = env.uav_dict[0].y_u
         env.uav_dict[1].z_u = env.uav_dict[0].z_u
         transitions = _mark_search_observations(env)
-        self.assertEqual(len(transitions), 2)
+        self.assertEqual(len(transitions), env.num_UAV)
         self.assertEqual(transitions[0].raw_unvisited, 1.0)
         self.assertEqual(transitions[1].raw_unvisited, 1.0)
         self.assertTrue(transitions[0].map_changed)

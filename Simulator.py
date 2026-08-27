@@ -50,15 +50,16 @@ from experiment_config import (
 
 @dataclass(frozen=True)
 class FovCoverageTransition:
-    """Immutable Search-map transition before its current footprint is committed."""
+    """Immutable all-participant sample from one pre-commit map snapshot."""
 
     uav_id: int
     previous_footprint: tuple[int, int, int, int] | None
-    current_footprint: tuple[int, int, int, int]
+    current_footprint: tuple[int, int, int, int] | None
     map_changed: bool
     raw_overlap: float | None = None
     raw_unvisited: float | None = None
     raw_frontier: float | None = None
+    coverage_contributor: bool = True
 
 
 class Simulator:
@@ -303,17 +304,19 @@ class Simulator:
         return (int(bx_min), int(bx_max), int(by_min), int(by_max))
 
     def mark_search_coverage(
-        self, uav_id, *, visited_snapshot=None, commit=True
+        self,
+        uav_id,
+        *,
+        visited_snapshot=None,
+        commit=True,
+        coverage_contributor=True,
     ):
-        """Build one immutable pre-commit Search-map transition."""
+        """Freeze one FOV sample; only Search contributors may mutate coverage."""
 
         uav = self.uav_dict[uav_id]
         current = self.fov_footprint_indices(uav_id)
-        if current is None:
-            return None
         previous = getattr(uav, "last_box_idx", None)
         previous = tuple(int(value) for value in previous) if previous is not None else None
-        bx_min, bx_max, by_min, by_max = current
         snapshot = (
             self.visited_bitmap
             if visited_snapshot is None
@@ -321,6 +324,18 @@ class Simulator:
         )
         if snapshot.shape != self.visited_bitmap.shape:
             raise ValueError("Search pre-commit bitmap shape is incompatible")
+        if current is None:
+            return FovCoverageTransition(
+                uav_id=int(uav_id),
+                previous_footprint=previous,
+                current_footprint=None,
+                map_changed=False,
+                raw_overlap=0.0,
+                raw_unvisited=0.0,
+                raw_frontier=0.0,
+                coverage_contributor=bool(coverage_contributor),
+            )
+        bx_min, bx_max, by_min, by_max = current
         patch = snapshot[bx_min : bx_max + 1, by_min : by_max + 1]
         map_changed = bool((~patch).any())
         raw_unvisited = float((~patch).mean()) if patch.size else 0.0
@@ -343,7 +358,7 @@ class Simulator:
                 else 0
             )
             raw_overlap = intersection / float(max(patch.size, 1))
-        if commit:
+        if commit and coverage_contributor:
             self.visited_bitmap[
                 bx_min : bx_max + 1, by_min : by_max + 1
             ] = True
@@ -355,6 +370,7 @@ class Simulator:
             raw_overlap=float(raw_overlap),
             raw_unvisited=float(raw_unvisited),
             raw_frontier=float(raw_frontier),
+            coverage_contributor=bool(coverage_contributor),
         )
         
         # if (not self.search_completed) and self.is_search_done(cov_th=0.8, min_found=4):

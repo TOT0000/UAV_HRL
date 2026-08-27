@@ -6,9 +6,7 @@ import csv
 import json
 import math
 from pathlib import Path
-from statistics import fmean, stdev
-
-from scipy.stats import t as student_t
+from statistics import fmean
 
 from centralized_movement import JOINT_ACTION_DIM, MOVEMENT_STATE_DIM
 from com_capacity_calibration import load_com_capacity_reference
@@ -28,8 +26,7 @@ from scenario_manifest import ScenarioManifest
 from training_checkpoint import inspect_model_checkpoint
 from evaluation_aggregation import (
     EVALUATION_AGGREGATION_SCHEMA_VERSION,
-    aggregate_episode_rows_by_seed,
-    aggregate_seed_rows,
+    canonical_aggregation,
 )
 
 
@@ -64,6 +61,13 @@ METRIC_COLUMNS = (
     "partial_transmission_count",
     "slot_budget_violation_count",
     "unattributed_transition_violation_count",
+    "unattributed_pre_routing_violation_count",
+    "system_qos_violation_count",
+    "system_qos_eligible_packets",
+    "routing_cost_sum",
+    "routing_cost_eligible_packets",
+    "routing_credit_violation_count",
+    "replay_attributed_violation_cost_count",
 )
 
 OPTIONAL_METRIC_COLUMNS = {"delay_violation_probability"}
@@ -127,20 +131,16 @@ SEED_SUMMARY_IDENTITY_COLUMNS = (
 
 
 def aggregation_metadata(seed_count):
-    degrees_of_freedom = max(int(seed_count) - 1, 0)
-    critical = (
-        float(student_t.ppf(0.975, df=degrees_of_freedom))
-        if degrees_of_freedom > 0
-        else 0.0
-    )
     return {
         "evaluation_unit": "episode",
         "uncertainty_unit": "trained-policy seed mean",
+        "configured_training_seed_count": int(seed_count),
         "standard_deviation": "sample (n-1)",
         "confidence_interval": "Student-t",
         "confidence_level": 0.95,
-        "degrees_of_freedom": degrees_of_freedom,
-        "t_critical_975": critical,
+        "result_specific_degrees_of_freedom": (
+            "serialized from canonical cross-seed rows"
+        ),
         "pooled_episode_inference": False,
         "aggregation_schema_version": EVALUATION_AGGREGATION_SCHEMA_VERSION,
         "within_seed_rule": "ratio of episode numerator sums / denominator sums",
@@ -221,7 +221,9 @@ def summarize_training_seeds(episode_rows):
                 if row[metric] is not None
             ]
             summary[metric] = fmean(values) if values else None
-        canonical_rows = aggregate_episode_rows_by_seed(rows)
+        canonical_rows, _canonical_cross_seed_rows = canonical_aggregation(
+            rows
+        )
         canonical = {
             (row["metric"], row.get("task_type")): row["value"]
             for row in canonical_rows
@@ -251,75 +253,49 @@ def summarize_training_seeds(episode_rows):
     return summaries
 
 
-def aggregate_seed_means(seed_summaries):
-    """Aggregate seed means; episodes are never treated as independent seeds."""
+def canonical_cross_seed_artifact_rows(canonical_rows, episode_rows):
+    """Attach generic identity fields without recomputing canonical statistics."""
 
-    grouped = {}
-    for row in seed_summaries:
-        key = (
-            str(row["method_id"]),
-            str(row["evaluation_split"]),
-            str(row["evaluation_manifest_hash"]),
-            _optional_text(row["training_manifest_hash"]),
-            _optional_int(row["checkpoint_completed_episodes"]),
-        )
-        grouped.setdefault(key, []).append(row)
+    rows = list(episode_rows)
+    if not rows:
+        raise ValueError("canonical artifact serialization requires episode rows")
 
-    aggregates = []
-    for key, rows in sorted(grouped.items()):
-        (
-            method_id,
-            evaluation_split,
-            evaluation_manifest_hash,
-            training_manifest_hash,
-            checkpoint_completed_episodes,
-        ) = key
-        for metric in SEED_SUMMARY_METRIC_COLUMNS:
-            values = [
-                float(row[metric])
-                for row in rows
-                if row[metric] is not None
-            ]
-            mean_value = fmean(values) if values else None
-            sample_stddev = (
-                stdev(values) if len(values) > 1 else (0.0 if values else None)
+    def unique(field, transform=lambda value: value):
+        values = {transform(row.get(field)) for row in rows}
+        if len(values) != 1:
+            raise ValueError(
+                f"canonical artifact rows disagree on identity field: {field}"
             )
-            degrees_of_freedom = max(len(values) - 1, 0)
-            t_critical = (
-                float(student_t.ppf(0.975, df=degrees_of_freedom))
-                if degrees_of_freedom > 0
-                else 0.0
+        return next(iter(values))
+
+    identity = {
+        "method_id": unique("method_id", str),
+        "evaluation_split": unique("evaluation_split", str),
+        "evaluation_manifest_hash": unique("evaluation_manifest_hash", str),
+        "training_manifest_hash": unique(
+            "training_manifest_hash", _optional_text
+        ),
+        "checkpoint_completed_episodes": unique(
+            "checkpoint_completed_episodes", _optional_int
+        ),
+    }
+    return [{**identity, **dict(row)} for row in canonical_rows]
+
+
+def canonical_cross_seed_csv_rows(artifact_rows):
+    """Project list provenance to JSON text; never calculate statistics."""
+
+    return [
+        {
+            field: (
+                json.dumps(value, ensure_ascii=False, allow_nan=False)
+                if isinstance(value, (list, dict))
+                else value
             )
-            ci95_half_width = (
-                t_critical * sample_stddev / math.sqrt(len(values))
-                if values
-                else None
-            )
-            aggregates.append(
-                {
-                    "method_id": method_id,
-                    "evaluation_split": evaluation_split,
-                    "evaluation_manifest_hash": evaluation_manifest_hash,
-                    "training_manifest_hash": training_manifest_hash,
-                    "checkpoint_completed_episodes": (
-                        checkpoint_completed_episodes
-                    ),
-                    "metric": metric,
-                    "training_seed_count": len(values),
-                    "degrees_of_freedom": degrees_of_freedom,
-                    "t_critical_975": t_critical,
-                    "mean": mean_value,
-                    "sample_stddev": sample_stddev,
-                    "ci95_half_width": ci95_half_width,
-                    "ci95_lower": (
-                        mean_value - ci95_half_width if values else None
-                    ),
-                    "ci95_upper": (
-                        mean_value + ci95_half_width if values else None
-                    ),
-                }
-            )
-    return aggregates
+            for field, value in row.items()
+        }
+        for row in artifact_rows
+    ]
 
 
 def validate_formal_aggregation_rows(
@@ -479,8 +455,9 @@ def write_evaluation_outputs(output_dir, episode_rows, run_metadata):
         + "\n",
         encoding="utf-8",
     )
-    canonical_seed_rows = aggregate_episode_rows_by_seed(normalized_rows)
-    canonical_cross_seed_rows = aggregate_seed_rows(canonical_seed_rows)
+    canonical_seed_rows, canonical_cross_seed_rows = canonical_aggregation(
+        normalized_rows
+    )
     canonical_seed_json = output_dir / "canonical_per_seed_aggregation.json"
     canonical_seed_json.write_text(
         json.dumps(canonical_seed_rows, indent=2, ensure_ascii=False, allow_nan=False)
@@ -686,16 +663,24 @@ def run_aggregate_command(args):
         }:
             raise ValueError("aggregate manifest does not match evaluation rows")
     seed_summaries = summarize_training_seeds(episode_rows)
-    aggregate_rows = aggregate_seed_means(seed_summaries)
+    canonical_seed_rows, canonical_cross_seed_rows = canonical_aggregation(
+        episode_rows
+    )
+    aggregate_rows = canonical_cross_seed_artifact_rows(
+        canonical_cross_seed_rows, episode_rows
+    )
+    aggregate_csv_rows = canonical_cross_seed_csv_rows(aggregate_rows)
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
     seed_fields = (*SEED_SUMMARY_IDENTITY_COLUMNS, *SEED_SUMMARY_METRIC_COLUMNS)
-    aggregate_fields = tuple(aggregate_rows[0].keys())
+    aggregate_fields = tuple(aggregate_csv_rows[0].keys())
     _write_csv(output_dir / "per_training_seed_summary.csv", seed_summaries, seed_fields)
-    _write_csv(output_dir / "cross_seed_summary.csv", aggregate_rows, aggregate_fields)
-    canonical_seed_rows = aggregate_episode_rows_by_seed(episode_rows)
-    canonical_cross_seed_rows = aggregate_seed_rows(canonical_seed_rows)
+    _write_csv(
+        output_dir / "cross_seed_summary.csv",
+        aggregate_csv_rows,
+        aggregate_fields,
+    )
     (output_dir / "canonical_per_seed_aggregation.json").write_text(
         json.dumps(canonical_seed_rows, indent=2, ensure_ascii=False, allow_nan=False)
         + "\n",

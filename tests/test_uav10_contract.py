@@ -76,7 +76,7 @@ class Uav10ConfigurationContractTest(unittest.TestCase):
         data["schema_version"] = "uav-hrl-scenario-v2"
         with self.assertRaisesRegex(ValueError, "16-UAV.*incompatible"):
             ScenarioManifest.from_dict(data)
-        self.assertEqual(CHECKPOINT_SCHEMA_VERSION, 14)
+        self.assertEqual(CHECKPOINT_SCHEMA_VERSION, 15)
         with self.assertRaisesRegex(RuntimeError, "must be retrained"):
             _validate_checkpoint_schema({"checkpoint_schema_version": 9})
 
@@ -369,7 +369,7 @@ class ChannelAndPacketContractTest(unittest.TestCase):
         self.assertEqual(result["reward_by_sender"][receiver], -0.5)
         self.assertEqual(result["cost_by_sender"], {})
 
-    def test_s2u_completion_at_deadline_is_sr_admission_drop(self):
+    def test_s2u_completion_at_deadline_is_one_formal_violation(self):
         engine = PacketEngine(NUM_UAV, step_time=0.25)
         sr = self.env.SR_teams[0]
         sr.assigned_gt_id = 0
@@ -390,14 +390,17 @@ class ChannelAndPacketContractTest(unittest.TestCase):
         )
 
         self.assertTrue(packet["done"])
-        self.assertEqual(packet["reason"], "sr_admission_drop")
+        self.assertEqual(packet["reason"], "deadline")
         self.assertFalse(packet["routing_eligible"])
         self.assertIsNone(packet["routing_eligible_time"])
         self.assertIsNone(packet["last_routing_sender"])
-        self.assertEqual(engine.eligible_packet_counts["COM"], 0)
-        self.assertEqual(engine.total_violated, 0)
-        self.assertEqual(result["outcomes"], [])
+        self.assertEqual(engine.eligible_packet_counts["COM"], 1)
+        self.assertEqual(engine.total_violated, 1)
+        self.assertEqual(len(result["outcomes"]), 1)
+        self.assertTrue(result["outcomes"][0]["violated"])
         self.assertEqual(result["cost_by_sender"], {})
+        self.assertEqual(result["deferred_cost_by_sender"], {-1: 1.0})
+        self.assertEqual(engine.unattributed_pre_routing_violation_count, 1)
 
     def test_direct_ratio_is_terminal_bit_per_j(self):
         self.assertEqual(terminal_ratio_objective("ratio", False, 1.0, 200000.0), 0.0)
