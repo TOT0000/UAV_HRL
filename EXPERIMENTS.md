@@ -453,11 +453,29 @@ FOV/COM/ALL violation probability, and FOV/COM delay. Valid seed ratios receive
 equal weight across seeds with sample SD and Student-t 95% CI; zero-denominator
 seeds are missing. `canonical_aggregation()` in
 `evaluation_aggregation.py` is the only statistical implementation. Generic
-CSV/JSON and paper JSON serialize or adapt the same returned rows; writers do
-not recompute means, sample SD, valid-seed counts, or Student-t intervals.
-Artifacts include per-seed numerator, denominator, units, schema, valid seed
-count, and CI provenance. Aggregation also writes `cross_seed_summary.csv`,
-JSON, and Student-t methodology in `aggregation_metadata.json`.
+CSV/JSON canonical rows and paper JSON serialize or adapt the same returned
+rows; writers do not recompute means, sample SD, valid-seed counts, or
+Student-t intervals. The canonical JSON artifacts contain only those six
+formal metrics, including their per-seed numerators, denominators, units,
+schema, valid/missing seed counts, and CI provenance. The paper path consumes
+only these canonical rows.
+
+Generic `cross_seed_summary.csv` and `.json` use the independent
+`uav-hrl-generic-cross-seed-aggregate-v2` artifact schema. They combine the six
+`canonical_ratio` rows with 24 `descriptive_seed_mean` diagnostics. Descriptive
+statistics first take the episode arithmetic mean within each training seed,
+then give each valid seed equal weight with seed-level sample SD and Student-t
+95% CI; missing seed values are excluded rather than replaced with zero. The
+legacy `delay_violation_probability` row is a `canonical_alias` that directly
+copies the canonical `(violation_probability, ALL)` result and records
+`alias_of_metric`/`alias_of_task_type`; it is not independently calculated.
+Consequently, the current 26-column episode metric registry produces 31 generic
+rows per identity: six canonical, 24 descriptive, and one alias. CSV uses the
+stable union of all row fields and JSON-serializes list/dict provenance. Method,
+split, manifest, training seeds, and per-seed checkpoint fingerprints remain in
+both generic formats. `aggregation_metadata.json` records the separate rules.
+Existing `per_episode.csv` files can therefore be re-aggregated without
+retraining.
 
 Formal training uses `packet_outcome_artifact_mode=disabled` and
 `collect_packet_outcomes=false`. It never retains a cross-episode list of raw

@@ -6,7 +6,9 @@ import csv
 import json
 import math
 from pathlib import Path
-from statistics import fmean
+from statistics import fmean, stdev
+
+from scipy.stats import t as student_t
 
 from centralized_movement import JOINT_ACTION_DIM, MOVEMENT_STATE_DIM
 from com_capacity_calibration import load_com_capacity_reference
@@ -25,6 +27,7 @@ from experiment_paths import (
 from scenario_manifest import ScenarioManifest
 from training_checkpoint import inspect_model_checkpoint
 from evaluation_aggregation import (
+    CANONICAL_METRICS,
     EVALUATION_AGGREGATION_SCHEMA_VERSION,
     canonical_aggregation,
 )
@@ -71,6 +74,61 @@ METRIC_COLUMNS = (
 )
 
 OPTIONAL_METRIC_COLUMNS = {"delay_violation_probability"}
+
+GENERIC_CROSS_SEED_ARTIFACT_SCHEMA_VERSION = (
+    "uav-hrl-generic-cross-seed-aggregate-v2"
+)
+
+# Every per-episode metric must opt in to exactly one generic aggregation path.
+# The canonical and alias entries are never handled by the descriptive helper.
+DESCRIPTIVE_EPISODE_METRIC_COLUMNS = (
+    "num_GT",
+    "timely_goodput_mbits",
+    "raw_final_hop_mbits",
+    "total_mobility_energy_j",
+    "fov_timely_delivered_packets",
+    "com_timely_delivered_packets",
+    "fov_deadline_violations",
+    "com_deadline_violations",
+    "total_deadline_violations",
+    "eligible_packet_count",
+    "sr_admission_drop_count",
+    "coverage",
+    "found_GT_ratio",
+    "routing_wait_count",
+    "partial_transmission_count",
+    "slot_budget_violation_count",
+    "unattributed_transition_violation_count",
+    "unattributed_pre_routing_violation_count",
+    "system_qos_violation_count",
+    "system_qos_eligible_packets",
+    "routing_cost_sum",
+    "routing_cost_eligible_packets",
+    "routing_credit_violation_count",
+    "replay_attributed_violation_cost_count",
+)
+
+METRIC_AGGREGATION_REGISTRY = {
+    **{
+        metric: {"aggregation_kind": "descriptive_seed_mean"}
+        for metric in DESCRIPTIVE_EPISODE_METRIC_COLUMNS
+    },
+    "energy_efficiency_mbit_per_j": {
+        "aggregation_kind": "canonical_ratio",
+        "canonical_metric": "energy_efficiency_mbit_per_j",
+        "canonical_task_type": None,
+    },
+    "delay_violation_probability": {
+        "aggregation_kind": "canonical_alias",
+        "alias_of_metric": "violation_probability",
+        "alias_of_task_type": "ALL",
+    },
+}
+
+if set(METRIC_AGGREGATION_REGISTRY) != set(METRIC_COLUMNS):
+    raise RuntimeError(
+        "every METRIC_COLUMNS entry must declare its generic aggregation kind"
+    )
 
 SEED_CANONICAL_METRIC_COLUMNS = (
     "fov_average_e2e_delay_seconds",
@@ -132,20 +190,35 @@ SEED_SUMMARY_IDENTITY_COLUMNS = (
 
 def aggregation_metadata(seed_count):
     return {
+        "generic_cross_seed_artifact_schema_version": (
+            GENERIC_CROSS_SEED_ARTIFACT_SCHEMA_VERSION
+        ),
         "evaluation_unit": "episode",
         "uncertainty_unit": "trained-policy seed mean",
         "configured_training_seed_count": int(seed_count),
         "standard_deviation": "sample (n-1)",
         "confidence_interval": "Student-t",
         "confidence_level": 0.95,
-        "result_specific_degrees_of_freedom": (
-            "serialized from canonical cross-seed rows"
-        ),
+        "result_specific_degrees_of_freedom": "serialized in every result row",
         "pooled_episode_inference": False,
         "aggregation_schema_version": EVALUATION_AGGREGATION_SCHEMA_VERSION,
         "within_seed_rule": "ratio of episode numerator sums / denominator sums",
+        "canonical_within_seed_rule": (
+            "ratio of episode numerator sums / denominator sums"
+        ),
+        "descriptive_within_seed_rule": "episode arithmetic mean",
         "cross_seed_rule": "equal weight across valid trained-policy seed values",
         "zero_denominator": "missing",
+        "aggregation_kinds": {
+            "canonical_ratio": "six metrics from canonical_aggregation()",
+            "canonical_alias": (
+                "delay_violation_probability copies canonical ALL violation"
+            ),
+            "descriptive_seed_mean": (
+                "episode mean within seed, then equal-weight seed inference"
+            ),
+        },
+        "metric_aggregation_registry": METRIC_AGGREGATION_REGISTRY,
     }
 
 
@@ -218,7 +291,7 @@ def summarize_training_seeds(episode_rows):
             values = [
                 float(row[metric])
                 for row in rows
-                if row[metric] is not None
+                if row[metric] is not None and row[metric] != ""
             ]
             summary[metric] = fmean(values) if values else None
         canonical_rows, _canonical_cross_seed_rows = canonical_aggregation(
@@ -253,22 +326,33 @@ def summarize_training_seeds(episode_rows):
     return summaries
 
 
-def canonical_cross_seed_artifact_rows(canonical_rows, episode_rows):
-    """Attach generic identity fields without recomputing canonical statistics."""
-
-    rows = list(episode_rows)
+def _cross_seed_identity(rows, *, source_name):
+    rows = list(rows)
     if not rows:
-        raise ValueError("canonical artifact serialization requires episode rows")
+        raise ValueError(f"{source_name} requires input rows")
 
     def unique(field, transform=lambda value: value):
         values = {transform(row.get(field)) for row in rows}
         if len(values) != 1:
             raise ValueError(
-                f"canonical artifact rows disagree on identity field: {field}"
+                f"{source_name} rows disagree on identity field: {field}"
             )
         return next(iter(values))
 
-    identity = {
+    checkpoint_by_seed = {}
+    for row in rows:
+        seed = int(row["training_seed"])
+        fingerprint = _optional_text(row.get("checkpoint_metadata_fingerprint"))
+        existing = checkpoint_by_seed.setdefault(seed, fingerprint)
+        if existing != fingerprint:
+            raise ValueError(
+                f"{source_name} rows disagree on checkpoint identity for seed {seed}"
+            )
+
+    return {
+        "generic_cross_seed_artifact_schema_version": (
+            GENERIC_CROSS_SEED_ARTIFACT_SCHEMA_VERSION
+        ),
         "method_id": unique("method_id", str),
         "evaluation_split": unique("evaluation_split", str),
         "evaluation_manifest_hash": unique("evaluation_manifest_hash", str),
@@ -278,13 +362,208 @@ def canonical_cross_seed_artifact_rows(canonical_rows, episode_rows):
         "checkpoint_completed_episodes": unique(
             "checkpoint_completed_episodes", _optional_int
         ),
+        "training_seeds": sorted(checkpoint_by_seed),
+        "checkpoint_identities": [
+            {
+                "training_seed": seed,
+                "checkpoint_metadata_fingerprint": checkpoint_by_seed[seed],
+            }
+            for seed in sorted(checkpoint_by_seed)
+        ],
     }
-    return [{**identity, **dict(row)} for row in canonical_rows]
 
 
-def canonical_cross_seed_csv_rows(artifact_rows):
-    """Project list provenance to JSON text; never calculate statistics."""
+def canonical_cross_seed_artifact_rows(canonical_rows, episode_rows):
+    """Attach generic identity fields without recomputing canonical statistics."""
 
+    rows = list(canonical_rows)
+    identities = [(row["metric"], row.get("task_type")) for row in rows]
+    if len(rows) != len(CANONICAL_METRICS) or set(identities) != set(
+        CANONICAL_METRICS
+    ):
+        raise ValueError("generic canonical artifact requires exactly six metrics")
+    identity = _cross_seed_identity(
+        episode_rows, source_name="canonical artifact serialization"
+    )
+    return [
+        {
+            **identity,
+            "aggregation_kind": "canonical_ratio",
+            **dict(row),
+        }
+        for row in rows
+    ]
+
+
+def aggregate_descriptive_seed_metrics(seed_summaries):
+    """Aggregate only descriptive metrics from episode means within each seed."""
+
+    grouped = {}
+    for row in seed_summaries:
+        key = (
+            str(row["method_id"]),
+            str(row["evaluation_split"]),
+            str(row["evaluation_manifest_hash"]),
+            _optional_text(row["training_manifest_hash"]),
+            _optional_int(row["checkpoint_completed_episodes"]),
+        )
+        grouped.setdefault(key, []).append(row)
+
+    aggregates = []
+    for _key, rows in sorted(
+        grouped.items(), key=lambda item: tuple(str(value) for value in item[0])
+    ):
+        rows = sorted(rows, key=lambda row: int(row["training_seed"]))
+        seeds = [int(row["training_seed"]) for row in rows]
+        if len(seeds) != len(set(seeds)):
+            raise ValueError("descriptive aggregation requires one row per seed")
+        identity = _cross_seed_identity(
+            rows, source_name="descriptive aggregation"
+        )
+        for metric in DESCRIPTIVE_EPISODE_METRIC_COLUMNS:
+            per_seed_values = []
+            for row in rows:
+                raw_value = row.get(metric)
+                if raw_value is None or raw_value == "":
+                    per_seed_values.append(None)
+                    continue
+                value = float(raw_value)
+                if not math.isfinite(value):
+                    raise ValueError(
+                        f"descriptive metric {metric} must be finite when present"
+                    )
+                per_seed_values.append(value)
+            valid_pairs = [
+                (seed, value)
+                for seed, value in zip(seeds, per_seed_values)
+                if value is not None
+            ]
+            values = [value for _seed, value in valid_pairs]
+            count = len(values)
+            mean = fmean(values) if values else None
+            sample_sd = stdev(values) if count > 1 else (0.0 if count else None)
+            degrees_of_freedom = max(count - 1, 0)
+            critical = (
+                float(student_t.ppf(0.975, df=degrees_of_freedom))
+                if degrees_of_freedom
+                else 0.0
+            )
+            half_width = (
+                critical * sample_sd / math.sqrt(count) if count else None
+            )
+            aggregates.append(
+                {
+                    **identity,
+                    "aggregation_kind": "descriptive_seed_mean",
+                    "aggregation_level": "cross_seed",
+                    "aggregation_rule": (
+                        "equal_weight_valid_seed_episode_means"
+                    ),
+                    "metric": metric,
+                    "task_type": None,
+                    "valid_training_seed_count": count,
+                    "missing_training_seed_count": len(rows) - count,
+                    "training_seed_count": len(rows),
+                    "valid_training_seeds": [seed for seed, _value in valid_pairs],
+                    "missing_training_seeds": [
+                        seed
+                        for seed, value in zip(seeds, per_seed_values)
+                        if value is None
+                    ],
+                    "per_seed_values": per_seed_values,
+                    "per_seed_episode_counts": [
+                        int(row["evaluation_episode_count"]) for row in rows
+                    ],
+                    "mean": mean,
+                    "sample_stddev": sample_sd,
+                    "degrees_of_freedom": degrees_of_freedom,
+                    "confidence_interval_method": "Student-t",
+                    "confidence_level": 0.95,
+                    "t_critical_975": critical,
+                    "ci95_half_width": half_width,
+                    "ci95_lower": mean - half_width if count else None,
+                    "ci95_upper": mean + half_width if count else None,
+                    "missing": count == 0,
+                }
+            )
+    return aggregates
+
+
+def build_generic_cross_seed_artifact(
+    canonical_cross_seed_rows,
+    descriptive_cross_seed_rows,
+    episode_rows,
+):
+    """Combine canonical serialization, one canonical alias, and diagnostics."""
+
+    canonical_rows = canonical_cross_seed_artifact_rows(
+        canonical_cross_seed_rows, episode_rows
+    )
+    all_violation = next(
+        row
+        for row in canonical_rows
+        if (row["metric"], row.get("task_type"))
+        == ("violation_probability", "ALL")
+    )
+    alias_row = {
+        **all_violation,
+        "aggregation_kind": "canonical_alias",
+        "metric": "delay_violation_probability",
+        "task_type": None,
+        "alias_of_metric": "violation_probability",
+        "alias_of_task_type": "ALL",
+    }
+    descriptive_rows = [dict(row) for row in descriptive_cross_seed_rows]
+    if (
+        len(descriptive_rows) != len(DESCRIPTIVE_EPISODE_METRIC_COLUMNS)
+        or {row.get("metric") for row in descriptive_rows}
+        != set(DESCRIPTIVE_EPISODE_METRIC_COLUMNS)
+        or any(
+            row.get("aggregation_kind") != "descriptive_seed_mean"
+            for row in descriptive_rows
+        )
+    ):
+        raise ValueError(
+            "generic artifact requires exactly one row for every descriptive metric"
+        )
+    identity_fields = (
+        "generic_cross_seed_artifact_schema_version",
+        "method_id",
+        "evaluation_split",
+        "evaluation_manifest_hash",
+        "training_manifest_hash",
+        "checkpoint_completed_episodes",
+        "training_seeds",
+        "checkpoint_identities",
+    )
+    if any(
+        any(
+            row.get(field) != canonical_rows[0].get(field)
+            for field in identity_fields
+        )
+        for row in descriptive_rows
+    ):
+        raise ValueError("canonical and descriptive artifact identities disagree")
+    return [*canonical_rows, alias_row, *descriptive_rows]
+
+
+def stable_cross_seed_csv_fields(artifact_rows):
+    """Return a deterministic union schema without performing aggregation."""
+
+    fields = []
+    seen = set()
+    for row in artifact_rows:
+        for field in row:
+            if field not in seen:
+                seen.add(field)
+                fields.append(field)
+    return tuple(fields)
+
+
+def canonical_cross_seed_csv_rows(artifact_rows, fieldnames=None):
+    """Project the stable union schema and JSON containers; calculate nothing."""
+
+    fieldnames = tuple(fieldnames or stable_cross_seed_csv_fields(artifact_rows))
     return [
         {
             field: (
@@ -292,7 +571,8 @@ def canonical_cross_seed_csv_rows(artifact_rows):
                 if isinstance(value, (list, dict))
                 else value
             )
-            for field, value in row.items()
+            for field in fieldnames
+            for value in (row.get(field),)
         }
         for row in artifact_rows
     ]
@@ -364,7 +644,7 @@ def validate_formal_aggregation_rows(
 
     for row in episode_rows:
         for metric in METRIC_COLUMNS:
-            if row[metric] is None and metric in OPTIONAL_METRIC_COLUMNS:
+            if row[metric] is None or row[metric] == "":
                 continue
             try:
                 value = float(row[metric])
@@ -666,15 +946,22 @@ def run_aggregate_command(args):
     canonical_seed_rows, canonical_cross_seed_rows = canonical_aggregation(
         episode_rows
     )
-    aggregate_rows = canonical_cross_seed_artifact_rows(
-        canonical_cross_seed_rows, episode_rows
+    descriptive_cross_seed_rows = aggregate_descriptive_seed_metrics(
+        seed_summaries
     )
-    aggregate_csv_rows = canonical_cross_seed_csv_rows(aggregate_rows)
+    aggregate_rows = build_generic_cross_seed_artifact(
+        canonical_cross_seed_rows,
+        descriptive_cross_seed_rows,
+        episode_rows,
+    )
+    aggregate_fields = stable_cross_seed_csv_fields(aggregate_rows)
+    aggregate_csv_rows = canonical_cross_seed_csv_rows(
+        aggregate_rows, aggregate_fields
+    )
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
     seed_fields = (*SEED_SUMMARY_IDENTITY_COLUMNS, *SEED_SUMMARY_METRIC_COLUMNS)
-    aggregate_fields = tuple(aggregate_csv_rows[0].keys())
     _write_csv(output_dir / "per_training_seed_summary.csv", seed_summaries, seed_fields)
     _write_csv(
         output_dir / "cross_seed_summary.csv",

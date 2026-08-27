@@ -1,5 +1,6 @@
 import csv
 import json
+import math
 import tempfile
 import unittest
 from pathlib import Path
@@ -10,10 +11,14 @@ import numpy as np
 import evaluation_metrics
 from evaluation_aggregation import canonical_aggregation
 from evaluation_metrics import (
+    DESCRIPTIVE_EPISODE_METRIC_COLUMNS,
     EPISODE_COLUMNS,
     METRIC_COLUMNS,
+    aggregate_descriptive_seed_metrics,
+    build_generic_cross_seed_artifact,
     canonical_cross_seed_artifact_rows,
     run_aggregate_command,
+    summarize_training_seeds,
 )
 from HRL_task_aware import _mark_search_observations
 from observation_strategy import routing_state_feature_names
@@ -264,7 +269,13 @@ class CanonicalArtifactSourceContractTest(unittest.TestCase):
 
         for field in (
             "valid_training_seed_count",
+            "missing_training_seed_count",
+            "training_seed_count",
+            "valid_training_seeds",
             "sample_stddev",
+            "degrees_of_freedom",
+            "t_critical_975",
+            "ci95_half_width",
             "ci95_lower",
             "ci95_upper",
             "per_seed_numerators",
@@ -279,13 +290,16 @@ class CanonicalArtifactSourceContractTest(unittest.TestCase):
         self.assertFalse(hasattr(evaluation_metrics, "aggregate_seed_means"))
         self.assertEqual(len(per_seed), 18)
 
-    def test_generic_csv_is_a_projection_of_canonical_cross_seed_rows(self):
+    def test_generic_artifacts_restore_diagnostics_and_preserve_canonical_rows(self):
         rows = [
             self._row(1, 0, 1, 1),
             self._row(1, 1, 0, 99),
             self._row(2, 0, 1, 2),
             self._row(2, 1, 0, 0),
         ]
+        for index, row in enumerate(rows, start=1):
+            for metric in DESCRIPTIVE_EPISODE_METRIC_COLUMNS:
+                row[metric] = float(index)
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             input_dir = root / "input" / "seed-results"
@@ -310,14 +324,81 @@ class CanonicalArtifactSourceContractTest(unittest.TestCase):
             with (output_dir / "cross_seed_summary.csv").open(
                 "r", encoding="utf-8", newline=""
             ) as handle:
-                generic_rows = list(csv.DictReader(handle))
+                csv_rows = list(csv.DictReader(handle))
+            generic_rows = json.loads(
+                (output_dir / "cross_seed_summary.json").read_text(
+                    encoding="utf-8"
+                )
+            )
             canonical_rows = json.loads(
                 (output_dir / "canonical_cross_seed_aggregation.json").read_text(
                     encoding="utf-8"
                 )
             )
+            aggregation_metadata = json.loads(
+                (output_dir / "aggregation_metadata.json").read_text(
+                    encoding="utf-8"
+                )
+            )
 
-        self.assertEqual(len(generic_rows), len(canonical_rows))
+        self.assertEqual(len(canonical_rows), 6)
+        self.assertEqual(len(generic_rows), 31)
+        self.assertEqual(len(csv_rows), 31)
+        self.assertEqual(
+            aggregation_metadata["generic_cross_seed_artifact_schema_version"],
+            "uav-hrl-generic-cross-seed-aggregate-v2",
+        )
+        kind_counts = {
+            kind: sum(row["aggregation_kind"] == kind for row in generic_rows)
+            for kind in (
+                "canonical_ratio",
+                "canonical_alias",
+                "descriptive_seed_mean",
+            )
+        }
+        self.assertEqual(
+            kind_counts,
+            {
+                "canonical_ratio": 6,
+                "canonical_alias": 1,
+                "descriptive_seed_mean": 24,
+            },
+        )
+        identities = {
+            (row["metric"], row.get("task_type")) for row in generic_rows
+        }
+        for row in generic_rows:
+            self.assertEqual(row["method_id"], "method")
+            self.assertEqual(row["evaluation_split"], "test")
+            self.assertEqual(row["evaluation_manifest_hash"], "evaluation")
+            self.assertEqual(row["training_manifest_hash"], "training")
+            self.assertEqual(row["checkpoint_completed_episodes"], 1500)
+            self.assertEqual(row["training_seeds"], [1, 2])
+            self.assertEqual(
+                row["checkpoint_identities"],
+                [
+                    {
+                        "training_seed": 1,
+                        "checkpoint_metadata_fingerprint": "checkpoint-1",
+                    },
+                    {
+                        "training_seed": 2,
+                        "checkpoint_metadata_fingerprint": "checkpoint-2",
+                    },
+                ],
+            )
+        for metric in (
+            "coverage",
+            "found_GT_ratio",
+            "raw_final_hop_mbits",
+            "total_mobility_energy_j",
+            "routing_wait_count",
+            "system_qos_violation_count",
+            "routing_credit_violation_count",
+            "unattributed_transition_violation_count",
+        ):
+            self.assertIn((metric, None), identities)
+
         generic = next(
             row
             for row in generic_rows
@@ -339,19 +420,106 @@ class CanonicalArtifactSourceContractTest(unittest.TestCase):
             "pooled_numerator",
             "pooled_denominator",
         ):
-            self.assertEqual(float(generic[field]), float(canonical[field]))
+            self.assertEqual(generic[field], canonical[field])
         self.assertEqual(
             generic["aggregation_schema_version"],
             canonical["aggregation_schema_version"],
         )
-        self.assertEqual(
-            json.loads(generic["per_seed_values"]),
-            canonical["per_seed_values"],
+        for field, value in canonical.items():
+            self.assertEqual(generic[field], value)
+
+        alias = next(
+            row
+            for row in generic_rows
+            if row["metric"] == "delay_violation_probability"
         )
-        self.assertEqual(
-            json.loads(generic["per_seed_numerators"]),
-            canonical["per_seed_numerators"],
+        all_violation = next(
+            row
+            for row in generic_rows
+            if (row["metric"], row.get("task_type"))
+            == ("violation_probability", "ALL")
         )
+        self.assertEqual(alias["alias_of_metric"], "violation_probability")
+        self.assertEqual(alias["alias_of_task_type"], "ALL")
+        for field in (
+            "mean",
+            "sample_stddev",
+            "valid_training_seed_count",
+            "missing_training_seed_count",
+            "t_critical_975",
+            "ci95_half_width",
+            "ci95_lower",
+            "ci95_upper",
+            "per_seed_values",
+            "per_seed_numerators",
+            "per_seed_denominators",
+        ):
+            self.assertEqual(alias[field], all_violation[field])
+
+        csv_by_identity = {
+            (
+                row["metric"],
+                row["task_type"] or None,
+                row["aggregation_kind"],
+            ): row
+            for row in csv_rows
+        }
+        for json_row in generic_rows:
+            csv_row = csv_by_identity[
+                (
+                    json_row["metric"],
+                    json_row.get("task_type"),
+                    json_row["aggregation_kind"],
+                )
+            ]
+            for field, value in json_row.items():
+                if isinstance(value, (list, dict)):
+                    self.assertEqual(json.loads(csv_row[field]), value)
+
+        # The union schema carries fields that only apply to other row kinds.
+        self.assertIn("alias_of_metric", csv_rows[0])
+        self.assertIn("missing_training_seeds", csv_rows[0])
+        self.assertIn("per_seed_episode_counts", csv_rows[0])
+
+    def test_descriptive_metrics_weight_seed_means_and_preserve_missing(self):
+        rows = [
+            self._row(1, 0, 0, 1),
+            self._row(1, 1, 0, 1),
+            self._row(2, 0, 0, 1),
+            self._row(3, 0, 0, 0),
+        ]
+        rows[0]["coverage"] = 0.0
+        rows[1]["coverage"] = 2.0
+        rows[2]["coverage"] = 10.0
+        rows[3]["coverage"] = None
+        summaries = summarize_training_seeds(rows)
+        descriptive = aggregate_descriptive_seed_metrics(summaries)
+        coverage = next(row for row in descriptive if row["metric"] == "coverage")
+
+        self.assertEqual(coverage["per_seed_values"], [1.0, 10.0, None])
+        self.assertEqual(coverage["per_seed_episode_counts"], [2, 1, 1])
+        self.assertEqual(coverage["mean"], 5.5)
+        self.assertNotEqual(coverage["mean"], (0.0 + 2.0 + 10.0) / 3.0)
+        self.assertAlmostEqual(coverage["sample_stddev"], 9.0 / math.sqrt(2.0))
+        self.assertEqual(coverage["degrees_of_freedom"], 1)
+        self.assertEqual(coverage["valid_training_seed_count"], 2)
+        self.assertEqual(coverage["missing_training_seed_count"], 1)
+        self.assertEqual(coverage["valid_training_seeds"], [1, 2])
+        self.assertEqual(coverage["missing_training_seeds"], [3])
+
+        _per_seed, canonical = canonical_aggregation(rows)
+        artifact = build_generic_cross_seed_artifact(
+            canonical, descriptive, rows
+        )
+        fov = next(
+            row
+            for row in artifact
+            if (row["metric"], row.get("task_type"))
+            == ("violation_probability", "FOV")
+        )
+        self.assertEqual(fov["per_seed_values"], [0.0, 0.0, None])
+        self.assertEqual(fov["valid_training_seed_count"], 2)
+        self.assertEqual(fov["missing_training_seed_count"], 1)
 
 
 if __name__ == "__main__":
