@@ -56,8 +56,25 @@ class Simulator:
     SR_UAV_LOS_EXCESS_DB = A2G_LOS_EXCESS_DB
     SR_UAV_NLOS_EXCESS_DB = A2G_NLOS_EXCESS_DB
 
-    def __init__(self, num_UAV, p_u = 30): #初始化
+    def __init__(self, num_UAV, p_u=30, rng_streams=None, evaluation=False): #初始化
         self.dt = 0.25
+        self.rng_streams = rng_streams
+        environment_stream = (
+            "evaluation_environment" if evaluation else "environment_dynamics"
+        )
+        assignment_stream = (
+            "evaluation_random_assignment" if evaluation else "random_assignment"
+        )
+        self.environment_rng = (
+            rng_streams.numpy(environment_stream)
+            if rng_streams is not None
+            else np.random.default_rng(0)
+        )
+        self.assignment_rng = (
+            rng_streams.numpy(assignment_stream)
+            if rng_streams is not None
+            else np.random.default_rng(0)
+        )
         self.sr_update_interval = int(1.0 / self.dt)
         self.sim_step_count = 0
         if int(num_UAV) != NUM_UAV:
@@ -1123,7 +1140,7 @@ class Simulator:
             uav_initial_data = [
                 {
                     "uav_id": index,
-                    "position": [x_u, y_u, random.uniform(80, 120)],
+                    "position": [x_u, y_u, self.environment_rng.uniform(80, 120)],
                     "energy_j": self.E_max,
                 }
                 for index, (x_u, y_u) in enumerate(
@@ -1166,8 +1183,8 @@ class Simulator:
                 if tries > max_tries_per_point:
                     d_min = max(int(d_min * relax_ratio), radius)
                     tries = 0
-                x = random.uniform(radius, W - radius)
-                y = random.uniform(radius, H - radius)
+                x = self.environment_rng.uniform(radius, W - radius)
+                y = self.environment_rng.uniform(radius, H - radius)
                 if (x - gs_x) ** 2 + (y - gs_y) ** 2 < 200**2:
                     tries += 1
                     continue

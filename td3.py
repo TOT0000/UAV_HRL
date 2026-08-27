@@ -4,8 +4,14 @@ import torch.nn.functional as F
 import torch.optim as optim
 import numpy as np
 import os
+import copy
 
-from centralized_movement import project_joint_action
+from centralized_movement import (
+    project_action_domain,
+    project_joint_action,
+    project_local_action,
+)
+from rng_contract import NamedRNGStreams, build_torch_module
 
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 print(device)
@@ -73,20 +79,38 @@ class TD3():
         max_action,
         gamma=0.99,
         tau=0.005,
-        policy_noise=0.2,
-        noise_clip=0.5,
+        policy_noise=0.10,
+        noise_clip=0.25,
         policy_delay=2,
         actor_lr=6e-5,
         critic_lr=2e-4,
+        rng_streams=None,
+        master_seed=0,
         ):
 
-        # self.lambd = 1
-        self.actor = Actor(state_dim, action_dim, max_action).to(device)
-        self.actor_target = Actor(state_dim, action_dim, max_action).to(device)
-        self.critic_1 = Critic(state_dim, action_dim).to(device)
-        self.critic_1_target = Critic(state_dim, action_dim).to(device)
-        self.critic_2 = Critic(state_dim, action_dim).to(device)
-        self.critic_2_target = Critic(state_dim, action_dim).to(device)
+        self.rng_streams = rng_streams or NamedRNGStreams(master_seed)
+        init_seed = self.rng_streams.master_seed
+        self.actor = build_torch_module(
+            lambda: Actor(state_dim, action_dim, max_action),
+            init_seed,
+            "movement_actor_init",
+            device,
+        )
+        self.critic_1 = build_torch_module(
+            lambda: Critic(state_dim, action_dim),
+            init_seed,
+            "movement_critic1_init",
+            device,
+        )
+        self.critic_2 = build_torch_module(
+            lambda: Critic(state_dim, action_dim),
+            init_seed,
+            "movement_critic2_init",
+            device,
+        )
+        self.actor_target = copy.deepcopy(self.actor)
+        self.critic_1_target = copy.deepcopy(self.critic_1)
+        self.critic_2_target = copy.deepcopy(self.critic_2)
         # self.cost_1 = Critic(state_dim, action_dim).to(device)
         # self.cost_1_target = Critic(state_dim, action_dim).to(device)
         # self.cost_2 = Critic(state_dim, action_dim).to(device)
@@ -96,9 +120,6 @@ class TD3():
         self.critic_1_optimizer = optim.Adam(self.critic_1.parameters(), lr=critic_lr)
         self.critic_2_optimizer = optim.Adam(self.critic_2.parameters(), lr=critic_lr)
 
-        self.actor_target.load_state_dict(self.actor.state_dict())
-        self.critic_1_target.load_state_dict(self.critic_1.state_dict())
-        self.critic_2_target.load_state_dict(self.critic_2.state_dict())
         # self.cost_1_target.load_state_dict(self.cost_1.state_dict())
         # self.cost_2_target.load_state_dict(self.cost_2.state_dict())        
 
@@ -128,16 +149,21 @@ class TD3():
                 noise_std = max(0.1, 0.5 * (1 - episode / 4000))
             if float(noise_std) < 0.0:
                 raise ValueError(f"noise_std must be non-negative, got {noise_std}")
-            noise = np.random.normal(0, noise_std, size=raw_action.shape)
+            noise = self.rng_streams.numpy("movement_exploration").normal(
+                0, noise_std, size=raw_action.shape
+            )
             raw_action = raw_action + noise
 
-        raw_action = np.clip(raw_action, -1.0, 1.0)
-        return raw_action
+        raw_action = raw_action.astype(np.float32, copy=False)
+        return (
+            project_action_domain(raw_action)
+            if raw_action.shape[-1] % 3 == 0
+            else raw_action
+        )
 
 
     def decode_action(self, raw_action):
-        raw_action = np.asarray(raw_action, dtype=np.float32)
-        v_scalar, theta_scalar, phi_scalar = np.clip(raw_action, -1.0, 1.0)
+        v_scalar, theta_scalar, phi_scalar = project_local_action(raw_action)
 
         max_speed_xy = 10.0
         max_dz = 2.0
@@ -161,6 +187,10 @@ class TD3():
 
     def update(self,replay_memory, num_GT, batch_size=64):
 
+        raise RuntimeError(
+            "legacy per-tag TD3.update is disabled; use canonical update_joint"
+        )
+
         # if self.num_training % 500 == 0:
         #     print("====================================")
         #     print("model has been trained for {} times...".format(self.num_training))
@@ -176,7 +206,14 @@ class TD3():
         # cost = c.to(device)
 
         # Select next action according to target policy:
-        noise = torch.ones_like(action).data.normal_(0, self.policy_noise).to(device)
+        noise = torch.randn(
+            action.shape,
+            dtype=action.dtype,
+            device=action.device,
+            generator=self.rng_streams.torch(
+                "td3_target_policy_noise", device=action.device
+            ),
+        ) * self.policy_noise
         noise = noise.clamp(-self.noise_clip, self.noise_clip)
 
         next_action = (self.actor_target(next_state) + noise)
@@ -283,17 +320,25 @@ class TD3():
         next_movement_mask = next_movement_mask.to(device)
 
         with torch.no_grad():
-            target_actor_action = project_joint_action(
-                self.actor_target(next_state),
-                movement_mask=next_movement_mask,
-            )
-            noise = torch.randn_like(action) * self.policy_noise
+            raw_target_action = self.actor_target(next_state)
+            noise = torch.randn(
+                action.shape,
+                dtype=action.dtype,
+                device=action.device,
+                generator=self.rng_streams.torch(
+                    "td3_target_policy_noise", device=action.device
+                ),
+            ) * self.policy_noise
             noise = noise.clamp(-self.noise_clip, self.noise_clip)
-            smoothed_action = (target_actor_action + noise).clamp(
-                -self.max_action, self.max_action
-            )
+            expanded_mask = next_movement_mask.unsqueeze(-1).expand(
+                *next_movement_mask.shape, 3
+            ).reshape_as(noise)
+            noise = noise * expanded_mask.to(dtype=noise.dtype)
             next_action = project_joint_action(
-                smoothed_action, movement_mask=next_movement_mask
+                raw_target_action + noise, movement_mask=next_movement_mask
+            )
+            target_actor_action = project_joint_action(
+                raw_target_action, movement_mask=next_movement_mask
             )
             target_q = torch.min(
                 self.critic_1_target(next_state, next_action),
@@ -347,6 +392,7 @@ class TD3():
             "next_state": next_state.detach().cpu(),
             "target_actor_action": target_actor_action.detach().cpu(),
             "target_smoothed_action": next_action.detach().cpu(),
+            "target_policy_noise": noise.detach().cpu(),
             "actor_action": None if actor_action is None else actor_action.detach().cpu(),
             "critic_1_loss": float(critic_1_loss.detach().cpu()),
             "critic_2_loss": float(critic_2_loss.detach().cpu()),

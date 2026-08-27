@@ -54,6 +54,9 @@ class Critic(nn.Module):
 
 class DDPG(object):
 	def __init__(self, state_dim, movement_dim, max_movement, discount=0.95, tau=0.005):
+		raise RuntimeError(
+			"legacy DDPG is disabled; use centralized_ddpg.CentralizedDDPG"
+		)
 		self.actor = Actor(state_dim, movement_dim, max_movement).to(device)
 		self.actor_target = copy.deepcopy(self.actor)
 		self.actor_optimizer = torch.optim.Adam(self.actor.parameters(), lr=1e-4)

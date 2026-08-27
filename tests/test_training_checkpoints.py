@@ -170,27 +170,21 @@ class TrainingSeedTest(unittest.TestCase):
                 self, getattr(first_ddqn, name), getattr(second_ddqn, name)
             )
 
-    def test_same_seed_reproduces_python_numpy_torch_and_cuda_rng(self):
-        def draw_values():
-            values = {
-                "python": random.random(),
-                "numpy": np.random.random(),
-                "torch_cpu": torch.rand(4),
-            }
-            if torch.cuda.is_available():
-                values["torch_cuda"] = torch.rand(4, device="cuda")
-            return values
+    def test_same_seed_reproduces_named_stream_without_mutating_globals(self):
+        python_before = random.getstate()
+        numpy_before = np.random.get_state()
+        torch_before = torch.get_rng_state().clone()
+        first = _seed_training_rng(20260817)
+        second = _seed_training_rng(20260817)
 
-        _seed_training_rng(20260817)
-        first = draw_values()
-        _seed_training_rng(20260817)
-        second = draw_values()
-
-        self.assertEqual(first["python"], second["python"])
-        self.assertEqual(first["numpy"], second["numpy"])
-        self.assertTrue(torch.equal(first["torch_cpu"], second["torch_cpu"]))
-        if torch.cuda.is_available():
-            self.assertTrue(torch.equal(first["torch_cuda"], second["torch_cuda"]))
+        np.testing.assert_array_equal(
+            first.numpy("movement_exploration").normal(size=4),
+            second.numpy("movement_exploration").normal(size=4),
+        )
+        self.assertEqual(random.getstate(), python_before)
+        self.assertEqual(np.random.get_state()[0], numpy_before[0])
+        np.testing.assert_array_equal(np.random.get_state()[1], numpy_before[1])
+        self.assertTrue(torch.equal(torch.get_rng_state(), torch_before))
 
 
 class FullResumeCheckpointTest(unittest.TestCase):
@@ -939,7 +933,7 @@ class TrainingCliTest(unittest.TestCase):
         self.assertEqual(formal.mode, "train")
         self.assertEqual(formal.total_episodes, 1500)
         self.assertEqual(formal.random_seed, 20260817)
-        self.assertEqual(formal.warmup_joint_transitions, 1000)
+        self.assertEqual(formal.warmup_joint_transitions, 10_000)
         self.assertEqual(formal.model_checkpoint_every, 50)
         self.assertEqual(formal.full_resume_every, 50)
         self.assertEqual(formal.full_resume_keep_last, 2)
@@ -961,7 +955,7 @@ class TrainingCliTest(unittest.TestCase):
         )
 
     def test_checkpoint_schema_is_explicit(self):
-        self.assertEqual(CHECKPOINT_SCHEMA_VERSION, 10)
+        self.assertEqual(CHECKPOINT_SCHEMA_VERSION, 11)
 
 
 if __name__ == "__main__":

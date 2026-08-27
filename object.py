@@ -155,6 +155,10 @@ class UAV:
                    min_step_ratio=0.30,        # η：最小步長比例
                    max_step_ratio=0.60,        # κ：最大步長比例
                    dz_cap=10.0,):
+        raise RuntimeError(
+            "legacy stochastic apply_movement is disabled; use the canonical "
+            "joint velocity proposal/apply path"
+        )
         dx_m = dx * step_time
         dy_m = dy * step_time
         dz_m = dz * step_time

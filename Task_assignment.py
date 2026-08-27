@@ -404,7 +404,10 @@ class UAVAssigner:
     ):
         candidates = self._candidate_tasks(task_list, coverage_threshold)
         task_indices = [index for index, _ in candidates]
-        random.shuffle(task_indices)
+        rng = getattr(self.env, "assignment_rng", None)
+        if rng is None:
+            rng = np.random.default_rng(0)
+        rng.shuffle(task_indices)
         self.assignments = {int(uid): [] for uid in uav_list}
         for uav_id, task_index in zip(uav_list, task_indices):
             task = task_list[task_index]

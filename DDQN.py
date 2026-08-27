@@ -17,6 +17,7 @@ from experiment_config import (
     ROUTING_LEARNING_RATE,
     ROUTING_TAU,
 )
+from rng_contract import NamedRNGStreams, build_torch_module
 
 """
 Implementation of Double DQN for gym environments with discrete action space.
@@ -108,12 +109,27 @@ class DDQN:
         lambda_cost=SAFE_DDQN_INITIAL_LAMBDA_COST,
         eta_c=SAFE_DDQN_ETA_C,
         qos_target_probability=SAFE_DDQN_QOS_TARGET_PROBABILITY,
+        rng_streams=None,
+        master_seed=0,
     ):
-        self.q_network = QNetwork(action_dim, state_dim, hidden_dim).to(device)
+        self.rng_streams = rng_streams or NamedRNGStreams(master_seed)
+        init_seed = self.rng_streams.master_seed
+        self.exploration_rng = self.rng_streams.numpy("safe_ddqn_exploration")
+        self.q_network = build_torch_module(
+            lambda: QNetwork(action_dim, state_dim, hidden_dim),
+            init_seed,
+            "safe_ddqn_network_init",
+            device,
+        )
         self.target_q_network = copy.deepcopy(self.q_network)
         self.optimizer = torch.optim.Adam(self.q_network.parameters(), lr=lr)
 
-        self.cost_network = QNetwork(action_dim, state_dim, hidden_dim).to(device)
+        self.cost_network = build_torch_module(
+            lambda: QNetwork(action_dim, state_dim, hidden_dim),
+            init_seed,
+            "safe_ddqn_cost_network_init",
+            device,
+        )
         self.target_cost_network = copy.deepcopy(self.cost_network)
         self.cost_optimizer = torch.optim.Adam(self.cost_network.parameters(), lr=lr)
 
@@ -184,14 +200,14 @@ class DDQN:
 
         # 加上 noise（可選）
         if logits_noise_std > 0:
-            q_values_masked = q_values_masked + np.random.normal(
+            q_values_masked = q_values_masked + self.exploration_rng.normal(
                 0, logits_noise_std, size=q_values_masked.shape
             )
 
         # ---------- ε-greedy ----------
-        if np.random.rand() < epsilon:
+        if float(epsilon) > 0.0 and self.exploration_rng.random() < epsilon:
             available_actions = np.where(final_mask)[0]
-            action = int(np.random.choice(available_actions))
+            action = int(self.exploration_rng.choice(available_actions))
         else:
             action = int(np.argmax(q_values_masked))
 
@@ -435,9 +451,6 @@ class DDQN:
 #     :param render_step: see above
 #     :return: the trained Q-Network and the measured performances
 #     """
-#     torch.manual_seed(seed)
-#     np.random.seed(seed)
-#     random.seed(seed)
 #     env = gym.make(env_name)
 #     env.seed(seed)
 

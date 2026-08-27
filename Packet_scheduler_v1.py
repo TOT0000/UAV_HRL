@@ -2514,7 +2514,9 @@ class PacketEngine:
         r = float(r_base) - lam * E_pen
 
         return task_type, r, pkt_done, e2e_ms, violated, cost, bits_tx_used, E_comm, moved
-    def Rand_selected_test(self, uav_id: int, mask=None, visited_nodes=None):
+    def Rand_selected_test(
+        self, uav_id: int, mask=None, visited_nodes=None, rng=None
+    ):
         """
         回傳 action = next_hop id (int)，介面完全對齊 DDQN.select_action()
         state 只是為了對齊介面，Rand 不用它。
@@ -2544,4 +2546,5 @@ class PacketEngine:
                 final_mask[uav_id] = False
 
         avail = np.flatnonzero(final_mask)
-        return int(np.random.choice(avail))
+        local_rng = rng if rng is not None else np.random.default_rng(0)
+        return int(local_rng.choice(avail))

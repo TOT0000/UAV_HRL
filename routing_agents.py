@@ -10,6 +10,7 @@ import torch.nn.functional as F
 
 from DDQN import DDQN, QNetwork, device, routing_action_mask_from_state
 from experiment_config import ROUTING_GAMMA, ROUTING_LEARNING_RATE, ROUTING_TAU
+from rng_contract import NamedRNGStreams, build_torch_module
 
 
 class ControlledDQN:
@@ -25,8 +26,17 @@ class ControlledDQN:
         gamma=ROUTING_GAMMA,
         tau=ROUTING_TAU,
         lr=ROUTING_LEARNING_RATE,
+        rng_streams=None,
+        master_seed=0,
     ):
-        self.q_network = QNetwork(action_dim, state_dim, hidden_dim).to(device)
+        self.rng_streams = rng_streams or NamedRNGStreams(master_seed)
+        self.exploration_rng = self.rng_streams.numpy("standard_dqn_exploration")
+        self.q_network = build_torch_module(
+            lambda: QNetwork(action_dim, state_dim, hidden_dim),
+            self.rng_streams.master_seed,
+            "standard_dqn_network_init",
+            device,
+        )
         self.target_q_network = copy.deepcopy(self.q_network)
         self.optimizer = torch.optim.Adam(self.q_network.parameters(), lr=lr)
         self.gamma = float(gamma)
@@ -60,12 +70,14 @@ class ControlledDQN:
             raise ValueError("routing mask shape does not match controlled DQN actions")
         if not legal.any():
             raise ValueError("routing action mask has no legal action")
-        if np.random.rand() < float(epsilon):
-            return int(np.random.choice(np.flatnonzero(legal)))
+        if float(epsilon) > 0.0 and self.exploration_rng.random() < float(epsilon):
+            return int(self.exploration_rng.choice(np.flatnonzero(legal)))
         masked_values = q_values.copy()
         masked_values[~legal] = -np.inf
         if float(logits_noise_std) > 0.0:
-            noise = np.random.normal(0.0, float(logits_noise_std), q_values.shape)
+            noise = self.exploration_rng.normal(
+                0.0, float(logits_noise_std), q_values.shape
+            )
             masked_values[legal] += noise[legal]
         return int(np.argmax(masked_values))
 
@@ -112,12 +124,13 @@ class RandomRoutingController:
 
     routing_agent_kind = "random"
 
-    def __init__(self, gamma=ROUTING_GAMMA):
+    def __init__(self, gamma=ROUTING_GAMMA, rng=None):
         self.gamma = float(gamma)
         self.tau = None
         self.num_training = 0
         self.target_update_count = 0
         self.loss_log = []
+        self.rng = rng or np.random.default_rng(0)
 
     def select_action(
         self,
@@ -133,7 +146,7 @@ class RandomRoutingController:
         legal = np.asarray(mask, dtype=bool)
         if legal.ndim != 1 or not legal.any():
             raise ValueError("random routing requires at least one legal action")
-        return int(np.random.choice(np.flatnonzero(legal)))
+        return int(self.rng.choice(np.flatnonzero(legal)))
 
     def train(self, replay_buffer, batch_size=64):
         del replay_buffer, batch_size
@@ -142,11 +155,24 @@ class RandomRoutingController:
         return None
 
 
-def create_routing_agent(method_spec, state_dim, action_dim):
+def create_routing_agent(
+    method_spec, state_dim, action_dim, rng_streams=None, evaluation=False
+):
+    master_seed = getattr(rng_streams, "master_seed", 0)
     if method_spec.routing == "safe_ddqn":
-        return DDQN(state_dim, action_dim)
+        return DDQN(
+            state_dim, action_dim, rng_streams=rng_streams, master_seed=master_seed
+        )
     if method_spec.routing == "dqn":
-        return ControlledDQN(state_dim, action_dim)
+        return ControlledDQN(
+            state_dim, action_dim, rng_streams=rng_streams, master_seed=master_seed
+        )
     if method_spec.routing == "random":
-        return RandomRoutingController()
+        stream = "evaluation_random_routing" if evaluation else "random_routing"
+        rng = (
+            rng_streams.numpy(stream)
+            if rng_streams is not None
+            else np.random.default_rng(0)
+        )
+        return RandomRoutingController(rng=rng)
     raise ValueError(f"unsupported routing policy: {method_spec.routing}")

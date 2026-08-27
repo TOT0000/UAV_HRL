@@ -49,6 +49,10 @@ SAFE_DDQN_LAMBDA_UPDATE_SCOPE = "episode_end"
 SAFE_DDQN_EVALUATION_LAMBDA_MODE = "checkpoint_frozen"
 ROUTING_MASK_SCOPE = "every_slot"
 MOVEMENT_INTERVAL_SECONDS = 1.0
+MOVEMENT_WARMUP_TRANSITIONS = 10_000
+MOVEMENT_REPLAY_CAPACITY = 50_000
+TD3_TARGET_POLICY_NOISE = 0.10
+TD3_TARGET_NOISE_CLIP = 0.25
 EXPLORATION_SCHEDULE_VERSION = "linear_v2_1000ep"
 EXPLORATION_SCHEDULE_TYPE = "linear"
 MOVEMENT_EXPLORATION_DECAY_EPISODES = 1000
@@ -56,6 +60,7 @@ ROUTING_EPSILON_DECAY_EPISODES = 1000
 ROUTING_EPSILON_START = 1.0
 ROUTING_EPSILON_END = 0.05
 ROUTING_WARMUP_TRANSITIONS = 1000
+ROUTING_REPLAY_CAPACITY = 200_000
 ROUTING_UPDATE_INTERVAL_SLOTS = 4
 ROUTING_GRADIENT_STEPS_PER_UPDATE = 1
 ROUTING_LEARNING_RATE = 1e-3
@@ -73,6 +78,9 @@ ROUTING_REWARD_ALPHA_DELAY = 0.5
 ROUTING_CAPACITY_EPSILON_BPS = 1e-9
 MOVEMENT_CHANNEL_TIMING_VERSION = "held-command-four-synchronous-substeps-v2"
 PROPULSION_MODEL_ID = "canonical-3d-quadrotor-v1"
+MOVEMENT_ACTION_PROJECTION_CONTRACT_VERSION = "fieldwise-clamp-heading-wrap-mask-v1"
+MOVEMENT_REPLAY_CONTRACT_VERSION = "executed-projected-action-capacity-50000-v1"
+MOVEMENT_WARMUP_CONTRACT_VERSION = "global-joint-transition-boundary-10000-v1"
 PROPULSION_PARAMETERS = MappingProxyType(
     {
         "n_r": 4,
@@ -383,16 +391,16 @@ FORMAL_EXPERIMENT_DEFAULTS = {
         "actor_learning_rate": 6e-5,
         "critic_learning_rate": 2e-4,
         "batch_size": 64,
-        "replay_size": 200_000,
-        "warmup_joint_transitions": 1000,
+        "replay_size": MOVEMENT_REPLAY_CAPACITY,
+        "warmup_joint_transitions": MOVEMENT_WARMUP_TRANSITIONS,
         "gamma": 1.0,
         "tau": 0.005,
         "exploration_noise_start": 0.20,
         "exploration_noise_end": 0.05,
         "td3": {
             "policy_delay": 2,
-            "target_policy_noise": 0.20,
-            "target_noise_clip": 0.50,
+            "target_policy_noise": TD3_TARGET_POLICY_NOISE,
+            "target_noise_clip": TD3_TARGET_NOISE_CLIP,
             "twin_critics": True,
         },
         "ddpg": {
@@ -427,6 +435,7 @@ def movement_agent_configuration(method_spec: MethodSpec, training_config=None) 
             "warmup_joint_transitions", common["warmup_joint_transitions"]
         )
     )
+    learned = bool(method_spec.learns_movement)
     return {
         "movement_agent_kind": method_spec.agent,
         "movement_agent_gamma": common["gamma"],
@@ -440,10 +449,12 @@ def movement_agent_configuration(method_spec: MethodSpec, training_config=None) 
         "hidden_layers": (
             list(common["hidden_layers"]) if method_spec.learns_movement else None
         ),
-        "batch_size": batch_size,
-        "replay_capacity": replay_capacity,
-        "warmup_joint_transitions": warmup,
-        "behavior_exploration_enabled": bool(method_spec.learns_movement),
+        "batch_size": batch_size if learned else None,
+        "replay_capacity": replay_capacity if learned else None,
+        "warmup_joint_transitions": warmup if learned else None,
+        "warmup_counter_source": "global_joint_transition_count" if learned else None,
+        "exploration_decay_origin": "first_post_warmup_transition" if learned else None,
+        "behavior_exploration_enabled": learned,
         "exploration_schedule_version": (
             EXPLORATION_SCHEDULE_VERSION if method_spec.learns_movement else None
         ),
@@ -457,7 +468,28 @@ def movement_agent_configuration(method_spec: MethodSpec, training_config=None) 
         "target_policy_noise": algorithm.get("target_policy_noise"),
         "target_noise_clip": algorithm.get("target_noise_clip"),
         "twin_critics": bool(algorithm.get("twin_critics", False)),
-        "optimizer_update_scope": "every_movement_transition_after_warmup",
+        "optimizer_update_scope": (
+            "every_movement_transition_after_warmup" if learned else None
+        ),
+        "action_projection_contract_version": (
+            MOVEMENT_ACTION_PROJECTION_CONTRACT_VERSION
+        ),
+        "heading_projection": "periodic-wrap-to-[-1,1)",
+        "replay_action_semantics": (
+            "executed_projected_joint_action" if learned else None
+        ),
+        "replay_contract_version": (
+            MOVEMENT_REPLAY_CONTRACT_VERSION if learned else None
+        ),
+        "warmup_contract_version": (
+            MOVEMENT_WARMUP_CONTRACT_VERSION if learned else None
+        ),
+        "capabilities": {
+            "learned_off_policy": learned,
+            "replay": learned,
+            "warmup": learned,
+            "target_policy_smoothing": method_spec.agent == "td3",
+        },
     }
 
 
@@ -590,7 +622,7 @@ def routing_agent_configuration(method_spec: MethodSpec, training_config=None) -
             int(resolved.get("batch_size", 64)) if learned else None
         ),
         "replay_capacity": (
-            int(resolved.get("replay_max_size", 200_000)) if learned else None
+            ROUTING_REPLAY_CAPACITY if learned else None
         ),
         "learning_rate": ROUTING_LEARNING_RATE if learned else None,
         "gamma": ROUTING_GAMMA,

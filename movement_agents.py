@@ -3,6 +3,7 @@
 import numpy as np
 
 from centralized_ddpg import CentralizedDDPG, RandomMovementController
+from centralized_movement import project_action_domain
 from experiment_config import (
     FORMAL_EXPERIMENT_DEFAULTS,
     movement_agent_configuration,
@@ -10,20 +11,28 @@ from experiment_config import (
 from td3 import TD3
 
 
-def sample_random_joint_action(action_dim):
+def sample_random_joint_action(action_dim, rng=None):
     """Sample the common continuous joint-action domain with the seeded RNG."""
 
-    return np.random.uniform(-1.0, 1.0, size=int(action_dim)).astype(np.float32)
+    if rng is None:
+        rng = np.random.default_rng(0)
+    return project_action_domain(
+        rng.uniform(-1.0, 1.0, size=int(action_dim)).astype(np.float32)
+    )
 
 
-def create_movement_agent(method_spec, state_dim, action_dim, config):
+def create_movement_agent(
+    method_spec, state_dim, action_dim, config, rng_streams=None
+):
     hyperparameters = FORMAL_EXPERIMENT_DEFAULTS["movement_hyperparameters"]
-    effective = movement_agent_configuration(method_spec)
+    effective = movement_agent_configuration(method_spec, config)
     common = {
         "state_dim": state_dim,
         "action_dim": action_dim,
         "max_action": hyperparameters["max_action"],
         "gamma": hyperparameters["gamma"],
+        "rng_streams": rng_streams,
+        "master_seed": getattr(config, "random_seed", 0) or 0,
     }
     if method_spec.agent == "td3":
         td3 = hyperparameters["td3"]

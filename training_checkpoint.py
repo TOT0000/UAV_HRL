@@ -17,11 +17,15 @@ from centralized_movement import (
     movement_mask_from_state,
 )
 from experiment_config import (
+    MOVEMENT_ACTION_PROJECTION_CONTRACT_VERSION,
+    MOVEMENT_REPLAY_CONTRACT_VERSION,
+    MOVEMENT_WARMUP_CONTRACT_VERSION,
     NUM_UAV,
     SAFE_DDQN_ETA_C,
     SAFE_DDQN_INITIAL_LAMBDA_COST,
     SAFE_DDQN_QOS_TARGET_PROBABILITY,
 )
+from rng_contract import NamedRNGStreams, RNG_CONTRACT_VERSION, RNG_STREAM_IDS
 from fov_ema_lifecycle import validate_fov_ema_state
 from scenario_manifest import (
     ScenarioManifest,
@@ -36,7 +40,7 @@ from dinkelbach_blocks import (
     dinkelbach_config_metadata,
 )
 
-CHECKPOINT_SCHEMA_VERSION = 10
+CHECKPOINT_SCHEMA_VERSION = 11
 ROUTING_LIFECYCLE_CHECKPOINT_SCHEMA_VERSION = 6
 PRE_ROUTING_LIFECYCLE_CHECKPOINT_SCHEMA_VERSION = 5
 PRE_ADAPTIVE_SAFE_DDQN_CHECKPOINT_SCHEMA_VERSION = 4
@@ -954,6 +958,27 @@ def _base_metadata(
             ddqn, resolved_routing
         ),
         "com_calibration_fingerprint": calibration_fingerprint(calibration),
+        "rng_contract_version": RNG_CONTRACT_VERSION,
+        "master_seed": experiment.get("training_seed"),
+        "rng_subsystem_mapping": dict(RNG_STREAM_IDS),
+        "training_evaluation_rng_separation": (
+            (experiment.get("rng_contract") or {}).get(
+                "training_evaluation_separation"
+            )
+        ),
+        "movement_action_projection_contract_version": (
+            MOVEMENT_ACTION_PROJECTION_CONTRACT_VERSION
+        ),
+        "movement_heading_contract": "periodic-wrap-to-[-1,1)",
+        "movement_replay_contract_version": MOVEMENT_REPLAY_CONTRACT_VERSION,
+        "movement_warmup_contract_version": MOVEMENT_WARMUP_CONTRACT_VERSION,
+        "capabilities": {
+            "movement_learning": kind in {"td3", "ddpg"},
+            "movement_replay": kind in {"td3", "ddpg"},
+            "target_policy_smoothing": kind == "td3",
+            "routing_learning": _routing_agent_kind(ddqn) in {"safe_ddqn", "dqn"},
+            "routing_replay": _routing_agent_kind(ddqn) in {"safe_ddqn", "dqn"},
+        },
     }
     reward_mode = (
         ((experiment.get("method_spec") or {}).get("reward_mode"))
@@ -1238,8 +1263,8 @@ def _validate_checkpoint_schema(metadata):
     schema = metadata.get("checkpoint_schema_version")
     if schema != CHECKPOINT_SCHEMA_VERSION:
         raise RuntimeError(
-            "checkpoint_schema_version is incompatible with the 10-UAV "
-            "state/channel/packet "
+            "checkpoint_schema_version is incompatible with the named-RNG, "
+            "projected-action and replay "
             "contract and must be retrained: "
             f"checkpoint={schema}, expected={CHECKPOINT_SCHEMA_VERSION}"
         )
@@ -1258,6 +1283,27 @@ def _validate_checkpoint_schema(metadata):
             raise RuntimeError(
                 "legacy safe-DDQN checkpoint lacks adaptive lambda_cost, eta_c, "
                 "and canonical eligible-packet QoS target state"
+            )
+        required_contracts = {
+            "rng_contract_version": RNG_CONTRACT_VERSION,
+            "movement_action_projection_contract_version": (
+                MOVEMENT_ACTION_PROJECTION_CONTRACT_VERSION
+            ),
+            "movement_replay_contract_version": MOVEMENT_REPLAY_CONTRACT_VERSION,
+            "movement_warmup_contract_version": MOVEMENT_WARMUP_CONTRACT_VERSION,
+        }
+        mismatches = {
+            key: (metadata.get(key), value)
+            for key, value in required_contracts.items()
+            if key in metadata and metadata.get(key) != value
+        }
+        capabilities = metadata.get("capabilities")
+        if mismatches or (
+            capabilities is not None and not isinstance(capabilities, dict)
+        ):
+            raise RuntimeError(
+                "checkpoint executable RNG/action/replay contract is incompatible: "
+                f"{mismatches}"
             )
         return schema
     try:
@@ -1611,6 +1657,7 @@ def _save_replay(path, replay, fields):
         "max_size": int(replay.max_size),
         "n_step": int(replay.n_step),
         "gamma": float(getattr(replay, "gamma", 1.0)),
+        "total_added": int(getattr(replay, "total_added", size)),
         "n_step_buffer": list(getattr(replay, "n_step_buffer", [])),
     }
 
@@ -1637,8 +1684,14 @@ def _validate_replay_payload(path, replay, fields, metadata):
             )
     size = int(metadata["size"])
     ptr = int(metadata["ptr"])
+    total_added = int(metadata.get("total_added", size))
     if not 0 <= size <= replay.max_size or not 0 <= ptr < replay.max_size:
         raise RuntimeError(f"invalid replay size/ptr in checkpoint: {size}/{ptr}")
+    if total_added < size or ptr != total_added % replay.max_size:
+        raise RuntimeError(
+            "replay wrap diagnostics are inconsistent: "
+            f"size={size}, ptr={ptr}, total_added={total_added}"
+        )
     with np.load(path, allow_pickle=False) as arrays:
         for field in fields:
             if field not in arrays:
@@ -1664,6 +1717,7 @@ def _load_replay(path, replay, fields, metadata):
             target[:size] = arrays[field]
     replay.size = size
     replay.ptr = ptr
+    replay.total_added = int(metadata.get("total_added", size))
     replay.n_step_buffer = list(metadata.get("n_step_buffer", []))
 
 
@@ -1682,6 +1736,8 @@ def _checkpoint_task_observation_mode(metadata):
 def _validate_joint_replay_projection_masks(checkpoint_dir, metadata):
     """Validate mask availability before exact-resume state can be mutated."""
 
+    if not bool((metadata.get("capabilities") or {}).get("movement_replay")):
+        return
     schema = int(metadata["checkpoint_schema_version"])
     observation_mode = _checkpoint_task_observation_mode(metadata)
     if schema < ROUTING_LIFECYCLE_CHECKPOINT_SCHEMA_VERSION:
@@ -1986,6 +2042,22 @@ def _validate_rng_state_payload(state):
                 raise RuntimeError("checkpoint CUDA RNG state is incompatible") from exc
 
 
+def _validate_named_rng_state_payload(state, expected_master_seed):
+    if not isinstance(state, dict):
+        raise RuntimeError("checkpoint named subsystem RNG state is missing")
+    try:
+        master_seed = int(state["master_seed"])
+        if expected_master_seed is not None and master_seed != int(
+            expected_master_seed
+        ):
+            raise RuntimeError("checkpoint named RNG master seed is incompatible")
+        NamedRNGStreams(master_seed).load_state_dict(state)
+    except (KeyError, TypeError, ValueError, RuntimeError) as exc:
+        if isinstance(exc, RuntimeError) and str(exc).startswith("checkpoint named"):
+            raise
+        raise RuntimeError("checkpoint named subsystem RNG state is incompatible") from exc
+
+
 def save_full_resume_checkpoint(
     checkpoint_dir,
     *,
@@ -2004,6 +2076,12 @@ def save_full_resume_checkpoint(
     keep_last=None,
 ):
     checkpoint_dir = Path(checkpoint_dir)
+    if not isinstance(training_state, dict):
+        raise TypeError("training_state must be an object")
+    if not isinstance(training_state.get("named_rng_state"), dict):
+        training_state["named_rng_state"] = NamedRNGStreams(
+            int(formal_config.get("random_seed") or 0)
+        ).state_dict()
     _validate_full_resume_logging_state(
         training_state,
         int(episode) + 1,
@@ -2055,11 +2133,19 @@ def save_full_resume_checkpoint(
         )
     def write(temporary):
         replay_metadata = {
-            "joint": _save_replay(
-                temporary / "joint_replay.npz", joint_replay, JOINT_REPLAY_FIELDS
-            ),
+            "joint": None,
             "routing": None,
         }
+        movement_kind = _agent_kind(td3)
+        if movement_kind == "random":
+            if joint_replay is not None:
+                raise ValueError("random movement must not allocate a joint replay")
+        else:
+            if joint_replay is None:
+                raise ValueError(f"{movement_kind} movement requires a joint replay")
+            replay_metadata["joint"] = _save_replay(
+                temporary / "joint_replay.npz", joint_replay, JOINT_REPLAY_FIELDS
+            )
         routing_kind = _routing_agent_kind(ddqn)
         if routing_kind == "random":
             if routing_replay is not None:
@@ -2231,6 +2317,10 @@ def _validate_full_resume_logging_state(
                 != lifecycle["routing_epsilon_decay_start_slot"]
             ):
                 raise RuntimeError("checkpoint routing lifecycle counters are inconsistent")
+    if training_state.get("named_rng_state") is not None:
+        _validate_named_rng_state_payload(
+            training_state["named_rng_state"], None
+        )
 
 
 def _validate_full_metadata(
@@ -2495,10 +2585,9 @@ def preflight_full_resume_checkpoint_metadata(
         current_formal_config=expected_formal_config,
         training_run_directory=training_run_directory,
     )
-    required_paths = [
-        checkpoint_dir / "training_state.pt",
-        checkpoint_dir / "joint_replay.npz",
-    ]
+    required_paths = [checkpoint_dir / "training_state.pt"]
+    if bool((metadata.get("capabilities") or {}).get("movement_replay")):
+        required_paths.append(checkpoint_dir / "joint_replay.npz")
     if metadata.get("routing_agent_kind", "safe_ddqn") != "random":
         required_paths.append(checkpoint_dir / "routing_replay.npz")
     missing = [str(path) for path in required_paths if not path.is_file()]
@@ -2574,6 +2663,10 @@ def inspect_full_resume_checkpoint(
     formal_config = payload.get("formal_config")
     if not isinstance(training_state, dict):
         raise RuntimeError("checkpoint training state is invalid")
+    if metadata.get("rng_contract_version") is not None:
+        _validate_named_rng_state_payload(
+            training_state.get("named_rng_state"), metadata.get("master_seed")
+        )
     try:
         state_completed = int(training_state["completed_episode_index"]) + 1
         state_next = int(training_state["next_episode_index"])
@@ -2721,8 +2814,14 @@ def load_full_resume_checkpoint(
     metadata = inspected["metadata"]
     payload = inspected["payload"]
     replay_metadata = payload["replay_metadata"]
-    if not isinstance(replay_metadata.get("joint"), dict):
-        raise RuntimeError("checkpoint joint replay metadata is missing")
+    movement_replay_enabled = bool(
+        (metadata.get("capabilities") or {}).get("movement_replay")
+    )
+    if movement_replay_enabled:
+        if not isinstance(replay_metadata.get("joint"), dict):
+            raise RuntimeError("checkpoint joint replay metadata is missing")
+    elif replay_metadata.get("joint") is not None:
+        raise RuntimeError("random-movement checkpoint contains a joint replay")
     if not isinstance(payload.get("networks"), dict):
         raise RuntimeError("checkpoint network payload is invalid")
     _validate_rng_state_payload(payload.get("rng_state"))
@@ -2737,12 +2836,17 @@ def load_full_resume_checkpoint(
             else LEGACY_JOINT_REPLAY_FIELDS
         )
     )
-    _validate_replay_payload(
-        checkpoint_dir / "joint_replay.npz",
-        joint_replay,
-        joint_fields,
-        replay_metadata["joint"],
-    )
+    if movement_replay_enabled:
+        if joint_replay is None:
+            raise RuntimeError("learned movement requires a joint replay")
+        _validate_replay_payload(
+            checkpoint_dir / "joint_replay.npz",
+            joint_replay,
+            joint_fields,
+            replay_metadata["joint"],
+        )
+    elif joint_replay is not None:
+        raise RuntimeError("random movement must not allocate a joint replay")
     routing_kind = metadata.get("routing_agent_kind", "safe_ddqn")
     if routing_kind == "random":
         if routing_replay is not None or replay_metadata.get("routing") is not None:
@@ -2768,17 +2872,18 @@ def load_full_resume_checkpoint(
     _load_network_states(payload["networks"], td3, ddqn)
     _restore_movement_training_payload(td3, payload)
     _restore_routing_training_payload(ddqn, payload)
-    _load_replay(
-        checkpoint_dir / "joint_replay.npz",
-        joint_replay,
-        joint_fields,
-        replay_metadata["joint"],
-    )
-    if (
-        metadata["checkpoint_schema_version"]
-        < ROUTING_LIFECYCLE_CHECKPOINT_SCHEMA_VERSION
-    ):
-        _reconstruct_legacy_full_observation_masks(joint_replay, metadata)
+    if movement_replay_enabled:
+        _load_replay(
+            checkpoint_dir / "joint_replay.npz",
+            joint_replay,
+            joint_fields,
+            replay_metadata["joint"],
+        )
+        if (
+            metadata["checkpoint_schema_version"]
+            < ROUTING_LIFECYCLE_CHECKPOINT_SCHEMA_VERSION
+        ):
+            _reconstruct_legacy_full_observation_masks(joint_replay, metadata)
     if routing_kind != "random":
         _load_replay(
             checkpoint_dir / "routing_replay.npz",

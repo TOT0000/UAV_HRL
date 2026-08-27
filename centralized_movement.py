@@ -162,7 +162,8 @@ def projected_joint_action_schema():
         "ordering": "UAV id ascending; speed, heading, vertical scalar",
         "range": [-1.0, 1.0],
         "projection": (
-            "task-inactive UAV blocks are replaced by hover raw action [-1, 0, 0]"
+            "speed/vertical clamp to [-1,1], heading wraps periodically to [-1,1), "
+            "then task-inactive UAV blocks become hover [-1,0,0]"
         ),
         "features": features,
         "continuous_indices": list(range(JOINT_ACTION_DIM)),
@@ -412,8 +413,48 @@ def validate_movement_mask(movement_mask):
     return mask.astype(bool, copy=False)
 
 
+def project_action_domain(raw_action):
+    """Project speed/heading/vertical blocks without applying task masks."""
+
+    if torch.is_tensor(raw_action):
+        if raw_action.shape[-1] % 3 != 0 or not torch.isfinite(raw_action).all():
+            raise ValueError("movement action must contain finite 3-value blocks")
+        blocks = raw_action.reshape(*raw_action.shape[:-1], -1, 3)
+        heading = blocks[..., 1]
+        wrapped_heading = torch.where(
+            torch.logical_and(heading >= -1.0, heading < 1.0),
+            heading,
+            torch.remainder(heading + 1.0, 2.0) - 1.0,
+        )
+        return torch.stack(
+            (
+                blocks[..., 0].clamp(-1.0, 1.0),
+                wrapped_heading,
+                blocks[..., 2].clamp(-1.0, 1.0),
+            ),
+            dim=-1,
+        ).reshape_as(raw_action)
+
+    action = np.asarray(raw_action, dtype=np.float32)
+    if (
+        action.shape[-1] % 3 != 0
+        or not np.isfinite(action).all()
+    ):
+        raise ValueError("movement action must contain finite 3-value blocks")
+    blocks = action.reshape(*action.shape[:-1], -1, 3).copy()
+    blocks[..., 0] = np.clip(blocks[..., 0], -1.0, 1.0)
+    heading = blocks[..., 1]
+    blocks[..., 1] = np.where(
+        np.logical_and(heading >= -1.0, heading < 1.0),
+        heading,
+        np.remainder(heading + 1.0, 2.0) - 1.0,
+    )
+    blocks[..., 2] = np.clip(blocks[..., 2], -1.0, 1.0)
+    return blocks.reshape(action.shape)
+
+
 def project_joint_action(raw_action, movement_state=None, *, movement_mask=None):
-    """Apply the authoritative task constraint to raw joint movement actions.
+    """Apply fieldwise domain projection followed by the task movement mask.
 
     Existing callers may provide an unmasked movement state. Training callers
     should provide the explicit per-UAV true ``movement_mask`` stored with
@@ -440,10 +481,12 @@ def project_joint_action(raw_action, movement_state=None, *, movement_mask=None)
             raise ValueError(
                 "joint action batch dimensions must match movement mask batch dimensions"
             )
-        action_blocks = raw_action.reshape(*raw_action.shape[:-1], NUM_UAV, 3)
+        projected_blocks = project_action_domain(raw_action).reshape(
+            *raw_action.shape[:-1], NUM_UAV, 3
+        )
         mask = movable.to(dtype=raw_action.dtype).unsqueeze(-1)
         hover = raw_action.new_tensor(HOVER_ACTION)
-        projected = action_blocks * mask + hover * (1.0 - mask)
+        projected = projected_blocks * mask + hover * (1.0 - mask)
         return projected.reshape_as(raw_action)
 
     action_array = np.asarray(raw_action, dtype=np.float32)
@@ -456,9 +499,20 @@ def project_joint_action(raw_action, movement_state=None, *, movement_mask=None)
         raise ValueError(
             "joint action batch dimensions must match movement mask batch dimensions"
         )
-    blocks = action_array.reshape(*action_array.shape[:-1], NUM_UAV, 3).copy()
+    blocks = project_action_domain(action_array).reshape(
+        *action_array.shape[:-1], NUM_UAV, 3
+    ).copy()
     blocks[~movable] = np.asarray(HOVER_ACTION, dtype=np.float32)
     return blocks.reshape(action_array.shape)
+
+
+def project_local_action(raw_action):
+    """Canonical projection for one decoded speed/heading/vertical block."""
+
+    action = np.asarray(raw_action, dtype=np.float32)
+    if action.shape != (3,):
+        raise ValueError("local movement action must be three finite values")
+    return project_action_domain(action)
 
 
 def _circle_rectangle_intersection_area(cx, cy, radius, xmin, xmax, ymin, ymax):

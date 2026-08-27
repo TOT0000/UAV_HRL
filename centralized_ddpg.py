@@ -5,8 +5,14 @@ from __future__ import annotations
 import numpy as np
 import torch
 import torch.nn.functional as F
+import copy
 
-from centralized_movement import project_joint_action
+from centralized_movement import (
+    project_action_domain,
+    project_joint_action,
+    project_local_action,
+)
+from rng_contract import NamedRNGStreams, build_torch_module
 from td3 import Actor, Critic, device
 
 
@@ -24,13 +30,25 @@ class CentralizedDDPG:
         tau=0.005,
         actor_lr=6e-5,
         critic_lr=2e-4,
+        rng_streams=None,
+        master_seed=0,
     ):
-        self.actor = Actor(state_dim, action_dim, max_action).to(device)
-        self.actor_target = Actor(state_dim, action_dim, max_action).to(device)
-        self.critic = Critic(state_dim, action_dim).to(device)
-        self.critic_target = Critic(state_dim, action_dim).to(device)
-        self.actor_target.load_state_dict(self.actor.state_dict())
-        self.critic_target.load_state_dict(self.critic.state_dict())
+        self.rng_streams = rng_streams or NamedRNGStreams(master_seed)
+        init_seed = self.rng_streams.master_seed
+        self.actor = build_torch_module(
+            lambda: Actor(state_dim, action_dim, max_action),
+            init_seed,
+            "movement_actor_init",
+            device,
+        )
+        self.critic = build_torch_module(
+            lambda: Critic(state_dim, action_dim),
+            init_seed,
+            "movement_critic1_init",
+            device,
+        )
+        self.actor_target = copy.deepcopy(self.actor)
+        self.critic_target = copy.deepcopy(self.critic)
         self.actor_optimizer = torch.optim.Adam(
             self.actor.parameters(), lr=float(actor_lr)
         )
@@ -59,14 +77,19 @@ class CentralizedDDPG:
                 noise_std = max(0.05, 0.20 * (1.0 - float(episode) / 4000.0))
             if float(noise_std) < 0.0:
                 raise ValueError("noise_std must be non-negative")
-            action = action + np.random.normal(0.0, float(noise_std), action.shape)
-        return np.clip(action, -self.max_action, self.max_action)
+            action = action + self.rng_streams.numpy("movement_exploration").normal(
+                0.0, float(noise_std), action.shape
+            )
+        action = action.astype(np.float32, copy=False)
+        return (
+            project_action_domain(action)
+            if action.shape[-1] % 3 == 0
+            else action
+        )
 
     @staticmethod
     def decode_action(raw_action):
-        v_scalar, theta_scalar, phi_scalar = np.clip(
-            np.asarray(raw_action, dtype=np.float32), -1.0, 1.0
-        )
+        v_scalar, theta_scalar, phi_scalar = project_local_action(raw_action)
         v_xy = (v_scalar + 1.0) * 5.0
         theta = theta_scalar * np.pi
         return np.asarray(

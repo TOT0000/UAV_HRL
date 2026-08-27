@@ -106,7 +106,7 @@ class ControlledMethodRegistryTest(unittest.TestCase):
         self.assertEqual(FORMAL_EXPERIMENT_DEFAULTS["training_seed_count"], 1)
         self.assertEqual(
             FORMAL_EXPERIMENT_DEFAULTS["movement_hyperparameters"]["replay_size"],
-            200_000,
+            50_000,
         )
 
     def test_one_transition_smoke_uses_shared_flow_for_all_methods(self):
@@ -360,7 +360,7 @@ class ControlledRewardTest(unittest.TestCase):
 class EffectiveMovementConfigurationTest(unittest.TestCase):
     def test_effective_algorithm_settings_are_method_specific(self):
         expected = {
-            "td3_dinkelbach": (2, 0.20, 0.50, True),
+            "td3_dinkelbach": (2, 0.10, 0.25, True),
             "ddpg_dinkelbach": (1, None, None, False),
             "random_action": (None, None, None, False),
         }

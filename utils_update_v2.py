@@ -5,6 +5,7 @@ from centralized_movement import (
     MOVEMENT_STATE_DIM,
     NUM_UAV,
     movement_mask_from_state,
+    project_joint_action,
     validate_movement_mask,
 )
 
@@ -16,11 +17,12 @@ def _to_np_float32(x):
     return x.astype(np.float32, copy=False)
 
 class ReplayBufferContinuous:
-    def __init__(self, state_dim, action_dim, max_size=int(2e5), n_step=3, gamma=0.99):
+    def __init__(self, state_dim, action_dim, max_size=50_000, n_step=3, gamma=0.99, rng=None):
         self.max_size = int(max_size)
         self.ptr = 0
         self.size = 0
-        
+        self.total_added = 0
+        self.rng = rng or np.random.default_rng(0)
 
         # 預配置為 float32，節省記憶體
         self.state      = np.zeros((self.max_size, state_dim), dtype=np.float32)
@@ -75,6 +77,7 @@ class ReplayBufferContinuous:
 
         self.ptr  = (self.ptr + 1) % self.max_size
         self.size = min(self.size + 1, self.max_size)
+        self.total_added += 1
 
         if d:
             self.n_step_buffer.clear()
@@ -139,14 +142,14 @@ class ReplayBufferContinuous:
             if k <= 0:
                 return np.empty((0,), dtype=np.int64)
             if len(pool) == 0:
-                return np.random.randint(0, size, size=k)
+                return self.rng.integers(0, size, size=k)
             replace = len(pool) < k
-            return np.random.choice(pool, size=k, replace=replace)
+            return self.rng.choice(pool, size=k, replace=replace)
 
         ind = np.concatenate([
             _pick(same_idx, n_same),
             _pick(neigh_idx, n_nei),
-            np.random.randint(0, size, size=n_mix),
+            self.rng.integers(0, size, size=n_mix),
         ])
         return self._gather(ind)
 
@@ -164,11 +167,13 @@ class ReplayBufferContinuous:
 class ReplayBufferJoint:
     """One-step joint replay supporting Dinkelbach reward reconstruction and stored terminal ratio objectives."""
 
-    def __init__(self, state_dim, action_dim, max_size=int(2e5)):
+    def __init__(self, state_dim, action_dim, max_size=50_000, rng=None):
         self.state_dim = int(state_dim)
         self.max_size = int(max_size)
         self.ptr = 0
         self.size = 0
+        self.total_added = 0
+        self.rng = rng or np.random.default_rng(0)
         self.n_step = 1
         self.state = np.zeros((self.max_size, state_dim), dtype=np.float32)
         self.action = np.zeros((self.max_size, action_dim), dtype=np.float32)
@@ -217,7 +222,6 @@ class ReplayBufferJoint:
         state_array = _to_np_float32(state)
         next_state_array = _to_np_float32(next_state)
         self.state[index] = state_array
-        self.action[index] = _to_np_float32(action)
         self.next_state[index] = next_state_array
         if (current_movement_mask is None) != (next_movement_mask is None):
             raise ValueError(
@@ -234,10 +238,14 @@ class ReplayBufferJoint:
             self.current_movement_mask[index] = np.asarray(current_mask, dtype=bool)
             self.next_movement_mask[index] = np.asarray(next_mask, dtype=bool)
             self.movement_mask_valid[index, 0] = True
+            self.action[index] = project_joint_action(
+                action, movement_mask=current_mask
+            )
         else:
             self.current_movement_mask[index] = False
             self.next_movement_mask[index] = False
             self.movement_mask_valid[index, 0] = False
+            self.action[index] = _to_np_float32(action)
         self.not_done[index, 0] = 1.0 - float(bool(done))
         self.delivered_mbits[index, 0] = float(delivered_mbits)
         self.total_mobility_energy[index, 0] = float(total_mobility_energy)
@@ -250,6 +258,26 @@ class ReplayBufferJoint:
         self.phi_com_t1[index, 0] = float(phi_com_t1)
         self.ptr = (self.ptr + 1) % self.max_size
         self.size = min(self.size + 1, self.max_size)
+        self.total_added += 1
+
+    def diagnostics(self):
+        if self.size == 0:
+            oldest = newest = None
+        elif self.size < self.max_size:
+            oldest, newest = 0, self.size - 1
+        else:
+            oldest, newest = self.ptr, (self.ptr - 1) % self.max_size
+        return {
+            "capacity": int(self.max_size),
+            "size": int(self.size),
+            "write_pointer": int(self.ptr),
+            "total_added": int(self.total_added),
+            "wrapped": bool(self.total_added > self.max_size),
+            "oldest_physical_index": oldest,
+            "newest_physical_index": newest,
+            "oldest_age": self.size - 1 if self.size else None,
+            "newest_age": 0 if self.size else None,
+        }
 
     def _reward_numpy(
         self,
@@ -297,7 +325,7 @@ class ReplayBufferJoint:
     ):
         if self.size <= 0:
             raise ValueError("Replay buffer is empty")
-        indices = np.random.randint(0, self.size, size=int(batch_size))
+        indices = self.rng.integers(0, self.size, size=int(batch_size))
         reward = self._reward_numpy(
             indices,
             current_lambda=current_lambda,
@@ -328,10 +356,12 @@ class ReplayBufferJoint:
 
 
 class ReplayBufferDiscrete:
-    def __init__(self, state_dim, action_dim, max_size=int(2e5), n_step=3, gamma=0.99):
+    def __init__(self, state_dim, action_dim, max_size=50_000, n_step=3, gamma=0.99, rng=None):
         self.max_size = int(max_size)
         self.ptr = 0
         self.size = 0
+        self.total_added = 0
+        self.rng = rng or np.random.default_rng(0)
         self.tag_gt = np.full((self.max_size, 1), -1, dtype=np.int16)
 
         self.state      = np.zeros((self.max_size, state_dim), dtype=np.float32)
@@ -392,6 +422,7 @@ class ReplayBufferDiscrete:
 
         self.ptr  = (self.ptr + 1) % self.max_size
         self.size = min(self.size + 1, self.max_size)
+        self.total_added += 1
 
         if d:
             self.n_step_buffer.clear()
@@ -412,7 +443,7 @@ class ReplayBufferDiscrete:
 
 
     def sample(self, batch_size, include_cost=False):
-        ind = np.random.randint(0, self.size, size=batch_size)
+        ind = self.rng.integers(0, self.size, size=batch_size)
         return self._gather(ind, include_cost=include_cost)
 
     def sample_by_tag(self, batch_size, curr_tag, neighbor_step=2,
@@ -433,14 +464,14 @@ class ReplayBufferDiscrete:
             if k <= 0:
                 return np.empty((0,), dtype=np.int64)
             if len(pool) == 0:
-                return np.random.randint(0, size, size=k)
+                return self.rng.integers(0, size, size=k)
             replace = len(pool) < k
-            return np.random.choice(pool, size=k, replace=replace)
+            return self.rng.choice(pool, size=k, replace=replace)
 
         ind = np.concatenate([
             _pick(same_idx, n_same),
             _pick(neigh_idx, n_nei),
-            np.random.randint(0, size, size=n_mix),
+            self.rng.integers(0, size, size=n_mix),
         ])
         return self._gather(ind, include_cost=include_cost)
 

@@ -6,13 +6,14 @@ import random
 import copy
 import matplotlib.pyplot as plt
 
-np.random.seed(1)
-torch.manual_seed(1)
-
 # 深度 Q 網絡（DQN）類別
 class DQN(nn.Module):
     def __init__(self, n_features, n_actions, learning_rate=1e-3, reward_decay=0.99, e_greedy=0.9,
-                 replace_target_iter=300, memory_size=500, e_greedy_increment=None, hidden_dim=20):
+                 replace_target_iter=300, memory_size=500, e_greedy_increment=None, hidden_dim=20,
+                 rng=None):
+        raise RuntimeError(
+            "legacy DQN is disabled; use routing_agents.ControlledDQN"
+        )
         super( DQN, self).__init__()
         
         self.n_actions = n_actions
@@ -25,6 +26,7 @@ class DQN(nn.Module):
         self.epsilon_increment = e_greedy_increment
         self.epsilon = 0 if e_greedy_increment is not None else self.epsilon_max
         self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+        self.rng = rng or np.random.default_rng(0)
 
         self.learn_step_counter = 0
 
@@ -108,14 +110,14 @@ class DQN(nn.Module):
         q_values_masked[~final_mask] = -1e9
 
         if logits_noise_std and logits_noise_std > 0:
-            q_values_masked = q_values_masked + np.random.normal(
+            q_values_masked = q_values_masked + self.rng.normal(
                 0, logits_noise_std, size=q_values_masked.shape
             )
 
         # epsilon-greedy
-        if np.random.rand() < epsilon:
+        if float(epsilon) > 0.0 and self.rng.random() < epsilon:
             available = np.where(final_mask)[0]
-            action = int(np.random.choice(available))
+            action = int(self.rng.choice(available))
         else:
             action = int(np.argmax(q_values_masked))
 
@@ -139,8 +141,9 @@ class DQN(nn.Module):
         """
 
         if seed is not None:
-            np.random.seed(seed)
-            torch.manual_seed(seed)
+            test_rng = np.random.default_rng(seed)
+        else:
+            test_rng = self.rng
 
         # ---------- forward ----------
         state_t = torch.as_tensor(
@@ -180,14 +183,14 @@ class DQN(nn.Module):
 
         # optional noise (test default off)
         if logits_noise_std > 0:
-            q_masked += np.random.normal(
+            q_masked += test_rng.normal(
                 0.0, logits_noise_std, size=q_masked.shape
             )
 
         # ---------- epsilon-greedy ----------
-        if np.random.rand() < epsilon:
+        if float(epsilon) > 0.0 and test_rng.random() < epsilon:
             avail = np.where(final_mask)[0]
-            action = int(np.random.choice(avail))
+            action = int(test_rng.choice(avail))
             mode = "random"
         else:
             action = int(np.argmax(q_masked))

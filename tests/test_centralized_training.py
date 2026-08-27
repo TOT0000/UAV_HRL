@@ -72,7 +72,7 @@ class CentralizedTrainingFlowTest(unittest.TestCase):
         formal = formal_training_config(100)
         self.assertEqual(formal.mode, "train")
         self.assertEqual(formal.total_episodes, 100)
-        self.assertEqual(formal.warmup_joint_transitions, 1000)
+        self.assertEqual(formal.warmup_joint_transitions, 10_000)
         self.assertEqual(formal.batch_size, 64)
         self.assertEqual(formal.policy_delay, 2)
         self.assertEqual(formal.dinkelbach_initial_lambda, 0.0)

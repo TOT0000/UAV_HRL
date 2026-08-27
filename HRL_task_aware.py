@@ -52,12 +52,14 @@ from experiment_config import (
     FORMAL_EXPERIMENT_DEFAULTS,
     MOVEMENT_EXPLORATION_DECAY_EPISODES,
     MOVEMENT_INTERVAL_SECONDS,
+    MOVEMENT_REPLAY_CAPACITY,
     MethodSpec,
     NUM_UAV,
     ROI_COUNT_MAX,
     ROI_COUNT_MIN,
     ROUTING_EPSILON_DECAY_EPISODES,
     ROUTING_GRADIENT_STEPS_PER_UPDATE,
+    ROUTING_REPLAY_CAPACITY,
     ROUTING_UPDATE_INTERVAL_SLOTS,
     ROUTING_WARMUP_TRANSITIONS,
     SR_ROUTE_LIFECYCLE_VERSION,
@@ -106,6 +108,7 @@ from training_history import (
     write_training_history,
 )
 import utils_update_v2
+from rng_contract import NamedRNGStreams, RNG_CONTRACT_VERSION
 
 
 MOVEMENT_CONTROL_INTERVAL = 4
@@ -122,14 +125,9 @@ SMOKE_RANDOM_SEED = DEFAULT_TRAINING_SEED
 
 
 def _seed_training_rng(seed):
-    if seed is None:
-        return
-    seed = int(seed)
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
+    """Return the local RNG registry; formal execution never seeds globals."""
+
+    return NamedRNGStreams(0 if seed is None else int(seed))
 
 
 def _git_commit_sha():
@@ -166,7 +164,9 @@ def _uses_warmup_random_action(total_joint_transitions, warmup_transitions):
     return int(total_joint_transitions) < int(warmup_transitions)
 
 
-def _create_active_replay_buffers(state_dim, routing_dim, max_size=int(2e5)):
+def _create_active_replay_buffers(
+    state_dim, routing_dim, max_size=MOVEMENT_REPLAY_CAPACITY
+):
     """Legacy test helper; the active movement path uses ReplayBufferJoint."""
     routing_buffer = utils_update_v2.ReplayBufferDiscrete(
         state_dim,
@@ -282,6 +282,25 @@ class TrainingConfig:
             raise ValueError("episode_seconds and total_episodes must be positive")
         if self.warmup_joint_transitions < 0 or self.batch_size <= 0:
             raise ValueError("warmup must be non-negative and batch_size positive")
+        if int(self.replay_max_size) <= 0:
+            raise ValueError("replay_max_size must be positive")
+        if (
+            self.mode == "train"
+            and int(self.total_episodes) >= int(
+                FORMAL_EXPERIMENT_DEFAULTS["training_episodes_per_seed"]
+            )
+            and (
+                int(self.warmup_joint_transitions)
+                != PRODUCTION_WARMUP_TRANSITIONS
+                or int(self.replay_max_size)
+                != FORMAL_EXPERIMENT_DEFAULTS["movement_hyperparameters"][
+                    "replay_size"
+                ]
+            )
+        ):
+            raise ValueError(
+                "formal movement warmup/replay capacity are fixed by contract"
+            )
         if (
             self.routing_warmup_transitions <= 0
             or self.routing_update_interval_slots <= 0
@@ -925,6 +944,7 @@ def _full_training_state(
     sr_route_state=None,
     routing_lifecycle_state=None,
     exploration_state,
+    named_rng_state=None,
 ):
     completed_episode_count = int(episode) + 1
     if lambda_cost_used_log is None:
@@ -999,11 +1019,18 @@ def _full_training_state(
         "fov_ema_state": copy.deepcopy(fov_ema_state),
         "sr_route_state": copy.deepcopy(sr_route_state),
         "training_history_rows": list(training_history_rows),
+        "named_rng_state": copy.deepcopy(named_rng_state),
     }
 
 
 def _experiment_identity(
-    method_spec, scenario_manifest, training_seed, config, *, evaluation=False
+    method_spec,
+    scenario_manifest,
+    training_seed,
+    config,
+    *,
+    evaluation=False,
+    rng_contract_metadata=None,
 ):
     comparison = comparison_method_configuration(method_spec)
     resolved_exploration = exploration_schedule_configuration(config, method_spec)
@@ -1053,6 +1080,8 @@ def _experiment_identity(
         ],
         "git_sha": _git_commit_sha(),
         "checkpoint_schema_version": CHECKPOINT_SCHEMA_VERSION,
+        "rng_contract_version": RNG_CONTRACT_VERSION,
+        "rng_contract": copy.deepcopy(rng_contract_metadata),
         "movement_agent": method_spec.agent,
         "movement_agent_configuration": movement_agent_configuration(
             method_spec, config
@@ -1480,10 +1509,12 @@ def train(
         0 <= int(trajectory_target_uav_id) < NUM_UAV
     ):
         raise ValueError(f"target_uav_id must be in [0, {NUM_UAV - 1}]")
-    _seed_training_rng(config.random_seed)
+    rng_streams = _seed_training_rng(config.random_seed)
 
     c_ref_com, calibration = load_com_capacity_reference()
-    env = Simulator(num_UAV=NUM_UAV)
+    env = Simulator(
+        num_UAV=NUM_UAV, rng_streams=rng_streams, evaluation=evaluation
+    )
     env.configure_method(method_spec)
     packet_engine = PacketEngine(
         num_uav=NUM_UAV,
@@ -1498,22 +1529,37 @@ def train(
         MOVEMENT_STATE_DIM,
         JOINT_ACTION_DIM,
         config,
+        rng_streams=rng_streams,
     )
     ddqn = create_routing_agent(
-        method_spec, ROUTING_STATE_DIM, env.num_UAV + 1
+        method_spec,
+        ROUTING_STATE_DIM,
+        env.num_UAV + 1,
+        rng_streams=rng_streams,
+        evaluation=evaluation,
     )
-    joint_replay = utils_update_v2.ReplayBufferJoint(
-        MOVEMENT_STATE_DIM,
-        JOINT_ACTION_DIM,
-        max_size=config.replay_max_size,
+    joint_replay = (
+        utils_update_v2.ReplayBufferJoint(
+            MOVEMENT_STATE_DIM,
+            JOINT_ACTION_DIM,
+            max_size=config.replay_max_size,
+            rng=rng_streams.numpy("movement_replay_sampling"),
+        )
+        if method_spec.learns_movement
+        else None
     )
     routing_replay = (
         utils_update_v2.ReplayBufferDiscrete(
             ROUTING_STATE_DIM,
             env.num_UAV + 1,
-            max_size=config.replay_max_size,
+            max_size=ROUTING_REPLAY_CAPACITY,
             n_step=1,
             gamma=0.99,
+            rng=rng_streams.numpy(
+                "safe_ddqn_replay_sampling"
+                if method_spec.routing == "safe_ddqn"
+                else "standard_dqn_replay_sampling"
+            ),
         )
         if method_spec.learns_routing
         else None
@@ -1534,6 +1580,7 @@ def train(
         config.random_seed,
         config,
         evaluation=evaluation,
+        rng_contract_metadata=rng_streams.metadata(),
     )
     if training_run_provenance is not None:
         if evaluation:
@@ -1769,6 +1816,12 @@ def train(
             training_run_directory=config.run_directory,
         )
         training_state = restored["training_state"]
+        try:
+            rng_streams.load_state_dict(training_state["named_rng_state"])
+        except KeyError as exc:
+            raise RuntimeError(
+                "resume checkpoint lacks named subsystem RNG state"
+            ) from exc
         resume_checkpoint_compatibility = restored["horizon_compatibility"]
         start_episode = int(training_state["next_episode_index"])
         if method_spec.uses_dinkelbach:
@@ -1946,7 +1999,7 @@ def train(
     for episode in range(start_episode, config.total_episodes):
         if scenario_manifest is None:
             env.num_GT = int(
-                np.random.randint(ROI_COUNT_MIN, ROI_COUNT_MAX + 1)
+                env.environment_rng.integers(ROI_COUNT_MIN, ROI_COUNT_MAX + 1)
             )
             env.reset_environment()
             scenario_id = None
@@ -2049,7 +2102,14 @@ def train(
                 raise
 
             if method_spec.agent == "random":
-                raw_joint_action = sample_random_joint_action(JOINT_ACTION_DIM)
+                raw_joint_action = sample_random_joint_action(
+                    JOINT_ACTION_DIM,
+                    rng_streams.numpy(
+                        "evaluation_random_movement"
+                        if evaluation
+                        else "random_movement"
+                    ),
+                )
             elif evaluation:
                 raw_joint_action = movement_agent.select_action(
                     state, add_noise=False, noise_std=0.0
@@ -2058,9 +2118,9 @@ def train(
             elif _uses_warmup_random_action(
                 total_joint_transitions, config.warmup_joint_transitions
             ):
-                raw_joint_action = np.random.uniform(
-                    -1.0, 1.0, size=JOINT_ACTION_DIM
-                ).astype(np.float32)
+                raw_joint_action = rng_streams.numpy(
+                    "movement_exploration"
+                ).uniform(-1.0, 1.0, size=JOINT_ACTION_DIM).astype(np.float32)
             else:
                 behavior_noise = movement_behavior_noise(
                     total_joint_transitions - config.warmup_joint_transitions,
@@ -2713,6 +2773,7 @@ def train(
                     warmup_joint_transitions=config.warmup_joint_transitions,
                     training_history_rows=training_history_rows,
                     dinkelbach_active=method_spec.uses_dinkelbach,
+                    named_rng_state=rng_streams.state_dict(),
                 ),
                 formal_config=formal_config,
                 movement_state_dim=MOVEMENT_STATE_DIM,
@@ -2873,7 +2934,14 @@ def train(
         "routing_ddqn_gamma": ddqn.gamma,
         "routing_agent_kind": ddqn.routing_agent_kind,
         "routing_policy": method_spec.routing,
-        "joint_replay_size": joint_replay.size,
+        "joint_replay_size": (
+            int(joint_replay.size) if joint_replay is not None else 0
+        ),
+        "joint_replay_diagnostics": (
+            joint_replay.diagnostics() if joint_replay is not None else None
+        ),
+        "rng_contract_version": RNG_CONTRACT_VERSION,
+        "rng_contract": rng_streams.metadata(),
         "routing_replay_size": (
             int(routing_replay.size) if routing_replay is not None else 0
         ),
