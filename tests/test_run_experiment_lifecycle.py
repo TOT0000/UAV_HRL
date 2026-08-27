@@ -468,7 +468,7 @@ class SimpleRunnerLifecycleIntegrationTest(unittest.TestCase):
                 final_payload["ddqn_state"]["constraint_state"][
                     "cost_multiplier_update_count"
                 ],
-                3,
+                2,
             )
             self.assertEqual(final_state["lambda_used_log"], [None, None, None])
             self.assertEqual(

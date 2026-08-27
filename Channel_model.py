@@ -15,7 +15,7 @@ import numpy as np
 
 CHANNEL_MODEL_VERSION = "sampled-a2g-conditional-5ms-block-fading-v1"
 CHANNEL_ENVIRONMENT_CONTRACT_VERSION = (
-    "boundary-aligned-one-second-a2g-state-fifty-block-service-v2"
+    "boundary-aligned-slot-range-masked-fifty-block-service-v3"
 )
 CHANNEL_FAIRNESS_CONTRACT_VERSION = "all-potential-links-fixed-order-crn-v1"
 CHANNEL_NORMALIZATION_VERSION = "link-type-fading-aware-physical-reference-v1"
@@ -429,7 +429,12 @@ def channel_configuration_metadata():
             "method": "fixed-order-Gauss-Laguerre",
             "order": EXPECTED_CAPACITY_QUADRATURE_ORDER,
         },
-        "communication_range_cutoff": None,
+        "communication_range_cutoff": {
+            "A2G_m": 200.0,
+            "A2A_m": 400.0,
+            "geometry": "slot-start-3d-euclidean-inclusive",
+            "profile_rng": "generated-for-all-potential-links-before-range-mask",
+        },
         "minimum_capacity_cutoff": None,
         "outage_per_harq": "disabled",
         "common_random_number_contract": CHANNEL_FAIRNESS_CONTRACT_VERSION,

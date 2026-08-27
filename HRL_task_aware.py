@@ -25,6 +25,7 @@ from dinkelbach_blocks import (
 )
 from Packet_scheduler_v1 import (
     EPISODE_INJECTION_CUTOFF_SECONDS,
+    PACKET_ENGINE_CHECKPOINT_SCHEMA_VERSION,
     PacketEngine,
     TASK_DEADLINE_SECONDS,
 )
@@ -44,6 +45,7 @@ from com_capacity_calibration import load_com_capacity_reference
 from exploration_schedules import movement_behavior_noise
 from evaluation_metrics import safe_energy_efficiency
 from experiment_config import (
+    COM_SESSION_LIFECYCLE_VERSION,
     COM_PACKET_SIZE_BITS,
     COM_OFFERED_RATE_BPS,
     DEFAULT_TRAINING_SEED,
@@ -87,6 +89,7 @@ from packet_outcome_artifacts import (
 )
 from routing_agents import create_routing_agent
 from routing_lifecycle import RoutingLearnerLifecycle
+from routing_transition_ledger import RoutingTransitionLedger
 from training_checkpoint import (
     CHECKPOINT_SCHEMA_VERSION,
     FULL_RESUME_LOGGING_SCHEMA_VERSION,
@@ -643,8 +646,11 @@ def _run_routing_slot(
     task_observation_mode="full",
     traffic_rate_overrides=None,
     pending_routing_transitions=None,
+    routing_transition_ledger=None,
 ):
     del routing_masks
+    if write_replay and int(getattr(routing_buffer, "n_step", -1)) != 1:
+        raise ValueError("formal routing replay requires n_step=1")
     step_time = float(packet_engine.step_time)
     env.current_time = float(current_time)
     absolute_slot = int(round(env.current_time / step_time))
@@ -667,13 +673,18 @@ def _run_routing_slot(
             violation_stats[task_type]["deadline_violated_packets"] += 1
         sender = int(violation["attributed_sender"])
         if write_replay:
-            if sender < 0 or not _attribute_routing_transition_cost(
+            if routing_transition_ledger is not None:
+                transition_id = violation.get("routing_transition_id")
+                if routing_transition_ledger.add_cost(transition_id, 1.0):
+                    packet_engine.replay_attributed_violation_cost_count += 1.0
+                else:
+                    packet_engine.unattributed_transition_violation_count += 1
+            elif sender >= 0 and _attribute_routing_transition_cost(
                 routing_buffer, pending_routing_transitions, sender, 1.0
             ):
-                raise AssertionError(
-                    "slot-boundary violation lacks its latest routing replay transition"
-                )
-            packet_engine.replay_attributed_violation_cost_count += 1.0
+                packet_engine.replay_attributed_violation_cost_count += 1.0
+            else:
+                packet_engine.unattributed_transition_violation_count += 1
     packet_engine.drop_expired_packets(env.current_time)
     backlog_before = _active_backlog(packet_engine)
     start_of_slot_hol_by_sender = {
@@ -724,12 +735,21 @@ def _run_routing_slot(
             )
 
     if write_replay:
-        _finalize_pending_routing_transitions(
-            routing_buffer,
-            pending_routing_transitions,
-            states,
-            start_of_slot_hol_by_sender,
-        )
+        if routing_transition_ledger is not None:
+            routing_transition_ledger.finalize_causality(
+                states, start_of_slot_hol_by_sender
+            )
+            routing_transition_ledger.commit_ready(
+                routing_buffer,
+                packet_engine.routing_transition_reference_counts(),
+            )
+        else:
+            _finalize_pending_routing_transitions(
+                routing_buffer,
+                pending_routing_transitions,
+                states,
+                start_of_slot_hol_by_sender,
+            )
 
     next_hops = _select_routing_actions(
         ddqn, states, effective_masks, epsilon=epsilon
@@ -743,6 +763,15 @@ def _run_routing_slot(
     active_capacities, _ = env.allocate_active_link_capacities(
         proposed_links, s2u_links=packet_engine.active_s2u_links(env)
     )
+    routing_transition_ids = {}
+    if write_replay and routing_transition_ledger is not None:
+        for uid in routing_decision_uav_ids:
+            routing_transition_ids[uid] = routing_transition_ledger.create(
+                agent_id=uid,
+                state=states[uid],
+                action=int(next_hops.get(uid, uid)),
+                tag_gt=int(env.num_GT),
+            )
     slot_result = packet_engine.serve_active_links(
         env,
         next_hops,
@@ -750,6 +779,11 @@ def _run_routing_slot(
         current_time=env.current_time,
         start_of_slot_hol_by_sender=start_of_slot_hol_by_sender,
         start_of_slot_eligible_packet_ids=start_of_slot_eligible_packet_ids,
+        start_of_slot_backlog_bits_by_sender={
+            uid: float(backlog_before.get(uid, 0.0))
+            for uid in routing_decision_uav_ids
+        },
+        routing_transition_ids_by_sender=routing_transition_ids,
         block_capacity_profiles=env.active_link_capacity_profiles_mbps,
         s2u_block_capacity_profiles=env.active_s2u_capacity_profiles_mbps,
     )
@@ -770,16 +804,28 @@ def _run_routing_slot(
             f"cost={attributed_cost}"
         )
     if write_replay:
-        for sender, cost in sorted(
-            slot_result["deferred_cost_by_sender"].items()
-        ):
-            if sender < 0 or not routing_buffer.attribute_latest_cost(
-                sender, cost
+        if routing_transition_ledger is not None:
+            for outcome in slot_result["outcomes"]:
+                if not outcome["violated"]:
+                    continue
+                transition_id = outcome.get("routing_transition_id")
+                if routing_transition_ledger.add_cost(transition_id, 1.0):
+                    packet_engine.replay_attributed_violation_cost_count += 1.0
+                else:
+                    packet_engine.unattributed_transition_violation_count += 1
+        else:
+            for sender, cost in sorted(
+                slot_result["deferred_cost_by_sender"].items()
             ):
-                raise AssertionError(
-                    "deadline violation lacks its latest routing replay transition"
-                )
-        packet_engine.replay_attributed_violation_cost_count += attributed_cost
+                if sender >= 0 and routing_buffer.attribute_latest_cost(
+                    sender, cost
+                ):
+                    packet_engine.replay_attributed_violation_cost_count += float(cost)
+                else:
+                    packet_engine.unattributed_transition_violation_count += int(cost)
+            packet_engine.replay_attributed_violation_cost_count += float(
+                sum(slot_result["cost_by_sender"].values())
+            )
     env.current_time = float(current_time) + step_time
     for outcome in slot_result["outcomes"]:
         task_type = outcome["task_type"]
@@ -791,8 +837,23 @@ def _run_routing_slot(
             violation_stats[task_type]["timely_delivered_packets"] += 1
 
     if write_replay:
-        immediate_next_states = {}
-        if pending_routing_transitions is None:
+        if routing_transition_ledger is not None:
+            for uid, transition_id in routing_transition_ids.items():
+                routing_transition_ledger.set_reward(
+                    transition_id, slot_result["reward_by_sender"][uid]
+                )
+            if done:
+                routing_transition_ledger.finalize_causality(
+                    {}, {}, terminal=True
+                )
+            routing_transition_ledger.commit_ready(
+                routing_buffer,
+                packet_engine.routing_transition_reference_counts(),
+            )
+            immediate_next_states = None
+        else:
+            immediate_next_states = {}
+        if routing_transition_ledger is None and pending_routing_transitions is None:
             backlog_after = _active_backlog(packet_engine)
             physical_next_states = {
                 uid: packet_engine.get_state_ta(
@@ -811,7 +872,7 @@ def _run_routing_slot(
                 )
                 for uid, state in physical_next_states.items()
             }
-        for uid in routing_decision_uav_ids:
+        for uid in routing_decision_uav_ids if routing_transition_ledger is None else ():
             next_hol = packet_engine.get_hol_packet(uid)
             transition_done = _routing_transition_done(done, next_hol)
             transition = {
@@ -872,17 +933,38 @@ def _select_routing_actions(ddqn, states, routing_masks, epsilon):
 def _mark_search_observations(env):
     if getattr(env, "_search_phase_over", False):
         return ()
-    transitions = []
-    for uav_id in range(env.num_UAV):
-        has_search = any(
+    search_uav_ids = [
+        uav_id
+        for uav_id in range(env.num_UAV)
+        if any(
             task.get("task_type") == "Search"
             for task in env.multi_tasks.get(uav_id, [])
         )
-        if has_search:
-            env.update_visited_grid(uav_id)
-            transition = env.mark_search_coverage(uav_id)
-            if transition is not None:
-                transitions.append(transition)
+    ]
+    if not search_uav_ids:
+        return ()
+    visited_precommit = env.visited_bitmap.copy()
+    # Discovery/geometry is evaluated first and does not mutate coverage.
+    for uav_id in search_uav_ids:
+        env.update_visited_grid(uav_id)
+    transitions = [
+        transition
+        for uav_id in search_uav_ids
+        for transition in (
+            env.mark_search_coverage(
+                uav_id,
+                visited_snapshot=visited_precommit,
+                commit=False,
+            ),
+        )
+        if transition is not None
+    ]
+    # Atomically commit the union only after every raw sample is frozen.
+    committed = env.visited_bitmap.copy()
+    for transition in transitions:
+        bx_min, bx_max, by_min, by_max = transition.current_footprint
+        committed[bx_min : bx_max + 1, by_min : by_max + 1] = True
+    env.visited_bitmap[:, :] = committed
     return tuple(transitions)
 
 
@@ -1044,6 +1126,8 @@ def _full_training_state(
     exploration_state,
     named_rng_state=None,
     channel_lifecycle_state=None,
+    routing_transition_state=None,
+    packet_engine_state=None,
 ):
     completed_episode_count = int(episode) + 1
     if lambda_cost_used_log is None:
@@ -1067,6 +1151,27 @@ def _full_training_state(
             "trajectory": {},
             "checkpoint_scope": "episode_boundary_terminal_snapshot",
             "mid_episode_checkpoint_supported": False,
+        }
+    if routing_transition_state is None:
+        routing_transition_state = RoutingTransitionLedger().state_dict()
+    if packet_engine_state is None:
+        packet_engine_state = {
+            "schema_version": PACKET_ENGINE_CHECKPOINT_SCHEMA_VERSION,
+            "checkpoint_scope": "episode_boundary_terminal_snapshot",
+            "mid_episode_checkpoint_supported": False,
+            "next_packet_id": 0,
+            "active_packets": [],
+            "uav_queue_packet_ids": {
+                str(uid): [] for uid in range(NUM_UAV)
+            },
+            "sr_queue_packet_ids": {},
+            "routing_transition_reference_counts": {},
+            "com_session_state": {
+                "lifecycle_version": COM_SESSION_LIFECYCLE_VERSION,
+                "sessions": {},
+            },
+            "pending_terminal_violation_events": [],
+            "unattributed_transition_violation_count": 0,
         }
     movement_post_warmup = max(
         int(total_joint_transitions) - int(warmup_joint_transitions), 0
@@ -1120,6 +1225,8 @@ def _full_training_state(
         "training_history_rows": list(training_history_rows),
         "named_rng_state": copy.deepcopy(named_rng_state),
         "channel_lifecycle_state": copy.deepcopy(channel_lifecycle_state),
+        "routing_transition_state": copy.deepcopy(routing_transition_state),
+        "packet_engine_state": copy.deepcopy(packet_engine_state),
     }
 
 
@@ -1677,6 +1784,9 @@ def train(
         if method_spec.learns_routing
         else None
     )
+    routing_transition_ledger = (
+        RoutingTransitionLedger() if method_spec.learns_routing else None
+    )
 
     experiment_identity = _experiment_identity(
         method_spec,
@@ -1920,6 +2030,14 @@ def train(
             training_run_directory=config.run_directory,
         )
         training_state = restored["training_state"]
+        if routing_transition_ledger is not None:
+            packet_state = training_state["packet_engine_state"]
+            routing_transition_ledger.load_state_dict(
+                training_state["routing_transition_state"],
+                reference_counts=packet_state[
+                    "routing_transition_reference_counts"
+                ],
+            )
         try:
             rng_streams.load_state_dict(training_state["named_rng_state"])
         except KeyError as exc:
@@ -2182,7 +2300,9 @@ def train(
                 "deadline_violated_packets": 0,
             },
         }
-        pending_routing_transitions = {}
+        pending_routing_transitions = (
+            {} if routing_transition_ledger is None else None
+        )
         expected_next_movement_state = None
         expected_next_movement_mask = None
         expected_next_movement_potentials = None
@@ -2319,6 +2439,7 @@ def train(
                     task_observation_mode=method_spec.task_observation,
                     traffic_rate_overrides=resolved_episode_rates,
                     pending_routing_transitions=pending_routing_transitions,
+                    routing_transition_ledger=routing_transition_ledger,
                 )
                 ddqn_action_selections += action_selections
                 interval_delivered_bits += delivered_bits
@@ -2496,19 +2617,27 @@ def train(
             float(config.episode_seconds)
         )
         if not evaluation and method_spec.learns_routing:
-            for sender, cost in sorted(
-                packet_engine.pending_terminal_cost_by_sender.items()
-            ):
-                if sender < 0:
-                    raise AssertionError(
-                        "terminal eligible violation has no routable sender"
-                    )
-                if not routing_replay.attribute_latest_cost(sender, cost):
-                    raise AssertionError(
-                        "terminal eligible violation lacks its terminal or "
-                        "latest routing replay transition"
-                    )
-                packet_engine.replay_attributed_violation_cost_count += float(cost)
+            for violation in packet_engine.pending_terminal_violation_events:
+                transition_id = violation.get("routing_transition_id")
+                if routing_transition_ledger.add_cost(transition_id, 1.0):
+                    packet_engine.replay_attributed_violation_cost_count += 1.0
+                else:
+                    packet_engine.unattributed_transition_violation_count += 1
+            routing_transition_ledger.finalize_causality(
+                {}, {}, terminal=True
+            )
+            routing_transition_ledger.commit_ready(
+                routing_replay,
+                packet_engine.routing_transition_reference_counts(),
+            )
+            routing_transition_ledger.assert_drained(
+                packet_engine.routing_transition_reference_counts()
+            )
+            packet_engine.pending_terminal_violation_events.clear()
+            packet_engine.pending_terminal_cost_by_sender.clear()
+        else:
+            packet_engine.pending_terminal_violation_events.clear()
+            packet_engine.pending_terminal_cost_by_sender.clear()
         episode_routing_cost_sum = float(packet_engine.total_violated)
         episode_eligible_packet_count = int(
             sum(packet_engine.eligible_packet_counts.values())
@@ -2519,12 +2648,13 @@ def train(
             not evaluation
             and method_spec.learns_routing
             and not np.isclose(
-                packet_engine.replay_attributed_violation_cost_count,
+                packet_engine.replay_attributed_violation_cost_count
+                + packet_engine.unattributed_transition_violation_count,
                 episode_routing_cost_sum,
             )
         ):
             raise AssertionError(
-                "replay-attributed cost count differs from canonical violations"
+                "attributed plus missing-ID routing costs differ from canonical violations"
             )
         episode_violation_probability = (
             episode_routing_cost_sum / float(episode_eligible_packet_count)
@@ -2716,6 +2846,9 @@ def train(
                 "routing_cost_eligible_packets": episode_eligible_packet_count,
                 "replay_attributed_violation_cost_count": float(
                     packet_engine.replay_attributed_violation_cost_count
+                ),
+                "unattributed_transition_violation_count": int(
+                    packet_engine.unattributed_transition_violation_count
                 ),
                 "lambda_cost_used": episode_lambda_cost,
                 "lambda_cost_after_episode": lambda_cost_after_episode,
@@ -2911,6 +3044,14 @@ def train(
                     dinkelbach_active=method_spec.uses_dinkelbach,
                     named_rng_state=rng_streams.state_dict(),
                     channel_lifecycle_state=env.channel_state_dict(),
+                    routing_transition_state=(
+                        routing_transition_ledger.state_dict(
+                            packet_engine.routing_transition_reference_counts()
+                        )
+                        if routing_transition_ledger is not None
+                        else RoutingTransitionLedger().state_dict()
+                    ),
+                    packet_engine_state=packet_engine.checkpoint_state(),
                 ),
                 formal_config=formal_config,
                 movement_state_dim=MOVEMENT_STATE_DIM,

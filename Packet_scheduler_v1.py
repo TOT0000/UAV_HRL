@@ -1,4 +1,5 @@
 import math
+from copy import deepcopy
 from collections import defaultdict, deque
 from Energy_model import EnergyConsumptionModel
 from Fov_model_phase import FovModel
@@ -12,18 +13,23 @@ from Channel_model import (
 )
 from centralized_movement import vs_data_valid
 from experiment_config import (
+    COM_SESSION_LIFECYCLE_VERSION,
     COM_PACKET_RATE_PER_SECOND,
     COM_PACKET_SIZE_BITS,
     FOV_EMA_LIFECYCLE_VERSION,
     PRODUCTION_PACKET_INJECTION_CUTOFF_SECONDS,
     PRODUCTION_TASK_DEADLINE_SECONDS,
-    ROUTING_CAPACITY_EPSILON_BPS,
     ROUTING_REWARD_ALPHA_CAPACITY,
     ROUTING_REWARD_ALPHA_DELAY,
     TOTAL_COMMUNICATION_BANDWIDTH_HZ,
 )
 from fov_ema_lifecycle import validate_fov_ema_state
 import numpy as np
+
+
+PACKET_ENGINE_CHECKPOINT_SCHEMA_VERSION = (
+    "episode-boundary-packet-reference-session-v1"
+)
 
 
 def final_hop_delivered_bits(to_target, gs_id, bits_tx_used):
@@ -206,7 +212,11 @@ class PacketEngine:
         self.eligible_packet_counts = {"FOV": 0, "COM": 0}
         self.sr_admission_drop_count = 0
         self.replay_attributed_violation_cost_count = 0.0
+        self.unattributed_transition_violation_count = 0
         self.pending_terminal_cost_by_sender = defaultdict(float)
+        self.pending_terminal_violation_events = []
+        self.routing_transition_refcounts = defaultdict(int)
+        self.com_sessions = {}
         self.packet_outcomes = []
 
         self.bp_skip_inject_steps = 0
@@ -374,12 +384,24 @@ class PacketEngine:
                 )
             previous = self._copy_footprint(previous)
             current = self._copy_footprint(current)
-            samples[uav_id] = self._fov_observation_sample(
-                env,
-                uav_id,
-                previous_footprint=previous,
-                current_footprint=current,
-            )
+            if (
+                transition is not None
+                and transition.raw_overlap is not None
+                and transition.raw_unvisited is not None
+                and transition.raw_frontier is not None
+            ):
+                samples[uav_id] = {
+                    "overlap": float(transition.raw_overlap),
+                    "unvisited": float(transition.raw_unvisited),
+                    "frontier": float(transition.raw_frontier),
+                }
+            else:
+                samples[uav_id] = self._fov_observation_sample(
+                    env,
+                    uav_id,
+                    previous_footprint=previous,
+                    current_footprint=current,
+                )
             current_footprints[uav_id] = current
 
         alpha = float(self.norm_cfg["ema_alpha"])
@@ -601,6 +623,7 @@ class PacketEngine:
             # routing decision, even after a just-completed relay hop changes
             # ``current`` before the receiver has had a decision slot.
             "last_routing_sender": None,
+            "last_routing_transition_id": None,
         }
         self.generated_packet_counts[task_type] += 1
         if source_kind == "UAV":
@@ -672,6 +695,36 @@ class PacketEngine:
             for pkt in self.uav_queues[int(uav_id)]
             if pkt is not None and not pkt.get("done", False)
         ]
+
+    def _set_packet_routing_transition(self, pkt, transition_id):
+        """Replace one packet's stable routing-credit reference."""
+
+        previous = pkt.get("last_routing_transition_id")
+        resolved = None if transition_id is None else int(transition_id)
+        if previous == resolved:
+            return False
+        if previous is not None:
+            previous = int(previous)
+            remaining = int(self.routing_transition_refcounts[previous]) - 1
+            if remaining < 0:
+                raise AssertionError("routing transition reference count became negative")
+            if remaining:
+                self.routing_transition_refcounts[previous] = remaining
+            else:
+                self.routing_transition_refcounts.pop(previous, None)
+        pkt["last_routing_transition_id"] = resolved
+        if resolved is not None:
+            self.routing_transition_refcounts[resolved] += 1
+        return True
+
+    def routing_transition_reference_counts(self):
+        return {
+            int(transition_id): int(count)
+            for transition_id, count in sorted(
+                self.routing_transition_refcounts.items()
+            )
+            if int(count) > 0
+        }
 
     def get_hol_packet(self, uav_id):
         queue = self.uav_queues[int(uav_id)]
@@ -823,6 +876,10 @@ class PacketEngine:
         fallback_owner = pkt.get("current", -1) if sender is None else sender
         last_sender = pkt.get("last_routing_sender")
         owner = int(fallback_owner if last_sender is None else last_sender)
+        transition_id = pkt.get("last_routing_transition_id")
+        transition_id = (
+            None if transition_id is None else int(transition_id)
+        )
         self.mark_packet_done(
             pkt,
             current_time=float(current_time),
@@ -832,6 +889,7 @@ class PacketEngine:
         return {
             "attributed_sender": owner,
             "sender": owner,
+            "routing_transition_id": transition_id,
             "task_type": task_type,
             "packet_id": int(pkt["id"]),
             "packet": pkt,
@@ -981,8 +1039,9 @@ class PacketEngine:
         *,
         pkt,
         current_time,
+        total_backlog_bits=None,
     ):
-        """Canonical capacity reward minus transmission and actual HOL wait."""
+        """Use frozen slot-start backlog and actual FDMA/fading capacity."""
 
         sender, receiver = int(sender), int(receiver)
         if pkt is None:
@@ -993,8 +1052,19 @@ class PacketEngine:
                 self._task_norm(pkt.get("task_type", "COM"))
             ]
         )
-        queue_delay = self._actual_hol_queue_wait_seconds(pkt, current_time)
-        queue_norm = float(np.clip(queue_delay / deadline, 0.0, 1.0))
+        # Retained for diagnostics only. Wall-clock HOL wait does not enter reward.
+        self._actual_hol_queue_wait_seconds(pkt, current_time)
+        hol_remaining_bits = max(float(pkt.get("rem_bits", 0.0)), 0.0)
+        if total_backlog_bits is None:
+            total_backlog_bits = float(self.backlog_bits.get(sender, 0.0))
+        total_backlog_bits = max(float(total_backlog_bits), 0.0)
+        if total_backlog_bits + PACKET_EPS < hol_remaining_bits:
+            raise AssertionError(
+                "slot-start total backlog is smaller than HOL remaining bits"
+            )
+        other_backlog_bits = max(
+            total_backlog_bits - hol_remaining_bits, 0.0
+        )
         service_available = (
             receiver != sender
             and np.isfinite(capacity_mbps)
@@ -1013,15 +1083,18 @@ class PacketEngine:
             capacity_norm = float(
                 np.clip(capacity_mbps / maximum_mbps, 0.0, 1.0)
             )
-            transmission_delay = max(float(pkt.get("rem_bits", 0.0)), 0.0) / max(
-                capacity_bps, ROUTING_CAPACITY_EPSILON_BPS
-            )
+            transmission_delay = hol_remaining_bits / capacity_bps
+            queue_delay = other_backlog_bits / capacity_bps
             transmission_norm = float(
                 np.clip(transmission_delay / deadline, 0.0, 1.0)
             )
+            queue_norm = float(
+                np.clip(queue_delay / deadline, 0.0, 1.0)
+            )
         else:
             capacity_norm = 0.0
-            transmission_norm = 1.0
+            transmission_norm = 1.0 if hol_remaining_bits > 0.0 else 0.0
+            queue_norm = 1.0 if other_backlog_bits > 0.0 else 0.0
         reward = (
             ROUTING_REWARD_ALPHA_CAPACITY * capacity_norm
             - ROUTING_REWARD_ALPHA_DELAY * (transmission_norm + queue_norm)
@@ -1161,7 +1234,9 @@ class PacketEngine:
                 self.s2u_completed_packets += 1
                 result["arrivals"].append(pkt)
             result["transmitted_bits_by_link"][("S2U", sr_id, receiver)] = transmitted
-            if transmitted > initial_budget + PACKET_EPS:
+            if transmitted > initial_budget + max(
+                PACKET_EPS, abs(initial_budget) * 1e-12
+            ):
                 self.link_slot_budget_violations += 1
                 raise AssertionError("S2U transmitted beyond its slot bit budget")
         return result
@@ -1175,6 +1250,8 @@ class PacketEngine:
         *,
         start_of_slot_hol_by_sender=None,
         start_of_slot_eligible_packet_ids=None,
+        start_of_slot_backlog_bits_by_sender=None,
+        routing_transition_ids_by_sender=None,
         block_capacity_profiles=None,
         s2u_block_capacity_profiles=None,
     ):
@@ -1217,6 +1294,30 @@ class PacketEngine:
         for sender, pkt in frozen_hol.items():
             if int(pkt["id"]) not in eligible_packet_ids[sender]:
                 raise AssertionError("frozen HOL is absent from its eligible snapshot")
+        if start_of_slot_backlog_bits_by_sender is None:
+            frozen_backlog = {
+                sender: float(self.backlog_bits.get(sender, 0.0))
+                for sender in frozen_hol
+            }
+        else:
+            frozen_backlog = {
+                int(sender): float(value)
+                for sender, value in start_of_slot_backlog_bits_by_sender.items()
+            }
+            if set(frozen_backlog) != set(frozen_hol):
+                raise AssertionError(
+                    "frozen backlog snapshots must match frozen HOL senders"
+                )
+        transition_ids = {
+            int(sender): int(transition_id)
+            for sender, transition_id in dict(
+                routing_transition_ids_by_sender or {}
+            ).items()
+        }
+        if transition_ids and set(transition_ids) != set(frozen_hol):
+            raise AssertionError(
+                "routing transition IDs must match frozen HOL senders"
+            )
         result = {
             "reward_by_sender": defaultdict(float),
             "cost_by_sender": defaultdict(float),
@@ -1240,17 +1341,37 @@ class PacketEngine:
             s2u_result["transmitted_bits_by_link"]
         )
 
+        reward_capacity_by_sender = {}
+        for sender in sorted(actions):
+            receiver = int(actions[sender])
+            capacity_mbps = float(
+                capacities.get((int(sender), receiver), 0.0)
+            )
+            profile = block_capacity_profiles.get((int(sender), receiver))
+            if receiver != int(sender) and profile is not None:
+                profile = self._block_service_profile(capacity_mbps, profile)
+                capacity_mbps = float(
+                    np.sum(profile * 1e6 * FADING_BLOCK_SECONDS)
+                    / (self.step_time * 1e6)
+                )
+            reward_capacity_by_sender[int(sender)] = capacity_mbps
+
         for sender in sorted(actions):
             receiver = int(actions[sender])
             hol = frozen_hol[int(sender)]
             hol["last_routing_sender"] = int(sender)
+            if sender in transition_ids:
+                self._set_packet_routing_transition(
+                    hol, transition_ids[sender]
+                )
             result["reward_by_sender"][int(sender)] = self.routing_local_reward(
                 env,
                 int(sender),
                 receiver,
-                capacities.get((int(sender), receiver), 0.0),
+                reward_capacity_by_sender[int(sender)],
                 pkt=hol,
                 current_time=current_time,
+                total_backlog_bits=frozen_backlog[sender],
             )
 
         for sender in sorted(actions):
@@ -1285,6 +1406,10 @@ class PacketEngine:
 
                 remaining_before = float(pkt.get("rem_bits", 0.0))
                 pkt["last_routing_sender"] = sender
+                if sender in transition_ids:
+                    self._set_packet_routing_transition(
+                        pkt, transition_ids[sender]
+                    )
                 if float(pkt.get("hop_bits_sent", 0.0)) <= PACKET_EPS:
                     service_start = cursor.current_time()
                     pkt["hop_service_start_time"] = service_start
@@ -1383,6 +1508,9 @@ class PacketEngine:
                                 result["outcomes"].append(
                                     {
                                         "attributed_sender": sender,
+                                        "routing_transition_id": violation[
+                                            "routing_transition_id"
+                                        ],
                                         "task_type": violation["task_type"],
                                         "packet_id": violation["packet_id"],
                                         "violated": True,
@@ -1405,6 +1533,9 @@ class PacketEngine:
                                 result["outcomes"].append(
                                     {
                                         "attributed_sender": sender,
+                                        "routing_transition_id": violation[
+                                            "routing_transition_id"
+                                        ],
                                         "task_type": violation["task_type"],
                                         "packet_id": violation["packet_id"],
                                         "violated": True,
@@ -1422,6 +1553,9 @@ class PacketEngine:
                             result["outcomes"].append(
                                 {
                                     "attributed_sender": sender,
+                                    "routing_transition_id": violation[
+                                        "routing_transition_id"
+                                    ],
                                     "task_type": violation["task_type"],
                                     "packet_id": violation["packet_id"],
                                     "violated": True,
@@ -1434,7 +1568,9 @@ class PacketEngine:
 
             transmitted = transmitted_on_link
             result["transmitted_bits_by_link"][link] = transmitted
-            if transmitted > initial_budget + PACKET_EPS:
+            if transmitted > initial_budget + max(
+                PACKET_EPS, abs(initial_budget) * 1e-12
+            ):
                 self.link_slot_budget_violations += 1
                 raise AssertionError(
                     f"link {link} transmitted {transmitted} bits beyond "
@@ -1455,6 +1591,9 @@ class PacketEngine:
             result["outcomes"].append(
                 {
                     "attributed_sender": sender,
+                    "routing_transition_id": violation[
+                        "routing_transition_id"
+                    ],
                     "task_type": violation["task_type"],
                     "packet_id": violation["packet_id"],
                     "violated": True,
@@ -1558,12 +1697,28 @@ class PacketEngine:
                     #     print(f"✅ Packet quota reached: {self.total_injected_packets}")
                     #     return
 
-        # COM data is generated at discovered/active SRs, never directly in a
-        # UAV queue. Assignment controls S2U reception, not source generation.
+        # COM generation begins only after its assigned UAV first enters the
+        # inclusive 200 m S2U range. Activation persists for the episode even
+        # while the assigned receiver later leaves range.
         for sr in sorted(getattr(env, "SR_teams", ()), key=lambda item: item.id):
             if getattr(sr, "assigned_gt_id", None) is None:
                 continue
-            key = f"SR_{int(sr.id)}_COM"
+            sr_id = int(sr.id)
+            session = self.com_sessions.setdefault(
+                sr_id,
+                {"session_active": False, "activation_time_seconds": None},
+            )
+            assigned_uav = self.assigned_com_uav(env, sr_id)
+            if (
+                not session["session_active"]
+                and assigned_uav is not None
+                and env.is_s2u_in_range(sr_id, assigned_uav)
+            ):
+                session["session_active"] = True
+                session["activation_time_seconds"] = float(current_time)
+            if not session["session_active"]:
+                continue
+            key = f"SR_{sr_id}_COM"
             self.inject_buffer[key] += base_ctrl_rate * step_time
             num_packets = int(self.inject_buffer[key])
             if num_packets <= 0:
@@ -1571,8 +1726,56 @@ class PacketEngine:
             self.inject_buffer[key] -= num_packets
             for _ in range(num_packets):
                 self.create_sr_packet(
-                    int(sr.id), COM_PACKET_SIZE_BITS, current_time
+                    sr_id, COM_PACKET_SIZE_BITS, current_time
                 )
+
+    def com_session_state(self):
+        return {
+            "lifecycle_version": COM_SESSION_LIFECYCLE_VERSION,
+            "sessions": {
+                str(sr_id): {
+                    "session_active": bool(state["session_active"]),
+                    "activation_time_seconds": state[
+                        "activation_time_seconds"
+                    ],
+                }
+                for sr_id, state in sorted(self.com_sessions.items())
+            },
+        }
+
+    def checkpoint_state(self):
+        """Serialize packet/session/reference state for exact resume."""
+
+        active_packets = sorted(
+            (deepcopy(pkt) for pkt in self.get_active_packets()),
+            key=lambda pkt: int(pkt["id"]),
+        )
+        return {
+            "schema_version": PACKET_ENGINE_CHECKPOINT_SCHEMA_VERSION,
+            "checkpoint_scope": "episode_boundary_terminal_snapshot",
+            "mid_episode_checkpoint_supported": False,
+            "next_packet_id": int(self._next_pkt_id),
+            "active_packets": active_packets,
+            "uav_queue_packet_ids": {
+                str(uid): [int(pkt["id"]) for pkt in queue]
+                for uid, queue in sorted(self.uav_queues.items())
+            },
+            "sr_queue_packet_ids": {
+                str(sr_id): [int(pkt["id"]) for pkt in queue]
+                for sr_id, queue in sorted(self.sr_queues.items())
+            },
+            "routing_transition_reference_counts": {
+                str(key): int(value)
+                for key, value in self.routing_transition_reference_counts().items()
+            },
+            "com_session_state": self.com_session_state(),
+            "pending_terminal_violation_events": deepcopy(
+                self.pending_terminal_violation_events
+            ),
+            "unattributed_transition_violation_count": int(
+                self.unattributed_transition_violation_count
+            ),
+        }
 
     def mark_packet_done(
         self, pkt, current_time=None, reason=None, remove_from_queue=True
@@ -1604,6 +1807,7 @@ class PacketEngine:
             pkt["finish_time"] = current_time
         terminal_reason = str(pkt.get("reason", "done"))
         self._record_terminal_outcome(pkt, terminal_reason)
+        self._set_packet_routing_transition(pkt, None)
 
         # 2) remove the packet from whichever per-UAV FIFO currently owns it.
         if remove_from_queue:
@@ -1691,6 +1895,7 @@ class PacketEngine:
                     reason="terminal_deadline",
                 )
                 if event is not None:
+                    self.pending_terminal_violation_events.append(event)
                     self.pending_terminal_cost_by_sender[
                         int(event["attributed_sender"])
                     ] += 1.0
@@ -1893,7 +2098,11 @@ class PacketEngine:
         self.eligible_packet_counts = {"FOV": 0, "COM": 0}
         self.sr_admission_drop_count = 0
         self.replay_attributed_violation_cost_count = 0.0
+        self.unattributed_transition_violation_count = 0
         self.pending_terminal_cost_by_sender = defaultdict(float)
+        self.pending_terminal_violation_events = []
+        self.routing_transition_refcounts = defaultdict(int)
+        self.com_sessions = {}
         self.packet_outcomes = []
         self.delay_log = []  # 每跳記錄
         self.type_delay_accum = {

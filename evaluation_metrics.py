@@ -26,6 +26,11 @@ from experiment_paths import (
 )
 from scenario_manifest import ScenarioManifest
 from training_checkpoint import inspect_model_checkpoint
+from evaluation_aggregation import (
+    EVALUATION_AGGREGATION_SCHEMA_VERSION,
+    aggregate_episode_rows_by_seed,
+    aggregate_seed_rows,
+)
 
 
 IDENTITY_COLUMNS = (
@@ -58,9 +63,19 @@ METRIC_COLUMNS = (
     "routing_wait_count",
     "partial_transmission_count",
     "slot_budget_violation_count",
+    "unattributed_transition_violation_count",
 )
 
 OPTIONAL_METRIC_COLUMNS = {"delay_violation_probability"}
+
+SEED_CANONICAL_METRIC_COLUMNS = (
+    "fov_average_e2e_delay_seconds",
+    "com_average_e2e_delay_seconds",
+    "fov_violation_probability",
+    "com_violation_probability",
+    "all_violation_probability",
+)
+SEED_SUMMARY_METRIC_COLUMNS = (*METRIC_COLUMNS, *SEED_CANONICAL_METRIC_COLUMNS)
 
 PACKET_METRIC_COLUMNS = tuple(
     f"{task}_{field}"
@@ -84,6 +99,17 @@ PACKET_METRIC_COLUMNS = tuple(
     "com_rate_packets_per_second",
     "fov_deadline_seconds",
     "com_deadline_seconds",
+)
+
+CANONICAL_AGGREGATION_INPUT_COLUMNS = tuple(
+    f"{task}_{field}"
+    for task in ("fov", "com")
+    for field in (
+        "eligible_packets",
+        "delivered_packets",
+        "delivered_e2e_delay_sum_seconds",
+        "violation_packets",
+    )
 )
 
 EPISODE_COLUMNS = (*IDENTITY_COLUMNS, *METRIC_COLUMNS, *PACKET_METRIC_COLUMNS)
@@ -116,6 +142,10 @@ def aggregation_metadata(seed_count):
         "degrees_of_freedom": degrees_of_freedom,
         "t_critical_975": critical,
         "pooled_episode_inference": False,
+        "aggregation_schema_version": EVALUATION_AGGREGATION_SCHEMA_VERSION,
+        "within_seed_rule": "ratio of episode numerator sums / denominator sums",
+        "cross_seed_rule": "equal weight across valid trained-policy seed values",
+        "zero_denominator": "missing",
     }
 
 
@@ -191,6 +221,32 @@ def summarize_training_seeds(episode_rows):
                 if row[metric] is not None
             ]
             summary[metric] = fmean(values) if values else None
+        canonical_rows = aggregate_episode_rows_by_seed(rows)
+        canonical = {
+            (row["metric"], row.get("task_type")): row["value"]
+            for row in canonical_rows
+        }
+        summary["energy_efficiency_mbit_per_j"] = canonical[
+            ("energy_efficiency_mbit_per_j", None)
+        ]
+        summary["fov_average_e2e_delay_seconds"] = canonical[
+            ("average_e2e_delay_seconds", "FOV")
+        ]
+        summary["com_average_e2e_delay_seconds"] = canonical[
+            ("average_e2e_delay_seconds", "COM")
+        ]
+        summary["fov_violation_probability"] = canonical[
+            ("violation_probability", "FOV")
+        ]
+        summary["com_violation_probability"] = canonical[
+            ("violation_probability", "COM")
+        ]
+        summary["all_violation_probability"] = canonical[
+            ("violation_probability", "ALL")
+        ]
+        summary["delay_violation_probability"] = summary[
+            "all_violation_probability"
+        ]
         summaries.append(summary)
     return summaries
 
@@ -218,7 +274,7 @@ def aggregate_seed_means(seed_summaries):
             training_manifest_hash,
             checkpoint_completed_episodes,
         ) = key
-        for metric in METRIC_COLUMNS:
+        for metric in SEED_SUMMARY_METRIC_COLUMNS:
             values = [
                 float(row[metric])
                 for row in rows
@@ -283,7 +339,11 @@ def validate_formal_aggregation_rows(
         raise ValueError("expected seed and episode counts must be positive")
     missing = [
         column
-        for column in (*IDENTITY_COLUMNS, *METRIC_COLUMNS)
+        for column in (
+            *IDENTITY_COLUMNS,
+            *METRIC_COLUMNS,
+            *CANONICAL_AGGREGATION_INPUT_COLUMNS,
+        )
         if any(column not in row for row in episode_rows)
     ]
     if missing:
@@ -397,7 +457,7 @@ def write_evaluation_outputs(output_dir, episode_rows, run_metadata):
         for row in episode_rows
     ]
     seed_summaries = summarize_training_seeds(normalized_rows)
-    seed_fields = (*SEED_SUMMARY_IDENTITY_COLUMNS, *METRIC_COLUMNS)
+    seed_fields = (*SEED_SUMMARY_IDENTITY_COLUMNS, *SEED_SUMMARY_METRIC_COLUMNS)
 
     per_episode_csv = _write_csv(
         output_dir / "per_episode.csv", normalized_rows, EPISODE_COLUMNS
@@ -419,6 +479,25 @@ def write_evaluation_outputs(output_dir, episode_rows, run_metadata):
         + "\n",
         encoding="utf-8",
     )
+    canonical_seed_rows = aggregate_episode_rows_by_seed(normalized_rows)
+    canonical_cross_seed_rows = aggregate_seed_rows(canonical_seed_rows)
+    canonical_seed_json = output_dir / "canonical_per_seed_aggregation.json"
+    canonical_seed_json.write_text(
+        json.dumps(canonical_seed_rows, indent=2, ensure_ascii=False, allow_nan=False)
+        + "\n",
+        encoding="utf-8",
+    )
+    canonical_cross_seed_json = output_dir / "canonical_cross_seed_aggregation.json"
+    canonical_cross_seed_json.write_text(
+        json.dumps(
+            canonical_cross_seed_rows,
+            indent=2,
+            ensure_ascii=False,
+            allow_nan=False,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
     metadata_path = output_dir / "run_metadata.json"
     metadata_path.write_text(
         json.dumps(run_metadata, indent=2, ensure_ascii=False, allow_nan=False)
@@ -430,6 +509,8 @@ def write_evaluation_outputs(output_dir, episode_rows, run_metadata):
         "per_episode_jsonl": per_episode_jsonl,
         "per_training_seed_csv": seed_csv,
         "per_training_seed_json": seed_json,
+        "canonical_per_seed_aggregation_json": canonical_seed_json,
+        "canonical_cross_seed_aggregation_json": canonical_cross_seed_json,
         "run_metadata": metadata_path,
     }
 
@@ -609,10 +690,27 @@ def run_aggregate_command(args):
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    seed_fields = (*SEED_SUMMARY_IDENTITY_COLUMNS, *METRIC_COLUMNS)
+    seed_fields = (*SEED_SUMMARY_IDENTITY_COLUMNS, *SEED_SUMMARY_METRIC_COLUMNS)
     aggregate_fields = tuple(aggregate_rows[0].keys())
     _write_csv(output_dir / "per_training_seed_summary.csv", seed_summaries, seed_fields)
     _write_csv(output_dir / "cross_seed_summary.csv", aggregate_rows, aggregate_fields)
+    canonical_seed_rows = aggregate_episode_rows_by_seed(episode_rows)
+    canonical_cross_seed_rows = aggregate_seed_rows(canonical_seed_rows)
+    (output_dir / "canonical_per_seed_aggregation.json").write_text(
+        json.dumps(canonical_seed_rows, indent=2, ensure_ascii=False, allow_nan=False)
+        + "\n",
+        encoding="utf-8",
+    )
+    (output_dir / "canonical_cross_seed_aggregation.json").write_text(
+        json.dumps(
+            canonical_cross_seed_rows,
+            indent=2,
+            ensure_ascii=False,
+            allow_nan=False,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
     (output_dir / "cross_seed_summary.json").write_text(
         json.dumps(aggregate_rows, indent=2, ensure_ascii=False, allow_nan=False)
         + "\n",

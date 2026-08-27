@@ -251,6 +251,9 @@ class RoutingBoundaryReplayTest(unittest.TestCase):
         env = Simulator(10, rng_streams=NamedRNGStreams(105))
         env.num_GT = 2
         env.reset_environment()
+        env.uav_dict[0].x_u = 100.0
+        env.uav_dict[0].y_u = 0.0
+        env.uav_dict[0].z_u = 100.0
         env.channel.u2g_los_state[:] = True
         env.channel.s2u_los_state[:] = True
         env.update_u2g_channels()
@@ -307,7 +310,8 @@ class RoutingBoundaryReplayTest(unittest.TestCase):
         np.testing.assert_array_equal(replay.next_state[0], policy.observations[1][1])
         self.assertFalse(np.array_equal(policy.observations[0][1], policy.observations[1][1]))
         self.assertEqual(
-            set(np.flatnonzero(policy.observations[1][2])), {0, env.GS_ID}
+            set(np.flatnonzero(policy.observations[1][2])),
+            {0, env.GS_ID},
         )
 
     def test_boundary_expiration_cost_attaches_to_pending_transition_before_truncation(self):
@@ -489,7 +493,7 @@ class CompatibilityAndRegistryTest(unittest.TestCase):
         )
 
     def test_old_boundary_checkpoint_is_rejected_before_restore(self):
-        self.assertEqual(CHECKPOINT_SCHEMA_VERSION, 13)
+        self.assertEqual(CHECKPOINT_SCHEMA_VERSION, 14)
         with self.assertRaisesRegex(RuntimeError, "must be retrained"):
             _validate_checkpoint_schema({"checkpoint_schema_version": 12})
 
@@ -506,7 +510,7 @@ class CompatibilityAndRegistryTest(unittest.TestCase):
                     configuration["movement_replay_contract_version"],
                 )
                 self.assertIn(
-                    "pending-next-observation",
+                    "causality-credit-pending",
                     configuration["packet_routing_causality_contract_version"],
                 )
 

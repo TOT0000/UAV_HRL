@@ -363,6 +363,7 @@ class ReplayBufferDiscrete:
         self.total_added = 0
         self.rng = rng or np.random.default_rng(0)
         self.tag_gt = np.full((self.max_size, 1), -1, dtype=np.int16)
+        self.transition_id = np.full((self.max_size,), -1, dtype=np.int64)
 
         self.state      = np.zeros((self.max_size, state_dim), dtype=np.float32)
         self.action     = np.zeros((self.max_size,), dtype=np.int64)
@@ -381,7 +382,7 @@ class ReplayBufferDiscrete:
     @torch.no_grad()
     def add(
         self, state, action, next_state, reward, cost, done, tag_gt=None,
-        agent_id=None,
+        agent_id=None, transition_id=None,
     ):
         s  = _to_np_float32(state)
         a  = _to_np_float32(action)
@@ -390,13 +391,14 @@ class ReplayBufferDiscrete:
         d  = bool(done)
         c  = float(cost)
         tg = int(tag_gt) if tag_gt is not None else -1
+        tid = int(transition_id) if transition_id is not None else -1
 
-        self.n_step_buffer.append((s, a, ns, r, c, d, tg))
+        self.n_step_buffer.append((s, a, ns, r, c, d, tg, tid))
         if len(self.n_step_buffer) < self.n_step:
             return
 
         R, C, next_s, done_flag = 0.0, 0.0, None, False
-        for idx, (_, _, ns_i, r_i, c_i, d_i, _) in enumerate(self.n_step_buffer):
+        for idx, (_, _, ns_i, r_i, c_i, d_i, _, _) in enumerate(self.n_step_buffer):
             g = self.gamma ** idx
             R += g * float(r_i)
             C += g * float(c_i)
@@ -407,7 +409,7 @@ class ReplayBufferDiscrete:
         if not done_flag:
             next_s = self.n_step_buffer[-1][2]
 
-        s0, a0, _, _, _, _, tg0 = self.n_step_buffer[0]
+        s0, a0, _, _, _, _, tg0, tid0 = self.n_step_buffer[0]
 
         i = self.ptr
         self.state[i]       = s0
@@ -417,6 +419,7 @@ class ReplayBufferDiscrete:
         self.cost[i, 0]     = C
         self.not_done[i, 0] = 1.0 - float(done_flag)
         self.tag_gt[i, 0]   = tg0  # ★ 寫入場景標籤
+        self.transition_id[i] = tid0
         if agent_id is not None:
             self.latest_index_by_agent[int(agent_id)] = i
 

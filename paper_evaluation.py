@@ -723,7 +723,10 @@ def run_paper_evaluation(
                 "task diagnostics and ALL each pool raw canonical violations / "
                 "raw eligible packets across episodes; ALL pools FOV+COM"
             ),
-            "energy_efficiency": "sum timely delivered Mbit / max(sum mobility J, epsilon)",
+            "energy_efficiency": (
+                "per-seed sum timely delivered Mbit / sum mobility J; "
+                "zero denominator is missing; valid seed values are equally weighted"
+            ),
             "zero_delivered_delay": "null with missing=true",
         },
         "points": point_results,

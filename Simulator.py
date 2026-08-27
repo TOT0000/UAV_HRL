@@ -33,6 +33,8 @@ from Energy_model import EnergyConsumptionModel
 from Task_assignment import UAVAssigner, Task
 from object import UAV, SRTeam, GroundTarget
 from experiment_config import (
+    A2A_COMMUNICATION_RANGE_M,
+    A2G_COMMUNICATION_RANGE_M,
     FOV_COM_PAIR_MAX_DISTANCE_M,
     COM_OFFERED_RATE_BPS,
     NUM_UAV,
@@ -54,6 +56,9 @@ class FovCoverageTransition:
     previous_footprint: tuple[int, int, int, int] | None
     current_footprint: tuple[int, int, int, int]
     map_changed: bool
+    raw_overlap: float | None = None
+    raw_unvisited: float | None = None
+    raw_frontier: float | None = None
 
 
 class Simulator:
@@ -123,6 +128,11 @@ class Simulator:
         self.gs_capacity = np.zeros(self.num_UAV+1)
         self.u2u_nominal_capacity = self.Capacity_matrix.copy()
         self.u2g_nominal_capacity = self.gs_capacity.copy()
+        self.u2u_range_mask = np.ones(
+            (self.num_UAV, self.num_UAV), dtype=bool
+        )
+        np.fill_diagonal(self.u2u_range_mask, False)
+        self.u2g_range_mask = np.ones(self.num_UAV, dtype=bool)
         self.active_link_capacities = {}
         self.active_link_bandwidths = {}
         self.active_s2u_capacities = {}
@@ -292,8 +302,10 @@ class Simulator:
             return None
         return (int(bx_min), int(bx_max), int(by_min), int(by_max))
 
-    def mark_search_coverage(self, uav_id):
-        """Apply coverage and return the uncommitted footprint transition."""
+    def mark_search_coverage(
+        self, uav_id, *, visited_snapshot=None, commit=True
+    ):
+        """Build one immutable pre-commit Search-map transition."""
 
         uav = self.uav_dict[uav_id]
         current = self.fov_footprint_indices(uav_id)
@@ -302,14 +314,47 @@ class Simulator:
         previous = getattr(uav, "last_box_idx", None)
         previous = tuple(int(value) for value in previous) if previous is not None else None
         bx_min, bx_max, by_min, by_max = current
-        patch = self.visited_bitmap[bx_min : bx_max + 1, by_min : by_max + 1]
+        snapshot = (
+            self.visited_bitmap
+            if visited_snapshot is None
+            else np.asarray(visited_snapshot, dtype=bool)
+        )
+        if snapshot.shape != self.visited_bitmap.shape:
+            raise ValueError("Search pre-commit bitmap shape is incompatible")
+        patch = snapshot[bx_min : bx_max + 1, by_min : by_max + 1]
         map_changed = bool((~patch).any())
-        self.visited_bitmap[bx_min : bx_max + 1, by_min : by_max + 1] = True
+        raw_unvisited = float((~patch).mean()) if patch.size else 0.0
+        if patch.size:
+            border = np.concatenate(
+                [patch[0, :], patch[-1, :], patch[:, 0], patch[:, -1]]
+            )
+            raw_frontier = float((~border).mean())
+        else:
+            raw_frontier = 0.0
+        if previous is None:
+            raw_overlap = 0.0
+        else:
+            lbx_min, lbx_max, lby_min, lby_max = previous
+            ix_min, iy_min = max(bx_min, lbx_min), max(by_min, lby_min)
+            ix_max, iy_max = min(bx_max, lbx_max), min(by_max, lby_max)
+            intersection = (
+                (ix_max - ix_min + 1) * (iy_max - iy_min + 1)
+                if ix_max >= ix_min and iy_max >= iy_min
+                else 0
+            )
+            raw_overlap = intersection / float(max(patch.size, 1))
+        if commit:
+            self.visited_bitmap[
+                bx_min : bx_max + 1, by_min : by_max + 1
+            ] = True
         return FovCoverageTransition(
             uav_id=int(uav_id),
             previous_footprint=previous,
             current_footprint=current,
             map_changed=map_changed,
+            raw_overlap=float(raw_overlap),
+            raw_unvisited=float(raw_unvisited),
+            raw_frontier=float(raw_frontier),
         )
         
         # if (not self.search_completed) and self.is_search_done(cov_th=0.8, min_found=4):
@@ -681,7 +726,7 @@ class Simulator:
     get_sr_uav_reference_capacity_mbps = get_sr_uav_capacity_mbps
 
     def get_sr_uav_normalized_utility(self, uav_id, sr_id):
-        """Return the shared fixed-reference COM utility for one link."""
+        """Return prospective COM utility without the hard service cutoff."""
 
         return normalized_s2u_capacity_utility(
             self.uav_dict[int(uav_id)].get_position(),
@@ -716,13 +761,23 @@ class Simulator:
                     )
                 )
         self.PL_uu_cache = path_loss
-        feasible = np.isfinite(capacity) & (capacity > 0.0)
-        np.fill_diagonal(feasible, False)
+        distances = np.linalg.norm(
+            positions[:, None, :] - positions[None, :, :], axis=-1
+        )
+        self.u2u_range_mask = distances <= A2A_COMMUNICATION_RANGE_M
+        np.fill_diagonal(self.u2u_range_mask, False)
+        feasible = (
+            self.u2u_range_mask
+            & np.isfinite(capacity)
+            & (capacity > 0.0)
+        )
         self.k_u_u2u = feasible.sum(axis=1)
         self.k_bar_u2u = float(self.k_u_u2u.mean())
         self.B_eff_u2u = np.full(count, self.B_tot, dtype=float)
         self.u2u_nominal_capacity = capacity
-        self.Capacity_matrix = capacity.copy()
+        self.Capacity_matrix = np.where(
+            self.u2u_range_mask, capacity, 0.0
+        )
 
     # ==========================U2G channel model============================
     # 無人機與地面站
@@ -748,7 +803,52 @@ class Simulator:
             ],
             dtype=float,
         )
-        self.gs_capacity = self.u2g_nominal_capacity.copy()
+        distances = np.linalg.norm(positions - gs_position[None, :], axis=1)
+        self.u2g_range_mask = distances <= A2G_COMMUNICATION_RANGE_M
+        self.gs_capacity = np.where(
+            self.u2g_range_mask, self.u2g_nominal_capacity, 0.0
+        )
+
+    @staticmethod
+    def distance_3d(first_position, second_position):
+        return float(
+            np.linalg.norm(
+                np.asarray(first_position, dtype=np.float64)
+                - np.asarray(second_position, dtype=np.float64)
+            )
+        )
+
+    def is_u2u_in_range(self, sender_id, receiver_id):
+        sender_id, receiver_id = int(sender_id), int(receiver_id)
+        if sender_id == receiver_id:
+            return False
+        if not hasattr(self, "uav_dict"):
+            return bool(self.u2u_range_mask[sender_id, receiver_id])
+        return self.distance_3d(
+            self.uav_dict[sender_id].get_position(),
+            self.uav_dict[receiver_id].get_position(),
+        ) <= A2A_COMMUNICATION_RANGE_M
+
+    def is_u2g_in_range(self, sender_id):
+        if not hasattr(self, "uav_dict"):
+            return bool(self.u2g_range_mask[int(sender_id)])
+        return self.distance_3d(
+            self.uav_dict[int(sender_id)].get_position(), self.GS_pos
+        ) <= A2G_COMMUNICATION_RANGE_M
+
+    def is_s2u_in_range(self, sr_id, uav_id):
+        if not hasattr(self, "uav_dict") or not self.SR_teams:
+            return False
+        return self.distance_3d(
+            self.SR_teams[int(sr_id)].get_position(),
+            self.uav_dict[int(uav_id)].get_position(),
+        ) <= A2G_COMMUNICATION_RANGE_M
+
+    def is_routing_link_in_range(self, sender_id, receiver_id):
+        receiver_id = int(receiver_id)
+        if receiver_id == self.GS_ID:
+            return self.is_u2g_in_range(sender_id)
+        return self.is_u2u_in_range(sender_id, receiver_id)
 
     def allocate_active_link_capacities(self, proposed_links, s2u_links=None):
         """Equal-FDMA then recompute 50 capacities using one cached gain profile."""
@@ -766,10 +866,12 @@ class Simulator:
             (int(sender), int(receiver))
             for sender, receiver in sorted(proposed_links.items())
             if int(receiver) != int(sender)
+            and self.is_routing_link_in_range(sender, receiver)
         ]
         s2u_links = {
             int(sr_id): int(uav_id)
             for sr_id, uav_id in dict(s2u_links or {}).items()
+            if self.is_s2u_in_range(sr_id, uav_id)
         }
         total_links = len(active_links) + len(s2u_links)
         shared_bandwidth = self.B_tot / total_links if total_links else 0.0
@@ -808,6 +910,17 @@ class Simulator:
                     "fading_blocks": FADING_BLOCKS_PER_ROUTING_SLOT,
                     "slot_service_bits": float(slot_service_bits(profile)),
                     "gain_profile_reused": True,
+                    "range_eligible": True,
+                    "distance_3d_m": (
+                        self.distance_3d(
+                            self.uav_dict[sender].get_position(),
+                            self.GS_pos
+                            if link_type == "U2G"
+                            else self.uav_dict[receiver].get_position(),
+                        )
+                        if hasattr(self, "uav_dict")
+                        else None
+                    ),
                 }
             )
         s2u_capacities = {}
@@ -846,6 +959,10 @@ class Simulator:
                     "fading_blocks": FADING_BLOCKS_PER_ROUTING_SLOT,
                     "slot_service_bits": float(slot_service_bits(profile)),
                     "gain_profile_reused": True,
+                    "range_eligible": True,
+                    "distance_3d_m": self.distance_3d(
+                        sr_position, uav_position
+                    ),
                 }
             )
 
@@ -881,13 +998,21 @@ class Simulator:
                 if to_id == from_uav_id:
                     continue
                 cap = float(self.Capacity_matrix[from_uav_id, to_id])
-                if np.isfinite(cap) and cap > 0.0:
+                if (
+                    bool(self.u2u_range_mask[from_uav_id, to_id])
+                    and np.isfinite(cap)
+                    and cap > 0.0
+                ):
                     mask[to_id] = 1.0
 
         # UAV → GS
         if self.gs_capacity is not None:
             cap_gs = float(self.gs_capacity[from_uav_id])
-            if np.isfinite(cap_gs) and cap_gs > 0.0:
+            if (
+                bool(self.u2g_range_mask[from_uav_id])
+                and np.isfinite(cap_gs)
+                and cap_gs > 0.0
+            ):
                 mask[num_uav] = 1.0
 
         return mask

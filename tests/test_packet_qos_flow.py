@@ -125,9 +125,12 @@ class PacketQosFlowTest(unittest.TestCase):
     def test_injection_cutoff_is_strictly_before_58_5_seconds(self):
         env = SimpleNamespace(
             source_uavs=set(),
-            multi_tasks={},
+            multi_tasks={
+                0: [{"task_type": "COM", "target_obj_id": 0}]
+            },
             SR_teams=[SimpleNamespace(id=0, assigned_gt_id=0, arrived=False)],
             load_factor=1.0,
+            is_s2u_in_range=lambda sr_id, uav_id: True,
         )
         engine = PacketEngine(num_uav=1, step_time=0.25)
         engine.inject_packets(

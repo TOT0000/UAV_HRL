@@ -386,10 +386,22 @@ class ObservationFdmaAndPacketServiceTest(unittest.TestCase):
         self.assertTrue(np.all(np.isfinite(ratios)))
         self.assertTrue(np.all((ratios >= 0.0) & (ratios <= 1.0 + 1e-12)))
         self.assertLess(float(np.mean(ratios >= 1.0 - 1e-12)), 0.1)
-        self.assertTrue(np.all(env.get_routing_action_mask(0)[1:] > 0.0))
+        mask = env.get_routing_action_mask(0).astype(bool)
+        expected = np.array(
+            [
+                True if receiver == 0 else env.is_routing_link_in_range(0, receiver)
+                for receiver in range(env.num_UAV + 1)
+            ],
+            dtype=bool,
+        )
+        np.testing.assert_array_equal(mask, expected)
 
     def test_equal_fdma_recomputes_profiles_and_reuses_slot_gains(self):
         env = make_environment(82)
+        env.uav_dict[2].x_u = 100.0
+        env.uav_dict[2].y_u = 0.0
+        env.uav_dict[2].z_u = 100.0
+        env.update_u2g_channels()
         env.prepare_channel_routing_slot(0)
         gains_before = env.channel.gain_profile("U2U", 0, 1).copy()
         draw_count = env.channel.small_scale_normal_draw_count

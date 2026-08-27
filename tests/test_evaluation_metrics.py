@@ -29,6 +29,14 @@ class EvaluationMetricTest(unittest.TestCase):
             "checkpoint_metadata_fingerprint": f"checkpoint-{training_seed}",
         }
         row.update({metric: float(value) for metric in METRIC_COLUMNS})
+        # Canonical EE is computed from raw per-seed numerator/denominator sums.
+        row["timely_goodput_mbits"] = float(value)
+        row["total_mobility_energy_j"] = 1.0
+        for prefix in ("fov", "com"):
+            row[f"{prefix}_delivered_packets"] = 1
+            row[f"{prefix}_delivered_e2e_delay_sum_seconds"] = float(value)
+            row[f"{prefix}_violation_packets"] = 0
+            row[f"{prefix}_eligible_packets"] = 1
         return row
 
     def test_zero_energy_efficiency_is_finite(self):

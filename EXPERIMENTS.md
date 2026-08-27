@@ -114,20 +114,27 @@ design-dataset collection, aggregation, and exact-resume workflows.
   excluded from both numerator and denominator
 - learned routing uses the common local reward
   `capacity_norm - 0.5 * (transmission_delay_norm + queue_delay_norm)` with
-  fixed canonical U2U/U2G reference capacities and no distance/progress bonus
+  fixed canonical U2U/U2G reference capacities and no distance/progress bonus.
+  For the frozen slot-start aggregate FIFO, transmission delay is the HOL
+  remaining bits divided by the actual equal-FDMA/fading slot capacity and
+  queue delay is all remaining bits behind that HOL divided by the same
+  capacity. Elapsed wall-clock HOL wait is diagnostic only
 - production FOV/COM deadlines `1.5 s`/`1.0 s`; completion at the exact deadline
   is timely
 - production packet injection cutoff `58.5 s`
-- Search footprints advance after every accepted physical transition, including
-  transitions that add no map cells; FOV EMA advances only on map change/reset.
-  Each overlap sample uses an immutable previous/current pair, and routing state
+- At each one-second Search boundary all Search UAVs compute raw unvisited,
+  frontier, overlap, and `map_changed` values from one immutable pre-commit
+  bitmap. Their footprint union is committed atomically before the single EMA
+  update, Search-to-Hover conversion, or assignment. Routing state
   getters are pure reads. Full checkpoints persist EMA values, initialization,
   previous footprints, footprint/EMA markers, and EMA update count.
   SR routes omit the duplicated start point, include the exact target, and mark
   arrival on the update that consumes the final waypoint. The only mutable SR
-  lifecycle fields are `assigned_gt_id` and `arrived`; movement and COM-source
-  enablement are read-only derived state, and assigned SRs keep generating COM
-  after arrival. These lifecycle fields remain episode-boundary snapshots in
+  lifecycle fields are `assigned_gt_id` and `arrived`. A COM session produces
+  no packets until its assigned UAV first enters the inclusive 200 m S2U
+  range; activation is permanent for the episode and packet generation then
+  continues at 50 packets/s even while the UAV is out of range. These lifecycle
+  fields remain episode-boundary snapshots in
   full checkpoints
   mid-episode checkpointing is explicitly unsupported.
 - 100 evaluation episodes
@@ -166,8 +173,12 @@ second.
 U2U links retain the directed sender-absolute-AGL, 3-D-distance, 2.4 GHz paper
 path-loss model and are always LoS. U2U and sampled A2G LoS links use normalized
 Rician fading with linear `K=10` (`10 dB`); sampled A2G NLoS links use normalized
-Rayleigh fading. No distance cutoff, `C_min`, outage/PER, HARQ, shadowing, or
-retransmission model is added.
+Rayleigh fading. Hard slot-start 3-D ranges are inclusive: S2U/U2G use 200 m
+and U2U uses 400 m. Out-of-range links have zero observable and service
+capacity, are absent from the physical mask, and consume no FDMA bandwidth.
+The full potential-link fading profile is still generated before the range
+mask, preserving policy-independent RNG draw counts. No `C_min`, outage/PER,
+HARQ, shadowing, or retransmission model is added.
 
 Routing decisions remain every 0.25 seconds. Before each decision the private
 channel lifecycle vectorizes fifty 5 ms gains for every potential directed U2U,
@@ -206,15 +217,20 @@ geometry/state. The next loop iteration reuses this prepared state, so every
 non-terminal movement replay `next_state`, projection mask, and `phi_*_t1`
 exactly equal the next policy observation, mask, and `phi_*_t`.
 
-Routing transitions that still have a next HOL decision remain pending instead
-of recording an end-of-slot observation. At the next slot, packet injection,
+Every routing decision, including Wait, receives a global monotonic transition
+ID. Packets retain the exact ID of their last routing action. Routing
+transitions first remain causality-pending instead of recording an end-of-slot
+observation. At the next slot, packet injection,
 expiration/cleanup, start-of-slot HOL eligibility, effective masks, and routing
 observations are resolved in their canonical order. Boundary expiration cost is
-first attached to the pending transition, which is then finalized using that
-actual decision observation. A sender without a next decision is truncated;
-the fourth slot is not unconditionally terminal. The episode-terminal slot is
-finalized immediately and does not sample a nonexistent next-episode channel
-state.
+attached by packet transition ID, never by the sender's latest replay index.
+After the actual next observation is fixed, a transition remains credit-pending
+while any active packet still references it and is not sampleable. Delivery,
+expiration, or replacement by a newer action releases that reference. Packets
+with no routing transition still contribute to system QoS and increment an
+explicit missing-ID diagnostic without receiving fabricated replay credit.
+Formal routing replay is one-step. Episode-terminal packet outcomes and costs
+are settled before the ledger is drained.
 
 Run one method and the configured training seed per training/evaluation job.
 Evaluation episodes are averaged within the seed; additional explicitly run
@@ -359,10 +375,11 @@ python -X utf8 comparison_experiment.py aggregate --input-dir runs/comparison/ev
 
 Exact-resume checkpoints validate the method fingerprint, training-manifest
 relationship, training seed, the complete Dinkelbach block state, and its configuration.
-Checkpoint schema v13 is the current boundary-aligned stochastic-channel,
-movement/routing replay, utility/QoS,
-routing-causality, actual-HOL-wait reward, pooled-QoS aggregation, propulsion,
-and four-slot/fifty-block movement-channel contract. Schema v12 and every older
+Checkpoint schema v14 is the current boundary-aligned stochastic-channel,
+movement/routing replay, utility/QoS, routing-ID causality/credit,
+frozen-backlog reward, hard-range/COM-session, atomic-FOV, seed-ratio
+aggregation, propulsion, and four-slot/fifty-block movement-channel contract.
+Schema v13 and every older
 schema is rejected before weights or replay state are restored and must be
 retrained; no legacy checkpoint migration is attempted. The current schema
 stores the 429/30/90 dimensions, movement feature schema, direct-ratio bit/J
@@ -408,15 +425,22 @@ Every evaluation episode writes method/seed/scenario identity plus:
   coverage, and found-GT ratio
 - routing Waits, partial transmissions, and slot-budget violations
 
-Zero or invalid energy produces an EE value of `0.0`, never NaN or infinity.
+Zero or invalid per-episode energy produces an episode diagnostic EE value of
+`0.0`, never NaN or infinity. Canonical aggregation treats a zero pooled
+denominator as missing.
 Each evaluation directory contains `per_episode.csv`, `per_episode.jsonl`,
 `per_training_seed_summary.csv`, `per_training_seed_summary.json`, and
 `run_metadata.json`. Formal aggregation defaults to exactly five seeds and 100
 rows per seed, requires identical scenario sets and compatible identities, and
 rejects duplicate reruns or non-finite values. For smaller deterministic tests,
 override `--expected-seed-count` and `--expected-episodes-per-seed` explicitly.
-Aggregation writes `cross_seed_summary.csv`, JSON, and Student-t methodology in
-`aggregation_metadata.json`.
+Canonical within-seed aggregation uses numerator/denominator sums for EE,
+FOV/COM/ALL violation probability, and FOV/COM delay. Valid seed ratios receive
+equal weight across seeds with sample SD and Student-t 95% CI; zero-denominator
+seeds are missing. Generic and paper paths share `evaluation_aggregation.py`.
+Artifacts include per-seed numerator, denominator, units, schema, valid seed
+count, and CI provenance. Aggregation also writes `cross_seed_summary.csv`,
+JSON, and Student-t methodology in `aggregation_metadata.json`.
 
 Formal training uses `packet_outcome_artifact_mode=disabled` and
 `collect_packet_outcomes=false`. It never retains a cross-episode list of raw
@@ -581,13 +605,16 @@ traffic-rate/deadline/cutoff overrides. The deadline-violation (Fig. 6) sweep
 uses a scoped `57.0 s` packet-injection cutoff so its maximum `3.0 s` deadline
 can resolve within the 60-second horizon; other training and evaluation suites
 retain the production `58.5 s` cutoff.
-Delay is pooled as total delivered E2E delay divided by total delivered packet
-count. FOV and COM violation rows remain diagnostics. The formal `ALL` row pools
-the two raw violation counts over the two raw eligible counts, and Fig. 6 reads
-only `ALL` while labeling the task whose deadline is swept. A delay with no
+Within each training seed, delay is total delivered E2E delay divided by total
+delivered packet count. FOV and COM violation rows remain diagnostics. The
+formal `ALL` seed row pools the two raw violation counts over the two raw
+eligible counts, and Fig. 6 reads only `ALL` while labeling the task whose
+deadline is swept. Across seeds, valid seed ratios are equally weighted with a
+Student-t interval. A delay with no
 delivered packets, or violation probability with no eligible packets, is
 `null` with `missing=true`. EE
-comparison points use pooled timely Mbit divided by pooled mobility joules.
+comparison points use each seed's summed timely Mbit divided by summed mobility
+joules, followed by the same equal-weight cross-seed rule.
 
 Every non-trajectory point has exactly the following six canonical aggregate
 rows, keyed by `(method_id, point_id, metric, task_type)`:
@@ -601,8 +628,9 @@ violation_probability       / COM
 violation_probability       / ALL
 ```
 
-The shared production helper in `paper_metrics.py` both computes and validates
-these rows. Before figure-specific filtering, the builder rejects missing,
+The shared canonical formulas live in `evaluation_aggregation.py`;
+`paper_metrics.py` adapts and validates these rows. Before figure-specific
+filtering, the builder rejects missing,
 duplicate, extra, or semantically invalid rows (including rows unused by the
 requested figure). It then requires exact canonical agreement among the
 top-level `aggregated_plot_data.json`, the union of all point-level aggregate

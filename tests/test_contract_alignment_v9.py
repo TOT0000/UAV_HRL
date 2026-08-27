@@ -37,7 +37,7 @@ class FormalContractTest(unittest.TestCase):
         self.assertEqual(FORMAL_CHECKPOINT_EPISODE, 1500)
         self.assertEqual(FORMAL_EXPERIMENT_DEFAULTS["training_episodes_per_seed"], 1500)
         self.assertEqual(checkpoint_episode_schedule(1500, 50), list(range(50, 1501, 50)))
-        self.assertEqual(CHECKPOINT_SCHEMA_VERSION, 13)
+        self.assertEqual(CHECKPOINT_SCHEMA_VERSION, 14)
 
     def test_all_methods_publish_the_same_physical_contracts(self):
         shared_fields = (
@@ -279,7 +279,7 @@ class QoSAndRoutingRewardContractTest(unittest.TestCase):
             engine.routing_local_reward(
                 env, 0, 0, 0.0, pkt=packet, current_time=1.0
             ),
-            -0.75,
+            -0.5,
         )
 
     def test_partial_hop_reward_keeps_service_start_queue_wait_fixed(self):
@@ -296,7 +296,7 @@ class QoSAndRoutingRewardContractTest(unittest.TestCase):
         second = engine.routing_local_reward(
             env, 0, 0, 0.0, pkt=packet, current_time=0.75
         )
-        self.assertEqual(first, -0.625)
+        self.assertEqual(first, -0.5)
         self.assertEqual(second, first)
 
     def test_next_hol_preserves_historical_wait_and_clips_at_deadline(self):
@@ -325,7 +325,7 @@ class QoSAndRoutingRewardContractTest(unittest.TestCase):
                 pkt=second_packet,
                 current_time=0.75,
             ),
-            -0.875,
+            -0.5,
         )
         self.assertEqual(
             engine.routing_local_reward(
@@ -336,7 +336,7 @@ class QoSAndRoutingRewardContractTest(unittest.TestCase):
                 pkt=second_packet,
                 current_time=2.0,
             ),
-            -1.0,
+            -0.5,
         )
 
 

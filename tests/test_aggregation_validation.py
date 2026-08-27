@@ -22,6 +22,18 @@ class FormalAggregationValidationTest(unittest.TestCase):
                     "checkpoint_metadata_fingerprint": f"checkpoint-{seed}",
                 }
                 row.update({metric: 1.0 for metric in METRIC_COLUMNS})
+                row.update(
+                    {
+                        "com_delivered_e2e_delay_sum_seconds": 1.0,
+                        "com_delivered_packets": 1,
+                        "com_eligible_packets": 1,
+                        "com_violation_packets": 1,
+                        "fov_delivered_e2e_delay_sum_seconds": 1.0,
+                        "fov_delivered_packets": 1,
+                        "fov_eligible_packets": 1,
+                        "fov_violation_packets": 1,
+                    }
+                )
                 rows.append(row)
         return rows
 

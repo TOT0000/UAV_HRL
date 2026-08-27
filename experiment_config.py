@@ -7,6 +7,8 @@ import hashlib
 import json
 from types import MappingProxyType
 
+from evaluation_aggregation import EVALUATION_AGGREGATION_SCHEMA_VERSION
+
 from Channel_model import (
     CHANNEL_ENVIRONMENT_CONTRACT_VERSION,
     CHANNEL_FAIRNESS_CONTRACT_VERSION,
@@ -41,6 +43,14 @@ REFERENCE_COM_BANDWIDTH_HZ = TOTAL_COMMUNICATION_BANDWIDTH_HZ / (
 COM_PACKET_RATE_PER_SECOND = 50.0
 COM_PACKET_SIZE_BITS = 256.0
 COM_OFFERED_RATE_BPS = COM_PACKET_RATE_PER_SECOND * COM_PACKET_SIZE_BITS
+A2G_COMMUNICATION_RANGE_M = 200.0
+A2A_COMMUNICATION_RANGE_M = 400.0
+COMMUNICATION_RANGE_CONTRACT_VERSION = (
+    "slot-start-3d-inclusive-a2g-200m-a2a-400m-v1"
+)
+COM_SESSION_LIFECYCLE_VERSION = (
+    "assigned-first-in-range-activation-persistent-generation-v1"
+)
 ASSIGNMENT_DUMMY_UTILITY = -1e-9
 UTILITY_NORMALIZATION_MODE = "fov-global-minmax-com-fading-aware-reference-v3"
 COM_UTILITY_CONTRACT_VERSION = "fixed-s2u-los-rician-expected-maximum-v2"
@@ -78,18 +88,22 @@ ROUTING_LEARNING_RATE = 1e-3
 ROUTING_GAMMA = 0.99
 ROUTING_TAU = 0.005
 ROUTING_OPTIMIZER_UPDATE_SCOPE = "every_4_routing_slots"
-FOV_EMA_LIFECYCLE_VERSION = "no-map-footprint-progression-v3"
+FOV_EMA_LIFECYCLE_VERSION = "atomic-precommit-search-snapshot-v4"
 SR_ROUTE_LIFECYCLE_VERSION = "assigned-and-arrived-derived-state-v2"
-PACKET_QOS_CONTRACT_VERSION = "eligible-fov-plus-next-slot-s2u-admitted-com-v4"
+PACKET_QOS_CONTRACT_VERSION = "activated-com-plus-next-slot-s2u-admitted-v5"
 PACKET_ROUTING_CAUSALITY_CONTRACT_VERSION = (
-    "start-of-slot-hol-pending-next-observation-v2"
+    "transition-id-causality-credit-pending-one-step-v3"
+)
+ROUTING_COST_ATTRIBUTION_CONTRACT_VERSION = (
+    "packet-stable-transition-id-reference-count-v1"
 )
 PACKET_SERVICE_CONTRACT_VERSION = "fifty-5ms-block-cumulative-service-v1"
-QOS_AGGREGATE_CONTRACT_VERSION = "pooled-fov-com-eligible-v1"
-ROUTING_REWARD_CONTRACT_VERSION = "fading-effective-capacity-minus-actual-hol-wait-v4"
+QOS_AGGREGATE_CONTRACT_VERSION = "seed-pooled-ratio-of-sums-student-t-v2"
+ROUTING_REWARD_CONTRACT_VERSION = (
+    "slot-start-other-backlog-over-fading-effective-capacity-v5"
+)
 ROUTING_REWARD_ALPHA_CAPACITY = 1.0
 ROUTING_REWARD_ALPHA_DELAY = 0.5
-ROUTING_CAPACITY_EPSILON_BPS = 1e-9
 MOVEMENT_CHANNEL_TIMING_VERSION = (
     "boundary-prepared-held-command-four-slots-fifty-fading-blocks-v4"
 )
@@ -721,15 +735,26 @@ def comparison_method_configuration(method_spec: MethodSpec) -> dict:
         "fov_ema_lifecycle_version": FOV_EMA_LIFECYCLE_VERSION,
         "sr_route_lifecycle_version": SR_ROUTE_LIFECYCLE_VERSION,
         "packet_qos_contract_version": PACKET_QOS_CONTRACT_VERSION,
+        "com_session_lifecycle_version": COM_SESSION_LIFECYCLE_VERSION,
+        "communication_range_contract_version": (
+            COMMUNICATION_RANGE_CONTRACT_VERSION
+        ),
+        "a2g_communication_range_m": A2G_COMMUNICATION_RANGE_M,
+        "a2a_communication_range_m": A2A_COMMUNICATION_RANGE_M,
         "packet_routing_causality_contract_version": (
             PACKET_ROUTING_CAUSALITY_CONTRACT_VERSION
         ),
+        "routing_cost_attribution_contract_version": (
+            ROUTING_COST_ATTRIBUTION_CONTRACT_VERSION
+        ),
         "packet_service_contract_version": PACKET_SERVICE_CONTRACT_VERSION,
         "qos_aggregate_contract_version": QOS_AGGREGATE_CONTRACT_VERSION,
+        "evaluation_aggregation_schema_version": (
+            EVALUATION_AGGREGATION_SCHEMA_VERSION
+        ),
         "routing_reward_contract_version": ROUTING_REWARD_CONTRACT_VERSION,
         "routing_reward_alpha_capacity": ROUTING_REWARD_ALPHA_CAPACITY,
         "routing_reward_alpha_delay": ROUTING_REWARD_ALPHA_DELAY,
-        "routing_capacity_epsilon_bps": ROUTING_CAPACITY_EPSILON_BPS,
         "reference_u2u_max_capacity_mbps": (
             reference_u2u_max_capacity_mbps(TOTAL_COMMUNICATION_BANDWIDTH_HZ)
         ),

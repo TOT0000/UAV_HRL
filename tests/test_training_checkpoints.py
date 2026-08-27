@@ -45,6 +45,7 @@ from training_checkpoint import (
 from utils_update_v2 import ReplayBufferDiscrete, ReplayBufferJoint
 from fov_ema_fixtures import initialized_fov_ema_state
 from channel_fixtures import initialized_channel_lifecycle_state
+from routing_transition_fixtures import routing_transition_checkpoint_fixture
 
 
 ROUTING_STATE_DIM = 90
@@ -105,6 +106,7 @@ def _lifecycle_training_state(
             "mid_episode_checkpoint_supported": False,
         },
         "channel_lifecycle_state": initialized_channel_lifecycle_state(),
+        **routing_transition_checkpoint_fixture(),
         "routing_lifecycle_state": lifecycle,
         "routing_epsilon_decay_start_slot": lifecycle[
             "routing_epsilon_decay_start_slot"
@@ -401,6 +403,7 @@ class FullResumeCheckpointTest(unittest.TestCase):
             cost=0.25,
             done=False,
             tag_gt=4,
+            transition_id=100,
         )
         routing.add(
             routing_state,
@@ -410,6 +413,7 @@ class FullResumeCheckpointTest(unittest.TestCase):
             cost=0.5,
             done=True,
             tag_gt=4,
+            transition_id=101,
         )
         ddqn.train(routing, batch_size=1)
         ddqn.update_target()
@@ -443,6 +447,7 @@ class FullResumeCheckpointTest(unittest.TestCase):
                 routing_updates=1,
                 routing_warmup=1,
             ),
+            **routing_transition_checkpoint_fixture(102),
         }
         formal_config = asdict(
             formal_training_config(
@@ -567,6 +572,10 @@ class FullResumeCheckpointTest(unittest.TestCase):
         )
         np.testing.assert_array_equal(
             restored_routing.cost[: routing.size], routing.cost[: routing.size]
+        )
+        np.testing.assert_array_equal(
+            restored_routing.transition_id[: routing.size],
+            routing.transition_id[: routing.size],
         )
         restored_state = dict(restored["training_state"])
         expected_state = dict(training_state)
@@ -971,7 +980,7 @@ class TrainingCliTest(unittest.TestCase):
         )
 
     def test_checkpoint_schema_is_explicit(self):
-        self.assertEqual(CHECKPOINT_SCHEMA_VERSION, 13)
+        self.assertEqual(CHECKPOINT_SCHEMA_VERSION, 14)
 
 
 if __name__ == "__main__":

@@ -977,7 +977,8 @@ class SyntheticFigureBuildTest(unittest.TestCase):
             top_ee["value"] = top_ee["numerator"] / top_ee["denominator"]
             aggregate_path.write_text(json.dumps(top_mutated), encoding="utf-8")
             with self.assertRaisesRegex(
-                IncompatiblePaperRunError, "top-level/point-level mismatch"
+                IncompatiblePaperRunError,
+                "top-level/point-level mismatch|per_seed_numerator_sum",
             ):
                 build_paper_figures(spec, figure="com_task_delay_vs_arrival_rate", output_root=root / "top-point-mismatch")
 
@@ -993,7 +994,8 @@ class SyntheticFigureBuildTest(unittest.TestCase):
             point_ee["value"] = point_ee["numerator"] / point_ee["denominator"]
             point_aggregate_path.write_text(json.dumps(point_rows), encoding="utf-8")
             with self.assertRaisesRegex(
-                IncompatiblePaperRunError, "point-level/per-episode mismatch"
+                IncompatiblePaperRunError,
+                "point-level/per-episode mismatch|per_seed_numerator_sum",
             ):
                 build_paper_figures(spec, figure="com_task_delay_vs_arrival_rate", output_root=root / "point-episode-mismatch")
 

@@ -23,6 +23,7 @@ from centralized_movement import (
     movement_mask_from_state,
 )
 from experiment_config import (
+    COM_SESSION_LIFECYCLE_VERSION,
     MOVEMENT_ACTION_PROJECTION_CONTRACT_VERSION,
     MOVEMENT_REPLAY_CONTRACT_VERSION,
     MOVEMENT_WARMUP_CONTRACT_VERSION,
@@ -30,6 +31,12 @@ from experiment_config import (
     SAFE_DDQN_ETA_C,
     SAFE_DDQN_INITIAL_LAMBDA_COST,
     SAFE_DDQN_QOS_TARGET_PROBABILITY,
+)
+from Packet_scheduler_v1 import (
+    PACKET_ENGINE_CHECKPOINT_SCHEMA_VERSION,
+)
+from routing_transition_ledger import (
+    validate_routing_transition_ledger_state,
 )
 from rng_contract import (
     CHANNEL_RNG_STREAMS,
@@ -51,7 +58,7 @@ from dinkelbach_blocks import (
     dinkelbach_config_metadata,
 )
 
-CHECKPOINT_SCHEMA_VERSION = 13
+CHECKPOINT_SCHEMA_VERSION = 14
 ROUTING_LIFECYCLE_CHECKPOINT_SCHEMA_VERSION = 6
 PRE_ROUTING_LIFECYCLE_CHECKPOINT_SCHEMA_VERSION = 5
 PRE_ADAPTIVE_SAFE_DDQN_CHECKPOINT_SCHEMA_VERSION = 4
@@ -102,6 +109,7 @@ ROUTING_REPLAY_FIELDS = (
     "cost",
     "not_done",
     "tag_gt",
+    "transition_id",
 )
 
 FORMAL_CORE_CONFIG_FIELDS = (
@@ -155,13 +163,18 @@ FORMAL_CORE_CONFIG_FIELDS = (
     "fov_ema_lifecycle_version",
     "sr_route_lifecycle_version",
     "packet_qos_contract_version",
+    "com_session_lifecycle_version",
+    "communication_range_contract_version",
+    "a2g_communication_range_m",
+    "a2a_communication_range_m",
     "packet_routing_causality_contract_version",
+    "routing_cost_attribution_contract_version",
     "packet_service_contract_version",
     "qos_aggregate_contract_version",
+    "evaluation_aggregation_schema_version",
     "routing_reward_contract_version",
     "routing_reward_alpha_capacity",
     "routing_reward_alpha_delay",
-    "routing_capacity_epsilon_bps",
     "reference_u2u_max_capacity_mbps",
     "reference_u2g_max_capacity_mbps",
     "propulsion_model_id",
@@ -2295,6 +2308,45 @@ def _validate_full_resume_logging_state(
         validate_channel_lifecycle_state(
             training_state.get("channel_lifecycle_state"), num_uav=NUM_UAV
         )
+        packet_state = training_state.get("packet_engine_state")
+        if not isinstance(packet_state, dict):
+            raise RuntimeError("checkpoint packet-engine state is missing")
+        if (
+            packet_state.get("schema_version")
+            != PACKET_ENGINE_CHECKPOINT_SCHEMA_VERSION
+            or packet_state.get("checkpoint_scope")
+            != "episode_boundary_terminal_snapshot"
+            or packet_state.get("mid_episode_checkpoint_supported") is not False
+        ):
+            raise RuntimeError("checkpoint packet-engine lifecycle is incompatible")
+        if packet_state.get("active_packets"):
+            raise RuntimeError("episode-boundary checkpoint contains active packets")
+        uav_queues = packet_state.get("uav_queue_packet_ids")
+        if (
+            not isinstance(uav_queues, dict)
+            or set(uav_queues) != {str(uid) for uid in range(NUM_UAV)}
+            or any(value for value in uav_queues.values())
+            or any(value for value in dict(packet_state.get("sr_queue_packet_ids") or {}).values())
+        ):
+            raise RuntimeError("episode-boundary checkpoint packet queues are not empty")
+        packet_refs = packet_state.get("routing_transition_reference_counts")
+        if not isinstance(packet_refs, dict) or packet_refs:
+            raise RuntimeError("episode-boundary checkpoint has packet routing references")
+        if packet_state.get("pending_terminal_violation_events"):
+            raise RuntimeError("checkpoint has unprocessed terminal violation events")
+        com_state = packet_state.get("com_session_state")
+        if (
+            not isinstance(com_state, dict)
+            or com_state.get("lifecycle_version")
+            != COM_SESSION_LIFECYCLE_VERSION
+        ):
+            raise RuntimeError("checkpoint COM-session lifecycle is incompatible")
+        ledger_state = validate_routing_transition_ledger_state(
+            training_state.get("routing_transition_state"),
+            reference_counts=packet_refs,
+        )
+        if ledger_state["entries"]:
+            raise RuntimeError("episode-boundary checkpoint routing ledger is not drained")
     if (
         int(checkpoint_schema_version)
         >= ROUTING_LIFECYCLE_CHECKPOINT_SCHEMA_VERSION

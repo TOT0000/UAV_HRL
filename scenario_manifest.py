@@ -14,6 +14,9 @@ import uuid
 import numpy as np
 
 from experiment_config import (
+    A2A_COMMUNICATION_RANGE_M,
+    A2G_COMMUNICATION_RANGE_M,
+    COMMUNICATION_RANGE_CONTRACT_VERSION,
     NUM_UAV,
     RESERVED_SEARCH_UAV_IDS,
     ROI_COUNT_MAX,
@@ -71,6 +74,11 @@ def current_environment_config() -> dict[str, Any]:
         "bit_resolution_m": 2,
         "uav_energy_max_j": 10000.0,
         "active_link_bandwidth_hz": 10e6,
+        "a2g_communication_range_m": A2G_COMMUNICATION_RANGE_M,
+        "a2a_communication_range_m": A2A_COMMUNICATION_RANGE_M,
+        "communication_range_contract_version": (
+            COMMUNICATION_RANGE_CONTRACT_VERSION
+        ),
         "uav_initial_layout": UAV_INITIAL_LAYOUT,
         "reserved_search_uav_ids": list(RESERVED_SEARCH_UAV_IDS),
         "gt_radius_m": 80.0,

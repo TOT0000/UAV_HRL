@@ -76,7 +76,7 @@ class Uav10ConfigurationContractTest(unittest.TestCase):
         data["schema_version"] = "uav-hrl-scenario-v2"
         with self.assertRaisesRegex(ValueError, "16-UAV.*incompatible"):
             ScenarioManifest.from_dict(data)
-        self.assertEqual(CHECKPOINT_SCHEMA_VERSION, 13)
+        self.assertEqual(CHECKPOINT_SCHEMA_VERSION, 14)
         with self.assertRaisesRegex(RuntimeError, "must be retrained"):
             _validate_checkpoint_schema({"checkpoint_schema_version": 9})
 
@@ -251,6 +251,21 @@ class ChannelAndPacketContractTest(unittest.TestCase):
         self.assertNotAlmostEqual(reverse, expected)
 
     def test_all_link_types_share_one_fdma_pool(self):
+        positions = {
+            0: (100.0, 0.0, 100.0),
+            1: (0.0, 0.0, 100.0),
+            2: (100.0, 0.0, 100.0),
+            3: (0.0, 0.0, 100.0),
+        }
+        for uid, (x, y, z) in positions.items():
+            self.env.uav_dict[uid].x_u = x
+            self.env.uav_dict[uid].y_u = y
+            self.env.uav_dict[uid].z_u = z
+        self.env.SR_teams[0].x = 0.0
+        self.env.SR_teams[0].y = 0.0
+        self.env.SR_teams[0].z = 0.0
+        self.env.update_u2u_channels()
+        self.env.update_u2g_channels()
         routing, bandwidths = self.env.allocate_active_link_capacities(
             {0: self.env.GS_ID, 1: 2}, s2u_links={0: 3}
         )
