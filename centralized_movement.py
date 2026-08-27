@@ -4,7 +4,18 @@ import numpy as np
 import torch
 from scipy.integrate import quad
 
-from experiment_config import NUM_UAV, ROI_COUNT_MAX
+from experiment_config import (
+    A2G_COMMUNICATION_RANGE_M,
+    COM_CAPACITY_POTENTIAL_WEIGHT,
+    COM_DISTANCE_POTENTIAL_WEIGHT,
+    GROUND_ALTITUDE_M,
+    NUM_UAV,
+    ROI_COUNT_MAX,
+    TASK_POTENTIAL_NORMALIZATION_EPSILON,
+    UAV_MAX_ALTITUDE_M,
+    VS_DISTANCE_POTENTIAL_WEIGHT,
+    VS_SENSING_POTENTIAL_WEIGHT,
+)
 from Fov_model_phase import FovModel
 
 
@@ -235,6 +246,109 @@ def normalized_com_link_quality(env, uav_id, task):
     if not math.isfinite(utility) or not 0.0 <= utility <= 1.0:
         raise RuntimeError("canonical normalized COM link quality is invalid")
     return utility
+
+
+def _finite_position(position, dimensions):
+    try:
+        values = tuple(float(value) for value in position)
+    except (TypeError, ValueError):
+        return None
+    if len(values) < dimensions or not all(
+        math.isfinite(value) for value in values[:dimensions]
+    ):
+        return None
+    return values
+
+
+def _positive_finite_reference(value, name):
+    value = float(value)
+    if not math.isfinite(value) or value <= 0.0:
+        raise ValueError(f"{name} must be positive and finite")
+    return value
+
+
+def normalized_horizontal_target_proximity(
+    uav_position,
+    target_position,
+    env_width,
+    env_height,
+):
+    """Return clipped 2-D target proximity using the environment diagonal."""
+
+    width = _positive_finite_reference(env_width, "environment width")
+    height = _positive_finite_reference(env_height, "environment height")
+    uav = _finite_position(uav_position, 2)
+    target = _finite_position(target_position, 2)
+    if uav is None or target is None:
+        return 0.0
+    distance = math.hypot(uav[0] - target[0], uav[1] - target[1])
+    reference = math.hypot(width, height)
+    progress = 1.0 - float(np.clip(distance / reference, 0.0, 1.0))
+    return float(np.clip(progress, 0.0, 1.0))
+
+
+def normalized_s2u_range_gap_proximity(
+    uav_position,
+    sr_position,
+    env_width,
+    env_height,
+    *,
+    s2u_range_m=A2G_COMMUNICATION_RANGE_M,
+    uav_max_altitude_m=UAV_MAX_ALTITUDE_M,
+    ground_altitude_m=GROUND_ALTITUDE_M,
+):
+    """Return clipped 3-D proximity to the inclusive formal S2U range."""
+
+    width = _positive_finite_reference(env_width, "environment width")
+    height = _positive_finite_reference(env_height, "environment height")
+    s2u_range = _positive_finite_reference(s2u_range_m, "S2U range")
+    z_max = float(uav_max_altitude_m)
+    z_ground = float(ground_altitude_m)
+    if not math.isfinite(z_max) or not math.isfinite(z_ground) or z_max < z_ground:
+        raise ValueError("altitude normalization bounds are invalid")
+    uav = _finite_position(uav_position, 3)
+    sr = _finite_position(sr_position, 3)
+    if uav is None or sr is None:
+        return 0.0
+    distance = math.dist(uav[:3], sr[:3])
+    range_gap = max(distance - s2u_range, 0.0)
+    maximum_distance = math.sqrt(
+        width**2 + height**2 + (z_max - z_ground) ** 2
+    )
+    maximum_gap = max(
+        maximum_distance - s2u_range,
+        TASK_POTENTIAL_NORMALIZATION_EPSILON,
+    )
+    progress = 1.0 - float(np.clip(range_gap / maximum_gap, 0.0, 1.0))
+    return float(np.clip(progress, 0.0, 1.0))
+
+
+def blended_vs_progress(sensing_progress, distance_progress):
+    sensing = float(sensing_progress)
+    distance = float(distance_progress)
+    if not math.isfinite(sensing):
+        sensing = 0.0
+    if not math.isfinite(distance):
+        distance = 0.0
+    progress = (
+        VS_SENSING_POTENTIAL_WEIGHT * float(np.clip(sensing, 0.0, 1.0))
+        + VS_DISTANCE_POTENTIAL_WEIGHT * float(np.clip(distance, 0.0, 1.0))
+    )
+    return float(np.clip(progress, 0.0, 1.0))
+
+
+def blended_com_progress(capacity_progress, distance_progress):
+    capacity = float(capacity_progress)
+    distance = float(distance_progress)
+    if not math.isfinite(capacity):
+        capacity = 0.0
+    if not math.isfinite(distance):
+        distance = 0.0
+    progress = (
+        COM_CAPACITY_POTENTIAL_WEIGHT * float(np.clip(capacity, 0.0, 1.0))
+        + COM_DISTANCE_POTENTIAL_WEIGHT * float(np.clip(distance, 0.0, 1.0))
+    )
+    return float(np.clip(progress, 0.0, 1.0))
 
 
 def get_global_movement_state(
@@ -598,11 +712,33 @@ def calculate_movement_potentials(env, c_ref_com):
         _assert_unique_target_tasks(uav_id, grouped)
         for task in grouped["FOV"]:
             coverage, image_score, geometry_valid = fov_task_metrics(env, uav_id, task)
-            progress = coverage * float(np.clip(image_score, 0.0, 1.0)) if geometry_valid else 0.0
-            vs_progress.append(progress)
+            sensing_progress = (
+                coverage * float(np.clip(image_score, 0.0, 1.0))
+                if geometry_valid
+                and math.isfinite(float(coverage))
+                and math.isfinite(float(image_score))
+                else 0.0
+            )
+            distance_progress = normalized_horizontal_target_proximity(
+                env.uav_dict[uav_id].get_position(),
+                task["target_pos"],
+                env.env_width,
+                env.env_height,
+            )
+            vs_progress.append(
+                blended_vs_progress(sensing_progress, distance_progress)
+            )
         for task in grouped["COM"]:
+            sr_id = _target_object_id(task, "COM")
+            capacity_progress = normalized_com_link_quality(env, uav_id, task)
+            distance_progress = normalized_s2u_range_gap_proximity(
+                env.uav_dict[uav_id].get_position(),
+                env.SR_teams[sr_id].get_position(),
+                env.env_width,
+                env.env_height,
+            )
             com_progress.append(
-                normalized_com_link_quality(env, uav_id, task)
+                blended_com_progress(capacity_progress, distance_progress)
             )
     phi_vs = float(np.mean(vs_progress)) if vs_progress else 0.0
     phi_com = float(np.mean(com_progress)) if com_progress else 0.0

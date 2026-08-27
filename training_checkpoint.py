@@ -33,7 +33,9 @@ from experiment_config import (
     SAFE_DDQN_ETA_C,
     SAFE_DDQN_INITIAL_LAMBDA_COST,
     SAFE_DDQN_QOS_TARGET_PROBABILITY,
+    TASK_POTENTIAL_CONTRACT_VERSION,
     UAV_INITIAL_LAYOUT_VERSION,
+    task_potential_contract_metadata,
 )
 from Packet_scheduler_v1 import (
     PACKET_ENGINE_CHECKPOINT_SCHEMA_VERSION,
@@ -61,7 +63,8 @@ from dinkelbach_blocks import (
     dinkelbach_config_metadata,
 )
 
-CHECKPOINT_SCHEMA_VERSION = 16
+CHECKPOINT_SCHEMA_VERSION = 17
+PRE_DISTANCE_AWARE_TASK_POTENTIAL_CHECKPOINT_SCHEMA_VERSION = 16
 PRE_INITIAL_TOPOLOGY_CHECKPOINT_SCHEMA_VERSION = 15
 ROUTING_LIFECYCLE_CHECKPOINT_SCHEMA_VERSION = 6
 PRE_ROUTING_LIFECYCLE_CHECKPOINT_SCHEMA_VERSION = 5
@@ -145,6 +148,9 @@ FORMAL_CORE_CONFIG_FIELDS = (
     "movement_objective",
     "routing_policy",
     "task_observation_mode",
+    "task_potential_enabled",
+    "task_potential_contract_version",
+    "task_potential_configuration",
     "ground_station_position_m",
     "uav_initial_layout_version",
     "initial_communication_topology_contract_version",
@@ -999,6 +1005,8 @@ def _base_metadata(
         "initial_communication_topology_contract_version": (
             INITIAL_COMMUNICATION_TOPOLOGY_CONTRACT_VERSION
         ),
+        "task_potential_contract_version": TASK_POTENTIAL_CONTRACT_VERSION,
+        "task_potential_configuration": task_potential_contract_metadata(),
         "movement_agent_kind": kind,
         "movement_agent_gamma": float(td3.gamma),
         "movement_agent_configuration": _movement_agent_configuration(
@@ -1317,7 +1325,8 @@ def _validate_checkpoint_schema(metadata):
         raise RuntimeError(
             "checkpoint_schema_version is incompatible with the boundary-aligned "
             "stochastic channel, COM QoS/routing-credit, all-participant FOV, "
-            "GS-reachable initial topology, named-RNG, projected-action and replay "
+            "GS-reachable initial topology, distance-aware VS/COM potentials, "
+            "named-RNG, projected-action and replay "
             "contract and must be retrained: "
             f"checkpoint={schema}, expected={CHECKPOINT_SCHEMA_VERSION}"
         )

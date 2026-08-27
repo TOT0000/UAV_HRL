@@ -167,6 +167,45 @@ design-dataset collection, aggregation, and exact-resume workflows.
 - model-only checkpoint every 50 episodes, including exactly one final checkpoint
 - full-resume checkpoint every 50 episodes, retaining only the latest two
 
+## Movement task-potential contract
+
+Movement shaping remains a potential difference with unit movement discount
+and unit task weights: `F_x = beta_x * (Phi_x(s_next) - Phi_x(s))`, where
+`beta_search = beta_vs = beta_com = 1` and `gamma = 1`. An unchanged potential
+therefore contributes zero, approaching a task target contributes positively,
+and retreating contributes negatively. Terminal transitions retain the existing
+terminal-zero potential lifecycle. No absolute per-step proximity bonus and no
+delivery or connectivity potential is present; routing reward is unchanged.
+
+Search remains exactly the global `mean(visited_bitmap)`. It does not use the
+Search target position, a frontier target, or any target-distance term, and the
+pre-commit coverage lifecycle is unchanged.
+
+For every assigned FOV task, VS progress is an equal blend of the existing
+`coverage_ratio * clip(image_score, 0, 1)` sensing progress and horizontal
+target proximity. Horizontal proximity is
+`1 - clip(d_xy / sqrt(W^2 + H^2), 0, 1)` and deliberately ignores altitude.
+Invalid sensing geometry contributes zero sensing progress while finite UAV
+and target coordinates still produce distance progress. `Phi_VS` is the
+arithmetic mean over FOV tasks, or zero when none exist.
+
+For every assigned COM task, progress is an equal blend of the existing
+deterministic expected S2U capacity normalization and 3-D S2U range-gap
+proximity. With inclusive `R_S2U = 200 m`, the gap is
+`max(d_3D - R_S2U, 0)` and is normalized by
+`max(sqrt(W^2 + H^2 + (z_max - z_ground)^2) - R_S2U, epsilon)`. The distance
+term is exactly one throughout the legal S2U range and decreases continuously
+only outside it; capacity continues to distinguish in-range geometry.
+`Phi_COM` is the arithmetic mean over COM tasks, or zero when none exist.
+Both blends use weights `0.5/0.5` and are finite in `[0,1]`.
+
+The contract is `vs-horizontal-proximity-com-range-gap-blend-v1`. TD3 and DDPG
+consume the same potential definitions, random-movement methods publish the
+same environment/reward contract, and `*_no_task_potential` methods disable all
+Search/VS/COM shaping. Existing observations already contain UAV and task
+positions plus COM capacity, so movement/routing state dimensions remain
+429/90 and the joint action dimension remains 30.
+
 ## Stochastic channel contract
 
 Every registered method uses the same `Simulator`-owned channel lifecycle.
@@ -410,19 +449,21 @@ python -X utf8 comparison_experiment.py aggregate --input-dir runs/comparison/ev
 
 Exact-resume checkpoints validate the method fingerprint, training-manifest
 relationship, training seed, the complete Dinkelbach block state, and its configuration.
-Checkpoint schema v16 is the current boundary-aligned stochastic-channel,
+Checkpoint schema v17 is the current boundary-aligned stochastic-channel,
 movement/routing replay, utility/QoS, routing-ID causality/credit,
-frozen-backlog reward, GS-reachable initial topology, hard-range/COM-session,
-atomic-FOV, seed-ratio
+frozen-backlog reward, GS-reachable initial topology, distance-aware VS/COM
+task potentials, hard-range/COM-session, atomic-FOV, seed-ratio
 aggregation, propulsion, and four-slot/fifty-block movement-channel contract.
-Schema v15 and every older
+Schema v16 and every older
 schema is rejected before weights or replay state are restored and must be
 retrained; no legacy checkpoint migration is attempted. The current schema
 stores the 429/30/90 dimensions, movement feature schema, direct-ratio bit/J
 objective, shared channel/packet contracts, adaptive routing lifecycle, and
-FOV-EMA state. The movement feature schema remains unchanged. Scenario v3 and
-schema-15 checkpoints are incompatible because their canonical initial grid
-has no legal 200 m U2G edge; they are never silently migrated. A partial
+FOV-EMA state. The movement feature and scenario-v4 schemas remain unchanged.
+Schema-16 checkpoints use the prior sensing-only VS and capacity-only COM
+reward semantics and must be retrained. Scenario v3 and schema-15 checkpoints
+also remain incompatible because their canonical initial grid has no legal
+200 m U2G edge; none are silently migrated. A partial
 Dinkelbach block is persisted
 exactly and resumes with
 the same lambda, completed-episode count, numerator sum, denominator sum, block

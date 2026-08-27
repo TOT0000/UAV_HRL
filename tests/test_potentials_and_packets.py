@@ -11,8 +11,10 @@ from Task_assignment import Task, UAVAssigner
 from centralized_movement import (
     JOINT_ACTION_DIM,
     LOCAL_MOVEMENT_DIM,
+    blended_com_progress,
     calculate_movement_potentials,
     get_global_movement_state,
+    normalized_s2u_range_gap_proximity,
     project_joint_action,
     vs_data_valid,
 )
@@ -253,7 +255,13 @@ class ComStateCalibrationAndDeliveryTest(unittest.TestCase):
 
         com_capacity_index = LOCAL_MOVEMENT_DIM - 1
         self.assertEqual(state[com_capacity_index], 0.5)
-        self.assertEqual(phi_com, 0.5)
+        expected_distance = normalized_s2u_range_gap_proximity(
+            self.env.uav_dict[0].get_position(),
+            sr.get_position(),
+            self.env.env_width,
+            self.env.env_height,
+        )
+        self.assertEqual(phi_com, blended_com_progress(0.5, expected_distance))
         self.assertEqual(problem.raw_com_utility[0, 0], 0.5)
         self.assertEqual(assignment[0][0][2], 0.5)
         self.assertGreaterEqual(utility_helper.call_count, 3)

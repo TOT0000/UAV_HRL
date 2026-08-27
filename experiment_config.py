@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 import hashlib
 import json
+import math
 from types import MappingProxyType
 
 from evaluation_aggregation import EVALUATION_AGGREGATION_SCHEMA_VERSION
@@ -48,6 +49,18 @@ UAV_INITIAL_LAYOUT_VERSION = "gs-reachable-gateway-grid-v2"
 INITIAL_COMMUNICATION_TOPOLOGY_CONTRACT_VERSION = (
     "finite-3d-inclusive-gs-component-min-two-uavs-v1"
 )
+ENVIRONMENT_WIDTH_M = 1000.0
+ENVIRONMENT_HEIGHT_M = 1000.0
+GROUND_ALTITUDE_M = 0.0
+UAV_MAX_ALTITUDE_M = 150.0
+TASK_POTENTIAL_NORMALIZATION_EPSILON = 1e-12
+TASK_POTENTIAL_CONTRACT_VERSION = (
+    "vs-horizontal-proximity-com-range-gap-blend-v1"
+)
+VS_SENSING_POTENTIAL_WEIGHT = 0.5
+VS_DISTANCE_POTENTIAL_WEIGHT = 0.5
+COM_CAPACITY_POTENTIAL_WEIGHT = 0.5
+COM_DISTANCE_POTENTIAL_WEIGHT = 0.5
 DEFAULT_TRAINING_SEED = 20260817
 FORMAL_TRAINING_EPISODES = 1500
 FORMAL_CHECKPOINT_EPISODE = FORMAL_TRAINING_EPISODES
@@ -153,6 +166,80 @@ PRODUCTION_TASK_DEADLINE_SECONDS = {"FOV": 1.5, "COM": 1.0}
 PRODUCTION_PACKET_INJECTION_CUTOFF_SECONDS = 58.5
 
 CURRENT_METHOD_ID = "td3_dinkelbach"
+
+
+def validate_task_potential_weights():
+    """Fail fast unless both authoritative blend pairs are convex weights."""
+
+    groups = {
+        "VS": (VS_SENSING_POTENTIAL_WEIGHT, VS_DISTANCE_POTENTIAL_WEIGHT),
+        "COM": (COM_CAPACITY_POTENTIAL_WEIGHT, COM_DISTANCE_POTENTIAL_WEIGHT),
+    }
+    for name, weights in groups.items():
+        numeric = tuple(float(weight) for weight in weights)
+        if not all(math.isfinite(weight) and weight >= 0.0 for weight in numeric):
+            raise ValueError(
+                f"{name} task-potential weights must be finite and non-negative"
+            )
+        if not math.isclose(sum(numeric), 1.0, rel_tol=0.0, abs_tol=1e-12):
+            raise ValueError(f"{name} task-potential weights must sum to 1")
+    return groups
+
+
+def task_potential_contract_metadata():
+    """Return the shared reward/config/checkpoint task-potential contract."""
+
+    validate_task_potential_weights()
+    horizontal_reference = math.hypot(
+        ENVIRONMENT_WIDTH_M, ENVIRONMENT_HEIGHT_M
+    )
+    distance_3d_reference = math.sqrt(
+        ENVIRONMENT_WIDTH_M**2
+        + ENVIRONMENT_HEIGHT_M**2
+        + (UAV_MAX_ALTITUDE_M - GROUND_ALTITUDE_M) ** 2
+    )
+    range_gap_reference = max(
+        distance_3d_reference - A2G_COMMUNICATION_RANGE_M,
+        TASK_POTENTIAL_NORMALIZATION_EPSILON,
+    )
+    return {
+        "contract_version": TASK_POTENTIAL_CONTRACT_VERSION,
+        "search": {
+            "unchanged": True,
+            "definition": "mean(visited_bitmap)",
+            "target_distance_used": False,
+        },
+        "vs": {
+            "sensing_weight": VS_SENSING_POTENTIAL_WEIGHT,
+            "distance_weight": VS_DISTANCE_POTENTIAL_WEIGHT,
+            "distance_dimensionality": "horizontal_2d",
+            "normalization": "environment_xy_diagonal",
+            "environment_width_m": ENVIRONMENT_WIDTH_M,
+            "environment_height_m": ENVIRONMENT_HEIGHT_M,
+            "distance_normalization_reference_m": horizontal_reference,
+        },
+        "com": {
+            "capacity_weight": COM_CAPACITY_POTENTIAL_WEIGHT,
+            "distance_weight": COM_DISTANCE_POTENTIAL_WEIGHT,
+            "distance_dimensionality": "three_dimensional_3d",
+            "s2u_range_m": A2G_COMMUNICATION_RANGE_M,
+            "normalization": "positive_range_gap_over_maximum_environment_gap",
+            "environment_width_m": ENVIRONMENT_WIDTH_M,
+            "environment_height_m": ENVIRONMENT_HEIGHT_M,
+            "uav_max_altitude_m": UAV_MAX_ALTITUDE_M,
+            "ground_altitude_m": GROUND_ALTITUDE_M,
+            "maximum_3d_distance_reference_m": distance_3d_reference,
+            "range_gap_normalization_reference_m": range_gap_reference,
+            "normalization_epsilon": TASK_POTENTIAL_NORMALIZATION_EPSILON,
+        },
+        "lifecycle": {
+            "form": "beta * (gamma * phi_next - phi_current)",
+            "delivery_or_connectivity_potential": False,
+        },
+    }
+
+
+validate_task_potential_weights()
 
 _COMMON_METHOD = {
     "assignment": "k_km",
@@ -713,6 +800,9 @@ def comparison_method_configuration(method_spec: MethodSpec) -> dict:
         "movement_objective": method_spec.reward_mode,
         "routing_policy": method_spec.routing,
         "task_observation_mode": method_spec.task_observation,
+        "task_potential_enabled": bool(method_spec.task_potential_enabled),
+        "task_potential_contract_version": TASK_POTENTIAL_CONTRACT_VERSION,
+        "task_potential_configuration": task_potential_contract_metadata(),
         "ground_station_position_m": list(GROUND_STATION_POSITION_M),
         "uav_initial_layout_version": UAV_INITIAL_LAYOUT_VERSION,
         "initial_communication_topology_contract_version": (

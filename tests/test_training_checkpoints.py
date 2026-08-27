@@ -21,8 +21,10 @@ from experiment_config import (
     MOVEMENT_EXPLORATION_DECAY_EPISODES,
     ROUTING_EPSILON_DECAY_EPISODES,
     SR_ROUTE_LIFECYCLE_VERSION,
+    TASK_POTENTIAL_CONTRACT_VERSION,
     UAV_INITIAL_LAYOUT_VERSION,
     effective_training_config,
+    task_potential_contract_metadata,
 )
 from HRL_task_aware import (
     _seed_training_rng,
@@ -37,7 +39,7 @@ from scenario_manifest import extend_training_manifest, generate_manifest
 from training_checkpoint import (
     CHECKPOINT_SCHEMA_VERSION,
     FULL_RESUME_LOGGING_SCHEMA_VERSION,
-    PRE_INITIAL_TOPOLOGY_CHECKPOINT_SCHEMA_VERSION,
+    PRE_DISTANCE_AWARE_TASK_POTENTIAL_CHECKPOINT_SCHEMA_VERSION,
     PRE_ROUTING_LIFECYCLE_CHECKPOINT_SCHEMA_VERSION,
     ROUTING_LIFECYCLE_CHECKPOINT_SCHEMA_VERSION,
     load_full_resume_checkpoint,
@@ -641,6 +643,14 @@ class FullResumeCheckpointTest(unittest.TestCase):
                 ],
                 INITIAL_COMMUNICATION_TOPOLOGY_CONTRACT_VERSION,
             )
+            self.assertEqual(
+                metadata["task_potential_contract_version"],
+                TASK_POTENTIAL_CONTRACT_VERSION,
+            )
+            self.assertEqual(
+                metadata["task_potential_configuration"],
+                task_potential_contract_metadata(),
+            )
             models = torch.load(
                 checkpoint_dir / "models.pt", weights_only=False
             )
@@ -677,7 +687,7 @@ class FullResumeCheckpointTest(unittest.TestCase):
                     calibration=calibration,
                 )
 
-    def test_schema_15_checkpoint_is_rejected_before_network_restore(self):
+    def test_schema_16_checkpoint_is_rejected_before_network_restore(self):
         td3, ddqn, _joint, _routing = self._components()
         with tempfile.TemporaryDirectory() as temp_dir:
             checkpoint_dir = Path(temp_dir) / "model"
@@ -696,7 +706,7 @@ class FullResumeCheckpointTest(unittest.TestCase):
             metadata_path = checkpoint_dir / "metadata.json"
             metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
             metadata["checkpoint_schema_version"] = (
-                PRE_INITIAL_TOPOLOGY_CHECKPOINT_SCHEMA_VERSION
+                PRE_DISTANCE_AWARE_TASK_POTENTIAL_CHECKPOINT_SCHEMA_VERSION
             )
             metadata_path.write_text(
                 json.dumps(metadata, indent=2) + "\n", encoding="utf-8"
@@ -1000,7 +1010,7 @@ class TrainingCliTest(unittest.TestCase):
         )
 
     def test_checkpoint_schema_is_explicit(self):
-        self.assertEqual(CHECKPOINT_SCHEMA_VERSION, 16)
+        self.assertEqual(CHECKPOINT_SCHEMA_VERSION, 17)
 
 
 if __name__ == "__main__":
