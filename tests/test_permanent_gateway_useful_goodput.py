@@ -20,6 +20,7 @@ from centralized_movement import (
 )
 from evaluation_aggregation import canonical_aggregation
 from experiment_config import (
+    COMMUNICATION_RANGE_CONTRACT_VERSION,
     GS_GATEWAY_HARD_RADIUS_M,
     GS_GATEWAY_PROJECTION_MODE,
     GS_GATEWAY_SOFT_RADIUS_M,
@@ -62,17 +63,17 @@ class PermanentGatewayProjectionTest(unittest.TestCase):
     def test_authoritative_constants_and_all_3d_boundaries(self):
         self.assertEqual(RESERVED_SEARCH_UAV_IDS, (0, 9))
         self.assertEqual(PERMANENT_GS_GATEWAY_UAV_ID, 0)
-        self.assertEqual(GS_GATEWAY_SOFT_RADIUS_M, 180.0)
-        self.assertEqual(GS_GATEWAY_HARD_RADIUS_M, 200.0)
+        self.assertEqual(GS_GATEWAY_SOFT_RADIUS_M, 360.0)
+        self.assertEqual(GS_GATEWAY_HARD_RADIUS_M, 400.0)
         self.assertEqual(GS_GATEWAY_PROJECTION_MODE, "gs_only")
 
         direction = np.asarray((3.0, 4.0, 12.0)) / 13.0
         expected_distances = {
-            179.0: 179.0,
-            180.0: 180.0,
-            190.0: 185.0,
-            200.0: 200.0,
-            250.0: 200.0,
+            359.0: 359.0,
+            360.0: 360.0,
+            380.0: 370.0,
+            400.0: 400.0,
+            500.0: 400.0,
         }
         for proposed_distance, expected_distance in expected_distances.items():
             with self.subTest(proposed_distance=proposed_distance):
@@ -90,6 +91,42 @@ class PermanentGatewayProjectionTest(unittest.TestCase):
                     gs_gateway_distance_m(projected), expected_distance
                 )
         self.assertEqual(project_gs_gateway_position((0.0, 0.0, 0.0)), (0.0, 0.0, 0.0))
+
+    def test_projection_respects_altitude_xy_and_height_dependent_horizontal_radius(self):
+        for altitude in (50.0, 100.0, 150.0):
+            boundary_x = math.sqrt(400.0**2 - altitude**2)
+            with self.subTest(altitude=altitude, position="boundary"):
+                projected = project_gs_gateway_position(
+                    (boundary_x, 0.0, altitude),
+                    min_altitude_m=50.0,
+                    max_altitude_m=150.0,
+                    env_width_m=1000.0,
+                    env_height_m=1000.0,
+                )
+                np.testing.assert_allclose(
+                    projected,
+                    (boundary_x, 0.0, altitude),
+                    rtol=0.0,
+                    atol=1e-9,
+                )
+            with self.subTest(altitude=altitude, position="outside"):
+                projected = project_gs_gateway_position(
+                    (500.0, -20.0, altitude),
+                    min_altitude_m=50.0,
+                    max_altitude_m=150.0,
+                    env_width_m=1000.0,
+                    env_height_m=1000.0,
+                )
+                horizontal = math.hypot(projected[0], projected[1])
+                horizontal_limit = math.sqrt(400.0**2 - projected[2] ** 2)
+                self.assertGreaterEqual(projected[2], 50.0)
+                self.assertLessEqual(projected[2], 150.0)
+                self.assertGreaterEqual(projected[0], 0.0)
+                self.assertLessEqual(projected[0], 1000.0)
+                self.assertGreaterEqual(projected[1], 0.0)
+                self.assertLessEqual(projected[1], 1000.0)
+                self.assertLessEqual(horizontal, horizontal_limit + 1e-9)
+                self.assertLessEqual(gs_gateway_distance_m(projected), 400.0 + 1e-9)
 
     def test_gateway_lifecycle_and_uav9_projection_exclusion(self):
         env = Simulator(num_UAV=NUM_UAV)
@@ -120,21 +157,21 @@ class PermanentGatewayProjectionTest(unittest.TestCase):
             )
         )
 
-        env.uav_dict[0].x_u, env.uav_dict[0].y_u, env.uav_dict[0].z_u = (190.0, 0.0, 50.0)
-        env.uav_dict[9].x_u, env.uav_dict[9].y_u, env.uav_dict[9].z_u = (250.0, 0.0, 50.0)
+        env.uav_dict[0].x_u, env.uav_dict[0].y_u, env.uav_dict[0].z_u = (390.0, 0.0, 50.0)
+        env.uav_dict[9].x_u, env.uav_dict[9].y_u, env.uav_dict[9].z_u = (450.0, 0.0, 50.0)
         action = np.tile(np.asarray(HOVER_ACTION, dtype=np.float32), NUM_UAV)
         proposals = build_joint_movement_proposals(
             env, RandomMovementController(), action, step_time=0.25
         )
-        self.assertLessEqual(gs_gateway_distance_m(proposals[0]["new_position"]), 200.0)
-        self.assertEqual(proposals[9]["new_position"], (250.0, 0.0, 50.0))
+        self.assertLessEqual(gs_gateway_distance_m(proposals[0]["new_position"]), 400.0)
+        self.assertEqual(proposals[9]["new_position"], (450.0, 0.0, 50.0))
 
     def test_random_td3_and_ddpg_share_gateway_execution_constraint(self):
         env = Simulator(num_UAV=NUM_UAV)
         env.num_GT = 2
         env.reset_environment()
         z = 50.0
-        x = math.sqrt(199.0**2 - z**2)
+        x = math.sqrt(399.0**2 - z**2)
         action = np.tile(np.asarray(HOVER_ACTION, dtype=np.float32), NUM_UAV)
         action[:3] = (1.0, 0.0, 0.0)
         controllers = (
@@ -163,7 +200,7 @@ class PermanentGatewayProjectionTest(unittest.TestCase):
         env.num_GT = 2
         env.reset_environment()
         env.uav_dict[0].x_u, env.uav_dict[0].y_u, env.uav_dict[0].z_u = (
-            math.sqrt(179.0**2 - 50.0**2),
+            math.sqrt(359.0**2 - 50.0**2),
             0.0,
             50.0,
         )
@@ -194,10 +231,10 @@ class PermanentGatewayProjectionTest(unittest.TestCase):
         manifest = generate_manifest("test", 721, 1)
         valid = manifest.episodes[0]
         self.assertLessEqual(
-            gs_gateway_distance_m(valid["uavs"][0]["position"]), 200.0
+            gs_gateway_distance_m(valid["uavs"][0]["position"]), 400.0
         )
         invalid = copy.deepcopy(valid)
-        invalid["uavs"][0]["position"] = [250.0, 50.0, 100.0]
+        invalid["uavs"][0]["position"] = [450.0, 50.0, 100.0]
         env = Simulator(num_UAV=NUM_UAV)
         with self.assertRaisesRegex(ValueError, "permanent GS gateway.*hard radius"):
             env.reset_environment(invalid)
@@ -362,6 +399,18 @@ class CoverageWeightedUsefulGoodputTest(unittest.TestCase):
 
     def test_all_registry_methods_publish_identical_environment_contracts(self):
         fields = (
+            "channel_environment_contract_version",
+            "channel_fairness_contract_version",
+            "communication_range_contract_version",
+            "communication_range_boundary_rule",
+            "maximum_3d_communication_distance_m",
+            "s2u_communication_range_m",
+            "u2g_communication_range_m",
+            "u2u_communication_range_m",
+            "routing_mask_scope",
+            "com_session_lifecycle_version",
+            "packet_service_contract_version",
+            "evaluation_aggregation_schema_version",
             "permanent_gs_gateway_uav_id",
             "gs_gateway_contract_version",
             "fov_packet_generation_contract_version",
@@ -374,6 +423,14 @@ class CoverageWeightedUsefulGoodputTest(unittest.TestCase):
             for method_id in METHOD_REGISTRY
         ]
         reference = {field: contracts[0][field] for field in fields}
+        self.assertEqual(
+            reference["communication_range_contract_version"],
+            COMMUNICATION_RANGE_CONTRACT_VERSION,
+        )
+        self.assertEqual(reference["maximum_3d_communication_distance_m"], 400.0)
+        self.assertEqual(reference["s2u_communication_range_m"], 400.0)
+        self.assertEqual(reference["u2g_communication_range_m"], 400.0)
+        self.assertEqual(reference["u2u_communication_range_m"], 400.0)
         self.assertTrue(
             all(
                 {field: contract[field] for field in fields} == reference

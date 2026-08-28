@@ -53,24 +53,24 @@ class InitialTopologyGeometryTest(unittest.TestCase):
                 uavs, scenario_id=f"gateway-z-{altitude}"
             )
             self.assertIn(0, topology["u2g_uav_ids"])
-            self.assertLess(topology["nearest_u2g_3d_distance_m"], 200.0)
+            self.assertLess(topology["nearest_u2g_3d_distance_m"], 400.0)
 
         boundary = validate_initial_communication_topology(
             [
-                _topology_uav(0, (0.0, 0.0, 200.0)),
-                _topology_uav(1, (400.0, 0.0, 200.0)),
+                _topology_uav(0, (0.0, 0.0, 400.0)),
+                _topology_uav(1, (400.0, 0.0, 400.0)),
             ],
             scenario_id="inclusive-boundary",
         )
         self.assertEqual(boundary["u2g_uav_ids"], [0])
         self.assertEqual(boundary["gs_component_uav_ids"], [0, 1])
-        self.assertEqual(boundary["nearest_u2g_3d_distance_m"], 200.0)
+        self.assertEqual(boundary["nearest_u2g_3d_distance_m"], 400.0)
 
         with self.assertRaisesRegex(ValueError, "no UAV.*U2G range edge"):
             validate_initial_communication_topology(
                 [
-                    _topology_uav(0, (0.0, 0.0, 200.0001)),
-                    _topology_uav(1, (400.0, 0.0, 200.0001)),
+                    _topology_uav(0, (0.0, 0.0, 400.0001)),
+                    _topology_uav(1, (400.0, 0.0, 400.0001)),
                 ],
                 scenario_id="outside-boundary",
             )
@@ -109,7 +109,7 @@ class InitialTopologyGeometryTest(unittest.TestCase):
         with self.assertRaisesRegex(
             ValueError,
             r"scenario_id=all-far;.*nearest_u2g_3d_distance_m=.*"
-            r"u2g_range_m=200;.*gs_component_uav_ids=\[\]",
+            r"u2g_range_m=400;.*gs_component_uav_ids=\[\]",
         ):
             validate_initial_communication_topology(
                 [
@@ -121,7 +121,7 @@ class InitialTopologyGeometryTest(unittest.TestCase):
 
         with self.assertRaisesRegex(
             ValueError,
-            r"scenario_id=isolated;.*u2g_range_m=200;.*"
+            r"scenario_id=isolated;.*u2g_range_m=400;.*"
             r"gs_component_uav_ids=\[0\]",
         ):
             validate_initial_communication_topology(
@@ -135,7 +135,7 @@ class InitialTopologyGeometryTest(unittest.TestCase):
         with self.assertRaisesRegex(
             ValueError,
             r"scenario_id=non-finite;.*nearest_u2g_3d_distance_m=non-finite;"
-            r".*u2g_range_m=200;.*gs_component_uav_ids=\[\]",
+            r".*u2g_range_m=400;.*gs_component_uav_ids=\[\]",
         ):
             validate_initial_communication_topology(
                 [
@@ -212,7 +212,7 @@ class InitialTopologyGeometryTest(unittest.TestCase):
                 )
 
     def test_schema_15_checkpoint_is_rejected_for_old_initial_geometry(self):
-        self.assertEqual(CHECKPOINT_SCHEMA_VERSION, 18)
+        self.assertEqual(CHECKPOINT_SCHEMA_VERSION, 19)
         with self.assertRaisesRegex(
             RuntimeError, "GS-reachable initial topology.*must be retrained"
         ):

@@ -1930,8 +1930,8 @@ class PacketEngine:
                     #     return
 
         # COM generation begins only after its assigned UAV first enters the
-        # inclusive 200 m S2U range. Activation persists for the episode even
-        # while the assigned receiver later leaves range.
+        # inclusive canonical 400 m S2U range. Activation persists for the
+        # episode even while the assigned receiver later leaves range.
         for sr in sorted(getattr(env, "SR_teams", ()), key=lambda item: item.id):
             if getattr(sr, "assigned_gt_id", None) is None:
                 continue

@@ -12,14 +12,15 @@ from centralized_movement import (
     blended_com_progress,
     blended_vs_progress,
     calculate_movement_potentials,
+    normalized_com_link_quality,
     normalized_horizontal_target_proximity,
     normalized_s2u_range_gap_proximity,
 )
 from experiment_config import (
-    A2G_COMMUNICATION_RANGE_M,
     COM_CAPACITY_POTENTIAL_WEIGHT,
     COM_DISTANCE_POTENTIAL_WEIGHT,
     METHOD_REGISTRY,
+    S2U_COMMUNICATION_RANGE_M,
     TASK_POTENTIAL_CONTRACT_VERSION,
     VS_DISTANCE_POTENTIAL_WEIGHT,
     VS_SENSING_POTENTIAL_WEIGHT,
@@ -88,9 +89,9 @@ class DistanceProgressHelperTest(unittest.TestCase):
         helper = normalized_s2u_range_gap_proximity
         common = ((0.0, 0.0, 0.0), 1000.0, 1000.0)
         within = helper((100.0, 0.0, 0.0), *common)
-        boundary = helper((200.0, 0.0, 0.0), *common)
-        just_outside = helper((200.001, 0.0, 0.0), *common)
-        farther = helper((600.0, 0.0, 0.0), *common)
+        boundary = helper((400.0, 0.0, 0.0), *common)
+        just_outside = helper((400.001, 0.0, 0.0), *common)
+        farther = helper((700.0, 0.0, 0.0), *common)
         farthest = helper((1000.0, 1000.0, 150.0), *common)
         self.assertEqual(within, 1.0)
         self.assertEqual(boundary, 1.0)
@@ -136,7 +137,8 @@ class DistanceProgressHelperTest(unittest.TestCase):
             metadata["com"]["distance_dimensionality"],
             "three_dimensional_3d",
         )
-        self.assertEqual(metadata["com"]["s2u_range_m"], A2G_COMMUNICATION_RANGE_M)
+        self.assertEqual(metadata["com"]["s2u_range_m"], S2U_COMMUNICATION_RANGE_M)
+        self.assertEqual(metadata["com"]["s2u_range_m"], 400.0)
         self.assertTrue(metadata["search"]["unchanged"])
         self.assertFalse(metadata["lifecycle"]["delivery_or_connectivity_potential"])
 
@@ -253,6 +255,61 @@ class DistanceAwarePotentialLifecycleTest(unittest.TestCase):
         self.assertGreater(self._shaping(far, near), 0.0)
         self.assertLess(self._shaping(near, far), 0.0)
 
+    def test_com_capacity_stays_prospective_outside_service_range_and_blend_is_half(self):
+        self.env.multi_tasks[0] = [self._com_task()]
+        sr = self.env.SR_teams[0]
+        uav = self.env.uav_dict[0]
+        uav.x_u, uav.y_u, uav.z_u = sr.x + 400.001, sr.y, sr.z
+        self.assertFalse(self.env.is_s2u_in_range(0, 0))
+
+        task = self.env.multi_tasks[0][0]
+        capacity = normalized_com_link_quality(self.env, 0, task)
+        distance = normalized_s2u_range_gap_proximity(
+            uav.get_position(),
+            sr.get_position(),
+            self.env.env_width,
+            self.env.env_height,
+        )
+        _, _, phi_com = calculate_movement_potentials(self.env, 1.0)
+
+        self.assertGreater(capacity, 0.0)
+        self.assertAlmostEqual(
+            phi_com,
+            0.5 * capacity + 0.5 * distance,
+        )
+
+    def test_vs_potential_is_independent_of_communication_range(self):
+        self.env.multi_tasks[0] = [self._fov_task()]
+        target = self.env.gts[0]
+        self.env.uav_dict[0].x_u = target.x + 123.0
+        self.env.uav_dict[0].y_u = target.y + 45.0
+        with mock.patch(
+            "centralized_movement.fov_task_metrics",
+            return_value=(0.6, 0.8, True),
+        ), mock.patch(
+            "centralized_movement.S2U_COMMUNICATION_RANGE_M", 200.0
+        ):
+            old_range_potential = calculate_movement_potentials(self.env, 1.0)
+        with mock.patch(
+            "centralized_movement.fov_task_metrics",
+            return_value=(0.6, 0.8, True),
+        ), mock.patch(
+            "centralized_movement.S2U_COMMUNICATION_RANGE_M", 400.0
+        ):
+            unified_range_potential = calculate_movement_potentials(self.env, 1.0)
+
+        self.assertEqual(old_range_potential, unified_range_potential)
+        expected_distance = normalized_horizontal_target_proximity(
+            self.env.uav_dict[0].get_position(),
+            target.get_position(),
+            self.env.env_width,
+            self.env.env_height,
+        )
+        self.assertAlmostEqual(
+            unified_range_potential[1],
+            0.5 * (0.6 * 0.8) + 0.5 * expected_distance,
+        )
+
     def test_no_tasks_are_zero_and_multiple_tasks_use_arithmetic_mean(self):
         self.env.visited_bitmap[:] = False
         self.assertEqual(
@@ -348,7 +405,7 @@ class TaskPotentialMethodContractTest(unittest.TestCase):
         self.assertEqual(MOVEMENT_STATE_DIM, 429)
         self.assertEqual(JOINT_ACTION_DIM, 30)
         self.assertEqual(ROUTING_STATE_DIM, 90)
-        self.assertEqual(SCENARIO_SCHEMA_VERSION, "uav-hrl-scenario-v5")
+        self.assertEqual(SCENARIO_SCHEMA_VERSION, "uav-hrl-scenario-v6")
 
 
 if __name__ == "__main__":

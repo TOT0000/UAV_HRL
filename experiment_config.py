@@ -8,6 +8,11 @@ import json
 import math
 from types import MappingProxyType
 
+from communication_contract import (
+    COMMUNICATION_RANGE_BOUNDARY_RULE,
+    MAX_3D_COMMUNICATION_DISTANCE_M,
+    validate_communication_range_aliases,
+)
 from evaluation_aggregation import EVALUATION_AGGREGATION_SCHEMA_VERSION
 
 from Channel_model import (
@@ -34,11 +39,11 @@ ROI_COUNT_MAX = 8
 RESERVED_SEARCH_UAV_IDS = (0, NUM_UAV - 1)
 GROUND_STATION_POSITION_M = (0.0, 0.0, 0.0)
 PERMANENT_GS_GATEWAY_UAV_ID = 0
-GS_GATEWAY_SOFT_RADIUS_M = 180.0
-GS_GATEWAY_HARD_RADIUS_M = 200.0
+GS_GATEWAY_SOFT_RADIUS_M = 360.0
+GS_GATEWAY_HARD_RADIUS_M = MAX_3D_COMMUNICATION_DISTANCE_M
 GS_GATEWAY_PROJECTION_MODE = "gs_only"
 GS_GATEWAY_CONTRACT_VERSION = (
-    "permanent-uav0-search-to-hover-3d-soft-hard-gs-projection-v1"
+    "permanent-uav0-search-to-hover-altitude-feasible-3d-soft360-hard400-v2"
 )
 CANONICAL_UAV_INITIAL_XY_M = (
     (50.0, 50.0),
@@ -54,7 +59,7 @@ CANONICAL_UAV_INITIAL_XY_M = (
 )
 UAV_INITIAL_LAYOUT_VERSION = "gs-reachable-gateway-grid-v2"
 INITIAL_COMMUNICATION_TOPOLOGY_CONTRACT_VERSION = (
-    "finite-3d-inclusive-gs-component-min-two-uavs-v1"
+    "finite-3d-inclusive-unified-400m-gs-component-min-two-uavs-v2"
 )
 ENVIRONMENT_WIDTH_M = 1000.0
 ENVIRONMENT_HEIGHT_M = 1000.0
@@ -62,7 +67,7 @@ GROUND_ALTITUDE_M = 0.0
 UAV_MAX_ALTITUDE_M = 150.0
 TASK_POTENTIAL_NORMALIZATION_EPSILON = 1e-12
 TASK_POTENTIAL_CONTRACT_VERSION = (
-    "vs-horizontal-proximity-com-range-gap-blend-v1"
+    "vs-horizontal-proximity-com-400m-range-gap-blend-v2"
 )
 VS_SENSING_POTENTIAL_WEIGHT = 0.5
 VS_DISTANCE_POTENTIAL_WEIGHT = 0.5
@@ -80,13 +85,24 @@ REFERENCE_COM_BANDWIDTH_HZ = TOTAL_COMMUNICATION_BANDWIDTH_HZ / (
 COM_PACKET_RATE_PER_SECOND = 50.0
 COM_PACKET_SIZE_BITS = 256.0
 COM_OFFERED_RATE_BPS = COM_PACKET_RATE_PER_SECOND * COM_PACKET_SIZE_BITS
-A2G_COMMUNICATION_RANGE_M = 200.0
-A2A_COMMUNICATION_RANGE_M = 400.0
+COMMUNICATION_RANGE_M = MAX_3D_COMMUNICATION_DISTANCE_M
+A2G_COMMUNICATION_RANGE_M = COMMUNICATION_RANGE_M
+A2A_COMMUNICATION_RANGE_M = COMMUNICATION_RANGE_M
+S2U_COMMUNICATION_RANGE_M = COMMUNICATION_RANGE_M
+U2G_COMMUNICATION_RANGE_M = COMMUNICATION_RANGE_M
+U2U_COMMUNICATION_RANGE_M = COMMUNICATION_RANGE_M
 COMMUNICATION_RANGE_CONTRACT_VERSION = (
-    "slot-start-3d-inclusive-a2g-200m-a2a-400m-v1"
+    "slot-start-3d-inclusive-s2u-u2g-u2u-400m-v2"
 )
 COM_SESSION_LIFECYCLE_VERSION = (
-    "activated-generation-immediate-e2e-qos-persistent-v2"
+    "400m-activated-generation-immediate-e2e-qos-persistent-v3"
+)
+validate_communication_range_aliases(
+    A2G_COMMUNICATION_RANGE_M,
+    A2A_COMMUNICATION_RANGE_M,
+    S2U_COMMUNICATION_RANGE_M,
+    U2G_COMMUNICATION_RANGE_M,
+    U2U_COMMUNICATION_RANGE_M,
 )
 ASSIGNMENT_DUMMY_UTILITY = -1e-9
 UTILITY_NORMALIZATION_MODE = "fov-global-minmax-com-fading-aware-reference-v3"
@@ -142,12 +158,14 @@ PACKET_ROUTING_CAUSALITY_CONTRACT_VERSION = (
 ROUTING_COST_ATTRIBUTION_CONTRACT_VERSION = (
     "system-qos-versus-routing-credit-stable-id-v2"
 )
-PACKET_SERVICE_CONTRACT_VERSION = "fifty-5ms-block-cumulative-service-v1"
+PACKET_SERVICE_CONTRACT_VERSION = (
+    "unified-400m-slot-start-fifty-5ms-block-cumulative-service-v2"
+)
 QOS_AGGREGATE_CONTRACT_VERSION = (
     "canonical-single-result-seed-ratio-of-sums-student-t-v3"
 )
 ROUTING_REWARD_CONTRACT_VERSION = (
-    "slot-start-other-backlog-over-fading-effective-capacity-v5"
+    "unified-400m-slot-start-other-backlog-over-fading-effective-capacity-v6"
 )
 ROUTING_REWARD_ALPHA_CAPACITY = 1.0
 ROUTING_REWARD_ALPHA_DELAY = 0.5
@@ -156,7 +174,7 @@ MOVEMENT_CHANNEL_TIMING_VERSION = (
 )
 PROPULSION_MODEL_ID = "canonical-3d-quadrotor-v1"
 MOVEMENT_ACTION_PROJECTION_CONTRACT_VERSION = (
-    "fieldwise-clamp-heading-wrap-mask-uav0-gs-3d-position-v2"
+    "fieldwise-clamp-heading-wrap-mask-uav0-altitude-feasible-gs-3d-position-v3"
 )
 MOVEMENT_REPLAY_CONTRACT_VERSION = (
     "executed-net-displacement-action-boundary-aligned-next-state-capacity-50000-v3"
@@ -214,7 +232,7 @@ def task_potential_contract_metadata():
         + (UAV_MAX_ALTITUDE_M - GROUND_ALTITUDE_M) ** 2
     )
     range_gap_reference = max(
-        distance_3d_reference - A2G_COMMUNICATION_RANGE_M,
+        distance_3d_reference - S2U_COMMUNICATION_RANGE_M,
         TASK_POTENTIAL_NORMALIZATION_EPSILON,
     )
     return {
@@ -237,7 +255,7 @@ def task_potential_contract_metadata():
             "capacity_weight": COM_CAPACITY_POTENTIAL_WEIGHT,
             "distance_weight": COM_DISTANCE_POTENTIAL_WEIGHT,
             "distance_dimensionality": "three_dimensional_3d",
-            "s2u_range_m": A2G_COMMUNICATION_RANGE_M,
+            "s2u_range_m": S2U_COMMUNICATION_RANGE_M,
             "normalization": "positive_range_gap_over_maximum_environment_gap",
             "environment_width_m": ENVIRONMENT_WIDTH_M,
             "environment_height_m": ENVIRONMENT_HEIGHT_M,
@@ -884,6 +902,13 @@ def comparison_method_configuration(method_spec: MethodSpec) -> dict:
         "communication_range_contract_version": (
             COMMUNICATION_RANGE_CONTRACT_VERSION
         ),
+        "communication_range_boundary_rule": COMMUNICATION_RANGE_BOUNDARY_RULE,
+        "maximum_3d_communication_distance_m": (
+            MAX_3D_COMMUNICATION_DISTANCE_M
+        ),
+        "s2u_communication_range_m": S2U_COMMUNICATION_RANGE_M,
+        "u2g_communication_range_m": U2G_COMMUNICATION_RANGE_M,
+        "u2u_communication_range_m": U2U_COMMUNICATION_RANGE_M,
         "a2g_communication_range_m": A2G_COMMUNICATION_RANGE_M,
         "a2a_communication_range_m": A2A_COMMUNICATION_RANGE_M,
         "packet_routing_causality_contract_version": (

@@ -39,7 +39,7 @@ from scenario_manifest import extend_training_manifest, generate_manifest
 from training_checkpoint import (
     CHECKPOINT_SCHEMA_VERSION,
     FULL_RESUME_LOGGING_SCHEMA_VERSION,
-    PRE_PERMANENT_GATEWAY_USEFUL_GOODPUT_CHECKPOINT_SCHEMA_VERSION,
+    PRE_UNIFIED_400M_COMMUNICATION_CHECKPOINT_SCHEMA_VERSION,
     PRE_ROUTING_LIFECYCLE_CHECKPOINT_SCHEMA_VERSION,
     ROUTING_LIFECYCLE_CHECKPOINT_SCHEMA_VERSION,
     load_full_resume_checkpoint,
@@ -687,7 +687,7 @@ class FullResumeCheckpointTest(unittest.TestCase):
                     calibration=calibration,
                 )
 
-    def test_schema_17_checkpoint_is_rejected_before_network_restore(self):
+    def test_split_range_schema_18_checkpoint_is_rejected_before_network_restore(self):
         td3, ddqn, _joint, _routing = self._components()
         with tempfile.TemporaryDirectory() as temp_dir:
             checkpoint_dir = Path(temp_dir) / "model"
@@ -706,7 +706,7 @@ class FullResumeCheckpointTest(unittest.TestCase):
             metadata_path = checkpoint_dir / "metadata.json"
             metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
             metadata["checkpoint_schema_version"] = (
-                PRE_PERMANENT_GATEWAY_USEFUL_GOODPUT_CHECKPOINT_SCHEMA_VERSION
+                PRE_UNIFIED_400M_COMMUNICATION_CHECKPOINT_SCHEMA_VERSION
             )
             metadata_path.write_text(
                 json.dumps(metadata, indent=2) + "\n", encoding="utf-8"
@@ -714,7 +714,10 @@ class FullResumeCheckpointTest(unittest.TestCase):
             with mock.patch(
                 "training_checkpoint._load_network_states"
             ) as load_networks:
-                with self.assertRaisesRegex(RuntimeError, "incompatible.*must be retrained"):
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "unified inclusive 400 m S2U/U2G/U2U.*must be retrained",
+                ):
                     load_model_checkpoint(checkpoint_dir, td3, ddqn)
                 load_networks.assert_not_called()
 
@@ -1010,7 +1013,7 @@ class TrainingCliTest(unittest.TestCase):
         )
 
     def test_checkpoint_schema_is_explicit(self):
-        self.assertEqual(CHECKPOINT_SCHEMA_VERSION, 18)
+        self.assertEqual(CHECKPOINT_SCHEMA_VERSION, 19)
 
 
 if __name__ == "__main__":

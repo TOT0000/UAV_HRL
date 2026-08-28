@@ -12,10 +12,15 @@ import time
 
 import numpy as np
 
+from communication_contract import (
+    COMMUNICATION_RANGE_BOUNDARY_RULE,
+    MAX_3D_COMMUNICATION_DISTANCE_M,
+)
+
 
 CHANNEL_MODEL_VERSION = "sampled-a2g-conditional-5ms-block-fading-v1"
 CHANNEL_ENVIRONMENT_CONTRACT_VERSION = (
-    "boundary-aligned-slot-range-masked-fifty-block-service-v3"
+    "boundary-aligned-unified-400m-slot-range-masked-fifty-block-service-v4"
 )
 CHANNEL_FAIRNESS_CONTRACT_VERSION = "all-potential-links-fixed-order-crn-v1"
 CHANNEL_NORMALIZATION_VERSION = "link-type-fading-aware-physical-reference-v1"
@@ -430,8 +435,13 @@ def channel_configuration_metadata():
             "order": EXPECTED_CAPACITY_QUADRATURE_ORDER,
         },
         "communication_range_cutoff": {
-            "A2G_m": 200.0,
-            "A2A_m": 400.0,
+            "maximum_3d_distance_m": MAX_3D_COMMUNICATION_DISTANCE_M,
+            "S2U_m": MAX_3D_COMMUNICATION_DISTANCE_M,
+            "U2G_m": MAX_3D_COMMUNICATION_DISTANCE_M,
+            "U2U_m": MAX_3D_COMMUNICATION_DISTANCE_M,
+            "A2G_m": MAX_3D_COMMUNICATION_DISTANCE_M,
+            "A2A_m": MAX_3D_COMMUNICATION_DISTANCE_M,
+            "boundary_rule": COMMUNICATION_RANGE_BOUNDARY_RULE,
             "geometry": "slot-start-3d-euclidean-inclusive",
             "profile_rng": "generated-for-all-potential-links-before-range-mask",
         },

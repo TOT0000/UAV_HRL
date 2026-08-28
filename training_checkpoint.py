@@ -24,6 +24,8 @@ from centralized_movement import (
 )
 from experiment_config import (
     COM_SESSION_LIFECYCLE_VERSION,
+    COMMUNICATION_RANGE_BOUNDARY_RULE,
+    COMMUNICATION_RANGE_CONTRACT_VERSION,
     FOV_PACKET_GENERATION_CONTRACT_VERSION,
     GROUND_STATION_POSITION_M,
     GS_GATEWAY_CONTRACT_VERSION,
@@ -34,6 +36,7 @@ from experiment_config import (
     MOVEMENT_ACTION_PROJECTION_CONTRACT_VERSION,
     MOVEMENT_REPLAY_CONTRACT_VERSION,
     MOVEMENT_WARMUP_CONTRACT_VERSION,
+    MAX_3D_COMMUNICATION_DISTANCE_M,
     NUM_UAV,
     PERMANENT_GS_GATEWAY_UAV_ID,
     SAFE_DDQN_ETA_C,
@@ -70,7 +73,8 @@ from dinkelbach_blocks import (
     dinkelbach_config_metadata,
 )
 
-CHECKPOINT_SCHEMA_VERSION = 18
+CHECKPOINT_SCHEMA_VERSION = 19
+PRE_UNIFIED_400M_COMMUNICATION_CHECKPOINT_SCHEMA_VERSION = 18
 PRE_PERMANENT_GATEWAY_USEFUL_GOODPUT_CHECKPOINT_SCHEMA_VERSION = 17
 PRE_DISTANCE_AWARE_TASK_POTENTIAL_CHECKPOINT_SCHEMA_VERSION = 16
 PRE_INITIAL_TOPOLOGY_CHECKPOINT_SCHEMA_VERSION = 15
@@ -196,6 +200,11 @@ FORMAL_CORE_CONFIG_FIELDS = (
     "fov_physical_packet_bits_coverage_weighted",
     "com_session_lifecycle_version",
     "communication_range_contract_version",
+    "communication_range_boundary_rule",
+    "maximum_3d_communication_distance_m",
+    "s2u_communication_range_m",
+    "u2g_communication_range_m",
+    "u2u_communication_range_m",
     "a2g_communication_range_m",
     "a2a_communication_range_m",
     "packet_routing_causality_contract_version",
@@ -1024,6 +1033,14 @@ def _base_metadata(
         "gs_gateway_hard_radius_m": GS_GATEWAY_HARD_RADIUS_M,
         "gs_gateway_projection_mode": GS_GATEWAY_PROJECTION_MODE,
         "gs_gateway_contract_version": GS_GATEWAY_CONTRACT_VERSION,
+        "communication_range_contract_version": (
+            COMMUNICATION_RANGE_CONTRACT_VERSION
+        ),
+        "communication_range_boundary_rule": COMMUNICATION_RANGE_BOUNDARY_RULE,
+        "maximum_3d_communication_distance_m": (
+            MAX_3D_COMMUNICATION_DISTANCE_M
+        ),
+        "com_session_lifecycle_version": COM_SESSION_LIFECYCLE_VERSION,
         "fov_packet_generation_contract_version": (
             FOV_PACKET_GENERATION_CONTRACT_VERSION
         ),
@@ -1356,6 +1373,7 @@ def _validate_checkpoint_schema(metadata):
             "stochastic channel, COM QoS/routing-credit, all-participant FOV, "
             "GS-reachable initial topology, distance-aware VS/COM potentials, "
             "permanent GS gateway, capture-weighted timely useful goodput, "
+            "unified inclusive 400 m S2U/U2G/U2U communication range, "
             "named-RNG, projected-action and replay "
             "contract and must be retrained: "
             f"checkpoint={schema}, expected={CHECKPOINT_SCHEMA_VERSION}"
@@ -1385,6 +1403,12 @@ def _validate_checkpoint_schema(metadata):
             "movement_replay_contract_version": MOVEMENT_REPLAY_CONTRACT_VERSION,
             "movement_warmup_contract_version": MOVEMENT_WARMUP_CONTRACT_VERSION,
             "gs_gateway_contract_version": GS_GATEWAY_CONTRACT_VERSION,
+            "channel_contract": CHANNEL_ENVIRONMENT_CONTRACT_VERSION,
+            "communication_range_contract_version": (
+                COMMUNICATION_RANGE_CONTRACT_VERSION
+            ),
+            "task_potential_contract_version": TASK_POTENTIAL_CONTRACT_VERSION,
+            "com_session_lifecycle_version": COM_SESSION_LIFECYCLE_VERSION,
             "fov_packet_generation_contract_version": (
                 FOV_PACKET_GENERATION_CONTRACT_VERSION
             ),

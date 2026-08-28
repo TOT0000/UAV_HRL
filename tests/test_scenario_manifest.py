@@ -206,11 +206,11 @@ class ScenarioManifestTest(unittest.TestCase):
                 self.assertTrue(left_ids.isdisjoint(right_ids))
                 self.assertTrue(left_seeds.isdisjoint(right_seeds))
 
-    def test_previous_geometry_manifest_is_explicitly_obsolete(self):
+    def test_previous_split_range_manifest_is_explicitly_obsolete(self):
         data = generate_manifest("test", 912, 1).to_dict()
         data["schema_version"] = OBSOLETE_SCHEMA_VERSION
 
-        with self.assertRaisesRegex(ValueError, "pre-permanent-gateway.*incompatible"):
+        with self.assertRaisesRegex(ValueError, "split-range 200 m A2G / 400 m A2A"):
             ScenarioManifest.from_dict(data)
 
     def test_training_manifest_extension_preserves_exact_canonical_prefix(self):

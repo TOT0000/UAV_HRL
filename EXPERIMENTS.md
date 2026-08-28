@@ -146,7 +146,7 @@ design-dataset collection, aggregation, and exact-resume workflows.
   SR routes omit the duplicated start point, include the exact target, and mark
   arrival on the update that consumes the final waypoint. The only mutable SR
   lifecycle fields are `assigned_gt_id` and `arrived`. A COM session produces
-  no packets until its assigned UAV first enters the inclusive 200 m S2U
+  no packets until its assigned UAV first enters the inclusive 400 m S2U
   range; activation is permanent for the episode and packet generation then
   continues at 50 packets/s even while the UAV is out of range. Each activated
   COM packet is immediately `qos_eligible=True` at SR generation, while
@@ -202,15 +202,18 @@ arithmetic mean over FOV tasks, or zero when none exist.
 
 For every assigned COM task, progress is an equal blend of the existing
 deterministic expected S2U capacity normalization and 3-D S2U range-gap
-proximity. With inclusive `R_S2U = 200 m`, the gap is
+proximity. With inclusive `R_S2U = 400 m`, the gap is
 `max(d_3D - R_S2U, 0)` and is normalized by
 `max(sqrt(W^2 + H^2 + (z_max - z_ground)^2) - R_S2U, epsilon)`. The distance
 term is exactly one throughout the legal S2U range and decreases continuously
-only outside it; capacity continues to distinguish in-range geometry.
+only outside it. The prospective fading-aware capacity component deliberately
+does not apply the hard service cutoff, so it continues to provide continuous
+channel-quality information outside 400 m. VS remains based only on FOV sensing
+and horizontal target geometry and is independent of the communication range.
 `Phi_COM` is the arithmetic mean over COM tasks, or zero when none exist.
 Both blends use weights `0.5/0.5` and are finite in `[0,1]`.
 
-The contract is `vs-horizontal-proximity-com-range-gap-blend-v1`. TD3 and DDPG
+The contract is `vs-horizontal-proximity-com-400m-range-gap-blend-v2`. TD3 and DDPG
 consume the same potential definitions, random-movement methods publish the
 same environment/reward contract, and `*_no_task_potential` methods disable all
 Search/VS/COM shaping. Existing observations already contain UAV and task
@@ -233,12 +236,19 @@ second.
 U2U links retain the directed sender-absolute-AGL, 3-D-distance, 2.4 GHz paper
 path-loss model and are always LoS. U2U and sampled A2G LoS links use normalized
 Rician fading with linear `K=10` (`10 dB`); sampled A2G NLoS links use normalized
-Rayleigh fading. Hard slot-start 3-D ranges are inclusive: S2U/U2G use 200 m
-and U2U uses 400 m. Out-of-range links have zero observable and service
+Rayleigh fading. S2U, U2G, and U2U all use the same hard, inclusive, Euclidean
+3-D slot-start range of 400 m. Out-of-range links have zero observable and service
 capacity, are absent from the physical mask, and consume no FDMA bandwidth.
 The full potential-link fading profile is still generated before the range
 mask, preserving policy-independent RNG draw counts. No `C_min`, outage/PER,
 HARQ, shadowing, or retransmission model is added.
+
+The range decision is frozen at the start of each 0.25 s routing slot and is
+shared by all fifty 5 ms service blocks in that slot. All sixteen registered
+methods use this same channel, range mask, COM activation, packet-service, and
+evaluation contract. `FOV_COM_PAIR_MAX_DISTANCE_M = 200 m` remains unchanged:
+it is a horizontal task-target compatibility rule for pairing FOV and COM, not
+a radio range.
 
 Routing decisions remain every 0.25 seconds. Before each decision the private
 channel lifecycle vectorizes fifty 5 ms gains for every potential directed U2U,
@@ -305,9 +315,9 @@ seeds, the critical value is approximately `2.776`.
 
 ## Scenario manifests
 
-The `uav-hrl-scenario-v5` JSON schema records the split, manifest seed, episode
+The `uav-hrl-scenario-v6` JSON schema records the split, manifest seed, episode
 count, generation profile, generator/config fingerprint, content hash, permanent
-gateway contract, and one entry per scenario. Schemas v1-v4 are obsolete and
+gateway contract, and one entry per scenario. Schemas v1-v5 are obsolete and
 must be regenerated. Each
 entry contains its profile-aware ID and seed, GT/RoI data, UAV initial state,
 SR initial state and deterministic motion primitive, and traffic/load
@@ -320,15 +330,19 @@ The ground station is fixed at `(0, 0, 0)`. Canonical UAV 0 starts at
 `z ~ Uniform(80,120)` draw and starts with 10,000 J. This is only an initial
 geometry contract. UAV 0 is the permanent GS gateway. The single common movement
 proposal/execution path applies its full 3-D soft/hard GS projection to every
-movement method in training and evaluation: distances through 180 m are
-unchanged, the open `(180,200)` m band uses the canonical soft compression, and
-distances at or above 200 m project radially to 200 m. UAV 9 is not projected.
+movement method in training and evaluation: distances through 360 m are
+unchanged, the open `(360,400)` m band uses the canonical soft compression, and
+distances at or above 400 m project radially to 400 m. The final projected point
+must also obey the UAV altitude and environment XY bounds; at altitude
+difference `dz`, its horizontal GS radius cannot exceed
+`sqrt(400^2 - dz^2)`. UAV 9 is not projected.
 Replay records the executed net movement, state/channel/task geometry observes
 the projected position, and propulsion energy uses the executed displacement.
 The fixed movement warm-up remains 10,000 joint transitions.
 
 Every manifest entry and formal preflight validates the finite 3-D initial
-range graph using inclusive boundaries: U2G/S2U are 200 m and U2U is 400 m.
+range graph using the common inclusive 400 m Euclidean 3-D boundary for U2G and
+U2U.
 At least one UAV must have a U2G edge and the GS connected component must
 contain at least two UAVs. Validation uses range geometry, never positive
 capacity, and runs before run-directory creation or learned-weight loading.
@@ -467,25 +481,27 @@ python -X utf8 comparison_experiment.py aggregate --input-dir runs/comparison/ev
 
 Exact-resume checkpoints validate the method fingerprint, training-manifest
 relationship, training seed, the complete Dinkelbach block state, and its configuration.
-Checkpoint schema v18 is the current permanent-gateway, coverage-weighted useful
-goodput, boundary-aligned stochastic-channel,
+Checkpoint schema v19 is the current unified-400-m communication,
+permanent-gateway, coverage-weighted useful goodput, boundary-aligned stochastic-channel,
 movement/routing replay, utility/QoS, routing-ID causality/credit,
 frozen-backlog reward, GS-reachable initial topology, distance-aware VS/COM
 task potentials, hard-range/COM-session, atomic-FOV, seed-ratio
 aggregation, propulsion, and four-slot/fifty-block movement-channel contract.
-Schema v17 and every older
-schema is rejected before weights or replay state are restored and must be
-retrained; no legacy checkpoint migration is attempted. The current schema
+Schema v18 and every older schema is rejected before weights or replay state are
+restored and must be retrained; no legacy checkpoint migration is attempted.
+The current schema
 stores the 429/30/90 dimensions, movement feature schema, direct-ratio bit/J
 objective, shared gateway/channel/packet contracts, active FOV capture-coverage
 snapshots, raw/useful counters, inject buffers, adaptive routing lifecycle, and
 FOV-EMA state. The movement feature schema remains unchanged; the scenario
-schema is v5. Schema-17 checkpoints predate the permanent UAV 0 gateway,
+schema is v6. Schema-18 checkpoints use the previous split 200 m A2G / 400 m
+A2A environment and older COM range-gap semantics, so they must be retrained.
+Schema-17 checkpoints predate the permanent UAV 0 gateway,
 assigned-source FOV generation, and useful-goodput numerator and must be
 retrained. Schema-16 checkpoints use the prior sensing-only VS and capacity-only COM
 reward semantics and must be retrained. Scenario v3 and schema-15 checkpoints
-also remain incompatible because their canonical initial grid has no legal
-200 m U2G edge; none are silently migrated. A partial
+also remain incompatible with the current canonical initial-topology contract;
+none are silently migrated. A partial
 Dinkelbach block is persisted
 exactly and resumes with
 the same lambda, completed-episode count, numerator sum, denominator sum, block

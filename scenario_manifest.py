@@ -18,6 +18,8 @@ from experiment_config import (
     A2A_COMMUNICATION_RANGE_M,
     A2G_COMMUNICATION_RANGE_M,
     CANONICAL_UAV_INITIAL_XY_M,
+    COMMUNICATION_RANGE_M,
+    COMMUNICATION_RANGE_BOUNDARY_RULE,
     COMMUNICATION_RANGE_CONTRACT_VERSION,
     GROUND_STATION_POSITION_M,
     GS_GATEWAY_CONTRACT_VERSION,
@@ -25,6 +27,7 @@ from experiment_config import (
     GS_GATEWAY_PROJECTION_MODE,
     GS_GATEWAY_SOFT_RADIUS_M,
     INITIAL_COMMUNICATION_TOPOLOGY_CONTRACT_VERSION,
+    MAX_3D_COMMUNICATION_DISTANCE_M,
     NUM_UAV,
     PERMANENT_GS_GATEWAY_UAV_ID,
     RESERVED_SEARCH_UAV_IDS,
@@ -34,18 +37,19 @@ from experiment_config import (
 )
 
 
-SCENARIO_SCHEMA_VERSION = "uav-hrl-scenario-v5"
+SCENARIO_SCHEMA_VERSION = "uav-hrl-scenario-v6"
 OBSOLETE_SCHEMA_VERSIONS = frozenset(
     {
         "uav-hrl-scenario-v1",
         "uav-hrl-scenario-v2",
         "uav-hrl-scenario-v3",
         "uav-hrl-scenario-v4",
+        "uav-hrl-scenario-v5",
     }
 )
 # Singular compatibility name used by callers that construct an obsolete
 # manifest explicitly for fail-fast tests.
-OBSOLETE_SCHEMA_VERSION = "uav-hrl-scenario-v4"
+OBSOLETE_SCHEMA_VERSION = "uav-hrl-scenario-v5"
 UAV_INITIAL_LAYOUT = UAV_INITIAL_LAYOUT_VERSION
 SUPPORTED_SPLITS = frozenset({"train", "validation", "test"})
 POLICY_DEPENDENT_KEYS = frozenset(
@@ -105,8 +109,8 @@ def validate_initial_communication_topology(
     *,
     scenario_id,
     gs_position=GROUND_STATION_POSITION_M,
-    u2g_range_m=A2G_COMMUNICATION_RANGE_M,
-    u2u_range_m=A2A_COMMUNICATION_RANGE_M,
+    u2g_range_m=COMMUNICATION_RANGE_M,
+    u2u_range_m=COMMUNICATION_RANGE_M,
 ):
     """Validate the finite inclusive 3-D range graph at episode start."""
 
@@ -306,9 +310,16 @@ def current_environment_config() -> dict[str, Any]:
         "active_link_bandwidth_hz": 10e6,
         "a2g_communication_range_m": A2G_COMMUNICATION_RANGE_M,
         "a2a_communication_range_m": A2A_COMMUNICATION_RANGE_M,
+        "maximum_3d_communication_distance_m": (
+            MAX_3D_COMMUNICATION_DISTANCE_M
+        ),
+        "s2u_communication_range_m": COMMUNICATION_RANGE_M,
+        "u2g_communication_range_m": COMMUNICATION_RANGE_M,
+        "u2u_communication_range_m": COMMUNICATION_RANGE_M,
         "communication_range_contract_version": (
             COMMUNICATION_RANGE_CONTRACT_VERSION
         ),
+        "communication_range_boundary_rule": COMMUNICATION_RANGE_BOUNDARY_RULE,
         "ground_station_position_m": list(GROUND_STATION_POSITION_M),
         "uav_initial_layout": UAV_INITIAL_LAYOUT,
         "canonical_uav_initial_xy_m": [
@@ -674,17 +685,23 @@ class ScenarioManifest:
         }:
             raise ValueError(
                 "legacy 16-UAV scenario schema is incompatible; regenerate the "
-                "manifest with the 10-UAV v5 generator"
+                "manifest with the 10-UAV v6 generator"
             )
         if data.get("schema_version") == "uav-hrl-scenario-v3":
             raise ValueError(
                 "legacy disconnected-GS scenario geometry is incompatible; "
-                "regenerate the manifest with the v5 gateway layout"
+                "regenerate the manifest with the v6 gateway layout"
             )
         if data.get("schema_version") == "uav-hrl-scenario-v4":
             raise ValueError(
                 "legacy pre-permanent-gateway packet-generation scenario is "
-                "incompatible; regenerate the manifest with the v5 generator"
+                "incompatible; regenerate the manifest with the v6 generator"
+            )
+        if data.get("schema_version") == "uav-hrl-scenario-v5":
+            raise ValueError(
+                "legacy split-range 200 m A2G / 400 m A2A scenario is "
+                "incompatible; regenerate the manifest with the unified 400 m "
+                "v6 generator"
             )
         if data.get("schema_version") != SCENARIO_SCHEMA_VERSION:
             raise ValueError(
@@ -776,6 +793,15 @@ def generate_manifest(
             ),
             "a2g_communication_range_m": A2G_COMMUNICATION_RANGE_M,
             "a2a_communication_range_m": A2A_COMMUNICATION_RANGE_M,
+            "communication_range_boundary_rule": (
+                COMMUNICATION_RANGE_BOUNDARY_RULE
+            ),
+            "maximum_3d_communication_distance_m": (
+                MAX_3D_COMMUNICATION_DISTANCE_M
+            ),
+            "s2u_communication_range_m": COMMUNICATION_RANGE_M,
+            "u2g_communication_range_m": COMMUNICATION_RANGE_M,
+            "u2u_communication_range_m": COMMUNICATION_RANGE_M,
             "num_uav": NUM_UAV,
             "reserved_search_uav_ids": list(RESERVED_SEARCH_UAV_IDS),
         },

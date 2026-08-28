@@ -122,6 +122,11 @@ class UAV:
                 not np.isfinite((new_x, new_y, new_z)).all()
                 or not 0.0 <= new_x <= float(proposal["env_width"])
                 or not 0.0 <= new_y <= float(proposal["env_height"])
+                or not float(
+                    proposal.get("minimum_altitude_m", self.min_AGL)
+                )
+                <= new_z
+                <= float(proposal.get("maximum_altitude_m", self.max_AGL))
             ):
                 raise ValueError("authoritative movement projection is invalid")
             self.x_u, self.y_u, self.z_u = new_x, new_y, new_z

@@ -33,9 +33,8 @@ from Energy_model import EnergyConsumptionModel
 from Task_assignment import UAVAssigner, Task
 from object import UAV, SRTeam, GroundTarget
 from experiment_config import (
-    A2A_COMMUNICATION_RANGE_M,
-    A2G_COMMUNICATION_RANGE_M,
     CANONICAL_UAV_INITIAL_XY_M,
+    COMMUNICATION_RANGE_M,
     FOV_COM_PAIR_MAX_DISTANCE_M,
     COM_OFFERED_RATE_BPS,
     GROUND_STATION_POSITION_M,
@@ -801,7 +800,7 @@ class Simulator:
         distances = np.linalg.norm(
             positions[:, None, :] - positions[None, :, :], axis=-1
         )
-        self.u2u_range_mask = distances <= A2A_COMMUNICATION_RANGE_M
+        self.u2u_range_mask = distances <= COMMUNICATION_RANGE_M
         np.fill_diagonal(self.u2u_range_mask, False)
         feasible = (
             self.u2u_range_mask
@@ -841,7 +840,7 @@ class Simulator:
             dtype=float,
         )
         distances = np.linalg.norm(positions - gs_position[None, :], axis=1)
-        self.u2g_range_mask = distances <= A2G_COMMUNICATION_RANGE_M
+        self.u2g_range_mask = distances <= COMMUNICATION_RANGE_M
         self.gs_capacity = np.where(
             self.u2g_range_mask, self.u2g_nominal_capacity, 0.0
         )
@@ -864,14 +863,14 @@ class Simulator:
         return self.distance_3d(
             self.uav_dict[sender_id].get_position(),
             self.uav_dict[receiver_id].get_position(),
-        ) <= A2A_COMMUNICATION_RANGE_M
+        ) <= COMMUNICATION_RANGE_M
 
     def is_u2g_in_range(self, sender_id):
         if not hasattr(self, "uav_dict"):
             return bool(self.u2g_range_mask[int(sender_id)])
         return self.distance_3d(
             self.uav_dict[int(sender_id)].get_position(), self.GS_pos
-        ) <= A2G_COMMUNICATION_RANGE_M
+        ) <= COMMUNICATION_RANGE_M
 
     def is_s2u_in_range(self, sr_id, uav_id):
         if not hasattr(self, "uav_dict") or not self.SR_teams:
@@ -879,7 +878,7 @@ class Simulator:
         return self.distance_3d(
             self.SR_teams[int(sr_id)].get_position(),
             self.uav_dict[int(uav_id)].get_position(),
-        ) <= A2G_COMMUNICATION_RANGE_M
+        ) <= COMMUNICATION_RANGE_M
 
     def is_routing_link_in_range(self, sender_id, receiver_id):
         receiver_id = int(receiver_id)
