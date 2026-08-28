@@ -1,5 +1,6 @@
 import hashlib
 import json
+import math
 import random
 from copy import deepcopy
 from pathlib import Path
@@ -2316,6 +2317,12 @@ def save_full_resume_checkpoint(
     return saved
 
 
+def _bit_counter_tolerance(*values):
+    scale = max((abs(float(value)) for value in values), default=0.0)
+    ulp_tolerance = 32.0 * math.ulp(scale if scale > 0.0 else 1.0)
+    return min(0.5, max(1e-9, ulp_tolerance))
+
+
 def _validate_full_resume_logging_state(
     training_state, completed_episode, routing_agent_kind, checkpoint_schema_version
 ):
@@ -2476,13 +2483,6 @@ def _validate_full_resume_logging_state(
                 rtol=0.0,
                 atol=1e-9,
             )
-            or not np.isclose(
-                packet_state["fov_timely_useful_bits"]
-                + packet_state["com_timely_delivered_bits"],
-                packet_state["total_timely_useful_bits"],
-                rtol=0.0,
-                atol=1e-9,
-            )
             or packet_state["fov_timely_useful_bits"]
             > packet_state["fov_timely_delivered_raw_bits"] + 1e-9
             or packet_state["fov_timely_delivered_raw_bits"]
@@ -2493,6 +2493,20 @@ def _validate_full_resume_logging_state(
             > packet_state["fov_capture_coverage_count"]
         ):
             raise RuntimeError("checkpoint packet useful-goodput state is inconsistent")
+        fov_useful = float(packet_state["fov_timely_useful_bits"])
+        com_delivered = float(packet_state["com_timely_delivered_bits"])
+        expected_total = fov_useful + com_delivered
+        total_useful = float(packet_state["total_timely_useful_bits"])
+        difference = abs(expected_total - total_useful)
+        tolerance = _bit_counter_tolerance(expected_total, total_useful)
+        if difference > tolerance:
+            raise RuntimeError(
+                "checkpoint packet useful-goodput class-sum invariant failed: "
+                f"fov={fov_useful!r}, com={com_delivered!r}, "
+                f"expected_sum={expected_total!r}, total={total_useful!r}, "
+                f"absolute_difference={difference!r}, "
+                f"allowed_tolerance={tolerance!r}"
+            )
         packet_qos_fields = (
             "system_qos_eligible_packet_count",
             "system_qos_violation_count",

@@ -46,6 +46,7 @@ from training_checkpoint import (
     load_full_resume_checkpoint,
     load_model_checkpoint,
     inspect_full_resume_checkpoint,
+    _validate_full_resume_logging_state,
     save_full_resume_checkpoint,
     save_model_checkpoint,
 )
@@ -131,6 +132,58 @@ def _lifecycle_training_state(
         "routing_epsilon_start": 1.0,
         "routing_epsilon_end": 0.05,
     }
+
+
+def _interleaved_useful_goodput_training_state():
+    state = {
+        "full_resume_logging_schema_version": FULL_RESUME_LOGGING_SCHEMA_VERSION,
+        "reward_log": [0.0],
+        "delivered_log": [0.0],
+        "energy_log": [1.0],
+        "lambda_used_log": [0.0],
+        "lambda_after_episode_log": [0.0],
+        **_lifecycle_training_state(1),
+    }
+    packet_state = state["packet_engine_state"]
+    fov_useful = 0.0
+    fov_raw = 0.0
+    fov_coverage_sum = 0.0
+    com_delivered = 0.0
+    total_useful = 0.0
+    fov_count = 0
+    com_count = 0
+    for event_index in range(100_000):
+        if event_index % 3:
+            useful_bits = 250_000.0 + (event_index % 17) * 0.125
+            com_delivered += useful_bits
+            com_count += 1
+        else:
+            raw_bits = 180_000.0 + (event_index % 23) * 0.2
+            coverage = 0.35 + (event_index % 11) / 20.0
+            useful_bits = raw_bits * coverage
+            fov_raw += raw_bits
+            fov_coverage_sum += coverage
+            fov_useful += useful_bits
+            fov_count += 1
+        total_useful += useful_bits
+    packet_state.update(
+        {
+            "next_packet_id": fov_count + com_count,
+            "generated_packet_counts": {"FOV": fov_count, "COM": com_count},
+            "eligible_packet_counts": {"FOV": fov_count, "COM": com_count},
+            "raw_final_hop_bits": fov_raw + com_delivered,
+            "timely_goodput_bits": total_useful,
+            "fov_generated_raw_bits": fov_raw,
+            "fov_timely_delivered_raw_bits": fov_raw,
+            "fov_timely_useful_bits": fov_useful,
+            "fov_capture_coverage_sum": fov_coverage_sum,
+            "fov_capture_coverage_count": fov_count,
+            "com_timely_delivered_bits": com_delivered,
+            "total_timely_useful_bits": total_useful,
+            "system_qos_eligible_packet_count": fov_count + com_count,
+        }
+    )
+    return state
 
 
 def _assert_module_equal(testcase, expected, actual):
@@ -219,6 +272,52 @@ class FullResumeCheckpointTest(unittest.TestCase):
             gamma=0.99,
         )
         return td3, ddqn, joint, routing
+
+    def test_useful_goodput_class_sum_accepts_interleaved_roundoff(self):
+        state = _interleaved_useful_goodput_training_state()
+        packet_state = state["packet_engine_state"]
+        expected_sum = (
+            packet_state["fov_timely_useful_bits"]
+            + packet_state["com_timely_delivered_bits"]
+        )
+        difference = abs(
+            expected_sum - packet_state["total_timely_useful_bits"]
+        )
+        self.assertGreater(packet_state["total_timely_useful_bits"], 1e10)
+        self.assertGreater(difference, 1e-9)
+
+        _validate_full_resume_logging_state(
+            state,
+            completed_episode=1,
+            routing_agent_kind="safe_ddqn",
+            checkpoint_schema_version=CHECKPOINT_SCHEMA_VERSION,
+        )
+
+    def test_useful_goodput_class_sum_rejects_one_bit_difference(self):
+        state = _interleaved_useful_goodput_training_state()
+        packet_state = state["packet_engine_state"]
+        packet_state["total_timely_useful_bits"] += 1.0
+        packet_state["timely_goodput_bits"] += 1.0
+
+        with self.assertRaisesRegex(
+            RuntimeError, "useful-goodput class-sum invariant failed"
+        ) as raised:
+            _validate_full_resume_logging_state(
+                state,
+                completed_episode=1,
+                routing_agent_kind="safe_ddqn",
+                checkpoint_schema_version=CHECKPOINT_SCHEMA_VERSION,
+            )
+        message = str(raised.exception)
+        for field in (
+            "fov=",
+            "com=",
+            "expected_sum=",
+            "total=",
+            "absolute_difference=",
+            "allowed_tolerance=",
+        ):
+            self.assertIn(field, message)
 
     def _preflight_checkpoint(self, root, *, planned=1, completed=1):
         td3, ddqn, joint, routing = self._components()
