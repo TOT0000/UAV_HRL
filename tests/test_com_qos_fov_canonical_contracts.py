@@ -221,6 +221,7 @@ class CanonicalArtifactSourceContractTest(unittest.TestCase):
             "checkpoint_metadata_fingerprint": f"checkpoint-{seed}",
             "scenario_id": f"episode-{episode}",
             "timely_goodput_mbits": float(eligible),
+            "total_timely_useful_mbits": float(eligible),
             "total_mobility_energy_j": float(max(eligible, 1)),
             "fov_delivered_packets": eligible,
             "fov_delivered_e2e_delay_sum_seconds": float(eligible),
@@ -342,11 +343,12 @@ class CanonicalArtifactSourceContractTest(unittest.TestCase):
             )
 
         self.assertEqual(len(canonical_rows), 6)
-        self.assertEqual(len(generic_rows), 31)
-        self.assertEqual(len(csv_rows), 31)
+        expected_rows = 7 + len(DESCRIPTIVE_EPISODE_METRIC_COLUMNS)
+        self.assertEqual(len(generic_rows), expected_rows)
+        self.assertEqual(len(csv_rows), expected_rows)
         self.assertEqual(
             aggregation_metadata["generic_cross_seed_artifact_schema_version"],
-            "uav-hrl-generic-cross-seed-aggregate-v2",
+            "uav-hrl-generic-cross-seed-aggregate-v3",
         )
         kind_counts = {
             kind: sum(row["aggregation_kind"] == kind for row in generic_rows)
@@ -361,7 +363,9 @@ class CanonicalArtifactSourceContractTest(unittest.TestCase):
             {
                 "canonical_ratio": 6,
                 "canonical_alias": 1,
-                "descriptive_seed_mean": 24,
+                "descriptive_seed_mean": len(
+                    DESCRIPTIVE_EPISODE_METRIC_COLUMNS
+                ),
             },
         )
         identities = {

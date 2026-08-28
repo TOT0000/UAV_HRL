@@ -262,7 +262,7 @@ class RegistryContractTest(unittest.TestCase):
                     self.assertEqual(resolved["warmup_joint_transitions"], 10_000)
                     self.assertEqual(
                         resolved["replay_action_semantics"],
-                        "executed_projected_joint_action",
+                        "inverse-encoded-executed-net-displacement",
                     )
                 else:
                     self.assertIsNone(resolved["replay_capacity"])

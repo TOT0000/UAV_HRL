@@ -79,7 +79,7 @@ class CentralizedTrainingFlowTest(unittest.TestCase):
         self.assertEqual(formal.dinkelbach_update_interval_episodes, 50)
         self.assertEqual(formal.dinkelbach_update_rule, "ratio_of_block_sums")
         self.assertEqual(
-            formal.dinkelbach_numerator_unit, "timely_delivered_mbits"
+            formal.dinkelbach_numerator_unit, "timely_useful_mbits"
         )
         self.assertEqual(
             formal.dinkelbach_denominator_unit, "mobility_energy_joules"

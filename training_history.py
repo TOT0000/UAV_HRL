@@ -22,6 +22,7 @@ TRAINING_HISTORY_COLUMNS = (
     "episode",
     "reward",
     "timely_goodput_mbits",
+    "total_timely_useful_mbits",
     "mobility_energy_j",
     "energy_efficiency_mbit_per_j",
     "dinkelbach_lambda_used",
@@ -42,6 +43,7 @@ TRAINING_HISTORY_COLUMNS = (
 FLOAT_COLUMNS = (
     "reward",
     "timely_goodput_mbits",
+    "total_timely_useful_mbits",
     "mobility_energy_j",
     "energy_efficiency_mbit_per_j",
     "dinkelbach_lambda_used",
@@ -64,7 +66,7 @@ BOOLEAN_COLUMNS = ("dinkelbach_lambda_updated",)
 
 STRING_COLUMNS = ("dinkelbach_update_status",)
 
-TRAINING_HISTORY_SCHEMA_VERSION = 5
+TRAINING_HISTORY_SCHEMA_VERSION = 6
 TRAINING_HISTORY_CSV = "training_history.csv"
 TRAINING_HISTORY_JSONL = "training_history.jsonl"
 TRAINING_HISTORY_COMMIT = "training_history_commit.json"
@@ -96,6 +98,7 @@ def build_training_history_row(
     episode,
     reward,
     timely_goodput_mbits,
+    total_timely_useful_mbits=None,
     mobility_energy_j,
     dinkelbach_lambda_used,
     dinkelbach_lambda_after_episode,
@@ -113,12 +116,18 @@ def build_training_history_row(
     lambda_cost_after_episode=None,
 ):
     timely_goodput_mbits = float(timely_goodput_mbits)
+    total_timely_useful_mbits = (
+        timely_goodput_mbits
+        if total_timely_useful_mbits is None
+        else float(total_timely_useful_mbits)
+    )
     mobility_energy_j = float(mobility_energy_j)
     row = {
         **identity,
         "episode": int(episode),
         "reward": float(reward),
         "timely_goodput_mbits": timely_goodput_mbits,
+        "total_timely_useful_mbits": total_timely_useful_mbits,
         "mobility_energy_j": mobility_energy_j,
         "energy_efficiency_mbit_per_j": safe_energy_efficiency(
             timely_goodput_mbits, mobility_energy_j
@@ -226,6 +235,15 @@ def validate_training_history(rows, identity):
             raise ValueError("training history Dinkelbach block episode must be positive")
         if not row["dinkelbach_update_status"]:
             raise ValueError("training history Dinkelbach status must be non-empty")
+        if not math.isclose(
+            row["timely_goodput_mbits"],
+            row["total_timely_useful_mbits"],
+            rel_tol=0.0,
+            abs_tol=1e-12,
+        ):
+            raise ValueError(
+                "training history timely_goodput_mbits must alias total timely useful Mbit"
+            )
     return normalized
 
 

@@ -117,13 +117,22 @@ class UAV:
         new_x, new_y, new_z = map(float, proposal["new_position"])
         step_time = float(step_time)
         self.last_position = (old_x, old_y, old_z)
-        self.move_to(
-            new_x,
-            new_y,
-            new_z,
-            env_width=proposal["env_width"],
-            env_height=proposal["env_height"],
-        )
+        if proposal.get("authoritative_position_projection", False):
+            if (
+                not np.isfinite((new_x, new_y, new_z)).all()
+                or not 0.0 <= new_x <= float(proposal["env_width"])
+                or not 0.0 <= new_y <= float(proposal["env_height"])
+            ):
+                raise ValueError("authoritative movement projection is invalid")
+            self.x_u, self.y_u, self.z_u = new_x, new_y, new_z
+        else:
+            self.move_to(
+                new_x,
+                new_y,
+                new_z,
+                env_width=proposal["env_width"],
+                env_height=proposal["env_height"],
+            )
 
         actual_dx = float(self.x_u) - old_x
         actual_dy = float(self.y_u) - old_y

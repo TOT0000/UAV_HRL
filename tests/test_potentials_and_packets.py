@@ -21,7 +21,7 @@ from centralized_movement import (
 from com_capacity_calibration import calibrate_com_capacity
 
 
-class VisualSensingPacketGateTest(unittest.TestCase):
+class VisualSensingPacketGenerationTest(unittest.TestCase):
     def setUp(self):
         self.env = Simulator(num_UAV=10)
         self.env.num_GT = 2
@@ -42,7 +42,7 @@ class VisualSensingPacketGateTest(unittest.TestCase):
         self.env.multi_tasks[0] = [self.task]
         self.env.source_uavs = {0}
 
-    def test_valid_geometry_generates_and_invalid_geometry_does_not(self):
+    def test_assignment_generates_for_valid_and_zero_coverage_geometry(self):
         self.assertTrue(vs_data_valid(self.env, 0, self.task))
         self.packet_engine.inject_packets(
             self.env,
@@ -64,11 +64,12 @@ class VisualSensingPacketGateTest(unittest.TestCase):
             step_time=0.25,
             base_fov_rate=4,
         )
-        self.assertEqual(self.packet_engine.active_count(), 1)
-        self.assertIs(self.packet_engine.get_active_packets()[0], old_packet)
+        self.assertEqual(self.packet_engine.active_count(), 2)
+        new_packet = self.packet_engine.get_active_packets()[1]
+        self.assertEqual(new_packet["capture_coverage_ratio"], 0.0)
+        self.assertEqual(self.packet_engine.eligible_packet_counts["FOV"], 2)
 
-        # The validity gate affects only new source generation. An existing FOV
-        # packet remains eligible for the canonical E2E forwarding path.
+        # Capture quality is frozen per packet and does not change physical FIFO.
         result = self.packet_engine.serve_active_links(
             self.env,
             actions={0: self.env.GS_ID},
@@ -98,9 +99,9 @@ class VisualSensingPacketGateTest(unittest.TestCase):
         ):
             self.assertFalse(vs_data_valid(self.env, 0, self.task))
 
-    def test_invalid_image_score_does_not_inject_a_new_packet(self):
+    def test_image_score_outside_old_validity_gate_still_injects(self):
         with patch(
-            "centralized_movement.fov_task_metrics",
+            "Packet_scheduler_v1.fov_task_metrics",
             return_value=(1.0, 1.5, True),
         ):
             self.packet_engine.inject_packets(
@@ -110,7 +111,10 @@ class VisualSensingPacketGateTest(unittest.TestCase):
                 step_time=0.25,
                 base_fov_rate=4,
             )
-        self.assertEqual(self.packet_engine.active_count(), 0)
+        self.assertEqual(self.packet_engine.active_count(), 1)
+        packet = self.packet_engine.get_active_packets()[0]
+        self.assertEqual(packet["capture_coverage_ratio"], 1.0)
+        self.assertGreaterEqual(packet["size_bits"], 0.0)
 
 
 class ComStateCalibrationAndDeliveryTest(unittest.TestCase):

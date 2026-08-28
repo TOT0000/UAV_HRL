@@ -24,16 +24,23 @@ from centralized_movement import (
 )
 from experiment_config import (
     COM_SESSION_LIFECYCLE_VERSION,
+    FOV_PACKET_GENERATION_CONTRACT_VERSION,
     GROUND_STATION_POSITION_M,
+    GS_GATEWAY_CONTRACT_VERSION,
+    GS_GATEWAY_HARD_RADIUS_M,
+    GS_GATEWAY_PROJECTION_MODE,
+    GS_GATEWAY_SOFT_RADIUS_M,
     INITIAL_COMMUNICATION_TOPOLOGY_CONTRACT_VERSION,
     MOVEMENT_ACTION_PROJECTION_CONTRACT_VERSION,
     MOVEMENT_REPLAY_CONTRACT_VERSION,
     MOVEMENT_WARMUP_CONTRACT_VERSION,
     NUM_UAV,
+    PERMANENT_GS_GATEWAY_UAV_ID,
     SAFE_DDQN_ETA_C,
     SAFE_DDQN_INITIAL_LAMBDA_COST,
     SAFE_DDQN_QOS_TARGET_PROBABILITY,
     TASK_POTENTIAL_CONTRACT_VERSION,
+    TIMELY_USEFUL_GOODPUT_CONTRACT_VERSION,
     UAV_INITIAL_LAYOUT_VERSION,
     task_potential_contract_metadata,
 )
@@ -63,7 +70,8 @@ from dinkelbach_blocks import (
     dinkelbach_config_metadata,
 )
 
-CHECKPOINT_SCHEMA_VERSION = 17
+CHECKPOINT_SCHEMA_VERSION = 18
+PRE_PERMANENT_GATEWAY_USEFUL_GOODPUT_CHECKPOINT_SCHEMA_VERSION = 17
 PRE_DISTANCE_AWARE_TASK_POTENTIAL_CHECKPOINT_SCHEMA_VERSION = 16
 PRE_INITIAL_TOPOLOGY_CHECKPOINT_SCHEMA_VERSION = 15
 ROUTING_LIFECYCLE_CHECKPOINT_SCHEMA_VERSION = 6
@@ -152,6 +160,11 @@ FORMAL_CORE_CONFIG_FIELDS = (
     "task_potential_contract_version",
     "task_potential_configuration",
     "ground_station_position_m",
+    "permanent_gs_gateway_uav_id",
+    "gs_gateway_soft_radius_m",
+    "gs_gateway_hard_radius_m",
+    "gs_gateway_projection_mode",
+    "gs_gateway_contract_version",
     "uav_initial_layout_version",
     "initial_communication_topology_contract_version",
     "fov_com_pair_max_distance_m",
@@ -176,6 +189,11 @@ FORMAL_CORE_CONFIG_FIELDS = (
     "fov_ema_lifecycle_version",
     "sr_route_lifecycle_version",
     "packet_qos_contract_version",
+    "fov_packet_generation_contract_version",
+    "timely_useful_goodput_contract_version",
+    "timely_goodput_definition",
+    "fov_coverage_snapshot_timing",
+    "fov_physical_packet_bits_coverage_weighted",
     "com_session_lifecycle_version",
     "communication_range_contract_version",
     "a2g_communication_range_m",
@@ -1001,6 +1019,17 @@ def _base_metadata(
             formal_config.get("channel_configuration")
         ),
         "ground_station_position_m": list(GROUND_STATION_POSITION_M),
+        "permanent_gs_gateway_uav_id": PERMANENT_GS_GATEWAY_UAV_ID,
+        "gs_gateway_soft_radius_m": GS_GATEWAY_SOFT_RADIUS_M,
+        "gs_gateway_hard_radius_m": GS_GATEWAY_HARD_RADIUS_M,
+        "gs_gateway_projection_mode": GS_GATEWAY_PROJECTION_MODE,
+        "gs_gateway_contract_version": GS_GATEWAY_CONTRACT_VERSION,
+        "fov_packet_generation_contract_version": (
+            FOV_PACKET_GENERATION_CONTRACT_VERSION
+        ),
+        "timely_useful_goodput_contract_version": (
+            TIMELY_USEFUL_GOODPUT_CONTRACT_VERSION
+        ),
         "uav_initial_layout_version": UAV_INITIAL_LAYOUT_VERSION,
         "initial_communication_topology_contract_version": (
             INITIAL_COMMUNICATION_TOPOLOGY_CONTRACT_VERSION
@@ -1047,7 +1076,7 @@ def _base_metadata(
     if reward_mode == "ratio":
         metadata["movement_objective"] = {
             "objective_unit": "bit_per_j",
-            "numerator": "episode timely delivered bits",
+            "numerator": "episode timely useful bits",
             "denominator": "episode mobility energy joules",
             "semantics": "terminal-only ratio of sums",
         }
@@ -1326,6 +1355,7 @@ def _validate_checkpoint_schema(metadata):
             "checkpoint_schema_version is incompatible with the boundary-aligned "
             "stochastic channel, COM QoS/routing-credit, all-participant FOV, "
             "GS-reachable initial topology, distance-aware VS/COM potentials, "
+            "permanent GS gateway, capture-weighted timely useful goodput, "
             "named-RNG, projected-action and replay "
             "contract and must be retrained: "
             f"checkpoint={schema}, expected={CHECKPOINT_SCHEMA_VERSION}"
@@ -1354,6 +1384,13 @@ def _validate_checkpoint_schema(metadata):
             ),
             "movement_replay_contract_version": MOVEMENT_REPLAY_CONTRACT_VERSION,
             "movement_warmup_contract_version": MOVEMENT_WARMUP_CONTRACT_VERSION,
+            "gs_gateway_contract_version": GS_GATEWAY_CONTRACT_VERSION,
+            "fov_packet_generation_contract_version": (
+                FOV_PACKET_GENERATION_CONTRACT_VERSION
+            ),
+            "timely_useful_goodput_contract_version": (
+                TIMELY_USEFUL_GOODPUT_CONTRACT_VERSION
+            ),
         }
         mismatches = {
             key: (metadata.get(key), value)
@@ -2356,6 +2393,77 @@ def _validate_full_resume_logging_state(
             raise RuntimeError("episode-boundary checkpoint has packet routing references")
         if packet_state.get("pending_terminal_violation_events"):
             raise RuntimeError("checkpoint has unprocessed terminal violation events")
+        for buffer_name in ("inject_buffer", "source_buffer"):
+            buffer_state = packet_state.get(buffer_name)
+            if not isinstance(buffer_state, dict) or any(
+                not isinstance(key, str)
+                or not np.isfinite(float(value))
+                or float(value) < 0.0
+                for key, value in buffer_state.items()
+            ):
+                raise RuntimeError(
+                    f"checkpoint packet {buffer_name} state is invalid"
+                )
+        for count_name in ("generated_packet_counts", "eligible_packet_counts"):
+            counts = packet_state.get(count_name)
+            if (
+                not isinstance(counts, dict)
+                or set(counts) != {"FOV", "COM"}
+                or any(type(value) is not int or value < 0 for value in counts.values())
+            ):
+                raise RuntimeError(
+                    f"checkpoint packet {count_name} state is invalid"
+                )
+        useful_float_fields = (
+            "raw_final_hop_bits",
+            "timely_goodput_bits",
+            "fov_generated_raw_bits",
+            "fov_timely_delivered_raw_bits",
+            "fov_timely_useful_bits",
+            "fov_capture_coverage_sum",
+            "com_timely_delivered_bits",
+            "total_timely_useful_bits",
+        )
+        if any(
+            not np.isfinite(float(packet_state.get(field, float("nan"))))
+            or float(packet_state[field]) < 0.0
+            for field in useful_float_fields
+        ):
+            raise RuntimeError("checkpoint packet raw/useful bit counters are invalid")
+        useful_count_fields = (
+            "fov_capture_coverage_count",
+            "fov_zero_coverage_packet_count",
+        )
+        if any(
+            type(packet_state.get(field)) is not int
+            or int(packet_state[field]) < 0
+            for field in useful_count_fields
+        ):
+            raise RuntimeError("checkpoint packet coverage counters are invalid")
+        if (
+            not np.isclose(
+                packet_state["timely_goodput_bits"],
+                packet_state["total_timely_useful_bits"],
+                rtol=0.0,
+                atol=1e-9,
+            )
+            or not np.isclose(
+                packet_state["fov_timely_useful_bits"]
+                + packet_state["com_timely_delivered_bits"],
+                packet_state["total_timely_useful_bits"],
+                rtol=0.0,
+                atol=1e-9,
+            )
+            or packet_state["fov_timely_useful_bits"]
+            > packet_state["fov_timely_delivered_raw_bits"] + 1e-9
+            or packet_state["fov_timely_delivered_raw_bits"]
+            > packet_state["fov_generated_raw_bits"] + 1e-9
+            or packet_state["fov_capture_coverage_sum"]
+            > packet_state["fov_capture_coverage_count"] + 1e-9
+            or packet_state["fov_zero_coverage_packet_count"]
+            > packet_state["fov_capture_coverage_count"]
+        ):
+            raise RuntimeError("checkpoint packet useful-goodput state is inconsistent")
         packet_qos_fields = (
             "system_qos_eligible_packet_count",
             "system_qos_violation_count",
@@ -2379,6 +2487,8 @@ def _validate_full_resume_logging_state(
         unattributed = packet_state[
             "unattributed_transition_violation_count"
         ]
+        if system_eligible != sum(packet_state["eligible_packet_counts"].values()):
+            raise RuntimeError("checkpoint packet eligible counts are inconsistent")
         if (
             routing_eligible > system_eligible
             or system_violations > system_eligible

@@ -12,7 +12,7 @@ from Channel_model import (
     reference_u2g_max_capacity_mbps,
     reference_u2u_max_capacity_mbps,
 )
-from centralized_movement import vs_data_valid
+from centralized_movement import fov_task_metrics
 from experiment_config import (
     COM_SESSION_LIFECYCLE_VERSION,
     COM_PACKET_RATE_PER_SECOND,
@@ -29,7 +29,7 @@ import numpy as np
 
 
 PACKET_ENGINE_CHECKPOINT_SCHEMA_VERSION = (
-    "episode-boundary-packet-qos-credit-session-v2"
+    "episode-boundary-packet-qos-useful-goodput-session-v3"
 )
 
 
@@ -43,6 +43,34 @@ MAX_PACKET_HOPS = 20
 PACKET_EPS = 1e-9
 TASK_DEADLINE_SECONDS = dict(PRODUCTION_TASK_DEADLINE_SECONDS)
 EPISODE_INJECTION_CUTOFF_SECONDS = PRODUCTION_PACKET_INJECTION_CUTOFF_SECONDS
+FOV_PACKET_PAYLOAD_FACTOR = 0.005 * (0.008 * 0.012 / (3.9e-6**2))
+
+
+def sanitize_capture_coverage_ratio(value):
+    """Freeze any invalid capture geometry as zero useful coverage."""
+
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    if not math.isfinite(value):
+        return 0.0
+    return float(np.clip(value, 0.0, 1.0))
+
+
+def fov_physical_packet_size_bits(image_quantity):
+    """Preserve the established payload formula with finite-value sanitizing."""
+
+    try:
+        quantity = float(image_quantity)
+    except (TypeError, ValueError):
+        quantity = 0.0
+    if not math.isfinite(quantity) or quantity < 0.0:
+        quantity = 0.0
+    payload = FOV_PACKET_PAYLOAD_FACTOR * min(quantity, 1.0)
+    if not math.isfinite(payload) or payload < 0.0:
+        raise RuntimeError("sanitized FOV physical packet size is invalid")
+    return float(payload)
 
 
 class BlockServiceCursor:
@@ -206,6 +234,14 @@ class PacketEngine:
         self.partial_transmissions = 0
         self.raw_final_hop_bits = 0.0
         self.timely_goodput_bits = 0.0
+        self.fov_generated_raw_bits = 0.0
+        self.fov_timely_delivered_raw_bits = 0.0
+        self.fov_timely_useful_bits = 0.0
+        self.fov_capture_coverage_sum = 0.0
+        self.fov_capture_coverage_count = 0
+        self.fov_zero_coverage_packet_count = 0
+        self.com_timely_delivered_bits = 0.0
+        self.total_timely_useful_bits = 0.0
         self.wait_actions = 0
         self.deadline_drops = 0
         self.link_slot_budget_violations = 0
@@ -629,14 +665,26 @@ class PacketEngine:
         source_kind,
         *,
         qos_eligible,
+        capture_coverage_ratio=None,
     ):
         source = int(source)
         task_type = self._task_norm(task_type)
         size_bits = float(size_bits)
         generation_time = float(generation_time)
+        if not math.isfinite(size_bits) or size_bits < 0.0:
+            raise ValueError("physical packet size must be finite and non-negative")
+        if not math.isfinite(generation_time):
+            raise ValueError("packet generation time must be finite")
         pool_idx = len(self.packet_pool)
         task_type = self._task_norm(task_type)
         deadline_seconds = float(self.task_deadlines_seconds[task_type])
+        frozen_coverage = (
+            sanitize_capture_coverage_ratio(
+                1.0 if capture_coverage_ratio is None else capture_coverage_ratio
+            )
+            if task_type == "FOV"
+            else None
+        )
         pkt = {
             "id": self._next_pkt_id,
             "_pool_idx": pool_idx,
@@ -656,6 +704,7 @@ class PacketEngine:
             "task_type": task_type,
             "size_bits": size_bits,
             "rem_bits": size_bits,
+            "capture_coverage_ratio": frozen_coverage,
             "path": [source],
             "e2e_delay_ms": 0.0,
             "bn_path_mbps": float("inf"),
@@ -684,6 +733,12 @@ class PacketEngine:
             "last_routing_transition_id": None,
         }
         self.generated_packet_counts[task_type] += 1
+        if task_type == "FOV":
+            self.fov_generated_raw_bits += size_bits
+            self.fov_capture_coverage_sum += frozen_coverage
+            self.fov_capture_coverage_count += 1
+            if frozen_coverage <= PACKET_EPS:
+                self.fov_zero_coverage_packet_count += 1
         if bool(qos_eligible):
             self.eligible_packet_counts[task_type] += 1
         self.packet_pool.append(pkt)
@@ -691,7 +746,15 @@ class PacketEngine:
         self._next_pkt_id += 1
         return pkt
 
-    def create_packet(self, source, task_type, size_bits, generation_time):
+    def create_packet(
+        self,
+        source,
+        task_type,
+        size_bits,
+        generation_time,
+        *,
+        capture_coverage_ratio=None,
+    ):
         """Create a UAV-origin FOV packet and enqueue it at its source UAV."""
 
         pkt = self._new_packet(
@@ -701,6 +764,7 @@ class PacketEngine:
             generation_time,
             source_kind="UAV",
             qos_eligible=True,
+            capture_coverage_ratio=capture_coverage_ratio,
         )
         self.enqueue_packet(pkt, source, generation_time)
         return pkt
@@ -1456,6 +1520,10 @@ class PacketEngine:
             "cost_by_sender": defaultdict(float),
             "deferred_cost_by_sender": defaultdict(float),
             "timely_goodput_bits": 0.0,
+            "total_timely_useful_bits": 0.0,
+            "fov_timely_delivered_raw_bits": 0.0,
+            "fov_timely_useful_bits": 0.0,
+            "com_timely_delivered_bits": 0.0,
             "raw_final_hop_bits": 0.0,
             "transmitted_bits_by_link": {},
             "relay_arrivals": [],
@@ -1620,10 +1688,30 @@ class PacketEngine:
                         )
                         if timely_delivery:
                             if not pkt.get("timely_goodput_counted", False):
-                                timely_bits = float(pkt["size_bits"])
+                                physical_bits = float(pkt["size_bits"])
+                                task_type = self._task_norm(pkt["task_type"])
+                                if task_type == "FOV":
+                                    coverage = sanitize_capture_coverage_ratio(
+                                        pkt.get("capture_coverage_ratio", 0.0)
+                                    )
+                                    useful_bits = physical_bits * coverage
+                                    self.fov_timely_delivered_raw_bits += physical_bits
+                                    self.fov_timely_useful_bits += useful_bits
+                                    result[
+                                        "fov_timely_delivered_raw_bits"
+                                    ] += physical_bits
+                                    result["fov_timely_useful_bits"] += useful_bits
+                                else:
+                                    useful_bits = physical_bits
+                                    self.com_timely_delivered_bits += physical_bits
+                                    result["com_timely_delivered_bits"] += physical_bits
                                 pkt["timely_goodput_counted"] = True
-                                self.timely_goodput_bits += timely_bits
-                                result["timely_goodput_bits"] += timely_bits
+                                pkt["timely_delivered_raw_bits"] = physical_bits
+                                pkt["timely_useful_bits"] = useful_bits
+                                self.total_timely_useful_bits += useful_bits
+                                self.timely_goodput_bits += useful_bits
+                                result["total_timely_useful_bits"] += useful_bits
+                                result["timely_goodput_bits"] += useful_bits
                             self.total_delivered += 1
                             task_type = self._task_norm(pkt["task_type"])
                             if task_type == "FOV":
@@ -1802,10 +1890,6 @@ class PacketEngine:
                 task_type = task["task_type"]
                 if task_type != "FOV":
                     continue
-                if task_type == "FOV" and not vs_data_valid(env, uav_id, task):
-                    # Existing queued/relayed VS packets remain untouched; only new
-                    # source generation is gated by current geometry and full ROI coverage.
-                    continue
                 rate = base_fov_rate
                 
                 # === 基於速率積分的封包計數 ===
@@ -1824,21 +1908,21 @@ class PacketEngine:
                 #     if num_packets > remain:
                 #         num_packets = remain
 
-                uav = env.uav_dict[uav_id]
-                x_tgt, y_tgt, z_tgt = task["target_pos"]
-                if not hasattr(self, "FovModel"):
-                    self.FovModel = FovModel(f=0.004, wl=0.008, i_l=0.012, z_u=uav.z_u, gamma_g=80)
-                self.FovModel.z_u = uav.z_u
-                current_fov, _ = self.FovModel.calculate_fov_single(
-                    uav.x_u, uav.y_u, uav.z_u, x_tgt, y_tgt, z_tgt
+                coverage_ratio, image_quantity, _geometry_valid = fov_task_metrics(
+                    env, uav_id, task
                 )
-                max_fov = min (1, current_fov)
-                wl, i_l, tau = 0.008, 0.012, 3.9e-6
-                pkt_bits = 0.005 * (wl * i_l / (tau ** 2)) * max_fov
+                capture_coverage_ratio = sanitize_capture_coverage_ratio(
+                    coverage_ratio
+                )
+                pkt_bits = fov_physical_packet_size_bits(image_quantity)
 
                 for _ in range(num_packets):
                     self.create_packet(
-                        uav_id, task_type, pkt_bits, current_time
+                        uav_id,
+                        task_type,
+                        pkt_bits,
+                        current_time,
+                        capture_coverage_ratio=capture_coverage_ratio,
                     )
                     # self.total_injected_packets += 1
                     # if self.total_injected_packets >= self.target_total_packets:
@@ -1898,12 +1982,31 @@ class PacketEngine:
             (deepcopy(pkt) for pkt in self.get_active_packets()),
             key=lambda pkt: int(pkt["id"]),
         )
+        for pkt in active_packets:
+            if self._task_norm(pkt.get("task_type", "COM")) == "FOV":
+                coverage = pkt.get("capture_coverage_ratio")
+                if (
+                    coverage is None
+                    or not math.isfinite(float(coverage))
+                    or not 0.0 <= float(coverage) <= 1.0
+                ):
+                    raise RuntimeError(
+                        "active FOV packet lacks a valid capture coverage snapshot"
+                    )
         return {
             "schema_version": PACKET_ENGINE_CHECKPOINT_SCHEMA_VERSION,
             "checkpoint_scope": "episode_boundary_terminal_snapshot",
             "mid_episode_checkpoint_supported": False,
             "next_packet_id": int(self._next_pkt_id),
             "active_packets": active_packets,
+            "inject_buffer": {
+                str(key): float(value)
+                for key, value in sorted(self.inject_buffer.items())
+            },
+            "source_buffer": {
+                str(key): float(value)
+                for key, value in sorted(self.source_buffer.items())
+            },
             "uav_queue_packet_ids": {
                 str(uid): [int(pkt["id"]) for pkt in queue]
                 for uid, queue in sorted(self.uav_queues.items())
@@ -1917,6 +2020,28 @@ class PacketEngine:
                 for key, value in self.routing_transition_reference_counts().items()
             },
             "com_session_state": self.com_session_state(),
+            "generated_packet_counts": {
+                key: int(value)
+                for key, value in sorted(self.generated_packet_counts.items())
+            },
+            "eligible_packet_counts": {
+                key: int(value)
+                for key, value in sorted(self.eligible_packet_counts.items())
+            },
+            "raw_final_hop_bits": float(self.raw_final_hop_bits),
+            "timely_goodput_bits": float(self.timely_goodput_bits),
+            "fov_generated_raw_bits": float(self.fov_generated_raw_bits),
+            "fov_timely_delivered_raw_bits": float(
+                self.fov_timely_delivered_raw_bits
+            ),
+            "fov_timely_useful_bits": float(self.fov_timely_useful_bits),
+            "fov_capture_coverage_sum": float(self.fov_capture_coverage_sum),
+            "fov_capture_coverage_count": int(self.fov_capture_coverage_count),
+            "fov_zero_coverage_packet_count": int(
+                self.fov_zero_coverage_packet_count
+            ),
+            "com_timely_delivered_bits": float(self.com_timely_delivered_bits),
+            "total_timely_useful_bits": float(self.total_timely_useful_bits),
             "pending_terminal_violation_events": deepcopy(
                 self.pending_terminal_violation_events
             ),
@@ -2037,6 +2162,11 @@ class PacketEngine:
                 "deadline_seconds": float(pkt.get("deadline", 0.0)),
                 "e2e_delay_seconds": e2e_seconds,
                 "size_bits": float(pkt.get("size_bits", 0.0)),
+                "capture_coverage_ratio": pkt.get("capture_coverage_ratio"),
+                "timely_delivered_raw_bits": float(
+                    pkt.get("timely_delivered_raw_bits", 0.0)
+                ),
+                "timely_useful_bits": float(pkt.get("timely_useful_bits", 0.0)),
                 "delivered_to_gs": delivered_to_gs,
                 "qos_eligible": bool(pkt.get("qos_eligible", False)),
                 "routing_eligible": bool(pkt.get("routing_eligible", False)),
@@ -2139,6 +2269,29 @@ class PacketEngine:
                     float(violations) / eligible if eligible else None
                 ),
             }
+            if task_type == "FOV":
+                result[task_type].update(
+                    {
+                        "generated_raw_bits": float(self.fov_generated_raw_bits),
+                        "timely_delivered_raw_bits": float(
+                            self.fov_timely_delivered_raw_bits
+                        ),
+                        "timely_useful_bits": float(self.fov_timely_useful_bits),
+                        "mean_capture_coverage": (
+                            float(self.fov_capture_coverage_sum)
+                            / int(self.fov_capture_coverage_count)
+                            if self.fov_capture_coverage_count
+                            else None
+                        ),
+                        "zero_coverage_packet_count": int(
+                            self.fov_zero_coverage_packet_count
+                        ),
+                    }
+                )
+            else:
+                result[task_type]["timely_delivered_bits"] = float(
+                    self.com_timely_delivered_bits
+                )
         return result
 
 
@@ -2261,6 +2414,14 @@ class PacketEngine:
         self.partial_transmissions = 0
         self.raw_final_hop_bits = 0.0
         self.timely_goodput_bits = 0.0
+        self.fov_generated_raw_bits = 0.0
+        self.fov_timely_delivered_raw_bits = 0.0
+        self.fov_timely_useful_bits = 0.0
+        self.fov_capture_coverage_sum = 0.0
+        self.fov_capture_coverage_count = 0
+        self.fov_zero_coverage_packet_count = 0
+        self.com_timely_delivered_bits = 0.0
+        self.total_timely_useful_bits = 0.0
         self.wait_actions = 0
         self.deadline_drops = 0
         self.link_slot_budget_violations = 0

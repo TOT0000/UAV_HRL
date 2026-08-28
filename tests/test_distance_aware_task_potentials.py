@@ -348,7 +348,7 @@ class TaskPotentialMethodContractTest(unittest.TestCase):
         self.assertEqual(MOVEMENT_STATE_DIM, 429)
         self.assertEqual(JOINT_ACTION_DIM, 30)
         self.assertEqual(ROUTING_STATE_DIM, 90)
-        self.assertEqual(SCENARIO_SCHEMA_VERSION, "uav-hrl-scenario-v4")
+        self.assertEqual(SCENARIO_SCHEMA_VERSION, "uav-hrl-scenario-v5")
 
 
 if __name__ == "__main__":

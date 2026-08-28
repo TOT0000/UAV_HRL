@@ -470,11 +470,15 @@ class SimpleRunnerLifecycleIntegrationTest(unittest.TestCase):
                 final_state["lambda_cost_used_log"][1],
                 ep1_state["lambda_cost_after_episode_log"][0],
             )
+            # Assigned FOV sources are immediately QoS eligible under the
+            # current packet contract, so each resumed episode contributes a
+            # valid constraint update instead of being skipped for lack of
+            # full-coverage FOV packets.
             self.assertEqual(
                 final_payload["ddqn_state"]["constraint_state"][
                     "cost_multiplier_update_count"
                 ],
-                ep1_constraint_state["cost_multiplier_update_count"],
+                3,
             )
             self.assertEqual(final_state["lambda_used_log"], [None, None, None])
             self.assertEqual(

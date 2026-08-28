@@ -33,6 +33,13 @@ ROI_COUNT_MIN = 2
 ROI_COUNT_MAX = 8
 RESERVED_SEARCH_UAV_IDS = (0, NUM_UAV - 1)
 GROUND_STATION_POSITION_M = (0.0, 0.0, 0.0)
+PERMANENT_GS_GATEWAY_UAV_ID = 0
+GS_GATEWAY_SOFT_RADIUS_M = 180.0
+GS_GATEWAY_HARD_RADIUS_M = 200.0
+GS_GATEWAY_PROJECTION_MODE = "gs_only"
+GS_GATEWAY_CONTRACT_VERSION = (
+    "permanent-uav0-search-to-hover-3d-soft-hard-gs-projection-v1"
+)
 CANONICAL_UAV_INITIAL_XY_M = (
     (50.0, 50.0),
     (300.0, 250.0),
@@ -121,7 +128,13 @@ ROUTING_OPTIMIZER_UPDATE_SCOPE = "every_4_routing_slots"
 FOV_EMA_LIFECYCLE_VERSION = "all-participant-precommit-search-union-v5"
 SR_ROUTE_LIFECYCLE_VERSION = "assigned-and-arrived-derived-state-v2"
 PACKET_QOS_CONTRACT_VERSION = (
-    "activated-com-immediate-qos-versus-routing-eligibility-v6"
+    "assigned-fov-and-activated-com-immediate-qos-v7"
+)
+FOV_PACKET_GENERATION_CONTRACT_VERSION = (
+    "assigned-source-rate-integrator-capture-coverage-snapshot-v2"
+)
+TIMELY_USEFUL_GOODPUT_CONTRACT_VERSION = (
+    "fov-capture-coverage-weighted-com-full-timely-bits-v1"
 )
 PACKET_ROUTING_CAUSALITY_CONTRACT_VERSION = (
     "transition-id-causality-credit-pending-one-step-v3"
@@ -142,9 +155,11 @@ MOVEMENT_CHANNEL_TIMING_VERSION = (
     "boundary-prepared-held-command-four-slots-fifty-fading-blocks-v4"
 )
 PROPULSION_MODEL_ID = "canonical-3d-quadrotor-v1"
-MOVEMENT_ACTION_PROJECTION_CONTRACT_VERSION = "fieldwise-clamp-heading-wrap-mask-v1"
+MOVEMENT_ACTION_PROJECTION_CONTRACT_VERSION = (
+    "fieldwise-clamp-heading-wrap-mask-uav0-gs-3d-position-v2"
+)
 MOVEMENT_REPLAY_CONTRACT_VERSION = (
-    "executed-projected-action-boundary-aligned-next-state-capacity-50000-v2"
+    "executed-net-displacement-action-boundary-aligned-next-state-capacity-50000-v3"
 )
 MOVEMENT_WARMUP_CONTRACT_VERSION = "global-joint-transition-boundary-10000-v1"
 PROPULSION_PARAMETERS = MappingProxyType(
@@ -616,7 +631,7 @@ def movement_agent_configuration(method_spec: MethodSpec, training_config=None) 
         ),
         "heading_projection": "periodic-wrap-to-[-1,1)",
         "replay_action_semantics": (
-            "executed_projected_joint_action" if learned else None
+            "inverse-encoded-executed-net-displacement" if learned else None
         ),
         "replay_contract_version": (
             MOVEMENT_REPLAY_CONTRACT_VERSION if learned else None
@@ -804,6 +819,11 @@ def comparison_method_configuration(method_spec: MethodSpec) -> dict:
         "task_potential_contract_version": TASK_POTENTIAL_CONTRACT_VERSION,
         "task_potential_configuration": task_potential_contract_metadata(),
         "ground_station_position_m": list(GROUND_STATION_POSITION_M),
+        "permanent_gs_gateway_uav_id": PERMANENT_GS_GATEWAY_UAV_ID,
+        "gs_gateway_soft_radius_m": GS_GATEWAY_SOFT_RADIUS_M,
+        "gs_gateway_hard_radius_m": GS_GATEWAY_HARD_RADIUS_M,
+        "gs_gateway_projection_mode": GS_GATEWAY_PROJECTION_MODE,
+        "gs_gateway_contract_version": GS_GATEWAY_CONTRACT_VERSION,
         "uav_initial_layout_version": UAV_INITIAL_LAYOUT_VERSION,
         "initial_communication_topology_contract_version": (
             INITIAL_COMMUNICATION_TOPOLOGY_CONTRACT_VERSION
@@ -851,6 +871,15 @@ def comparison_method_configuration(method_spec: MethodSpec) -> dict:
         "fov_ema_lifecycle_version": FOV_EMA_LIFECYCLE_VERSION,
         "sr_route_lifecycle_version": SR_ROUTE_LIFECYCLE_VERSION,
         "packet_qos_contract_version": PACKET_QOS_CONTRACT_VERSION,
+        "fov_packet_generation_contract_version": (
+            FOV_PACKET_GENERATION_CONTRACT_VERSION
+        ),
+        "timely_useful_goodput_contract_version": (
+            TIMELY_USEFUL_GOODPUT_CONTRACT_VERSION
+        ),
+        "timely_goodput_definition": "total timely useful bits",
+        "fov_coverage_snapshot_timing": "packet generation/capture time",
+        "fov_physical_packet_bits_coverage_weighted": False,
         "com_session_lifecycle_version": COM_SESSION_LIFECYCLE_VERSION,
         "communication_range_contract_version": (
             COMMUNICATION_RANGE_CONTRACT_VERSION

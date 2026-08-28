@@ -20,8 +20,13 @@ from experiment_config import (
     CANONICAL_UAV_INITIAL_XY_M,
     COMMUNICATION_RANGE_CONTRACT_VERSION,
     GROUND_STATION_POSITION_M,
+    GS_GATEWAY_CONTRACT_VERSION,
+    GS_GATEWAY_HARD_RADIUS_M,
+    GS_GATEWAY_PROJECTION_MODE,
+    GS_GATEWAY_SOFT_RADIUS_M,
     INITIAL_COMMUNICATION_TOPOLOGY_CONTRACT_VERSION,
     NUM_UAV,
+    PERMANENT_GS_GATEWAY_UAV_ID,
     RESERVED_SEARCH_UAV_IDS,
     ROI_COUNT_MAX,
     ROI_COUNT_MIN,
@@ -29,17 +34,18 @@ from experiment_config import (
 )
 
 
-SCENARIO_SCHEMA_VERSION = "uav-hrl-scenario-v4"
+SCENARIO_SCHEMA_VERSION = "uav-hrl-scenario-v5"
 OBSOLETE_SCHEMA_VERSIONS = frozenset(
     {
         "uav-hrl-scenario-v1",
         "uav-hrl-scenario-v2",
         "uav-hrl-scenario-v3",
+        "uav-hrl-scenario-v4",
     }
 )
 # Singular compatibility name used by callers that construct an obsolete
 # manifest explicitly for fail-fast tests.
-OBSOLETE_SCHEMA_VERSION = "uav-hrl-scenario-v3"
+OBSOLETE_SCHEMA_VERSION = "uav-hrl-scenario-v4"
 UAV_INITIAL_LAYOUT = UAV_INITIAL_LAYOUT_VERSION
 SUPPORTED_SPLITS = frozenset({"train", "validation", "test"})
 POLICY_DEPENDENT_KEYS = frozenset(
@@ -237,6 +243,55 @@ def validate_initial_communication_topology(
     }
 
 
+def validate_permanent_gateway_initial_position(
+    uavs,
+    *,
+    scenario_id,
+    gs_position=GROUND_STATION_POSITION_M,
+):
+    """Fail before reset side effects if UAV 0 would require an initial teleport."""
+
+    by_id = {int(item["uav_id"]): item for item in uavs}
+    if PERMANENT_GS_GATEWAY_UAV_ID not in by_id:
+        raise ValueError(
+            "permanent GS gateway is absent from initial scenario: "
+            f"scenario_id={scenario_id}; uav_id={PERMANENT_GS_GATEWAY_UAV_ID}"
+        )
+    try:
+        position = tuple(
+            float(value)
+            for value in by_id[PERMANENT_GS_GATEWAY_UAV_ID]["position"]
+        )
+        station = tuple(float(value) for value in gs_position)
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError(
+            "permanent GS gateway initial position is invalid: "
+            f"scenario_id={scenario_id}"
+        ) from exc
+    if len(position) != 3 or len(station) != 3 or not all(
+        math.isfinite(value) for value in (*position, *station)
+    ):
+        raise ValueError(
+            "permanent GS gateway initial position must be finite 3-D: "
+            f"scenario_id={scenario_id}"
+        )
+    distance = math.dist(position, station)
+    if distance > GS_GATEWAY_HARD_RADIUS_M:
+        raise ValueError(
+            "permanent GS gateway initial position exceeds hard radius: "
+            f"scenario_id={scenario_id}; uav_id={PERMANENT_GS_GATEWAY_UAV_ID}; "
+            f"distance_3d_m={distance:.12g}; "
+            f"hard_radius_m={GS_GATEWAY_HARD_RADIUS_M:.12g}"
+        )
+    return {
+        "uav_id": PERMANENT_GS_GATEWAY_UAV_ID,
+        "position": list(position),
+        "distance_3d_m": distance,
+        "hard_radius_m": GS_GATEWAY_HARD_RADIUS_M,
+        "contract_version": GS_GATEWAY_CONTRACT_VERSION,
+    }
+
+
 def current_environment_config() -> dict[str, Any]:
     return {
         "num_uav": NUM_UAV,
@@ -263,6 +318,11 @@ def current_environment_config() -> dict[str, Any]:
             INITIAL_COMMUNICATION_TOPOLOGY_CONTRACT_VERSION
         ),
         "reserved_search_uav_ids": list(RESERVED_SEARCH_UAV_IDS),
+        "permanent_gs_gateway_uav_id": PERMANENT_GS_GATEWAY_UAV_ID,
+        "gs_gateway_soft_radius_m": GS_GATEWAY_SOFT_RADIUS_M,
+        "gs_gateway_hard_radius_m": GS_GATEWAY_HARD_RADIUS_M,
+        "gs_gateway_projection_mode": GS_GATEWAY_PROJECTION_MODE,
+        "gs_gateway_contract_version": GS_GATEWAY_CONTRACT_VERSION,
         "gt_radius_m": 80.0,
         "com_deadline_seconds": 1.0,
         "fov_deadline_seconds": 1.5,
@@ -427,7 +487,7 @@ def generate_scenario_entry(
             "load_factor": 1.0,
             "base_fov_packets_per_second": 5.0,
             "base_com_packets_per_second": 50.0,
-            "generation_model": "task-and-fov-gated-rate-accumulator-v1",
+            "generation_model": "assigned-fov-rate-accumulator-v2",
         },
         "exogenous_primitives": {
             "channel_randomness": "none",
@@ -439,6 +499,8 @@ def generate_scenario_entry(
             ),
             "num_uav": NUM_UAV,
             "reserved_search_uav_ids": list(RESERVED_SEARCH_UAV_IDS),
+            "permanent_gs_gateway_uav_id": PERMANENT_GS_GATEWAY_UAV_ID,
+            "gs_gateway_contract_version": GS_GATEWAY_CONTRACT_VERSION,
         },
     }
     validate_scenario_entry(entry)
@@ -473,6 +535,9 @@ def validate_scenario_entry(entry: dict[str, Any]) -> dict[str, Any]:
         )
     if len(entry["uavs"]) != NUM_UAV:
         raise ValueError(f"scenario must contain exactly {NUM_UAV} UAVs")
+    validate_permanent_gateway_initial_position(
+        entry["uavs"], scenario_id=entry["scenario_id"]
+    )
     topology = validate_initial_communication_topology(
         entry["uavs"], scenario_id=entry["scenario_id"]
     )
@@ -500,6 +565,16 @@ def validate_scenario_entry(entry: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("scenario UAV count metadata is incompatible")
     if tuple(metadata.get("reserved_search_uav_ids", ())) != RESERVED_SEARCH_UAV_IDS:
         raise ValueError("scenario reserved Search UAV IDs are incompatible")
+    if int(metadata.get("permanent_gs_gateway_uav_id", -1)) != (
+        PERMANENT_GS_GATEWAY_UAV_ID
+    ):
+        raise ValueError("scenario permanent GS gateway UAV ID is incompatible")
+    if metadata.get("gs_gateway_contract_version") != GS_GATEWAY_CONTRACT_VERSION:
+        raise ValueError("scenario permanent GS gateway contract is incompatible")
+    if entry["traffic_primitives"].get("generation_model") != (
+        "assigned-fov-rate-accumulator-v2"
+    ):
+        raise ValueError("scenario packet generation model is incompatible")
     uav_ids = [int(item["uav_id"]) for item in entry["uavs"]]
     if uav_ids != list(range(NUM_UAV)):
         raise ValueError("scenario UAV IDs and order are incompatible")
@@ -599,12 +674,17 @@ class ScenarioManifest:
         }:
             raise ValueError(
                 "legacy 16-UAV scenario schema is incompatible; regenerate the "
-                "manifest with the 10-UAV v4 generator"
+                "manifest with the 10-UAV v5 generator"
             )
         if data.get("schema_version") == "uav-hrl-scenario-v3":
             raise ValueError(
                 "legacy disconnected-GS scenario geometry is incompatible; "
-                "regenerate the manifest with the v4 reachable-gateway layout"
+                "regenerate the manifest with the v5 gateway layout"
+            )
+        if data.get("schema_version") == "uav-hrl-scenario-v4":
+            raise ValueError(
+                "legacy pre-permanent-gateway packet-generation scenario is "
+                "incompatible; regenerate the manifest with the v5 generator"
             )
         if data.get("schema_version") != SCENARIO_SCHEMA_VERSION:
             raise ValueError(

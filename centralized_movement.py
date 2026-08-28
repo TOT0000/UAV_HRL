@@ -8,8 +8,13 @@ from experiment_config import (
     A2G_COMMUNICATION_RANGE_M,
     COM_CAPACITY_POTENTIAL_WEIGHT,
     COM_DISTANCE_POTENTIAL_WEIGHT,
+    GROUND_STATION_POSITION_M,
     GROUND_ALTITUDE_M,
+    GS_GATEWAY_HARD_RADIUS_M,
+    GS_GATEWAY_PROJECTION_MODE,
+    GS_GATEWAY_SOFT_RADIUS_M,
     NUM_UAV,
+    PERMANENT_GS_GATEWAY_UAV_ID,
     ROI_COUNT_MAX,
     TASK_POTENTIAL_NORMALIZATION_EPSILON,
     UAV_MAX_ALTITUDE_M,
@@ -761,6 +766,85 @@ def decode_joint_velocity_commands(model, projected_joint_action):
     return commands
 
 
+def gs_gateway_distance_m(position, gs_position=GROUND_STATION_POSITION_M):
+    """Return the finite 3-D GS distance used by the gateway contract."""
+
+    point = np.asarray(position, dtype=np.float64)
+    station = np.asarray(gs_position, dtype=np.float64)
+    if point.shape != (3,) or station.shape != (3,):
+        raise ValueError("gateway and GS positions must each contain three values")
+    if not np.isfinite(point).all() or not np.isfinite(station).all():
+        raise ValueError("gateway and GS positions must be finite")
+    return float(np.linalg.norm(point - station))
+
+
+def project_gs_gateway_position(
+    proposed_position,
+    *,
+    gs_position=GROUND_STATION_POSITION_M,
+    soft_radius_m=GS_GATEWAY_SOFT_RADIUS_M,
+    hard_radius_m=GS_GATEWAY_HARD_RADIUS_M,
+):
+    """Apply the authoritative legacy soft/hard 3-D GS sphere projection."""
+
+    point = np.asarray(proposed_position, dtype=np.float64)
+    station = np.asarray(gs_position, dtype=np.float64)
+    soft = float(soft_radius_m)
+    hard = float(hard_radius_m)
+    if point.shape != (3,) or station.shape != (3,):
+        raise ValueError("gateway and GS positions must each contain three values")
+    if not np.isfinite(point).all() or not np.isfinite(station).all():
+        raise ValueError("gateway and GS positions must be finite")
+    if not np.isfinite(soft) or not np.isfinite(hard) or not 0.0 < soft < hard:
+        raise ValueError("gateway radii must be finite with 0 < soft < hard")
+    vector = point - station
+    distance = float(np.linalg.norm(vector))
+    if distance <= soft or distance <= 1e-12:
+        return tuple(float(value) for value in point)
+    if distance >= hard:
+        target_distance = hard
+    else:
+        alpha = (distance - soft) / (hard - soft)
+        target_distance = (1.0 - alpha) * distance + alpha * soft
+    projected = station + vector * (target_distance / distance)
+    if not np.isfinite(projected).all():
+        raise RuntimeError("gateway projection produced a non-finite position")
+    return tuple(float(value) for value in projected)
+
+
+def executed_joint_action_from_displacement(
+    initial_positions, final_positions, interval_seconds
+):
+    """Encode the actually executed net displacement in the replay action domain."""
+
+    initial = np.asarray(initial_positions, dtype=np.float64)
+    final = np.asarray(final_positions, dtype=np.float64)
+    duration = float(interval_seconds)
+    if initial.shape != (NUM_UAV, 3) or final.shape != (NUM_UAV, 3):
+        raise ValueError(f"executed positions must have shape ({NUM_UAV}, 3)")
+    if not np.isfinite(initial).all() or not np.isfinite(final).all():
+        raise ValueError("executed positions must be finite")
+    if not np.isfinite(duration) or duration <= 0.0:
+        raise ValueError("movement interval must be positive and finite")
+    velocity = (final - initial) / duration
+    result = np.empty((NUM_UAV, 3), dtype=np.float32)
+    for uav_id, (dx, dy, dz) in enumerate(velocity):
+        speed = float(np.hypot(dx, dy))
+        speed_scalar = speed / 5.0 - 1.0
+        vertical_scalar = float(dz) / 2.0
+        heading_scalar = 0.0 if speed <= 1e-12 else float(math.atan2(dy, dx) / math.pi)
+        if heading_scalar >= 1.0:
+            heading_scalar = -1.0
+        result[uav_id] = (
+            speed_scalar,
+            heading_scalar,
+            vertical_scalar,
+        )
+    if not np.isfinite(result).all():
+        raise RuntimeError("executed replay action contains NaN or Inf")
+    return result.reshape(JOINT_ACTION_DIM)
+
+
 def build_velocity_substep_proposals(env, velocity_commands, step_time):
     commands = np.asarray(velocity_commands, dtype=np.float64)
     if commands.shape != (NUM_UAV, 3) or not np.isfinite(commands).all():
@@ -777,6 +861,23 @@ def build_velocity_substep_proposals(env, velocity_commands, step_time):
             env_width=env.env_width,
             env_height=env.env_height,
         )
+        if uav_id == PERMANENT_GS_GATEWAY_UAV_ID:
+            if GS_GATEWAY_PROJECTION_MODE != "gs_only":
+                raise RuntimeError(
+                    f"unsupported permanent gateway projection mode: "
+                    f"{GS_GATEWAY_PROJECTION_MODE}"
+                )
+            unprojected = tuple(proposal["new_position"])
+            projected = project_gs_gateway_position(
+                unprojected,
+                gs_position=getattr(env, "GS_pos", GROUND_STATION_POSITION_M),
+            )
+            proposal["unprojected_position"] = unprojected
+            proposal["new_position"] = projected
+            proposal["authoritative_position_projection"] = True
+            proposal["gateway_projection_applied"] = not np.allclose(
+                projected, unprojected, rtol=0.0, atol=1e-12
+            )
         proposals.append(proposal)
     return proposals
 
@@ -802,4 +903,13 @@ def apply_joint_movement_proposals(env, proposals, step_time=1.0):
             proposal, energy_model=env.energy_model, step_time=step_time
         )
         energies.append(float(energy))
+    gateway_distance = gs_gateway_distance_m(
+        env.uav_dict[PERMANENT_GS_GATEWAY_UAV_ID].get_position(),
+        getattr(env, "GS_pos", GROUND_STATION_POSITION_M),
+    )
+    if gateway_distance > GS_GATEWAY_HARD_RADIUS_M + 1e-9:
+        raise AssertionError(
+            "permanent GS gateway left its hard 3-D radius after movement: "
+            f"distance_m={gateway_distance}"
+        )
     return np.asarray(energies, dtype=np.float64)

@@ -31,6 +31,7 @@ from centralized_movement import (
 )
 from experiment_config import (
     NUM_UAV,
+    PERMANENT_GS_GATEWAY_UAV_ID,
     REFERENCE_COM_BANDWIDTH_HZ,
     RESERVED_SEARCH_UAV_IDS,
 )
@@ -46,6 +47,7 @@ class Uav10ConfigurationContractTest(unittest.TestCase):
         self.assertEqual(JOINT_ACTION_DIM, 30)
         self.assertEqual(ROUTING_STATE_DIM, 90)
         self.assertEqual(RESERVED_SEARCH_UAV_IDS, (0, 9))
+        self.assertEqual(PERMANENT_GS_GATEWAY_UAV_ID, 0)
         self.assertAlmostEqual(REFERENCE_COM_BANDWIDTH_HZ, 10e6 / 18.0)
 
         manifest = generate_manifest("test", 123, 1)
@@ -76,7 +78,7 @@ class Uav10ConfigurationContractTest(unittest.TestCase):
         data["schema_version"] = "uav-hrl-scenario-v2"
         with self.assertRaisesRegex(ValueError, "16-UAV.*incompatible"):
             ScenarioManifest.from_dict(data)
-        self.assertEqual(CHECKPOINT_SCHEMA_VERSION, 17)
+        self.assertEqual(CHECKPOINT_SCHEMA_VERSION, 18)
         with self.assertRaisesRegex(RuntimeError, "must be retrained"):
             _validate_checkpoint_schema({"checkpoint_schema_version": 9})
 
@@ -140,7 +142,17 @@ class StateAndAssignmentContractTest(unittest.TestCase):
                 for task in entries
             )
         )
-        self.assertEqual(set(self.env.last_assignment.assignments), set(range(NUM_UAV)))
+        self.assertEqual(
+            set(self.env.last_assignment.assignments),
+            set(range(NUM_UAV)) - {PERMANENT_GS_GATEWAY_UAV_ID},
+        )
+        self.assertEqual(
+            [
+                task["task_type"]
+                for task in self.env.multi_tasks[PERMANENT_GS_GATEWAY_UAV_ID]
+            ],
+            ["Hovering"],
+        )
 
     def test_fov_com_order_is_observation_potential_and_generation_invariant(self):
         uav_id = 1

@@ -6,7 +6,7 @@ import json
 from pathlib import Path
 
 
-PACKET_OUTCOME_ARTIFACT_SCHEMA_VERSION = "uav-hrl-packet-outcomes-jsonl-v2"
+PACKET_OUTCOME_ARTIFACT_SCHEMA_VERSION = "uav-hrl-packet-outcomes-jsonl-v3"
 PACKET_OUTCOME_MODE_DISABLED = "disabled"
 PACKET_OUTCOME_MODE_BOUNDED = "bounded_memory"
 PACKET_OUTCOME_MODE_STREAMING = "stream_jsonl"

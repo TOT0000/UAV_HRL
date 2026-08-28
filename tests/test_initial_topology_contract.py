@@ -212,7 +212,7 @@ class InitialTopologyGeometryTest(unittest.TestCase):
                 )
 
     def test_schema_15_checkpoint_is_rejected_for_old_initial_geometry(self):
-        self.assertEqual(CHECKPOINT_SCHEMA_VERSION, 17)
+        self.assertEqual(CHECKPOINT_SCHEMA_VERSION, 18)
         with self.assertRaisesRegex(
             RuntimeError, "GS-reachable initial topology.*must be retrained"
         ):
@@ -237,7 +237,7 @@ class InitialTopologyGeometryTest(unittest.TestCase):
         with (
             mock.patch("HRL_task_aware.Simulator") as simulator,
             mock.patch("HRL_task_aware.load_model_checkpoint") as load_weights,
-            self.assertRaisesRegex(ValueError, "initial communication topology"),
+            self.assertRaisesRegex(ValueError, "permanent GS gateway"),
         ):
             train(
                 config,

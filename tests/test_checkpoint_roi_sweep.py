@@ -415,8 +415,10 @@ class CheckpointRoiBatchPlanTest(unittest.TestCase):
         self.assertTrue(
             all(row["energy_efficiency_bit_per_joule"] == 200_000.0 for row in summary)
         )
-        self.assertTrue(all(row["timely_delivered_bits"] == 2_000_000.0 for row in summary))
-        self.assertTrue(all(row["timely_goodput_bps"] == 200_000.0 for row in summary))
+        self.assertTrue(all(row["timely_useful_bits"] == 2_000_000.0 for row in summary))
+        self.assertTrue(
+            all(row["timely_useful_goodput_bps"] == 200_000.0 for row in summary)
+        )
         self.assertTrue(all(row["delay_violation_probability"] is None for row in summary))
         self.assertTrue(all(row["sr_admission_drop_count"] == 6 for row in summary))
 

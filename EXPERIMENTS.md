@@ -22,8 +22,10 @@ shuffle-and-pair random round, respectively.
 
 All assignment solvers exclude Search and Hovering. Below 0.99 coverage UAVs
 0 and 9 are reserved for Search, while the other UAVs solve only discovered FOV
-and COM service tasks; unassigned UAVs fall back to Search. At release, all 10
-UAVs are immediately reassigned and only unassigned UAVs Hover. FOV raw utility
+and COM service tasks; unassigned UAVs fall back to Search. UAV 0 is permanently
+excluded from service assignment: it is Search plus GS gateway below the release
+threshold and Hovering plus GS gateway after release. UAV 9 keeps the ordinary
+reserved-Search lifecycle and may be reassigned after release. FOV raw utility
 uses global feasible-pair min/max normalization (equal values map to 0.5), while
 COM uses canonical S2U capacity at the candidate's actual 3-D geometry,
 computed with `10 MHz / 18` from the sampled one-second A2G LoS/NLoS state and
@@ -123,6 +125,15 @@ design-dataset collection, aggregation, and exact-resume workflows.
 - production FOV/COM deadlines `1.5 s`/`1.0 s`; completion at the exact deadline
   is timely
 - production packet injection cutoff `58.5 s`
+- every assigned FOV source runs its existing rate integrator beginning with the
+  first normal post-assignment injection event. Generation is not gated by full
+  RoI coverage, geometry validity, or image-quality validity, and assignment
+  does not create a burst. Every generated FOV packet freezes the authoritative
+  `fov_task_metrics` overlap ratio as `capture_coverage_ratio`, clipped to
+  `[0,1]`; invalid geometry and non-finite values map to `0.0`. The full physical
+  `size_bits` remains the queue, service, partial-hop, and routing-reward load.
+  Timely FOV useful bits are `size_bits * capture_coverage_ratio`; timely COM
+  useful bits are the full `size_bits`; late packets contribute zero useful bits
 - At each one-second Search boundary every FOV-observation participant computes
   raw unvisited, frontier, overlap, and `map_changed` from the same immutable
   pre-commit bitmap. Observation participation is separate from coverage
@@ -153,12 +164,12 @@ design-dataset collection, aggregation, and exact-resume workflows.
 - no network, optimizer, target-network, replay, or Dinkelbach update in evaluation
 - direct-ratio methods store zero objective reward on every non-terminal
   movement transition and the single episode value
-  `sum(timely delivered Mbit) / sum(all-UAV mobility energy J)` on the terminal
+  `sum(timely useful Mbit) / sum(all-UAV mobility energy J)` on the terminal
   transition; task-potential shaping remains transition-local
 - Dinkelbach lambda starts at `0.0` and is fixed within each non-overlapping
   50-episode outer block
 - after every complete block, lambda becomes
-  `sum(timely delivered Mbit) / sum(all-UAV mobility energy J)`; no scaling,
+  `sum(timely useful Mbit) / sum(all-UAV mobility energy J)`; no scaling,
   clipping, or moving average is applied (1,500 episodes contain 30 complete
   block updates)
 - propulsion energy uses the fixed `canonical-3d-quadrotor-v1` vector-power
@@ -294,9 +305,10 @@ seeds, the critical value is approximately `2.776`.
 
 ## Scenario manifests
 
-The `uav-hrl-scenario-v4` JSON schema records the split, manifest seed, episode
-count, generation profile, generator/config fingerprint, content hash, and one
-entry per scenario. Schemas v1-v3 are obsolete and must be regenerated. Each
+The `uav-hrl-scenario-v5` JSON schema records the split, manifest seed, episode
+count, generation profile, generator/config fingerprint, content hash, permanent
+gateway contract, and one entry per scenario. Schemas v1-v4 are obsolete and
+must be regenerated. Each
 entry contains its profile-aware ID and seed, GT/RoI data, UAV initial state,
 SR initial state and deterministic motion primitive, and traffic/load
 primitives.
@@ -306,9 +318,14 @@ The ground station is fixed at `(0, 0, 0)`. Canonical UAV 0 starts at
 `(900,250)`, `(100,750)`, `(300,750)`, `(500,750)`, `(700,750)`, and
 `(900,750)` respectively. Every UAV still consumes exactly one deterministic
 `z ~ Uniform(80,120)` draw and starts with 10,000 J. This is only an initial
-geometry contract: UAV 0 receives no fixed relay task, is not range-projected,
-and may leave GS range after movement begins. The fixed movement warm-up remains
-10,000 joint transitions.
+geometry contract. UAV 0 is the permanent GS gateway. The single common movement
+proposal/execution path applies its full 3-D soft/hard GS projection to every
+movement method in training and evaluation: distances through 180 m are
+unchanged, the open `(180,200)` m band uses the canonical soft compression, and
+distances at or above 200 m project radially to 200 m. UAV 9 is not projected.
+Replay records the executed net movement, state/channel/task geometry observes
+the projected position, and propulsion energy uses the executed displacement.
+The fixed movement warm-up remains 10,000 joint transitions.
 
 Every manifest entry and formal preflight validates the finite 3-D initial
 range graph using inclusive boundaries: U2G/S2U are 200 m and U2U is 400 m.
@@ -346,8 +363,9 @@ The randomness audit separates:
   assignment, actions, coverage, discovery, FOV validity, sources, packets,
   routing decisions, and delivered bits.
 
-Traffic packet creation remains gated by the policy-dependent task assignment
-and FOV state; the manifest stores only the underlying demand primitive.
+Traffic packet creation remains gated by the policy-dependent task assignment.
+Once assigned, a FOV source is not gated by FOV validity; the manifest stores
+only the underlying demand primitive and no policy-dependent coverage snapshot.
 
 ## Commands
 
@@ -449,18 +467,22 @@ python -X utf8 comparison_experiment.py aggregate --input-dir runs/comparison/ev
 
 Exact-resume checkpoints validate the method fingerprint, training-manifest
 relationship, training seed, the complete Dinkelbach block state, and its configuration.
-Checkpoint schema v17 is the current boundary-aligned stochastic-channel,
+Checkpoint schema v18 is the current permanent-gateway, coverage-weighted useful
+goodput, boundary-aligned stochastic-channel,
 movement/routing replay, utility/QoS, routing-ID causality/credit,
 frozen-backlog reward, GS-reachable initial topology, distance-aware VS/COM
 task potentials, hard-range/COM-session, atomic-FOV, seed-ratio
 aggregation, propulsion, and four-slot/fifty-block movement-channel contract.
-Schema v16 and every older
+Schema v17 and every older
 schema is rejected before weights or replay state are restored and must be
 retrained; no legacy checkpoint migration is attempted. The current schema
 stores the 429/30/90 dimensions, movement feature schema, direct-ratio bit/J
-objective, shared channel/packet contracts, adaptive routing lifecycle, and
-FOV-EMA state. The movement feature and scenario-v4 schemas remain unchanged.
-Schema-16 checkpoints use the prior sensing-only VS and capacity-only COM
+objective, shared gateway/channel/packet contracts, active FOV capture-coverage
+snapshots, raw/useful counters, inject buffers, adaptive routing lifecycle, and
+FOV-EMA state. The movement feature schema remains unchanged; the scenario
+schema is v5. Schema-17 checkpoints predate the permanent UAV 0 gateway,
+assigned-source FOV generation, and useful-goodput numerator and must be
+retrained. Schema-16 checkpoints use the prior sensing-only VS and capacity-only COM
 reward semantics and must be retrained. Scenario v3 and schema-15 checkpoints
 also remain incompatible because their canonical initial grid has no legal
 200 m U2G edge; none are silently migrated. A partial
@@ -497,9 +519,12 @@ that run's `checkpoints/full` directory. Formal evaluation always uses
 
 Every evaluation episode writes method/seed/scenario identity plus:
 
-- timely goodput and raw final-hop throughput in Mbit
-- total mobility energy and `timely_goodput_mbits / mobility_energy_j`
+- canonical timely useful goodput and raw final-hop throughput in Mbit
+- total mobility energy and `total_timely_useful_mbits / mobility_energy_j`
 - FOV/COM timely deliveries and deadline violations
+- FOV generated raw bits, timely delivered raw bits, timely useful bits, mean
+  capture coverage, zero-coverage packet count, timely COM bits, and total timely
+  useful bits
 - canonical system-QoS eligible count, violation count/probability, isolated
   non-formal SR admission diagnostics, coverage, and found-GT ratio
 - routing Waits, partial transmissions, and slot-budget violations
@@ -526,8 +551,8 @@ schema, valid/missing seed counts, and CI provenance. The paper path consumes
 only these canonical rows.
 
 Generic `cross_seed_summary.csv` and `.json` use the independent
-`uav-hrl-generic-cross-seed-aggregate-v2` artifact schema. They combine the six
-`canonical_ratio` rows with 24 `descriptive_seed_mean` diagnostics. Descriptive
+`uav-hrl-generic-cross-seed-aggregate-v3` artifact schema. They combine the six
+`canonical_ratio` rows with 32 `descriptive_seed_mean` diagnostics. Descriptive
 statistics first take the episode arithmetic mean within each training seed,
 then give each valid seed equal weight with seed-level sample SD and Student-t
 95% CI; missing seed values are excluded rather than replaced with zero. The
@@ -596,7 +621,7 @@ to `packet_outcomes.jsonl`, flushing one complete episode before starting the
 next. The in-memory all-episode artifact field remains disabled. Every JSONL
 record contains `scenario_id`, the episode packet summary, the original raw
 `packet_outcomes`, and
-`artifact_schema_version=uav-hrl-packet-outcomes-jsonl-v2`. The collection
+`artifact_schema_version=uav-hrl-packet-outcomes-jsonl-v3`. The collection
 mode, artifact schema, output path, and written episode count are recorded in
 metadata. Writer/open/serialization errors fail the evaluation, and the stream
 is closed on both successful and exceptional exits.
@@ -713,7 +738,7 @@ deadline is swept. Across seeds, valid seed ratios are equally weighted with a
 Student-t interval. A delay with no
 delivered packets, or violation probability with no eligible packets, is
 `null` with `missing=true`. EE
-comparison points use each seed's summed timely Mbit divided by summed mobility
+comparison points use each seed's summed timely useful Mbit divided by summed mobility
 joules, followed by the same equal-weight cross-seed rule.
 
 Every non-trajectory point has exactly the following six canonical aggregate

@@ -210,7 +210,7 @@ class ScenarioManifestTest(unittest.TestCase):
         data = generate_manifest("test", 912, 1).to_dict()
         data["schema_version"] = OBSOLETE_SCHEMA_VERSION
 
-        with self.assertRaisesRegex(ValueError, "disconnected-GS.*incompatible"):
+        with self.assertRaisesRegex(ValueError, "pre-permanent-gateway.*incompatible"):
             ScenarioManifest.from_dict(data)
 
     def test_training_manifest_extension_preserves_exact_canonical_prefix(self):

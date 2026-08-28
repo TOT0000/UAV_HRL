@@ -26,7 +26,7 @@ from scenario_manifest import generate_manifest
 from training_checkpoint import CHECKPOINT_HORIZON_COMPATIBILITY_FIELDS
 
 
-CHECKPOINT_ROI_SWEEP_SCHEMA_VERSION = "uav-hrl-checkpoint-roi-sweep-v1"
+CHECKPOINT_ROI_SWEEP_SCHEMA_VERSION = "uav-hrl-checkpoint-roi-sweep-v2"
 SUMMARY_FIELDS = (
     "method_id",
     "training_run_id",
@@ -44,8 +44,8 @@ SUMMARY_FIELDS = (
     "manifest_seed",
     "manifest_hash",
     "energy_efficiency_bit_per_joule",
-    "timely_delivered_bits",
-    "timely_goodput_bps",
+    "timely_useful_bits",
+    "timely_useful_goodput_bps",
     "propulsion_energy_j",
     "mobility_energy_j",
     "coverage",
@@ -60,11 +60,11 @@ METRIC_FIELD_MAPPING = {
     "energy_efficiency_bit_per_joule": (
         "canonical energy_efficiency_mbit_per_j row value multiplied by 1e6"
     ),
-    "timely_delivered_bits": (
-        "canonical energy-efficiency numerator timely_goodput_mbits multiplied by 1e6"
+    "timely_useful_bits": (
+        "canonical energy-efficiency numerator total_timely_useful_mbits multiplied by 1e6"
     ),
-    "timely_goodput_bps": (
-        "timely_delivered_bits / (evaluation_episode_count * episode_seconds)"
+    "timely_useful_goodput_bps": (
+        "timely_useful_bits / (evaluation_episode_count * episode_seconds)"
     ),
     "propulsion_energy_j": (
         "canonical total_mobility_energy_j sum; mobility energy is propulsion-only"
@@ -417,8 +417,8 @@ def _completed_summary(point, result):
             result_directory=evaluated["output_directory"],
         ),
         "energy_efficiency_bit_per_joule": float(energy["value"]) * 1e6,
-        "timely_delivered_bits": timely_bits,
-        "timely_goodput_bps": timely_bits / horizon_seconds,
+        "timely_useful_bits": timely_bits,
+        "timely_useful_goodput_bps": timely_bits / horizon_seconds,
         "propulsion_energy_j": mobility_joules,
         "mobility_energy_j": mobility_joules,
         "coverage": sum(float(row["coverage"]) for row in rows) / len(rows),

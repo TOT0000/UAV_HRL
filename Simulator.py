@@ -39,7 +39,12 @@ from experiment_config import (
     FOV_COM_PAIR_MAX_DISTANCE_M,
     COM_OFFERED_RATE_BPS,
     GROUND_STATION_POSITION_M,
+    GS_GATEWAY_CONTRACT_VERSION,
+    GS_GATEWAY_HARD_RADIUS_M,
+    GS_GATEWAY_PROJECTION_MODE,
+    GS_GATEWAY_SOFT_RADIUS_M,
     NUM_UAV,
+    PERMANENT_GS_GATEWAY_UAV_ID,
     REFERENCE_COM_BANDWIDTH_HZ,
     RESERVED_SEARCH_UAV_IDS,
     ROI_COUNT_MAX,
@@ -193,6 +198,7 @@ class Simulator:
         self.fov_com_pair_max_distance_m = FOV_COM_PAIR_MAX_DISTANCE_M
         self.search_coverage_threshold = SEARCH_COVERAGE_THRESHOLD
         self.reserved_search_uav_ids = RESERVED_SEARCH_UAV_IDS
+        self.permanent_gs_gateway_uav_id = PERMANENT_GS_GATEWAY_UAV_ID
         self.com_offered_rate_bps = COM_OFFERED_RATE_BPS
         self.search_release_time = None
         self.search_release_coverage = None
@@ -228,7 +234,10 @@ class Simulator:
             )
         coverage = float(np.asarray(self.visited_bitmap, dtype=bool).mean())
         search_active = not self._search_phase_over and coverage < self.search_coverage_threshold
-        reserved = set(self.reserved_search_uav_ids) if search_active else set()
+        reserved = (
+            set(self.reserved_search_uav_ids) if search_active else set()
+        )
+        reserved.add(self.permanent_gs_gateway_uav_id)
         uav_id_list = [
             uav_id for uav_id in self.get_available_uav_ids() if uav_id not in reserved
         ]
@@ -472,6 +481,11 @@ class Simulator:
             for task in entries
         ):
             raise AssertionError("Search assignment survived the 99% release event")
+        gateway_tasks = self.multi_tasks.get(self.permanent_gs_gateway_uav_id, ())
+        if [task["task_type"] for task in gateway_tasks] != ["Hovering"]:
+            raise AssertionError(
+                "permanent GS gateway must enter Hovering after Search release"
+            )
 
     def assignment_metadata(self):
         return {
@@ -483,6 +497,11 @@ class Simulator:
                 else int(self.channel.movement_interval_index)
             ),
             "reserved_search_uav_ids": list(self.reserved_search_uav_ids),
+            "permanent_gs_gateway_uav_id": self.permanent_gs_gateway_uav_id,
+            "gs_gateway_contract_version": GS_GATEWAY_CONTRACT_VERSION,
+            "gs_gateway_projection_mode": GS_GATEWAY_PROJECTION_MODE,
+            "gs_gateway_soft_radius_m": GS_GATEWAY_SOFT_RADIUS_M,
+            "gs_gateway_hard_radius_m": GS_GATEWAY_HARD_RADIUS_M,
             "search_release_time_seconds": self.search_release_time,
             "search_release_coverage": self.search_release_coverage,
             "assignments": {
@@ -1443,7 +1462,7 @@ class Simulator:
                 "load_factor": 1.0,
                 "base_fov_packets_per_second": 5.0,
                 "base_com_packets_per_second": 50.0,
-                "generation_model": "task-and-fov-gated-rate-accumulator-v1",
+                "generation_model": "assigned-fov-rate-accumulator-v2",
             }
         if not ROI_COUNT_MIN <= int(self.num_GT) <= ROI_COUNT_MAX:
             raise ValueError(
@@ -1497,9 +1516,21 @@ class Simulator:
             uav_initial_data = sorted(
                 scenario_entry["uavs"], key=lambda item: int(item["uav_id"])
             )
-        from scenario_manifest import validate_initial_communication_topology
+        from scenario_manifest import (
+            validate_initial_communication_topology,
+            validate_permanent_gateway_initial_position,
+        )
 
         validate_initial_communication_topology(
+            uav_initial_data,
+            scenario_id=(
+                self.active_scenario_id
+                if self.active_scenario_id is not None
+                else "simulator-fallback"
+            ),
+            gs_position=self.GS_pos,
+        )
+        validate_permanent_gateway_initial_position(
             uav_initial_data,
             scenario_id=(
                 self.active_scenario_id

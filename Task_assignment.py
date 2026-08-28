@@ -13,6 +13,7 @@ from centralized_movement import fov_task_metrics
 from experiment_config import (
     ASSIGNMENT_DUMMY_UTILITY,
     FOV_COM_PAIR_MAX_DISTANCE_M,
+    PERMANENT_GS_GATEWAY_UAV_ID,
     RESERVED_SEARCH_UAV_IDS,
     SEARCH_COVERAGE_THRESHOLD,
 )
@@ -438,6 +439,10 @@ class UAVAssigner:
             assigned = self.assignments.get(uav_id, [])
             uav = self.env.uav_dict[uav_id]
             entries = []
+            if uav_id == PERMANENT_GS_GATEWAY_UAV_ID and assigned:
+                raise AssertionError(
+                    "permanent GS gateway entered FOV/COM service assignment"
+                )
             for task_index, task_type, _ in assigned:
                 task = snapshot[task_index]
                 if task_type == "FOV":
@@ -458,7 +463,18 @@ class UAVAssigner:
                         "target_pos": tuple(position),
                     }
                 )
-            if search_active and uav_id in tuple(
+            if uav_id == PERMANENT_GS_GATEWAY_UAV_ID:
+                entries.append(
+                    {
+                        "task_type": "Search" if search_active else "Hovering",
+                        "target_id": None,
+                        "target_obj_id": int(uav_id),
+                        "target_pos": tuple(uav.get_position()),
+                        "reserved_search": bool(search_active),
+                        "permanent_gs_gateway": True,
+                    }
+                )
+            elif search_active and uav_id in tuple(
                 getattr(self.env, "reserved_search_uav_ids", RESERVED_SEARCH_UAV_IDS)
             ):
                 if entries:

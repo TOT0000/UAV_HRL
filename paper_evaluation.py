@@ -687,6 +687,10 @@ def run_paper_evaluation(
             field: method_contracts[field]
             for field in (
                 "packet_qos_contract_version",
+                "fov_packet_generation_contract_version",
+                "timely_useful_goodput_contract_version",
+                "gs_gateway_contract_version",
+                "permanent_gs_gateway_uav_id",
                 "packet_routing_causality_contract_version",
                 "routing_reward_contract_version",
                 "qos_aggregate_contract_version",
@@ -744,9 +748,10 @@ def run_paper_evaluation(
                 "raw eligible packets across episodes; ALL pools FOV+COM"
             ),
             "energy_efficiency": (
-                "per-seed sum timely delivered Mbit / sum mobility J; "
+                "per-seed sum timely useful Mbit / sum mobility J; "
                 "zero denominator is missing; valid seed values are equally weighted"
             ),
+            "fov_coverage_snapshot_timing": "packet generation/capture time",
             "zero_delivered_delay": "null with missing=true",
         },
         "points": point_results,

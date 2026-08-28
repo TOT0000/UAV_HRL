@@ -37,6 +37,7 @@ from centralized_movement import (
     build_velocity_substep_proposals,
     calculate_movement_potentials,
     decode_joint_velocity_commands,
+    executed_joint_action_from_displacement,
     get_global_movement_state,
     movement_mask_from_state,
     project_joint_action,
@@ -1176,6 +1177,8 @@ def _full_training_state(
             "mid_episode_checkpoint_supported": False,
             "next_packet_id": 0,
             "active_packets": [],
+            "inject_buffer": {},
+            "source_buffer": {},
             "uav_queue_packet_ids": {
                 str(uid): [] for uid in range(NUM_UAV)
             },
@@ -1185,6 +1188,18 @@ def _full_training_state(
                 "lifecycle_version": COM_SESSION_LIFECYCLE_VERSION,
                 "sessions": {},
             },
+            "generated_packet_counts": {"FOV": 0, "COM": 0},
+            "eligible_packet_counts": {"FOV": 0, "COM": 0},
+            "raw_final_hop_bits": 0.0,
+            "timely_goodput_bits": 0.0,
+            "fov_generated_raw_bits": 0.0,
+            "fov_timely_delivered_raw_bits": 0.0,
+            "fov_timely_useful_bits": 0.0,
+            "fov_capture_coverage_sum": 0.0,
+            "fov_capture_coverage_count": 0,
+            "fov_zero_coverage_packet_count": 0,
+            "com_timely_delivered_bits": 0.0,
+            "total_timely_useful_bits": 0.0,
             "pending_terminal_violation_events": [],
             "system_qos_eligible_packet_count": 0,
             "system_qos_violation_count": 0,
@@ -1319,17 +1334,41 @@ def _experiment_identity(
         ),
         "exploration_schedule_configuration": resolved_exploration,
         "reward_mode": method_spec.reward_mode,
+        "goodput_metric_metadata": {
+            "timely_goodput_bits": {
+                "unit": "bit",
+                "definition": "alias of total_timely_useful_bits",
+            },
+            "total_timely_useful_bits": {
+                "unit": "bit",
+                "definition": (
+                    "timely FOV physical size times capture-time coverage "
+                    "plus timely COM physical size"
+                ),
+            },
+            "fov_generated_raw_bits": {"unit": "bit"},
+            "fov_timely_delivered_raw_bits": {"unit": "bit"},
+            "fov_timely_useful_bits": {"unit": "bit"},
+            "fov_mean_capture_coverage": {
+                "unit": "ratio",
+                "missing_when": "no generated FOV packets",
+            },
+            "fov_zero_coverage_packet_count": {"unit": "packet"},
+            "com_timely_delivered_bits": {"unit": "bit"},
+            "coverage_snapshot_timing": "FOV packet generation/capture time",
+            "physical_packet_service_weighted_by_coverage": False,
+        },
         "movement_objective_definition": (
             {
                 "objective_unit": "bit_per_j",
-                "numerator": "sum of episode timely delivered bits",
+                "numerator": "sum of episode timely useful bits",
                 "denominator": "sum of episode mobility energy joules",
                 "semantics": "terminal-only ratio of sums",
             }
             if method_spec.reward_mode == "ratio"
             else {
                 "objective_unit": "Mbit_minus_lambda_Mbit_per_J_times_J",
-                "numerator": "timely delivered Mbit",
+                "numerator": "timely useful Mbit",
                 "semantics": "Dinkelbach residual",
             }
         ),
@@ -2413,6 +2452,10 @@ def train(
             velocity_commands = decode_joint_velocity_commands(
                 movement_agent, projected_action
             )
+            interval_initial_positions = np.asarray(
+                [env.uav_dict[uav_id].get_position() for uav_id in range(env.num_UAV)],
+                dtype=np.float64,
+            )
             env.update_source_uavs()
             interval_energies = np.zeros(env.num_UAV, dtype=np.float64)
             interval_delivered_bits = 0.0
@@ -2474,6 +2517,17 @@ def train(
                         ddqn, routing_replay, config.batch_size
                     )
 
+            executed_action = executed_joint_action_from_displacement(
+                interval_initial_positions,
+                np.asarray(
+                    [
+                        env.uav_dict[uav_id].get_position()
+                        for uav_id in range(env.num_UAV)
+                    ],
+                    dtype=np.float64,
+                ),
+                MOVEMENT_INTERVAL_SECONDS,
+            )
             interval_energy = float(interval_energies.sum())
             # Search observation, RoI discovery, and task assignment remain
             # one-second boundary events and therefore execute exactly once.
@@ -2548,7 +2602,7 @@ def train(
             if not evaluation and method_spec.learns_movement:
                 joint_replay.add(
                     state,
-                    projected_action,
+                    executed_action,
                     next_state,
                     done=done,
                     delivered_mbits=interval_delivered_mbits,
@@ -2775,6 +2829,16 @@ def train(
                 }
             )
         timely_goodput_mbits = float(packet_engine.timely_goodput_bits) / 1e6
+        total_timely_useful_bits = float(
+            packet_engine.total_timely_useful_bits
+        )
+        if not np.isclose(
+            packet_engine.timely_goodput_bits,
+            total_timely_useful_bits,
+            rtol=0.0,
+            atol=1e-9,
+        ):
+            raise AssertionError("timely-goodput alias diverged from useful bits")
         raw_final_hop_mbits = float(packet_engine.raw_final_hop_bits) / 1e6
         dinkelbach_event = None
         if not evaluation and method_spec.uses_dinkelbach:
@@ -2838,6 +2902,29 @@ def train(
                 ),
                 "num_GT": int(env.num_GT),
                 "timely_goodput_mbits": timely_goodput_mbits,
+                "total_timely_useful_mbits": total_timely_useful_bits / 1e6,
+                "fov_generated_raw_bits": float(
+                    packet_engine.fov_generated_raw_bits
+                ),
+                "fov_timely_delivered_raw_bits": float(
+                    packet_engine.fov_timely_delivered_raw_bits
+                ),
+                "fov_timely_useful_bits": float(
+                    packet_engine.fov_timely_useful_bits
+                ),
+                "fov_mean_capture_coverage": (
+                    float(packet_engine.fov_capture_coverage_sum)
+                    / int(packet_engine.fov_capture_coverage_count)
+                    if packet_engine.fov_capture_coverage_count
+                    else None
+                ),
+                "fov_zero_coverage_packet_count": int(
+                    packet_engine.fov_zero_coverage_packet_count
+                ),
+                "com_timely_delivered_bits": float(
+                    packet_engine.com_timely_delivered_bits
+                ),
+                "total_timely_useful_bits": total_timely_useful_bits,
                 "raw_final_hop_mbits": raw_final_hop_mbits,
                 "total_mobility_energy_j": float(episode_energy),
                 "energy_efficiency_mbit_per_j": safe_energy_efficiency(
@@ -2931,6 +3018,7 @@ def train(
                     episode=episode + 1,
                     reward=episode_reward,
                     timely_goodput_mbits=timely_goodput_mbits,
+                    total_timely_useful_mbits=timely_goodput_mbits,
                     mobility_energy_j=episode_energy,
                     eligible_packet_count=episode_system_eligible_packet_count,
                     delay_violation_count=int(episode_system_violation_count),
@@ -3337,6 +3425,22 @@ def train(
         "routing_epsilon_log": routing_epsilon_log,
         "raw_final_hop_bits": packet_engine.raw_final_hop_bits,
         "timely_goodput_bits": packet_engine.timely_goodput_bits,
+        "fov_generated_raw_bits": packet_engine.fov_generated_raw_bits,
+        "fov_timely_delivered_raw_bits": (
+            packet_engine.fov_timely_delivered_raw_bits
+        ),
+        "fov_timely_useful_bits": packet_engine.fov_timely_useful_bits,
+        "fov_mean_capture_coverage": (
+            packet_engine.fov_capture_coverage_sum
+            / packet_engine.fov_capture_coverage_count
+            if packet_engine.fov_capture_coverage_count
+            else None
+        ),
+        "fov_zero_coverage_packet_count": (
+            packet_engine.fov_zero_coverage_packet_count
+        ),
+        "com_timely_delivered_bits": packet_engine.com_timely_delivered_bits,
+        "total_timely_useful_bits": packet_engine.total_timely_useful_bits,
         "timely_delivered_packets": packet_engine.total_delivered,
         "deadline_violated_packets": packet_engine.total_violated,
         "routing_wait_actions": packet_engine.wait_actions,

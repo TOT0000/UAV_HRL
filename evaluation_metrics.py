@@ -50,6 +50,14 @@ IDENTITY_COLUMNS = (
 METRIC_COLUMNS = (
     "num_GT",
     "timely_goodput_mbits",
+    "total_timely_useful_mbits",
+    "fov_generated_raw_bits",
+    "fov_timely_delivered_raw_bits",
+    "fov_timely_useful_bits",
+    "fov_mean_capture_coverage",
+    "fov_zero_coverage_packet_count",
+    "com_timely_delivered_bits",
+    "total_timely_useful_bits",
     "raw_final_hop_mbits",
     "total_mobility_energy_j",
     "energy_efficiency_mbit_per_j",
@@ -76,10 +84,13 @@ METRIC_COLUMNS = (
     "replay_attributed_violation_cost_count",
 )
 
-OPTIONAL_METRIC_COLUMNS = {"delay_violation_probability"}
+OPTIONAL_METRIC_COLUMNS = {
+    "delay_violation_probability",
+    "fov_mean_capture_coverage",
+}
 
 GENERIC_CROSS_SEED_ARTIFACT_SCHEMA_VERSION = (
-    "uav-hrl-generic-cross-seed-aggregate-v2"
+    "uav-hrl-generic-cross-seed-aggregate-v3"
 )
 
 # Every per-episode metric must opt in to exactly one generic aggregation path.
@@ -87,6 +98,14 @@ GENERIC_CROSS_SEED_ARTIFACT_SCHEMA_VERSION = (
 DESCRIPTIVE_EPISODE_METRIC_COLUMNS = (
     "num_GT",
     "timely_goodput_mbits",
+    "total_timely_useful_mbits",
+    "fov_generated_raw_bits",
+    "fov_timely_delivered_raw_bits",
+    "fov_timely_useful_bits",
+    "fov_mean_capture_coverage",
+    "fov_zero_coverage_packet_count",
+    "com_timely_delivered_bits",
+    "total_timely_useful_bits",
     "raw_final_hop_mbits",
     "total_mobility_energy_j",
     "fov_timely_delivered_packets",

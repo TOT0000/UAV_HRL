@@ -13,7 +13,7 @@ from evaluation_aggregation import (
 PAPER_EE_EPSILON_J = 1e-12
 AGGREGATE_REL_TOL = 1e-12
 AGGREGATE_ABS_TOL = 1e-15
-PAPER_AGGREGATE_SCHEMA_VERSION = "uav-hrl-paper-aggregate-v4"
+PAPER_AGGREGATE_SCHEMA_VERSION = "uav-hrl-paper-aggregate-v5"
 CANONICAL_AGGREGATE_ROWS = (
     ("energy_efficiency_mbit_per_j", None),
     ("average_e2e_delay_seconds", "FOV"),
@@ -74,12 +74,12 @@ def causal_trailing_average(values, window=50):
 
 
 def paper_energy_efficiency(timely_goodput_mbits, mobility_energy_j):
-    """Production paper adapter: timely delivered Mbit per mobility joule."""
+    """Production paper adapter: timely useful Mbit per mobility joule."""
 
     numerator = float(timely_goodput_mbits)
     denominator = float(mobility_energy_j)
     if not math.isfinite(numerator) or numerator < 0.0:
-        raise ValueError("timely goodput must be finite and non-negative")
+        raise ValueError("timely useful goodput must be finite and non-negative")
     if not math.isfinite(denominator) or denominator < 0.0:
         raise ValueError("mobility energy must be finite and non-negative")
     value = numerator / max(denominator, PAPER_EE_EPSILON_J)
@@ -104,7 +104,17 @@ def normalize_episode_ee(method_id, history_rows, window=50):
             raise ValueError(
                 f"{method_id} training history lacks production EE inputs"
             ) from exc
-        raw_mbit.append(paper_energy_efficiency(timely_mbits, mobility_joules))
+        useful_mbits = row.get("total_timely_useful_mbits", timely_mbits)
+        if not math.isclose(
+            float(timely_mbits),
+            float(useful_mbits),
+            rel_tol=0.0,
+            abs_tol=1e-12,
+        ):
+            raise ValueError(
+                f"{method_id} timely-goodput alias differs from useful numerator"
+            )
+        raw_mbit.append(paper_energy_efficiency(useful_mbits, mobility_joules))
     raw_bits = [value * 1e6 for value in raw_mbit]
     averaged = causal_trailing_average(raw_bits, window=window)
     return [
@@ -112,6 +122,11 @@ def normalize_episode_ee(method_id, history_rows, window=50):
             "method_id": str(method_id),
             "episode": episode,
             "timely_goodput_mbits": float(source["timely_goodput_mbits"]),
+            "total_timely_useful_mbits": float(
+                source.get(
+                    "total_timely_useful_mbits", source["timely_goodput_mbits"]
+                )
+            ),
             "mobility_energy_j": float(source["mobility_energy_j"]),
             "raw_energy_efficiency_bit_per_j": raw_value,
             "trailing_50_energy_efficiency_bit_per_j": average,
@@ -141,6 +156,8 @@ def aggregate_paper_point_metrics(method_id, suite, point, episode_rows):
         "fixed_num_gt": point.get("fixed_num_gt"),
         "swept_task": point.get("swept_task"),
         "evaluation_episode_count": len(rows),
+        "ee_numerator_definition": "total timely useful Mbit",
+        "fov_coverage_snapshot_timing": "packet generation/capture time",
     }
     per_seed, cross_seed = canonical_aggregation(rows)
     result = []

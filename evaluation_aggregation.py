@@ -9,7 +9,7 @@ from scipy.stats import t as student_t
 
 
 EVALUATION_AGGREGATION_SCHEMA_VERSION = (
-    "canonical-result-single-artifact-source-v2"
+    "canonical-useful-goodput-single-artifact-source-v3"
 )
 
 CANONICAL_METRICS = (
@@ -74,7 +74,19 @@ def aggregate_episode_rows_by_seed(episode_rows, *, seed_field="training_seed"):
         grouped.setdefault(seed, []).append(row)
     output = []
     for seed, rows in sorted(grouped.items()):
-        timely = sum(_row_number(row, "timely_goodput_mbits") for row in rows)
+        timely = 0.0
+        for row in rows:
+            alias = _row_number(row, "timely_goodput_mbits")
+            useful = (
+                alias
+                if row.get("total_timely_useful_mbits") in (None, "")
+                else _row_number(row, "total_timely_useful_mbits")
+            )
+            if not math.isclose(useful, alias, rel_tol=0.0, abs_tol=1e-12):
+                raise ValueError(
+                    "timely_goodput_mbits must alias total_timely_useful_mbits"
+                )
+            timely += useful
         energy = sum(_row_number(row, "total_mobility_energy_j") for row in rows)
         seed_rows = [
             _ratio_row(
