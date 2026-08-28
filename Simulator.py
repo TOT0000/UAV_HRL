@@ -42,6 +42,7 @@ from experiment_config import (
     GS_GATEWAY_HARD_RADIUS_M,
     GS_GATEWAY_PROJECTION_MODE,
     GS_GATEWAY_SOFT_RADIUS_M,
+    GS_GATEWAY_SOFT_RADIUS_OPERATIONAL,
     NUM_UAV,
     PERMANENT_GS_GATEWAY_UAV_ID,
     REFERENCE_COM_BANDWIDTH_HZ,
@@ -500,6 +501,9 @@ class Simulator:
             "gs_gateway_contract_version": GS_GATEWAY_CONTRACT_VERSION,
             "gs_gateway_projection_mode": GS_GATEWAY_PROJECTION_MODE,
             "gs_gateway_soft_radius_m": GS_GATEWAY_SOFT_RADIUS_M,
+            "gs_gateway_soft_radius_operational": (
+                GS_GATEWAY_SOFT_RADIUS_OPERATIONAL
+            ),
             "gs_gateway_hard_radius_m": GS_GATEWAY_HARD_RADIUS_M,
             "search_release_time_seconds": self.search_release_time,
             "search_release_coverage": self.search_release_coverage,

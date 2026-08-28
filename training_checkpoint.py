@@ -32,6 +32,7 @@ from experiment_config import (
     GS_GATEWAY_HARD_RADIUS_M,
     GS_GATEWAY_PROJECTION_MODE,
     GS_GATEWAY_SOFT_RADIUS_M,
+    GS_GATEWAY_SOFT_RADIUS_OPERATIONAL,
     INITIAL_COMMUNICATION_TOPOLOGY_CONTRACT_VERSION,
     MOVEMENT_ACTION_PROJECTION_CONTRACT_VERSION,
     MOVEMENT_REPLAY_CONTRACT_VERSION,
@@ -73,7 +74,8 @@ from dinkelbach_blocks import (
     dinkelbach_config_metadata,
 )
 
-CHECKPOINT_SCHEMA_VERSION = 19
+CHECKPOINT_SCHEMA_VERSION = 20
+PRE_CONTINUOUS_GATEWAY_PROJECTION_CHECKPOINT_SCHEMA_VERSION = 19
 PRE_UNIFIED_400M_COMMUNICATION_CHECKPOINT_SCHEMA_VERSION = 18
 PRE_PERMANENT_GATEWAY_USEFUL_GOODPUT_CHECKPOINT_SCHEMA_VERSION = 17
 PRE_DISTANCE_AWARE_TASK_POTENTIAL_CHECKPOINT_SCHEMA_VERSION = 16
@@ -166,6 +168,7 @@ FORMAL_CORE_CONFIG_FIELDS = (
     "ground_station_position_m",
     "permanent_gs_gateway_uav_id",
     "gs_gateway_soft_radius_m",
+    "gs_gateway_soft_radius_operational",
     "gs_gateway_hard_radius_m",
     "gs_gateway_projection_mode",
     "gs_gateway_contract_version",
@@ -1030,6 +1033,7 @@ def _base_metadata(
         "ground_station_position_m": list(GROUND_STATION_POSITION_M),
         "permanent_gs_gateway_uav_id": PERMANENT_GS_GATEWAY_UAV_ID,
         "gs_gateway_soft_radius_m": GS_GATEWAY_SOFT_RADIUS_M,
+        "gs_gateway_soft_radius_operational": GS_GATEWAY_SOFT_RADIUS_OPERATIONAL,
         "gs_gateway_hard_radius_m": GS_GATEWAY_HARD_RADIUS_M,
         "gs_gateway_projection_mode": GS_GATEWAY_PROJECTION_MODE,
         "gs_gateway_contract_version": GS_GATEWAY_CONTRACT_VERSION,
@@ -1373,6 +1377,7 @@ def _validate_checkpoint_schema(metadata):
             "stochastic channel, COM QoS/routing-credit, all-participant FOV, "
             "GS-reachable initial topology, distance-aware VS/COM potentials, "
             "permanent GS gateway, capture-weighted timely useful goodput, "
+            "continuous hard-only 400 m UAV 0 gateway projection, "
             "unified inclusive 400 m S2U/U2G/U2U communication range, "
             "named-RNG, projected-action and replay "
             "contract and must be retrained: "

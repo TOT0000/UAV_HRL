@@ -26,6 +26,7 @@ from experiment_config import (
     GS_GATEWAY_HARD_RADIUS_M,
     GS_GATEWAY_PROJECTION_MODE,
     GS_GATEWAY_SOFT_RADIUS_M,
+    GS_GATEWAY_SOFT_RADIUS_OPERATIONAL,
     INITIAL_COMMUNICATION_TOPOLOGY_CONTRACT_VERSION,
     MAX_3D_COMMUNICATION_DISTANCE_M,
     NUM_UAV,
@@ -37,7 +38,7 @@ from experiment_config import (
 )
 
 
-SCENARIO_SCHEMA_VERSION = "uav-hrl-scenario-v6"
+SCENARIO_SCHEMA_VERSION = "uav-hrl-scenario-v7"
 OBSOLETE_SCHEMA_VERSIONS = frozenset(
     {
         "uav-hrl-scenario-v1",
@@ -45,11 +46,12 @@ OBSOLETE_SCHEMA_VERSIONS = frozenset(
         "uav-hrl-scenario-v3",
         "uav-hrl-scenario-v4",
         "uav-hrl-scenario-v5",
+        "uav-hrl-scenario-v6",
     }
 )
 # Singular compatibility name used by callers that construct an obsolete
 # manifest explicitly for fail-fast tests.
-OBSOLETE_SCHEMA_VERSION = "uav-hrl-scenario-v5"
+OBSOLETE_SCHEMA_VERSION = "uav-hrl-scenario-v6"
 UAV_INITIAL_LAYOUT = UAV_INITIAL_LAYOUT_VERSION
 SUPPORTED_SPLITS = frozenset({"train", "validation", "test"})
 POLICY_DEPENDENT_KEYS = frozenset(
@@ -331,6 +333,7 @@ def current_environment_config() -> dict[str, Any]:
         "reserved_search_uav_ids": list(RESERVED_SEARCH_UAV_IDS),
         "permanent_gs_gateway_uav_id": PERMANENT_GS_GATEWAY_UAV_ID,
         "gs_gateway_soft_radius_m": GS_GATEWAY_SOFT_RADIUS_M,
+        "gs_gateway_soft_radius_operational": GS_GATEWAY_SOFT_RADIUS_OPERATIONAL,
         "gs_gateway_hard_radius_m": GS_GATEWAY_HARD_RADIUS_M,
         "gs_gateway_projection_mode": GS_GATEWAY_PROJECTION_MODE,
         "gs_gateway_contract_version": GS_GATEWAY_CONTRACT_VERSION,
@@ -685,23 +688,29 @@ class ScenarioManifest:
         }:
             raise ValueError(
                 "legacy 16-UAV scenario schema is incompatible; regenerate the "
-                "manifest with the 10-UAV v6 generator"
+                "manifest with the 10-UAV v7 generator"
             )
         if data.get("schema_version") == "uav-hrl-scenario-v3":
             raise ValueError(
                 "legacy disconnected-GS scenario geometry is incompatible; "
-                "regenerate the manifest with the v6 gateway layout"
+                "regenerate the manifest with the v7 gateway layout"
             )
         if data.get("schema_version") == "uav-hrl-scenario-v4":
             raise ValueError(
                 "legacy pre-permanent-gateway packet-generation scenario is "
-                "incompatible; regenerate the manifest with the v6 generator"
+                "incompatible; regenerate the manifest with the v7 generator"
             )
         if data.get("schema_version") == "uav-hrl-scenario-v5":
             raise ValueError(
                 "legacy split-range 200 m A2G / 400 m A2A scenario is "
                 "incompatible; regenerate the manifest with the unified 400 m "
-                "v6 generator"
+                "v7 generator"
+            )
+        if data.get("schema_version") == "uav-hrl-scenario-v6":
+            raise ValueError(
+                "legacy soft-compressed 360-400 m UAV 0 gateway projection is "
+                "incompatible; regenerate the manifest with the continuous "
+                "hard-only 400 m v7 generator"
             )
         if data.get("schema_version") != SCENARIO_SCHEMA_VERSION:
             raise ValueError(
@@ -791,6 +800,13 @@ def generate_manifest(
             "initial_communication_topology_contract_version": (
                 INITIAL_COMMUNICATION_TOPOLOGY_CONTRACT_VERSION
             ),
+            "gs_gateway_projection_mode": GS_GATEWAY_PROJECTION_MODE,
+            "gs_gateway_soft_radius_m": GS_GATEWAY_SOFT_RADIUS_M,
+            "gs_gateway_soft_radius_operational": (
+                GS_GATEWAY_SOFT_RADIUS_OPERATIONAL
+            ),
+            "gs_gateway_hard_radius_m": GS_GATEWAY_HARD_RADIUS_M,
+            "gs_gateway_contract_version": GS_GATEWAY_CONTRACT_VERSION,
             "a2g_communication_range_m": A2G_COMMUNICATION_RANGE_M,
             "a2a_communication_range_m": A2A_COMMUNICATION_RANGE_M,
             "communication_range_boundary_rule": (

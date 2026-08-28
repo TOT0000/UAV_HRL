@@ -40,10 +40,11 @@ RESERVED_SEARCH_UAV_IDS = (0, NUM_UAV - 1)
 GROUND_STATION_POSITION_M = (0.0, 0.0, 0.0)
 PERMANENT_GS_GATEWAY_UAV_ID = 0
 GS_GATEWAY_SOFT_RADIUS_M = 360.0
+GS_GATEWAY_SOFT_RADIUS_OPERATIONAL = False
 GS_GATEWAY_HARD_RADIUS_M = MAX_3D_COMMUNICATION_DISTANCE_M
-GS_GATEWAY_PROJECTION_MODE = "gs_only"
+GS_GATEWAY_PROJECTION_MODE = "gs_3d_hard_only"
 GS_GATEWAY_CONTRACT_VERSION = (
-    "permanent-uav0-search-to-hover-altitude-feasible-3d-soft360-hard400-v2"
+    "permanent-uav0-search-to-hover-altitude-feasible-3d-hard400-only-v3"
 )
 CANONICAL_UAV_INITIAL_XY_M = (
     (50.0, 50.0),
@@ -174,7 +175,7 @@ MOVEMENT_CHANNEL_TIMING_VERSION = (
 )
 PROPULSION_MODEL_ID = "canonical-3d-quadrotor-v1"
 MOVEMENT_ACTION_PROJECTION_CONTRACT_VERSION = (
-    "fieldwise-clamp-heading-wrap-mask-uav0-altitude-feasible-gs-3d-position-v3"
+    "fieldwise-clamp-heading-wrap-mask-uav0-continuous-hard400-3d-position-v4"
 )
 MOVEMENT_REPLAY_CONTRACT_VERSION = (
     "executed-net-displacement-action-boundary-aligned-next-state-capacity-50000-v3"
@@ -839,6 +840,7 @@ def comparison_method_configuration(method_spec: MethodSpec) -> dict:
         "ground_station_position_m": list(GROUND_STATION_POSITION_M),
         "permanent_gs_gateway_uav_id": PERMANENT_GS_GATEWAY_UAV_ID,
         "gs_gateway_soft_radius_m": GS_GATEWAY_SOFT_RADIUS_M,
+        "gs_gateway_soft_radius_operational": GS_GATEWAY_SOFT_RADIUS_OPERATIONAL,
         "gs_gateway_hard_radius_m": GS_GATEWAY_HARD_RADIUS_M,
         "gs_gateway_projection_mode": GS_GATEWAY_PROJECTION_MODE,
         "gs_gateway_contract_version": GS_GATEWAY_CONTRACT_VERSION,

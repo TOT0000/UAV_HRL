@@ -11,7 +11,6 @@ from experiment_config import (
     GROUND_ALTITUDE_M,
     GS_GATEWAY_HARD_RADIUS_M,
     GS_GATEWAY_PROJECTION_MODE,
-    GS_GATEWAY_SOFT_RADIUS_M,
     NUM_UAV,
     PERMANENT_GS_GATEWAY_UAV_ID,
     ROI_COUNT_MAX,
@@ -782,30 +781,29 @@ def project_gs_gateway_position(
     proposed_position,
     *,
     gs_position=GROUND_STATION_POSITION_M,
-    soft_radius_m=GS_GATEWAY_SOFT_RADIUS_M,
     hard_radius_m=GS_GATEWAY_HARD_RADIUS_M,
     min_altitude_m=None,
     max_altitude_m=None,
     env_width_m=None,
     env_height_m=None,
 ):
-    """Apply the authoritative soft/hard 3-D GS sphere projection.
+    """Apply the authoritative continuous hard-only 3-D GS projection.
 
-    Movement callers provide the environment/altitude bounds.  If radial
-    compression would cross the minimum altitude, the horizontal radius is
-    reduced so the same 3-D target distance is retained.
+    Legal positions are returned unchanged. For an out-of-range position,
+    altitude is retained whenever feasible and only the horizontal component
+    is shortened to the hard sphere. This avoids naïve radial scaling below
+    the UAV minimum altitude.
     """
 
     point = np.asarray(proposed_position, dtype=np.float64)
     station = np.asarray(gs_position, dtype=np.float64)
-    soft = float(soft_radius_m)
     hard = float(hard_radius_m)
     if point.shape != (3,) or station.shape != (3,):
         raise ValueError("gateway and GS positions must each contain three values")
     if not np.isfinite(point).all() or not np.isfinite(station).all():
         raise ValueError("gateway and GS positions must be finite")
-    if not np.isfinite(soft) or not np.isfinite(hard) or not 0.0 < soft < hard:
-        raise ValueError("gateway radii must be finite with 0 < soft < hard")
+    if not np.isfinite(hard) or hard <= 0.0:
+        raise ValueError("gateway hard radius must be positive and finite")
     bounds = (min_altitude_m, max_altitude_m, env_width_m, env_height_m)
     bounded = any(value is not None for value in bounds)
     if bounded and any(value is None for value in bounds):
@@ -817,6 +815,8 @@ def project_gs_gateway_position(
             or z_min > z_max
             or width < 0.0
             or height < 0.0
+            or not 0.0 <= station[0] <= width
+            or not 0.0 <= station[1] <= height
         ):
             raise ValueError("gateway feasibility bounds are invalid")
         point = np.asarray(
@@ -829,27 +829,36 @@ def project_gs_gateway_position(
         )
     vector = point - station
     distance = float(np.linalg.norm(vector))
-    if distance <= soft or distance <= 1e-12:
+    if distance <= hard or distance <= 1e-12:
         return tuple(float(value) for value in point)
-    if distance >= hard:
-        target_distance = hard
-    else:
-        alpha = (distance - soft) / (hard - soft)
-        target_distance = (1.0 - alpha) * distance + alpha * soft
-    projected = station + vector * (target_distance / distance)
+
     if bounded:
-        projected[2] = float(np.clip(projected[2], z_min, z_max))
-        vertical = float(projected[2] - station[2])
-        horizontal_direction = np.asarray(vector[:2], dtype=np.float64)
-        horizontal_norm = float(np.linalg.norm(horizontal_direction))
-        if horizontal_norm > 1e-12 and abs(vertical) <= target_distance:
-            horizontal_target = math.sqrt(
-                max(target_distance**2 - vertical**2, 0.0)
+        feasible_z_min = max(z_min, float(station[2]) - hard)
+        feasible_z_max = min(z_max, float(station[2]) + hard)
+        if feasible_z_min > feasible_z_max:
+            raise RuntimeError(
+                "gateway altitude bounds do not intersect the hard 3-D sphere"
             )
-            projected[:2] = (
-                station[:2]
-                + horizontal_direction / horizontal_norm * horizontal_target
-            )
+        projected_z = float(np.clip(point[2], feasible_z_min, feasible_z_max))
+    else:
+        projected_z = float(station[2] + np.clip(vector[2], -hard, hard))
+
+    vertical = projected_z - float(station[2])
+    horizontal_limit = math.sqrt(max(hard**2 - vertical**2, 0.0))
+    horizontal_vector = np.asarray(point[:2] - station[:2], dtype=np.float64)
+    horizontal_distance = float(np.linalg.norm(horizontal_vector))
+    if horizontal_distance <= 1e-12:
+        projected_xy = np.asarray(station[:2], dtype=np.float64)
+    else:
+        projected_xy = (
+            station[:2]
+            + horizontal_vector
+            * (min(horizontal_distance, horizontal_limit) / horizontal_distance)
+        )
+    projected = np.asarray(
+        (projected_xy[0], projected_xy[1], projected_z), dtype=np.float64
+    )
+    if bounded:
         projected[0] = float(np.clip(projected[0], 0.0, width))
         projected[1] = float(np.clip(projected[1], 0.0, height))
     if not np.isfinite(projected).all():
@@ -917,7 +926,7 @@ def build_velocity_substep_proposals(env, velocity_commands, step_time):
             env_height=env.env_height,
         )
         if uav_id == PERMANENT_GS_GATEWAY_UAV_ID:
-            if GS_GATEWAY_PROJECTION_MODE != "gs_only":
+            if GS_GATEWAY_PROJECTION_MODE != "gs_3d_hard_only":
                 raise RuntimeError(
                     f"unsupported permanent gateway projection mode: "
                     f"{GS_GATEWAY_PROJECTION_MODE}"

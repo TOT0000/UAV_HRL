@@ -315,9 +315,9 @@ seeds, the critical value is approximately `2.776`.
 
 ## Scenario manifests
 
-The `uav-hrl-scenario-v6` JSON schema records the split, manifest seed, episode
+The `uav-hrl-scenario-v7` JSON schema records the split, manifest seed, episode
 count, generation profile, generator/config fingerprint, content hash, permanent
-gateway contract, and one entry per scenario. Schemas v1-v5 are obsolete and
+gateway contract, and one entry per scenario. Schemas v1-v6 are obsolete and
 must be regenerated. Each
 entry contains its profile-aware ID and seed, GT/RoI data, UAV initial state,
 SR initial state and deterministic motion primitive, and traffic/load
@@ -329,13 +329,15 @@ The ground station is fixed at `(0, 0, 0)`. Canonical UAV 0 starts at
 `(900,750)` respectively. Every UAV still consumes exactly one deterministic
 `z ~ Uniform(80,120)` draw and starts with 10,000 J. This is only an initial
 geometry contract. UAV 0 is the permanent GS gateway. The single common movement
-proposal/execution path applies its full 3-D soft/hard GS projection to every
-movement method in training and evaluation: distances through 360 m are
-unchanged, the open `(360,400)` m band uses the canonical soft compression, and
-distances at or above 400 m project radially to 400 m. The final projected point
-must also obey the UAV altitude and environment XY bounds; at altitude
-difference `dz`, its horizontal GS radius cannot exceed
-`sqrt(400^2 - dz^2)`. UAV 9 is not projected.
+proposal/execution path applies a continuous, hard-only 3-D GS projection to
+every movement method in training and evaluation. Every airspace-legal proposed
+position at distance `<= 400 m` is retained exactly, including the full
+`360-400 m` band. Only points beyond 400 m are projected to the inclusive hard
+boundary. Feasible UAV altitude is retained and the horizontal component is
+shortened to at most `sqrt(400^2 - dz^2)`, avoiding naïve radial scaling below
+minimum altitude; the final point must also obey environment XY bounds. The
+legacy 360 m soft radius remains metadata-only with
+`gs_gateway_soft_radius_operational=false`. UAV 9 is not projected.
 Replay records the executed net movement, state/channel/task geometry observes
 the projected position, and propulsion energy uses the executed displacement.
 The fixed movement warm-up remains 10,000 joint transitions.
@@ -481,20 +483,23 @@ python -X utf8 comparison_experiment.py aggregate --input-dir runs/comparison/ev
 
 Exact-resume checkpoints validate the method fingerprint, training-manifest
 relationship, training seed, the complete Dinkelbach block state, and its configuration.
-Checkpoint schema v19 is the current unified-400-m communication,
-permanent-gateway, coverage-weighted useful goodput, boundary-aligned stochastic-channel,
+Checkpoint schema v20 is the current continuous-hard-only-gateway,
+unified-400-m communication, permanent-gateway, coverage-weighted useful
+goodput, boundary-aligned stochastic-channel,
 movement/routing replay, utility/QoS, routing-ID causality/credit,
 frozen-backlog reward, GS-reachable initial topology, distance-aware VS/COM
 task potentials, hard-range/COM-session, atomic-FOV, seed-ratio
 aggregation, propulsion, and four-slot/fifty-block movement-channel contract.
-Schema v18 and every older schema is rejected before weights or replay state are
+Schema v19 and every older schema is rejected before weights or replay state are
 restored and must be retrained; no legacy checkpoint migration is attempted.
 The current schema
 stores the 429/30/90 dimensions, movement feature schema, direct-ratio bit/J
 objective, shared gateway/channel/packet contracts, active FOV capture-coverage
 snapshots, raw/useful counters, inject buffers, adaptive routing lifecycle, and
 FOV-EMA state. The movement feature schema remains unchanged; the scenario
-schema is v6. Schema-18 checkpoints use the previous split 200 m A2G / 400 m
+schema is v7. Schema-19 checkpoints use the discontinuous 360-400 m soft
+compression and must be retrained under the hard-only projection dynamics.
+Schema-18 checkpoints use the previous split 200 m A2G / 400 m
 A2A environment and older COM range-gap semantics, so they must be retrained.
 Schema-17 checkpoints predate the permanent UAV 0 gateway,
 assigned-source FOV generation, and useful-goodput numerator and must be

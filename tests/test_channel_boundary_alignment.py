@@ -1,4 +1,5 @@
 import copy
+import math
 import tempfile
 import unittest
 from pathlib import Path
@@ -14,7 +15,13 @@ from Channel_model import (
 from HRL_task_aware import TrainingConfig, _run_routing_slot, train
 from Packet_scheduler_v1 import PacketEngine
 from Simulator import Simulator
-from centralized_movement import LOCAL_MOVEMENT_DIM, movement_mask_from_state
+from centralized_movement import (
+    HOVER_ACTION,
+    LOCAL_MOVEMENT_DIM,
+    apply_joint_movement_proposals,
+    gs_gateway_distance_m,
+    movement_mask_from_state,
+)
 from experiment_config import METHOD_REGISTRY, MethodSpec, comparison_method_configuration
 from rng_contract import NamedRNGStreams
 from training_checkpoint import CHECKPOINT_SCHEMA_VERSION, _validate_checkpoint_schema
@@ -372,13 +379,30 @@ class CompatibilityAndRegistryTest(unittest.TestCase):
             return
         test_case.assertEqual(expected, actual)
 
-    def test_full_resume_matches_uninterrupted_boundary_gain_and_transition(self):
+    def test_full_resume_matches_uninterrupted_at_gateway_projection_boundary(self):
         original_add = ReplayBufferJoint.add
         original_initial = Simulator.prepare_initial_movement_interval
         original_slot = Simulator.prepare_channel_routing_slot
+        original_reset = Simulator.reset_environment
+
+        fixed_action = np.tile(np.asarray(HOVER_ACTION, dtype=np.float32), 10)
+        fixed_action[:3] = (1.0, 0.0, 0.0)
 
         def run_with_capture(config):
-            captured = {"boundaries": [], "profiles": [], "transitions": []}
+            captured = {
+                "boundaries": [],
+                "profiles": [],
+                "transitions": [],
+                "executions": [],
+            }
+
+            def boundary_reset(simulator, *args, **kwargs):
+                result = original_reset(simulator, *args, **kwargs)
+                altitude = 100.0
+                simulator.uav_dict[0].x_u = math.sqrt(399.0**2 - altitude**2)
+                simulator.uav_dict[0].y_u = 0.0
+                simulator.uav_dict[0].z_u = altitude
+                return result
 
             def capture_initial(simulator):
                 result = original_initial(simulator)
@@ -417,7 +441,29 @@ class CompatibilityAndRegistryTest(unittest.TestCase):
                 )
                 return original_add(replay, state, action, next_state, **kwargs)
 
+            def capture_execution(simulator, proposals, step_time=1.0):
+                energies = apply_joint_movement_proposals(
+                    simulator, proposals, step_time=step_time
+                )
+                captured["executions"].append(
+                    {
+                        "positions": np.asarray(
+                            [
+                                simulator.uav_dict[uav_id].get_position()
+                                for uav_id in range(simulator.num_UAV)
+                            ],
+                            dtype=np.float64,
+                        ),
+                        "energies": np.asarray(energies).copy(),
+                    }
+                )
+                return energies
+
             with mock.patch.object(
+                Simulator,
+                "reset_environment",
+                new=boundary_reset,
+            ), mock.patch.object(
                 Simulator,
                 "prepare_initial_movement_interval",
                 new=capture_initial,
@@ -429,6 +475,12 @@ class CompatibilityAndRegistryTest(unittest.TestCase):
                 ReplayBufferJoint,
                 "add",
                 new=capture_transition,
+            ), mock.patch(
+                "HRL_task_aware.project_joint_action",
+                side_effect=lambda *args, **kwargs: fixed_action.copy(),
+            ), mock.patch(
+                "HRL_task_aware.apply_joint_movement_proposals",
+                new=capture_execution,
             ):
                 result = train(config)
             return result, captured
@@ -468,9 +520,11 @@ class CompatibilityAndRegistryTest(unittest.TestCase):
         self.assertEqual(len(uninterrupted_capture["boundaries"]), 2)
         self.assertEqual(len(uninterrupted_capture["profiles"]), 8)
         self.assertEqual(len(uninterrupted_capture["transitions"]), 2)
+        self.assertEqual(len(uninterrupted_capture["executions"]), 8)
         self.assertEqual(len(resumed_capture["boundaries"]), 1)
         self.assertEqual(len(resumed_capture["profiles"]), 4)
         self.assertEqual(len(resumed_capture["transitions"]), 1)
+        self.assertEqual(len(resumed_capture["executions"]), 4)
         self._assert_nested_exact(
             self,
             uninterrupted_capture["boundaries"][1],
@@ -488,12 +542,23 @@ class CompatibilityAndRegistryTest(unittest.TestCase):
         )
         self._assert_nested_exact(
             self,
+            uninterrupted_capture["executions"][4:],
+            resumed_capture["executions"],
+        )
+        self.assertAlmostEqual(
+            gs_gateway_distance_m(
+                uninterrupted_capture["executions"][4]["positions"][0]
+            ),
+            400.0,
+        )
+        self._assert_nested_exact(
+            self,
             uninterrupted["channel_lifecycle_state"],
             resumed["channel_lifecycle_state"],
         )
 
     def test_old_boundary_checkpoint_is_rejected_before_restore(self):
-        self.assertEqual(CHECKPOINT_SCHEMA_VERSION, 19)
+        self.assertEqual(CHECKPOINT_SCHEMA_VERSION, 20)
         with self.assertRaisesRegex(RuntimeError, "must be retrained"):
             _validate_checkpoint_schema({"checkpoint_schema_version": 12})
 
