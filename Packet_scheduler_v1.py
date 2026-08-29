@@ -1250,7 +1250,9 @@ class PacketEngine:
         if total_backlog_bits is None:
             total_backlog_bits = float(self.backlog_bits.get(sender, 0.0))
         total_backlog_bits = max(float(total_backlog_bits), 0.0)
-        if total_backlog_bits + PACKET_EPS < hol_remaining_bits:
+        backlog_tolerance_bits = 1e-6
+
+        if total_backlog_bits + backlog_tolerance_bits < hol_remaining_bits:
             raise AssertionError(
                 "slot-start total backlog is smaller than HOL remaining bits"
             )
