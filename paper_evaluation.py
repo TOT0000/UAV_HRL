@@ -5,6 +5,7 @@ from __future__ import annotations
 import csv
 from datetime import datetime, timezone
 import json
+import math
 from pathlib import Path
 import subprocess
 
@@ -127,11 +128,37 @@ def validate_production_deadlines():
     return actual
 
 
-def evaluation_sweep_points(suite, roi_counts=None):
+def _validate_deadline_seconds(deadline_seconds):
+    try:
+        values = tuple(float(value) for value in deadline_seconds)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("deadline_seconds values must be floats") from exc
+    if not values:
+        raise ValueError("deadline_seconds must contain at least one value")
+    if any(not math.isfinite(value) for value in values):
+        raise ValueError("deadline_seconds values must all be finite")
+    if any(value <= 0.0 for value in values):
+        raise ValueError("deadline_seconds values must all be greater than zero")
+    if len(set(values)) != len(values):
+        raise ValueError("deadline_seconds values must not contain duplicates")
+    return values
+
+
+def evaluation_sweep_points(
+    suite,
+    roi_counts=None,
+    deadline_seconds=None,
+    episode_seconds=None,
+):
     suite = resolve_evaluation_suite(suite)
     kind = PAPER_EVALUATION_SUITES[suite]["kind"]
     if roi_counts is not None and kind != "fixed_roi":
         raise ValueError("RoI selectors are available only for the fixed_roi suite")
+    if deadline_seconds is not None and kind != "deadline":
+        raise ValueError(
+            "deadline_seconds is available only for the "
+            "task_type_delay_violation_vs_target_delay suite"
+        )
     if kind == "training_history":
         return ({"point_id": "training_history", "overrides": {}},)
     if kind == "trajectory":
@@ -163,9 +190,40 @@ def evaluation_sweep_points(suite, roi_counts=None):
         return tuple(points)
     if kind == "deadline":
         defaults = validate_production_deadlines()
+        if deadline_seconds is None:
+            sweep_seconds = DEADLINE_SWEEP_SECONDS
+            injection_cutoff_seconds = (
+                DEADLINE_SWEEP_INJECTION_CUTOFF_SECONDS
+            )
+        else:
+            sweep_seconds = _validate_deadline_seconds(deadline_seconds)
+            if episode_seconds is None:
+                raise ValueError(
+                    "episode_seconds is required for custom deadline_seconds"
+                )
+            horizon_seconds = float(episode_seconds)
+            if not math.isfinite(horizon_seconds) or horizon_seconds <= 0.0:
+                raise ValueError(
+                    "episode_seconds must be finite and greater than zero for "
+                    "custom deadline_seconds"
+                )
+            max_required_deadline = max(
+                max(sweep_seconds),
+                defaults["FOV"],
+                defaults["COM"],
+            )
+            if max_required_deadline >= horizon_seconds:
+                raise ValueError(
+                    "maximum required deadline must be less than episode_seconds: "
+                    f"deadline={max_required_deadline:g}, "
+                    f"episode_seconds={horizon_seconds:g}"
+                )
+            injection_cutoff_seconds = (
+                horizon_seconds - max_required_deadline
+            )
         points = []
         for task_type in ("COM", "FOV"):
-            for value in DEADLINE_SWEEP_SECONDS:
+            for value in sweep_seconds:
                 deadlines = dict(defaults)
                 deadlines[task_type] = value
                 points.append(
@@ -174,9 +232,7 @@ def evaluation_sweep_points(suite, roi_counts=None):
                         "overrides": {
                             "fov_deadline_seconds": deadlines["FOV"],
                             "com_deadline_seconds": deadlines["COM"],
-                            "packet_injection_cutoff_seconds": (
-                                DEADLINE_SWEEP_INJECTION_CUTOFF_SECONDS
-                            ),
+                            "packet_injection_cutoff_seconds": injection_cutoff_seconds,
                         },
                         "swept_task": task_type,
                         "display_task": "VS" if task_type == "FOV" else "COM",
@@ -327,6 +383,7 @@ def run_paper_evaluation(
     output_root="results/paper_evaluations",
     checkpoint_episode=None,
     roi_counts=None,
+    deadline_seconds=None,
     output_directory=None,
     fixed_roi_manifests=None,
     allow_registered_fixed_roi_method=False,
@@ -335,6 +392,22 @@ def run_paper_evaluation(
     validate_production_deadlines()
     suite = resolve_evaluation_suite(suite)
     definition = PAPER_EVALUATION_SUITES[suite]
+    if deadline_seconds is not None and definition["kind"] != "deadline":
+        raise ValueError(
+            "deadline_seconds is available only for the "
+            "task_type_delay_violation_vs_target_delay suite"
+        )
+    if deadline_seconds is not None:
+        deadline_seconds = _validate_deadline_seconds(deadline_seconds)
+        evaluation_sweep_points(
+            suite,
+            deadline_seconds=deadline_seconds,
+            episode_seconds=int(
+                FORMAL_EXPERIMENT_DEFAULTS["episode_seconds"]
+                if episode_seconds is None
+                else episode_seconds
+            ),
+        )
     method = MethodSpec.parse(method_id)
     registry_fixed_roi = bool(
         suite == "fixed_roi"
@@ -451,7 +524,12 @@ def run_paper_evaluation(
     if definition["kind"] == "trajectory" and target_uav_id is None:
         raise ValueError("uav_trajectory_snapshots requires --target-uav-id")
 
-    points = evaluation_sweep_points(suite, selected_roi_counts)
+    points = evaluation_sweep_points(
+        suite,
+        selected_roi_counts,
+        deadline_seconds=deadline_seconds,
+        episode_seconds=resolved_seconds,
+    )
     if flatten_single_point and len(points) != 1:
         raise ValueError("flatten_single_point requires exactly one evaluation point")
     shared_manifests = dict(fixed_roi_manifests or {})

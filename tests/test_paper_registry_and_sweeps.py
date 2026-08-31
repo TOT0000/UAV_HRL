@@ -1,4 +1,6 @@
+import math
 import unittest
+from unittest import mock
 
 from experiment_config import (
     METHOD_REGISTRY,
@@ -14,6 +16,7 @@ from paper_evaluation import (
     PAPER_EVALUATION_SUITES,
     TRAJECTORY_SNAPSHOT_SECONDS,
     evaluation_sweep_points,
+    run_paper_evaluation,
 )
 from paper_figure_registry import (
     DEPRECATED_FIGURE_ALIASES,
@@ -24,7 +27,10 @@ from paper_figure_registry import (
     resolve_figure_ids,
 )
 from build_paper_figures import build_parser as build_figure_parser
-from run_paper_evaluation import build_parser as build_evaluation_parser
+from run_paper_evaluation import (
+    build_parser as build_evaluation_parser,
+    main as run_evaluation_main,
+)
 
 
 EXPECTED_SEMANTIC_FIGURES = (
@@ -176,6 +182,137 @@ class PaperSweepContractTest(unittest.TestCase):
                 "td3_dinkelbach_wo_ta",
                 "td3_dinkelbach",
             ),
+        )
+
+    def test_custom_deadline_sweep_preserves_order_and_opposite_defaults(self):
+        points = evaluation_sweep_points(
+            "task_type_delay_violation_vs_target_delay",
+            deadline_seconds=(1, 2, 4, 5),
+            episode_seconds=60,
+        )
+        self.assertEqual(len(points), 8)
+        com = [point for point in points if point["swept_task"] == "COM"]
+        fov = [point for point in points if point["swept_task"] == "FOV"]
+        self.assertEqual(tuple(point["x_value"] for point in com), (1.0, 2.0, 4.0, 5.0))
+        self.assertEqual(tuple(point["x_value"] for point in fov), (1.0, 2.0, 4.0, 5.0))
+        self.assertEqual(
+            {point["overrides"]["fov_deadline_seconds"] for point in com},
+            {1.5},
+        )
+        self.assertEqual(
+            {point["overrides"]["com_deadline_seconds"] for point in fov},
+            {1.0},
+        )
+        self.assertEqual(
+            {
+                point["overrides"]["packet_injection_cutoff_seconds"]
+                for point in points
+            },
+            {55.0},
+        )
+        for point in points:
+            self.assertEqual(point["x_unit"], "seconds")
+            self.assertIn("fov_deadline_seconds", point["overrides"])
+            self.assertIn("com_deadline_seconds", point["overrides"])
+
+    def test_invalid_custom_deadline_values_fail_fast(self):
+        invalid_cases = (
+            ((), "at least one"),
+            ((0,), "greater than zero"),
+            ((-1, 1), "greater than zero"),
+            ((math.nan,), "finite"),
+            ((math.inf,), "finite"),
+            ((1, 1, 2), "duplicates"),
+        )
+        for values, message in invalid_cases:
+            with self.subTest(values=values):
+                with self.assertRaisesRegex(ValueError, message):
+                    evaluation_sweep_points(
+                        "task_type_delay_violation_vs_target_delay",
+                        deadline_seconds=values,
+                        episode_seconds=60,
+                    )
+
+    def test_custom_deadline_must_fit_episode_horizon(self):
+        with self.assertRaisesRegex(ValueError, "less than episode_seconds"):
+            evaluation_sweep_points(
+                "task_type_delay_violation_vs_target_delay",
+                deadline_seconds=(1, 5),
+                episode_seconds=5,
+            )
+
+    def test_run_api_rejects_invalid_deadline_before_loading_checkpoint(self):
+        with mock.patch("paper_evaluation._load_training_run") as load_run:
+            with self.assertRaisesRegex(ValueError, "greater than zero"):
+                run_paper_evaluation(
+                    "td3_dinkelbach",
+                    run_directory="unused",
+                    suite="task_type_delay_violation_vs_target_delay",
+                    deadline_seconds=(0,),
+                    episode_seconds=60,
+                )
+        load_run.assert_not_called()
+
+    def test_deadline_selector_is_rejected_for_other_suites(self):
+        with self.assertRaisesRegex(ValueError, "only for"):
+            evaluation_sweep_points(
+                "fixed_roi",
+                deadline_seconds=(1,),
+                episode_seconds=60,
+            )
+        with self.assertRaisesRegex(ValueError, "only for"):
+            run_paper_evaluation(
+                "td3_dinkelbach",
+                suite="fixed_roi",
+                deadline_seconds=(1,),
+            )
+        with self.assertRaisesRegex(ValueError, "only for"):
+            run_evaluation_main(
+                [
+                    "td3_dinkelbach",
+                    "--suite",
+                    "fixed_roi",
+                    "--deadline-seconds",
+                    "1",
+                ]
+            )
+
+    def test_cli_parses_custom_deadline_seconds_as_floats(self):
+        args = build_evaluation_parser().parse_args(
+            [
+                "td3_dinkelbach",
+                "--suite",
+                "task_type_delay_violation_vs_target_delay",
+                "--deadline-seconds",
+                "0.5",
+                "1",
+                "4",
+            ]
+        )
+        self.assertEqual(args.deadline_seconds, [0.5, 1.0, 4.0])
+
+    def test_cli_passes_custom_deadline_seconds_to_evaluation(self):
+        with mock.patch(
+            "run_paper_evaluation.run_paper_evaluation",
+            return_value={},
+        ) as run_evaluation:
+            exit_code = run_evaluation_main(
+                [
+                    "td3_dinkelbach",
+                    "--run-dir",
+                    "run",
+                    "--suite",
+                    "task_type_delay_violation_vs_target_delay",
+                    "--deadline-seconds",
+                    "0.5",
+                    "2",
+                    "5",
+                ]
+            )
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(
+            run_evaluation.call_args.kwargs["deadline_seconds"],
+            [0.5, 2.0, 5.0],
         )
 
 

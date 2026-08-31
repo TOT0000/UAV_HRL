@@ -22,6 +22,12 @@ def build_parser():
     parser.add_argument("--manifest-seed", type=int)
     parser.add_argument("--episodes", type=int)
     parser.add_argument("--episode-seconds", type=int)
+    parser.add_argument(
+        "--deadline-seconds",
+        type=float,
+        nargs="+",
+        help="custom thresholds for the target-delay deadline suite only",
+    )
     checkpoint = parser.add_mutually_exclusive_group()
     checkpoint.add_argument("--checkpoint-episode", type=int)
     checkpoint.add_argument("--checkpoint-episodes", type=int, nargs="+")
@@ -39,6 +45,14 @@ def build_parser():
 
 def main(argv=None):
     args = build_parser().parse_args(argv)
+    if (
+        args.deadline_seconds is not None
+        and args.suite != "task_type_delay_violation_vs_target_delay"
+    ):
+        raise ValueError(
+            "--deadline-seconds is available only for the "
+            "task_type_delay_violation_vs_target_delay suite"
+        )
     checkpoint_episodes = resolve_checkpoint_episodes(
         args.checkpoint_episode, args.checkpoint_episodes
     )
@@ -97,6 +111,7 @@ def main(argv=None):
         output_root=args.output_root,
         checkpoint_episode=checkpoint_episodes[0],
         roi_counts=roi_counts,
+        deadline_seconds=args.deadline_seconds,
         allow_registered_fixed_roi_method=bool(
             args.suite == "fixed_roi" and (explicit_checkpoint or explicit_roi)
         ),
