@@ -31,7 +31,10 @@ from packet_outcome_artifacts import (
     PACKET_OUTCOME_ARTIFACT_SCHEMA_VERSION,
     PACKET_OUTCOME_MODE_DISABLED,
     PACKET_OUTCOME_MODE_STREAMING,
+    PACKET_ROUTING_DIAGNOSTIC_CONTRACT_VERSION,
+    PACKET_ROUTING_DIAGNOSTIC_DEFINITIONS,
     PacketOutcomeJsonlWriter,
+    write_packet_routing_diagnostic_artifacts,
 )
 from paper_figure_registry import FIGURE_REGISTRY, PAPER_METHOD_MAPPINGS
 from paper_metrics import (
@@ -626,6 +629,10 @@ def run_paper_evaluation(
                 ),
                 packet_outcome_sink=outcome_writer.write_episode,
             )
+        diagnostic_outputs = write_packet_routing_diagnostic_artifacts(
+            point_dir,
+            outcome_writer.routing_diagnostics(),
+        )
         if fixed_num_gt is not None and any(
             int(row["num_GT"]) != int(fixed_num_gt)
             for row in result["episode_metrics"]
@@ -673,6 +680,7 @@ def run_paper_evaluation(
         }
         outputs = write_evaluation_outputs(point_dir, result["episode_metrics"], run_metadata)
         outputs["packet_outcomes_jsonl"] = packet_outcomes_path.resolve()
+        outputs.update(diagnostic_outputs)
         trajectories = [
             {
                 **artifact,
@@ -715,6 +723,9 @@ def run_paper_evaluation(
                 ),
                 "packet_outcome_streamed_episode_count": (
                     outcome_writer.episode_count
+                ),
+                "packet_routing_diagnostic_contract_version": (
+                    PACKET_ROUTING_DIAGNOSTIC_CONTRACT_VERSION
                 ),
                 "resolved_overrides": result["run_metadata"].get(
                     "evaluation_overrides"
@@ -816,6 +827,10 @@ def run_paper_evaluation(
         "packet_outcome_artifact_schema_version": (
             PACKET_OUTCOME_ARTIFACT_SCHEMA_VERSION
         ),
+        "packet_routing_diagnostic_contract_version": (
+            PACKET_ROUTING_DIAGNOSTIC_CONTRACT_VERSION
+        ),
+        **PACKET_ROUTING_DIAGNOSTIC_DEFINITIONS,
         "target_uav_id": int(target_uav_id) if target_uav_id is not None else None,
         "git_sha": git_sha,
         "new_training_started": False,

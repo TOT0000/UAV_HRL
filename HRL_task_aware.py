@@ -86,6 +86,8 @@ from packet_outcome_artifacts import (
     PACKET_OUTCOME_MODE_BOUNDED,
     PACKET_OUTCOME_MODE_DISABLED,
     PACKET_OUTCOME_MODE_STREAMING,
+    PACKET_ROUTING_DIAGNOSTIC_CONTRACT_VERSION,
+    PACKET_ROUTING_DIAGNOSTIC_DEFINITIONS,
     packet_outcome_episode_record,
 )
 from routing_agents import create_routing_agent
@@ -713,9 +715,13 @@ def _run_routing_slot(
         }
         for uid in routing_decision_uav_ids
     }
+    physical_masks = {
+        uid: env.get_routing_action_mask(uid).astype(bool)
+        for uid in routing_decision_uav_ids
+    }
     effective_masks = {
         uid: packet_engine.get_effective_action_mask(
-            env, uid, env.get_routing_action_mask(uid).astype(bool)
+            env, uid, physical_masks[uid]
         )
         for uid in routing_decision_uav_ids
     }
@@ -793,6 +799,8 @@ def _run_routing_slot(
             for uid in routing_decision_uav_ids
         },
         routing_transition_ids_by_sender=routing_transition_ids,
+        start_of_slot_physical_masks_by_sender=physical_masks,
+        start_of_slot_effective_masks_by_sender=effective_masks,
         block_capacity_profiles=env.active_link_capacity_profiles_mbps,
         s2u_block_capacity_profiles=env.active_s2u_capacity_profiles_mbps,
     )
@@ -1318,6 +1326,21 @@ def _experiment_identity(
             != PACKET_OUTCOME_MODE_DISABLED
             else None
         ),
+        "packet_routing_diagnostic_contract_version": (
+            PACKET_ROUTING_DIAGNOSTIC_CONTRACT_VERSION
+            if config.packet_outcome_artifact_mode
+            != PACKET_OUTCOME_MODE_DISABLED
+            else None
+        ),
+        **{
+            field: (
+                definition
+                if config.packet_outcome_artifact_mode
+                != PACKET_OUTCOME_MODE_DISABLED
+                else None
+            )
+            for field, definition in PACKET_ROUTING_DIAGNOSTIC_DEFINITIONS.items()
+        },
         "routing_slots_per_episode": resolved_exploration[
             "routing_slots_per_episode"
         ],
@@ -1797,6 +1820,9 @@ def train(
         injection_cutoff_seconds=resolved_evaluation[
             "packet_injection_cutoff_seconds"
         ],
+        enable_packet_diagnostic_artifacts=(
+            packet_outcome_mode != PACKET_OUTCOME_MODE_DISABLED
+        ),
     )
     movement_agent = create_movement_agent(
         method_spec,

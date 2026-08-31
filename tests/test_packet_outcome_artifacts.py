@@ -2,7 +2,9 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
+import HRL_task_aware
 from experiment_config import METHOD_REGISTRY, MethodSpec, effective_training_config
 from HRL_task_aware import TrainingConfig, formal_training_config, train
 from packet_outcome_artifacts import (
@@ -11,6 +13,9 @@ from packet_outcome_artifacts import (
     PACKET_OUTCOME_MODE_BOUNDED,
     PACKET_OUTCOME_MODE_DISABLED,
     PACKET_OUTCOME_MODE_STREAMING,
+    PACKET_OUTCOME_REQUIRED_FIELDS,
+    PACKET_ROUTING_DIAGNOSTIC_CONTRACT_VERSION,
+    PACKET_ROUTING_DIAGNOSTIC_DEFINITIONS,
     PacketOutcomeJsonlWriter,
     packet_outcome_episode_record,
 )
@@ -61,21 +66,45 @@ class PacketOutcomeTrainingContractTest(unittest.TestCase):
         self.assertIsNone(
             result["run_metadata"]["packet_outcome_artifact_schema_version"]
         )
+        self.assertIsNone(
+            result["run_metadata"][
+                "packet_routing_diagnostic_contract_version"
+            ]
+        )
+        for field in PACKET_ROUTING_DIAGNOSTIC_DEFINITIONS:
+            self.assertIsNone(result["run_metadata"][field])
 
     def test_bounded_collection_is_explicit_small_and_metric_equivalent(self):
         manifest = generate_manifest("train", 8502, 2, num_gt=2)
-        disabled = train(
-            _short_config(2),
-            scenario_manifest=manifest,
-            method_spec=PURE_RANDOM_METHOD,
-        )
-        bounded = train(
-            _short_config(2, artifact_mode=PACKET_OUTCOME_MODE_BOUNDED),
-            scenario_manifest=manifest,
-            method_spec=PURE_RANDOM_METHOD,
+
+        def run_and_capture_actions(config):
+            actions = []
+            select_actions = HRL_task_aware._select_routing_actions
+
+            def record_actions(*args, **kwargs):
+                selected = select_actions(*args, **kwargs)
+                actions.append(tuple(sorted(selected.items())))
+                return selected
+
+            with mock.patch.object(
+                HRL_task_aware,
+                "_select_routing_actions",
+                side_effect=record_actions,
+            ):
+                result = train(
+                    config,
+                    scenario_manifest=manifest,
+                    method_spec=PURE_RANDOM_METHOD,
+                )
+            return result, actions
+
+        disabled, disabled_actions = run_and_capture_actions(_short_config(2))
+        bounded, bounded_actions = run_and_capture_actions(
+            _short_config(2, artifact_mode=PACKET_OUTCOME_MODE_BOUNDED)
         )
 
         self.assertEqual(disabled["episode_metrics"], bounded["episode_metrics"])
+        self.assertEqual(disabled_actions, bounded_actions)
         for field in (
             "reward_log",
             "delivered_log",
@@ -85,6 +114,14 @@ class PacketOutcomeTrainingContractTest(unittest.TestCase):
         ):
             self.assertEqual(disabled[field], bounded[field])
         self.assertEqual(len(bounded["packet_outcome_artifacts"]), 2)
+        self.assertEqual(
+            bounded["run_metadata"][
+                "packet_routing_diagnostic_contract_version"
+            ],
+            PACKET_ROUTING_DIAGNOSTIC_CONTRACT_VERSION,
+        )
+        for field, definition in PACKET_ROUTING_DIAGNOSTIC_DEFINITIONS.items():
+            self.assertEqual(bounded["run_metadata"][field], definition)
         for record, scenario_id, metrics in zip(
             bounded["packet_outcome_artifacts"],
             bounded["scenario_ids"],
@@ -222,6 +259,11 @@ class PacketOutcomeStreamingTest(unittest.TestCase):
                     "sr_waiting_seconds",
                     "remaining_bits_at_drop",
                 }.issubset(record["packet_outcomes"][0])
+            )
+            self.assertTrue(
+                PACKET_OUTCOME_REQUIRED_FIELDS.issubset(
+                    record["packet_outcomes"][0]
+                )
             )
             self.assertEqual(
                 record["summary"]["FOV"]["generated_packets"],

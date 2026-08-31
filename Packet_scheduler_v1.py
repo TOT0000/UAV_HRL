@@ -158,6 +158,7 @@ class PacketEngine:
         E_max=10000,
         task_deadlines_seconds=None,
         injection_cutoff_seconds=EPISODE_INJECTION_CUTOFF_SECONDS,
+        enable_packet_diagnostic_artifacts=False,
     ):
         self.step_time = float(step_time)
         if not np.isclose(
@@ -165,6 +166,9 @@ class PacketEngine:
         ):
             raise ValueError("packet service slot is fixed at 0.25 seconds")
         self.num_UAV = num_uav
+        self.enable_packet_diagnostic_artifacts = bool(
+            enable_packet_diagnostic_artifacts
+        )
         deadlines = dict(TASK_DEADLINE_SECONDS)
         if task_deadlines_seconds is not None:
             deadlines.update(
@@ -732,6 +736,16 @@ class PacketEngine:
             "last_routing_sender": None,
             "last_routing_transition_id": None,
         }
+        if self.enable_packet_diagnostic_artifacts:
+            pkt.update(
+                {
+                    "routing_decision_slot_count": 0,
+                    "routing_wait_slot_count": 0,
+                    "routing_wait_seconds": 0.0,
+                    "locked_receiver_out_of_range_wait_slot_count": 0,
+                    "locked_receiver_out_of_range_wait_seconds": 0.0,
+                }
+            )
         self.generated_packet_counts[task_type] += 1
         if task_type == "FOV":
             self.fov_generated_raw_bits += size_bits
@@ -948,6 +962,59 @@ class PacketEngine:
             if locked_is_physical:
                 mask[locked_receiver] = True
         return mask
+
+    def _record_routing_decision_diagnostics(
+        self,
+        pkt,
+        sender,
+        receiver,
+        *,
+        physical_mask=None,
+        effective_mask=None,
+    ):
+        """Record one frozen-HOL decision without changing its selected action."""
+
+        if (
+            not self.enable_packet_diagnostic_artifacts
+            or not bool(pkt.get("routing_eligible", False))
+        ):
+            return
+        sender, receiver = int(sender), int(receiver)
+        pkt["routing_decision_slot_count"] = int(
+            pkt.get("routing_decision_slot_count", 0)
+        ) + 1
+        if receiver != sender:
+            return
+        pkt["routing_wait_slot_count"] = int(
+            pkt.get("routing_wait_slot_count", 0)
+        ) + 1
+        pkt["routing_wait_seconds"] = float(
+            pkt.get("routing_wait_seconds", 0.0)
+        ) + float(self.step_time)
+
+        locked_receiver = pkt.get("hop_receiver")
+        if locked_receiver is None or physical_mask is None or effective_mask is None:
+            return
+        locked_receiver = int(locked_receiver)
+        physical = np.asarray(physical_mask, dtype=bool)
+        effective = np.asarray(effective_mask, dtype=bool)
+        expected_shape = (self.num_UAV + 1,)
+        if physical.shape != expected_shape or effective.shape != expected_shape:
+            return
+        forced_locked_wait = (
+            0 <= locked_receiver < expected_shape[0]
+            and not bool(physical[locked_receiver])
+            and bool(effective[sender])
+            and int(np.count_nonzero(effective)) == 1
+        )
+        if not forced_locked_wait:
+            return
+        pkt["locked_receiver_out_of_range_wait_slot_count"] = int(
+            pkt.get("locked_receiver_out_of_range_wait_slot_count", 0)
+        ) + 1
+        pkt["locked_receiver_out_of_range_wait_seconds"] = float(
+            pkt.get("locked_receiver_out_of_range_wait_seconds", 0.0)
+        ) + float(self.step_time)
 
     def record_hop_transmission(self, pkt, sender, receiver, bits):
         """Apply partial hop service while keeping the packet at its sender."""
@@ -1451,6 +1518,8 @@ class PacketEngine:
         start_of_slot_eligible_packet_ids=None,
         start_of_slot_backlog_bits_by_sender=None,
         routing_transition_ids_by_sender=None,
+        start_of_slot_physical_masks_by_sender=None,
+        start_of_slot_effective_masks_by_sender=None,
         block_capacity_profiles=None,
         s2u_block_capacity_profiles=None,
     ):
@@ -1517,6 +1586,21 @@ class PacketEngine:
             raise AssertionError(
                 "routing transition IDs must match frozen HOL senders"
             )
+        physical_masks = {}
+        effective_masks = {}
+        if self.enable_packet_diagnostic_artifacts:
+            physical_masks = {
+                int(sender): np.asarray(mask, dtype=bool)
+                for sender, mask in dict(
+                    start_of_slot_physical_masks_by_sender or {}
+                ).items()
+            }
+            effective_masks = {
+                int(sender): np.asarray(mask, dtype=bool)
+                for sender, mask in dict(
+                    start_of_slot_effective_masks_by_sender or {}
+                ).items()
+            }
         result = {
             "reward_by_sender": defaultdict(float),
             "cost_by_sender": defaultdict(float),
@@ -1577,6 +1661,14 @@ class PacketEngine:
         for sender in sorted(actions):
             receiver = int(actions[sender])
             hol = frozen_hol[int(sender)]
+            if self.enable_packet_diagnostic_artifacts:
+                self._record_routing_decision_diagnostics(
+                    hol,
+                    sender,
+                    receiver,
+                    physical_mask=physical_masks.get(int(sender)),
+                    effective_mask=effective_masks.get(int(sender)),
+                )
             hol["last_routing_sender"] = int(sender)
             if sender in transition_ids:
                 self._set_packet_routing_transition(
@@ -2120,6 +2212,136 @@ class PacketEngine:
         if 0 <= pi < len(self.packet_pool):
             self.packet_pool[pi] = None
 
+    def _packet_terminal_diagnostics(self, pkt, delivered_to_gs):
+        source_kind = str(pkt.get("source_kind", "UAV"))
+        raw_path = list(pkt.get("path") or [])
+        uav_nodes = []
+        for index, node in enumerate(raw_path):
+            if source_kind == "SR" and index == 0:
+                continue
+            try:
+                node_id = int(node)
+            except (TypeError, ValueError):
+                continue
+            if 0 <= node_id < self.num_UAV:
+                uav_nodes.append(node_id)
+        occurrences = defaultdict(int)
+        for node_id in uav_nodes:
+            occurrences[node_id] += 1
+        repeated_uav_ids = sorted(
+            node_id for node_id, count in occurrences.items() if count > 1
+        )
+
+        raw_hops = list(pkt.get("per_hop") or [])
+        diagnostic_hops = []
+        completed_uav_hops = []
+        s2u_hops = []
+        for hop in raw_hops:
+            link_type = hop.get("link_type")
+            if link_type is None:
+                try:
+                    is_u2g = int(hop.get("to")) == self.num_UAV
+                except (TypeError, ValueError):
+                    is_u2g = False
+                link_type = "U2G" if is_u2g else "U2U"
+            compact_hop = {
+                "from": hop.get("from"),
+                "to": hop.get("to"),
+                "link_type": str(link_type),
+                "queue_s": float(hop.get("queue_s", 0.0)),
+                "tx_s": float(hop.get("tx_s", 0.0)),
+            }
+            diagnostic_hops.append(compact_hop)
+            if compact_hop["link_type"] == "S2U":
+                s2u_hops.append(compact_hop)
+            else:
+                completed_uav_hops.append(compact_hop)
+
+        if delivered_to_gs:
+            terminal_node_type = "GS"
+            terminal_node_id = int(self.num_UAV)
+            terminal_uav_id = None
+        elif source_kind == "SR" and pkt.get("s2u_completion_time") is None:
+            terminal_node_type = "SR"
+            terminal_node_id = int(pkt.get("source_id", pkt.get("source", -1)))
+            terminal_uav_id = None
+        else:
+            terminal_node_type = "UAV"
+            current_node = pkt.get("current", -1)
+            if source_kind == "SR" and raw_path:
+                # A completed S2U hop can hit the deadline before enqueue_packet()
+                # updates ``current``.  The appended path receiver is then the
+                # authoritative terminal UAV.
+                try:
+                    current_node = int(raw_path[-1])
+                except (TypeError, ValueError):
+                    pass
+            terminal_node_id = int(current_node)
+            terminal_uav_id = terminal_node_id
+
+        s2u_applicable = source_kind == "SR"
+        s2u_completion_time = pkt.get("s2u_completion_time")
+        routing_eligible_time = pkt.get("routing_eligible_time")
+        locked_receiver = pkt.get("hop_receiver")
+        return {
+            "s2u_completed": (
+                bool(s2u_completion_time is not None) if s2u_applicable else None
+            ),
+            "s2u_completion_time_seconds": (
+                float(s2u_completion_time)
+                if s2u_completion_time is not None
+                else None
+            ),
+            "routing_eligible_time_seconds": (
+                float(routing_eligible_time)
+                if routing_eligible_time is not None
+                else None
+            ),
+            "terminal_node_type": terminal_node_type,
+            "terminal_node_id": terminal_node_id,
+            "terminal_uav_id": terminal_uav_id,
+            "locked_hop_receiver_at_terminal": (
+                int(locked_receiver) if locked_receiver is not None else None
+            ),
+            "path": raw_path,
+            "per_hop": diagnostic_hops,
+            "path_hop_count": max(len(raw_path) - 1, 0),
+            "completed_uav_hop_count": len(completed_uav_hops),
+            "unique_uav_count": len(occurrences),
+            "has_repeated_uav": bool(repeated_uav_ids),
+            "repeated_uav_count": len(repeated_uav_ids),
+            "repeated_uav_ids": repeated_uav_ids,
+            "routing_decision_slot_count": int(
+                pkt.get("routing_decision_slot_count", 0)
+            ),
+            "routing_wait_slot_count": int(
+                pkt.get("routing_wait_slot_count", 0)
+            ),
+            "routing_wait_seconds": float(pkt.get("routing_wait_seconds", 0.0)),
+            "locked_receiver_out_of_range_wait_slot_count": int(
+                pkt.get("locked_receiver_out_of_range_wait_slot_count", 0)
+            ),
+            "locked_receiver_out_of_range_wait_seconds": float(
+                pkt.get("locked_receiver_out_of_range_wait_seconds", 0.0)
+            ),
+            "cumulative_uav_queue_delay_seconds": float(
+                sum(hop["queue_s"] for hop in completed_uav_hops)
+            ),
+            "cumulative_uav_tx_delay_seconds": float(
+                sum(hop["tx_s"] for hop in completed_uav_hops)
+            ),
+            "s2u_queue_delay_seconds": (
+                float(sum(hop["queue_s"] for hop in s2u_hops))
+                if s2u_applicable and s2u_hops
+                else None
+            ),
+            "s2u_tx_delay_seconds": (
+                float(sum(hop["tx_s"] for hop in s2u_hops))
+                if s2u_applicable and s2u_hops
+                else None
+            ),
+        }
+
     def _record_terminal_outcome(self, pkt, reason):
         if pkt.get("terminal_outcome") is not None:
             return
@@ -2143,6 +2365,11 @@ class PacketEngine:
             max(finish_time - generation_time, 0.0) if delivered_to_gs else None
         )
         pkt["terminal_outcome"] = outcome
+        diagnostics = (
+            self._packet_terminal_diagnostics(pkt, delivered_to_gs)
+            if self.enable_packet_diagnostic_artifacts
+            else {}
+        )
         self.packet_outcomes.append(
             {
                 "packet_id": int(pkt["id"]),
@@ -2179,6 +2406,7 @@ class PacketEngine:
                 "remaining_bits_at_drop": pkt.get(
                     "sr_admission_remaining_bits"
                 ),
+                **diagnostics,
             }
         )
 
