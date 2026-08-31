@@ -76,7 +76,13 @@ def fov_physical_packet_size_bits(image_quantity):
 class BlockServiceCursor:
     """Consume one link's capacity profile in physical block/time order."""
 
-    def __init__(self, capacity_profile_mbps, slot_start_time):
+    def __init__(
+        self,
+        capacity_profile_mbps,
+        slot_start_time,
+        *,
+        track_actual_service_time=False,
+    ):
         profile = np.asarray(capacity_profile_mbps, dtype=np.float64)
         if profile.shape != (FADING_BLOCKS_PER_ROUTING_SLOT,):
             raise ValueError("link service profile must contain exactly 50 blocks")
@@ -88,6 +94,8 @@ class BlockServiceCursor:
         self.block_index = 0
         self.used_bits_in_block = 0.0
         self.total_consumed_bits = 0.0
+        self.track_actual_service_time = bool(track_actual_service_time)
+        self.last_consumed_service_seconds = 0.0
         self.total_budget_bits = float(
             np.sum(self.capacity_bps * FADING_BLOCK_SECONDS)
         )
@@ -125,6 +133,7 @@ class BlockServiceCursor:
     def consume(self, requested_bits):
         requested = max(float(requested_bits), 0.0)
         consumed = 0.0
+        actual_service_seconds = 0.0
         completion_time = self.current_time()
         while requested - consumed > PACKET_EPS:
             self._advance_empty_or_exhausted()
@@ -141,11 +150,14 @@ class BlockServiceCursor:
             self.used_bits_in_block += used
             consumed += used
             self.total_consumed_bits += used
+            if self.track_actual_service_time:
+                actual_service_seconds += used / capacity_bps
             completion_time = (
                 self.slot_start_time
                 + self.block_index * FADING_BLOCK_SECONDS
                 + self.used_bits_in_block / capacity_bps
             )
+        self.last_consumed_service_seconds = float(actual_service_seconds)
         return float(consumed), float(completion_time)
 
 
@@ -744,6 +756,9 @@ class PacketEngine:
                     "routing_wait_seconds": 0.0,
                     "locked_receiver_out_of_range_wait_slot_count": 0,
                     "locked_receiver_out_of_range_wait_seconds": 0.0,
+                    "current_hop_actual_tx_seconds": 0.0,
+                    "cumulative_actual_uav_tx_seconds": 0.0,
+                    "s2u_actual_tx_seconds": 0.0,
                 }
             )
         self.generated_packet_counts[task_type] += 1
@@ -969,7 +984,7 @@ class PacketEngine:
         sender,
         receiver,
         *,
-        physical_mask=None,
+        env=None,
         effective_mask=None,
     ):
         """Record one frozen-HOL decision without changing its selected action."""
@@ -993,17 +1008,21 @@ class PacketEngine:
         ) + float(self.step_time)
 
         locked_receiver = pkt.get("hop_receiver")
-        if locked_receiver is None or physical_mask is None or effective_mask is None:
+        if locked_receiver is None or env is None or effective_mask is None:
             return
         locked_receiver = int(locked_receiver)
-        physical = np.asarray(physical_mask, dtype=bool)
         effective = np.asarray(effective_mask, dtype=bool)
         expected_shape = (self.num_UAV + 1,)
-        if physical.shape != expected_shape or effective.shape != expected_shape:
+        if effective.shape != expected_shape:
             return
+        range_check = getattr(env, "is_routing_link_in_range", None)
+        if not callable(range_check):
+            raise RuntimeError(
+                "routing diagnostics require authoritative range predicate"
+            )
         forced_locked_wait = (
             0 <= locked_receiver < expected_shape[0]
-            and not bool(physical[locked_receiver])
+            and not bool(range_check(sender, locked_receiver))
             and bool(effective[sender])
             and int(np.count_nonzero(effective)) == 1
         )
@@ -1064,6 +1083,8 @@ class PacketEngine:
         pkt["hop_bits_sent"] = 0.0
         pkt["hop_service_start_time"] = None
         pkt["hop_queue_delay_s"] = 0.0
+        if self.enable_packet_diagnostic_artifacts:
+            pkt["current_hop_actual_tx_seconds"] = 0.0
         return {
             "packet": pkt,
             "receiver": receiver,
@@ -1204,13 +1225,13 @@ class PacketEngine:
                     continue
                 if is_expired(pkt):
                     expired_bits += max(float(pkt.get("rem_bits", 0.0)), 0.0)
-                    pkt["_queued_uav"] = None
                     event = self._mark_deadline_violation(
                         pkt,
                         current_time,
                         sender=uav_id,
                         remove_from_queue=False,
                     )
+                    pkt["_queued_uav"] = None
                     if event is not None:
                         violations.append(event)
                 else:
@@ -1233,7 +1254,6 @@ class PacketEngine:
                     continue
                 if is_expired(pkt):
                     expired_bits += max(float(pkt.get("rem_bits", 0.0)), 0.0)
-                    pkt["_queued_sr"] = None
                     if bool(pkt.get("qos_eligible", False)):
                         event = self._mark_deadline_violation(
                             pkt,
@@ -1246,6 +1266,7 @@ class PacketEngine:
                         self._mark_sr_admission_drop(
                             pkt, current_time, remove_from_queue=False
                         )
+                    pkt["_queued_sr"] = None
                 else:
                     kept.append(pkt)
             self.sr_queues[sr_id] = kept
@@ -1408,7 +1429,13 @@ class PacketEngine:
                 capacity_mbps,
                 block_capacity_profiles.get((sr_id, receiver)),
             )
-            cursor = BlockServiceCursor(profile, current_time)
+            cursor = BlockServiceCursor(
+                profile,
+                current_time,
+                track_actual_service_time=(
+                    self.enable_packet_diagnostic_artifacts
+                ),
+            )
             initial_budget = cursor.total_budget_bits
             transmitted = 0.0
             eligible_ids = {int(pkt["id"]) for pkt in self.sr_queues[sr_id]}
@@ -1441,6 +1468,10 @@ class PacketEngine:
                 bits_used, completion_time = cursor.consume(remaining_before)
                 if bits_used <= PACKET_EPS:
                     break
+                if self.enable_packet_diagnostic_artifacts:
+                    pkt["s2u_actual_tx_seconds"] = float(
+                        pkt.get("s2u_actual_tx_seconds", 0.0)
+                    ) + float(cursor.last_consumed_service_seconds)
                 pkt["rem_bits"] = max(remaining_before - bits_used, 0.0)
                 pkt["s2u_bits_sent"] = float(pkt.get("s2u_bits_sent", 0.0)) + bits_used
                 self.s2u_backlog_bits[sr_id] = max(
@@ -1468,6 +1499,9 @@ class PacketEngine:
                         "to": receiver,
                         "queue_s": queue_delay_s,
                         "tx_s": tx_elapsed_s,
+                        "actual_tx_s": float(
+                            pkt.get("s2u_actual_tx_seconds", 0.0)
+                        ),
                         "delay_ms": max(
                             completion_time - float(pkt["generation_time"]), 0.0
                         )
@@ -1586,15 +1620,8 @@ class PacketEngine:
             raise AssertionError(
                 "routing transition IDs must match frozen HOL senders"
             )
-        physical_masks = {}
         effective_masks = {}
         if self.enable_packet_diagnostic_artifacts:
-            physical_masks = {
-                int(sender): np.asarray(mask, dtype=bool)
-                for sender, mask in dict(
-                    start_of_slot_physical_masks_by_sender or {}
-                ).items()
-            }
             effective_masks = {
                 int(sender): np.asarray(mask, dtype=bool)
                 for sender, mask in dict(
@@ -1666,7 +1693,7 @@ class PacketEngine:
                     hol,
                     sender,
                     receiver,
-                    physical_mask=physical_masks.get(int(sender)),
+                    env=env,
                     effective_mask=effective_masks.get(int(sender)),
                 )
             hol["last_routing_sender"] = int(sender)
@@ -1697,7 +1724,13 @@ class PacketEngine:
             profile = self._block_service_profile(
                 capacity_mbps, block_capacity_profiles.get(link)
             )
-            cursor = BlockServiceCursor(profile, current_time)
+            cursor = BlockServiceCursor(
+                profile,
+                current_time,
+                track_actual_service_time=(
+                    self.enable_packet_diagnostic_artifacts
+                ),
+            )
             initial_budget = cursor.total_budget_bits
             transmitted_on_link = 0.0
 
@@ -1731,6 +1764,16 @@ class PacketEngine:
                 bits_used, completion_time = cursor.consume(remaining_before)
                 if bits_used <= PACKET_EPS:
                     break
+                if self.enable_packet_diagnostic_artifacts:
+                    actual_tx_seconds = float(
+                        cursor.last_consumed_service_seconds
+                    )
+                    pkt["current_hop_actual_tx_seconds"] = float(
+                        pkt.get("current_hop_actual_tx_seconds", 0.0)
+                    ) + actual_tx_seconds
+                    pkt["cumulative_actual_uav_tx_seconds"] = float(
+                        pkt.get("cumulative_actual_uav_tx_seconds", 0.0)
+                    ) + actual_tx_seconds
                 completed_hop = self.record_hop_transmission(
                     pkt, sender, receiver, bits_used
                 )
@@ -1757,6 +1800,9 @@ class PacketEngine:
                             "to": receiver,
                             "queue_s": queue_delay_s,
                             "tx_s": tx_elapsed_s,
+                            "actual_tx_s": float(
+                                pkt.get("current_hop_actual_tx_seconds", 0.0)
+                            ),
                             "delay_ms": total_hop_s * 1e3,
                         }
                     )
@@ -2212,8 +2258,55 @@ class PacketEngine:
         if 0 <= pi < len(self.packet_pool):
             self.packet_pool[pi] = None
 
+    @staticmethod
+    def _current_uav_terminal_queue_elapsed(pkt, terminal_time):
+        """Return elapsed queue time for an unfinished terminal UAV hop."""
+
+        active_uav_segment = (
+            pkt.get("_queued_uav") is not None
+            or pkt.get("hop_receiver") is not None
+        )
+        if not bool(pkt.get("routing_eligible", False)) or not active_uav_segment:
+            return 0.0
+        terminal_time = float(terminal_time)
+        queue_enter_time = float(pkt.get("queue_enter_time", terminal_time))
+        service_start_time = pkt.get("hop_service_start_time")
+        service_started = (
+            float(pkt.get("hop_bits_sent", 0.0)) > PACKET_EPS
+            and service_start_time is not None
+        )
+        queue_end_time = (
+            float(service_start_time) if service_started else terminal_time
+        )
+        return float(max(queue_end_time - queue_enter_time, 0.0))
+
+    @staticmethod
+    def _terminal_s2u_queue_elapsed(pkt, terminal_time, completed_s2u_hops):
+        """Return completed or terminal-incomplete S2U queue elapsed time."""
+
+        if str(pkt.get("source_kind", "UAV")) != "SR":
+            return None
+        if completed_s2u_hops:
+            return float(sum(hop["queue_s"] for hop in completed_s2u_hops))
+        if pkt.get("s2u_completion_time") is not None:
+            return float(max(pkt.get("s2u_queue_delay_s", 0.0), 0.0))
+        terminal_time = float(terminal_time)
+        generation_time = float(pkt.get("generation_time", terminal_time))
+        service_start_time = pkt.get("s2u_service_start_time")
+        service_started = (
+            float(pkt.get("s2u_bits_sent", 0.0)) > PACKET_EPS
+            and service_start_time is not None
+        )
+        queue_end_time = (
+            float(service_start_time) if service_started else terminal_time
+        )
+        return float(max(queue_end_time - generation_time, 0.0))
+
     def _packet_terminal_diagnostics(self, pkt, delivered_to_gs):
         source_kind = str(pkt.get("source_kind", "UAV"))
+        terminal_time = float(
+            pkt.get("finish_time", pkt.get("generation_time", 0.0))
+        )
         raw_path = list(pkt.get("path") or [])
         uav_nodes = []
         for index, node in enumerate(raw_path):
@@ -2250,6 +2343,7 @@ class PacketEngine:
                 "link_type": str(link_type),
                 "queue_s": float(hop.get("queue_s", 0.0)),
                 "tx_s": float(hop.get("tx_s", 0.0)),
+                "actual_tx_s": float(hop.get("actual_tx_s", 0.0)),
             }
             diagnostic_hops.append(compact_hop)
             if compact_hop["link_type"] == "S2U":
@@ -2283,6 +2377,12 @@ class PacketEngine:
         s2u_completion_time = pkt.get("s2u_completion_time")
         routing_eligible_time = pkt.get("routing_eligible_time")
         locked_receiver = pkt.get("hop_receiver")
+        terminal_uav_queue_elapsed = self._current_uav_terminal_queue_elapsed(
+            pkt, terminal_time
+        )
+        s2u_queue_elapsed = self._terminal_s2u_queue_elapsed(
+            pkt, terminal_time, s2u_hops
+        )
         return {
             "s2u_completed": (
                 bool(s2u_completion_time is not None) if s2u_applicable else None
@@ -2326,18 +2426,15 @@ class PacketEngine:
             ),
             "cumulative_uav_queue_delay_seconds": float(
                 sum(hop["queue_s"] for hop in completed_uav_hops)
+                + terminal_uav_queue_elapsed
             ),
             "cumulative_uav_tx_delay_seconds": float(
-                sum(hop["tx_s"] for hop in completed_uav_hops)
+                pkt.get("cumulative_actual_uav_tx_seconds", 0.0)
             ),
-            "s2u_queue_delay_seconds": (
-                float(sum(hop["queue_s"] for hop in s2u_hops))
-                if s2u_applicable and s2u_hops
-                else None
-            ),
+            "s2u_queue_delay_seconds": s2u_queue_elapsed,
             "s2u_tx_delay_seconds": (
-                float(sum(hop["tx_s"] for hop in s2u_hops))
-                if s2u_applicable and s2u_hops
+                float(pkt.get("s2u_actual_tx_seconds", 0.0))
+                if s2u_applicable
                 else None
             ),
         }
@@ -2546,7 +2643,6 @@ class PacketEngine:
                     continue
                 if int(pkt.get("hops", 0)) >= MAX_PACKET_HOPS:
                     dropped_bits += max(float(pkt.get("rem_bits", 0.0)), 0.0)
-                    pkt["_queued_uav"] = None
                     event = self._mark_deadline_violation(
                         pkt,
                         current_time,
@@ -2554,6 +2650,7 @@ class PacketEngine:
                         reason="max_hops",
                         remove_from_queue=False,
                     )
+                    pkt["_queued_uav"] = None
                     if event is not None:
                         violations.append(event)
                 else:

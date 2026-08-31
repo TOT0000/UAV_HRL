@@ -262,7 +262,10 @@ class HardRangeAndComSessionContractTest(unittest.TestCase):
         env.uav_dict[0].x_u, env.uav_dict[0].y_u, env.uav_dict[0].z_u = (0.0, 0.0, 100.0)
         env.uav_dict[1].x_u, env.uav_dict[1].y_u, env.uav_dict[1].z_u = (100.0, 0.0, 100.0)
         env.update_u2u_channels()
-        engine = PacketEngine(num_uav=10)
+        engine = PacketEngine(
+            num_uav=10,
+            enable_packet_diagnostic_artifacts=True,
+        )
         pkt = engine.create_packet(0, "COM", 1_000.0, 0.0)
         pkt["hop_service_start_time"] = 0.0
         engine.record_hop_transmission(pkt, 0, 1, 400.0)
@@ -275,6 +278,16 @@ class HardRangeAndComSessionContractTest(unittest.TestCase):
             env, 0, env.get_routing_action_mask(0).astype(bool)
         )
         self.assertEqual(set(np.flatnonzero(effective)), {0})
+        engine.serve_active_links(
+            env,
+            {0: 0},
+            {},
+            current_time=0.0,
+            start_of_slot_effective_masks_by_sender={0: effective},
+        )
+        self.assertEqual(
+            pkt["locked_receiver_out_of_range_wait_slot_count"], 1
+        )
         capacities, bandwidths = env.allocate_active_link_capacities({0: 1})
         self.assertEqual(capacities, {})
         self.assertEqual(bandwidths, {})
@@ -283,12 +296,27 @@ class HardRangeAndComSessionContractTest(unittest.TestCase):
 
         env.uav_dict[1].x_u = 400.0
         env.update_u2u_channels()
+        capacity_unavailable = np.zeros(env.num_UAV + 1, dtype=bool)
+        capacity_unavailable[0] = True
+        effective = engine.get_effective_action_mask(
+            env, 0, capacity_unavailable
+        )
+        engine.serve_active_links(
+            env,
+            {0: 0},
+            {},
+            current_time=0.25,
+            start_of_slot_effective_masks_by_sender={0: effective},
+        )
+        self.assertEqual(
+            pkt["locked_receiver_out_of_range_wait_slot_count"], 1
+        )
         capacities, _ = env.allocate_active_link_capacities({0: 1})
         engine.serve_active_links(
             env,
             {0: 1},
             capacities,
-            current_time=0.25,
+            current_time=0.5,
             block_capacity_profiles=env.active_link_capacity_profiles_mbps,
         )
         self.assertEqual(pkt["path"][-1], 1)

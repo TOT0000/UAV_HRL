@@ -8,7 +8,7 @@ from unittest import mock
 
 import numpy as np
 
-from Packet_scheduler_v1 import PacketEngine
+from Packet_scheduler_v1 import BlockServiceCursor, PacketEngine
 from paper_evaluation import run_paper_evaluation
 from packet_outcome_artifacts import (
     PACKET_OUTCOME_ARTIFACT_SCHEMA_VERSION,
@@ -19,8 +19,13 @@ from packet_outcome_artifacts import (
 )
 
 
-def routing_env(num_uav=3):
-    return SimpleNamespace(GS_ID=num_uav)
+def routing_env(num_uav=3, *, routing_link_in_range=True):
+    return SimpleNamespace(
+        GS_ID=num_uav,
+        is_routing_link_in_range=mock.Mock(
+            return_value=bool(routing_link_in_range)
+        ),
+    )
 
 
 def action_mask(num_uav, *enabled):
@@ -35,6 +40,23 @@ def diagnostic_engine(num_uav=3):
         step_time=0.25,
         enable_packet_diagnostic_artifacts=True,
     )
+
+
+class PacketActualServiceTimeTest(unittest.TestCase):
+    def test_cursor_actual_airtime_excludes_zero_capacity_block_gap(self):
+        profile = np.zeros(50, dtype=float)
+        profile[10] = 1.0
+        cursor = BlockServiceCursor(
+            profile,
+            slot_start_time=0.0,
+            track_actual_service_time=True,
+        )
+
+        consumed, completion_time = cursor.consume(1_000.0)
+
+        self.assertAlmostEqual(consumed, 1_000.0)
+        self.assertAlmostEqual(cursor.last_consumed_service_seconds, 0.001)
+        self.assertAlmostEqual(completion_time, 0.051)
 
 
 class PacketRoutingDecisionDiagnosticTest(unittest.TestCase):
@@ -93,7 +115,7 @@ class PacketRoutingDecisionDiagnosticTest(unittest.TestCase):
         self.assertEqual(engine.wait_actions, 1)
 
     def test_out_of_range_locked_receiver_is_a_forced_wait(self):
-        env = routing_env()
+        env = routing_env(routing_link_in_range=False)
         engine = diagnostic_engine()
         packet = engine.create_packet(0, "FOV", 100.0, 0.0)
         self.assertFalse(engine.record_hop_transmission(packet, 0, 1, 40.0))
@@ -116,14 +138,15 @@ class PacketRoutingDecisionDiagnosticTest(unittest.TestCase):
         self.assertAlmostEqual(
             packet["locked_receiver_out_of_range_wait_seconds"], 0.25
         )
+        env.is_routing_link_in_range.assert_called_once_with(0, 1)
 
-    def test_in_range_locked_receiver_wait_is_not_forced(self):
-        env = routing_env()
+    def test_in_range_but_capacity_unavailable_lock_is_not_out_of_range(self):
+        env = routing_env(routing_link_in_range=True)
         engine = diagnostic_engine()
         packet = engine.create_packet(0, "FOV", 100.0, 0.0)
         self.assertFalse(engine.record_hop_transmission(packet, 0, 1, 40.0))
-        physical = action_mask(3, 0, 1)
-        effective = action_mask(3, 0, 1)
+        physical = action_mask(3, 0)
+        effective = action_mask(3, 0)
 
         engine.serve_active_links(
             env,
@@ -138,6 +161,7 @@ class PacketRoutingDecisionDiagnosticTest(unittest.TestCase):
         self.assertEqual(
             packet["locked_receiver_out_of_range_wait_slot_count"], 0
         )
+        env.is_routing_link_in_range.assert_called_once_with(0, 1)
 
 
 class PacketTerminalDiagnosticTest(unittest.TestCase):
@@ -202,6 +226,8 @@ class PacketTerminalDiagnosticTest(unittest.TestCase):
         self.assertEqual(delivered_outcome["terminal_node_type"], "GS")
         self.assertIsNone(delivered_outcome["s2u_completed"])
         self.assertIsNone(delivered_outcome["s2u_completion_time_seconds"])
+        self.assertIsNone(delivered_outcome["s2u_queue_delay_seconds"])
+        self.assertIsNone(delivered_outcome["s2u_tx_delay_seconds"])
 
     def test_completed_s2u_at_deadline_uses_path_receiver_as_terminal_uav(self):
         engine = diagnostic_engine()
@@ -233,6 +259,100 @@ class PacketTerminalDiagnosticTest(unittest.TestCase):
         self.assertEqual(outcome["terminal_node_type"], "UAV")
         self.assertEqual(outcome["terminal_uav_id"], 0)
         self.assertEqual(outcome["locked_hop_receiver_at_terminal"], 1)
+
+    def test_uav_queue_expiry_before_service_includes_terminal_wait(self):
+        engine = diagnostic_engine()
+        packet = engine.create_packet(0, "FOV", 100.0, 0.0)
+        packet["deadline_abs"] = 0.5
+
+        engine.expire_packets(0.5)
+
+        outcome = engine.packet_outcomes[0]
+        self.assertAlmostEqual(
+            outcome["cumulative_uav_queue_delay_seconds"], 0.5
+        )
+        self.assertAlmostEqual(outcome["cumulative_uav_tx_delay_seconds"], 0.0)
+
+    def test_partial_uav_transmission_records_actual_airtime_before_expiry(self):
+        env = routing_env()
+        engine = diagnostic_engine()
+        packet = engine.create_packet(0, "FOV", 1_000_000.0, 0.0)
+        packet["deadline_abs"] = 0.5
+        mask = action_mask(3, 0, 1)
+
+        engine.serve_active_links(
+            env,
+            actions={0: 1},
+            capacities={(0, 1): 1.0},
+            current_time=0.0,
+            start_of_slot_physical_masks_by_sender={0: mask},
+            start_of_slot_effective_masks_by_sender={0: mask},
+        )
+        engine.expire_packets(0.5)
+
+        outcome = engine.packet_outcomes[0]
+        self.assertEqual(outcome["completed_uav_hop_count"], 0)
+        self.assertAlmostEqual(outcome["cumulative_uav_tx_delay_seconds"], 0.25)
+        self.assertAlmostEqual(
+            outcome["cumulative_uav_queue_delay_seconds"], 0.0
+        )
+
+    def test_completed_hop_plus_current_queue_is_added_without_double_count(self):
+        env = routing_env()
+        engine = diagnostic_engine()
+        packet = engine.create_packet(0, "FOV", 100.0, 0.0)
+        packet["deadline_abs"] = 0.75
+        mask = action_mask(3, 0, 1)
+
+        engine.serve_active_links(
+            env,
+            actions={0: 1},
+            capacities={(0, 1): 0.0004},
+            current_time=0.2,
+            start_of_slot_physical_masks_by_sender={0: mask},
+            start_of_slot_effective_masks_by_sender={0: mask},
+        )
+        engine.expire_packets(0.75)
+
+        outcome = engine.packet_outcomes[0]
+        self.assertEqual(outcome["completed_uav_hop_count"], 1)
+        self.assertAlmostEqual(outcome["per_hop"][0]["queue_s"], 0.2)
+        self.assertAlmostEqual(outcome["per_hop"][0]["actual_tx_s"], 0.25)
+        self.assertAlmostEqual(
+            outcome["cumulative_uav_queue_delay_seconds"], 0.5
+        )
+        self.assertAlmostEqual(outcome["cumulative_uav_tx_delay_seconds"], 0.25)
+
+    def test_pre_s2u_queue_expiry_reports_elapsed_wait_and_zero_airtime(self):
+        engine = diagnostic_engine()
+        packet = engine.create_sr_packet(4, 100.0, 0.0)
+        packet["deadline_abs"] = 0.5
+
+        engine.expire_packets(0.5)
+
+        outcome = engine.packet_outcomes[0]
+        self.assertFalse(outcome["s2u_completed"])
+        self.assertAlmostEqual(outcome["s2u_queue_delay_seconds"], 0.5)
+        self.assertAlmostEqual(outcome["s2u_tx_delay_seconds"], 0.0)
+
+    def test_partial_s2u_transmission_reports_queue_and_actual_airtime(self):
+        env = routing_env()
+        engine = diagnostic_engine()
+        packet = engine.create_sr_packet(5, 1_000_000.0, 0.0)
+        packet["s2u_receiver"] = 0
+        packet["deadline_abs"] = 0.75
+
+        engine.serve_s2u_links(
+            env,
+            capacities={(5, 0): 1.0},
+            current_time=0.2,
+        )
+        engine.expire_packets(0.75)
+
+        outcome = engine.packet_outcomes[0]
+        self.assertFalse(outcome["s2u_completed"])
+        self.assertAlmostEqual(outcome["s2u_queue_delay_seconds"], 0.2)
+        self.assertAlmostEqual(outcome["s2u_tx_delay_seconds"], 0.25)
 
     def test_disabled_diagnostics_do_not_expand_terminal_outcome(self):
         engine = PacketEngine(num_uav=3, step_time=0.25)
@@ -292,7 +412,7 @@ class PacketRoutingAggregateTest(unittest.TestCase):
         )
         self.assertEqual(
             record["artifact_schema_version"],
-            "uav-hrl-packet-outcomes-jsonl-v4",
+            "uav-hrl-packet-outcomes-jsonl-v5",
         )
         self.assertEqual(
             record["artifact_schema_version"],
@@ -317,6 +437,59 @@ class PacketRoutingAggregateTest(unittest.TestCase):
         self.assertEqual(fov["violations_with_forced_locked_wait"], 1)
         self.assertEqual(all_packets["eligible_packets"], 3)
         self.assertEqual(all_packets["violated_packets"], 3)
+
+    def test_loop_mean_hops_excludes_s2u_and_terminal_partial_hop(self):
+        engine = diagnostic_engine()
+        packet = engine.create_sr_packet(0, 100.0, 0.0)
+        self.assertTrue(engine._remove_from_sr_queue(packet))
+        packet.update(
+            {
+                "s2u_completion_time": 0.1,
+                "routing_eligible": True,
+                "routing_eligible_time": 0.25,
+                "path": ["SR:0", 1, 2, 1],
+                "current": 1,
+                "hops": 2,
+                "deadline_abs": 0.5,
+                "rem_bits": packet["size_bits"],
+                "s2u_actual_tx_seconds": 0.05,
+                "cumulative_actual_uav_tx_seconds": 0.2,
+                "per_hop": [
+                    {
+                        "from": "SR:0",
+                        "to": 1,
+                        "queue_s": 0.05,
+                        "tx_s": 0.05,
+                        "actual_tx_s": 0.05,
+                        "link_type": "S2U",
+                    },
+                    {
+                        "from": 1,
+                        "to": 2,
+                        "queue_s": 0.1,
+                        "tx_s": 0.1,
+                        "actual_tx_s": 0.1,
+                    },
+                    {
+                        "from": 2,
+                        "to": 1,
+                        "queue_s": 0.1,
+                        "tx_s": 0.1,
+                        "actual_tx_s": 0.1,
+                    },
+                ],
+            }
+        )
+        engine.enqueue_packet(packet, 1, 0.4)
+        engine.expire_packets(0.5)
+
+        outcome = engine.packet_outcomes[0]
+        diagnostics = packet_routing_diagnostics_from_outcomes([outcome])
+        self.assertEqual(outcome["path_hop_count"], 3)
+        self.assertEqual(outcome["completed_uav_hop_count"], 2)
+        self.assertEqual(
+            diagnostics["groups"]["COM"]["mean_hops_loop_packets"], 2.0
+        )
 
     def test_writes_json_csv_and_terminal_distribution(self):
         diagnostics = packet_routing_diagnostics_from_outcomes(
@@ -352,41 +525,31 @@ class PacketRoutingAggregateTest(unittest.TestCase):
 
 class PacketRoutingNoBehaviorChangeTest(unittest.TestCase):
     @staticmethod
-    def _run_two_slot_scenario(*, disable_packet_counters):
+    def _run_two_slot_scenario(*, diagnostics_enabled):
         env = routing_env()
-        engine = diagnostic_engine()
+        engine = PacketEngine(
+            num_uav=3,
+            step_time=0.25,
+            enable_packet_diagnostic_artifacts=diagnostics_enabled,
+        )
         packet = engine.create_packet(0, "FOV", 100.0, 0.0)
         mask = action_mask(3, 0, env.GS_ID)
-        context = (
-            mock.patch.object(
-                engine,
-                "_record_routing_decision_diagnostics",
-                return_value=None,
-            )
-            if disable_packet_counters
-            else mock.patch.object(
-                engine,
-                "_record_routing_decision_diagnostics",
-                wraps=engine._record_routing_decision_diagnostics,
-            )
+        first = engine.serve_active_links(
+            env,
+            actions={0: 0},
+            capacities={},
+            current_time=0.0,
+            start_of_slot_physical_masks_by_sender={0: mask},
+            start_of_slot_effective_masks_by_sender={0: mask},
         )
-        with context:
-            first = engine.serve_active_links(
-                env,
-                actions={0: 0},
-                capacities={},
-                current_time=0.0,
-                start_of_slot_physical_masks_by_sender={0: mask},
-                start_of_slot_effective_masks_by_sender={0: mask},
-            )
-            second = engine.serve_active_links(
-                env,
-                actions={0: env.GS_ID},
-                capacities={(0, env.GS_ID): 0.0004},
-                current_time=0.25,
-                start_of_slot_physical_masks_by_sender={0: mask},
-                start_of_slot_effective_masks_by_sender={0: mask},
-            )
+        second = engine.serve_active_links(
+            env,
+            actions={0: env.GS_ID},
+            capacities={(0, env.GS_ID): 0.0004},
+            current_time=0.25,
+            start_of_slot_physical_masks_by_sender={0: mask},
+            start_of_slot_effective_masks_by_sender={0: mask},
+        )
         core_packet = {
             key: packet.get(key)
             for key in (
@@ -413,16 +576,35 @@ class PacketRoutingNoBehaviorChangeTest(unittest.TestCase):
             "second_transmitted": dict(second["transmitted_bits_by_link"]),
             "second_goodput": second["timely_goodput_bits"],
         }
-        return core_packet, core_engine, core_results
+        terminal = engine.packet_outcomes[0]
+        core_terminal = {
+            key: terminal[key]
+            for key in (
+                "packet_id",
+                "source_uav_id",
+                "source_sr_id",
+                "source_kind",
+                "task_type",
+                "outcome",
+                "generation_time_seconds",
+                "finish_time_seconds",
+                "deadline_seconds",
+                "e2e_delay_seconds",
+                "size_bits",
+                "delivered_to_gs",
+                "qos_eligible",
+            )
+        }
+        return core_packet, core_engine, core_results, core_terminal
 
-    def test_packet_counters_do_not_change_service_outcomes(self):
-        without_counters = self._run_two_slot_scenario(
-            disable_packet_counters=True
+    def test_diagnostics_do_not_change_service_or_core_terminal_outcomes(self):
+        without_diagnostics = self._run_two_slot_scenario(
+            diagnostics_enabled=False
         )
-        with_counters = self._run_two_slot_scenario(
-            disable_packet_counters=False
+        with_diagnostics = self._run_two_slot_scenario(
+            diagnostics_enabled=True
         )
-        self.assertEqual(with_counters, without_counters)
+        self.assertEqual(with_diagnostics, without_diagnostics)
 
 
 class PacketRoutingPaperEvaluationIntegrationTest(unittest.TestCase):

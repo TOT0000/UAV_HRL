@@ -8,9 +8,9 @@ import math
 from pathlib import Path
 
 
-PACKET_OUTCOME_ARTIFACT_SCHEMA_VERSION = "uav-hrl-packet-outcomes-jsonl-v4"
+PACKET_OUTCOME_ARTIFACT_SCHEMA_VERSION = "uav-hrl-packet-outcomes-jsonl-v5"
 PACKET_ROUTING_DIAGNOSTIC_CONTRACT_VERSION = (
-    "uav-hrl-packet-routing-diagnostics-v1"
+    "uav-hrl-packet-routing-diagnostics-v2"
 )
 PACKET_ROUTING_DIAGNOSTIC_DEFINITIONS = {
     "routing_wait_definition": (
@@ -20,10 +20,12 @@ PACKET_ROUTING_DIAGNOSTIC_DEFINITIONS = {
         "== sender, and routing_wait_seconds adds the authoritative slot duration"
     ),
     "forced_locked_wait_definition": (
-        "a routing-eligible frozen HOL packet had a locked hop_receiver absent "
-        "from the physical mask, its effective mask contained only sender/Wait, "
-        "and the selected action was Wait; aggregate fraction uses all routing "
-        "decision slots as its denominator"
+        "a routing-eligible frozen HOL packet selected Wait, had a locked "
+        "hop_receiver outside the authoritative inclusive 400 m 3-D routing "
+        "range according to env.is_routing_link_in_range, and its effective "
+        "mask contained only sender/Wait; capacity unavailability while in "
+        "range is excluded; aggregate fraction uses all routing decision slots "
+        "as its denominator"
     ),
     "loop_definition": (
         "at least one UAV ID occurs more than once in path; the SR source entry "
@@ -33,6 +35,30 @@ PACKET_ROUTING_DIAGNOSTIC_DEFINITIONS = {
     "terminal_node_definition": (
         "an unfinished partial hop remains at its sender UAV; pre-S2U packets "
         "remain at SR; completed delivery terminates at GS"
+    ),
+    "uav_queue_delay_definition": (
+        "sum of queue_s for completed U2U/U2G hops plus elapsed queue waiting "
+        "for an unfinished terminal UAV hop; current queue waiting ends at the "
+        "first actual service start, or at terminal finish_time if service has "
+        "not started"
+    ),
+    "uav_tx_delay_definition": (
+        "actual U2U/U2G transmission airtime accumulated as bits consumed "
+        "divided by each positive instantaneous block capacity, including a "
+        "terminal partial hop and excluding Wait, zero-capacity blocks, and "
+        "wall-clock gaps; per_hop.tx_s remains the legacy service span while "
+        "per_hop.actual_tx_s is actual airtime"
+    ),
+    "s2u_delay_definition": (
+        "for COM, S2U queue delay ends at first actual S2U service or terminal "
+        "finish_time if service never starts, and S2U tx delay is actual "
+        "positive-capacity block airtime including incomplete S2U service; both "
+        "fields are null for FOV"
+    ),
+    "loop_hop_statistic_definition": (
+        "mean_hops_loop_packets and mean_hops_non_loop_packets use completed "
+        "UAV-side U2U plus U2G hops only; S2U and terminal partial hops are "
+        "excluded"
     ),
 }
 PACKET_OUTCOME_MODE_DISABLED = "disabled"
@@ -128,6 +154,10 @@ def validate_packet_outcome(row):
             raise ValueError("SR packet source fields are inconsistent")
         if type(row["s2u_completed"]) is not bool:
             raise ValueError("SR packet s2u_completed must be boolean")
+        if row["s2u_queue_delay_seconds"] is None:
+            raise ValueError("SR packet S2U queue delay must be numeric")
+        if row["s2u_tx_delay_seconds"] is None:
+            raise ValueError("SR packet S2U transmission delay must be numeric")
     else:
         if row["source_sr_id"] is not None or not isinstance(
             row["source_uav_id"], int
@@ -192,9 +222,14 @@ def validate_packet_outcome(row):
     for hop in row["per_hop"]:
         if not isinstance(hop, dict):
             raise ValueError("per_hop entries must be dictionaries")
-        missing_hop_fields = {"from", "to", "link_type", "queue_s", "tx_s"}.difference(
-            hop
-        )
+        missing_hop_fields = {
+            "from",
+            "to",
+            "link_type",
+            "queue_s",
+            "tx_s",
+            "actual_tx_s",
+        }.difference(hop)
         if missing_hop_fields:
             raise ValueError(
                 "per_hop entry lacks required fields: "
@@ -204,6 +239,7 @@ def validate_packet_outcome(row):
             raise ValueError("per_hop link_type is invalid")
         _validate_nonnegative_number(hop, "queue_s")
         _validate_nonnegative_number(hop, "tx_s")
+        _validate_nonnegative_number(hop, "actual_tx_s")
     count_fields = (
         "path_hop_count",
         "completed_uav_hop_count",
@@ -360,10 +396,12 @@ class PacketRoutingDiagnosticAccumulator:
                 distribution[terminal_uav] = distribution.get(terminal_uav, 0) + 1
         if row["has_repeated_uav"]:
             group["loop_packet_count"] += 1
-            group["loop_hop_sum"] += float(row["path_hop_count"])
+            group["loop_hop_sum"] += float(row["completed_uav_hop_count"])
         else:
             group["non_loop_packet_count"] += 1
-            group["non_loop_hop_sum"] += float(row["path_hop_count"])
+            group["non_loop_hop_sum"] += float(
+                row["completed_uav_hop_count"]
+            )
         decision_slots = int(row["routing_decision_slot_count"])
         wait_slots = int(row["routing_wait_slot_count"])
         forced_slots = int(
