@@ -15,16 +15,25 @@ from packet_outcome_artifacts import (
     PACKET_ROUTING_DIAGNOSTIC_CONTRACT_VERSION,
     packet_outcome_episode_record,
     packet_routing_diagnostics_from_outcomes,
+    validate_packet_outcome,
     write_packet_routing_diagnostic_artifacts,
 )
 
 
-def routing_env(num_uav=3, *, routing_link_in_range=True):
+def routing_env(
+    num_uav=3,
+    *,
+    routing_link_in_range=True,
+    s2u_in_range=True,
+    multi_tasks=None,
+):
     return SimpleNamespace(
         GS_ID=num_uav,
+        multi_tasks=dict(multi_tasks or {}),
         is_routing_link_in_range=mock.Mock(
             return_value=bool(routing_link_in_range)
         ),
+        is_s2u_in_range=mock.Mock(return_value=bool(s2u_in_range)),
     )
 
 
@@ -106,6 +115,12 @@ class PacketRoutingDecisionDiagnosticTest(unittest.TestCase):
 
         self.assertEqual(hol["routing_decision_slot_count"], 1)
         self.assertEqual(hol["routing_wait_slot_count"], 1)
+        self.assertEqual(
+            hol["routing_voluntary_wait_with_legal_nonwait_slot_count"], 1
+        )
+        self.assertEqual(
+            hol["routing_only_wait_no_available_link_slot_count"], 0
+        )
         self.assertAlmostEqual(hol["routing_wait_seconds"], 0.25)
         self.assertEqual(
             hol["locked_receiver_out_of_range_wait_slot_count"], 0
@@ -113,6 +128,28 @@ class PacketRoutingDecisionDiagnosticTest(unittest.TestCase):
         self.assertEqual(queued["routing_decision_slot_count"], 0)
         self.assertEqual(queued["routing_wait_slot_count"], 0)
         self.assertEqual(engine.wait_actions, 1)
+
+    def test_only_wait_counts_when_effective_mask_has_no_nonwait_action(self):
+        env = routing_env()
+        engine = diagnostic_engine()
+        packet = engine.create_packet(0, "FOV", 100.0, 0.0)
+        effective = action_mask(3, 0)
+
+        engine.serve_active_links(
+            env,
+            actions={0: 0},
+            capacities={},
+            current_time=0.0,
+            start_of_slot_effective_masks_by_sender={0: effective},
+        )
+
+        self.assertEqual(packet["routing_wait_slot_count"], 1)
+        self.assertEqual(
+            packet["routing_voluntary_wait_with_legal_nonwait_slot_count"], 0
+        )
+        self.assertEqual(
+            packet["routing_only_wait_no_available_link_slot_count"], 1
+        )
 
     def test_out_of_range_locked_receiver_is_a_forced_wait(self):
         env = routing_env(routing_link_in_range=False)
@@ -132,6 +169,9 @@ class PacketRoutingDecisionDiagnosticTest(unittest.TestCase):
         )
 
         self.assertEqual(packet["routing_wait_slot_count"], 1)
+        self.assertEqual(
+            packet["routing_only_wait_no_available_link_slot_count"], 1
+        )
         self.assertEqual(
             packet["locked_receiver_out_of_range_wait_slot_count"], 1
         )
@@ -159,9 +199,181 @@ class PacketRoutingDecisionDiagnosticTest(unittest.TestCase):
 
         self.assertEqual(packet["routing_wait_slot_count"], 1)
         self.assertEqual(
+            packet["routing_only_wait_no_available_link_slot_count"], 1
+        )
+        self.assertEqual(
             packet["locked_receiver_out_of_range_wait_slot_count"], 0
         )
         env.is_routing_link_in_range.assert_called_once_with(0, 1)
+
+    def test_nonwait_action_increments_no_wait_counter(self):
+        env = routing_env()
+        engine = diagnostic_engine()
+        packet = engine.create_packet(0, "FOV", 1_000_000.0, 0.0)
+        mask = action_mask(3, 0, 1)
+
+        engine.serve_active_links(
+            env,
+            actions={0: 1},
+            capacities={(0, 1): 1.0},
+            current_time=0.0,
+            start_of_slot_effective_masks_by_sender={0: mask},
+        )
+
+        self.assertEqual(packet["routing_wait_slot_count"], 0)
+        self.assertEqual(
+            packet["routing_voluntary_wait_with_legal_nonwait_slot_count"], 0
+        )
+        self.assertEqual(
+            packet["routing_only_wait_no_available_link_slot_count"], 0
+        )
+
+
+class PacketS2uHolDiagnosticTest(unittest.TestCase):
+    def test_non_hol_packet_expires_without_hol_opportunity(self):
+        engine = diagnostic_engine()
+        first = engine.create_sr_packet(0, 100.0, 0.0)
+        second = engine.create_sr_packet(0, 100.0, 0.0)
+        first["deadline_abs"] = 1.0
+        second["deadline_abs"] = 0.5
+
+        engine.expire_packets(0.5)
+
+        outcome = engine.packet_outcomes[0]
+        self.assertEqual(outcome["packet_id"], second["id"])
+        self.assertEqual(outcome["s2u_hol_opportunity_slot_count"], 0)
+        diagnostics = packet_routing_diagnostics_from_outcomes([outcome])
+        com = diagnostics["groups"]["COM"]
+        self.assertEqual(
+            com["pre_s2u_violation_never_became_hol_count"], 1
+        )
+
+    def test_hol_without_receiver_has_exact_reason(self):
+        env = routing_env()
+        engine = diagnostic_engine()
+        packet = engine.create_sr_packet(0, 100.0, 0.0)
+
+        engine.serve_s2u_links(
+            env,
+            capacities={},
+            current_time=0.0,
+            resolved_active_links={},
+        )
+
+        self.assertEqual(packet["s2u_hol_opportunity_slot_count"], 1)
+        self.assertEqual(packet["s2u_hol_no_receiver_slot_count"], 1)
+        self.assertEqual(packet["s2u_hol_service_slot_count"], 0)
+
+    def test_hol_receiver_out_of_range_has_exact_reason(self):
+        env = routing_env(s2u_in_range=False)
+        engine = diagnostic_engine()
+        packet = engine.create_sr_packet(0, 100.0, 0.0)
+        packet["s2u_receiver"] = 0
+
+        engine.serve_s2u_links(
+            env,
+            capacities={},
+            current_time=0.0,
+            resolved_active_links={},
+        )
+
+        self.assertEqual(packet["s2u_hol_opportunity_slot_count"], 1)
+        self.assertEqual(
+            packet["s2u_hol_receiver_out_of_range_slot_count"], 1
+        )
+        self.assertEqual(packet["s2u_hol_service_slot_count"], 0)
+
+    def test_in_range_hol_without_resolved_active_link_has_exact_reason(self):
+        env = routing_env()
+        engine = diagnostic_engine()
+        packet = engine.create_sr_packet(0, 100.0, 0.0)
+        packet["s2u_receiver"] = 0
+
+        engine.serve_s2u_links(
+            env,
+            capacities={},
+            current_time=0.0,
+            resolved_active_links={},
+        )
+
+        self.assertEqual(packet["s2u_hol_no_active_link_slot_count"], 1)
+
+    def test_active_link_with_zero_capacity_has_exact_reason(self):
+        env = routing_env()
+        engine = diagnostic_engine()
+        packet = engine.create_sr_packet(0, 100.0, 0.0)
+        packet["s2u_receiver"] = 0
+
+        engine.serve_s2u_links(
+            env,
+            capacities={(0, 0): 0.0},
+            current_time=0.0,
+            resolved_active_links={0: 0},
+        )
+
+        self.assertEqual(packet["s2u_hol_no_positive_capacity_slot_count"], 1)
+
+    def test_positive_capacity_and_actual_service_counts_service_only(self):
+        env = routing_env()
+        engine = diagnostic_engine()
+        packet = engine.create_sr_packet(0, 1_000_000.0, 0.0)
+        packet["s2u_receiver"] = 0
+
+        engine.serve_s2u_links(
+            env,
+            capacities={(0, 0): 1.0},
+            current_time=0.0,
+            resolved_active_links={0: 0},
+        )
+
+        self.assertEqual(packet["s2u_hol_opportunity_slot_count"], 1)
+        self.assertEqual(packet["s2u_hol_service_slot_count"], 1)
+        no_service = sum(
+            packet[field]
+            for field in (
+                "s2u_hol_no_receiver_slot_count",
+                "s2u_hol_receiver_out_of_range_slot_count",
+                "s2u_hol_no_active_link_slot_count",
+                "s2u_hol_no_positive_capacity_slot_count",
+                "s2u_hol_positive_capacity_but_no_service_slot_count",
+            )
+        )
+        self.assertEqual(no_service, 0)
+
+    def test_hol_never_started_and_partial_service_terminal_groups(self):
+        never_engine = diagnostic_engine()
+        never = never_engine.create_sr_packet(0, 100.0, 0.0)
+        never["s2u_receiver"] = 0
+        never["deadline_abs"] = 0.5
+        never_engine.serve_s2u_links(
+            routing_env(s2u_in_range=False),
+            capacities={},
+            current_time=0.0,
+            resolved_active_links={},
+        )
+        never_engine.expire_packets(0.5)
+
+        partial_engine = diagnostic_engine()
+        partial = partial_engine.create_sr_packet(1, 1_000_000.0, 0.0)
+        partial["s2u_receiver"] = 0
+        partial["deadline_abs"] = 0.5
+        partial_engine.serve_s2u_links(
+            routing_env(),
+            capacities={(1, 0): 1.0},
+            current_time=0.0,
+            resolved_active_links={1: 0},
+        )
+        partial_engine.expire_packets(0.5)
+
+        diagnostics = packet_routing_diagnostics_from_outcomes(
+            never_engine.packet_outcomes + partial_engine.packet_outcomes
+        )
+        com = diagnostics["groups"]["COM"]
+        self.assertEqual(
+            com["pre_s2u_violation_became_hol_never_started_count"], 1
+        )
+        self.assertEqual(com["pre_s2u_violation_partial_service_count"], 1)
+        self.assertEqual(com["pre_s2u_violation_count"], 2)
 
 
 class PacketTerminalDiagnosticTest(unittest.TestCase):
@@ -393,6 +605,8 @@ class PacketRoutingAggregateTest(unittest.TestCase):
         fov["deadline_abs"] = 0.5
         fov["routing_decision_slot_count"] = 2
         fov["routing_wait_slot_count"] = 1
+        fov["routing_voluntary_wait_with_legal_nonwait_slot_count"] = 0
+        fov["routing_only_wait_no_available_link_slot_count"] = 1
         fov["routing_wait_seconds"] = 0.25
         fov["locked_receiver_out_of_range_wait_slot_count"] = 1
         fov["locked_receiver_out_of_range_wait_seconds"] = 0.25
@@ -403,7 +617,7 @@ class PacketRoutingAggregateTest(unittest.TestCase):
             + fov_engine.packet_outcomes
         )
 
-    def test_schema_v4_and_grouped_diagnostic_summary(self):
+    def test_schema_v6_and_grouped_diagnostic_summary(self):
         outcomes = self._violation_outcomes()
         record = packet_outcome_episode_record(
             "scenario-diagnostics",
@@ -412,7 +626,7 @@ class PacketRoutingAggregateTest(unittest.TestCase):
         )
         self.assertEqual(
             record["artifact_schema_version"],
-            "uav-hrl-packet-outcomes-jsonl-v5",
+            "uav-hrl-packet-outcomes-jsonl-v6",
         )
         self.assertEqual(
             record["artifact_schema_version"],
@@ -435,8 +649,38 @@ class PacketRoutingAggregateTest(unittest.TestCase):
         self.assertIsNone(fov["post_s2u_violation_count"])
         self.assertEqual(fov["loop_violation_count"], 1)
         self.assertEqual(fov["violations_with_forced_locked_wait"], 1)
+        self.assertEqual(fov["total_only_wait_no_available_link_slots"], 1)
+        self.assertEqual(fov["total_voluntary_wait_with_legal_nonwait_slots"], 0)
+        self.assertEqual(
+            com["pre_s2u_violation_never_became_hol_count"], 1
+        )
+        self.assertIsNone(all_packets["total_s2u_hol_opportunity_slots"])
+        self.assertIsNone(fov["total_s2u_hol_opportunity_slots"])
         self.assertEqual(all_packets["eligible_packets"], 3)
         self.assertEqual(all_packets["violated_packets"], 3)
+        self.assertEqual(
+            all_packets["total_wait_slots"],
+            all_packets["total_voluntary_wait_with_legal_nonwait_slots"]
+            + all_packets["total_only_wait_no_available_link_slots"],
+        )
+        self.assertEqual(
+            com["pre_s2u_violation_count"],
+            com["pre_s2u_violation_never_became_hol_count"]
+            + com["pre_s2u_violation_became_hol_never_started_count"]
+            + com["pre_s2u_violation_partial_service_count"],
+        )
+
+    def test_validator_enforces_wait_and_s2u_hol_conservation(self):
+        outcomes = self._violation_outcomes()
+        invalid_wait = dict(outcomes[-1])
+        invalid_wait["routing_only_wait_no_available_link_slot_count"] = 0
+        with self.assertRaisesRegex(ValueError, "voluntary plus only-Wait"):
+            validate_packet_outcome(invalid_wait)
+
+        invalid_s2u = dict(outcomes[0])
+        invalid_s2u["s2u_hol_opportunity_slot_count"] = 1
+        with self.assertRaisesRegex(ValueError, "service plus no-service"):
+            validate_packet_outcome(invalid_s2u)
 
     def test_loop_mean_hops_excludes_s2u_and_terminal_partial_hop(self):
         engine = diagnostic_engine()
@@ -605,6 +849,108 @@ class PacketRoutingNoBehaviorChangeTest(unittest.TestCase):
             diagnostics_enabled=True
         )
         self.assertEqual(with_diagnostics, without_diagnostics)
+
+    @staticmethod
+    def _run_deterministic_s2u_pipeline(*, diagnostics_enabled):
+        rng = np.random.default_rng(20260901)
+        lifecycle_calls = {"prepare": 0, "allocate": 0}
+        env = routing_env(
+            multi_tasks={
+                1: [{"task_type": "COM", "target_obj_id": 0}],
+            }
+        )
+        env.active_s2u_capacities = {}
+        env.active_s2u_capacity_profiles_mbps = {}
+        env.active_link_capacity_profiles_mbps = {}
+
+        def prepare_channel_routing_slot(slot):
+            lifecycle_calls["prepare"] += 1
+            env.cached_s2u_profile = 0.5 + rng.random(50)
+            return int(slot)
+
+        def allocate_active_link_capacities(proposed_links, s2u_links=None):
+            lifecycle_calls["allocate"] += 1
+            self_s2u_links = dict(s2u_links or {})
+            env.active_s2u_capacities = {
+                (int(sr_id), int(receiver)): float(
+                    np.mean(env.cached_s2u_profile)
+                )
+                for sr_id, receiver in self_s2u_links.items()
+            }
+            env.active_s2u_capacity_profiles_mbps = {
+                link: np.asarray(env.cached_s2u_profile, dtype=float).copy()
+                for link in env.active_s2u_capacities
+            }
+            return dict(proposed_links), {}
+
+        env.prepare_channel_routing_slot = prepare_channel_routing_slot
+        env.allocate_active_link_capacities = allocate_active_link_capacities
+        engine = PacketEngine(
+            num_uav=3,
+            step_time=0.25,
+            enable_packet_diagnostic_artifacts=diagnostics_enabled,
+        )
+        packet = engine.create_sr_packet(0, 1_000_000.0, 0.0)
+        packet["deadline_abs"] = 0.5
+
+        env.prepare_channel_routing_slot(0)
+        requested_s2u_links = engine.active_s2u_links(env)
+        env.allocate_active_link_capacities({}, s2u_links=requested_s2u_links)
+        resolved_s2u_links = {
+            int(sr_id): int(receiver)
+            for sr_id, receiver in env.active_s2u_capacities
+        }
+        slot_result = engine.serve_active_links(
+            env,
+            actions={},
+            capacities={},
+            current_time=0.0,
+            s2u_block_capacity_profiles=(
+                env.active_s2u_capacity_profiles_mbps
+            ),
+            resolved_s2u_links=resolved_s2u_links,
+        )
+        engine.expire_packets(0.5)
+        terminal = engine.packet_outcomes[0]
+        return {
+            "routing_actions": {},
+            "requested_s2u_links": requested_s2u_links,
+            "resolved_s2u_links": resolved_s2u_links,
+            "allocated_s2u_capacities": dict(env.active_s2u_capacities),
+            "transmitted_bits": dict(slot_result["transmitted_bits_by_link"]),
+            "delivered_count": engine.total_delivered,
+            "violation_count": engine.total_violated,
+            "timely_useful_bits": engine.total_timely_useful_bits,
+            "mobility_energy": np.asarray(engine.energy).tolist(),
+            "packet_core_terminal_outcome": {
+                key: terminal[key]
+                for key in (
+                    "packet_id",
+                    "task_type",
+                    "outcome",
+                    "generation_time_seconds",
+                    "finish_time_seconds",
+                    "deadline_seconds",
+                    "remaining_bits_at_drop",
+                )
+            },
+            "channel_lifecycle_calls": lifecycle_calls,
+            "rng_state": rng.bit_generator.state,
+        }
+
+    def test_s2u_diagnostics_do_not_change_rng_allocation_or_service(self):
+        without_diagnostics = self._run_deterministic_s2u_pipeline(
+            diagnostics_enabled=False
+        )
+        with_diagnostics = self._run_deterministic_s2u_pipeline(
+            diagnostics_enabled=True
+        )
+
+        self.assertEqual(with_diagnostics, without_diagnostics)
+        self.assertEqual(
+            with_diagnostics["channel_lifecycle_calls"],
+            {"prepare": 1, "allocate": 1},
+        )
 
 
 class PacketRoutingPaperEvaluationIntegrationTest(unittest.TestCase):

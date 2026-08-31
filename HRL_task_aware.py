@@ -775,9 +775,16 @@ def _run_routing_slot(
         for sender, receiver in next_hops.items()
         if receiver != sender and sender in start_of_slot_hol_by_sender
     }
+    requested_s2u_links = packet_engine.active_s2u_links(env)
     active_capacities, _ = env.allocate_active_link_capacities(
-        proposed_links, s2u_links=packet_engine.active_s2u_links(env)
+        proposed_links, s2u_links=requested_s2u_links
     )
+    resolved_s2u_links = None
+    if packet_engine.enable_packet_diagnostic_artifacts:
+        resolved_s2u_links = {
+            int(sr_id): int(receiver)
+            for sr_id, receiver in env.active_s2u_capacities
+        }
     routing_transition_ids = {}
     if write_replay and routing_transition_ledger is not None:
         for uid in routing_decision_uav_ids:
@@ -803,6 +810,7 @@ def _run_routing_slot(
         start_of_slot_effective_masks_by_sender=effective_masks,
         block_capacity_profiles=env.active_link_capacity_profiles_mbps,
         s2u_block_capacity_profiles=env.active_s2u_capacity_profiles_mbps,
+        resolved_s2u_links=resolved_s2u_links,
     )
     attributable_violation_count = sum(
         bool(outcome["violated"])

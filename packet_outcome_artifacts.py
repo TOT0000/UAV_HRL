@@ -8,9 +8,9 @@ import math
 from pathlib import Path
 
 
-PACKET_OUTCOME_ARTIFACT_SCHEMA_VERSION = "uav-hrl-packet-outcomes-jsonl-v5"
+PACKET_OUTCOME_ARTIFACT_SCHEMA_VERSION = "uav-hrl-packet-outcomes-jsonl-v6"
 PACKET_ROUTING_DIAGNOSTIC_CONTRACT_VERSION = (
-    "uav-hrl-packet-routing-diagnostics-v2"
+    "uav-hrl-packet-routing-diagnostics-v3"
 )
 PACKET_ROUTING_DIAGNOSTIC_DEFINITIONS = {
     "routing_wait_definition": (
@@ -19,13 +19,42 @@ PACKET_ROUTING_DIAGNOSTIC_DEFINITIONS = {
         "routing_wait_slot_count increments when that decision selects receiver "
         "== sender, and routing_wait_seconds adds the authoritative slot duration"
     ),
+    "routing_wait_decomposition_definition": (
+        "voluntary Wait means selected receiver == sender while at least one "
+        "effective-mask action other than sender is True; only-Wait means selected "
+        "receiver == sender while no effective non-Wait action is True; the two "
+        "categories are mutually exclusive and sum to routing_wait_slot_count"
+    ),
     "forced_locked_wait_definition": (
         "a routing-eligible frozen HOL packet selected Wait, had a locked "
         "hop_receiver outside the authoritative inclusive 400 m 3-D routing "
         "range according to env.is_routing_link_in_range, and its effective "
         "mask contained only sender/Wait; capacity unavailability while in "
-        "range is excluded; aggregate fraction uses all routing decision slots "
-        "as its denominator"
+        "range is excluded; this is a strict subcategory of only-Wait; aggregate "
+        "fraction uses all routing decision slots as its denominator"
+    ),
+    "s2u_hol_opportunity_definition": (
+        "a COM packet is counted at most once per routing slot when it is the "
+        "actual SR FIFO HOL and enters that slot's canonical S2U service "
+        "opportunity path; non-HOL queue packets are not scanned or counted"
+    ),
+    "s2u_hol_service_definition": (
+        "an S2U HOL service slot requires actual packet bits to be consumed and "
+        "the packet's actual positive-capacity S2U airtime to increase; active "
+        "link or nominal capacity alone is not service"
+    ),
+    "s2u_hol_no_service_reason_priority": (
+        "each unserved S2U HOL opportunity is assigned exactly one reason in "
+        "priority order: no locked or assigned receiver; receiver outside the "
+        "authoritative inclusive 400 m 3-D S2U range; no matching canonical "
+        "resolved active S2U link; no finite positive allocated capacity/block "
+        "budget; or positive capacity but no actual service"
+    ),
+    "pre_s2u_violation_decomposition_definition": (
+        "incomplete-S2U violations are mutually partitioned into never became "
+        "HOL (zero S2U HOL opportunities), became HOL but never started (positive "
+        "HOL opportunities and zero actual S2U airtime), or partial S2U service "
+        "(positive actual S2U airtime without S2U completion)"
     ),
     "loop_definition": (
         "at least one UAV ID occurs more than once in path; the SR source entry "
@@ -102,6 +131,8 @@ PACKET_OUTCOME_REQUIRED_FIELDS = frozenset(
         "repeated_uav_ids",
         "routing_decision_slot_count",
         "routing_wait_slot_count",
+        "routing_voluntary_wait_with_legal_nonwait_slot_count",
+        "routing_only_wait_no_available_link_slot_count",
         "routing_wait_seconds",
         "locked_receiver_out_of_range_wait_slot_count",
         "locked_receiver_out_of_range_wait_seconds",
@@ -109,9 +140,27 @@ PACKET_OUTCOME_REQUIRED_FIELDS = frozenset(
         "cumulative_uav_tx_delay_seconds",
         "s2u_queue_delay_seconds",
         "s2u_tx_delay_seconds",
+        "s2u_hol_opportunity_slot_count",
+        "s2u_hol_service_slot_count",
+        "s2u_hol_no_receiver_slot_count",
+        "s2u_hol_receiver_out_of_range_slot_count",
+        "s2u_hol_no_active_link_slot_count",
+        "s2u_hol_no_positive_capacity_slot_count",
+        "s2u_hol_positive_capacity_but_no_service_slot_count",
         "qos_eligible",
     }
 )
+
+S2U_HOL_COUNT_FIELDS = (
+    "s2u_hol_opportunity_slot_count",
+    "s2u_hol_service_slot_count",
+    "s2u_hol_no_receiver_slot_count",
+    "s2u_hol_receiver_out_of_range_slot_count",
+    "s2u_hol_no_active_link_slot_count",
+    "s2u_hol_no_positive_capacity_slot_count",
+    "s2u_hol_positive_capacity_but_no_service_slot_count",
+)
+S2U_HOL_NO_SERVICE_COUNT_FIELDS = S2U_HOL_COUNT_FIELDS[2:]
 
 
 def _validate_nonnegative_number(row, field, *, nullable=False):
@@ -247,6 +296,8 @@ def validate_packet_outcome(row):
         "repeated_uav_count",
         "routing_decision_slot_count",
         "routing_wait_slot_count",
+        "routing_voluntary_wait_with_legal_nonwait_slot_count",
+        "routing_only_wait_no_available_link_slot_count",
         "locked_receiver_out_of_range_wait_slot_count",
     )
     for field in count_fields:
@@ -259,11 +310,38 @@ def validate_packet_outcome(row):
         raise ValueError("repeated_uav_count disagrees with repeated_uav_ids")
     if row["routing_wait_slot_count"] > row["routing_decision_slot_count"]:
         raise ValueError("routing wait slots exceed routing decision slots")
+    if row["routing_wait_slot_count"] != (
+        row["routing_voluntary_wait_with_legal_nonwait_slot_count"]
+        + row["routing_only_wait_no_available_link_slot_count"]
+    ):
+        raise ValueError(
+            "routing wait slots do not equal voluntary plus only-Wait slots"
+        )
     if (
         row["locked_receiver_out_of_range_wait_slot_count"]
-        > row["routing_wait_slot_count"]
+        > row["routing_only_wait_no_available_link_slot_count"]
     ):
-        raise ValueError("forced locked wait slots exceed routing wait slots")
+        raise ValueError("forced locked wait slots exceed only-Wait slots")
+    for field in S2U_HOL_COUNT_FIELDS:
+        value = row[field]
+        if row["task_type"] == "FOV":
+            if value is not None:
+                raise ValueError(f"FOV packet outcome field {field} must be null")
+        elif (
+            isinstance(value, bool)
+            or not isinstance(value, int)
+            or value < 0
+        ):
+            raise ValueError(
+                f"COM packet outcome field {field} must be a non-negative integer"
+            )
+    if row["task_type"] == "COM" and row["s2u_hol_opportunity_slot_count"] != (
+        row["s2u_hol_service_slot_count"]
+        + sum(row[field] for field in S2U_HOL_NO_SERVICE_COUNT_FIELDS)
+    ):
+        raise ValueError(
+            "S2U HOL opportunities do not equal service plus no-service reasons"
+        )
     for field in (
         "generation_time_seconds",
         "finish_time_seconds",
@@ -327,6 +405,9 @@ def _empty_diagnostic_group():
         "eligible_packets": 0,
         "violated_packets": 0,
         "pre_s2u_violation_count": 0,
+        "pre_s2u_violation_never_became_hol_count": 0,
+        "pre_s2u_violation_became_hol_never_started_count": 0,
+        "pre_s2u_violation_partial_service_count": 0,
         "post_s2u_violation_count": 0,
         "expired_at_sr_count": 0,
         "expired_at_uav_count": 0,
@@ -335,6 +416,12 @@ def _empty_diagnostic_group():
         "non_loop_violation_count": 0,
         "total_routing_decision_slots": 0,
         "total_wait_slots": 0,
+        "total_voluntary_wait_with_legal_nonwait_slots": 0,
+        "total_only_wait_no_available_link_slots": 0,
+        "packets_with_voluntary_wait": 0,
+        "packets_with_only_wait_no_available_link": 0,
+        "violations_with_voluntary_wait": 0,
+        "violations_with_only_wait_no_available_link": 0,
         "forced_locked_out_of_range_wait_slots": 0,
         "packets_with_forced_locked_wait": 0,
         "violations_with_forced_locked_wait": 0,
@@ -343,6 +430,13 @@ def _empty_diagnostic_group():
         "sum_cumulative_uav_tx_delay_seconds": 0.0,
         "sum_wait_slots": 0.0,
         "sum_forced_locked_wait_slots": 0.0,
+        "total_s2u_hol_opportunity_slots": 0,
+        "total_s2u_hol_service_slots": 0,
+        "total_s2u_hol_no_receiver_slots": 0,
+        "total_s2u_hol_receiver_out_of_range_slots": 0,
+        "total_s2u_hol_no_active_link_slots": 0,
+        "total_s2u_hol_no_positive_capacity_slots": 0,
+        "total_s2u_hol_positive_capacity_but_no_service_slots": 0,
         "loop_hop_sum": 0.0,
         "non_loop_hop_sum": 0.0,
         "non_loop_packet_count": 0,
@@ -382,6 +476,21 @@ class PacketRoutingDiagnosticAccumulator:
                     group["post_s2u_violation_count"] += 1
                 elif row["s2u_completed"] is False:
                     group["pre_s2u_violation_count"] += 1
+                    hol_opportunities = int(
+                        row["s2u_hol_opportunity_slot_count"]
+                    )
+                    if hol_opportunities == 0:
+                        group[
+                            "pre_s2u_violation_never_became_hol_count"
+                        ] += 1
+                    elif float(row["s2u_tx_delay_seconds"]) == 0.0:
+                        group[
+                            "pre_s2u_violation_became_hol_never_started_count"
+                        ] += 1
+                    else:
+                        group[
+                            "pre_s2u_violation_partial_service_count"
+                        ] += 1
             if row["has_repeated_uav"]:
                 group["loop_violation_count"] += 1
             else:
@@ -404,11 +513,19 @@ class PacketRoutingDiagnosticAccumulator:
             )
         decision_slots = int(row["routing_decision_slot_count"])
         wait_slots = int(row["routing_wait_slot_count"])
+        voluntary_slots = int(
+            row["routing_voluntary_wait_with_legal_nonwait_slot_count"]
+        )
+        only_wait_slots = int(
+            row["routing_only_wait_no_available_link_slot_count"]
+        )
         forced_slots = int(
             row["locked_receiver_out_of_range_wait_slot_count"]
         )
         group["total_routing_decision_slots"] += decision_slots
         group["total_wait_slots"] += wait_slots
+        group["total_voluntary_wait_with_legal_nonwait_slots"] += voluntary_slots
+        group["total_only_wait_no_available_link_slots"] += only_wait_slots
         group["forced_locked_out_of_range_wait_slots"] += forced_slots
         group["sum_wait_slots"] += wait_slots
         group["sum_forced_locked_wait_slots"] += forced_slots
@@ -416,6 +533,38 @@ class PacketRoutingDiagnosticAccumulator:
             group["packets_with_forced_locked_wait"] += 1
             if violated:
                 group["violations_with_forced_locked_wait"] += 1
+        if voluntary_slots > 0:
+            group["packets_with_voluntary_wait"] += 1
+            if violated:
+                group["violations_with_voluntary_wait"] += 1
+        if only_wait_slots > 0:
+            group["packets_with_only_wait_no_available_link"] += 1
+            if violated:
+                group["violations_with_only_wait_no_available_link"] += 1
+        if row["task_type"] == "COM":
+            group["total_s2u_hol_opportunity_slots"] += int(
+                row["s2u_hol_opportunity_slot_count"]
+            )
+            group["total_s2u_hol_service_slots"] += int(
+                row["s2u_hol_service_slot_count"]
+            )
+            group["total_s2u_hol_no_receiver_slots"] += int(
+                row["s2u_hol_no_receiver_slot_count"]
+            )
+            group["total_s2u_hol_receiver_out_of_range_slots"] += int(
+                row["s2u_hol_receiver_out_of_range_slot_count"]
+            )
+            group["total_s2u_hol_no_active_link_slots"] += int(
+                row["s2u_hol_no_active_link_slot_count"]
+            )
+            group["total_s2u_hol_no_positive_capacity_slots"] += int(
+                row["s2u_hol_no_positive_capacity_slot_count"]
+            )
+            group[
+                "total_s2u_hol_positive_capacity_but_no_service_slots"
+            ] += int(
+                row["s2u_hol_positive_capacity_but_no_service_slot_count"]
+            )
         group["sum_completed_uav_hops"] += float(
             row["completed_uav_hop_count"]
         )
@@ -432,6 +581,43 @@ class PacketRoutingDiagnosticAccumulator:
             eligible = raw["eligible_packets"]
             violations = raw["violated_packets"]
             com_only = name == "COM"
+            if raw["total_wait_slots"] != (
+                raw["total_voluntary_wait_with_legal_nonwait_slots"]
+                + raw["total_only_wait_no_available_link_slots"]
+            ):
+                raise AssertionError(
+                    f"{name} aggregate routing Wait decomposition failed"
+                )
+            if raw["forced_locked_out_of_range_wait_slots"] > raw[
+                "total_only_wait_no_available_link_slots"
+            ]:
+                raise AssertionError(
+                    f"{name} forced locked Wait subtype conservation failed"
+                )
+            s2u_no_service_slots = sum(
+                raw[field]
+                for field in (
+                    "total_s2u_hol_no_receiver_slots",
+                    "total_s2u_hol_receiver_out_of_range_slots",
+                    "total_s2u_hol_no_active_link_slots",
+                    "total_s2u_hol_no_positive_capacity_slots",
+                    "total_s2u_hol_positive_capacity_but_no_service_slots",
+                )
+            )
+            if raw["total_s2u_hol_opportunity_slots"] != (
+                raw["total_s2u_hol_service_slots"] + s2u_no_service_slots
+            ):
+                raise AssertionError(
+                    f"{name} aggregate S2U HOL decomposition failed"
+                )
+            if raw["pre_s2u_violation_count"] != (
+                raw["pre_s2u_violation_never_became_hol_count"]
+                + raw["pre_s2u_violation_became_hol_never_started_count"]
+                + raw["pre_s2u_violation_partial_service_count"]
+            ):
+                raise AssertionError(
+                    f"{name} pre-S2U violation decomposition failed"
+                )
             groups[name] = {
                 "task_type": name,
                 "eligible_packets": eligible,
@@ -439,6 +625,47 @@ class PacketRoutingDiagnosticAccumulator:
                 "violation_probability": _ratio(violations, eligible),
                 "pre_s2u_violation_count": (
                     raw["pre_s2u_violation_count"] if com_only else None
+                ),
+                "pre_s2u_violation_never_became_hol_count": (
+                    raw["pre_s2u_violation_never_became_hol_count"]
+                    if com_only
+                    else None
+                ),
+                "pre_s2u_violation_never_became_hol_share": (
+                    _ratio(
+                        raw["pre_s2u_violation_never_became_hol_count"],
+                        raw["pre_s2u_violation_count"],
+                    )
+                    if com_only
+                    else None
+                ),
+                "pre_s2u_violation_became_hol_never_started_count": (
+                    raw["pre_s2u_violation_became_hol_never_started_count"]
+                    if com_only
+                    else None
+                ),
+                "pre_s2u_violation_became_hol_never_started_share": (
+                    _ratio(
+                        raw[
+                            "pre_s2u_violation_became_hol_never_started_count"
+                        ],
+                        raw["pre_s2u_violation_count"],
+                    )
+                    if com_only
+                    else None
+                ),
+                "pre_s2u_violation_partial_service_count": (
+                    raw["pre_s2u_violation_partial_service_count"]
+                    if com_only
+                    else None
+                ),
+                "pre_s2u_violation_partial_service_share": (
+                    _ratio(
+                        raw["pre_s2u_violation_partial_service_count"],
+                        raw["pre_s2u_violation_count"],
+                    )
+                    if com_only
+                    else None
                 ),
                 "post_s2u_violation_count": (
                     raw["post_s2u_violation_count"] if com_only else None
@@ -463,6 +690,47 @@ class PacketRoutingDiagnosticAccumulator:
                     "total_routing_decision_slots"
                 ],
                 "total_wait_slots": raw["total_wait_slots"],
+                "total_voluntary_wait_with_legal_nonwait_slots": raw[
+                    "total_voluntary_wait_with_legal_nonwait_slots"
+                ],
+                "total_only_wait_no_available_link_slots": raw[
+                    "total_only_wait_no_available_link_slots"
+                ],
+                "voluntary_wait_share_among_wait_slots": _ratio(
+                    raw["total_voluntary_wait_with_legal_nonwait_slots"],
+                    raw["total_wait_slots"],
+                ),
+                "only_wait_no_available_link_share_among_wait_slots": _ratio(
+                    raw["total_only_wait_no_available_link_slots"],
+                    raw["total_wait_slots"],
+                ),
+                "voluntary_wait_fraction_of_routing_decisions": _ratio(
+                    raw["total_voluntary_wait_with_legal_nonwait_slots"],
+                    raw["total_routing_decision_slots"],
+                ),
+                "only_wait_no_available_link_fraction_of_routing_decisions": _ratio(
+                    raw["total_only_wait_no_available_link_slots"],
+                    raw["total_routing_decision_slots"],
+                ),
+                "packets_with_voluntary_wait": raw[
+                    "packets_with_voluntary_wait"
+                ],
+                "packets_with_only_wait_no_available_link": raw[
+                    "packets_with_only_wait_no_available_link"
+                ],
+                "violations_with_voluntary_wait": raw[
+                    "violations_with_voluntary_wait"
+                ],
+                "violations_with_only_wait_no_available_link": raw[
+                    "violations_with_only_wait_no_available_link"
+                ],
+                "share_of_violations_with_voluntary_wait": _ratio(
+                    raw["violations_with_voluntary_wait"], violations
+                ),
+                "share_of_violations_with_only_wait_no_available_link": _ratio(
+                    raw["violations_with_only_wait_no_available_link"],
+                    violations,
+                ),
                 "wait_slot_fraction": _ratio(
                     raw["total_wait_slots"], raw["total_routing_decision_slots"]
                 ),
@@ -502,6 +770,88 @@ class PacketRoutingDiagnosticAccumulator:
                 ),
                 "mean_hops_non_loop_packets": _ratio(
                     raw["non_loop_hop_sum"], raw["non_loop_packet_count"]
+                ),
+                "total_s2u_hol_opportunity_slots": (
+                    raw["total_s2u_hol_opportunity_slots"]
+                    if com_only
+                    else None
+                ),
+                "total_s2u_hol_service_slots": (
+                    raw["total_s2u_hol_service_slots"] if com_only else None
+                ),
+                "total_s2u_hol_no_receiver_slots": (
+                    raw["total_s2u_hol_no_receiver_slots"]
+                    if com_only
+                    else None
+                ),
+                "total_s2u_hol_receiver_out_of_range_slots": (
+                    raw["total_s2u_hol_receiver_out_of_range_slots"]
+                    if com_only
+                    else None
+                ),
+                "total_s2u_hol_no_active_link_slots": (
+                    raw["total_s2u_hol_no_active_link_slots"]
+                    if com_only
+                    else None
+                ),
+                "total_s2u_hol_no_positive_capacity_slots": (
+                    raw["total_s2u_hol_no_positive_capacity_slots"]
+                    if com_only
+                    else None
+                ),
+                "total_s2u_hol_positive_capacity_but_no_service_slots": (
+                    raw[
+                        "total_s2u_hol_positive_capacity_but_no_service_slots"
+                    ]
+                    if com_only
+                    else None
+                ),
+                "s2u_hol_service_fraction": (
+                    _ratio(
+                        raw["total_s2u_hol_service_slots"],
+                        raw["total_s2u_hol_opportunity_slots"],
+                    )
+                    if com_only
+                    else None
+                ),
+                "s2u_no_receiver_share_among_no_service_hol_slots": (
+                    _ratio(raw["total_s2u_hol_no_receiver_slots"], s2u_no_service_slots)
+                    if com_only
+                    else None
+                ),
+                "s2u_receiver_out_of_range_share_among_no_service_hol_slots": (
+                    _ratio(
+                        raw["total_s2u_hol_receiver_out_of_range_slots"],
+                        s2u_no_service_slots,
+                    )
+                    if com_only
+                    else None
+                ),
+                "s2u_no_active_link_share_among_no_service_hol_slots": (
+                    _ratio(
+                        raw["total_s2u_hol_no_active_link_slots"],
+                        s2u_no_service_slots,
+                    )
+                    if com_only
+                    else None
+                ),
+                "s2u_no_positive_capacity_share_among_no_service_hol_slots": (
+                    _ratio(
+                        raw["total_s2u_hol_no_positive_capacity_slots"],
+                        s2u_no_service_slots,
+                    )
+                    if com_only
+                    else None
+                ),
+                "s2u_positive_capacity_but_no_service_share_among_no_service_hol_slots": (
+                    _ratio(
+                        raw[
+                            "total_s2u_hol_positive_capacity_but_no_service_slots"
+                        ],
+                        s2u_no_service_slots,
+                    )
+                    if com_only
+                    else None
                 ),
                 "expired_packet_count_by_terminal_uav": dict(
                     sorted(

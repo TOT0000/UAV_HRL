@@ -753,6 +753,8 @@ class PacketEngine:
                 {
                     "routing_decision_slot_count": 0,
                     "routing_wait_slot_count": 0,
+                    "routing_voluntary_wait_with_legal_nonwait_slot_count": 0,
+                    "routing_only_wait_no_available_link_slot_count": 0,
                     "routing_wait_seconds": 0.0,
                     "locked_receiver_out_of_range_wait_slot_count": 0,
                     "locked_receiver_out_of_range_wait_seconds": 0.0,
@@ -761,6 +763,18 @@ class PacketEngine:
                     "s2u_actual_tx_seconds": 0.0,
                 }
             )
+            if task_type == "COM":
+                pkt.update(
+                    {
+                        "s2u_hol_opportunity_slot_count": 0,
+                        "s2u_hol_service_slot_count": 0,
+                        "s2u_hol_no_receiver_slot_count": 0,
+                        "s2u_hol_receiver_out_of_range_slot_count": 0,
+                        "s2u_hol_no_active_link_slot_count": 0,
+                        "s2u_hol_no_positive_capacity_slot_count": 0,
+                        "s2u_hol_positive_capacity_but_no_service_slot_count": 0,
+                    }
+                )
         self.generated_packet_counts[task_type] += 1
         if task_type == "FOV":
             self.fov_generated_raw_bits += size_bits
@@ -1007,14 +1021,35 @@ class PacketEngine:
             pkt.get("routing_wait_seconds", 0.0)
         ) + float(self.step_time)
 
-        locked_receiver = pkt.get("hop_receiver")
-        if locked_receiver is None or env is None or effective_mask is None:
-            return
-        locked_receiver = int(locked_receiver)
+        if effective_mask is None:
+            raise RuntimeError(
+                "routing Wait diagnostics require the canonical effective mask"
+            )
         effective = np.asarray(effective_mask, dtype=bool)
         expected_shape = (self.num_UAV + 1,)
         if effective.shape != expected_shape:
+            raise ValueError(
+                "routing Wait diagnostic mask has shape "
+                f"{effective.shape}, expected {expected_shape}"
+            )
+        legal_nonwait_exists = bool(
+            np.any(effective[np.arange(expected_shape[0]) != sender])
+        )
+        if legal_nonwait_exists:
+            pkt["routing_voluntary_wait_with_legal_nonwait_slot_count"] = int(
+                pkt.get(
+                    "routing_voluntary_wait_with_legal_nonwait_slot_count", 0
+                )
+            ) + 1
+        else:
+            pkt["routing_only_wait_no_available_link_slot_count"] = int(
+                pkt.get("routing_only_wait_no_available_link_slot_count", 0)
+            ) + 1
+
+        locked_receiver = pkt.get("hop_receiver")
+        if locked_receiver is None or env is None:
             return
+        locked_receiver = int(locked_receiver)
         range_check = getattr(env, "is_routing_link_in_range", None)
         if not callable(range_check):
             raise RuntimeError(
@@ -1402,6 +1437,61 @@ class PacketEngine:
             raise ValueError("packet service profile must be finite and non-negative")
         return profile
 
+    def _s2u_hol_no_service_counter(
+        self,
+        env,
+        pkt,
+        sr_id,
+        capacities,
+        block_capacity_profiles,
+        resolved_active_links,
+    ):
+        """Classify one HOL opportunity from already-resolved slot state."""
+
+        receiver = pkt.get("s2u_receiver")
+        if receiver is None:
+            receiver = self.assigned_com_uav(env, sr_id)
+        if receiver is None:
+            return "s2u_hol_no_receiver_slot_count"
+        receiver = int(receiver)
+
+        range_check = getattr(env, "is_s2u_in_range", None)
+        if not callable(range_check):
+            raise RuntimeError(
+                "S2U diagnostics require the authoritative range predicate"
+            )
+        if not bool(range_check(sr_id, receiver)):
+            return "s2u_hol_receiver_out_of_range_slot_count"
+
+        if resolved_active_links.get(int(sr_id)) != receiver:
+            return "s2u_hol_no_active_link_slot_count"
+
+        link = (int(sr_id), receiver)
+        raw_capacity = capacities.get(link)
+        try:
+            capacity_mbps = float(raw_capacity)
+        except (TypeError, ValueError):
+            capacity_mbps = float("nan")
+        positive_budget = bool(
+            np.isfinite(capacity_mbps) and capacity_mbps > PACKET_EPS
+        )
+        profile = block_capacity_profiles.get(link)
+        if profile is None:
+            positive_budget = positive_budget and bool(
+                capacity_mbps * 1e6 * float(self.step_time) > PACKET_EPS
+            )
+        else:
+            profile = np.asarray(profile, dtype=np.float64)
+            positive_budget = positive_budget and bool(
+                profile.shape == (FADING_BLOCKS_PER_ROUTING_SLOT,)
+                and np.all(np.isfinite(profile))
+                and np.all(profile >= 0.0)
+                and np.sum(profile * 1e6 * FADING_BLOCK_SECONDS) > PACKET_EPS
+            )
+        if not positive_budget:
+            return "s2u_hol_no_positive_capacity_slot_count"
+        return "s2u_hol_positive_capacity_but_no_service_slot_count"
+
     def serve_s2u_links(
         self,
         env,
@@ -1409,17 +1499,64 @@ class PacketEngine:
         current_time,
         *,
         block_capacity_profiles=None,
+        resolved_active_links=None,
     ):
         """Serve SR FIFO uploads with partial HOL locks and next-slot causality."""
 
         current_time = float(current_time)
         slot_end = current_time + float(self.step_time)
         block_capacity_profiles = dict(block_capacity_profiles or {})
+        capacities = capacities or {}
+        if self.enable_packet_diagnostic_artifacts:
+            if resolved_active_links is None:
+                resolved_active_links = {}
+                for sr_id, receiver in capacities:
+                    sr_id, receiver = int(sr_id), int(receiver)
+                    previous = resolved_active_links.setdefault(sr_id, receiver)
+                    if previous != receiver:
+                        raise AssertionError(
+                            f"SR {sr_id} has multiple resolved active S2U links"
+                        )
+            else:
+                resolved_active_links = {
+                    int(sr_id): int(receiver)
+                    for sr_id, receiver in dict(resolved_active_links).items()
+                }
+        else:
+            resolved_active_links = {}
         result = {
             "transmitted_bits_by_link": {},
             "arrivals": [],
             "violations": [],
         }
+        diagnostic_opportunities = {}
+        diagnostic_serviced_packet_ids = set()
+
+        def observe_hol(pkt, sr_id):
+            if not self.enable_packet_diagnostic_artifacts or pkt is None:
+                return
+            packet_id = int(pkt["id"])
+            if packet_id in diagnostic_opportunities:
+                return
+            pkt["s2u_hol_opportunity_slot_count"] = int(
+                pkt.get("s2u_hol_opportunity_slot_count", 0)
+            ) + 1
+            diagnostic_opportunities[packet_id] = (
+                pkt,
+                self._s2u_hol_no_service_counter(
+                    env,
+                    pkt,
+                    int(sr_id),
+                    capacities,
+                    block_capacity_profiles,
+                    resolved_active_links,
+                ),
+            )
+
+        if self.enable_packet_diagnostic_artifacts:
+            for sr_id in sorted(self.sr_queues):
+                observe_hol(self.get_sr_hol_packet(sr_id), sr_id)
+
         for (sr_id, receiver), capacity_mbps in sorted(capacities.items()):
             sr_id, receiver = int(sr_id), int(receiver)
             capacity_mbps = float(capacity_mbps)
@@ -1443,6 +1580,7 @@ class PacketEngine:
                 pkt = self.get_sr_hol_packet(sr_id)
                 if pkt is None or int(pkt["id"]) not in eligible_ids:
                     break
+                observe_hol(pkt, sr_id)
                 locked = pkt.get("s2u_receiver")
                 if locked is None:
                     assigned_receiver = self.assigned_com_uav(env, sr_id)
@@ -1469,9 +1607,21 @@ class PacketEngine:
                 if bits_used <= PACKET_EPS:
                     break
                 if self.enable_packet_diagnostic_artifacts:
+                    actual_tx_seconds = float(
+                        cursor.last_consumed_service_seconds
+                    )
                     pkt["s2u_actual_tx_seconds"] = float(
                         pkt.get("s2u_actual_tx_seconds", 0.0)
-                    ) + float(cursor.last_consumed_service_seconds)
+                    ) + actual_tx_seconds
+                    if (
+                        actual_tx_seconds > PACKET_EPS
+                        and int(pkt["id"])
+                        not in diagnostic_serviced_packet_ids
+                    ):
+                        pkt["s2u_hol_service_slot_count"] = int(
+                            pkt.get("s2u_hol_service_slot_count", 0)
+                        ) + 1
+                        diagnostic_serviced_packet_ids.add(int(pkt["id"]))
                 pkt["rem_bits"] = max(remaining_before - bits_used, 0.0)
                 pkt["s2u_bits_sent"] = float(pkt.get("s2u_bits_sent", 0.0)) + bits_used
                 self.s2u_backlog_bits[sr_id] = max(
@@ -1539,6 +1689,13 @@ class PacketEngine:
             ):
                 self.link_slot_budget_violations += 1
                 raise AssertionError("S2U transmitted beyond its slot bit budget")
+        if self.enable_packet_diagnostic_artifacts:
+            for packet_id, (pkt, no_service_counter) in (
+                diagnostic_opportunities.items()
+            ):
+                if packet_id in diagnostic_serviced_packet_ids:
+                    continue
+                pkt[no_service_counter] = int(pkt.get(no_service_counter, 0)) + 1
         return result
 
     def serve_active_links(
@@ -1556,6 +1713,7 @@ class PacketEngine:
         start_of_slot_effective_masks_by_sender=None,
         block_capacity_profiles=None,
         s2u_block_capacity_profiles=None,
+        resolved_s2u_links=None,
     ):
         """Serve each sender FIFO with one shared bit budget for its active link."""
 
@@ -1649,6 +1807,7 @@ class PacketEngine:
             getattr(env, "active_s2u_capacities", {}),
             current_time,
             block_capacity_profiles=s2u_block_capacity_profiles,
+            resolved_active_links=resolved_s2u_links,
         )
         result["s2u_arrivals"] = list(s2u_result["arrivals"])
         result["transmitted_bits_by_link"].update(
@@ -2417,6 +2576,14 @@ class PacketEngine:
             "routing_wait_slot_count": int(
                 pkt.get("routing_wait_slot_count", 0)
             ),
+            "routing_voluntary_wait_with_legal_nonwait_slot_count": int(
+                pkt.get(
+                    "routing_voluntary_wait_with_legal_nonwait_slot_count", 0
+                )
+            ),
+            "routing_only_wait_no_available_link_slot_count": int(
+                pkt.get("routing_only_wait_no_available_link_slot_count", 0)
+            ),
             "routing_wait_seconds": float(pkt.get("routing_wait_seconds", 0.0)),
             "locked_receiver_out_of_range_wait_slot_count": int(
                 pkt.get("locked_receiver_out_of_range_wait_slot_count", 0)
@@ -2435,6 +2602,46 @@ class PacketEngine:
             "s2u_tx_delay_seconds": (
                 float(pkt.get("s2u_actual_tx_seconds", 0.0))
                 if s2u_applicable
+                else None
+            ),
+            "s2u_hol_opportunity_slot_count": (
+                int(pkt.get("s2u_hol_opportunity_slot_count", 0))
+                if pkt.get("task_type") == "COM"
+                else None
+            ),
+            "s2u_hol_service_slot_count": (
+                int(pkt.get("s2u_hol_service_slot_count", 0))
+                if pkt.get("task_type") == "COM"
+                else None
+            ),
+            "s2u_hol_no_receiver_slot_count": (
+                int(pkt.get("s2u_hol_no_receiver_slot_count", 0))
+                if pkt.get("task_type") == "COM"
+                else None
+            ),
+            "s2u_hol_receiver_out_of_range_slot_count": (
+                int(pkt.get("s2u_hol_receiver_out_of_range_slot_count", 0))
+                if pkt.get("task_type") == "COM"
+                else None
+            ),
+            "s2u_hol_no_active_link_slot_count": (
+                int(pkt.get("s2u_hol_no_active_link_slot_count", 0))
+                if pkt.get("task_type") == "COM"
+                else None
+            ),
+            "s2u_hol_no_positive_capacity_slot_count": (
+                int(pkt.get("s2u_hol_no_positive_capacity_slot_count", 0))
+                if pkt.get("task_type") == "COM"
+                else None
+            ),
+            "s2u_hol_positive_capacity_but_no_service_slot_count": (
+                int(
+                    pkt.get(
+                        "s2u_hol_positive_capacity_but_no_service_slot_count",
+                        0,
+                    )
+                )
+                if pkt.get("task_type") == "COM"
                 else None
             ),
         }
