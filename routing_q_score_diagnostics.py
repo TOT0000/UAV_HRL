@@ -161,28 +161,68 @@ class RoutingQScoreDiagnosticAccumulator:
         task_type = str(hol_task_type).upper()
         if task_type not in {"COM", "FOV"}:
             raise ValueError("routing Q-score HOL task type must be COM or FOV")
-        q_r = np.asarray(inspection["q_r"], dtype=np.float64)
-        q_c = np.asarray(inspection["q_c"], dtype=np.float64)
-        q_safe = np.asarray(inspection["q_safe"], dtype=np.float64)
+        q_r_native = np.asarray(inspection["q_r"])
+        q_c_native = np.asarray(inspection["q_c"])
+        q_safe_native = np.asarray(inspection["q_safe"])
         legal_mask = np.asarray(inspection["legal_mask"], dtype=bool)
-        if q_r.ndim != 1 or not (
-            q_r.shape == q_c.shape == q_safe.shape == legal_mask.shape
+        if q_r_native.ndim != 1 or not (
+            q_r_native.shape
+            == q_c_native.shape
+            == q_safe_native.shape
+            == legal_mask.shape
         ):
             raise ValueError("routing Q-score arrays must be aligned one-dimensional values")
+        for name, values in (
+            ("Q_r", q_r_native),
+            ("Q_c", q_c_native),
+            ("Q_safe", q_safe_native),
+        ):
+            if not np.issubdtype(values.dtype, np.floating):
+                raise TypeError(f"routing {name} values must have a floating dtype")
         if not legal_mask.any():
             raise ValueError("routing Q-score diagnostic has no legal action")
-        for name, values in (("Q_r", q_r), ("Q_c", q_c), ("Q_safe", q_safe)):
+        for name, values in (
+            ("Q_r", q_r_native),
+            ("Q_c", q_c_native),
+            ("Q_safe", q_safe_native),
+        ):
             if not np.all(np.isfinite(values[legal_mask])):
                 raise ValueError(f"legal routing {name} values must be finite")
 
         lambda_cost = float(inspection["lambda_cost_used"])
         if not math.isfinite(lambda_cost) or lambda_cost < 0.0:
             raise ValueError("routing Q-score lambda_cost_used must be finite and non-negative")
-        expected_safe = q_r[legal_mask] - lambda_cost * q_c[legal_mask]
+        q_r_legal_native = q_r_native[legal_mask]
+        q_c_legal_native = q_c_native[legal_mask]
+        q_safe_legal_native = q_safe_native[legal_mask]
+        cost_term_legal_native = lambda_cost * q_c_legal_native
+        expected_safe_legal_native = q_r_legal_native - cost_term_legal_native
+        if expected_safe_legal_native.dtype != q_safe_legal_native.dtype:
+            raise TypeError(
+                "routing Q_safe dtype differs from native Q_r - lambda_cost * Q_c"
+            )
+        if not np.all(np.isfinite(expected_safe_legal_native)):
+            raise ValueError("expected legal routing Q_safe values must be finite")
+        # Bound native multiply/subtract roundoff by machine epsilon and the
+        # largest operand/result magnitude; 32 eps is deliberately conservative.
+        scale = max(
+            1.0,
+            float(np.max(np.abs(q_r_legal_native).astype(np.float64))),
+            float(np.max(np.abs(cost_term_legal_native).astype(np.float64))),
+            float(np.max(np.abs(q_safe_legal_native).astype(np.float64))),
+        )
+        native_atol = 32.0 * float(np.finfo(q_safe_native.dtype).eps) * scale
         if not np.allclose(
-            q_safe[legal_mask], expected_safe, rtol=1e-6, atol=1e-6
+            q_safe_legal_native,
+            expected_safe_legal_native,
+            rtol=0.0,
+            atol=native_atol,
         ):
             raise AssertionError("routing Q_safe does not equal Q_r - lambda_cost * Q_c")
+
+        q_r = q_r_native.astype(np.float64, copy=False)
+        q_c = q_c_native.astype(np.float64, copy=False)
+        q_safe = q_safe_native.astype(np.float64, copy=False)
 
         sender = int(sender_uav_id)
         selected = int(selected_action)

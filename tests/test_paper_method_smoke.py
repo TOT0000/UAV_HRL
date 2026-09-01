@@ -96,7 +96,7 @@ class PaperMethodSmokeTest(unittest.TestCase):
                     TrainingConfig(
                         total_episodes=1,
                         mode="custom",
-                        episode_seconds=1,
+                        episode_seconds=2,
                         routing_slot_seconds=0.25,
                         warmup_joint_transitions=0,
                         batch_size=1,
@@ -134,6 +134,12 @@ class PaperMethodSmokeTest(unittest.TestCase):
                     )
                     self.assertIsInstance(
                         evaluation["routing_q_score_voluntary_waits"], list
+                    )
+                    self.assertGreater(
+                        evaluation["routing_q_score_diagnostics"]["groups"][
+                            "ALL"
+                        ]["total_routing_q_decisions"],
+                        0,
                     )
                     self.assertTrue(
                         evaluation["run_metadata"][

@@ -225,6 +225,70 @@ class RoutingQScoreDecisionTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Q_r.*finite"):
             agent.inspect_action_scores(np.zeros(2), [True, True])
 
+    def test_native_float32_safe_consistency_avoids_float64_false_positive(self):
+        lambda_cost = 15.0595
+        q_c = np.asarray([1000.123, 2000.456], dtype=np.float32)
+        q_r = np.asarray(lambda_cost * q_c, dtype=np.float32)
+        agent = fixed_agent(q_r, q_c, lambda_cost)
+        state = np.zeros(2, dtype=np.float32)
+        inspection = agent.inspect_action_scores(state, [True, True])
+
+        self.assertEqual(inspection["q_r"].dtype, np.dtype(np.float32))
+        self.assertEqual(inspection["q_c"].dtype, np.dtype(np.float32))
+        self.assertEqual(inspection["q_safe"].dtype, np.dtype(np.float32))
+        float64_recomputed = inspection["q_r"].astype(np.float64) - (
+            lambda_cost * inspection["q_c"].astype(np.float64)
+        )
+        self.assertGreater(
+            float(
+                np.max(
+                    np.abs(
+                        inspection["q_safe"].astype(np.float64)
+                        - float64_recomputed
+                    )
+                )
+            ),
+            1e-6,
+        )
+        self.assertFalse(
+            np.allclose(
+                inspection["q_safe"].astype(np.float64),
+                float64_recomputed,
+                rtol=1e-6,
+                atol=1e-6,
+            )
+        )
+
+        accumulator = RoutingQScoreDiagnosticAccumulator()
+        event = accumulator.add_decision(
+            inspection,
+            selected_action=inspection["safe_argmax_action"],
+            sender_uav_id=0,
+            hol_task_type="FOV",
+            scenario_id="float32-regression",
+            episode_index=0,
+            slot_index=0,
+            time_seconds=0.0,
+        )
+        self.assertIsNotNone(event)
+
+        corrupted = copy.deepcopy(inspection)
+        corrupted["q_safe"][0] += np.float32(1.0)
+        with self.assertRaisesRegex(
+            AssertionError,
+            "routing Q_safe does not equal Q_r - lambda_cost \\* Q_c",
+        ):
+            RoutingQScoreDiagnosticAccumulator().add_decision(
+                corrupted,
+                selected_action=inspection["safe_argmax_action"],
+                sender_uav_id=0,
+                hol_task_type="FOV",
+                scenario_id="float32-corruption",
+                episode_index=0,
+                slot_index=0,
+                time_seconds=0.0,
+            )
+
 
 class RoutingQScoreArtifactTest(unittest.TestCase):
     def test_group_statistics_and_three_artifacts(self):
