@@ -90,6 +90,11 @@ from packet_outcome_artifacts import (
     PACKET_ROUTING_DIAGNOSTIC_DEFINITIONS,
     packet_outcome_episode_record,
 )
+from routing_q_score_diagnostics import (
+    ROUTING_Q_SCORE_DIAGNOSTIC_CONTRACT_VERSION,
+    ROUTING_Q_SCORE_DIAGNOSTIC_DEFINITIONS,
+    RoutingQScoreDiagnosticAccumulator,
+)
 from routing_agents import create_routing_agent
 from routing_lifecycle import RoutingLearnerLifecycle
 from routing_transition_ledger import RoutingTransitionLedger
@@ -651,6 +656,8 @@ def _run_routing_slot(
     traffic_rate_overrides=None,
     pending_routing_transitions=None,
     routing_transition_ledger=None,
+    routing_q_score_accumulator=None,
+    routing_q_score_context=None,
 ):
     del routing_masks
     if write_replay and int(getattr(routing_buffer, "n_step", -1)) != 1:
@@ -769,6 +776,29 @@ def _run_routing_slot(
     next_hops = _select_routing_actions(
         ddqn, states, effective_masks, epsilon=epsilon
     )
+    if routing_q_score_accumulator is not None:
+        if not np.isclose(float(epsilon), 0.0, rtol=0.0, atol=0.0):
+            raise AssertionError(
+                "routing Q-score diagnostics require evaluation epsilon=0"
+            )
+        if getattr(ddqn, "routing_agent_kind", None) != "safe_ddqn":
+            raise TypeError("routing Q-score diagnostics require safe-DDQN")
+        if routing_q_score_context is None:
+            raise ValueError("routing Q-score diagnostics require slot context")
+        for uid in routing_decision_uav_ids:
+            inspection = ddqn.inspect_action_scores(
+                states[uid], effective_masks[uid]
+            )
+            routing_q_score_accumulator.add_decision(
+                inspection,
+                selected_action=next_hops[uid],
+                sender_uav_id=uid,
+                hol_task_type=start_of_slot_hol_by_sender[uid]["task_type"],
+                scenario_id=routing_q_score_context["scenario_id"],
+                episode_index=routing_q_score_context["episode_index"],
+                slot_index=routing_q_score_context["slot_index"],
+                time_seconds=current_time,
+            )
 
     proposed_links = {
         sender: receiver
@@ -1734,6 +1764,7 @@ def train(
     trajectory_snapshot_times=None,
     trajectory_target_uav_id=None,
     packet_outcome_sink=None,
+    collect_routing_q_score_diagnostics=False,
 ):
     if config is None:
         raise ValueError(
@@ -1759,6 +1790,15 @@ def train(
     elif packet_outcome_sink is not None:
         raise ValueError(
             "a packet outcome sink is valid only in stream_jsonl mode"
+        )
+    collect_routing_q_score_diagnostics = bool(
+        collect_routing_q_score_diagnostics
+    )
+    if collect_routing_q_score_diagnostics and (
+        not evaluation or method_spec.routing != "safe_ddqn"
+    ):
+        raise ValueError(
+            "routing Q-score diagnostics are evaluation-only and require safe-DDQN"
         )
     if scenario_manifest is not None:
         if scenario_manifest.episode_count < config.total_episodes:
@@ -1883,6 +1923,11 @@ def train(
     )
     routing_transition_ledger = (
         RoutingTransitionLedger() if method_spec.learns_routing else None
+    )
+    routing_q_score_accumulator = (
+        RoutingQScoreDiagnosticAccumulator()
+        if collect_routing_q_score_diagnostics
+        else None
     )
 
     experiment_identity = _experiment_identity(
@@ -2541,6 +2586,16 @@ def train(
                     traffic_rate_overrides=resolved_episode_rates,
                     pending_routing_transitions=pending_routing_transitions,
                     routing_transition_ledger=routing_transition_ledger,
+                    routing_q_score_accumulator=routing_q_score_accumulator,
+                    routing_q_score_context=(
+                        {
+                            "scenario_id": scenario_id,
+                            "episode_index": episode,
+                            "slot_index": absolute_slot,
+                        }
+                        if routing_q_score_accumulator is not None
+                        else None
+                    ),
                 )
                 ddqn_action_selections += action_selections
                 interval_delivered_bits += delivered_bits
@@ -3492,6 +3547,16 @@ def train(
         "packet_outcome_streamed_episode_count": (
             packet_outcome_streamed_episode_count
         ),
+        "routing_q_score_diagnostics": (
+            routing_q_score_accumulator.summary()
+            if routing_q_score_accumulator is not None
+            else None
+        ),
+        "routing_q_score_voluntary_waits": (
+            list(routing_q_score_accumulator.voluntary_wait_events)
+            if routing_q_score_accumulator is not None
+            else None
+        ),
         "trajectory_artifacts": [
             {
                 **artifact,
@@ -3609,6 +3674,24 @@ def train(
             "packet_outcome_streamed_episode_count": (
                 packet_outcome_streamed_episode_count
             ),
+            "routing_q_score_diagnostics_enabled": bool(
+                routing_q_score_accumulator is not None
+            ),
+            "routing_q_score_diagnostic_contract_version": (
+                ROUTING_Q_SCORE_DIAGNOSTIC_CONTRACT_VERSION
+                if routing_q_score_accumulator is not None
+                else None
+            ),
+            **{
+                field: (
+                    definition
+                    if routing_q_score_accumulator is not None
+                    else None
+                )
+                for field, definition in (
+                    ROUTING_Q_SCORE_DIAGNOSTIC_DEFINITIONS.items()
+                )
+            },
             "evaluation_overrides": (
                 resolved_evaluation if evaluation else None
             ),

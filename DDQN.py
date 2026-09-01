@@ -213,6 +213,68 @@ class DDQN:
 
         return action
 
+    def inspect_action_scores(self, state, mask=None):
+        """Read raw legal Q scores without touching selection or RNG state."""
+
+        prohibited = (
+            nn.modules.batchnorm._BatchNorm,
+            nn.modules.dropout._DropoutNd,
+        )
+        for network_name, network in (
+            ("reward", self.q_network),
+            ("cost", self.cost_network),
+        ):
+            if any(isinstance(module, prohibited) for module in network.modules()):
+                raise RuntimeError(
+                    f"{network_name} Q-score diagnostics require a deterministic "
+                    "stateless inference network"
+                )
+        training_modes = {
+            id(module): bool(module.training)
+            for network in (self.q_network, self.cost_network)
+            for module in network.modules()
+        }
+        state_t = torch.FloatTensor(np.asarray(state).reshape(1, -1)).to(device)
+        with torch.no_grad():
+            q_r = self.q_network(state_t).detach().cpu().numpy().flatten()
+            q_c = self.cost_network(state_t).detach().cpu().numpy().flatten()
+        if any(
+            bool(module.training) != training_modes[id(module)]
+            for network in (self.q_network, self.cost_network)
+            for module in network.modules()
+        ):
+            raise AssertionError("Q-score inspection changed network module state")
+        if q_r.shape != (self.action_dim,) or q_c.shape != (self.action_dim,):
+            raise ValueError("Q-score inspection network output shape is invalid")
+        legal_mask = (
+            np.ones(self.action_dim, dtype=bool)
+            if mask is None
+            else np.asarray(mask, dtype=bool).copy()
+        )
+        if legal_mask.shape != q_r.shape:
+            raise ValueError(
+                f"routing mask shape {legal_mask.shape} does not match "
+                f"action values {q_r.shape}"
+            )
+        if not legal_mask.any():
+            raise ValueError("routing action mask has no legal action")
+        lambda_cost_used = float(self.lambda_cost)
+        q_safe = q_r - lambda_cost_used * q_c
+        for name, values in (("Q_r", q_r), ("Q_c", q_c), ("Q_safe", q_safe)):
+            if not np.all(np.isfinite(values[legal_mask])):
+                raise ValueError(f"legal routing {name} values must be finite")
+        masked_q_r = np.where(legal_mask, q_r, -np.inf)
+        masked_q_safe = np.where(legal_mask, q_safe, -np.inf)
+        return {
+            "q_r": q_r.copy(),
+            "q_c": q_c.copy(),
+            "q_safe": q_safe.copy(),
+            "legal_mask": legal_mask,
+            "lambda_cost_used": lambda_cost_used,
+            "reward_argmax_action": int(np.argmax(masked_q_r)),
+            "safe_argmax_action": int(np.argmax(masked_q_safe)),
+        }
+
     def _routing_action_mask(self, next_state):
         return routing_action_mask_from_state(next_state, self.action_dim)
 

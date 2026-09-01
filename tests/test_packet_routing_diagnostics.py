@@ -984,6 +984,15 @@ class PacketRoutingPaperEvaluationIntegrationTest(unittest.TestCase):
                     encoding="utf-8"
                 )
             )
+            self.assertFalse(
+                (output_directory / "routing_q_score_diagnostics.json").exists()
+            )
+            self.assertFalse(
+                (output_directory / "routing_q_score_diagnostics.csv").exists()
+            )
+            self.assertFalse(
+                (output_directory / "routing_q_score_voluntary_waits.csv").exists()
+            )
 
         self.assertEqual(
             metadata["packet_routing_diagnostic_contract_version"],
@@ -998,6 +1007,14 @@ class PacketRoutingPaperEvaluationIntegrationTest(unittest.TestCase):
         )
         self.assertIn(
             "packet_routing_diagnostics_json",
+            result["points"][0]["outputs"],
+        )
+        self.assertFalse(metadata["routing_q_score_diagnostics_enabled"])
+        self.assertIsNone(
+            metadata["routing_q_score_diagnostic_contract_version"]
+        )
+        self.assertNotIn(
+            "routing_q_score_diagnostics_json",
             result["points"][0]["outputs"],
         )
 

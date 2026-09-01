@@ -36,6 +36,11 @@ from packet_outcome_artifacts import (
     PacketOutcomeJsonlWriter,
     write_packet_routing_diagnostic_artifacts,
 )
+from routing_q_score_diagnostics import (
+    ROUTING_Q_SCORE_DIAGNOSTIC_CONTRACT_VERSION,
+    ROUTING_Q_SCORE_DIAGNOSTIC_DEFINITIONS,
+    write_routing_q_score_diagnostic_artifacts,
+)
 from paper_figure_registry import FIGURE_REGISTRY, PAPER_METHOD_MAPPINGS
 from paper_metrics import (
     PAPER_AGGREGATE_SCHEMA_VERSION,
@@ -373,6 +378,20 @@ def _write_csv(path, rows):
         writer.writerows(rows)
 
 
+def _write_routing_q_score_outputs(output_directory, method, result):
+    """Write independent Q-score artifacts only for safe-DDQN evaluation."""
+
+    if method.routing != "safe_ddqn":
+        return {}
+    diagnostics = result.get("routing_q_score_diagnostics")
+    voluntary_waits = result.get("routing_q_score_voluntary_waits")
+    if diagnostics is None or voluntary_waits is None:
+        raise RuntimeError("safe-DDQN evaluation lacks routing Q-score diagnostics")
+    return write_routing_q_score_diagnostic_artifacts(
+        output_directory, diagnostics, voluntary_waits
+    )
+
+
 def run_paper_evaluation(
     method_id,
     *,
@@ -628,10 +647,16 @@ def run_paper_evaluation(
                     else None
                 ),
                 packet_outcome_sink=outcome_writer.write_episode,
+                collect_routing_q_score_diagnostics=(
+                    method.routing == "safe_ddqn"
+                ),
             )
         diagnostic_outputs = write_packet_routing_diagnostic_artifacts(
             point_dir,
             outcome_writer.routing_diagnostics(),
+        )
+        routing_q_score_outputs = _write_routing_q_score_outputs(
+            point_dir, method, result
         )
         if fixed_num_gt is not None and any(
             int(row["num_GT"]) != int(fixed_num_gt)
@@ -681,6 +706,7 @@ def run_paper_evaluation(
         outputs = write_evaluation_outputs(point_dir, result["episode_metrics"], run_metadata)
         outputs["packet_outcomes_jsonl"] = packet_outcomes_path.resolve()
         outputs.update(diagnostic_outputs)
+        outputs.update(routing_q_score_outputs)
         trajectories = [
             {
                 **artifact,
@@ -726,6 +752,14 @@ def run_paper_evaluation(
                 ),
                 "packet_routing_diagnostic_contract_version": (
                     PACKET_ROUTING_DIAGNOSTIC_CONTRACT_VERSION
+                ),
+                "routing_q_score_diagnostics_enabled": (
+                    method.routing == "safe_ddqn"
+                ),
+                "routing_q_score_diagnostic_contract_version": (
+                    ROUTING_Q_SCORE_DIAGNOSTIC_CONTRACT_VERSION
+                    if method.routing == "safe_ddqn"
+                    else None
                 ),
                 "resolved_overrides": result["run_metadata"].get(
                     "evaluation_overrides"
@@ -831,6 +865,18 @@ def run_paper_evaluation(
             PACKET_ROUTING_DIAGNOSTIC_CONTRACT_VERSION
         ),
         **PACKET_ROUTING_DIAGNOSTIC_DEFINITIONS,
+        "routing_q_score_diagnostics_enabled": (
+            method.routing == "safe_ddqn"
+        ),
+        "routing_q_score_diagnostic_contract_version": (
+            ROUTING_Q_SCORE_DIAGNOSTIC_CONTRACT_VERSION
+            if method.routing == "safe_ddqn"
+            else None
+        ),
+        **{
+            field: definition if method.routing == "safe_ddqn" else None
+            for field, definition in ROUTING_Q_SCORE_DIAGNOSTIC_DEFINITIONS.items()
+        },
         "target_uav_id": int(target_uav_id) if target_uav_id is not None else None,
         "git_sha": git_sha,
         "new_training_started": False,

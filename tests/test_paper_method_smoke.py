@@ -7,6 +7,9 @@ import torch
 
 from experiment_config import MethodSpec, effective_training_config
 from HRL_task_aware import TrainingConfig, train
+from routing_q_score_diagnostics import (
+    ROUTING_Q_SCORE_DIAGNOSTIC_CONTRACT_VERSION,
+)
 from scenario_manifest import generate_manifest
 
 
@@ -117,8 +120,38 @@ class PaperMethodSmokeTest(unittest.TestCase):
                     trajectory_target_uav_id=0
                     if method.routing == "random"
                     else None,
+                    collect_routing_q_score_diagnostics=(
+                        method.routing == "safe_ddqn"
+                    ),
                 )
                 self.assertTrue(all(evaluation["evaluation_invariants"].values()))
+                if method.routing == "safe_ddqn":
+                    self.assertEqual(
+                        evaluation["routing_q_score_diagnostics"][
+                            "routing_q_score_diagnostic_contract_version"
+                        ],
+                        ROUTING_Q_SCORE_DIAGNOSTIC_CONTRACT_VERSION,
+                    )
+                    self.assertIsInstance(
+                        evaluation["routing_q_score_voluntary_waits"], list
+                    )
+                    self.assertTrue(
+                        evaluation["run_metadata"][
+                            "routing_q_score_diagnostics_enabled"
+                        ]
+                    )
+                else:
+                    self.assertIsNone(
+                        evaluation["routing_q_score_diagnostics"]
+                    )
+                    self.assertIsNone(
+                        evaluation["routing_q_score_voluntary_waits"]
+                    )
+                    self.assertFalse(
+                        evaluation["run_metadata"][
+                            "routing_q_score_diagnostics_enabled"
+                        ]
+                    )
                 self.assertEqual(evaluation["movement_agent_kind"], method.agent)
                 self.assertEqual(evaluation["routing_agent_kind"], method.routing)
                 run_metadata = evaluation["run_metadata"]
