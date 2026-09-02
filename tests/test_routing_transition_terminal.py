@@ -156,7 +156,7 @@ class RoutingTransitionTerminalTest(unittest.TestCase):
         self.assertEqual(replay.size, 0)
         self.assertIs(self.engine.get_hol_packet(receiver), packet)
         self.assertIsNone(packet["last_routing_sender"])
-        self.assertEqual(packet["routing_eligible_time"], 0.25)
+        self.assertEqual(packet["routing_eligible_time"], 0.1)
         self.assertEqual(packet["rem_bits"], packet["size_bits"])
 
         self.env.active_s2u_capacities = {}

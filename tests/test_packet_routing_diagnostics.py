@@ -410,7 +410,7 @@ class PacketTerminalDiagnosticTest(unittest.TestCase):
         self.assertTrue(post_engine._remove_from_sr_queue(post))
         post["s2u_completion_time"] = 0.1
         post["routing_eligible"] = True
-        post["routing_eligible_time"] = 0.25
+        post["routing_eligible_time"] = 0.1
         post["path"].append(2)
         post["rem_bits"] = post["size_bits"]
         post["deadline_abs"] = 0.5
@@ -591,7 +591,7 @@ class PacketRoutingAggregateTest(unittest.TestCase):
         post_engine._remove_from_sr_queue(post)
         post["s2u_completion_time"] = 0.1
         post["routing_eligible"] = True
-        post["routing_eligible_time"] = 0.25
+        post["routing_eligible_time"] = 0.1
         post["path"].append(2)
         post["rem_bits"] = post["size_bits"]
         post["deadline_abs"] = 0.5
@@ -690,7 +690,7 @@ class PacketRoutingAggregateTest(unittest.TestCase):
             {
                 "s2u_completion_time": 0.1,
                 "routing_eligible": True,
-                "routing_eligible_time": 0.25,
+                "routing_eligible_time": 0.1,
                 "path": ["SR:0", 1, 2, 1],
                 "current": 1,
                 "hops": 2,

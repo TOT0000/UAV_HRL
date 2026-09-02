@@ -332,7 +332,7 @@ class ChannelAndPacketContractTest(unittest.TestCase):
         self.assertIsNone(next_packet["s2u_receiver"])
         self.assertEqual(engine.active_s2u_links(self.env), {0: 2})
         self.assertIs(engine.get_hol_packet(receiver), packet)
-        self.assertEqual(packet["routing_eligible_time"], 0.5)
+        self.assertAlmostEqual(packet["routing_eligible_time"], 0.375)
         self.assertEqual(packet["generation_time"], 0.0)
         self.assertIsNone(packet["_queued_sr"])
         self.assertIsNone(packet["last_routing_sender"])

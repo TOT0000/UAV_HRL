@@ -654,6 +654,19 @@ class PacketEngine:
             pkt["_queued_sr"] = None
         return removed
 
+    def _mark_routing_stage_eligible(self, pkt, eligible_time):
+        """Mark first routing-stage entry at its physical boundary time."""
+
+        if bool(pkt.get("routing_eligible", False)):
+            return False
+        if not bool(pkt.get("qos_eligible", False)):
+            raise AssertionError("non-QoS packet cannot enter the routing stage")
+        task_type = self._task_norm(pkt.get("task_type", "COM"))
+        pkt["routing_eligible"] = True
+        pkt["routing_eligible_time"] = float(eligible_time)
+        self.routing_stage_eligible_packet_counts[task_type] += 1
+        return True
+
     def enqueue_packet(self, pkt, uav_id, queue_enter_time):
         """Append a fully arrived packet to a UAV's aggregate FIFO."""
 
@@ -662,13 +675,7 @@ class PacketEngine:
             raise ValueError(f"invalid UAV queue id: {uav_id}")
         if pkt.get("_queued_uav") is not None:
             raise AssertionError("packet is already owned by a UAV queue")
-        if not bool(pkt.get("routing_eligible", False)):
-            if not bool(pkt.get("qos_eligible", False)):
-                raise AssertionError("non-QoS packet cannot enter the routing stage")
-            task_type = self._task_norm(pkt.get("task_type", "COM"))
-            pkt["routing_eligible"] = True
-            pkt["routing_eligible_time"] = float(queue_enter_time)
-            self.routing_stage_eligible_packet_counts[task_type] += 1
+        self._mark_routing_stage_eligible(pkt, queue_enter_time)
         pkt["current"] = uav_id
         pkt["queue_enter_time"] = float(queue_enter_time)
         pkt["_queued_uav"] = uav_id
@@ -1655,10 +1662,7 @@ class PacketEngine:
                 pkt["s2u_service_start_time"] = None
                 pkt["s2u_queue_delay_s"] = 0.0
                 deadline_abs = float(pkt["deadline_abs"])
-                if (
-                    completion_time >= deadline_abs - PACKET_EPS
-                    or slot_end >= deadline_abs - PACKET_EPS
-                ):
+                if completion_time >= deadline_abs - PACKET_EPS:
                     event = self._mark_deadline_violation(
                         pkt,
                         completion_time,
@@ -1667,7 +1671,12 @@ class PacketEngine:
                     if event is not None:
                         result["violations"].append(event)
                     continue
-                # Enqueue only after this routing slot's eligible packet snapshot.
+                # Routing eligibility begins at physical S2U completion, while
+                # queue/service availability remains next-slot causal.  If the
+                # deadline falls later in this slot, canonical slot-end expiry
+                # classifies a routing-stage violation without charging the
+                # receiver's already-frozen action snapshot.
+                self._mark_routing_stage_eligible(pkt, completion_time)
                 self.enqueue_packet(pkt, receiver, slot_end)
                 self.s2u_completed_packets += 1
                 result["arrivals"].append(pkt)

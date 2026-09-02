@@ -145,7 +145,7 @@ class RoutingImmediateCostContractTest(unittest.TestCase):
         self.assertEqual(self.engine.routing_constraint_counts(), (0, 0))
         self.assertEqual(self.engine.pre_routing_violation_count, 1)
 
-    def test_h_com_becomes_routing_eligible_only_after_s2u_enqueue(self):
+    def test_h_com_becomes_routing_eligible_at_s2u_completion(self):
         sr = self.env.SR_teams[0]
         self.env.multi_tasks[1] = [
             {
@@ -166,10 +166,84 @@ class RoutingImmediateCostContractTest(unittest.TestCase):
 
         self.assertEqual(result["arrivals"], [packet])
         self.assertEqual(self.engine.routing_constraint_counts(), (0, 1))
+        self.assertAlmostEqual(packet["routing_eligible_time"], 0.1)
         packet["deadline_abs"] = 0.25
         self.engine.expire_packets(0.25, inclusive=True)
         self.assertEqual(self.engine.routing_constraint_counts(), (1, 1))
         self.assertTrue(self.engine.assert_violation_credit_conservation())
+
+    def test_s2u_completion_before_mid_slot_deadline_is_routing_stage_violation(self):
+        sr = self.env.SR_teams[0]
+        receiver = 1
+        self.env.multi_tasks[receiver] = [
+            {
+                "task_type": "COM",
+                "target_id": 0,
+                "target_obj_id": 0,
+                "target_pos": sr.get_position(),
+            }
+        ]
+        self.engine.enable_packet_diagnostic_artifacts = True
+        packet = self.engine.create_sr_packet(0, 100.0, 0.0)
+        packet["deadline_abs"] = 0.20
+        self.env.active_s2u_capacities = {(0, receiver): 0.001}
+
+        result = self.engine.serve_active_links(
+            self.env,
+            actions={},
+            capacities={},
+            current_time=0.0,
+            resolved_s2u_links={0: receiver},
+        )
+
+        self.assertEqual(self.engine.system_qos_counts(), (1, 1))
+        self.assertEqual(self.engine.routing_constraint_counts(), (1, 1))
+        self.assertEqual(self.engine.pre_routing_violation_count, 0)
+        self.assertTrue(packet["routing_eligible"])
+        self.assertAlmostEqual(packet["routing_eligible_time"], 0.10)
+        self.assertAlmostEqual(packet["s2u_completion_time"], 0.10)
+        self.assertEqual(packet["terminal_outcome"], "expired_dropped")
+        self.assertEqual(sum(result["cost_by_sender"].values()), 0.0)
+        self.assertEqual(self.engine.routing_immediate_cost_sum, 0.0)
+
+        outcome = self.engine.packet_outcomes[0]
+        self.assertTrue(outcome["s2u_completed"])
+        self.assertTrue(outcome["routing_eligible"])
+        self.assertAlmostEqual(
+            outcome["routing_eligible_time_seconds"], 0.10
+        )
+        self.assertAlmostEqual(outcome["s2u_completion_time_seconds"], 0.10)
+
+    def test_post_action_s2u_violation_does_not_charge_receiver_wait(self):
+        sr = self.env.SR_teams[0]
+        receiver = 1
+        self.env.multi_tasks[receiver] = [
+            {
+                "task_type": "COM",
+                "target_id": 0,
+                "target_obj_id": 0,
+                "target_pos": sr.get_position(),
+            }
+        ]
+        resident = self.engine.create_packet(receiver, "FOV", 100.0, 0.0)
+        resident["deadline_abs"] = 10.0
+        incoming = self.engine.create_sr_packet(0, 100.0, 0.0)
+        incoming["deadline_abs"] = 0.20
+        self.env.active_s2u_capacities = {(0, receiver): 0.001}
+
+        result = self.engine.serve_active_links(
+            self.env,
+            actions={receiver: receiver},
+            capacities={},
+            current_time=0.0,
+        )
+
+        self.assertTrue(incoming["routing_eligible"])
+        self.assertEqual(self.engine.routing_constraint_counts(), (1, 2))
+        self.assertEqual(result["cost_by_sender"][receiver], 0.0)
+        self.assertEqual(result["charged_snapshot_packet_ids"], ())
+        self.assertEqual(self.engine.routing_immediate_cost_sum, 0.0)
+        self.assertIs(self.engine.get_hol_packet(receiver), resident)
 
     def test_i_fov_is_routing_eligible_on_enqueue_even_before_hol(self):
         first = self.engine.create_packet(0, "FOV", 100.0, 0.0)
