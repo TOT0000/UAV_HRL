@@ -10,10 +10,9 @@ from centralized_movement import (
     JOINT_ACTION_DIM,
     MOVEMENT_STATE_DIM,
     blended_com_progress,
-    blended_vs_progress,
     calculate_movement_potentials,
+    fov_sensing_progress,
     normalized_com_link_quality,
-    normalized_horizontal_target_proximity,
     normalized_s2u_range_gap_proximity,
 )
 from experiment_config import (
@@ -22,8 +21,6 @@ from experiment_config import (
     METHOD_REGISTRY,
     S2U_COMMUNICATION_RANGE_M,
     TASK_POTENTIAL_CONTRACT_VERSION,
-    VS_DISTANCE_POTENTIAL_WEIGHT,
-    VS_SENSING_POTENTIAL_WEIGHT,
     MethodSpec,
     comparison_method_configuration,
     task_potential_contract_metadata,
@@ -34,56 +31,15 @@ from scenario_manifest import SCENARIO_SCHEMA_VERSION
 
 
 class DistanceProgressHelperTest(unittest.TestCase):
-    def test_vs_horizontal_boundaries_monotonicity_and_altitude_invariance(
-        self,
-    ):
-        width = 1000.0
-        height = 1000.0
-        self.assertEqual(
-            normalized_horizontal_target_proximity(
-                (400.0, 500.0, 80.0),
-                (400.0, 500.0, 0.0),
-                width,
-                height,
-            ),
-            1.0,
-        )
-        self.assertEqual(
-            normalized_horizontal_target_proximity(
-                (0.0, 0.0, 80.0),
-                (1000.0, 1000.0, 0.0),
-                width,
-                height,
-            ),
-            0.0,
-        )
-        distances = (1000.0, 500.0, 100.0)
-        progresses = [
-            normalized_horizontal_target_proximity(
-                (distance, 0.0, 100.0),
-                (0.0, 0.0, 0.0),
-                width,
-                height,
-            )
-            for distance in distances
-        ]
-        self.assertLess(progresses[0], progresses[1])
-        self.assertLess(progresses[1], progresses[2])
-        low = normalized_horizontal_target_proximity(
-            (300.0, 400.0, 50.0), (0.0, 0.0, 0.0), width, height
-        )
-        high = normalized_horizontal_target_proximity(
-            (300.0, 400.0, 150.0), (0.0, 0.0, 0.0), width, height
-        )
-        self.assertEqual(low, high)
-        self.assertTrue(all(0.0 <= value <= 1.0 for value in progresses))
-
-    def test_vs_blend_rewards_nearer_target_at_fixed_sensing_progress(self):
-        far = blended_vs_progress(0.4, 0.2)
-        near = blended_vs_progress(0.4, 0.8)
-        self.assertLess(far, near)
-        self.assertTrue(0.0 <= far <= 1.0)
-        self.assertTrue(0.0 <= near <= 1.0)
+    def test_vs_sensing_progress_is_monotonic_and_saturates(self):
+        self.assertEqual(fov_sensing_progress(0.5, -1.0), 0.0)
+        self.assertEqual(fov_sensing_progress(0.5, 0.0), 0.0)
+        self.assertEqual(fov_sensing_progress(0.5, 0.5), 0.25)
+        self.assertEqual(fov_sensing_progress(0.5, 1.0), 0.5)
+        self.assertEqual(fov_sensing_progress(0.5, 2.0), 0.5)
+        self.assertEqual(fov_sensing_progress(float("nan"), 1.0), 0.0)
+        self.assertLess(fov_sensing_progress(0.2, 0.8), fov_sensing_progress(0.7, 0.8))
+        self.assertLess(fov_sensing_progress(0.7, 0.2), fov_sensing_progress(0.7, 0.8))
 
     def test_com_range_gap_boundaries_continuity_and_monotonicity(self):
         helper = normalized_s2u_range_gap_proximity
@@ -118,10 +74,6 @@ class DistanceProgressHelperTest(unittest.TestCase):
     def test_weights_and_contract_metadata_are_authoritative(self):
         groups = validate_task_potential_weights()
         self.assertEqual(
-            groups["VS"],
-            (VS_SENSING_POTENTIAL_WEIGHT, VS_DISTANCE_POTENTIAL_WEIGHT),
-        )
-        self.assertEqual(
             groups["COM"],
             (COM_CAPACITY_POTENTIAL_WEIGHT, COM_DISTANCE_POTENTIAL_WEIGHT),
         )
@@ -132,7 +84,8 @@ class DistanceProgressHelperTest(unittest.TestCase):
         self.assertEqual(
             metadata["contract_version"], TASK_POTENTIAL_CONTRACT_VERSION
         )
-        self.assertEqual(metadata["vs"]["distance_dimensionality"], "horizontal_2d")
+        self.assertFalse(metadata["vs"]["target_distance_used"])
+        self.assertNotIn("distance_weight", metadata["vs"])
         self.assertEqual(
             metadata["com"]["distance_dimensionality"],
             "three_dimensional_3d",
@@ -142,10 +95,6 @@ class DistanceProgressHelperTest(unittest.TestCase):
         self.assertTrue(metadata["search"]["unchanged"])
         self.assertFalse(metadata["lifecycle"]["delivery_or_connectivity_potential"])
 
-        with mock.patch(
-            "experiment_config.VS_DISTANCE_POTENTIAL_WEIGHT", 0.6
-        ), self.assertRaisesRegex(ValueError, "must sum to 1"):
-            validate_task_potential_weights()
         with mock.patch(
             "experiment_config.COM_CAPACITY_POTENTIAL_WEIGHT", float("nan")
         ), self.assertRaisesRegex(ValueError, "finite and non-negative"):
@@ -200,7 +149,7 @@ class DistanceAwarePotentialLifecycleTest(unittest.TestCase):
             task_potential_enabled=enabled,
         )
 
-    def test_invalid_sensing_geometry_keeps_finite_distance_progress(self):
+    def test_invalid_sensing_geometry_has_zero_vs_progress(self):
         self.env.multi_tasks[0] = [self._fov_task()]
         target = self.env.gts[0]
         self.env.uav_dict[0].x_u = target.x + 100.0
@@ -210,17 +159,11 @@ class DistanceAwarePotentialLifecycleTest(unittest.TestCase):
             return_value=(0.9, 0.8, False),
         ):
             _, phi_vs, _ = calculate_movement_potentials(self.env, 1.0)
-        distance = normalized_horizontal_target_proximity(
-            self.env.uav_dict[0].get_position(),
-            target.get_position(),
-            self.env.env_width,
-            self.env.env_height,
-        )
-        self.assertAlmostEqual(phi_vs, blended_vs_progress(0.0, distance))
+        self.assertEqual(phi_vs, 0.0)
         self.assertTrue(math.isfinite(phi_vs))
         self.assertTrue(0.0 <= phi_vs <= 1.0)
 
-    def test_vs_approach_unchanged_and_retreat_have_signed_differences(self):
+    def test_vs_horizontal_distance_change_alone_does_not_change_potential(self):
         self.env.multi_tasks[0] = [self._fov_task()]
         target = self.env.gts[0]
         with mock.patch(
@@ -234,8 +177,10 @@ class DistanceAwarePotentialLifecycleTest(unittest.TestCase):
             self.env.uav_dict[0].y_u = target.y
             near = calculate_movement_potentials(self.env, 1.0)
         self.assertEqual(self._shaping(far, far), 0.0)
-        self.assertGreater(self._shaping(far, near), 0.0)
-        self.assertLess(self._shaping(near, far), 0.0)
+        self.assertEqual(far[1], 0.2)
+        self.assertEqual(near[1], 0.2)
+        self.assertEqual(self._shaping(far, near), 0.0)
+        self.assertEqual(self._shaping(near, far), 0.0)
         self.assertAlmostEqual(self._shaping(near, far, done=True), -sum(near))
 
     def test_com_approach_unchanged_and_retreat_have_signed_differences(self):
@@ -299,16 +244,7 @@ class DistanceAwarePotentialLifecycleTest(unittest.TestCase):
             unified_range_potential = calculate_movement_potentials(self.env, 1.0)
 
         self.assertEqual(old_range_potential, unified_range_potential)
-        expected_distance = normalized_horizontal_target_proximity(
-            self.env.uav_dict[0].get_position(),
-            target.get_position(),
-            self.env.env_width,
-            self.env.env_height,
-        )
-        self.assertAlmostEqual(
-            unified_range_potential[1],
-            0.5 * (0.6 * 0.8) + 0.5 * expected_distance,
-        )
+        self.assertAlmostEqual(unified_range_potential[1], 0.6 * 0.8)
 
     def test_no_tasks_are_zero_and_multiple_tasks_use_arithmetic_mean(self):
         self.env.visited_bitmap[:] = False
@@ -326,22 +262,7 @@ class DistanceAwarePotentialLifecycleTest(unittest.TestCase):
             return_value=(0.0, 0.0, True),
         ):
             _, phi_vs, _ = calculate_movement_potentials(self.env, 1.0)
-        per_task = [
-            blended_vs_progress(
-                0.0,
-                normalized_horizontal_target_proximity(
-                    self.env.uav_dict[uav_id].get_position(),
-                    task["target_pos"],
-                    self.env.env_width,
-                    self.env.env_height,
-                ),
-            )
-            for uav_id, task in (
-                (0, self.env.multi_tasks[0][0]),
-                (1, self.env.multi_tasks[1][0]),
-            )
-        ]
-        self.assertAlmostEqual(phi_vs, float(np.mean(per_task)))
+        self.assertEqual(phi_vs, 0.0)
 
     def test_search_potential_remains_global_coverage_mean(self):
         self.env.visited_bitmap[:] = False

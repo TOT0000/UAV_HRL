@@ -78,7 +78,7 @@ class Uav10ConfigurationContractTest(unittest.TestCase):
         data["schema_version"] = "uav-hrl-scenario-v2"
         with self.assertRaisesRegex(ValueError, "16-UAV.*incompatible"):
             ScenarioManifest.from_dict(data)
-        self.assertEqual(CHECKPOINT_SCHEMA_VERSION, 20)
+        self.assertEqual(CHECKPOINT_SCHEMA_VERSION, 21)
         with self.assertRaisesRegex(RuntimeError, "must be retrained"):
             _validate_checkpoint_schema({"checkpoint_schema_version": 9})
 
@@ -379,7 +379,7 @@ class ChannelAndPacketContractTest(unittest.TestCase):
         self.assertEqual(resident["last_routing_sender"], receiver)
         self.assertIsNone(arrival["last_routing_sender"])
         self.assertEqual(result["reward_by_sender"][receiver], -0.5)
-        self.assertEqual(result["cost_by_sender"], {})
+        self.assertEqual(result["cost_by_sender"], {receiver: 0.0})
 
     def test_s2u_completion_at_deadline_is_one_formal_violation(self):
         engine = PacketEngine(NUM_UAV, step_time=0.25)
@@ -411,8 +411,8 @@ class ChannelAndPacketContractTest(unittest.TestCase):
         self.assertEqual(len(result["outcomes"]), 1)
         self.assertTrue(result["outcomes"][0]["violated"])
         self.assertEqual(result["cost_by_sender"], {})
-        self.assertEqual(result["deferred_cost_by_sender"], {-1: 1.0})
-        self.assertEqual(engine.unattributed_pre_routing_violation_count, 1)
+        self.assertEqual(engine.routing_constraint_counts(), (0, 0))
+        self.assertEqual(engine.pre_routing_violation_count, 1)
 
     def test_direct_ratio_is_terminal_bit_per_j(self):
         self.assertEqual(terminal_ratio_objective("ratio", False, 1.0, 200000.0), 0.0)

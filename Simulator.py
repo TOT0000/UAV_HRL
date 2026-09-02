@@ -36,6 +36,8 @@ from experiment_config import (
     CANONICAL_UAV_INITIAL_XY_M,
     COMMUNICATION_RANGE_M,
     FOV_COM_PAIR_MAX_DISTANCE_M,
+    FOV_ASSIGNMENT_UTILITY_VERSION,
+    FOV_QUALITY_TRANSFORM,
     COM_OFFERED_RATE_BPS,
     GROUND_STATION_POSITION_M,
     GS_GATEWAY_CONTRACT_VERSION,
@@ -52,6 +54,7 @@ from experiment_config import (
     SR_ROUTE_LIFECYCLE_VERSION,
     SEARCH_COVERAGE_THRESHOLD,
     TOTAL_COMMUNICATION_BANDWIDTH_HZ,
+    TASK_COMPATIBILITY_POLICY,
 )
 
 
@@ -505,6 +508,11 @@ class Simulator:
                 GS_GATEWAY_SOFT_RADIUS_OPERATIONAL
             ),
             "gs_gateway_hard_radius_m": GS_GATEWAY_HARD_RADIUS_M,
+            "fov_com_pair_max_distance_m": self.fov_com_pair_max_distance_m,
+            "fov_com_pair_distance_gate": "disabled",
+            "task_compatibility_policy": TASK_COMPATIBILITY_POLICY,
+            "fov_assignment_utility_version": FOV_ASSIGNMENT_UTILITY_VERSION,
+            "fov_quality_transform": FOV_QUALITY_TRANSFORM,
             "search_release_time_seconds": self.search_release_time,
             "search_release_coverage": self.search_release_coverage,
             "assignments": {

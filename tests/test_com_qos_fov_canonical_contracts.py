@@ -71,10 +71,9 @@ class ActivatedComQosContractTest(unittest.TestCase):
         self.assertEqual(summary["expired_dropped_packets"], 4)
         self.assertEqual(summary["violation_packets"], 4)
         self.assertEqual(summary["violation_probability"], 1.0)
-        self.assertEqual(engine.routing_credit_violation_count, 0)
-        self.assertEqual(engine.replay_attributed_violation_cost_count, 0.0)
-        self.assertEqual(engine.unattributed_transition_violation_count, 4)
-        self.assertEqual(engine.unattributed_pre_routing_violation_count, 4)
+        self.assertEqual(engine.routing_constraint_counts(), (0, 0))
+        self.assertEqual(engine.routing_immediate_cost_sum, 0.0)
+        self.assertEqual(engine.pre_routing_violation_count, 4)
 
     def test_s2u_completion_changes_only_routing_eligibility(self):
         engine = PacketEngine(num_uav=1)
@@ -113,7 +112,7 @@ class ActivatedComQosContractTest(unittest.TestCase):
         self.assertEqual(summary["eligible_packets"], 1)
         self.assertEqual(summary["violation_packets"], 1)
         self.assertEqual(engine.total_violated, 1)
-        self.assertEqual(engine.unattributed_pre_routing_violation_count, 1)
+        self.assertEqual(engine.pre_routing_violation_count, 1)
 
     def test_never_activated_session_has_missing_probability(self):
         in_range = {"value": False}
@@ -142,8 +141,8 @@ class ActivatedComQosContractTest(unittest.TestCase):
         self.assertEqual(summary["eligible_packets"], 3)
         self.assertEqual(summary["expired_dropped_packets"], 3)
         self.assertEqual(summary["violation_packets"], 3)
-        self.assertEqual(engine.routing_credit_violation_count, 0)
-        self.assertEqual(engine.unattributed_pre_routing_violation_count, 3)
+        self.assertEqual(engine.routing_constraint_counts(), (0, 0))
+        self.assertEqual(engine.pre_routing_violation_count, 3)
 
 
 class AllParticipantFovSnapshotContractTest(unittest.TestCase):
@@ -398,8 +397,8 @@ class CanonicalArtifactSourceContractTest(unittest.TestCase):
             "total_mobility_energy_j",
             "routing_wait_count",
             "system_qos_violation_count",
-            "routing_credit_violation_count",
-            "unattributed_transition_violation_count",
+            "routing_stage_violated_packets",
+            "pre_routing_violation_count",
         ):
             self.assertIn((metric, None), identities)
 

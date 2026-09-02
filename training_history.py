@@ -36,6 +36,13 @@ TRAINING_HISTORY_COLUMNS = (
     "eligible_packet_count",
     "delay_violation_count",
     "delay_violation_probability",
+    "system_eligible_packets",
+    "system_violated_packets",
+    "system_violation_probability",
+    "routing_stage_eligible_packets",
+    "routing_stage_violated_packets",
+    "routing_stage_violation_probability",
+    "routing_immediate_cost_sum",
     "lambda_cost_used",
     "lambda_cost_after_episode",
 )
@@ -51,6 +58,9 @@ FLOAT_COLUMNS = (
     "dinkelbach_block_timely_mbits_so_far",
     "dinkelbach_block_energy_joules_so_far",
     "delay_violation_probability",
+    "system_violation_probability",
+    "routing_stage_violation_probability",
+    "routing_immediate_cost_sum",
     "lambda_cost_used",
     "lambda_cost_after_episode",
 )
@@ -60,13 +70,17 @@ INTEGER_COLUMNS = (
     "dinkelbach_block_episode",
     "eligible_packet_count",
     "delay_violation_count",
+    "system_eligible_packets",
+    "system_violated_packets",
+    "routing_stage_eligible_packets",
+    "routing_stage_violated_packets",
 )
 
 BOOLEAN_COLUMNS = ("dinkelbach_lambda_updated",)
 
 STRING_COLUMNS = ("dinkelbach_update_status",)
 
-TRAINING_HISTORY_SCHEMA_VERSION = 6
+TRAINING_HISTORY_SCHEMA_VERSION = 7
 TRAINING_HISTORY_CSV = "training_history.csv"
 TRAINING_HISTORY_JSONL = "training_history.jsonl"
 TRAINING_HISTORY_COMMIT = "training_history_commit.json"
@@ -112,6 +126,13 @@ def build_training_history_row(
     eligible_packet_count=0,
     delay_violation_count=0,
     delay_violation_probability=None,
+    system_eligible_packets=None,
+    system_violated_packets=None,
+    system_violation_probability=None,
+    routing_stage_eligible_packets=0,
+    routing_stage_violated_packets=0,
+    routing_stage_violation_probability=None,
+    routing_immediate_cost_sum=0.0,
     lambda_cost_used=None,
     lambda_cost_after_episode=None,
 ):
@@ -122,6 +143,21 @@ def build_training_history_row(
         else float(total_timely_useful_mbits)
     )
     mobility_energy_j = float(mobility_energy_j)
+    system_eligible_packets = (
+        int(eligible_packet_count)
+        if system_eligible_packets is None
+        else int(system_eligible_packets)
+    )
+    system_violated_packets = (
+        int(delay_violation_count)
+        if system_violated_packets is None
+        else int(system_violated_packets)
+    )
+    system_violation_probability = (
+        delay_violation_probability
+        if system_violation_probability is None
+        else system_violation_probability
+    )
     row = {
         **identity,
         "episode": int(episode),
@@ -145,6 +181,13 @@ def build_training_history_row(
         "eligible_packet_count": int(eligible_packet_count),
         "delay_violation_count": int(delay_violation_count),
         "delay_violation_probability": delay_violation_probability,
+        "system_eligible_packets": system_eligible_packets,
+        "system_violated_packets": system_violated_packets,
+        "system_violation_probability": system_violation_probability,
+        "routing_stage_eligible_packets": int(routing_stage_eligible_packets),
+        "routing_stage_violated_packets": int(routing_stage_violated_packets),
+        "routing_stage_violation_probability": routing_stage_violation_probability,
+        "routing_immediate_cost_sum": float(routing_immediate_cost_sum),
         "lambda_cost_used": lambda_cost_used,
         "lambda_cost_after_episode": lambda_cost_after_episode,
     }
@@ -169,6 +212,8 @@ def normalize_training_history_row(row):
         "dinkelbach_block_timely_mbits_so_far",
         "dinkelbach_block_energy_joules_so_far",
         "delay_violation_probability",
+        "system_violation_probability",
+        "routing_stage_violation_probability",
         "lambda_cost_used",
         "lambda_cost_after_episode",
     }
@@ -243,6 +288,42 @@ def validate_training_history(rows, identity):
         ):
             raise ValueError(
                 "training history timely_goodput_mbits must alias total timely useful Mbit"
+            )
+        if (
+            row["eligible_packet_count"] != row["system_eligible_packets"]
+            or row["delay_violation_count"] != row["system_violated_packets"]
+            or row["delay_violation_probability"]
+            != row["system_violation_probability"]
+        ):
+            raise ValueError(
+                "training history system QoS aliases are inconsistent"
+            )
+        if (
+            row["system_violated_packets"] > row["system_eligible_packets"]
+            or row["routing_stage_violated_packets"]
+            > row["routing_stage_eligible_packets"]
+        ):
+            raise ValueError("training history QoS counts are inconsistent")
+        expected_routing_probability = (
+            row["routing_stage_violated_packets"]
+            / float(row["routing_stage_eligible_packets"])
+            if row["routing_stage_eligible_packets"]
+            else None
+        )
+        if (
+            expected_routing_probability is None
+            and row["routing_stage_violation_probability"] is not None
+        ) or (
+            expected_routing_probability is not None
+            and not math.isclose(
+                row["routing_stage_violation_probability"],
+                expected_routing_probability,
+                rel_tol=0.0,
+                abs_tol=1e-12,
+            )
+        ):
+            raise ValueError(
+                "training history routing-stage probability is inconsistent"
             )
     return normalized
 

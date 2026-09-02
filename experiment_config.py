@@ -68,17 +68,15 @@ GROUND_ALTITUDE_M = 0.0
 UAV_MAX_ALTITUDE_M = 150.0
 TASK_POTENTIAL_NORMALIZATION_EPSILON = 1e-12
 TASK_POTENTIAL_CONTRACT_VERSION = (
-    "vs-horizontal-proximity-com-400m-range-gap-blend-v2"
+    "vs-sensing-only-com-400m-range-gap-blend-v3"
 )
-VS_SENSING_POTENTIAL_WEIGHT = 0.5
-VS_DISTANCE_POTENTIAL_WEIGHT = 0.5
 COM_CAPACITY_POTENTIAL_WEIGHT = 0.5
 COM_DISTANCE_POTENTIAL_WEIGHT = 0.5
 DEFAULT_TRAINING_SEED = 20260817
 FORMAL_TRAINING_EPISODES = 1500
 FORMAL_CHECKPOINT_EPISODE = FORMAL_TRAINING_EPISODES
 SEARCH_COVERAGE_THRESHOLD = 0.99
-FOV_COM_PAIR_MAX_DISTANCE_M = 200.0
+FOV_COM_PAIR_MAX_DISTANCE_M = None
 TOTAL_COMMUNICATION_BANDWIDTH_HZ = 10e6
 REFERENCE_COM_BANDWIDTH_HZ = TOTAL_COMMUNICATION_BANDWIDTH_HZ / (
     NUM_UAV + ROI_COUNT_MAX
@@ -108,18 +106,19 @@ validate_communication_range_aliases(
 ASSIGNMENT_DUMMY_UTILITY = -1e-9
 UTILITY_NORMALIZATION_MODE = "fov-global-minmax-com-fading-aware-reference-v3"
 COM_UTILITY_CONTRACT_VERSION = "fixed-s2u-los-rician-expected-maximum-v2"
-TASK_COMPATIBILITY_POLICY = "fov_com_only_with_distance_limit"
-FOV_ASSIGNMENT_UTILITY_VERSION = "coverage_times_reciprocal_image_quality-v1"
+TASK_COMPATIBILITY_POLICY = "fov_com_type_only_no_distance_limit"
+FOV_ASSIGNMENT_UTILITY_VERSION = "coverage_times_saturated_image_quality-v2"
 FOV_QUALITY_TRANSFORM = (
-    "q(I)=0 for non-finite or I<=0; I for 0<I<=1; 1/I for I>1"
+    "q(I)=0 for non-finite or I<=0; clip(I,0,1) otherwise"
 )
 FOV_COVERAGE_SOURCE = (
     "centralized_movement.fov_task_metrics circle-ROI/rectangular-FOV "
     "intersection ratio [0,1]"
 )
-SAFE_DDQN_QOS_TARGET_PROBABILITY = 0.1
+SAFE_DDQN_QOS_TARGET_PROBABILITY = 0.05
 SAFE_DDQN_INITIAL_LAMBDA_COST = 0.0
 SAFE_DDQN_ETA_C = 0.01
+SAFE_DDQN_DUAL_NORMALIZATION_REFERENCE_PACKETS = 10_000
 SAFE_DDQN_LAMBDA_UPDATE_SCOPE = "episode_end"
 SAFE_DDQN_EVALUATION_LAMBDA_MODE = "checkpoint_frozen"
 ROUTING_MASK_SCOPE = "every_slot"
@@ -154,10 +153,10 @@ TIMELY_USEFUL_GOODPUT_CONTRACT_VERSION = (
     "fov-capture-coverage-weighted-com-full-timely-bits-v1"
 )
 PACKET_ROUTING_CAUSALITY_CONTRACT_VERSION = (
-    "transition-id-causality-credit-pending-one-step-v3"
+    "sender-next-state-immediate-cost-one-step-v4"
 )
 ROUTING_COST_ATTRIBUTION_CONTRACT_VERSION = (
-    "system-qos-versus-routing-credit-stable-id-v2"
+    "routing-stage-frozen-full-queue-sender-immediate-count-v3"
 )
 PACKET_SERVICE_CONTRACT_VERSION = (
     "unified-400m-slot-start-fifty-5ms-block-cumulative-service-v2"
@@ -203,10 +202,9 @@ CURRENT_METHOD_ID = "td3_dinkelbach"
 
 
 def validate_task_potential_weights():
-    """Fail fast unless both authoritative blend pairs are convex weights."""
+    """Fail fast unless the authoritative COM blend is convex."""
 
     groups = {
-        "VS": (VS_SENSING_POTENTIAL_WEIGHT, VS_DISTANCE_POTENTIAL_WEIGHT),
         "COM": (COM_CAPACITY_POTENTIAL_WEIGHT, COM_DISTANCE_POTENTIAL_WEIGHT),
     }
     for name, weights in groups.items():
@@ -224,9 +222,6 @@ def task_potential_contract_metadata():
     """Return the shared reward/config/checkpoint task-potential contract."""
 
     validate_task_potential_weights()
-    horizontal_reference = math.hypot(
-        ENVIRONMENT_WIDTH_M, ENVIRONMENT_HEIGHT_M
-    )
     distance_3d_reference = math.sqrt(
         ENVIRONMENT_WIDTH_M**2
         + ENVIRONMENT_HEIGHT_M**2
@@ -244,13 +239,10 @@ def task_potential_contract_metadata():
             "target_distance_used": False,
         },
         "vs": {
-            "sensing_weight": VS_SENSING_POTENTIAL_WEIGHT,
-            "distance_weight": VS_DISTANCE_POTENTIAL_WEIGHT,
-            "distance_dimensionality": "horizontal_2d",
-            "normalization": "environment_xy_diagonal",
-            "environment_width_m": ENVIRONMENT_WIDTH_M,
-            "environment_height_m": ENVIRONMENT_HEIGHT_M,
-            "distance_normalization_reference_m": horizontal_reference,
+            "definition": "coverage_ratio * q(image_quality)",
+            "quality_transform": FOV_QUALITY_TRANSFORM,
+            "target_distance_used": False,
+            "aggregation": "mean over assigned FOV tasks",
         },
         "com": {
             "capacity_weight": COM_CAPACITY_POTENTIAL_WEIGHT,
@@ -876,6 +868,11 @@ def comparison_method_configuration(method_spec: MethodSpec) -> dict:
         ),
         "safe_ddqn_eta_c": (
             SAFE_DDQN_ETA_C if method_spec.routing == "safe_ddqn" else None
+        ),
+        "safe_ddqn_dual_normalization_reference_packets": (
+            SAFE_DDQN_DUAL_NORMALIZATION_REFERENCE_PACKETS
+            if method_spec.routing == "safe_ddqn"
+            else None
         ),
         "safe_ddqn_lambda_update_scope": (
             SAFE_DDQN_LAMBDA_UPDATE_SCOPE

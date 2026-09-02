@@ -74,19 +74,27 @@ METRIC_COLUMNS = (
     "routing_wait_count",
     "partial_transmission_count",
     "slot_budget_violation_count",
-    "unattributed_transition_violation_count",
-    "unattributed_pre_routing_violation_count",
     "system_qos_violation_count",
     "system_qos_eligible_packets",
+    "system_qos_violation_probability",
+    "system_eligible_packets",
+    "system_violated_packets",
+    "system_violation_probability",
     "routing_cost_sum",
-    "routing_cost_eligible_packets",
-    "routing_credit_violation_count",
-    "replay_attributed_violation_cost_count",
+    "routing_stage_eligible_packets",
+    "routing_stage_violation_count",
+    "routing_stage_violated_packets",
+    "routing_stage_violation_probability",
+    "routing_immediate_cost_sum",
+    "pre_routing_violation_count",
 )
 
 OPTIONAL_METRIC_COLUMNS = {
     "delay_violation_probability",
     "fov_mean_capture_coverage",
+    "system_qos_violation_probability",
+    "system_violation_probability",
+    "routing_stage_violation_probability",
 }
 
 GENERIC_CROSS_SEED_ARTIFACT_SCHEMA_VERSION = (
@@ -120,14 +128,19 @@ DESCRIPTIVE_EPISODE_METRIC_COLUMNS = (
     "routing_wait_count",
     "partial_transmission_count",
     "slot_budget_violation_count",
-    "unattributed_transition_violation_count",
-    "unattributed_pre_routing_violation_count",
     "system_qos_violation_count",
     "system_qos_eligible_packets",
+    "system_qos_violation_probability",
+    "system_eligible_packets",
+    "system_violated_packets",
+    "system_violation_probability",
     "routing_cost_sum",
-    "routing_cost_eligible_packets",
-    "routing_credit_violation_count",
-    "replay_attributed_violation_cost_count",
+    "routing_stage_eligible_packets",
+    "routing_stage_violation_count",
+    "routing_stage_violated_packets",
+    "routing_stage_violation_probability",
+    "routing_immediate_cost_sum",
+    "pre_routing_violation_count",
 )
 
 METRIC_AGGREGATION_REGISTRY = {

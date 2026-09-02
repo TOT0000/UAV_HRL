@@ -180,7 +180,7 @@ def _interleaved_useful_goodput_training_state():
             "fov_capture_coverage_count": fov_count,
             "com_timely_delivered_bits": com_delivered,
             "total_timely_useful_bits": total_useful,
-            "system_qos_eligible_packet_count": fov_count + com_count,
+            "system_eligible_packets": fov_count + com_count,
         }
     )
     return state
@@ -1148,7 +1148,7 @@ class TrainingCliTest(unittest.TestCase):
         )
 
     def test_checkpoint_schema_is_explicit(self):
-        self.assertEqual(CHECKPOINT_SCHEMA_VERSION, 20)
+        self.assertEqual(CHECKPOINT_SCHEMA_VERSION, 21)
 
 
 if __name__ == "__main__":

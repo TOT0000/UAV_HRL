@@ -24,6 +24,7 @@ from evaluation_metrics import (
     EPISODE_COLUMNS,
     IDENTITY_COLUMNS,
     METRIC_COLUMNS,
+    OPTIONAL_METRIC_COLUMNS,
     PACKET_METRIC_COLUMNS,
 )
 from experiment_config import (
@@ -320,6 +321,9 @@ def _normalize_episode_row(row):
         if column in INTEGER_EPISODE_COLUMNS:
             normalized[column] = int(value)
         elif column in METRIC_COLUMNS:
+            if column in OPTIONAL_METRIC_COLUMNS and value in (None, ""):
+                normalized[column] = None
+                continue
             number = float(value)
             if not np.isfinite(number):
                 raise RuntimeError(f"evaluation metric {column} is non-finite")

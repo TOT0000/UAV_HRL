@@ -41,6 +41,8 @@ from experiment_config import (
     MAX_3D_COMMUNICATION_DISTANCE_M,
     NUM_UAV,
     PERMANENT_GS_GATEWAY_UAV_ID,
+    ROUTING_COST_ATTRIBUTION_CONTRACT_VERSION,
+    SAFE_DDQN_DUAL_NORMALIZATION_REFERENCE_PACKETS,
     SAFE_DDQN_ETA_C,
     SAFE_DDQN_INITIAL_LAMBDA_COST,
     SAFE_DDQN_QOS_TARGET_PROBABILITY,
@@ -75,7 +77,8 @@ from dinkelbach_blocks import (
     dinkelbach_config_metadata,
 )
 
-CHECKPOINT_SCHEMA_VERSION = 20
+CHECKPOINT_SCHEMA_VERSION = 21
+PRE_ROUTING_IMMEDIATE_COST_CHECKPOINT_SCHEMA_VERSION = 20
 PRE_CONTINUOUS_GATEWAY_PROJECTION_CHECKPOINT_SCHEMA_VERSION = 19
 PRE_UNIFIED_400M_COMMUNICATION_CHECKPOINT_SCHEMA_VERSION = 18
 PRE_PERMANENT_GATEWAY_USEFUL_GOODPUT_CHECKPOINT_SCHEMA_VERSION = 17
@@ -191,6 +194,7 @@ FORMAL_CORE_CONFIG_FIELDS = (
     "reference_s2u_max_capacity_mbps",
     "safe_ddqn_initial_lambda_cost",
     "safe_ddqn_eta_c",
+    "safe_ddqn_dual_normalization_reference_packets",
     "safe_ddqn_lambda_update_scope",
     "safe_ddqn_evaluation_lambda_mode",
     "routing_mask_scope",
@@ -819,10 +823,13 @@ def _validate_safe_ddqn_constraint_metadata(metadata):
     routing = metadata.get("routing_agent_configuration") or {}
     expected = {
         "initial_lambda_cost": SAFE_DDQN_INITIAL_LAMBDA_COST,
-        "eta_c": SAFE_DDQN_ETA_C,
+        "normalized_eta_c": SAFE_DDQN_ETA_C,
+        "dual_normalization_reference_packets": (
+            SAFE_DDQN_DUAL_NORMALIZATION_REFERENCE_PACKETS
+        ),
         "qos_target_probability": SAFE_DDQN_QOS_TARGET_PROBABILITY,
         "lambda_update_scope": "episode_end",
-        "cost_denominator": "eligible_packets",
+        "cost_denominator": "fixed_reference_packets",
         "mid_episode_checkpoint_supported": False,
     }
     mismatches = {
@@ -1058,6 +1065,9 @@ def _base_metadata(
         ),
         "task_potential_contract_version": TASK_POTENTIAL_CONTRACT_VERSION,
         "task_potential_configuration": task_potential_contract_metadata(),
+        "routing_cost_attribution_contract_version": (
+            ROUTING_COST_ATTRIBUTION_CONTRACT_VERSION
+        ),
         "movement_agent_kind": kind,
         "movement_agent_gamma": float(td3.gamma),
         "movement_agent_configuration": _movement_agent_configuration(
@@ -1375,8 +1385,10 @@ def _validate_checkpoint_schema(metadata):
     if schema != CHECKPOINT_SCHEMA_VERSION:
         raise RuntimeError(
             "checkpoint_schema_version is incompatible with the boundary-aligned "
-            "stochastic channel, COM QoS/routing-credit, all-participant FOV, "
-            "GS-reachable initial topology, distance-aware VS/COM potentials, "
+            "stochastic channel, routing-stage frozen-queue immediate cost, "
+            "fixed-reference Safe-DDQN dual update, all-participant FOV, "
+            "GS-reachable initial topology, sensing-only VS and range-gap COM "
+            "potentials, "
             "permanent GS gateway, capture-weighted timely useful goodput, "
             "continuous hard-only 400 m UAV 0 gateway projection, "
             "unified inclusive 400 m S2U/U2G/U2U communication range, "
@@ -1397,8 +1409,8 @@ def _validate_checkpoint_schema(metadata):
             and metadata.get("routing_agent_kind", "safe_ddqn") == "safe_ddqn"
         ):
             raise RuntimeError(
-                "legacy safe-DDQN checkpoint lacks adaptive lambda_cost, eta_c, "
-                "and canonical eligible-packet QoS target state"
+                "legacy safe-DDQN checkpoint lacks adaptive lambda_cost and "
+                "canonical routing-stage QoS target state"
             )
         required_contracts = {
             "rng_contract_version": RNG_CONTRACT_VERSION,
@@ -1420,6 +1432,9 @@ def _validate_checkpoint_schema(metadata):
             ),
             "timely_useful_goodput_contract_version": (
                 TIMELY_USEFUL_GOODPUT_CONTRACT_VERSION
+            ),
+            "routing_cost_attribution_contract_version": (
+                ROUTING_COST_ATTRIBUTION_CONTRACT_VERSION
             ),
         }
         mismatches = {
@@ -2424,11 +2439,6 @@ def _validate_full_resume_logging_state(
             or any(value for value in dict(packet_state.get("sr_queue_packet_ids") or {}).values())
         ):
             raise RuntimeError("episode-boundary checkpoint packet queues are not empty")
-        packet_refs = packet_state.get("routing_transition_reference_counts")
-        if not isinstance(packet_refs, dict) or packet_refs:
-            raise RuntimeError("episode-boundary checkpoint has packet routing references")
-        if packet_state.get("pending_terminal_violation_events"):
-            raise RuntimeError("checkpoint has unprocessed terminal violation events")
         for buffer_name in ("inject_buffer", "source_buffer"):
             buffer_state = packet_state.get(buffer_name)
             if not isinstance(buffer_state, dict) or any(
@@ -2508,12 +2518,11 @@ def _validate_full_resume_logging_state(
                 f"allowed_tolerance={tolerance!r}"
             )
         packet_qos_fields = (
-            "system_qos_eligible_packet_count",
-            "system_qos_violation_count",
-            "routing_credit_eligible_packet_count",
-            "routing_credit_violation_count",
-            "unattributed_transition_violation_count",
-            "unattributed_pre_routing_violation_count",
+            "system_eligible_packets",
+            "system_violated_packets",
+            "routing_stage_eligible_packets",
+            "routing_stage_violated_packets",
+            "pre_routing_violation_count",
         )
         if any(
             type(packet_state.get(field)) is not int
@@ -2521,38 +2530,45 @@ def _validate_full_resume_logging_state(
             for field in packet_qos_fields
         ):
             raise RuntimeError("checkpoint packet QoS/credit counters are invalid")
-        system_eligible = packet_state["system_qos_eligible_packet_count"]
-        system_violations = packet_state["system_qos_violation_count"]
-        routing_eligible = packet_state[
-            "routing_credit_eligible_packet_count"
-        ]
-        routing_violations = packet_state["routing_credit_violation_count"]
-        unattributed = packet_state[
-            "unattributed_transition_violation_count"
-        ]
+        system_eligible = packet_state["system_eligible_packets"]
+        system_violations = packet_state["system_violated_packets"]
+        routing_eligible = packet_state["routing_stage_eligible_packets"]
+        routing_violations = packet_state["routing_stage_violated_packets"]
+        pre_routing = packet_state["pre_routing_violation_count"]
         if system_eligible != sum(packet_state["eligible_packet_counts"].values()):
             raise RuntimeError("checkpoint packet eligible counts are inconsistent")
+        for class_field, total_field in (
+            ("routing_stage_eligible_packet_counts", "routing_stage_eligible_packets"),
+            ("routing_stage_violation_counts", "routing_stage_violated_packets"),
+        ):
+            class_counts = packet_state.get(class_field)
+            if (
+                not isinstance(class_counts, dict)
+                or set(class_counts) != {"FOV", "COM"}
+                or any(type(value) is not int or value < 0 for value in class_counts.values())
+                or sum(class_counts.values()) != packet_state[total_field]
+            ):
+                raise RuntimeError(
+                    f"checkpoint packet {class_field} is inconsistent"
+                )
         if (
             routing_eligible > system_eligible
             or system_violations > system_eligible
             or routing_violations > routing_eligible
-            or system_violations != routing_violations + unattributed
-            or packet_state["unattributed_pre_routing_violation_count"]
-            > unattributed
+            or system_violations != routing_violations + pre_routing
         ):
             raise RuntimeError(
-                "checkpoint packet system-QoS/routing-credit conservation failed"
+                "checkpoint packet system-QoS/routing-stage conservation failed"
             )
-        replay_cost = packet_state.get(
-            "replay_attributed_violation_cost_count"
-        )
+        replay_cost = packet_state.get("routing_immediate_cost_sum")
         if (
             not isinstance(replay_cost, (int, float))
             or not np.isfinite(float(replay_cost))
-            or not np.isclose(float(replay_cost), routing_violations)
+            or float(replay_cost) < 0.0
+            or float(replay_cost) > routing_violations
         ):
             raise RuntimeError(
-                "checkpoint replay-attributed routing cost is inconsistent"
+                "checkpoint routing immediate cost is invalid"
             )
         com_state = packet_state.get("com_session_state")
         if (
@@ -2562,8 +2578,7 @@ def _validate_full_resume_logging_state(
         ):
             raise RuntimeError("checkpoint COM-session lifecycle is incompatible")
         ledger_state = validate_routing_transition_ledger_state(
-            training_state.get("routing_transition_state"),
-            reference_counts=packet_refs,
+            training_state.get("routing_transition_state")
         )
         if ledger_state["entries"]:
             raise RuntimeError("episode-boundary checkpoint routing ledger is not drained")

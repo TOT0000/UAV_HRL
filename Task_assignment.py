@@ -9,7 +9,11 @@ import random
 import numpy as np
 from scipy.optimize import linear_sum_assignment
 
-from centralized_movement import fov_task_metrics
+from centralized_movement import (
+    fov_quality_transform,
+    fov_sensing_progress,
+    fov_task_metrics,
+)
 from experiment_config import (
     ASSIGNMENT_DUMMY_UTILITY,
     FOV_COM_PAIR_MAX_DISTANCE_M,
@@ -35,15 +39,6 @@ class AssignmentProblem:
     raw_com_utility: np.ndarray
     raw_fov_coverage: np.ndarray | None = None
     raw_fov_image_quality: np.ndarray | None = None
-
-
-def fov_quality_transform(image_quality):
-    """Apply the assignment-only reciprocal quality policy to production I."""
-
-    value = float(image_quality)
-    if not math.isfinite(value) or value <= 0.0:
-        return 0.0
-    return value if value <= 1.0 else 1.0 / value
 
 
 def assignment_fov_pair_metrics(env, uav_id, task):
@@ -95,32 +90,16 @@ def normalize_feasible_values(raw_values, feasible_mask):
     return normalized
 
 
-def fov_com_distance_m(fov_task, com_task):
-    """Return horizontal distance between the current FOV and COM targets."""
-
-    fov_target = fov_task.target_obj
-    com_target = com_task.target_obj
-    return float(
-        math.hypot(
-            float(fov_target.x) - float(com_target.x),
-            float(fov_target.y) - float(com_target.y),
-        )
-    )
-
-
 def fov_com_pair_is_feasible(
     first_task,
     second_task,
     max_distance_m=FOV_COM_PAIR_MAX_DISTANCE_M,
 ):
-    """Allow only symmetric FOV+COM pairs within the configured distance."""
+    """Allow only symmetric FOV+COM pairs; distance is intentionally ignored."""
 
+    del max_distance_m
     pair = {first_task.task_type, second_task.task_type}
-    if pair != {"FOV", "COM"}:
-        return False
-    fov_task = first_task if first_task.task_type == "FOV" else second_task
-    com_task = first_task if first_task.task_type == "COM" else second_task
-    return fov_com_distance_m(fov_task, com_task) <= float(max_distance_m)
+    return pair == {"FOV", "COM"}
 
 
 def solve_assignment_plan_with_dummies(
@@ -219,11 +198,7 @@ class UAVAssigner:
         if strategy not in {"k_km", "km", "random_one_to_one"}:
             raise ValueError(f"unknown assignment strategy: {strategy}")
         self._snapshot_tasks = list(task_list)
-        max_distance_m = float(
-            FOV_COM_PAIR_MAX_DISTANCE_M
-            if max_distance_m is None
-            else max_distance_m
-        )
+        del max_distance_m
         coverage_threshold = float(
             SEARCH_COVERAGE_THRESHOLD
             if coverage_threshold is None
@@ -240,7 +215,6 @@ class UAVAssigner:
             uav_id_list,
             task_list,
             K=rounds,
-            max_distance_m=max_distance_m,
             coverage_threshold=coverage_threshold,
         )
 
@@ -284,8 +258,8 @@ class UAVAssigner:
                     )
                     raw_fov_coverage[row, column] = coverage
                     raw_fov_image_quality[row, column] = image_quality
-                    raw_fov[row, column] = (
-                        coverage * fov_quality_transform(image_quality)
+                    raw_fov[row, column] = fov_sensing_progress(
+                        coverage, image_quality
                     )
                     if geometry_valid:
                         fov_feasible[row, column] = True
@@ -325,7 +299,6 @@ class UAVAssigner:
         assignments,
         available_original_indices,
         round_index,
-        max_distance_m,
     ):
         feasible = problem.feasible_mask.copy()
         for column, original_index in enumerate(problem.original_task_indices):
@@ -345,7 +318,6 @@ class UAVAssigner:
                 feasible[row, column] &= fov_com_pair_is_feasible(
                     first_task,
                     candidate,
-                    max_distance_m=max_distance_m,
                 )
         return feasible
 
@@ -358,6 +330,7 @@ class UAVAssigner:
         max_distance_m=FOV_COM_PAIR_MAX_DISTANCE_M,
         coverage_threshold=SEARCH_COVERAGE_THRESHOLD,
     ):
+        del max_distance_m
         rounds = min(max(int(K), 0), 2)
         self.assignments = {int(uid): [] for uid in uav_list}
         problem = self.build_problem(
@@ -375,7 +348,6 @@ class UAVAssigner:
                 self.assignments,
                 available,
                 round_index,
-                max_distance_m,
             )
             self.last_round_problems.append((problem.utility_matrix.copy(), feasible.copy()))
             for row, column in solve_assignment_with_dummies(

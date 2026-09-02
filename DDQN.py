@@ -10,6 +10,7 @@ from torch.optim.lr_scheduler import StepLR
 import matplotlib.pyplot as plt
 
 from experiment_config import (
+    SAFE_DDQN_DUAL_NORMALIZATION_REFERENCE_PACKETS,
     SAFE_DDQN_ETA_C,
     SAFE_DDQN_INITIAL_LAMBDA_COST,
     SAFE_DDQN_QOS_TARGET_PROBABILITY,
@@ -108,6 +109,9 @@ class DDQN:
         lr=ROUTING_LEARNING_RATE,
         lambda_cost=SAFE_DDQN_INITIAL_LAMBDA_COST,
         eta_c=SAFE_DDQN_ETA_C,
+        dual_normalization_reference_packets=(
+            SAFE_DDQN_DUAL_NORMALIZATION_REFERENCE_PACKETS
+        ),
         qos_target_probability=SAFE_DDQN_QOS_TARGET_PROBABILITY,
         rng_streams=None,
         master_seed=0,
@@ -141,12 +145,16 @@ class DDQN:
         self.lambda_cost = float(lambda_cost)
         self.initial_lambda_cost = float(SAFE_DDQN_INITIAL_LAMBDA_COST)
         self.eta_c = float(eta_c)
+        self.dual_normalization_reference_packets = int(
+            dual_normalization_reference_packets
+        )
         self.qos_target_probability = float(qos_target_probability)
         if (
             not np.isfinite(self.lambda_cost)
             or self.lambda_cost < 0.0
             or not np.isfinite(self.eta_c)
             or self.eta_c <= 0.0
+            or self.dual_normalization_reference_packets <= 0
             or not np.isfinite(self.qos_target_probability)
             or not 0.0 <= self.qos_target_probability <= 1.0
         ):
@@ -317,17 +325,21 @@ class DDQN:
         used = float(self.lambda_cost)
         self.last_episode_violation_count = violation_count
         self.last_episode_eligible_packet_count = eligible_count
-        if eligible_count == 0:
-            self.last_episode_violation_probability = None
-            self.last_lambda_cost_used = used
-            self.last_lambda_cost_after = used
-            return used
-        violation_probability = violation_count / float(eligible_count)
+        violation_probability = (
+            violation_count / float(eligible_count)
+            if eligible_count
+            else None
+        )
+        residual_count = (
+            violation_count
+            - self.qos_target_probability * float(eligible_count)
+        )
         updated = max(
             0.0,
             used
             + self.eta_c
-            * (violation_probability - self.qos_target_probability),
+            * residual_count
+            / float(self.dual_normalization_reference_packets),
         )
         self.lambda_cost = float(updated)
         self.cost_multiplier_update_count += 1
@@ -340,10 +352,13 @@ class DDQN:
         return {
             "lambda_cost": float(self.lambda_cost),
             "initial_lambda_cost": float(self.initial_lambda_cost),
-            "eta_c": float(self.eta_c),
+            "normalized_eta_c": float(self.eta_c),
+            "dual_normalization_reference_packets": int(
+                self.dual_normalization_reference_packets
+            ),
             "qos_target_probability": float(self.qos_target_probability),
             "lambda_update_scope": "episode_end",
-            "cost_denominator": "eligible_packets",
+            "cost_denominator": "fixed_reference_packets",
             "cost_multiplier_update_count": int(
                 self.cost_multiplier_update_count
             ),
@@ -365,7 +380,8 @@ class DDQN:
         required = {
             "lambda_cost",
             "initial_lambda_cost",
-            "eta_c",
+            "normalized_eta_c",
+            "dual_normalization_reference_packets",
             "qos_target_probability",
             "lambda_update_scope",
             "cost_denominator",
@@ -382,11 +398,13 @@ class DDQN:
         if (
             float(state["initial_lambda_cost"])
             != SAFE_DDQN_INITIAL_LAMBDA_COST
-            or float(state["eta_c"]) != SAFE_DDQN_ETA_C
+            or float(state["normalized_eta_c"]) != SAFE_DDQN_ETA_C
+            or int(state["dual_normalization_reference_packets"])
+            != SAFE_DDQN_DUAL_NORMALIZATION_REFERENCE_PACKETS
             or float(state["qos_target_probability"])
             != SAFE_DDQN_QOS_TARGET_PROBABILITY
             or state["lambda_update_scope"] != "episode_end"
-            or state["cost_denominator"] != "eligible_packets"
+            or state["cost_denominator"] != "fixed_reference_packets"
             or float(state["episode_violation_accumulator"]) != 0.0
             or int(state["episode_eligible_packet_accumulator"]) != 0
             or bool(state["mid_episode_checkpoint_supported"])
@@ -399,6 +417,9 @@ class DDQN:
             raise RuntimeError("safe-DDQN checkpoint lambda_cost is invalid")
         self.initial_lambda_cost = SAFE_DDQN_INITIAL_LAMBDA_COST
         self.eta_c = SAFE_DDQN_ETA_C
+        self.dual_normalization_reference_packets = (
+            SAFE_DDQN_DUAL_NORMALIZATION_REFERENCE_PACKETS
+        )
         self.qos_target_probability = SAFE_DDQN_QOS_TARGET_PROBABILITY
         self.cost_multiplier_update_count = int(
             state["cost_multiplier_update_count"]

@@ -37,7 +37,7 @@ class FormalContractTest(unittest.TestCase):
         self.assertEqual(FORMAL_CHECKPOINT_EPISODE, 1500)
         self.assertEqual(FORMAL_EXPERIMENT_DEFAULTS["training_episodes_per_seed"], 1500)
         self.assertEqual(checkpoint_episode_schedule(1500, 50), list(range(50, 1501, 50)))
-        self.assertEqual(CHECKPOINT_SCHEMA_VERSION, 20)
+        self.assertEqual(CHECKPOINT_SCHEMA_VERSION, 21)
 
     def test_all_methods_publish_the_same_physical_contracts(self):
         shared_fields = (
@@ -204,18 +204,17 @@ class PropulsionContractTest(unittest.TestCase):
 
 
 class QoSAndRoutingRewardContractTest(unittest.TestCase):
-    def test_multiplier_uses_probability_and_skips_empty_episode(self):
+    def test_multiplier_uses_fixed_reference_count_residual(self):
         agent = DDQN(4, 2)
         initial = agent.lambda_cost
         self.assertEqual(agent.qos_target_probability, SAFE_DDQN_QOS_TARGET_PROBABILITY)
-        self.assertAlmostEqual(agent.update_cost_multiplier(2, 20), initial)
-        increased = agent.update_cost_multiplier(3, 20)
-        self.assertAlmostEqual(increased, initial + 0.01 * 0.05)
+        self.assertAlmostEqual(agent.update_cost_multiplier(1, 20), initial)
+        increased = agent.update_cost_multiplier(2, 20)
+        self.assertAlmostEqual(increased, initial + 0.01 / 10_000)
         agent.lambda_cost = 0.0
         self.assertEqual(agent.update_cost_multiplier(0, 20), 0.0)
-        updates = agent.cost_multiplier_update_count
         self.assertEqual(agent.update_cost_multiplier(0, 0), 0.0)
-        self.assertEqual(agent.cost_multiplier_update_count, updates)
+        self.assertEqual(agent.cost_multiplier_update_count, 4)
 
     def test_activated_sr_packet_is_immediately_qos_eligible_and_terminal_violation(self):
         engine = PacketEngine(2)
@@ -226,8 +225,8 @@ class QoSAndRoutingRewardContractTest(unittest.TestCase):
         self.assertEqual(summary["COM"]["sr_admission_drop_packets"], 0)
         self.assertEqual(summary["COM"]["violation_packets"], 1)
         self.assertEqual(summary["COM"]["violation_probability"], 1.0)
-        self.assertEqual(engine.replay_attributed_violation_cost_count, 0.0)
-        self.assertEqual(engine.unattributed_pre_routing_violation_count, 1)
+        self.assertEqual(engine.routing_immediate_cost_sum, 0.0)
+        self.assertEqual(engine.pre_routing_violation_count, 1)
 
     def test_eligible_violation_counts_once_and_cost_is_one(self):
         engine = PacketEngine(2)
@@ -238,7 +237,8 @@ class QoSAndRoutingRewardContractTest(unittest.TestCase):
         self.assertEqual(first["FOV"]["eligible_packets"], 1)
         self.assertEqual(first["FOV"]["violation_packets"], 1)
         self.assertEqual(second["FOV"]["violation_packets"], 1)
-        self.assertEqual(sum(engine.pending_terminal_cost_by_sender.values()), 1.0)
+        self.assertEqual(engine.routing_immediate_cost_sum, 0.0)
+        self.assertEqual(engine.routing_constraint_counts(), (1, 1))
 
     def test_reward_is_exact_capacity_delay_formula_and_has_no_distance_term(self):
         class Environment:

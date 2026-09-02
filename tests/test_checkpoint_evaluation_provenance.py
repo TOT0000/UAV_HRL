@@ -47,10 +47,11 @@ class CheckpointEvaluationProvenanceTest(unittest.TestCase):
             routing.update(
                 lambda_cost=2.75,
                 initial_lambda_cost=0.0,
-                eta_c=0.01,
-                qos_target_probability=0.1,
+                normalized_eta_c=0.01,
+                dual_normalization_reference_packets=10_000,
+                qos_target_probability=0.05,
                 lambda_update_scope="episode_end",
-                cost_denominator="eligible_packets",
+                cost_denominator="fixed_reference_packets",
                 mid_episode_checkpoint_supported=False,
             )
         experiment = {

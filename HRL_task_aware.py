@@ -685,25 +685,6 @@ def _run_routing_slot(
         task_type = violation["task_type"]
         if task_type in violation_stats:
             violation_stats[task_type]["deadline_violated_packets"] += 1
-        sender = int(violation["attributed_sender"])
-        if write_replay:
-            if routing_transition_ledger is not None:
-                transition_id = violation.get("routing_transition_id")
-                if transition_id is None:
-                    # The packet engine already recorded this formal system
-                    # violation as pre-routing/unattributed. It must not enter
-                    # safe-DDQN replay.
-                    continue
-                if routing_transition_ledger.add_cost(transition_id, 1.0):
-                    packet_engine.replay_attributed_violation_cost_count += 1.0
-                else:
-                    raise AssertionError(
-                        "stable routing transition ID rejected delayed cost"
-                    )
-            elif sender >= 0 and _attribute_routing_transition_cost(
-                routing_buffer, pending_routing_transitions, sender, 1.0
-            ):
-                packet_engine.replay_attributed_violation_cost_count += 1.0
     backlog_before = _active_backlog(packet_engine)
     start_of_slot_hol_by_sender = {
         int(uid): packet_engine.get_hol_packet(uid)
@@ -715,7 +696,7 @@ def _run_routing_slot(
         if pkt is not None
     }
     routing_decision_uav_ids = sorted(start_of_slot_hol_by_sender)
-    start_of_slot_eligible_packet_ids = {
+    frozen_queue_packet_ids_by_sender = {
         uid: {
             int(pkt["id"])
             for pkt in packet_engine.get_queue_packets(uid)
@@ -761,10 +742,7 @@ def _run_routing_slot(
             routing_transition_ledger.finalize_causality(
                 states, start_of_slot_hol_by_sender
             )
-            routing_transition_ledger.commit_ready(
-                routing_buffer,
-                packet_engine.routing_transition_reference_counts(),
-            )
+            routing_transition_ledger.commit_ready(routing_buffer)
         else:
             _finalize_pending_routing_transitions(
                 routing_buffer,
@@ -830,7 +808,7 @@ def _run_routing_slot(
         active_capacities,
         current_time=env.current_time,
         start_of_slot_hol_by_sender=start_of_slot_hol_by_sender,
-        start_of_slot_eligible_packet_ids=start_of_slot_eligible_packet_ids,
+        start_of_slot_queue_packet_ids=frozen_queue_packet_ids_by_sender,
         start_of_slot_backlog_bits_by_sender={
             uid: float(backlog_before.get(uid, 0.0))
             for uid in routing_decision_uav_ids
@@ -842,47 +820,40 @@ def _run_routing_slot(
         s2u_block_capacity_profiles=env.active_s2u_capacity_profiles_mbps,
         resolved_s2u_links=resolved_s2u_links,
     )
-    attributable_violation_count = sum(
-        bool(outcome["violated"])
-        for outcome in slot_result["outcomes"]
-    )
-    deferred_cost = float(
-        sum(slot_result["deferred_cost_by_sender"].values())
-    )
-    attributed_cost = float(
-        sum(slot_result["cost_by_sender"].values()) + deferred_cost
-    )
-    if not np.isclose(attributed_cost, float(attributable_violation_count)):
-        raise AssertionError(
-            "deadline violation cost attribution mismatch: "
-            f"attributable_violations={attributable_violation_count}, "
-            f"cost={attributed_cost}"
+    frozen_owner_by_packet_id = {
+        packet_id: sender
+        for sender, packet_ids in frozen_queue_packet_ids_by_sender.items()
+        for packet_id in packet_ids
+    }
+    charged_packet_ids = set(slot_result["charged_snapshot_packet_ids"])
+    if not charged_packet_ids.issubset(frozen_owner_by_packet_id):
+        raise AssertionError("routing cost includes a packet outside the frozen queue")
+    if done:
+        # Horizon settlement happens after this transition is committed. Charge
+        # only still-active packets that belonged to this final action's frozen
+        # sender queue; finalize_episode will record their system/routing-stage
+        # outcomes without retroactively touching replay.
+        active_packet_ids = {
+            int(pkt["id"])
+            for pkt in packet_engine.get_active_packets()
+            if bool(pkt.get("routing_eligible", False))
+        }
+        terminal_snapshot_packet_ids = (
+            active_packet_ids.intersection(frozen_owner_by_packet_id)
+            - charged_packet_ids
         )
-    if write_replay:
-        if routing_transition_ledger is not None:
-            for outcome in slot_result["outcomes"]:
-                if not outcome["violated"]:
-                    continue
-                transition_id = outcome.get("routing_transition_id")
-                if transition_id is None:
-                    continue
-                if routing_transition_ledger.add_cost(transition_id, 1.0):
-                    packet_engine.replay_attributed_violation_cost_count += 1.0
-                else:
-                    raise AssertionError(
-                        "stable routing transition ID rejected slot cost"
-                    )
-        else:
-            for sender, cost in sorted(
-                slot_result["deferred_cost_by_sender"].items()
-            ):
-                if sender >= 0 and routing_buffer.attribute_latest_cost(
-                    sender, cost
-                ):
-                    packet_engine.replay_attributed_violation_cost_count += float(cost)
-            packet_engine.replay_attributed_violation_cost_count += float(
-                sum(slot_result["cost_by_sender"].values())
-            )
+        for packet_id in terminal_snapshot_packet_ids:
+            slot_result["cost_by_sender"][
+                frozen_owner_by_packet_id[packet_id]
+            ] += 1.0
+        slot_result["terminal_snapshot_packet_ids"] = tuple(
+            sorted(terminal_snapshot_packet_ids)
+        )
+        packet_engine.routing_immediate_cost_sum += float(
+            len(terminal_snapshot_packet_ids)
+        )
+    else:
+        slot_result["terminal_snapshot_packet_ids"] = ()
     env.current_time = float(current_time) + step_time
     for outcome in slot_result["outcomes"]:
         task_type = outcome["task_type"]
@@ -896,6 +867,9 @@ def _run_routing_slot(
     if write_replay:
         if routing_transition_ledger is not None:
             for uid, transition_id in routing_transition_ids.items():
+                routing_transition_ledger.set_cost(
+                    transition_id, slot_result["cost_by_sender"][uid]
+                )
                 routing_transition_ledger.set_reward(
                     transition_id, slot_result["reward_by_sender"][uid]
                 )
@@ -903,10 +877,7 @@ def _run_routing_slot(
                 routing_transition_ledger.finalize_causality(
                     {}, {}, terminal=True
                 )
-            routing_transition_ledger.commit_ready(
-                routing_buffer,
-                packet_engine.routing_transition_reference_counts(),
-            )
+            routing_transition_ledger.commit_ready(routing_buffer)
             immediate_next_states = None
         else:
             immediate_next_states = {}
@@ -1229,7 +1200,6 @@ def _full_training_state(
                 str(uid): [] for uid in range(NUM_UAV)
             },
             "sr_queue_packet_ids": {},
-            "routing_transition_reference_counts": {},
             "com_session_state": {
                 "lifecycle_version": COM_SESSION_LIFECYCLE_VERSION,
                 "sessions": {},
@@ -1246,14 +1216,14 @@ def _full_training_state(
             "fov_zero_coverage_packet_count": 0,
             "com_timely_delivered_bits": 0.0,
             "total_timely_useful_bits": 0.0,
-            "pending_terminal_violation_events": [],
-            "system_qos_eligible_packet_count": 0,
-            "system_qos_violation_count": 0,
-            "routing_credit_eligible_packet_count": 0,
-            "routing_credit_violation_count": 0,
-            "replay_attributed_violation_cost_count": 0.0,
-            "unattributed_transition_violation_count": 0,
-            "unattributed_pre_routing_violation_count": 0,
+            "system_eligible_packets": 0,
+            "system_violated_packets": 0,
+            "routing_stage_eligible_packet_counts": {"FOV": 0, "COM": 0},
+            "routing_stage_violation_counts": {"FOV": 0, "COM": 0},
+            "routing_stage_eligible_packets": 0,
+            "routing_stage_violated_packets": 0,
+            "routing_immediate_cost_sum": 0.0,
+            "pre_routing_violation_count": 0,
         }
     movement_post_warmup = max(
         int(total_joint_transitions) - int(warmup_joint_transitions), 0
@@ -2173,12 +2143,8 @@ def train(
         )
         training_state = restored["training_state"]
         if routing_transition_ledger is not None:
-            packet_state = training_state["packet_engine_state"]
             routing_transition_ledger.load_state_dict(
-                training_state["routing_transition_state"],
-                reference_counts=packet_state[
-                    "routing_transition_reference_counts"
-                ],
+                training_state["routing_transition_state"]
             )
         try:
             rng_streams.load_state_dict(training_state["named_rng_state"])
@@ -2784,63 +2750,43 @@ def train(
             float(config.episode_seconds)
         )
         if not evaluation and method_spec.learns_routing:
-            for violation in packet_engine.pending_terminal_violation_events:
-                transition_id = violation.get("routing_transition_id")
-                if transition_id is None:
-                    continue
-                if routing_transition_ledger.add_cost(transition_id, 1.0):
-                    packet_engine.replay_attributed_violation_cost_count += 1.0
-                else:
-                    raise AssertionError(
-                        "stable routing transition ID rejected terminal cost"
-                    )
             routing_transition_ledger.finalize_causality(
                 {}, {}, terminal=True
             )
-            routing_transition_ledger.commit_ready(
-                routing_replay,
-                packet_engine.routing_transition_reference_counts(),
-            )
-            routing_transition_ledger.assert_drained(
-                packet_engine.routing_transition_reference_counts()
-            )
-            packet_engine.pending_terminal_violation_events.clear()
-            packet_engine.pending_terminal_cost_by_sender.clear()
-        else:
-            packet_engine.pending_terminal_violation_events.clear()
-            packet_engine.pending_terminal_cost_by_sender.clear()
+            routing_transition_ledger.commit_ready(routing_replay)
+            routing_transition_ledger.assert_drained()
         (
             episode_system_violation_count,
             episode_system_eligible_packet_count,
         ) = packet_engine.system_qos_counts()
         (
-            episode_routing_cost_sum,
+            episode_routing_stage_violation_count,
             episode_routing_eligible_packet_count,
         ) = packet_engine.routing_constraint_counts()
         packet_engine.assert_violation_credit_conservation()
-        episode_routing_cost_sum = float(episode_routing_cost_sum)
-        if (
-            not evaluation
-            and method_spec.learns_routing
-            and not np.isclose(
-                episode_routing_cost_sum,
-                packet_engine.replay_attributed_violation_cost_count,
-            )
-        ):
-            raise AssertionError(
-                "replay-attributed costs differ from routing-credit violations"
-            )
+        episode_routing_stage_violation_count = int(
+            episode_routing_stage_violation_count
+        )
+        episode_routing_immediate_cost_sum = float(
+            packet_engine.routing_immediate_cost_sum
+        )
         episode_violation_probability = (
             episode_system_violation_count
             / float(episode_system_eligible_packet_count)
             if episode_system_eligible_packet_count
             else None
         )
+        episode_routing_stage_violation_probability = (
+            episode_routing_stage_violation_count
+            / float(episode_routing_eligible_packet_count)
+            if episode_routing_eligible_packet_count
+            else None
+        )
         lambda_cost_after_episode = episode_lambda_cost
         if method_spec.routing == "safe_ddqn":
             if not evaluation:
                 lambda_cost_after_episode = ddqn.update_cost_multiplier(
-                    episode_routing_cost_sum,
+                    episode_routing_stage_violation_count,
                     episode_routing_eligible_packet_count,
                 )
             else:
@@ -3045,7 +2991,7 @@ def train(
                     resolved_evaluation["packet_injection_cutoff_seconds"]
                 ),
                 "episode_horizon_seconds": float(config.episode_seconds),
-                "routing_cost_sum": episode_routing_cost_sum,
+                "routing_cost_sum": episode_routing_immediate_cost_sum,
                 "eligible_packet_count": episode_system_eligible_packet_count,
                 "delay_violation_probability": episode_violation_probability,
                 "sr_admission_drop_count": int(
@@ -3055,20 +3001,31 @@ def train(
                 "system_qos_eligible_packets": (
                     episode_system_eligible_packet_count
                 ),
-                "routing_cost_eligible_packets": (
+                "system_qos_violation_probability": (
+                    episode_violation_probability
+                ),
+                "system_eligible_packets": (
+                    episode_system_eligible_packet_count
+                ),
+                "system_violated_packets": episode_system_violation_count,
+                "system_violation_probability": episode_violation_probability,
+                "routing_stage_eligible_packets": (
                     episode_routing_eligible_packet_count
                 ),
-                "routing_credit_violation_count": int(
-                    packet_engine.routing_credit_violation_count
+                "routing_stage_violated_packets": (
+                    episode_routing_stage_violation_count
                 ),
-                "replay_attributed_violation_cost_count": float(
-                    packet_engine.replay_attributed_violation_cost_count
+                "routing_stage_violation_count": (
+                    episode_routing_stage_violation_count
                 ),
-                "unattributed_transition_violation_count": int(
-                    packet_engine.unattributed_transition_violation_count
+                "routing_stage_violation_probability": (
+                    episode_routing_stage_violation_probability
                 ),
-                "unattributed_pre_routing_violation_count": int(
-                    packet_engine.unattributed_pre_routing_violation_count
+                "routing_immediate_cost_sum": (
+                    episode_routing_immediate_cost_sum
+                ),
+                "pre_routing_violation_count": int(
+                    packet_engine.pre_routing_violation_count
                 ),
                 "lambda_cost_used": episode_lambda_cost,
                 "lambda_cost_after_episode": lambda_cost_after_episode,
@@ -3112,6 +3069,27 @@ def train(
                     eligible_packet_count=episode_system_eligible_packet_count,
                     delay_violation_count=int(episode_system_violation_count),
                     delay_violation_probability=episode_violation_probability,
+                    system_eligible_packets=(
+                        episode_system_eligible_packet_count
+                    ),
+                    system_violated_packets=(
+                        episode_system_violation_count
+                    ),
+                    system_violation_probability=(
+                        episode_violation_probability
+                    ),
+                    routing_stage_eligible_packets=(
+                        episode_routing_eligible_packet_count
+                    ),
+                    routing_stage_violated_packets=(
+                        episode_routing_stage_violation_count
+                    ),
+                    routing_stage_violation_probability=(
+                        episode_routing_stage_violation_probability
+                    ),
+                    routing_immediate_cost_sum=(
+                        episode_routing_immediate_cost_sum
+                    ),
                     lambda_cost_used=episode_lambda_cost,
                     lambda_cost_after_episode=lambda_cost_after_episode,
                     **dinkelbach_event,
@@ -3266,9 +3244,7 @@ def train(
                     named_rng_state=rng_streams.state_dict(),
                     channel_lifecycle_state=env.channel_state_dict(),
                     routing_transition_state=(
-                        routing_transition_ledger.state_dict(
-                            packet_engine.routing_transition_reference_counts()
-                        )
+                        routing_transition_ledger.state_dict()
                         if routing_transition_ledger is not None
                         else RoutingTransitionLedger().state_dict()
                     ),

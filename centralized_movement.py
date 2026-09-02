@@ -17,8 +17,6 @@ from experiment_config import (
     S2U_COMMUNICATION_RANGE_M,
     TASK_POTENTIAL_NORMALIZATION_EPSILON,
     UAV_MAX_ALTITUDE_M,
-    VS_DISTANCE_POTENTIAL_WEIGHT,
-    VS_SENSING_POTENTIAL_WEIGHT,
 )
 from Fov_model_phase import FovModel
 
@@ -252,6 +250,32 @@ def normalized_com_link_quality(env, uav_id, task):
     return utility
 
 
+def fov_quality_transform(image_quality):
+    """Return the canonical finite, positive, saturated FOV image quality."""
+
+    try:
+        value = float(image_quality)
+    except (TypeError, ValueError):
+        return 0.0
+    if not math.isfinite(value) or value <= 0.0:
+        return 0.0
+    return float(np.clip(value, 0.0, 1.0))
+
+
+def fov_sensing_progress(coverage_ratio, image_quality):
+    """Return canonical FOV progress shared by assignment and VS potential."""
+
+    try:
+        coverage = float(coverage_ratio)
+    except (TypeError, ValueError):
+        return 0.0
+    if not math.isfinite(coverage):
+        return 0.0
+    return float(np.clip(coverage, 0.0, 1.0)) * fov_quality_transform(
+        image_quality
+    )
+
+
 def _finite_position(position, dimensions):
     try:
         values = tuple(float(value) for value in position)
@@ -269,26 +293,6 @@ def _positive_finite_reference(value, name):
     if not math.isfinite(value) or value <= 0.0:
         raise ValueError(f"{name} must be positive and finite")
     return value
-
-
-def normalized_horizontal_target_proximity(
-    uav_position,
-    target_position,
-    env_width,
-    env_height,
-):
-    """Return clipped 2-D target proximity using the environment diagonal."""
-
-    width = _positive_finite_reference(env_width, "environment width")
-    height = _positive_finite_reference(env_height, "environment height")
-    uav = _finite_position(uav_position, 2)
-    target = _finite_position(target_position, 2)
-    if uav is None or target is None:
-        return 0.0
-    distance = math.hypot(uav[0] - target[0], uav[1] - target[1])
-    reference = math.hypot(width, height)
-    progress = 1.0 - float(np.clip(distance / reference, 0.0, 1.0))
-    return float(np.clip(progress, 0.0, 1.0))
 
 
 def normalized_s2u_range_gap_proximity(
@@ -324,20 +328,6 @@ def normalized_s2u_range_gap_proximity(
         TASK_POTENTIAL_NORMALIZATION_EPSILON,
     )
     progress = 1.0 - float(np.clip(range_gap / maximum_gap, 0.0, 1.0))
-    return float(np.clip(progress, 0.0, 1.0))
-
-
-def blended_vs_progress(sensing_progress, distance_progress):
-    sensing = float(sensing_progress)
-    distance = float(distance_progress)
-    if not math.isfinite(sensing):
-        sensing = 0.0
-    if not math.isfinite(distance):
-        distance = 0.0
-    progress = (
-        VS_SENSING_POTENTIAL_WEIGHT * float(np.clip(sensing, 0.0, 1.0))
-        + VS_DISTANCE_POTENTIAL_WEIGHT * float(np.clip(distance, 0.0, 1.0))
-    )
     return float(np.clip(progress, 0.0, 1.0))
 
 
@@ -716,21 +706,10 @@ def calculate_movement_potentials(env, c_ref_com):
         _assert_unique_target_tasks(uav_id, grouped)
         for task in grouped["FOV"]:
             coverage, image_score, geometry_valid = fov_task_metrics(env, uav_id, task)
-            sensing_progress = (
-                coverage * float(np.clip(image_score, 0.0, 1.0))
-                if geometry_valid
-                and math.isfinite(float(coverage))
-                and math.isfinite(float(image_score))
-                else 0.0
-            )
-            distance_progress = normalized_horizontal_target_proximity(
-                env.uav_dict[uav_id].get_position(),
-                task["target_pos"],
-                env.env_width,
-                env.env_height,
-            )
             vs_progress.append(
-                blended_vs_progress(sensing_progress, distance_progress)
+                fov_sensing_progress(coverage, image_score)
+                if geometry_valid
+                else 0.0
             )
         for task in grouped["COM"]:
             sr_id = _target_object_id(task, "COM")

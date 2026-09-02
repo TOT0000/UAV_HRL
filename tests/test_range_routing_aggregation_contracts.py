@@ -345,7 +345,7 @@ class RoutingCreditAndRewardContractTest(unittest.TestCase):
             -1.0,
         )
 
-    def test_transition_is_not_sampleable_until_packet_reference_closes(self):
+    def test_transition_commits_after_immediate_cost_and_next_state_are_known(self):
         engine = PacketEngine(num_uav=1)
         pkt = engine.create_packet(0, "COM", 100.0, 0.0)
         replay = ReplayBufferDiscrete(2, 2, max_size=8, n_step=1)
@@ -357,93 +357,45 @@ class RoutingCreditAndRewardContractTest(unittest.TestCase):
             tag_gt=2,
         )
         ledger.set_reward(transition_id, 0.25)
-        engine._set_packet_routing_transition(pkt, transition_id)
+        ledger.set_cost(transition_id, 0.0)
         ledger.finalize_causality(
             {0: np.array([0.0, 1.0], dtype=np.float32)}, {0: pkt}
         )
         self.assertEqual(
-            ledger.commit_ready(
-                replay, engine.routing_transition_reference_counts()
-            ),
-            [],
+            ledger.commit_ready(replay),
+            [transition_id],
         )
         event = engine._mark_deadline_violation(
             pkt, 0.25, sender=0, reason="deadline"
         )
-        self.assertEqual(event["routing_transition_id"], transition_id)
+        self.assertIsNone(event["routing_transition_id"])
         self.assertEqual(engine.routing_constraint_counts(), (1, 1))
         self.assertEqual(engine.system_qos_counts(), (1, 1))
         self.assertTrue(engine.assert_violation_credit_conservation())
-        self.assertEqual(engine.unattributed_transition_violation_count, 0)
-        self.assertTrue(ledger.add_cost(event["routing_transition_id"], 1.0))
-        self.assertEqual(
-            ledger.commit_ready(
-                replay, engine.routing_transition_reference_counts()
-            ),
-            [transition_id],
-        )
         self.assertEqual(replay.transition_id[0], transition_id)
-        self.assertEqual(replay.cost[0, 0], 1.0)
+        self.assertEqual(replay.cost[0, 0], 0.0)
 
-    def test_packet_a_cost_cannot_move_to_later_packet_b_transition(self):
-        engine = PacketEngine(num_uav=1)
-        packet_a = engine.create_packet(0, "COM", 100.0, 0.0)
-        packet_b = engine.create_packet(0, "COM", 100.0, 0.0)
+    def test_immediate_raw_cost_can_exceed_one(self):
         replay = ReplayBufferDiscrete(2, 2, max_size=8, n_step=1)
         ledger = RoutingTransitionLedger()
-        transition_a = ledger.create(
+        transition_id = ledger.create(
             agent_id=0, state=[1.0, 0.0], action=0, tag_gt=2
         )
-        ledger.set_reward(transition_a, 0.0)
-        engine._set_packet_routing_transition(packet_a, transition_a)
-        ledger.finalize_causality({0: [0.0, 1.0]}, {0: packet_a})
-        transition_b = ledger.create(
-            agent_id=0, state=[0.0, 1.0], action=0, tag_gt=2
-        )
-        ledger.set_reward(transition_b, 0.0)
-        engine._set_packet_routing_transition(packet_b, transition_b)
-        self.assertEqual(engine.routing_transition_reference_counts(), {0: 1, 1: 1})
-        event_a = engine._mark_deadline_violation(
-            packet_a, 0.5, sender=0, reason="deadline"
-        )
-        self.assertEqual(event_a["routing_transition_id"], transition_a)
-        ledger.add_cost(event_a["routing_transition_id"], 1.0)
+        ledger.set_reward(transition_id, 0.0)
+        ledger.set_cost(transition_id, 3.0)
         ledger.finalize_causality({}, {}, terminal=True)
-        engine.mark_packet_done(packet_b, current_time=0.5, reason="dropped")
-        ledger.commit_ready(replay, engine.routing_transition_reference_counts())
-        costs = {
-            int(replay.transition_id[index]): float(replay.cost[index, 0])
-            for index in range(replay.size)
-        }
-        self.assertEqual(costs, {transition_a: 1.0, transition_b: 0.0})
+        self.assertEqual(ledger.commit_ready(replay), [transition_id])
+        self.assertEqual(replay.cost[0, 0], 3.0)
 
-    def test_one_wait_transition_can_reference_multiple_packets(self):
-        engine = PacketEngine(num_uav=1)
-        packets = [
-            engine.create_packet(0, "COM", 100.0, 0.0)
-            for _ in range(2)
-        ]
-        transition_id = 7
-        for pkt in packets:
-            engine._set_packet_routing_transition(pkt, transition_id)
-        self.assertEqual(
-            engine.routing_transition_reference_counts(), {transition_id: 2}
-        )
-        engine._set_packet_routing_transition(packets[0], 8)
-        self.assertEqual(
-            engine.routing_transition_reference_counts(), {transition_id: 1, 8: 1}
-        )
-
-    def test_max_hop_violation_returns_its_stable_transition_event(self):
+    def test_max_hop_violation_is_a_routing_stage_outcome_without_transition_credit(self):
         engine = PacketEngine(num_uav=1)
         packet = engine.create_packet(0, "COM", 100.0, 0.0)
         packet["hops"] = 20
-        engine._set_packet_routing_transition(packet, 12)
 
         events = engine.drop_expired_packets(0.25)
 
         self.assertEqual(len(events), 1)
-        self.assertEqual(events[0]["routing_transition_id"], 12)
+        self.assertIsNone(events[0]["routing_transition_id"])
         self.assertEqual(engine.system_qos_counts(), (1, 1))
         self.assertEqual(engine.routing_constraint_counts(), (1, 1))
         self.assertTrue(engine.assert_violation_credit_conservation())

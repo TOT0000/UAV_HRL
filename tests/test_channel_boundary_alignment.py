@@ -353,7 +353,7 @@ class RoutingBoundaryReplayTest(unittest.TestCase):
         self.assertEqual(pending, {})
         self.assertEqual(replay.not_done[0, 0], 0.0)
         self.assertEqual(replay.cost[0, 0], 1.0)
-        self.assertEqual(engine.replay_attributed_violation_cost_count, 1.0)
+        self.assertEqual(engine.routing_immediate_cost_sum, 1.0)
         self.assertEqual(stats["COM"]["deadline_violated_packets"], 1)
 
 
@@ -558,7 +558,7 @@ class CompatibilityAndRegistryTest(unittest.TestCase):
         )
 
     def test_old_boundary_checkpoint_is_rejected_before_restore(self):
-        self.assertEqual(CHECKPOINT_SCHEMA_VERSION, 20)
+        self.assertEqual(CHECKPOINT_SCHEMA_VERSION, 21)
         with self.assertRaisesRegex(RuntimeError, "must be retrained"):
             _validate_checkpoint_schema({"checkpoint_schema_version": 12})
 
@@ -575,7 +575,7 @@ class CompatibilityAndRegistryTest(unittest.TestCase):
                     configuration["movement_replay_contract_version"],
                 )
                 self.assertIn(
-                    "causality-credit-pending",
+                    "sender-next-state-immediate-cost",
                     configuration["packet_routing_causality_contract_version"],
                 )
 

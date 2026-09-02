@@ -29,7 +29,7 @@ import numpy as np
 
 
 PACKET_ENGINE_CHECKPOINT_SCHEMA_VERSION = (
-    "episode-boundary-packet-qos-useful-goodput-session-v3"
+    "episode-boundary-routing-stage-immediate-cost-v4"
 )
 
 
@@ -264,14 +264,10 @@ class PacketEngine:
         self.generated_packet_counts = {"FOV": 0, "COM": 0}
         self.eligible_packet_counts = {"FOV": 0, "COM": 0}
         self.sr_admission_drop_count = 0
-        self.routing_credit_eligible_packet_count = 0
-        self.routing_credit_violation_count = 0
-        self.replay_attributed_violation_cost_count = 0.0
-        self.unattributed_transition_violation_count = 0
-        self.unattributed_pre_routing_violation_count = 0
-        self.pending_terminal_cost_by_sender = defaultdict(float)
-        self.pending_terminal_violation_events = []
-        self.routing_transition_refcounts = defaultdict(int)
+        self.routing_stage_eligible_packet_counts = {"FOV": 0, "COM": 0}
+        self.routing_stage_violation_counts = {"FOV": 0, "COM": 0}
+        self.routing_immediate_cost_sum = 0.0
+        self.pre_routing_violation_count = 0
         self.com_sessions = {}
         self.packet_outcomes = []
 
@@ -666,6 +662,13 @@ class PacketEngine:
             raise ValueError(f"invalid UAV queue id: {uav_id}")
         if pkt.get("_queued_uav") is not None:
             raise AssertionError("packet is already owned by a UAV queue")
+        if not bool(pkt.get("routing_eligible", False)):
+            if not bool(pkt.get("qos_eligible", False)):
+                raise AssertionError("non-QoS packet cannot enter the routing stage")
+            task_type = self._task_norm(pkt.get("task_type", "COM"))
+            pkt["routing_eligible"] = True
+            pkt["routing_eligible_time"] = float(queue_enter_time)
+            self.routing_stage_eligible_packet_counts[task_type] += 1
         pkt["current"] = uav_id
         pkt["queue_enter_time"] = float(queue_enter_time)
         pkt["_queued_uav"] = uav_id
@@ -734,19 +737,14 @@ class PacketEngine:
             "timely_goodput_counted": False,
             "violation_counted": False,
             "qos_eligible": bool(qos_eligible),
-            "routing_eligible": source_kind == "UAV",
-            "routing_credit_eligible": False,
+            "routing_eligible": False,
             "terminal_outcome": None,
             "s2u_receiver": None,
             "s2u_bits_sent": 0.0,
-            "routing_eligible_time": (
-                generation_time if source_kind == "UAV" else None
-            ),
-            # Credit boundary/terminal violations to the packet's most recent
-            # routing decision, even after a just-completed relay hop changes
-            # ``current`` before the receiver has had a decision slot.
+            "routing_eligible_time": None,
+            # Diagnostic only; Safe-DDQN cost never follows this field into
+            # future slots or packet locations.
             "last_routing_sender": None,
-            "last_routing_transition_id": None,
         }
         if self.enable_packet_diagnostic_artifacts:
             pkt.update(
@@ -873,43 +871,6 @@ class PacketEngine:
             if pkt is not None and not pkt.get("done", False)
         ]
 
-    def _set_packet_routing_transition(self, pkt, transition_id):
-        """Replace one packet's stable routing-credit reference."""
-
-        previous = pkt.get("last_routing_transition_id")
-        resolved = None if transition_id is None else int(transition_id)
-        if previous == resolved:
-            return False
-        if previous is not None:
-            previous = int(previous)
-            remaining = int(self.routing_transition_refcounts[previous]) - 1
-            if remaining < 0:
-                raise AssertionError("routing transition reference count became negative")
-            if remaining:
-                self.routing_transition_refcounts[previous] = remaining
-            else:
-                self.routing_transition_refcounts.pop(previous, None)
-        pkt["last_routing_transition_id"] = resolved
-        if resolved is not None:
-            if not bool(pkt.get("routing_eligible", False)):
-                raise AssertionError(
-                    "non-routable packet cannot reference a routing transition"
-                )
-            if not bool(pkt.get("routing_credit_eligible", False)):
-                pkt["routing_credit_eligible"] = True
-                self.routing_credit_eligible_packet_count += 1
-            self.routing_transition_refcounts[resolved] += 1
-        return True
-
-    def routing_transition_reference_counts(self):
-        return {
-            int(transition_id): int(count)
-            for transition_id, count in sorted(
-                self.routing_transition_refcounts.items()
-            )
-            if int(count) > 0
-        }
-
     def system_qos_counts(self):
         """Return the formal E2E system numerator and denominator."""
 
@@ -919,11 +880,11 @@ class PacketEngine:
         )
 
     def routing_constraint_counts(self):
-        """Return only stable-ID-controllable cost numerator and denominator."""
+        """Return routing-stage outcome numerator and denominator."""
 
         return (
-            int(self.routing_credit_violation_count),
-            int(self.routing_credit_eligible_packet_count),
+            int(sum(self.routing_stage_violation_counts.values())),
+            int(sum(self.routing_stage_eligible_packet_counts.values())),
         )
 
     def assert_violation_credit_conservation(self):
@@ -933,17 +894,53 @@ class PacketEngine:
             raise AssertionError("QoS violation count exceeds eligible packets")
         if routing_violations > routing_eligible:
             raise AssertionError(
-                "routing-attributable violations exceed credit-eligible packets"
+                "routing-stage violations exceed routing-stage eligible packets"
             )
         if (
             routing_violations
-            + int(self.unattributed_transition_violation_count)
+            + int(self.pre_routing_violation_count)
             != system_violations
         ):
             raise AssertionError(
-                "system violations differ from routing-attributed plus "
-                "unattributed violations"
+                "system violations differ from routing-stage plus pre-routing "
+                "violations"
             )
+        terminal_ids = [int(row["packet_id"]) for row in self.packet_outcomes]
+        if len(terminal_ids) != len(set(terminal_ids)):
+            raise AssertionError("a packet has multiple terminal outcomes")
+        routing_terminal_rows = [
+            row
+            for row in self.packet_outcomes
+            if bool(row.get("qos_eligible", False))
+            and bool(row.get("routing_eligible", False))
+        ]
+        routing_terminal_violations = sum(
+            row["outcome"] in {"late_delivered", "expired_dropped"}
+            for row in routing_terminal_rows
+        )
+        if routing_terminal_violations != routing_violations:
+            raise AssertionError(
+                "routing-stage violation counter disagrees with terminal outcomes"
+            )
+        active_routing = sum(
+            bool(pkt.get("qos_eligible", False))
+            and bool(pkt.get("routing_eligible", False))
+            for pkt in self.get_active_packets()
+        )
+        if len(routing_terminal_rows) + active_routing != routing_eligible:
+            raise AssertionError(
+                "routing-stage eligible packets lack a unique active/terminal class"
+            )
+        if not self.get_active_packets():
+            if system_eligible != routing_eligible + self.pre_routing_violation_count:
+                raise AssertionError(
+                    "terminal system population is not routing entrants plus "
+                    "pre-routing outcomes"
+                )
+            if self.routing_immediate_cost_sum > routing_violations:
+                raise AssertionError(
+                    "immediate routing costs exceed routing-stage violations"
+                )
         return True
 
     def get_hol_packet(self, uav_id):
@@ -1160,12 +1157,10 @@ class PacketEngine:
             self.fov_violated += 1
         else:
             self.com_violated += 1
-        if pkt.get("last_routing_transition_id") is None:
-            self.unattributed_transition_violation_count += 1
-            if not bool(pkt.get("routing_eligible", False)):
-                self.unattributed_pre_routing_violation_count += 1
+        if bool(pkt.get("routing_eligible", False)):
+            self.routing_stage_violation_counts[task_type] += 1
         else:
-            self.routing_credit_violation_count += 1
+            self.pre_routing_violation_count += 1
         return True
 
     def _mark_deadline_violation(
@@ -1180,12 +1175,7 @@ class PacketEngine:
             return None
         task_type = self._task_norm(pkt.get("task_type", "COM"))
         fallback_owner = pkt.get("current", -1) if sender is None else sender
-        last_sender = pkt.get("last_routing_sender")
-        owner = int(fallback_owner if last_sender is None else last_sender)
-        transition_id = pkt.get("last_routing_transition_id")
-        transition_id = (
-            None if transition_id is None else int(transition_id)
-        )
+        owner = int(fallback_owner)
         self.mark_packet_done(
             pkt,
             current_time=float(current_time),
@@ -1195,7 +1185,7 @@ class PacketEngine:
         return {
             "attributed_sender": owner,
             "sender": owner,
-            "routing_transition_id": transition_id,
+            "routing_transition_id": None,
             "task_type": task_type,
             "packet_id": int(pkt["id"]),
             "packet": pkt,
@@ -1677,8 +1667,6 @@ class PacketEngine:
                     if event is not None:
                         result["violations"].append(event)
                     continue
-                pkt["routing_eligible"] = True
-                pkt["routing_eligible_time"] = slot_end
                 # Enqueue only after this routing slot's eligible packet snapshot.
                 self.enqueue_packet(pkt, receiver, slot_end)
                 self.s2u_completed_packets += 1
@@ -1706,7 +1694,7 @@ class PacketEngine:
         current_time,
         *,
         start_of_slot_hol_by_sender=None,
-        start_of_slot_eligible_packet_ids=None,
+        start_of_slot_queue_packet_ids=None,
         start_of_slot_backlog_bits_by_sender=None,
         routing_transition_ids_by_sender=None,
         start_of_slot_physical_masks_by_sender=None,
@@ -1715,7 +1703,12 @@ class PacketEngine:
         s2u_block_capacity_profiles=None,
         resolved_s2u_links=None,
     ):
-        """Serve each sender FIFO with one shared bit budget for its active link."""
+        """Serve frozen sender FIFOs and emit queue-snapshot immediate costs.
+
+        The cost population is exactly the full UAV queue present when each
+        action was selected. Later S2U/relay arrivals and future violations
+        cannot mutate the returned cost.
+        """
 
         current_time = float(current_time)
         slot_end = current_time + float(self.step_time)
@@ -1735,25 +1728,25 @@ class PacketEngine:
             raise AssertionError(
                 "routing actions must match frozen start-of-slot HOL senders"
             )
-        if start_of_slot_eligible_packet_ids is None:
-            eligible_packet_ids = {
+        if start_of_slot_queue_packet_ids is None:
+            frozen_queue_packet_ids = {
                 sender: {
                     int(pkt["id"]) for pkt in self.get_queue_packets(sender)
                 }
                 for sender in frozen_hol
             }
         else:
-            eligible_packet_ids = {
+            frozen_queue_packet_ids = {
                 int(sender): {int(packet_id) for packet_id in packet_ids}
-                for sender, packet_ids in start_of_slot_eligible_packet_ids.items()
+                for sender, packet_ids in start_of_slot_queue_packet_ids.items()
             }
-            if set(eligible_packet_ids) != set(frozen_hol):
+            if set(frozen_queue_packet_ids) != set(frozen_hol):
                 raise AssertionError(
-                    "eligible packet snapshots must match frozen HOL senders"
+                    "frozen queue snapshots must match frozen HOL senders"
                 )
         for sender, pkt in frozen_hol.items():
-            if int(pkt["id"]) not in eligible_packet_ids[sender]:
-                raise AssertionError("frozen HOL is absent from its eligible snapshot")
+            if int(pkt["id"]) not in frozen_queue_packet_ids[sender]:
+                raise AssertionError("frozen HOL is absent from its queue snapshot")
         if start_of_slot_backlog_bits_by_sender is None:
             frozen_backlog = {
                 sender: float(self.backlog_bits.get(sender, 0.0))
@@ -1768,16 +1761,15 @@ class PacketEngine:
                 raise AssertionError(
                     "frozen backlog snapshots must match frozen HOL senders"
                 )
-        transition_ids = {
-            int(sender): int(transition_id)
-            for sender, transition_id in dict(
-                routing_transition_ids_by_sender or {}
-            ).items()
-        }
-        if transition_ids and set(transition_ids) != set(frozen_hol):
-            raise AssertionError(
-                "routing transition IDs must match frozen HOL senders"
-            )
+        del routing_transition_ids_by_sender
+        snapshot_owner_by_packet_id = {}
+        for sender, packet_ids in frozen_queue_packet_ids.items():
+            for packet_id in packet_ids:
+                if packet_id in snapshot_owner_by_packet_id:
+                    raise AssertionError(
+                        "a packet appears in multiple frozen UAV queue snapshots"
+                    )
+                snapshot_owner_by_packet_id[packet_id] = sender
         effective_masks = {}
         if self.enable_packet_diagnostic_artifacts:
             effective_masks = {
@@ -1789,7 +1781,6 @@ class PacketEngine:
         result = {
             "reward_by_sender": defaultdict(float),
             "cost_by_sender": defaultdict(float),
-            "deferred_cost_by_sender": defaultdict(float),
             "timely_goodput_bits": 0.0,
             "total_timely_useful_bits": 0.0,
             "fov_timely_delivered_raw_bits": 0.0,
@@ -1815,7 +1806,6 @@ class PacketEngine:
         )
         for violation in s2u_result["violations"]:
             sender = int(violation["attributed_sender"])
-            result["deferred_cost_by_sender"][sender] += 1.0
             result["outcomes"].append(
                 {
                     "attributed_sender": sender,
@@ -1856,10 +1846,6 @@ class PacketEngine:
                     effective_mask=effective_masks.get(int(sender)),
                 )
             hol["last_routing_sender"] = int(sender)
-            if sender in transition_ids:
-                self._set_packet_routing_transition(
-                    hol, transition_ids[sender]
-                )
             result["reward_by_sender"][int(sender)] = self.routing_local_reward(
                 env,
                 int(sender),
@@ -1895,7 +1881,7 @@ class PacketEngine:
 
             while cursor.remaining_bits > PACKET_EPS:
                 pkt = self.get_hol_packet(sender)
-                if pkt is None or int(pkt["id"]) not in eligible_packet_ids[sender]:
+                if pkt is None or int(pkt["id"]) not in frozen_queue_packet_ids[sender]:
                     break
                 locked_receiver = pkt.get("hop_receiver")
                 if (
@@ -1908,10 +1894,6 @@ class PacketEngine:
 
                 remaining_before = float(pkt.get("rem_bits", 0.0))
                 pkt["last_routing_sender"] = sender
-                if sender in transition_ids:
-                    self._set_packet_routing_transition(
-                        pkt, transition_ids[sender]
-                    )
                 if float(pkt.get("hop_bits_sent", 0.0)) <= PACKET_EPS:
                     service_start = cursor.current_time()
                     pkt["hop_service_start_time"] = service_start
@@ -2117,12 +2099,6 @@ class PacketEngine:
         )
         for violation in self.expire_packets(slot_end, inclusive=True):
             sender = int(violation["attributed_sender"])
-            cost_bucket = (
-                result["cost_by_sender"]
-                if sender in actions
-                else result["deferred_cost_by_sender"]
-            )
-            cost_bucket[sender] += 1.0
             result["outcomes"].append(
                 {
                     "attributed_sender": sender,
@@ -2135,6 +2111,28 @@ class PacketEngine:
                     "packet": violation["packet"],
                 }
             )
+        # The learning cost is a sender-local, slot-immediate raw count over
+        # the full frozen UAV queue. Packets arriving through S2U or relay
+        # after the snapshot cannot affect any transition in this slot.
+        result["cost_by_sender"] = defaultdict(float)
+        charged_packet_ids = set()
+        for outcome in result["outcomes"]:
+            if not bool(outcome["violated"]):
+                continue
+            packet_id = int(outcome["packet_id"])
+            sender = snapshot_owner_by_packet_id.get(packet_id)
+            if sender is None or packet_id in charged_packet_ids:
+                continue
+            result["cost_by_sender"][sender] += 1.0
+            charged_packet_ids.add(packet_id)
+        for sender in frozen_hol:
+            result["cost_by_sender"][sender] += 0.0
+        result["charged_snapshot_packet_ids"] = tuple(
+            sorted(charged_packet_ids)
+        )
+        self.routing_immediate_cost_sum += float(
+            sum(result["cost_by_sender"].values())
+        )
         return result
 
     def inject_packets(
@@ -2314,10 +2312,6 @@ class PacketEngine:
                 str(sr_id): [int(pkt["id"]) for pkt in queue]
                 for sr_id, queue in sorted(self.sr_queues.items())
             },
-            "routing_transition_reference_counts": {
-                str(key): int(value)
-                for key, value in self.routing_transition_reference_counts().items()
-            },
             "com_session_state": self.com_session_state(),
             "generated_packet_counts": {
                 key: int(value)
@@ -2341,27 +2335,33 @@ class PacketEngine:
             ),
             "com_timely_delivered_bits": float(self.com_timely_delivered_bits),
             "total_timely_useful_bits": float(self.total_timely_useful_bits),
-            "pending_terminal_violation_events": deepcopy(
-                self.pending_terminal_violation_events
-            ),
-            "system_qos_eligible_packet_count": int(
+            "system_eligible_packets": int(
                 sum(self.eligible_packet_counts.values())
             ),
-            "system_qos_violation_count": int(self.total_violated),
-            "routing_credit_eligible_packet_count": int(
-                self.routing_credit_eligible_packet_count
+            "system_violated_packets": int(self.total_violated),
+            "routing_stage_eligible_packet_counts": {
+                key: int(value)
+                for key, value in sorted(
+                    self.routing_stage_eligible_packet_counts.items()
+                )
+            },
+            "routing_stage_violation_counts": {
+                key: int(value)
+                for key, value in sorted(
+                    self.routing_stage_violation_counts.items()
+                )
+            },
+            "routing_stage_eligible_packets": int(
+                sum(self.routing_stage_eligible_packet_counts.values())
             ),
-            "routing_credit_violation_count": int(
-                self.routing_credit_violation_count
+            "routing_stage_violated_packets": int(
+                sum(self.routing_stage_violation_counts.values())
             ),
-            "replay_attributed_violation_cost_count": float(
-                self.replay_attributed_violation_cost_count
+            "routing_immediate_cost_sum": float(
+                self.routing_immediate_cost_sum
             ),
-            "unattributed_transition_violation_count": int(
-                self.unattributed_transition_violation_count
-            ),
-            "unattributed_pre_routing_violation_count": int(
-                self.unattributed_pre_routing_violation_count
+            "pre_routing_violation_count": int(
+                self.pre_routing_violation_count
             ),
         }
 
@@ -2395,8 +2395,6 @@ class PacketEngine:
             pkt["finish_time"] = current_time
         terminal_reason = str(pkt.get("reason", "done"))
         self._record_terminal_outcome(pkt, terminal_reason)
-        self._set_packet_routing_transition(pkt, None)
-
         # 2) remove the packet from whichever per-UAV FIFO currently owns it.
         if remove_from_queue:
             if not self._remove_from_queue(pkt):
@@ -2703,9 +2701,6 @@ class PacketEngine:
                 "delivered_to_gs": delivered_to_gs,
                 "qos_eligible": bool(pkt.get("qos_eligible", False)),
                 "routing_eligible": bool(pkt.get("routing_eligible", False)),
-                "routing_credit_eligible": bool(
-                    pkt.get("routing_credit_eligible", False)
-                ),
                 "sr_waiting_seconds": pkt.get("sr_waiting_seconds"),
                 "remaining_bits_at_drop": pkt.get(
                     "sr_admission_remaining_bits"
@@ -2726,11 +2721,6 @@ class PacketEngine:
                     sender=sender,
                     reason="terminal_deadline",
                 )
-                if event is not None:
-                    self.pending_terminal_violation_events.append(event)
-                    self.pending_terminal_cost_by_sender[
-                        int(event["attributed_sender"])
-                    ] += 1.0
             else:
                 self._mark_sr_admission_drop(pkt, float(current_time))
         return self.packet_metric_summary()
@@ -2962,14 +2952,10 @@ class PacketEngine:
         self.generated_packet_counts = {"FOV": 0, "COM": 0}
         self.eligible_packet_counts = {"FOV": 0, "COM": 0}
         self.sr_admission_drop_count = 0
-        self.routing_credit_eligible_packet_count = 0
-        self.routing_credit_violation_count = 0
-        self.replay_attributed_violation_cost_count = 0.0
-        self.unattributed_transition_violation_count = 0
-        self.unattributed_pre_routing_violation_count = 0
-        self.pending_terminal_cost_by_sender = defaultdict(float)
-        self.pending_terminal_violation_events = []
-        self.routing_transition_refcounts = defaultdict(int)
+        self.routing_stage_eligible_packet_counts = {"FOV": 0, "COM": 0}
+        self.routing_stage_violation_counts = {"FOV": 0, "COM": 0}
+        self.routing_immediate_cost_sum = 0.0
+        self.pre_routing_violation_count = 0
         self.com_sessions = {}
         self.packet_outcomes = []
         self.delay_log = []  # 每跳記錄

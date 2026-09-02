@@ -64,7 +64,7 @@ class AssignmentUtilityTest(unittest.TestCase):
             (0.0, 0.0),
             (0.5, 0.5),
             (1.0, 1.0),
-            (2.0, 0.5),
+            (2.0, 1.0),
             (float("nan"), 0.0),
             (float("inf"), 0.0),
         )
@@ -73,6 +73,7 @@ class AssignmentUtilityTest(unittest.TestCase):
                 transformed = fov_quality_transform(value)
                 self.assertTrue(np.isfinite(transformed))
                 self.assertEqual(transformed, expected)
+        self.assertGreaterEqual(fov_quality_transform(2.0), fov_quality_transform(1.0))
 
     def test_fov_coverage_multiplies_quality_and_i_above_one_remains_feasible(self):
         gt = self.env.gts[0]
@@ -83,7 +84,7 @@ class AssignmentUtilityTest(unittest.TestCase):
             return_value=(0.4, 2.0, True),
         ):
             problem = UAVAssigner(self.env).build_problem([0], [task])
-        self.assertAlmostEqual(problem.raw_fov_utility[0, 0], 0.2)
+        self.assertAlmostEqual(problem.raw_fov_utility[0, 0], 0.4)
         self.assertTrue(problem.feasible_mask[0, 0])
         self.assertAlmostEqual(problem.utility_matrix[0, 0], 0.5)
 
@@ -128,13 +129,13 @@ class AssignmentCompatibilityTest(unittest.TestCase):
         target = SimpleNamespace(x=float(x), y=float(y))
         return Task(task_id, task_type, target, target_id)
 
-    def test_fov_com_distance_boundary_is_symmetric_and_roi_independent(self):
+    def test_fov_com_pairing_is_symmetric_distance_independent_and_roi_independent(self):
         fov = self._task(0, "FOV", 0.0, 0.0, target_id=7)
-        for distance, expected in ((199.0, True), (200.0, True), (200.01, False)):
+        for distance in (199.0, 200.0, 200.01, 900.0):
             with self.subTest(distance=distance):
                 com = self._task(1, "COM", distance, 0.0, target_id=7)
-                self.assertEqual(fov_com_pair_is_feasible(fov, com), expected)
-                self.assertEqual(fov_com_pair_is_feasible(com, fov), expected)
+                self.assertTrue(fov_com_pair_is_feasible(fov, com))
+                self.assertTrue(fov_com_pair_is_feasible(com, fov))
         different_roi_com = self._task(2, "COM", 150.0, 0.0, target_id=99)
         self.assertTrue(fov_com_pair_is_feasible(fov, different_roi_com))
 
@@ -153,7 +154,7 @@ class AssignmentCompatibilityTest(unittest.TestCase):
         ):
             self.assertFalse(fov_com_pair_is_feasible(tasks[first], tasks[second]))
 
-    def test_over_distance_high_utility_is_masked_without_changing_utility(self):
+    def test_over_200m_pair_remains_feasible_and_utility_decides(self):
         env = SimpleNamespace()
         assigner = UAVAssigner(env)
         fov = self._task(0, "FOV", 0.0, 0.0)
@@ -175,11 +176,10 @@ class AssignmentCompatibilityTest(unittest.TestCase):
             {0: [(0, "FOV", 0.5)]},
             {1, 2},
             round_index=1,
-            max_distance_m=200.0,
         )
-        np.testing.assert_array_equal(feasible, [[False, True]])
+        np.testing.assert_array_equal(feasible, [[True, True]])
         np.testing.assert_array_equal(problem.utility_matrix, utility)
-        self.assertEqual(solve_assignment_with_dummies(utility, feasible), [(0, 1)])
+        self.assertEqual(solve_assignment_with_dummies(utility, feasible), [(0, 0)])
 
     def test_k_km_is_capped_at_two_rounds_and_km_at_one(self):
         fov = self._task(0, "FOV", 0.0, 0.0)
