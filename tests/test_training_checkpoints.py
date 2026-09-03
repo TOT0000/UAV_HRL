@@ -56,7 +56,7 @@ from channel_fixtures import initialized_channel_lifecycle_state
 from routing_transition_fixtures import routing_transition_checkpoint_fixture
 
 
-ROUTING_STATE_DIM = 90
+ROUTING_STATE_DIM = 101
 ROUTING_ACTION_DIM = 11
 
 
@@ -1148,7 +1148,7 @@ class TrainingCliTest(unittest.TestCase):
         )
 
     def test_checkpoint_schema_is_explicit(self):
-        self.assertEqual(CHECKPOINT_SCHEMA_VERSION, 21)
+        self.assertEqual(CHECKPOINT_SCHEMA_VERSION, 22)
 
 
 if __name__ == "__main__":

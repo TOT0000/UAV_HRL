@@ -68,7 +68,7 @@ class CheckpointEvaluationProvenanceTest(unittest.TestCase):
             "episode": 1499,
             "movement_state_dim": 429,
             "joint_action_dim": 30,
-            "routing_state_dim": 90,
+            "routing_state_dim": 101,
             "movement_agent_kind": method.agent,
             "movement_agent_gamma": 1.0,
             "movement_agent_configuration": deepcopy(

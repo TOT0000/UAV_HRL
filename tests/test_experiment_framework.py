@@ -117,7 +117,7 @@ class ExperimentFrameworkTest(unittest.TestCase):
         )
         self.assertEqual(result["movement_state_dim"], 429)
         self.assertEqual(result["joint_action_dim"], 30)
-        self.assertEqual(result["routing_state_dim"], 90)
+        self.assertEqual(result["routing_state_dim"], 101)
 
 
 if __name__ == "__main__":

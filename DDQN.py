@@ -14,6 +14,7 @@ from experiment_config import (
     SAFE_DDQN_ETA_C,
     SAFE_DDQN_INITIAL_LAMBDA_COST,
     SAFE_DDQN_QOS_TARGET_PROBABILITY,
+    ROUTING_ACTION_FEATURE_GROUPS,
     ROUTING_GAMMA,
     ROUTING_LEARNING_RATE,
     ROUTING_TAU,
@@ -39,6 +40,12 @@ def routing_action_mask_from_state(next_state, action_dim):
     if state_dim == 5 * num_uav + 20:
         mask_start = num_uav + 7
     elif state_dim == 6 * num_uav + 30:
+        mask_start = num_uav + 8
+    elif state_dim == (
+        num_uav
+        + 25
+        + len(ROUTING_ACTION_FEATURE_GROUPS) * int(action_dim)
+    ):
         mask_start = num_uav + 8
     else:
         raise ValueError(

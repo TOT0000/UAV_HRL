@@ -45,7 +45,7 @@ class Uav10ConfigurationContractTest(unittest.TestCase):
         self.assertEqual(NUM_UAV, 10)
         self.assertEqual(MOVEMENT_STATE_DIM, 429)
         self.assertEqual(JOINT_ACTION_DIM, 30)
-        self.assertEqual(ROUTING_STATE_DIM, 90)
+        self.assertEqual(ROUTING_STATE_DIM, 101)
         self.assertEqual(RESERVED_SEARCH_UAV_IDS, (0, 9))
         self.assertEqual(PERMANENT_GS_GATEWAY_UAV_ID, 0)
         self.assertAlmostEqual(REFERENCE_COM_BANDWIDTH_HZ, 10e6 / 18.0)
@@ -78,7 +78,7 @@ class Uav10ConfigurationContractTest(unittest.TestCase):
         data["schema_version"] = "uav-hrl-scenario-v2"
         with self.assertRaisesRegex(ValueError, "16-UAV.*incompatible"):
             ScenarioManifest.from_dict(data)
-        self.assertEqual(CHECKPOINT_SCHEMA_VERSION, 21)
+        self.assertEqual(CHECKPOINT_SCHEMA_VERSION, 22)
         with self.assertRaisesRegex(RuntimeError, "must be retrained"):
             _validate_checkpoint_schema({"checkpoint_schema_version": 9})
 
@@ -398,7 +398,7 @@ class ChannelAndPacketContractTest(unittest.TestCase):
         self.env.active_s2u_capacities = {(0, receiver): 0.001024}
 
         result = engine.serve_active_links(
-            self.env, {}, {}, current_time=0.75
+            self.env, {}, {}, current_time=1.75
         )
 
         self.assertTrue(packet["done"])

@@ -40,8 +40,21 @@ from experiment_config import (
     MOVEMENT_WARMUP_CONTRACT_VERSION,
     MAX_3D_COMMUNICATION_DISTANCE_M,
     NUM_UAV,
+    PACKET_QOS_CONTRACT_VERSION,
     PERMANENT_GS_GATEWAY_UAV_ID,
+    PRODUCTION_EPISODE_HORIZON_SECONDS,
+    PRODUCTION_PACKET_INJECTION_CUTOFF_SECONDS,
+    PRODUCTION_TASK_DEADLINE_SECONDS,
+    ROUTING_ACTION_DIM,
+    ROUTING_ACTION_FEATURE_GROUPS,
     ROUTING_COST_ATTRIBUTION_CONTRACT_VERSION,
+    ROUTING_GS_PROGRESS_FORMULA,
+    ROUTING_REWARD_ALPHA_CAPACITY,
+    ROUTING_REWARD_ALPHA_DELAY,
+    ROUTING_REWARD_ALPHA_GS_PROGRESS,
+    ROUTING_REWARD_CONTRACT_VERSION,
+    ROUTING_STATE_DIM,
+    ROUTING_STATE_SCHEMA_VERSION,
     SAFE_DDQN_DUAL_NORMALIZATION_REFERENCE_PACKETS,
     SAFE_DDQN_ETA_C,
     SAFE_DDQN_INITIAL_LAMBDA_COST,
@@ -77,7 +90,8 @@ from dinkelbach_blocks import (
     dinkelbach_config_metadata,
 )
 
-CHECKPOINT_SCHEMA_VERSION = 21
+CHECKPOINT_SCHEMA_VERSION = 22
+PRE_GS_PROGRESS_CHECKPOINT_SCHEMA_VERSION = 21
 PRE_ROUTING_IMMEDIATE_COST_CHECKPOINT_SCHEMA_VERSION = 20
 PRE_CONTINUOUS_GATEWAY_PROJECTION_CHECKPOINT_SCHEMA_VERSION = 19
 PRE_UNIFIED_400M_COMMUNICATION_CHECKPOINT_SCHEMA_VERSION = 18
@@ -223,6 +237,14 @@ FORMAL_CORE_CONFIG_FIELDS = (
     "routing_reward_contract_version",
     "routing_reward_alpha_capacity",
     "routing_reward_alpha_delay",
+    "routing_reward_alpha_gs_progress",
+    "routing_gs_progress_formula",
+    "routing_gs_progress_normalization_reference_m",
+    "routing_state_schema_version",
+    "routing_state_dim",
+    "routing_action_dim",
+    "routing_action_order",
+    "routing_action_feature_groups",
     "reference_u2u_max_capacity_mbps",
     "reference_u2g_max_capacity_mbps",
     "propulsion_model_id",
@@ -243,6 +265,8 @@ FORMAL_CORE_CONFIG_FIELDS = (
     "rician_k_db",
     "resolved_fov_deadline_seconds",
     "resolved_com_deadline_seconds",
+    "production_task_deadline_seconds",
+    "production_episode_horizon_seconds",
     "packet_injection_cutoff_seconds",
 )
 ROUTING_EXPLORATION_CONFIG_FIELDS = frozenset(
@@ -1029,6 +1053,10 @@ def _base_metadata(
         "movement_state_dim": int(movement_state_dim),
         "joint_action_dim": int(joint_action_dim),
         "routing_state_dim": int(routing_state_dim),
+        "routing_state_schema_version": ROUTING_STATE_SCHEMA_VERSION,
+        "routing_action_dim": ROUTING_ACTION_DIM,
+        "routing_action_order": "UAV_0_through_UAV_N_minus_1_then_GS",
+        "routing_action_feature_groups": list(ROUTING_ACTION_FEATURE_GROUPS),
         "num_uav": NUM_UAV,
         "movement_feature_schema_version": MOVEMENT_FEATURE_SCHEMA_VERSION,
         "state_contract": "10-uav-no-hidden-num-gt-v1",
@@ -1051,6 +1079,24 @@ def _base_metadata(
         "communication_range_boundary_rule": COMMUNICATION_RANGE_BOUNDARY_RULE,
         "maximum_3d_communication_distance_m": (
             MAX_3D_COMMUNICATION_DISTANCE_M
+        ),
+        "routing_reward_contract_version": ROUTING_REWARD_CONTRACT_VERSION,
+        "routing_reward_alpha_capacity": ROUTING_REWARD_ALPHA_CAPACITY,
+        "routing_reward_alpha_delay": ROUTING_REWARD_ALPHA_DELAY,
+        "routing_reward_alpha_gs_progress": ROUTING_REWARD_ALPHA_GS_PROGRESS,
+        "routing_gs_progress_formula": ROUTING_GS_PROGRESS_FORMULA,
+        "routing_gs_progress_normalization_reference_m": (
+            MAX_3D_COMMUNICATION_DISTANCE_M
+        ),
+        "packet_qos_contract_version": PACKET_QOS_CONTRACT_VERSION,
+        "production_task_deadline_seconds": dict(
+            PRODUCTION_TASK_DEADLINE_SECONDS
+        ),
+        "production_episode_horizon_seconds": (
+            PRODUCTION_EPISODE_HORIZON_SECONDS
+        ),
+        "packet_injection_cutoff_seconds": (
+            PRODUCTION_PACKET_INJECTION_CUTOFF_SECONDS
         ),
         "com_session_lifecycle_version": COM_SESSION_LIFECYCLE_VERSION,
         "fov_packet_generation_contract_version": (
@@ -1392,9 +1438,18 @@ def _validate_checkpoint_schema(metadata):
             "permanent GS gateway, capture-weighted timely useful goodput, "
             "continuous hard-only 400 m UAV 0 gateway projection, "
             "unified inclusive 400 m S2U/U2G/U2U communication range, "
+            "101-D action-wise GS-progress routing state and v7 routing reward, "
+            "2.5 s FOV / 2.0 s COM QoS deadlines, "
             "named-RNG, projected-action and replay "
             "contract and must be retrained: "
             f"checkpoint={schema}, expected={CHECKPOINT_SCHEMA_VERSION}"
+        )
+    routing_state_dim = metadata.get("routing_state_dim")
+    if routing_state_dim is not None and int(routing_state_dim) != ROUTING_STATE_DIM:
+        raise RuntimeError(
+            "checkpoint routing_state_dim is incompatible with the action-wise "
+            "GS-progress schema and must be retrained: "
+            f"checkpoint={routing_state_dim}, expected={ROUTING_STATE_DIM}"
         )
     if schema in {
         CHECKPOINT_SCHEMA_VERSION,
@@ -1436,6 +1491,9 @@ def _validate_checkpoint_schema(metadata):
             "routing_cost_attribution_contract_version": (
                 ROUTING_COST_ATTRIBUTION_CONTRACT_VERSION
             ),
+            "routing_reward_contract_version": ROUTING_REWARD_CONTRACT_VERSION,
+            "routing_state_schema_version": ROUTING_STATE_SCHEMA_VERSION,
+            "packet_qos_contract_version": PACKET_QOS_CONTRACT_VERSION,
         }
         mismatches = {
             key: (metadata.get(key), value)

@@ -10,6 +10,10 @@ class DummyUav:
     def __init__(self, x):
         self.x_u = float(x)
         self.y_u = 0.0
+        self.z_u = 0.0
+
+    def get_position(self):
+        return self.x_u, self.y_u, self.z_u
 
 
 def routing_env(num_uav=3):
@@ -83,7 +87,7 @@ class IncrementalBacklogTest(unittest.TestCase):
         packet = engine.create_packet(0, "COM", 100.0, 0.0)
         engine.record_hop_transmission(packet, 0, 2, 40.0)
 
-        violations = engine.expire_packets(1.0)
+        violations = engine.expire_packets(2.0)
 
         self.assertEqual(len(violations), 1)
         self.assertEqual(engine.backlog_bits[0], 0.0)
@@ -95,7 +99,7 @@ class IncrementalBacklogTest(unittest.TestCase):
         expired_a = engine.create_packet(0, "COM", 30.0, 0.0)
         expired_b = engine.create_packet(0, "COM", 20.0, 0.0)
 
-        violations = engine.expire_packets(1.0)
+        violations = engine.expire_packets(2.0)
 
         self.assertEqual(len(violations), 2)
         self.assertIs(engine.get_hol_packet(0), survivor)
@@ -143,7 +147,7 @@ class IncrementalBacklogTest(unittest.TestCase):
             "_remove_from_queue",
             side_effect=AssertionError("batch expiration used per-packet removal"),
         ) as remove_spy:
-            violations = engine.expire_packets(1.0)
+            violations = engine.expire_packets(2.0)
 
         self.assertEqual(remove_spy.call_count, 0)
         self.assertEqual(len(violations), 10_000)

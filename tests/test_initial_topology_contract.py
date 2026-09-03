@@ -212,7 +212,7 @@ class InitialTopologyGeometryTest(unittest.TestCase):
                 )
 
     def test_schema_15_checkpoint_is_rejected_for_old_initial_geometry(self):
-        self.assertEqual(CHECKPOINT_SCHEMA_VERSION, 21)
+        self.assertEqual(CHECKPOINT_SCHEMA_VERSION, 22)
         with self.assertRaisesRegex(
             RuntimeError, "GS-reachable initial topology.*must be retrained"
         ):

@@ -271,7 +271,7 @@ class RoutingBoundaryReplayTest(unittest.TestCase):
         env, engine = self._environment_and_engine()
         packet = engine.create_packet(0, "COM", 1e12, 0.75)
         packet["deadline_abs"] = 10.0
-        replay = ReplayBufferDiscrete(90, 11, max_size=16, n_step=1)
+        replay = ReplayBufferDiscrete(101, 11, max_size=16, n_step=1)
         pending = {}
         policy = RecordingRoutingPolicy(env.GS_ID)
         stats = violation_stats()
@@ -325,7 +325,7 @@ class RoutingBoundaryReplayTest(unittest.TestCase):
         env, engine = self._environment_and_engine()
         packet = engine.create_packet(0, "COM", 1e12, 0.75)
         packet["deadline_abs"] = 1.0
-        replay = ReplayBufferDiscrete(90, 11, max_size=16, n_step=1)
+        replay = ReplayBufferDiscrete(101, 11, max_size=16, n_step=1)
         pending = {}
         policy = RecordingRoutingPolicy(env.GS_ID)
         stats = violation_stats()
@@ -558,7 +558,7 @@ class CompatibilityAndRegistryTest(unittest.TestCase):
         )
 
     def test_old_boundary_checkpoint_is_rejected_before_restore(self):
-        self.assertEqual(CHECKPOINT_SCHEMA_VERSION, 21)
+        self.assertEqual(CHECKPOINT_SCHEMA_VERSION, 22)
         with self.assertRaisesRegex(RuntimeError, "must be retrained"):
             _validate_checkpoint_schema({"checkpoint_schema_version": 12})
 

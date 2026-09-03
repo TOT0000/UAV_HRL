@@ -66,7 +66,7 @@ class RoutingWaitAndHolStateTest(unittest.TestCase):
         delay_start = 10 + 8 + 11
         delays = state[delay_start:delay_start + 11]
 
-        self.assertEqual(state.shape, (90,))
+        self.assertEqual(state.shape, (101,))
         self.assertAlmostEqual(delays[1], 1.0)
         self.assertAlmostEqual(delays[2], 0.5)
         self.assertAlmostEqual(delays[self.env.GS_ID], 2.0 / 3.0)
@@ -99,8 +99,8 @@ class RoutingWaitAndHolStateTest(unittest.TestCase):
             action_mask=self.env.get_routing_action_mask(5),
         )
 
-        self.assertEqual(state.shape, (90,))
-        np.testing.assert_allclose(state[-4:], [0.0, 1.0, 0.5, 1.0])
+        self.assertEqual(state.shape, (101,))
+        np.testing.assert_allclose(state[-4:], [0.0, 1.0, 0.25, 1.0])
         self.engine.get_state_ta(
             self.env,
             5,

@@ -68,9 +68,9 @@ class PaperMethodRegistryTest(unittest.TestCase):
             spec = MethodSpec.parse(method_id)
             resolved = comparison_method_configuration(spec)
             self.assertEqual(resolved["routing_mask_scope"], "every_slot")
-            self.assertEqual(resolved["packet_injection_cutoff_seconds"], 58.5)
-            self.assertEqual(resolved["resolved_fov_deadline_seconds"], 1.5)
-            self.assertEqual(resolved["resolved_com_deadline_seconds"], 1.0)
+            self.assertEqual(resolved["packet_injection_cutoff_seconds"], 57.5)
+            self.assertEqual(resolved["resolved_fov_deadline_seconds"], 2.5)
+            self.assertEqual(resolved["resolved_com_deadline_seconds"], 2.0)
             if spec.routing == "safe_ddqn":
                 safe_method_count += 1
                 self.assertEqual(resolved["safe_ddqn_qos_target_probability"], 0.05)
@@ -201,11 +201,11 @@ class PaperSweepContractTest(unittest.TestCase):
         self.assertEqual(tuple(point["x_value"] for point in fov), (1.0, 2.0, 4.0, 5.0))
         self.assertEqual(
             {point["overrides"]["fov_deadline_seconds"] for point in com},
-            {1.5},
+            {2.5},
         )
         self.assertEqual(
             {point["overrides"]["com_deadline_seconds"] for point in fov},
-            {1.0},
+            {2.0},
         )
         self.assertEqual(
             {

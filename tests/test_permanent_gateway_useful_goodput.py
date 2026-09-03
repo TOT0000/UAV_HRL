@@ -38,7 +38,21 @@ from td3 import TD3
 
 
 def _routing_env(num_uav=3):
-    return SimpleNamespace(GS_ID=num_uav)
+    return SimpleNamespace(
+        GS_ID=num_uav,
+        num_UAV=num_uav,
+        GS_pos=(0.0, 0.0, 0.0),
+        uav_dict={
+            uav_id: SimpleNamespace(
+                get_position=lambda uav_id=uav_id: (
+                    100.0 - 10.0 * uav_id,
+                    0.0,
+                    0.0,
+                )
+            )
+            for uav_id in range(num_uav)
+        },
+    )
 
 
 def _canonical_row(*, useful_mbits, energy_j, seed=1):

@@ -52,7 +52,7 @@ class RoutingTransitionTerminalTest(unittest.TestCase):
                 {},
             )
         )
-        replay = ReplayBufferDiscrete(90, 11, max_size=16, n_step=1)
+        replay = ReplayBufferDiscrete(101, 11, max_size=16, n_step=1)
         _run_routing_slot(
             self.env,
             self.engine,

@@ -29,6 +29,18 @@ def routing_env(
 ):
     return SimpleNamespace(
         GS_ID=num_uav,
+        num_UAV=num_uav,
+        GS_pos=(0.0, 0.0, 0.0),
+        uav_dict={
+            uav_id: SimpleNamespace(
+                get_position=lambda uav_id=uav_id: (
+                    100.0 - 10.0 * uav_id,
+                    0.0,
+                    0.0,
+                )
+            )
+            for uav_id in range(num_uav)
+        },
         multi_tasks=dict(multi_tasks or {}),
         is_routing_link_in_range=mock.Mock(
             return_value=bool(routing_link_in_range)

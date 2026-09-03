@@ -28,7 +28,7 @@ from training_checkpoint import (
 )
 
 
-ROUTING_STATE_DIM = 90
+ROUTING_STATE_DIM = 101
 ROUTING_ACTION_DIM = 11
 
 

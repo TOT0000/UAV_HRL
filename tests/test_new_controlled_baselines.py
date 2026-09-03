@@ -71,7 +71,7 @@ class MaskedTaskObservationTest(unittest.TestCase):
         )
         masked_routing = apply_observation_strategy(routing, "masked", "routing")
         self.assertEqual(masked_movement.shape, (429,))
-        self.assertEqual(masked_routing.shape, (90,))
+        self.assertEqual(masked_routing.shape, (101,))
         np.testing.assert_array_equal(
             masked_movement[list(MOVEMENT_TASK_ASSIGNMENT_INDICES)], 0.0
         )
@@ -80,7 +80,7 @@ class MaskedTaskObservationTest(unittest.TestCase):
         )
         movement_keep = np.ones(429, dtype=bool)
         movement_keep[list(MOVEMENT_TASK_ASSIGNMENT_INDICES)] = False
-        routing_keep = np.ones(90, dtype=bool)
+        routing_keep = np.ones(ROUTING_STATE_DIM, dtype=bool)
         routing_keep[list(ROUTING_TASK_ASSIGNMENT_INDICES)] = False
         np.testing.assert_array_equal(masked_movement[movement_keep], movement[movement_keep])
         np.testing.assert_array_equal(masked_routing[routing_keep], routing[routing_keep])
@@ -125,7 +125,7 @@ class MaskedTaskObservationTest(unittest.TestCase):
                 # A one-second episode may end before the random scenario admits
                 # any packet to the routing layer.  When routing transitions do
                 # exist, both current and next observations must stay masked.
-                self.assertEqual(replay["state"].shape[1], 90)
+                self.assertEqual(replay["state"].shape[1], ROUTING_STATE_DIM)
                 np.testing.assert_array_equal(
                     replay["state"][:, list(ROUTING_TASK_ASSIGNMENT_INDICES)], 0.0
                 )
@@ -341,7 +341,7 @@ class ControlledDQNTest(unittest.TestCase):
         )
         formal_config = effective_training_config(config, method)
         movement = TD3(4, 2, 1.0, gamma=1.0)
-        routing = ControlledDQN(42, 3, hidden_dim=8)
+        routing = ControlledDQN(101, 3, hidden_dim=8)
         routing.num_training = 1
         routing.target_update_count = 1
         routing.reward_optimizer_update_count = 1
@@ -355,8 +355,8 @@ class ControlledDQNTest(unittest.TestCase):
             phi_vs_t=0.0, phi_vs_t1=0.0,
             phi_com_t=0.0, phi_com_t1=0.0,
         )
-        routing_replay = ReplayBufferDiscrete(42, 3, max_size=8, n_step=1)
-        routing_state = np.zeros(42, dtype=np.float32)
+        routing_replay = ReplayBufferDiscrete(101, 3, max_size=8, n_step=1)
+        routing_state = np.zeros(101, dtype=np.float32)
         routing_state[10:13] = [1.0, 0.0, 1.0]
         routing_replay.add(
             routing_state, 0, routing_state, reward=1.0, cost=3.0, done=False
@@ -406,7 +406,7 @@ class ControlledDQNTest(unittest.TestCase):
                 formal_config=formal_config,
                 movement_state_dim=4,
                 joint_action_dim=2,
-                routing_state_dim=42,
+                routing_state_dim=101,
                 calibration={"fixture": "dqn"},
                 experiment_metadata=experiment,
             )
@@ -420,9 +420,9 @@ class ControlledDQNTest(unittest.TestCase):
             self.assertNotIn("ddqn_optimizers", payload)
 
             restored_movement = TD3(4, 2, 1.0, gamma=1.0)
-            restored_routing = ControlledDQN(42, 3, hidden_dim=8)
+            restored_routing = ControlledDQN(101, 3, hidden_dim=8)
             restored_joint = ReplayBufferJoint(4, 2, max_size=8)
-            restored_replay = ReplayBufferDiscrete(42, 3, max_size=8, n_step=1)
+            restored_replay = ReplayBufferDiscrete(101, 3, max_size=8, n_step=1)
             load_full_resume_checkpoint(
                 checkpoint,
                 td3=restored_movement,
@@ -431,7 +431,7 @@ class ControlledDQNTest(unittest.TestCase):
                 routing_replay=restored_replay,
                 movement_state_dim=4,
                 joint_action_dim=2,
-                routing_state_dim=42,
+                routing_state_dim=101,
                 calibration={"fixture": "dqn"},
                 expected_experiment_metadata={
                     "method_spec_fingerprint": method.compatible_fingerprints

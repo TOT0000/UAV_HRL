@@ -44,7 +44,7 @@ class EpisodeScopedRoutingStateTest(unittest.TestCase):
             action_mask=env.get_routing_action_mask(0),
         )
 
-        self.assertEqual(reset_state.shape, (90,))
+        self.assertEqual(reset_state.shape, (101,))
         np.testing.assert_array_equal(reset_state, fresh_state)
         self.assertEqual(reused.fov_ema, fresh.fov_ema)
 

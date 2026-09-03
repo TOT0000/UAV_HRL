@@ -73,7 +73,7 @@ class DesignDatasetIntegrationTest(unittest.TestCase):
             cls.dinkelbach_state.record_episode(1.0, 2.0)
 
         td3 = TD3(MOVEMENT_STATE_DIM, JOINT_ACTION_DIM, max_action=1.0, gamma=1.0)
-        ddqn = DDQN(90, 11)
+        ddqn = DDQN(101, 11)
         _, calibration = load_com_capacity_reference()
         cls.checkpoint = cls.root / "checkpoints" / "models" / "ep_1500"
         save_model_checkpoint(
@@ -83,7 +83,7 @@ class DesignDatasetIntegrationTest(unittest.TestCase):
             ddqn=ddqn,
             movement_state_dim=429,
             joint_action_dim=30,
-            routing_state_dim=90,
+            routing_state_dim=101,
             calibration=calibration,
             experiment_metadata={
                 "method_id": cls.method.method_id,

@@ -13,6 +13,7 @@ from Channel_model import (
     reference_u2u_max_capacity_mbps,
 )
 from centralized_movement import fov_task_metrics
+from communication_contract import normalized_gs_progress
 from experiment_config import (
     COM_SESSION_LIFECYCLE_VERSION,
     COM_PACKET_RATE_PER_SECOND,
@@ -20,8 +21,10 @@ from experiment_config import (
     FOV_EMA_LIFECYCLE_VERSION,
     PRODUCTION_PACKET_INJECTION_CUTOFF_SECONDS,
     PRODUCTION_TASK_DEADLINE_SECONDS,
+    ROUTING_ACTION_FEATURE_GROUPS,
     ROUTING_REWARD_ALPHA_CAPACITY,
     ROUTING_REWARD_ALPHA_DELAY,
+    ROUTING_REWARD_ALPHA_GS_PROGRESS,
     TOTAL_COMMUNICATION_BANDWIDTH_HZ,
 )
 from fov_ema_lifecycle import validate_fov_ema_state
@@ -43,6 +46,49 @@ MAX_PACKET_HOPS = 20
 PACKET_EPS = 1e-9
 TASK_DEADLINE_SECONDS = dict(PRODUCTION_TASK_DEADLINE_SECONDS)
 EPISODE_INJECTION_CUTOFF_SECONDS = PRODUCTION_PACKET_INJECTION_CUTOFF_SECONDS
+
+
+def _routing_ground_station_position(env):
+    for attribute in ("GS_pos", "gs_position", "GS_POS"):
+        if hasattr(env, attribute):
+            return getattr(env, attribute)
+    raise AttributeError("routing environment has no ground-station position")
+
+
+def canonical_routing_gs_progress(env, sender, receiver):
+    """Return the canonical soft GS progress for one routing action."""
+
+    sender, receiver = int(sender), int(receiver)
+    if receiver == sender:
+        return 0.0
+    gs_id = int(env.GS_ID)
+    sender_position = env.uav_dict[sender].get_position()
+    receiver_position = (
+        None
+        if receiver == gs_id
+        else env.uav_dict[receiver].get_position()
+    )
+    return normalized_gs_progress(
+        sender_position,
+        receiver_position,
+        _routing_ground_station_position(env),
+        is_wait=False,
+    )
+
+
+def action_wise_gs_progress(env, sender):
+    """Return UAV-0..UAV-(N-1),GS progress without applying link masks."""
+
+    num_uav = int(env.num_UAV)
+    if int(env.GS_ID) != num_uav:
+        raise ValueError("canonical routing action order requires GS_ID == num_UAV")
+    return np.asarray(
+        [
+            canonical_routing_gs_progress(env, sender, receiver)
+            for receiver in range(num_uav + 1)
+        ],
+        dtype=float,
+    )
 FOV_PACKET_PAYLOAD_FACTOR = 0.005 * (0.008 * 0.012 / (3.9e-6**2))
 
 
@@ -1412,6 +1458,8 @@ class PacketEngine:
         reward = (
             ROUTING_REWARD_ALPHA_CAPACITY * capacity_norm
             - ROUTING_REWARD_ALPHA_DELAY * (transmission_norm + queue_norm)
+            + ROUTING_REWARD_ALPHA_GS_PROGRESS
+            * canonical_routing_gs_progress(env, sender, receiver)
         )
         if not np.isfinite(reward):
             raise RuntimeError("canonical routing reward is NaN or Inf")
@@ -3050,68 +3098,27 @@ class PacketEngine:
             e2e[pid]["hops"]+= 1
         return [{"pkt_id": pid, **v} for pid, v in e2e.items()]
     def debug_print_state_v2(self, uav_id, state, env):
-        """
-        統一版 State Debug Print，格式類似你原本的版本
-        """
-        N = env.num_UAV
-        L = N + 1
+        """Print the canonical routing state using its named feature schema."""
 
-        idx = 0
+        from observation_strategy import routing_state_feature_names
+
+        names = routing_state_feature_names()
+        values = np.asarray(state, dtype=float).reshape(-1)
+        if values.shape[0] != len(names):
+            raise ValueError(
+                f"routing state has {values.shape[0]} values, expected {len(names)}"
+            )
         print("\n=== State Breakdown ===")
-
-        # UAV one-hot
-        uav_one_hot = state[idx:idx+N]; idx += N
-        print("UAV one-hot ID:", uav_one_hot)
-
-        # Energy / My backlog
-        energy_norm = state[idx]; idx += 1
-        my_backlog = state[idx]; idx += 1
-        print("Normalized energy:", energy_norm)
-        print("My backlog (log-norm):", my_backlog)
-
-        # Task flags / FOV flag
-        task_flags = state[idx:idx+4]; idx += 4
-        fov_task_flag = state[idx]; idx += 1
-        print("Task flags:", task_flags, "FOV_task_flag:", fov_task_flag)
-
-        # Link info
-        link_valid_mask = state[idx:idx+L]; idx += L
-        link_delay_norm = state[idx:idx+L]; idx += L
-        link_capacity_norm = state[idx:idx+L]; idx += L
-        next_hop_backlog_norm = state[idx:idx+L]; idx += L
-        print("Link valid mask:", link_valid_mask)
-        print("Link delay vector (norm):", link_delay_norm)
-        print("Link capacity vector (norm):", link_capacity_norm)
-        print("Next hop backlog vector (log-norm):", next_hop_backlog_norm)
-
-        # Geometry / GS
-        uav_position = state[idx:idx+3]; idx += 3
-        dist_to_GS_norm = state[idx]; idx += 1
-        eta_to_GS_slots_norm = state[idx]; idx += 1
-        print("UAV position:", uav_position)
-        print("Dist to GS (norm):", dist_to_GS_norm)
-        print("ETA to GS (slots, norm):", eta_to_GS_slots_norm)
-
-        # FOV features
-        overlap_ema = state[idx]; idx += 1
-        unvisited_ema = state[idx]; idx += 1
-        frontier_ema = state[idx]; idx += 1
-        print("FOV overlap EMA:", overlap_ema)
-        print("FOV unvisited EMA:", unvisited_ema)
-        print("FOV frontier EMA:", frontier_ema)
-
-        # 與任務資訊
-        print(f"[STATE DEBUG] UAV {uav_id} → task_type = {env.uav_dict[uav_id].task_type}")
-        print(f"[STATE DEBUG] UAV {uav_id} → multi_tasks = {[t['task_type'] for t in env.multi_tasks.get(uav_id, [])]}")
-
+        for name, value in zip(names, values):
+            print(f"{name}: {value}")
         print("=== End of State ===\n")
 
     def get_state(self, env, uav_id, visited_nodes=None, backlog_bits=None):
         """
-        Task-aware routing state with dimension 6N+30.
+        Legacy task-aware routing state with dimension 5N+20.
 
-        The original 6N+26 fields keep their order. Four HOL packet fields
-        [is_FOV, is_COM, normalized_slack, normalized_remaining] are appended.
+        This historical helper retains its old field order. Production routing
+        uses :meth:`get_state_ta` and its action-wise GS-progress schema.
         """
         
 
@@ -3261,9 +3268,9 @@ class PacketEngine:
         action_mask=None,
     ):
         """
-        Canonical task-aware state (dimension = 6N + 30, L=N+1 including GS):
+        Canonical task-aware state (dimension = 7N + 31, L=N+1 including GS):
         A 個體/任務: [uav_one_hot(N), energy(1), my_backlog(1), task_flags(4), fov_task_flag(1)]
-        B 通訊(逐鏈路; 含GS): [link_valid_mask(L), link_delay_norm(L), link_capacity_norm(L), next_hop_backlog_log_norm(L)]
+        B 通訊(逐鏈路; 含GS): [link_valid_mask(L), link_delay_norm(L), link_capacity_norm(L), next_hop_backlog_log_norm(L), gs_progress_norm(L), next_hop_is_fov(L)]
         C 幾何/回傳緊迫度: [uav_position(3), dist_to_GS_norm(1), eta_to_GS_slots_norm(1)]
         D FOV 探索(EMA): [overlap_ema(1), unvisited_ema(1), frontier_ema(1)]
         """
@@ -3358,6 +3365,7 @@ class PacketEngine:
         link_delay_norm           = np.zeros(L, dtype=float)
         link_capacity_norm        = np.zeros(L, dtype=float)
         next_hop_backlog_log_norm = np.zeros(L, dtype=float)
+        gs_progress_norm = action_wise_gs_progress(env, uav_id)
         next_hop_is_fov = np.zeros(L, dtype=float)
         effective_mask = self.get_effective_action_mask(
             env, uav_id, action_mask
@@ -3413,12 +3421,7 @@ class PacketEngine:
 
         # ---------- 幾何/回傳緊迫度 ----------
         # 取得 GS 座標（請依你的環境擇一實作）
-        if hasattr(env, "gs_position"):
-            gs_x, gs_y, gs_z = env.gs_position
-        elif hasattr(env, "GS_POS"):
-            gs_x, gs_y, gs_z = env.GS_POS
-        else:
-            gs_x, gs_y, gs_z = 0.0, 0.0, 0.0  # fallback
+        gs_x, gs_y, gs_z = _routing_ground_station_position(env)
 
         # 2D 距離（通常回傳走水平面）
         dist_to_GS = float(np.hypot(x_u - gs_x, y_u - gs_y))
@@ -3469,7 +3472,8 @@ class PacketEngine:
             link_valid_mask,                                   # L
             link_delay_norm,                                   # L
             link_capacity_norm,                                # L
-            next_hop_backlog_log_norm,                         # L       => B: 4L
+            next_hop_backlog_log_norm,                         # L
+            gs_progress_norm,                                  # L
             next_hop_is_fov,                                   # L
 
             np.array([x_u, y_u, z_norm], dtype=float),             # 3 (z normalized)
@@ -3483,7 +3487,7 @@ class PacketEngine:
             hol_context,                                        # 4
         ], dtype=float)
 
-        expected = 6 * N + 30
+        expected = N + 25 + len(ROUTING_ACTION_FEATURE_GROUPS) * L
         assert state.shape[0] == expected, f"State dim mismatch: got {state.shape[0]}, expect {expected}"
         # self.debug_print_state_v2(uav_id, state, env)
         return state

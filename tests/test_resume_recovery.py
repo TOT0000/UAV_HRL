@@ -123,7 +123,7 @@ class ResumeRecoveryTest(unittest.TestCase):
             "episode": completed_episode - 1,
             "movement_state_dim": 429,
             "joint_action_dim": 30,
-            "routing_state_dim": 90,
+            "routing_state_dim": 101,
             "movement_agent_kind": "td3",
             "movement_agent_gamma": 1.0,
             "movement_agent_configuration": self.formal_config[
@@ -237,7 +237,7 @@ class ResumeRecoveryTest(unittest.TestCase):
         common = {
             "movement_state_dim": 429,
             "joint_action_dim": 30,
-            "routing_state_dim": 90,
+            "routing_state_dim": 101,
             "td3_gamma": 1.0,
             "ddqn_gamma": 0.99,
             "calibration": self.calibration,

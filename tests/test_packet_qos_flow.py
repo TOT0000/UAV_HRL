@@ -8,6 +8,10 @@ class DummyUav:
     def __init__(self, x):
         self.x_u = float(x)
         self.y_u = 0.0
+        self.z_u = 0.0
+
+    def get_position(self):
+        return self.x_u, self.y_u, self.z_u
 
 
 def routing_env(num_uav=3):
@@ -93,14 +97,14 @@ class PacketQosFlowTest(unittest.TestCase):
         engine = PacketEngine(num_uav=3, step_time=0.25)
         com = engine.create_packet(0, "COM", 100.0, 0.0)
         fov = engine.create_packet(1, "FOV", 100.0, 0.0)
-        self.assertEqual(com["deadline_abs"], 1.0)
-        self.assertEqual(fov["deadline_abs"], 1.5)
+        self.assertEqual(com["deadline_abs"], 2.0)
+        self.assertEqual(fov["deadline_abs"], 2.5)
 
         timely = engine.serve_active_links(
             env,
             actions={0: env.GS_ID, 1: 1},
             capacities={(0, env.GS_ID): 0.0004},
-            current_time=0.75,
+            current_time=1.75,
         )
         self.assertEqual(timely["timely_goodput_bits"], 100.0)
         self.assertEqual(timely["cost_by_sender"][0], 0.0)
@@ -111,7 +115,7 @@ class PacketQosFlowTest(unittest.TestCase):
             env,
             actions={0: env.GS_ID},
             capacities={(0, env.GS_ID): 0.0002},
-            current_time=0.75,
+            current_time=1.75,
         )
         self.assertTrue(expired["done"])
         self.assertEqual(expired["reason"], "deadline")
@@ -119,10 +123,10 @@ class PacketQosFlowTest(unittest.TestCase):
         self.assertEqual(missed["timely_goodput_bits"], 0.0)
         self.assertEqual(missed["raw_final_hop_bits"], 50.0)
         self.assertEqual(expired_engine.deadline_drops, 1)
-        self.assertEqual(expired_engine.expire_packets(1.25), [])
+        self.assertEqual(expired_engine.expire_packets(2.25), [])
         self.assertEqual(expired_engine.deadline_drops, 1)
 
-    def test_injection_cutoff_is_strictly_before_58_5_seconds(self):
+    def test_injection_cutoff_is_strictly_before_57_5_seconds(self):
         env = SimpleNamespace(
             source_uavs=set(),
             multi_tasks={
@@ -136,7 +140,7 @@ class PacketQosFlowTest(unittest.TestCase):
         engine.inject_packets(
             env,
             delay_bound_steps=20,
-            current_time=58.25,
+            current_time=57.25,
             step_time=0.25,
             base_ctrl_rate=4,
         )
@@ -144,7 +148,7 @@ class PacketQosFlowTest(unittest.TestCase):
         engine.inject_packets(
             env,
             delay_bound_steps=20,
-            current_time=58.5,
+            current_time=57.5,
             step_time=0.25,
             base_ctrl_rate=4,
         )
@@ -221,7 +225,7 @@ class PacketQosFlowTest(unittest.TestCase):
             env,
             actions={0: 2},
             capacities={(0, 2): 0.001},
-            current_time=0.75,
+            current_time=1.75,
         )
 
         self.assertIsNone(engine.get_hol_packet(2))
@@ -246,7 +250,7 @@ class PacketQosFlowTest(unittest.TestCase):
             env,
             actions={0: 2, 2: 2},
             capacities={(0, 2): 0.001},
-            current_time=0.75,
+            current_time=1.75,
         )
 
         self.assertTrue(incoming["done"])
@@ -260,7 +264,7 @@ class PacketQosFlowTest(unittest.TestCase):
         resident = engine.create_packet(2, "COM", 100.0, 0.0)
 
         result = engine.serve_active_links(
-            env, actions={2: 2}, capacities={}, current_time=0.75
+            env, actions={2: 2}, capacities={}, current_time=1.75
         )
 
         self.assertTrue(resident["done"])
@@ -294,7 +298,7 @@ class PacketQosFlowTest(unittest.TestCase):
             env,
             actions={0: 2},
             capacities={(0, 2): 0.001},
-            current_time=0.75,
+            current_time=1.75,
         )
 
         delivered = sum(not outcome["violated"] for outcome in result["outcomes"])

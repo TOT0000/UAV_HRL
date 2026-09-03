@@ -13,7 +13,7 @@ process. The registry keys are `td3_dinkelbach`, `ddpg_dinkelbach`,
 energy/delivery accounting, evaluation, and logging.
 
 The added baselines are orthogonal configurations of that shared flow. The
-`wo_ta` method keeps the 429-D/90-D layouts but zeros named task-assignment
+`wo_ta` method keeps the 429-D/101-D layouts but zeros named task-assignment
 observation fields. The controlled DQN method replaces safe-DDQN with a masked
 standard DQN. The combined random baseline uses K-KM, the common projected
 continuous movement domain, and uniform random routing over each slot's current
@@ -116,15 +116,19 @@ design-dataset collection, aggregation, and exact-resume workflows.
   formal system QoS violations but cannot update the multiplier or replay cost;
   an episode with no routing-credit-eligible packets does not update it
 - learned routing uses the common local reward
-  `capacity_norm - 0.5 * (transmission_delay_norm + queue_delay_norm)` with
-  fixed canonical U2U/U2G reference capacities and no distance/progress bonus.
+  `capacity_norm - 0.5 * (transmission_delay_norm + queue_delay_norm) + 2 * gs_progress_norm`
+  with fixed canonical U2U/U2G reference capacities. The soft GS progress is
+  `clip((d_3D(sender,GS) - d_3D(receiver,GS)) / 400 m, -1, 1)`; a direct GS
+  action uses receiver distance zero and wait is exactly zero. Progress never
+  changes the existing action mask.
   For the frozen slot-start aggregate FIFO, transmission delay is the HOL
   remaining bits divided by the actual equal-FDMA/fading slot capacity and
   queue delay is all remaining bits behind that HOL divided by the same
   capacity. Elapsed wall-clock HOL wait is diagnostic only
-- production FOV/COM deadlines `1.5 s`/`1.0 s`; completion at the exact deadline
+- production FOV/COM deadlines `2.5 s`/`2.0 s`; completion at the exact deadline
   is timely
-- production packet injection cutoff `58.5 s`
+- production packet injection cutoff `57.5 s`, derived as the 60-second horizon
+  minus the maximum production deadline
 - every assigned FOV source runs its existing rate integrator beginning with the
   first normal post-assignment injection event. Generation is not gated by full
   RoI coverage, geometry validity, or image-quality validity, and assignment
@@ -186,7 +190,8 @@ and unit task weights: `F_x = beta_x * (Phi_x(s_next) - Phi_x(s))`, where
 therefore contributes zero, approaching a task target contributes positively,
 and retreating contributes negatively. Terminal transitions retain the existing
 terminal-zero potential lifecycle. No absolute per-step proximity bonus and no
-delivery or connectivity potential is present; routing reward is unchanged.
+delivery or connectivity potential is present; routing reward is governed by
+the separate GS-progress routing contract above.
 
 Search remains exactly the global `mean(visited_bitmap)`. It does not use the
 Search target position, a frontier target, or any target-distance term, and the
@@ -217,8 +222,9 @@ The contract is `vs-horizontal-proximity-com-400m-range-gap-blend-v2`. TD3 and D
 consume the same potential definitions, random-movement methods publish the
 same environment/reward contract, and `*_no_task_potential` methods disable all
 Search/VS/COM shaping. Existing observations already contain UAV and task
-positions plus COM capacity, so movement/routing state dimensions remain
-429/90 and the joint action dimension remains 30.
+positions plus COM capacity. Movement state and joint action dimensions remain
+429 and 30; routing state is 101-D after adding the 11 action-wise GS-progress
+features in UAV-0-through-UAV-9-then-GS order.
 
 ## Stochastic channel contract
 
@@ -483,17 +489,18 @@ python -X utf8 comparison_experiment.py aggregate --input-dir runs/comparison/ev
 
 Exact-resume checkpoints validate the method fingerprint, training-manifest
 relationship, training seed, the complete Dinkelbach block state, and its configuration.
-Checkpoint schema v20 is the current continuous-hard-only-gateway,
+Checkpoint schema v22 is the current action-wise-GS-progress,
+continuous-hard-only-gateway,
 unified-400-m communication, permanent-gateway, coverage-weighted useful
 goodput, boundary-aligned stochastic-channel,
 movement/routing replay, utility/QoS, routing-ID causality/credit,
-frozen-backlog reward, GS-reachable initial topology, distance-aware VS/COM
+frozen-backlog plus soft-GS-progress reward, GS-reachable initial topology, distance-aware VS/COM
 task potentials, hard-range/COM-session, atomic-FOV, seed-ratio
 aggregation, propulsion, and four-slot/fifty-block movement-channel contract.
-Schema v19 and every older schema is rejected before weights or replay state are
+Schema v21 and every older schema is rejected before weights or replay state are
 restored and must be retrained; no legacy checkpoint migration is attempted.
 The current schema
-stores the 429/30/90 dimensions, movement feature schema, direct-ratio bit/J
+stores the 429/30/101 dimensions, movement feature schema, direct-ratio bit/J
 objective, shared gateway/channel/packet contracts, active FOV capture-coverage
 snapshots, raw/useful counters, inject buffers, adaptive routing lifecycle, and
 FOV-EMA state. The movement feature schema remains unchanged; the scenario
@@ -515,7 +522,7 @@ block never triggers a forced update. Full-resume logging schema v2 separately
 persists `lambda_used_log` and `lambda_after_episode_log`; a legacy ambiguous
 single-lambda log is rejected for exact resume without changing model-only
 checkpoint compatibility. Formal evaluation validates model-only type, schema,
-429/30/90 dimensions, movement-agent/DDQN gamma, COM normalization, method/seed,
+429/30/101 dimensions, movement-agent/DDQN gamma, COM normalization, method/seed,
 the formal core configuration before loading weights. The checkpoint's own
 planned horizon may be smaller than the current run horizon only when
 `total_episodes` is the sole formal-config difference, the checkpoint episode is
@@ -750,7 +757,7 @@ scenario IDs, evaluation count/horizon/seed, 10-UAV count, and fully resolved
 traffic-rate/deadline/cutoff overrides. The deadline-violation (Fig. 6) sweep
 uses a scoped `57.0 s` packet-injection cutoff so its maximum `3.0 s` deadline
 can resolve within the 60-second horizon; other training and evaluation suites
-retain the production `58.5 s` cutoff.
+retain the production `57.5 s` cutoff.
 Within each training seed, delay is total delivered E2E delay divided by total
 delivered packet count. FOV and COM violation rows remain diagnostics. The
 formal `ALL` seed row pools the two raw violation counts over the two raw

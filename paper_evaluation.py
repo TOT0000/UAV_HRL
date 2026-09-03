@@ -23,6 +23,8 @@ from experiment_config import (
     FORMAL_EXPERIMENT_DEFAULTS,
     MethodSpec,
     NUM_UAV,
+    PRODUCTION_PACKET_INJECTION_CUTOFF_SECONDS,
+    PRODUCTION_TASK_DEADLINE_SECONDS,
     comparison_method_configuration,
 )
 from HRL_task_aware import TrainingConfig, train
@@ -127,12 +129,24 @@ def resolve_evaluation_suite(suite):
 
 
 def validate_production_deadlines():
-    expected = {"FOV": 1.5, "COM": 1.0}
+    expected = {
+        key: float(value)
+        for key, value in PRODUCTION_TASK_DEADLINE_SECONDS.items()
+    }
     actual = {key: float(value) for key, value in TASK_DEADLINE_SECONDS.items()}
     if actual != expected:
         raise RuntimeError(
             f"production task deadlines differ from the paper contract: {actual}"
         )
+    horizon = float(FORMAL_EXPERIMENT_DEFAULTS["episode_seconds"])
+    if not math.isclose(
+        float(PRODUCTION_PACKET_INJECTION_CUTOFF_SECONDS)
+        + max(actual.values()),
+        horizon,
+        rel_tol=0.0,
+        abs_tol=1e-12,
+    ):
+        raise RuntimeError("production packet cutoff does not preserve a full deadline")
     return actual
 
 

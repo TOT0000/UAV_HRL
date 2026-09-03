@@ -31,13 +31,25 @@ from object import SRTeam, UAV
 from training_checkpoint import CHECKPOINT_SCHEMA_VERSION, checkpoint_episode_schedule
 
 
+class _RoutingEnvironment:
+    GS_ID = 2
+    num_UAV = 2
+    GS_pos = (0.0, 0.0, 0.0)
+
+    def __init__(self):
+        self.uav_dict = {
+            0: UAV(0, 400.0, 0.0, 0.0),
+            1: UAV(1, 200.0, 0.0, 0.0),
+        }
+
+
 class FormalContractTest(unittest.TestCase):
     def test_formal_horizon_and_checkpoint_schedule(self):
         self.assertEqual(FORMAL_TRAINING_EPISODES, 1500)
         self.assertEqual(FORMAL_CHECKPOINT_EPISODE, 1500)
         self.assertEqual(FORMAL_EXPERIMENT_DEFAULTS["training_episodes_per_seed"], 1500)
         self.assertEqual(checkpoint_episode_schedule(1500, 50), list(range(50, 1501, 50)))
-        self.assertEqual(CHECKPOINT_SCHEMA_VERSION, 21)
+        self.assertEqual(CHECKPOINT_SCHEMA_VERSION, 22)
 
     def test_all_methods_publish_the_same_physical_contracts(self):
         shared_fields = (
@@ -240,16 +252,13 @@ class QoSAndRoutingRewardContractTest(unittest.TestCase):
         self.assertEqual(engine.routing_immediate_cost_sum, 0.0)
         self.assertEqual(engine.routing_constraint_counts(), (1, 1))
 
-    def test_reward_is_exact_capacity_delay_formula_and_has_no_distance_term(self):
-        class Environment:
-            GS_ID = 2
-
-        env = Environment()
+    def test_reward_is_exact_capacity_delay_plus_soft_gs_progress_formula(self):
+        env = _RoutingEnvironment()
         engine = PacketEngine(2, task_deadlines_seconds={"FOV": 2.0, "COM": 1.0})
         packet = engine.create_packet(0, "FOV", 1_000_000.0, 0.0)
         capacity = 10.0
         maximum = reference_u2g_max_capacity_mbps(TOTAL_COMMUNICATION_BANDWIDTH_HZ)
-        expected = capacity / maximum - 0.5 * ((0.1 / 2.0) + 0.0)
+        expected = capacity / maximum - 0.5 * ((0.1 / 2.0) + 0.0) + 2.0
         first = engine.routing_local_reward(
             env,
             0,
@@ -259,9 +268,7 @@ class QoSAndRoutingRewardContractTest(unittest.TestCase):
             current_time=0.0,
         )
         self.assertAlmostEqual(first, expected, places=12)
-        # The reward API reads no GS geometry; changing a diagnostic distance
-        # cannot reintroduce progress-to-GS shaping.
-        env.gs_distance_m = 10_000.0
+        env.uav_dict[0].x_u = 200.0
         second = engine.routing_local_reward(
             env,
             0,
@@ -270,7 +277,7 @@ class QoSAndRoutingRewardContractTest(unittest.TestCase):
             pkt=packet,
             current_time=0.0,
         )
-        self.assertEqual(first, second)
+        self.assertAlmostEqual(first - second, 1.0, places=12)
         self.assertEqual(
             engine.routing_local_reward(
                 env, 0, 0, 0.0, pkt=packet, current_time=0.0
@@ -285,10 +292,7 @@ class QoSAndRoutingRewardContractTest(unittest.TestCase):
         )
 
     def test_partial_hop_reward_keeps_service_start_queue_wait_fixed(self):
-        class Environment:
-            GS_ID = 2
-
-        env = Environment()
+        env = _RoutingEnvironment()
         engine = PacketEngine(2, task_deadlines_seconds={"FOV": 2.0, "COM": 1.0})
         packet = engine.create_packet(0, "COM", 1_000_000.0, 0.0)
         packet["hop_service_start_time"] = 0.25
@@ -302,10 +306,7 @@ class QoSAndRoutingRewardContractTest(unittest.TestCase):
         self.assertEqual(second, first)
 
     def test_next_hol_preserves_historical_wait_and_clips_at_deadline(self):
-        class Environment:
-            GS_ID = 2
-
-        env = Environment()
+        env = _RoutingEnvironment()
         engine = PacketEngine(2, task_deadlines_seconds={"FOV": 2.0, "COM": 1.0})
         first_packet = engine.create_packet(0, "COM", 100.0, 0.0)
         second_packet = engine.create_packet(0, "COM", 100.0, 0.0)

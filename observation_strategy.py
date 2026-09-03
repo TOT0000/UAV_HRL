@@ -6,10 +6,14 @@ import numpy as np
 import torch
 
 from centralized_movement import MOVEMENT_STATE_DIM, movement_state_feature_schema
-from experiment_config import NUM_UAV
+from experiment_config import (
+    NUM_UAV,
+    ROUTING_ACTION_FEATURE_GROUPS,
+    ROUTING_STATE_DIM as CANONICAL_ROUTING_STATE_DIM,
+)
 
 
-ROUTING_STATE_DIM = 6 * NUM_UAV + 30
+ROUTING_STATE_DIM = CANONICAL_ROUTING_STATE_DIM
 _MOVEMENT_TASK_SUFFIXES = {
     "task_search",
     "task_fov",
@@ -42,13 +46,7 @@ def routing_state_feature_names():
             "assigned_source_uav",
         ]
     )
-    for group in (
-        "effective_action_mask",
-        "link_delay",
-        "link_capacity",
-        "next_hop_backlog",
-        "next_hop_assigned_fov",
-    ):
+    for group in ROUTING_ACTION_FEATURE_GROUPS:
         names.extend(f"{group}[{index}]" for index in range(NUM_UAV + 1))
     names.extend(
         [

@@ -67,7 +67,7 @@ class ExperimentPreflightTest(unittest.TestCase):
             "episode": 1499,
             "movement_state_dim": 429,
             "joint_action_dim": 30,
-            "routing_state_dim": 90,
+            "routing_state_dim": 101,
             "movement_agent_kind": "td3",
             "movement_agent_gamma": 1.0,
             "movement_agent_configuration": formal_config[
@@ -349,7 +349,7 @@ class ExperimentPreflightTest(unittest.TestCase):
                 "episode": 0,
                 "movement_state_dim": 429,
                 "joint_action_dim": 30,
-                "routing_state_dim": 90,
+                "routing_state_dim": 101,
                 "centralized_td3_gamma": 1.0,
                 "routing_ddqn_gamma": 0.99,
                 "routing_agent_kind": "safe_ddqn",

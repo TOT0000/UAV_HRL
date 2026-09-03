@@ -54,7 +54,7 @@ class RoutingImmediateCostContractTest(unittest.TestCase):
                 {},
             )
         )
-        replay = replay or ReplayBufferDiscrete(90, 11, max_size=32, n_step=1)
+        replay = replay or ReplayBufferDiscrete(101, 11, max_size=32, n_step=1)
         _run_routing_slot(
             self.env,
             self.engine,
@@ -105,7 +105,7 @@ class RoutingImmediateCostContractTest(unittest.TestCase):
         relayed["deadline_abs"] = 1.0
         resident = self.engine.create_packet(1, "FOV", 100.0, 0.0)
         resident["deadline_abs"] = 10.0
-        replay = ReplayBufferDiscrete(90, 11, max_size=32, n_step=1)
+        replay = ReplayBufferDiscrete(101, 11, max_size=32, n_step=1)
 
         self.run_slot(
             {0: 1, 1: 1},

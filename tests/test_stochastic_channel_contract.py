@@ -429,7 +429,14 @@ class ObservationFdmaAndPacketServiceTest(unittest.TestCase):
         env = SimpleNamespace(
             GS_ID=1,
             GS_pos=(0.0, 0.0, 0.0),
-            uav_dict={0: SimpleNamespace(x_u=10.0, y_u=0.0)},
+            uav_dict={
+                0: SimpleNamespace(
+                    x_u=10.0,
+                    y_u=0.0,
+                    z_u=0.0,
+                    get_position=lambda: (10.0, 0.0, 0.0),
+                )
+            },
         )
         engine = PacketEngine(1)
         packet = engine.create_packet(0, "COM", 2.5, 0.0)

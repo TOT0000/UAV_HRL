@@ -327,7 +327,14 @@ class RoutingCreditAndRewardContractTest(unittest.TestCase):
     def test_reward_uses_frozen_other_backlog_not_elapsed_wait(self):
         engine = PacketEngine(num_uav=1)
         pkt = engine.create_packet(0, "COM", 200.0, 0.0)
-        env = SimpleNamespace(GS_ID=1)
+        env = SimpleNamespace(
+            GS_ID=1,
+            num_UAV=1,
+            GS_pos=(0.0, 0.0, 0.0),
+            uav_dict={
+                0: SimpleNamespace(get_position=lambda: (200.0, 0.0, 0.0))
+            },
+        )
         first = engine.routing_local_reward(
             env, 0, 1, 0.001, pkt=pkt, current_time=0.0,
             total_backlog_bits=600.0,

@@ -73,7 +73,7 @@ class SafeDDQNTargetTest(unittest.TestCase):
             [[40.0, 99.0, 60.0], [40.0, 99.0, 60.0]]
         )
 
-        # Task-aware state layout: 6N + 30, with N=2 and mask starting at N+8.
+        # Task-aware state layout: 7N + 31, with N=2 and mask starting at N+8.
         next_state = torch.zeros((2, 42), dtype=torch.float32)
         next_state[0, 0] = 1.0
         next_state[1, 1] = 1.0

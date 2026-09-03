@@ -413,7 +413,14 @@ class RoutingQScoreNoBehaviorChangeTest(unittest.TestCase):
         engine = PacketEngine(num_uav=2, step_time=0.25)
         packet = engine.create_packet(0, "FOV", 100.0, 0.0)
         packet["deadline_abs"] = 0.75
-        env = SimpleNamespace(GS_ID=2)
+        env = SimpleNamespace(
+            GS_ID=2,
+            GS_pos=(0.0, 0.0, 0.0),
+            uav_dict={
+                0: SimpleNamespace(get_position=lambda: (100.0, 0.0, 0.0)),
+                1: SimpleNamespace(get_position=lambda: (50.0, 0.0, 0.0)),
+            },
+        )
         engine.serve_active_links(
             env,
             actions={0: actions[0]},
@@ -458,7 +465,7 @@ class RoutingQScoreNoBehaviorChangeTest(unittest.TestCase):
         engine = PacketEngine(num_uav=10, step_time=0.25)
         packet = engine.create_packet(0, "COM", 100.0, 0.0)
         packet["deadline_abs"] = 0.25
-        replay = ReplayBufferDiscrete(90, 11, max_size=16, n_step=1)
+        replay = ReplayBufferDiscrete(101, 11, max_size=16, n_step=1)
         q_r = np.asarray([2.0, 1.0, *([0.0] * 9)])
         agent = fixed_agent(q_r, np.zeros(11), lambda_cost=15.0)
         accumulator = (

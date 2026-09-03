@@ -585,7 +585,7 @@ class FovOverlapEmaLifecycleTest(unittest.TestCase):
                 np.testing.assert_array_equal(
                     observed[ema_indices], physical[ema_indices]
                 )
-                self.assertEqual(observed.shape, (90,))
+                self.assertEqual(observed.shape, (101,))
 
 
 if __name__ == "__main__":

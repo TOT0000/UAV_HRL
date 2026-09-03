@@ -34,6 +34,21 @@ from Channel_model import (
 
 
 NUM_UAV = 10
+ROUTING_ACTION_DIM = NUM_UAV + 1
+ROUTING_ACTION_FEATURE_GROUPS = (
+    "effective_action_mask",
+    "link_delay",
+    "link_capacity",
+    "next_hop_backlog",
+    "gs_progress_norm",
+    "next_hop_assigned_fov",
+)
+ROUTING_NON_ACTION_FEATURE_DIM = NUM_UAV + 25
+ROUTING_STATE_DIM = (
+    ROUTING_NON_ACTION_FEATURE_DIM
+    + len(ROUTING_ACTION_FEATURE_GROUPS) * ROUTING_ACTION_DIM
+)
+ROUTING_STATE_SCHEMA_VERSION = "action-wise-gs-progress-v1"
 ROI_COUNT_MIN = 2
 ROI_COUNT_MAX = 8
 RESERVED_SEARCH_UAV_IDS = (0, NUM_UAV - 1)
@@ -144,7 +159,7 @@ ROUTING_OPTIMIZER_UPDATE_SCOPE = "every_4_routing_slots"
 FOV_EMA_LIFECYCLE_VERSION = "all-participant-precommit-search-union-v5"
 SR_ROUTE_LIFECYCLE_VERSION = "assigned-and-arrived-derived-state-v2"
 PACKET_QOS_CONTRACT_VERSION = (
-    "assigned-fov-and-activated-com-immediate-qos-v7"
+    "assigned-fov-and-activated-com-immediate-qos-v8"
 )
 FOV_PACKET_GENERATION_CONTRACT_VERSION = (
     "assigned-source-rate-integrator-capture-coverage-snapshot-v2"
@@ -165,10 +180,15 @@ QOS_AGGREGATE_CONTRACT_VERSION = (
     "canonical-single-result-seed-ratio-of-sums-student-t-v3"
 )
 ROUTING_REWARD_CONTRACT_VERSION = (
-    "unified-400m-slot-start-other-backlog-over-fading-effective-capacity-v6"
+    "unified-400m-slot-start-backlog-fading-capacity-gs-progress-v7"
 )
 ROUTING_REWARD_ALPHA_CAPACITY = 1.0
 ROUTING_REWARD_ALPHA_DELAY = 0.5
+ROUTING_REWARD_ALPHA_GS_PROGRESS = 2.0
+ROUTING_GS_PROGRESS_FORMULA = (
+    "clip((d_3d(sender,GS)-d_3d(receiver,GS))/"
+    "maximum_3d_communication_distance_m,-1,1)"
+)
 MOVEMENT_CHANNEL_TIMING_VERSION = (
     "boundary-prepared-held-command-four-slots-fifty-fading-blocks-v4"
 )
@@ -195,8 +215,20 @@ PROPULSION_PARAMETERS = MappingProxyType(
         "d_0": 0.834,
     }
 )
-PRODUCTION_TASK_DEADLINE_SECONDS = {"FOV": 1.5, "COM": 1.0}
-PRODUCTION_PACKET_INJECTION_CUTOFF_SECONDS = 58.5
+PRODUCTION_EPISODE_HORIZON_SECONDS = 60.0
+PRODUCTION_TASK_DEADLINE_SECONDS = {"FOV": 2.5, "COM": 2.0}
+PRODUCTION_PACKET_INJECTION_CUTOFF_SECONDS = (
+    PRODUCTION_EPISODE_HORIZON_SECONDS
+    - max(PRODUCTION_TASK_DEADLINE_SECONDS.values())
+)
+if not math.isclose(
+    PRODUCTION_PACKET_INJECTION_CUTOFF_SECONDS
+    + max(PRODUCTION_TASK_DEADLINE_SECONDS.values()),
+    PRODUCTION_EPISODE_HORIZON_SECONDS,
+    rel_tol=0.0,
+    abs_tol=1e-12,
+):
+    raise RuntimeError("production packet cutoff does not preserve a full deadline")
 
 CURRENT_METHOD_ID = "td3_dinkelbach"
 
@@ -542,7 +574,7 @@ FORMAL_EXPERIMENT_DEFAULTS = {
     "num_uav": NUM_UAV,
     "roi_count_min": ROI_COUNT_MIN,
     "roi_count_max": ROI_COUNT_MAX,
-    "episode_seconds": 60,
+    "episode_seconds": int(PRODUCTION_EPISODE_HORIZON_SECONDS),
     "routing_slot_seconds": ROUTING_SLOT_SECONDS,
     "evaluation_episodes_per_trained_seed": 100,
     "checkpoint_interval_episodes": 50,
@@ -924,6 +956,16 @@ def comparison_method_configuration(method_spec: MethodSpec) -> dict:
         "routing_reward_contract_version": ROUTING_REWARD_CONTRACT_VERSION,
         "routing_reward_alpha_capacity": ROUTING_REWARD_ALPHA_CAPACITY,
         "routing_reward_alpha_delay": ROUTING_REWARD_ALPHA_DELAY,
+        "routing_reward_alpha_gs_progress": ROUTING_REWARD_ALPHA_GS_PROGRESS,
+        "routing_gs_progress_formula": ROUTING_GS_PROGRESS_FORMULA,
+        "routing_gs_progress_normalization_reference_m": (
+            MAX_3D_COMMUNICATION_DISTANCE_M
+        ),
+        "routing_state_schema_version": ROUTING_STATE_SCHEMA_VERSION,
+        "routing_state_dim": ROUTING_STATE_DIM,
+        "routing_action_dim": ROUTING_ACTION_DIM,
+        "routing_action_order": "UAV_0_through_UAV_N_minus_1_then_GS",
+        "routing_action_feature_groups": list(ROUTING_ACTION_FEATURE_GROUPS),
         "reference_u2u_max_capacity_mbps": (
             reference_u2u_max_capacity_mbps(TOTAL_COMMUNICATION_BANDWIDTH_HZ)
         ),
@@ -950,6 +992,12 @@ def comparison_method_configuration(method_spec: MethodSpec) -> dict:
         "rician_k_db": RICIAN_K_DB,
         "resolved_fov_deadline_seconds": PRODUCTION_TASK_DEADLINE_SECONDS["FOV"],
         "resolved_com_deadline_seconds": PRODUCTION_TASK_DEADLINE_SECONDS["COM"],
+        "production_task_deadline_seconds": dict(
+            PRODUCTION_TASK_DEADLINE_SECONDS
+        ),
+        "production_episode_horizon_seconds": (
+            PRODUCTION_EPISODE_HORIZON_SECONDS
+        ),
         "packet_injection_cutoff_seconds": (
             PRODUCTION_PACKET_INJECTION_CUTOFF_SECONDS
         ),
