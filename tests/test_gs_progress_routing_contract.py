@@ -114,7 +114,7 @@ class RoutingRewardAndStateContractTest(unittest.TestCase):
         self.assertEqual(ROUTING_REWARD_ALPHA_GS_PROGRESS, 2.0)
         self.assertTrue(ROUTING_REWARD_CONTRACT_VERSION.endswith("v7"))
 
-    def test_state_is_101d_and_progress_block_survives_task_masking(self):
+    def test_state_is_143d_and_progress_block_survives_task_masking(self):
         env = Simulator(num_UAV=NUM_UAV)
         env.num_GT = 2
         env.reset_environment()
@@ -198,7 +198,7 @@ class QosAndCheckpointContractTest(unittest.TestCase):
         self.assertEqual(DEADLINE_SWEEP_INJECTION_CUTOFF_SECONDS, 57.0)
 
     def test_schema_21_and_90d_current_schema_are_rejected(self):
-        self.assertEqual(CHECKPOINT_SCHEMA_VERSION, 24)
+        self.assertEqual(CHECKPOINT_SCHEMA_VERSION, 25)
         with self.assertRaisesRegex(RuntimeError, "must be retrained"):
             _validate_checkpoint_schema({"checkpoint_schema_version": 21})
         with self.assertRaisesRegex(RuntimeError, "GS-progress"):

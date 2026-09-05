@@ -83,7 +83,7 @@ class ControlledMethodRegistryTest(unittest.TestCase):
             spec = MethodSpec.parse(key)
             self.assertEqual(spec.assignment, "k_km")
             self.assertEqual(spec.routing, "safe_ddqn")
-        self.assertEqual(NUM_UAV, 10)
+        self.assertEqual(NUM_UAV, 16)
         self.assertEqual((ROI_COUNT_MIN, ROI_COUNT_MAX), (2, 8))
         environment = Simulator(num_UAV=NUM_UAV)
         environment.num_GT = ROI_COUNT_MAX + 1
@@ -133,8 +133,8 @@ class ControlledMethodRegistryTest(unittest.TestCase):
                     method_spec=spec,
                 )
                 self.assertEqual(result["movement_agent_kind"], spec.agent)
-                self.assertEqual(result["movement_state_dim"], 519)
-                self.assertEqual(result["joint_action_dim"], 30)
+                self.assertEqual(result["movement_state_dim"], 675)
+                self.assertEqual(result["joint_action_dim"], 48)
                 self.assertEqual(result["proposal_batches"], 4)
                 self.assertIsNone(result["packet_outcome_artifacts"])
                 metadata = result["run_metadata"]

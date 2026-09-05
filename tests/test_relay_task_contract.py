@@ -31,7 +31,7 @@ def discover_all(env):
 
 class RelayCountAndAssignmentTest(unittest.TestCase):
     def setUp(self):
-        self.env = Simulator(num_UAV=10)
+        self.env = Simulator(num_UAV=16)
         self.env.num_GT = 4
         self.env.reset_environment()
 
@@ -69,6 +69,27 @@ class RelayCountAndAssignmentTest(unittest.TestCase):
             self.assertEqual([task["task_type"] for task in tasks], ["Relay"])
             self.assertNotIn("target_pos", tasks[0])
             self.assertIsNone(tasks[0]["target_obj_id"])
+
+    def test_roi_eight_k_km_fills_relay_quota_and_both_service_rounds(self):
+        self.env.num_GT = 8
+        self.env.reset_environment()
+        discover_all(self.env)
+        self.env.assign_tasks()
+
+        assigned_types = [
+            task["task_type"]
+            for tasks in self.env.multi_tasks.values()
+            for task in tasks
+        ]
+        self.assertEqual(assigned_types.count("Relay"), 4)
+        self.assertEqual(assigned_types.count("FOV"), 8)
+        self.assertEqual(assigned_types.count("COM"), 8)
+        self.assertEqual(assigned_types.count("Search"), 2)
+        for uid in self.env.last_assignment.selected_relay_uav_ids:
+            self.assertEqual(
+                [task["task_type"] for task in self.env.multi_tasks[uid]],
+                ["Relay"],
+            )
 
     def test_km_uses_one_joint_relay_fov_com_round(self):
         discover_all(self.env)
@@ -122,7 +143,7 @@ class RelayCountAndAssignmentTest(unittest.TestCase):
 
 class RelayUtilityAndStateTest(unittest.TestCase):
     def setUp(self):
-        self.env = Simulator(num_UAV=10)
+        self.env = Simulator(num_UAV=16)
         self.env.num_GT = 2
         self.env.reset_environment()
 
@@ -171,11 +192,11 @@ class RelayUtilityAndStateTest(unittest.TestCase):
         self.env.multi_tasks[1] = [
             {"task_type": "Relay", "target_id": "relay-2-1", "target_obj_id": None}
         ]
-        packet_engine = PacketEngine(10)
+        packet_engine = PacketEngine(16)
         state = get_global_movement_state(
             self.env,
             packet_engine,
-            {uid: 0.0 for uid in range(10)},
+            {uid: 0.0 for uid in range(16)},
             c_ref_com=1.0,
             remaining_time=1.0,
         )
@@ -198,7 +219,7 @@ class RelayUtilityAndStateTest(unittest.TestCase):
         for suffix in relay_suffixes:
             self.assertEqual(state[by_name[f"uav_2.{suffix}"]], 0.0)
         masked = apply_observation_strategy(state, "masked", "movement")
-        for uid in range(10):
+        for uid in range(16):
             for suffix in relay_suffixes:
                 self.assertEqual(masked[by_name[f"uav_{uid}.{suffix}"]], 0.0)
 
@@ -210,7 +231,7 @@ class RelayUtilityAndStateTest(unittest.TestCase):
         first = calculate_movement_potentials(
             self.env, 1.0, backlog_bits=frozen
         )[3]
-        self.env.assignment_backlog_snapshot = {uid: 9e9 for uid in range(10)}
+        self.env.assignment_backlog_snapshot = {uid: 9e9 for uid in range(16)}
         second = calculate_movement_potentials(
             self.env, 1.0, backlog_bits=frozen
         )[3]
@@ -218,15 +239,76 @@ class RelayUtilityAndStateTest(unittest.TestCase):
         self.assertTrue(math.isfinite(first))
         self.assertTrue(0.0 <= first <= 1.0)
 
+    def _range_progress_metrics(self, candidate_x):
+        self.env.get_available_uav_ids = lambda: [0, 1, 2]
+        positions = {
+            0: (100.0, 0.0, 100.0),
+            1: (float(candidate_x), 0.0, 100.0),
+            2: (1000.0, 0.0, 100.0),
+        }
+        for uid, (x, y, z) in positions.items():
+            uav = self.env.uav_dict[uid]
+            uav.x_u, uav.y_u, uav.z_u = x, y, z
+        self.env.update_u2u_channels()
+        self.env.update_u2g_channels()
+        return relay_metrics(
+            self.env,
+            1,
+            backlog_bits={0: 0.0, 1: 0.0, 2: 10_000.0},
+        )
+
+    def test_receive_range_progress_is_monotone_and_saturates(self):
+        metrics = [self._range_progress_metrics(x) for x in (400, 500, 600, 700)]
+        progress = [item.receive_distance_progress for item in metrics]
+        self.assertLess(progress[0], progress[1])
+        self.assertLess(progress[1], progress[2])
+        self.assertEqual(progress[2], 1.0)
+        self.assertEqual(progress[3], 1.0)
+        self.assertTrue(all(item.utility == min(item.receive_score, item.forward_score) for item in metrics))
+
+    def test_forward_range_progress_is_monotone_saturates_and_guides_direction(self):
+        metrics = [self._range_progress_metrics(x) for x in (700, 600, 500, 400)]
+        progress = [item.forward_distance_progress for item in metrics]
+        self.assertLess(progress[0], progress[1])
+        self.assertLess(progress[1], progress[2])
+        self.assertEqual(progress[2], 1.0)
+        self.assertEqual(progress[3], 1.0)
+        self.assertFalse(metrics[0].reachable)
+        self.assertEqual(metrics[0].forward_distance_target_node, 0)
+        self.assertEqual(metrics[0].forward_direction_target, (100.0, 0.0, 100.0))
+        self.assertEqual(metrics[0].receive_direction_target, (1000.0, 0.0, 100.0))
+
+    def test_zero_backlog_direction_fallback_is_finite_and_deterministic(self):
+        first = self._range_progress_metrics(700)
+        second = relay_metrics(
+            self.env,
+            1,
+            backlog_bits={0: 0.0, 1: 0.0, 2: 0.0},
+        )
+        third = relay_metrics(
+            self.env,
+            1,
+            backlog_bits={0: 0.0, 1: 0.0, 2: 0.0},
+        )
+        self.assertTrue(second.zero_backlog_fallback)
+        self.assertEqual(second, third)
+        self.assertEqual(second.receive_direction_target, first.receive_direction_target)
+        for target in (
+            second.receive_direction_target,
+            second.forward_direction_target,
+        ):
+            self.assertIsNotNone(target)
+            self.assertTrue(np.isfinite(target).all())
+
 
 class RelayRoutingCheckpointDiagnosticsTest(unittest.TestCase):
     def setUp(self):
-        self.env = Simulator(num_UAV=10)
+        self.env = Simulator(num_UAV=16)
         self.env.num_GT = 2
         self.env.reset_environment()
 
     def test_reassignment_preserves_packet_queue_identity_and_ownership(self):
-        engine = PacketEngine(10)
+        engine = PacketEngine(16)
         packet = {"id": 7, "rem_bits": 128.0}
         engine.uav_queues[1].append(packet)
         engine.backlog_bits[1] = 128.0
@@ -243,7 +325,7 @@ class RelayRoutingCheckpointDiagnosticsTest(unittest.TestCase):
         self.env.multi_tasks[1] = [{"task_type": "Relay"}]
         after = self.env.get_routing_action_mask(1)
         np.testing.assert_array_equal(before, after)
-        self.assertEqual(len(routing_state_feature_names()), 101)
+        self.assertEqual(len(routing_state_feature_names()), 143)
         self.assertFalse(
             any("next_hop_is_relay" in name for name in routing_state_feature_names())
         )
@@ -352,7 +434,7 @@ class RelayRoutingCheckpointDiagnosticsTest(unittest.TestCase):
         self.assertAlmostEqual(relay_shaping_sum, 0.0, places=12)
 
     def test_old_checkpoint_fails_before_loading(self):
-        self.assertEqual(CHECKPOINT_SCHEMA_VERSION, 24)
+        self.assertEqual(CHECKPOINT_SCHEMA_VERSION, 25)
         with self.assertRaisesRegex(RuntimeError, "Relay.*retrained"):
             _validate_checkpoint_schema({"checkpoint_schema_version": 23})
 
@@ -360,7 +442,7 @@ class RelayRoutingCheckpointDiagnosticsTest(unittest.TestCase):
         state = copy.deepcopy(self.env.assignment_rng.bit_generator.state)
         self.env.assignment_metadata()
         self.assertEqual(state, self.env.assignment_rng.bit_generator.state)
-        engine = PacketEngine(10, enable_packet_diagnostic_artifacts=True)
+        engine = PacketEngine(16, enable_packet_diagnostic_artifacts=True)
         engine._record_relay_forwarding_observation(
             self.env, 1, self.env.GS_ID, 64.0, True
         )

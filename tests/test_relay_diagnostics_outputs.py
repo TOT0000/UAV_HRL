@@ -8,8 +8,15 @@ from evaluation_metrics import write_evaluation_outputs
 from experiment_config import MethodSpec
 from HRL_task_aware import TrainingConfig, train
 from relay_diagnostics import (
+    RELAY_BITS_SUM_ABS_TOL,
+    RELAY_BITS_SUM_REL_TOL,
     RELAY_DIAGNOSTICS_FILENAME,
     RELAY_DIAGNOSTICS_OUTPUT_CONTRACT_VERSION,
+    RELAY_FORWARDING_GROUPS,
+    aggregate_relay_episode_diagnostics,
+    relay_diagnostics_metadata,
+    validate_relay_diagnostics,
+    write_relay_diagnostics,
 )
 from scenario_manifest import generate_manifest
 
@@ -106,6 +113,56 @@ class RelayDiagnosticsOutputTest(unittest.TestCase):
             self.assertFalse(
                 (Path(temp_dir) / RELAY_DIAGNOSTICS_FILENAME).exists()
             )
+
+    def test_500_episode_fsum_round_trip_and_meaningful_tamper_rejection(self):
+        episodes = []
+        for index in range(500):
+            forwarding = {
+                group: {
+                    "bits": 1e9 if index % 2 == 0 else 1e-7,
+                    "packets": index % 3,
+                    "completed_packet_hops": index % 5,
+                }
+                for group in RELAY_FORWARDING_GROUPS
+            }
+            episodes.append(
+                {
+                    "episode_index": index,
+                    "scenario_id": f"scenario-{index}",
+                    "assignment": {
+                        "relay_assignment_history": [],
+                        "relay_candidate_metrics": {},
+                        "selected_relay_uav_ids": [],
+                        "relay_role_change_count": index % 2,
+                    },
+                    "forwarding": forwarding,
+                }
+            )
+
+        diagnostics = aggregate_relay_episode_diagnostics(episodes)
+        metadata = relay_diagnostics_metadata(diagnostics)
+        self.assertEqual(metadata["relay_diagnostics_episode_count"], 500)
+        self.assertEqual(
+            metadata["relay_diagnostics_forwarding_semantics"][
+                "bits_validation_relative_tolerance"
+            ],
+            RELAY_BITS_SUM_REL_TOL,
+        )
+        self.assertEqual(
+            metadata["relay_diagnostics_forwarding_semantics"][
+                "bits_validation_absolute_tolerance"
+            ],
+            RELAY_BITS_SUM_ABS_TOL,
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            _metadata, path = write_relay_diagnostics(temp_dir, diagnostics)
+            loaded = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual(validate_relay_diagnostics(loaded), loaded)
+
+        tampered = copy.deepcopy(diagnostics)
+        tampered["forwarding"]["assigned_relay_forwarding"]["bits"] += 1.0
+        with self.assertRaisesRegex(ValueError, "summary disagrees"):
+            validate_relay_diagnostics(tampered)
 
 
 if __name__ == "__main__":

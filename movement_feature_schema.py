@@ -1,7 +1,7 @@
 """Authoritative local feature ordering for centralized UAV movement."""
 
 
-MOVEMENT_FEATURE_SCHEMA_VERSION = 4
+MOVEMENT_FEATURE_SCHEMA_VERSION = 5
 
 TASK_TYPES = ("Search", "FOV", "COM", "Relay", "Hovering")
 ACTIVE_MOVEMENT_TASK_TYPES = ("Search", "FOV", "COM", "Relay")
@@ -68,42 +68,42 @@ LOCAL_MOVEMENT_FEATURES = (
         "continuous",
         -1.0,
         1.0,
-        "receive-centroid relative x / environment width",
+        "capacity-weighted receive centroid, falling back to backlog-weighted source centroid, relative x / environment width",
     ),
     (
         "relay_receive_dy",
         "continuous",
         -1.0,
         1.0,
-        "receive-centroid relative y / environment height",
+        "capacity-weighted receive centroid, falling back to backlog-weighted source centroid, relative y / environment height",
     ),
     (
         "relay_receive_dz",
         "continuous",
         -1.0,
         1.0,
-        "receive-centroid relative z / UAV altitude span",
+        "capacity-weighted receive centroid, falling back to backlog-weighted source centroid, relative z / UAV altitude span",
     ),
     (
         "relay_forward_dx",
         "continuous",
         -1.0,
         1.0,
-        "best-path first-hop relative x / environment width",
+        "best-path first hop, falling back to nearest GS-connected component node or GS, relative x / environment width",
     ),
     (
         "relay_forward_dy",
         "continuous",
         -1.0,
         1.0,
-        "best-path first-hop relative y / environment height",
+        "best-path first hop, falling back to nearest GS-connected component node or GS, relative y / environment height",
     ),
     (
         "relay_forward_dz",
         "continuous",
         -1.0,
         1.0,
-        "best-path first-hop relative z / UAV altitude span",
+        "best-path first hop, falling back to nearest GS-connected component node or GS, relative z / UAV altitude span",
     ),
 )
 

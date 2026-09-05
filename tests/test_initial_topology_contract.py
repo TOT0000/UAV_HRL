@@ -159,7 +159,7 @@ class InitialTopologyGeometryTest(unittest.TestCase):
             validate_scenario_entry(entry)
 
     def test_simulator_fallback_uses_the_canonical_layout(self):
-        env = Simulator(10, rng_streams=NamedRNGStreams(501))
+        env = Simulator(16, rng_streams=NamedRNGStreams(501))
         env.num_GT = 2
         env.reset_environment()
 
@@ -186,7 +186,7 @@ class InitialTopologyGeometryTest(unittest.TestCase):
         self.assertEqual(len(METHOD_REGISTRY), 16)
         for method_id in METHOD_REGISTRY:
             with self.subTest(method=method_id):
-                env = Simulator(10, rng_streams=NamedRNGStreams(88))
+                env = Simulator(16, rng_streams=NamedRNGStreams(88))
                 env.configure_method(MethodSpec.parse(method_id))
                 env.apply_scenario_entry(entry)
                 geometry = [uav.get_position() for uav in env.UAVs]
@@ -212,7 +212,7 @@ class InitialTopologyGeometryTest(unittest.TestCase):
                 )
 
     def test_schema_15_checkpoint_is_rejected_for_old_initial_geometry(self):
-        self.assertEqual(CHECKPOINT_SCHEMA_VERSION, 24)
+        self.assertEqual(CHECKPOINT_SCHEMA_VERSION, 25)
         with self.assertRaisesRegex(
             RuntimeError, "GS-reachable initial topology.*must be retrained"
         ):
@@ -252,14 +252,14 @@ class InitialTopologyGeometryTest(unittest.TestCase):
 
 class InitialTopologyDeliveryTest(unittest.TestCase):
     def test_non_gateway_packet_reaches_gs_through_production_service(self):
-        env = Simulator(10, rng_streams=NamedRNGStreams(123))
+        env = Simulator(16, rng_streams=NamedRNGStreams(123))
         env.apply_scenario_entry(
             generate_manifest("test", 123, 1, num_gt=2).episodes[0]
         )
         self.assertTrue(env.is_routing_link_in_range(1, 0))
         self.assertTrue(env.is_u2g_in_range(0))
 
-        engine = PacketEngine(10)
+        engine = PacketEngine(16)
         packet = engine.create_packet(1, "COM", 256.0, 0.0)
         env.prepare_channel_routing_slot(0)
         capacities, bandwidths = env.allocate_active_link_capacities({1: 0})

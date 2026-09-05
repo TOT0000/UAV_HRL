@@ -97,7 +97,7 @@ class PermanentGatewayProjectionTest(unittest.TestCase):
         )
 
     def test_authoritative_constants_and_every_legal_position_is_unchanged(self):
-        self.assertEqual(RESERVED_SEARCH_UAV_IDS, (0, 9))
+        self.assertEqual(RESERVED_SEARCH_UAV_IDS, (0, 15))
         self.assertEqual(PERMANENT_GS_GATEWAY_UAV_ID, 0)
         self.assertEqual(GS_GATEWAY_SOFT_RADIUS_M, 360.0)
         self.assertFalse(GS_GATEWAY_SOFT_RADIUS_OPERATIONAL)

@@ -20,7 +20,7 @@ from Task_assignment import (
 
 class AssignmentUtilityTest(unittest.TestCase):
     def setUp(self):
-        self.env = Simulator(num_UAV=10)
+        self.env = Simulator(num_UAV=16)
         self.env.num_GT = 2
         self.env.reset_environment()
 
@@ -215,7 +215,7 @@ class AssignmentCompatibilityTest(unittest.TestCase):
 
 class AssignmentLifecycleTest(unittest.TestCase):
     def setUp(self):
-        self.env = Simulator(num_UAV=10)
+        self.env = Simulator(num_UAV=16)
         self.env.num_GT = 2
         self.env.reset_environment()
 

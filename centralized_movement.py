@@ -399,8 +399,8 @@ def get_global_movement_state(
                 ]
 
             relay_features = [metrics.receive_score, metrics.forward_score]
-            relay_features += relative_vector(metrics.receive_centroid)
-            relay_features += relative_vector(metrics.forward_target)
+            relay_features += relative_vector(metrics.receive_direction_target)
+            relay_features += relative_vector(metrics.forward_direction_target)
 
         uav_features = np.asarray(
             task_flags
@@ -714,7 +714,9 @@ def calculate_movement_potentials(env, c_ref_com, backlog_bits=None):
             )
         for _task in grouped["Relay"]:
             relay_progress.append(
-                relay_metrics(env, uav_id, backlog_bits=backlog_bits).utility
+                relay_metrics(
+                    env, uav_id, backlog_bits=backlog_bits
+                ).movement_utility
             )
     phi_vs = float(np.mean(vs_progress)) if vs_progress else 0.0
     phi_com = float(np.mean(com_progress)) if com_progress else 0.0

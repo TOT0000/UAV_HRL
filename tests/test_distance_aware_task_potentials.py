@@ -112,10 +112,10 @@ class DistanceProgressHelperTest(unittest.TestCase):
 
 class DistanceAwarePotentialLifecycleTest(unittest.TestCase):
     def setUp(self):
-        self.env = Simulator(10)
+        self.env = Simulator(16)
         self.env.num_GT = 2
         self.env.reset_environment()
-        self.env.multi_tasks = {uav_id: [] for uav_id in range(10)}
+        self.env.multi_tasks = {uav_id: [] for uav_id in range(16)}
         self.config = TrainingConfig(
             total_episodes=1,
             mode="custom",
@@ -332,10 +332,10 @@ class TaskPotentialMethodContractTest(unittest.TestCase):
                 if shared is None:
                     shared = config["task_potential_configuration"]
                 self.assertEqual(config["task_potential_configuration"], shared)
-        self.assertEqual(MOVEMENT_STATE_DIM, 519)
-        self.assertEqual(JOINT_ACTION_DIM, 30)
-        self.assertEqual(ROUTING_STATE_DIM, 101)
-        self.assertEqual(SCENARIO_SCHEMA_VERSION, "uav-hrl-scenario-v7")
+        self.assertEqual(MOVEMENT_STATE_DIM, 675)
+        self.assertEqual(JOINT_ACTION_DIM, 48)
+        self.assertEqual(ROUTING_STATE_DIM, 143)
+        self.assertEqual(SCENARIO_SCHEMA_VERSION, "uav-hrl-scenario-v8")
 
 
 if __name__ == "__main__":

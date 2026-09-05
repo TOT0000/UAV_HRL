@@ -29,6 +29,8 @@ from evaluation_metrics import (
 )
 from experiment_config import (
     MOVEMENT_REPLAY_CONTRACT_VERSION,
+    NUM_UAV,
+    RELAY_TASK_CONTRACT_VERSION,
     TASK_POTENTIAL_CONTRACT_VERSION,
     FORMAL_EXPERIMENT_DEFAULTS,
     MethodSpec,
@@ -42,6 +44,7 @@ from experiment_paths import (
     write_run_status,
 )
 from scenario_manifest import (
+    SCENARIO_SCHEMA_VERSION,
     ScenarioManifest,
     validate_manifest_initial_topologies,
 )
@@ -51,7 +54,7 @@ from training_checkpoint import (
 )
 
 
-DESIGN_DATASET_SCHEMA_VERSION = 4
+DESIGN_DATASET_SCHEMA_VERSION = 5
 DESIGN_TRANSITIONS_FILENAME = "design_transitions.npz"
 DESIGN_METADATA_FILENAME = "design_dataset_metadata.json"
 DESIGN_EPISODES_CSV = "per_episode.csv"
@@ -461,6 +464,11 @@ def _build_metadata(preflight, arrays, result, run_dir, reference_rows):
     action_schema = projected_joint_action_schema()
     metadata = {
         "schema_version": DESIGN_DATASET_SCHEMA_VERSION,
+        "checkpoint_schema_version": int(
+            preflight["checkpoint"]["metadata"]["checkpoint_schema_version"]
+        ),
+        "scenario_schema_version": SCENARIO_SCHEMA_VERSION,
+        "num_uav": NUM_UAV,
         "method_id": preflight["method"].method_id,
         "training_seed": int(preflight["training_seed"]),
         "checkpoint_path": str(preflight["checkpoint"]["checkpoint_dir"]),
@@ -494,6 +502,7 @@ def _build_metadata(preflight, arrays, result, run_dir, reference_rows):
             "beta_relay": float(formal_config["beta_relay"]),
         },
         "task_potential_contract_version": TASK_POTENTIAL_CONTRACT_VERSION,
+        "relay_task_contract_version": RELAY_TASK_CONTRACT_VERSION,
         "movement_replay_contract_version": MOVEMENT_REPLAY_CONTRACT_VERSION,
         "potential_boundary_semantics": (
             "phi_current uses current decision-state backlog; phi_next uses next "

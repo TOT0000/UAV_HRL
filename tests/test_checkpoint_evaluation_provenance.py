@@ -66,9 +66,9 @@ class CheckpointEvaluationProvenanceTest(unittest.TestCase):
             "checkpoint_schema_version": CHECKPOINT_SCHEMA_VERSION,
             "checkpoint_type": MODEL_CHECKPOINT_TYPE,
             "episode": 1499,
-            "movement_state_dim": 519,
-            "joint_action_dim": 30,
-            "routing_state_dim": 101,
+            "movement_state_dim": 675,
+            "joint_action_dim": 48,
+            "routing_state_dim": 143,
             "movement_agent_kind": method.agent,
             "movement_agent_gamma": 1.0,
             "movement_agent_configuration": deepcopy(

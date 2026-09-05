@@ -416,7 +416,7 @@ class SyntheticFigureBuildTest(unittest.TestCase):
                 }
                 for time in history_times
             ]
-            for uid in range(10)
+            for uid in range(16)
         }
         sr_paths = {
             str(uid): [
@@ -432,10 +432,10 @@ class SyntheticFigureBuildTest(unittest.TestCase):
                 "actual_time_seconds": time,
                 "target_uav_id": 0,
                 "target_uav_phase": phase,
-                "uavs": [{"uav_id": uid, "x": uav_paths[str(uid)][history_times.index(time)]["x"], "y": uav_paths[str(uid)][history_times.index(time)]["y"], "z": 90 + uid, "task_phase": phase if uid == 0 else "Hover", "assigned_tasks": [{"task_type": phase if uid == 0 else "Hovering"}]} for uid in range(10)],
+                "uavs": [{"uav_id": uid, "x": uav_paths[str(uid)][history_times.index(time)]["x"], "y": uav_paths[str(uid)][history_times.index(time)]["y"], "z": 90 + uid, "task_phase": phase if uid == 0 else "Hover", "assigned_tasks": [{"task_type": phase if uid == 0 else "Hovering"}]} for uid in range(16)],
                 "sr_teams": [{"sr_id": uid, "x": sr_paths[str(uid)][history_times.index(time)]["x"], "y": 500, "z": 0, "active": True} for uid in range(2)],
                 "ground_targets": [{"gt_id": 0, "x": 650.0, "y": 650.0, "z": 0.0, "radius_m": 80.0, "detected": time >= 10, "detected_by_uav_id": 0 if time >= 10 else None}],
-                "ground_station": {"gs_id": 10, "x": 0.0, "y": 0.0, "z": 0.0},
+                "ground_station": {"gs_id": 16, "x": 0.0, "y": 0.0, "z": 0.0},
                 "active_links": [
                     {"sender_id": 0, "receiver_id": 1, "link_type": "U2U", "bandwidth_hz": 5e6, "capacity_bits_per_second": 1e6},
                     {"sender_id": 0, "receiver_id": 2, "link_type": "S2U", "bandwidth_hz": 5e6, "capacity_bits_per_second": 0.5e6},
@@ -462,7 +462,7 @@ class SyntheticFigureBuildTest(unittest.TestCase):
                                 if key != "actual_time_seconds"
                             },
                         }
-                        for uid in range(10)
+                        for uid in range(16)
                     ],
                     "sr_teams": [
                         {
@@ -622,7 +622,7 @@ class SyntheticFigureBuildTest(unittest.TestCase):
                 "evaluation_horizon_seconds": EVALUATION_HORIZON_SECONDS,
                 "evaluation_seed": TRAINING_SEED,
                 "manifest_seed": TRAINING_SEED,
-                "num_uav": 10,
+                "num_uav": 16,
                 "resolved_overrides": self._resolved_overrides(suite, point),
                 "checkpoint_required": checkpoint_required,
                 "checkpoint_path": str(checkpoint) if checkpoint_required else None,
@@ -801,8 +801,8 @@ class SyntheticFigureBuildTest(unittest.TestCase):
             source_10 = json.loads(
                 (output / "UAV_trajectory_t_10s.json").read_text(encoding="utf-8")
             )
-            self.assertEqual(len(source_5["uavs"]), 10)
-            self.assertEqual(len(source_5["uav_paths"]), 10)
+            self.assertEqual(len(source_5["uavs"]), 16)
+            self.assertEqual(len(source_5["uav_paths"]), 16)
             self.assertTrue(source_5["sr_paths"])
             self.assertTrue(source_5["ground_targets"])
             self.assertTrue(source_5["ground_station"])

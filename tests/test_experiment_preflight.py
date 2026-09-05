@@ -96,9 +96,9 @@ class ExperimentPreflightTest(unittest.TestCase):
             "checkpoint_schema_version": CHECKPOINT_SCHEMA_VERSION,
             "checkpoint_type": MODEL_CHECKPOINT_TYPE,
             "episode": 1499,
-            "movement_state_dim": 519,
-            "joint_action_dim": 30,
-            "routing_state_dim": 101,
+            "movement_state_dim": 675,
+            "joint_action_dim": 48,
+            "routing_state_dim": 143,
             "movement_agent_kind": "td3",
             "movement_agent_gamma": 1.0,
             "movement_agent_configuration": formal_config[
@@ -393,9 +393,9 @@ class ExperimentPreflightTest(unittest.TestCase):
                 "checkpoint_schema_version": CHECKPOINT_SCHEMA_VERSION,
                 "checkpoint_type": FULL_CHECKPOINT_TYPE,
                 "episode": 0,
-                "movement_state_dim": 519,
-                "joint_action_dim": 30,
-                "routing_state_dim": 101,
+                "movement_state_dim": 675,
+                "joint_action_dim": 48,
+                "routing_state_dim": 143,
                 "centralized_td3_gamma": 1.0,
                 "routing_ddqn_gamma": 0.99,
                 "routing_agent_kind": "safe_ddqn",
@@ -437,8 +437,8 @@ class ExperimentPreflightTest(unittest.TestCase):
             )
             np.savez_compressed(
                 resume / "joint_replay.npz",
-                current_movement_mask=np.zeros((0, 10), dtype=bool),
-                next_movement_mask=np.zeros((0, 10), dtype=bool),
+                current_movement_mask=np.zeros((0, 16), dtype=bool),
+                next_movement_mask=np.zeros((0, 16), dtype=bool),
                 movement_mask_valid=np.zeros((0, 1), dtype=bool),
             )
             (resume / "routing_replay.npz").write_bytes(b"routing")

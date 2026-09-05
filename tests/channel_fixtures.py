@@ -4,9 +4,10 @@ from Channel_model import (
     CHANNEL_ENVIRONMENT_CONTRACT_VERSION,
     CHANNEL_MODEL_VERSION,
 )
+from experiment_config import NUM_UAV
 
 
-def initialized_channel_lifecycle_state(num_uav=10, num_sr=2):
+def initialized_channel_lifecycle_state(num_uav=NUM_UAV, num_sr=2):
     """Small valid terminal channel snapshot for checkpoint contract tests."""
 
     return {

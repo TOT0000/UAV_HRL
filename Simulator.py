@@ -209,6 +209,7 @@ class Simulator:
         self.com_offered_rate_bps = COM_OFFERED_RATE_BPS
         self.search_release_time = None
         self.search_release_coverage = None
+        self.search_release_reassignment_pending = False
         self.assignment_invocations = 0
         self.search_to_hover_conversions = 0
         self.assignment_backlog_snapshot = {
@@ -542,9 +543,20 @@ class Simulator:
         self.search_release_coverage = float(self.visited_bitmap.mean())
         self.task_list = [task for task in self.task_list if task.task_type != "Search"]
         self.need_reassign = True
+        self.search_release_reassignment_pending = True
         if not defer_assignment:
             self.assign_tasks()
             self.need_reassign = False
+            self.search_release_reassignment_pending = False
+            self._validate_search_release_assignment()
+
+    def _validate_search_release_assignment(self):
+        """Validate the post-99% assignment only after its real boundary commit."""
+
+        if not self._search_phase_over or not self.search_completed:
+            raise AssertionError("Search release assignment validated before phase completion")
+        if self.need_reassign or self.search_release_reassignment_pending:
+            raise AssertionError("Search release reassignment is still pending")
         if any(
             task["task_type"] == "Search"
             for entries in self.multi_tasks.values()
@@ -556,6 +568,24 @@ class Simulator:
             raise AssertionError(
                 "permanent GS gateway must enter Hovering after Search release"
             )
+        assigned_service_targets = set()
+        for uav_id, entries in self.multi_tasks.items():
+            task_types = [task["task_type"] for task in entries]
+            if "Relay" in task_types and task_types != ["Relay"]:
+                raise AssertionError("Relay must remain exclusive after Search release")
+            for task in entries:
+                task_type = task["task_type"]
+                if task_type not in {"Relay", "FOV", "COM", "Hovering"}:
+                    raise AssertionError(
+                        f"invalid task after Search release: UAV {uav_id} {task_type}"
+                    )
+                if task_type in {"FOV", "COM"}:
+                    key = (task_type, int(task["target_obj_id"]))
+                    if key in assigned_service_targets:
+                        raise AssertionError(
+                            "duplicate FOV/COM target after Search release"
+                        )
+                    assigned_service_targets.add(key)
 
     def assignment_metadata(self):
         assigner = getattr(self, "last_assignment", None)
@@ -625,6 +655,15 @@ class Simulator:
                 for entry in self.assignment_history
             ],
             "relay_reassignment_pending": bool(self.need_reassign),
+            "search_release_reassignment_pending": bool(
+                self.search_release_reassignment_pending
+            ),
+            "search_phase_over": bool(self._search_phase_over),
+            "search_completed": bool(self.search_completed),
+            "search_release_assignment_applied": bool(
+                self._search_phase_over
+                and not self.search_release_reassignment_pending
+            ),
             "search_release_time_seconds": self.search_release_time,
             "search_release_coverage": self.search_release_coverage,
             "assignments": {
@@ -831,6 +870,10 @@ class Simulator:
         if self.need_reassign:
             self.assign_tasks()
             self.need_reassign = False
+            released_search = self.search_release_reassignment_pending
+            self.search_release_reassignment_pending = False
+            if released_search:
+                self._validate_search_release_assignment()
             assignment_performed = True
         return assignment_performed
 
@@ -1604,6 +1647,7 @@ class Simulator:
         self.last_assignment = None
         self.search_release_time = None
         self.search_release_coverage = None
+        self.search_release_reassignment_pending = False
         self.UAVs.clear()
         self.current_time = 0
         self.uav_tasks = {}

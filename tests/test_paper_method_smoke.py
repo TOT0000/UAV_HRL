@@ -205,7 +205,7 @@ class PaperMethodSmokeTest(unittest.TestCase):
                     self.assertGreaterEqual(
                         artifact["snapshots"][0]["actual_time_seconds"], 1.0
                     )
-                    self.assertEqual(len(artifact["snapshots"][0]["uavs"]), 10)
+                    self.assertEqual(len(artifact["snapshots"][0]["uavs"]), 16)
                     self.assertEqual(artifact["target_uav_id"], 0)
                     self.assertEqual(artifact["method_id"], method_id)
                     self.assertIn("uav_paths", artifact)

@@ -52,8 +52,8 @@ class ScenarioManifestTest(unittest.TestCase):
 
     def test_same_entry_reproduces_exogenous_initial_state(self):
         entry = generate_manifest("test", 303, 1).episodes[0]
-        first = Simulator(num_UAV=10)
-        second = Simulator(num_UAV=10)
+        first = Simulator(num_UAV=16)
+        second = Simulator(num_UAV=16)
 
         first.apply_scenario_entry(entry)
         second.apply_scenario_entry(entry)
@@ -76,7 +76,7 @@ class ScenarioManifestTest(unittest.TestCase):
         entry = generate_manifest("test", 404, 1).episodes[0]
         trajectories = []
         for _ in range(2):
-            env = Simulator(num_UAV=10)
+            env = Simulator(num_UAV=16)
             env.apply_scenario_entry(entry)
             env.SR_team_gogo(env.gts[0])
             for _ in range(5):
@@ -160,7 +160,7 @@ class ScenarioManifestTest(unittest.TestCase):
             },
         )
         self.assertEqual({entry["num_GT"] for entry in manifest.episodes}, {4})
-        env = Simulator(num_UAV=10)
+        env = Simulator(num_UAV=16)
         env.apply_scenario_entry(manifest.episodes[0])
         self.assertEqual(env.num_GT, 4)
         self.assertEqual(len(env.gts), 4)
@@ -206,11 +206,11 @@ class ScenarioManifestTest(unittest.TestCase):
                 self.assertTrue(left_ids.isdisjoint(right_ids))
                 self.assertTrue(left_seeds.isdisjoint(right_seeds))
 
-    def test_previous_soft_projection_manifest_is_explicitly_obsolete(self):
+    def test_previous_ten_uav_manifest_is_explicitly_obsolete(self):
         data = generate_manifest("test", 912, 1).to_dict()
         data["schema_version"] = OBSOLETE_SCHEMA_VERSION
 
-        with self.assertRaisesRegex(ValueError, "soft-compressed 360-400 m"):
+        with self.assertRaisesRegex(ValueError, "legacy 10-UAV.*16-UAV v8"):
             ScenarioManifest.from_dict(data)
 
     def test_training_manifest_extension_preserves_exact_canonical_prefix(self):

@@ -151,7 +151,7 @@ class AllParticipantFovSnapshotContractTest(unittest.TestCase):
         cls.scenario = generate_manifest("test", 9501, 1).episodes[0]
 
     def _environment(self):
-        env = Simulator(num_UAV=10)
+        env = Simulator(num_UAV=16)
         env.apply_scenario_entry(self.scenario)
         env._search_phase_over = False
         env.visited_bitmap[:] = False
@@ -176,8 +176,8 @@ class AllParticipantFovSnapshotContractTest(unittest.TestCase):
         bx0, bx1, by0, by1 = non_search.current_footprint
         self.assertFalse(env.visited_bitmap[bx0 : bx1 + 1, by0 : by1 + 1].any())
 
-        first = PacketEngine(num_uav=10)
-        second = PacketEngine(num_uav=10)
+        first = PacketEngine(num_uav=16)
+        second = PacketEngine(num_uav=16)
         self.assertTrue(first.process_fov_transitions(env, "a", transitions))
         self.assertTrue(
             second.process_fov_transitions(env, "a", tuple(reversed(transitions)))
@@ -202,7 +202,7 @@ class AllParticipantFovSnapshotContractTest(unittest.TestCase):
         env = self._environment()
         transitions = _mark_search_observations(env)
         with self.assertRaisesRegex(RuntimeError, "every UAV"):
-            PacketEngine(num_uav=10).process_fov_transitions(
+            PacketEngine(num_uav=16).process_fov_transitions(
                 env, "incomplete", transitions[:-1]
             )
 

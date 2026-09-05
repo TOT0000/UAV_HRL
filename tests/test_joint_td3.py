@@ -46,9 +46,9 @@ class JointActionProjectionTest(unittest.TestCase):
         derived = project_joint_action(raw, full_current)
         explicit = project_joint_action(raw, movement_mask=current_mask)
         np.testing.assert_array_equal(explicit, derived)
-        blocks = explicit.reshape(10, 3)
-        raw_blocks = raw.reshape(10, 3)
-        for uav_id in range(10):
+        blocks = explicit.reshape(16, 3)
+        raw_blocks = raw.reshape(16, 3)
+        for uav_id in range(16):
             expected = raw_blocks[uav_id] if current_mask[uav_id] else HOVER_ACTION
             np.testing.assert_array_equal(blocks[uav_id], expected)
 
@@ -67,16 +67,16 @@ class JointActionProjectionTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "shape"):
             project_joint_action(raw, movement_mask=np.ones(9, dtype=bool))
         with self.assertRaisesRegex(ValueError, "exactly 0 or 1"):
-            project_joint_action(raw, movement_mask=np.full(10, 0.5))
+            project_joint_action(raw, movement_mask=np.full(16, 0.5))
 
     def test_shape_block_order_and_hover_projection(self):
         state = movement_state({0, 3, 9})
         raw = np.linspace(-1.0, 1.0, JOINT_ACTION_DIM, dtype=np.float32)
         projected = project_joint_action(raw, state)
-        self.assertEqual(projected.shape, (30,))
-        blocks = projected.reshape(10, 3)
-        raw_blocks = raw.reshape(10, 3)
-        for uav_id in range(10):
+        self.assertEqual(projected.shape, (48,))
+        blocks = projected.reshape(16, 3)
+        raw_blocks = raw.reshape(16, 3)
+        for uav_id in range(16):
             if uav_id in {0, 3, 9}:
                 np.testing.assert_array_equal(blocks[uav_id], raw_blocks[uav_id])
             else:
@@ -87,24 +87,24 @@ class JointActionProjectionTest(unittest.TestCase):
         raw = torch.zeros((1, JOINT_ACTION_DIM), requires_grad=True)
         projected = project_joint_action(raw, state)
         projected.sum().backward()
-        gradients = raw.grad.reshape(10, 3)
+        gradients = raw.grad.reshape(16, 3)
         self.assertTrue(torch.all(gradients[2] == 1.0))
         self.assertTrue(torch.all(gradients[:2] == 0.0))
         self.assertTrue(torch.all(gradients[3:] == 0.0))
 
     def test_all_proposals_precede_mutation_hover_is_stationary_and_energy_positive(self):
-        env = Simulator(num_UAV=10)
+        env = Simulator(num_UAV=16)
         env.num_GT = 2
         env.reset_environment()
         model = TD3(MOVEMENT_STATE_DIM, JOINT_ACTION_DIM, 1.0)
         state = movement_state({9})
         raw = np.zeros(JOINT_ACTION_DIM, dtype=np.float32)
-        raw.reshape(10, 3)[9] = np.array([1.0, 0.0, 0.0])
+        raw.reshape(16, 3)[9] = np.array([1.0, 0.0, 0.0])
         projected = project_joint_action(raw, state)
         positions_before = [uav.get_position() for uav in env.UAVs]
 
         proposals = build_joint_movement_proposals(env, model, projected)
-        self.assertEqual(len(proposals), 10)
+        self.assertEqual(len(proposals), 16)
         self.assertEqual(positions_before, [uav.get_position() for uav in env.UAVs])
 
         with mock.patch.object(
@@ -113,9 +113,9 @@ class JointActionProjectionTest(unittest.TestCase):
             wraps=env.energy_model.compute_mobility_energy,
         ) as energy_call:
             energies = apply_joint_movement_proposals(env, proposals)
-        self.assertEqual(energy_call.call_count, 10)
+        self.assertEqual(energy_call.call_count, 16)
         self.assertTrue(np.all(energies > 0.0))
-        for uav_id in range(9):
+        for uav_id in set(range(16)) - {9}:
             self.assertEqual(env.uav_dict[uav_id].get_position(), positions_before[uav_id])
         self.assertNotEqual(env.uav_dict[9].get_position(), positions_before[9])
 
@@ -180,7 +180,7 @@ class JointReplayAndLearnerTest(unittest.TestCase):
         self.assertEqual(model.num_actor_update_iteration, 1)
 
         for name in ("target_actor_action", "target_smoothed_action", "actor_action"):
-            blocks = model.last_joint_update[name].reshape(-1, 10, 3)
+            blocks = model.last_joint_update[name].reshape(-1, 16, 3)
             expected = torch.tensor(HOVER_ACTION, dtype=blocks.dtype)
             self.assertTrue(torch.allclose(blocks[:, 1:, :], expected.expand_as(blocks[:, 1:, :])))
 
@@ -216,8 +216,8 @@ class JointReplayAndLearnerTest(unittest.TestCase):
             1, current_lambda=0.0, gamma=1.0, include_movement_masks=True
         )
         state, _, next_state, _, _, sampled_current, sampled_next = batch
-        self.assertEqual(tuple(sampled_current.shape), (1, 10))
-        self.assertEqual(tuple(sampled_next.shape), (1, 10))
+        self.assertEqual(tuple(sampled_current.shape), (1, 16))
+        self.assertEqual(tuple(sampled_next.shape), (1, 16))
         np.testing.assert_array_equal(sampled_current.cpu().numpy()[0], current_mask)
         np.testing.assert_array_equal(sampled_next.cpu().numpy()[0], next_mask)
         np.testing.assert_array_equal(
@@ -295,7 +295,7 @@ class JointReplayAndLearnerTest(unittest.TestCase):
             ("target_actor_action", next_mask),
             ("target_smoothed_action", next_mask),
         ):
-            blocks = update[action_name].reshape(-1, 10, 3)[0]
+            blocks = update[action_name].reshape(-1, 16, 3)[0]
             hover = torch.tensor(HOVER_ACTION, dtype=blocks.dtype)
             self.assertTrue(torch.all(blocks[~torch.from_numpy(mask)] == hover))
             self.assertTrue(torch.any(blocks[torch.from_numpy(mask)] != hover))
@@ -319,7 +319,7 @@ class JointReplayAndLearnerTest(unittest.TestCase):
             ("actor_action", current_mask),
             ("target_actor_action", next_mask),
         ):
-            blocks = update[action_name].reshape(-1, 10, 3)[0]
+            blocks = update[action_name].reshape(-1, 16, 3)[0]
             hover = torch.tensor(HOVER_ACTION, dtype=blocks.dtype)
             self.assertTrue(torch.all(blocks[~torch.from_numpy(mask)] == hover))
             self.assertTrue(torch.any(blocks[torch.from_numpy(mask)] != hover))

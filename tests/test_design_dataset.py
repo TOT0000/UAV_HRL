@@ -51,11 +51,11 @@ class DesignSchemaTest(unittest.TestCase):
         continuous = set(state["continuous_indices"])
         discrete = set(state["discrete_indices"])
         self.assertFalse(continuous.intersection(discrete))
-        self.assertEqual(continuous | discrete, set(range(519)))
-        self.assertEqual([item["index"] for item in state["features"]], list(range(519)))
-        self.assertEqual(len(action["features"]), 30)
+        self.assertEqual(continuous | discrete, set(range(675)))
+        self.assertEqual([item["index"] for item in state["features"]], list(range(675)))
+        self.assertEqual(len(action["features"]), 48)
         self.assertEqual(
-            {item["index"] for item in action["features"]}, set(range(30))
+            {item["index"] for item in action["features"]}, set(range(48))
         )
         self.assertEqual(action["range"], [-1.0, 1.0])
 
@@ -79,7 +79,7 @@ class DesignDatasetIntegrationTest(unittest.TestCase):
             cls.dinkelbach_state.record_episode(1.0, 2.0)
 
         td3 = TD3(MOVEMENT_STATE_DIM, JOINT_ACTION_DIM, max_action=1.0, gamma=1.0)
-        ddqn = DDQN(101, 11)
+        ddqn = DDQN(143, 17)
         _, calibration = load_com_capacity_reference()
         cls.checkpoint = cls.root / "checkpoints" / "models" / "ep_1500"
         save_model_checkpoint(
@@ -87,9 +87,9 @@ class DesignDatasetIntegrationTest(unittest.TestCase):
             episode=1499,
             td3=td3,
             ddqn=ddqn,
-            movement_state_dim=519,
-            joint_action_dim=30,
-            routing_state_dim=101,
+            movement_state_dim=675,
+            joint_action_dim=48,
+            routing_state_dim=143,
             calibration=calibration,
             experiment_metadata={
                 "method_id": cls.method.method_id,
@@ -189,8 +189,11 @@ class DesignDatasetIntegrationTest(unittest.TestCase):
 
     def test_two_episodes_produce_120_ordered_joint_transitions(self):
         arrays = self.arrays_one
-        self.assertEqual(DESIGN_DATASET_SCHEMA_VERSION, 4)
-        self.assertEqual(self.metadata_one["schema_version"], 4)
+        self.assertEqual(DESIGN_DATASET_SCHEMA_VERSION, 5)
+        self.assertEqual(self.metadata_one["schema_version"], 5)
+        self.assertEqual(self.metadata_one["checkpoint_schema_version"], 25)
+        self.assertEqual(self.metadata_one["scenario_schema_version"], "uav-hrl-scenario-v8")
+        self.assertEqual(self.metadata_one["num_uav"], 16)
         self.assertEqual(
             self.metadata_one["task_potential_contract_version"],
             TASK_POTENTIAL_CONTRACT_VERSION,
@@ -200,9 +203,9 @@ class DesignDatasetIntegrationTest(unittest.TestCase):
             MOVEMENT_REPLAY_CONTRACT_VERSION,
         )
         self.assertEqual(set(arrays), set(ARRAY_NAMES))
-        self.assertEqual(arrays["state"].shape, (120, 519))
-        self.assertEqual(arrays["projected_joint_action"].shape, (120, 30))
-        self.assertEqual(arrays["next_state"].shape, (120, 519))
+        self.assertEqual(arrays["state"].shape, (120, 675))
+        self.assertEqual(arrays["projected_joint_action"].shape, (120, 48))
+        self.assertEqual(arrays["next_state"].shape, (120, 675))
         self.assertEqual(int(arrays["done"].sum()), 2)
         self.assertEqual(self.metadata_one["centralized_actor_calls"], 120)
         np.testing.assert_array_equal(arrays["global_transition_index"], np.arange(120))

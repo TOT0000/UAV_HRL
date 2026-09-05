@@ -1,6 +1,10 @@
 import copy
+import json
 import math
+from pathlib import Path
+import tempfile
 import unittest
+from unittest import mock
 
 import numpy as np
 
@@ -18,6 +22,7 @@ from HRL_task_aware import (
     TrainingConfig,
     _interval_reward,
     terminal_ratio_objective,
+    train,
 )
 from Packet_scheduler_v1 import PacketEngine
 from Simulator import Simulator
@@ -30,25 +35,32 @@ from centralized_movement import (
     movement_mask_from_state,
 )
 from experiment_config import (
+    MethodSpec,
     NUM_UAV,
     PERMANENT_GS_GATEWAY_UAV_ID,
     REFERENCE_COM_BANDWIDTH_HZ,
     RESERVED_SEARCH_UAV_IDS,
+    ROUTING_ACTION_DIM,
 )
 from observation_strategy import apply_observation_strategy
 from scenario_manifest import ScenarioManifest, generate_manifest
 from training_checkpoint import CHECKPOINT_SCHEMA_VERSION, _validate_checkpoint_schema
+from training_checkpoint import (
+    inspect_model_checkpoint,
+    preflight_full_resume_checkpoint_metadata,
+)
 
 
-class Uav10ConfigurationContractTest(unittest.TestCase):
+class Uav16ConfigurationContractTest(unittest.TestCase):
     def test_dimensions_and_manifest_layout_are_authoritative(self):
-        self.assertEqual(NUM_UAV, 10)
-        self.assertEqual(MOVEMENT_STATE_DIM, 519)
-        self.assertEqual(JOINT_ACTION_DIM, 30)
-        self.assertEqual(ROUTING_STATE_DIM, 101)
-        self.assertEqual(RESERVED_SEARCH_UAV_IDS, (0, 9))
+        self.assertEqual(NUM_UAV, 16)
+        self.assertEqual(MOVEMENT_STATE_DIM, 675)
+        self.assertEqual(JOINT_ACTION_DIM, 48)
+        self.assertEqual(ROUTING_STATE_DIM, 143)
+        self.assertEqual(ROUTING_ACTION_DIM, 17)
+        self.assertEqual(RESERVED_SEARCH_UAV_IDS, (0, 15))
         self.assertEqual(PERMANENT_GS_GATEWAY_UAV_ID, 0)
-        self.assertAlmostEqual(REFERENCE_COM_BANDWIDTH_HZ, 10e6 / 18.0)
+        self.assertAlmostEqual(REFERENCE_COM_BANDWIDTH_HZ, 10e6 / 24.0)
 
         manifest = generate_manifest("test", 123, 1)
         entry = manifest.episodes[0]
@@ -56,31 +68,70 @@ class Uav10ConfigurationContractTest(unittest.TestCase):
         self.assertEqual(
             positions,
             [
-                (50.0, 50.0),
-                (300.0, 250.0),
-                (500.0, 250.0),
-                (700.0, 250.0),
-                (900.0, 250.0),
-                (100.0, 750.0),
-                (300.0, 750.0),
-                (500.0, 750.0),
-                (700.0, 750.0),
-                (900.0, 750.0),
+                (100.0, 100.0),
+                (300.0, 100.0),
+                (500.0, 100.0),
+                (700.0, 100.0),
+                (100.0, 300.0),
+                (300.0, 300.0),
+                (500.0, 300.0),
+                (700.0, 300.0),
+                (100.0, 500.0),
+                (300.0, 500.0),
+                (500.0, 500.0),
+                (700.0, 500.0),
+                (100.0, 700.0),
+                (300.0, 700.0),
+                (500.0, 700.0),
+                (700.0, 700.0),
             ],
         )
-        self.assertEqual(entry["exogenous_primitives"]["num_uav"], 10)
+        self.assertEqual(entry["exogenous_primitives"]["num_uav"], 16)
         self.assertEqual(
-            entry["exogenous_primitives"]["reserved_search_uav_ids"], [0, 9]
+            entry["exogenous_primitives"]["reserved_search_uav_ids"], [0, 15]
         )
+        repeated = generate_manifest("test", 123, 1).episodes[0]
+        self.assertEqual(entry["uavs"], repeated["uavs"])
+        self.assertTrue(
+            all(80.0 <= row["position"][2] <= 120.0 for row in entry["uavs"])
+        )
+        env = Simulator(NUM_UAV)
+        env.apply_scenario_entry(entry)
+        self.assertEqual(env.GS_ID, 16)
+        self.assertEqual(env.get_routing_action_mask(0).shape, (ROUTING_ACTION_DIM,))
 
     def test_legacy_manifest_and_checkpoint_fail_fast(self):
         data = generate_manifest("test", 124, 1).to_dict()
         data["schema_version"] = "uav-hrl-scenario-v2"
         with self.assertRaisesRegex(ValueError, "16-UAV.*incompatible"):
             ScenarioManifest.from_dict(data)
-        self.assertEqual(CHECKPOINT_SCHEMA_VERSION, 24)
+        self.assertEqual(CHECKPOINT_SCHEMA_VERSION, 25)
         with self.assertRaisesRegex(RuntimeError, "must be retrained"):
-            _validate_checkpoint_schema({"checkpoint_schema_version": 9})
+            _validate_checkpoint_schema({"checkpoint_schema_version": 24})
+
+    def test_schema_24_is_rejected_before_model_or_resume_payload_load(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            checkpoint = Path(temp_dir)
+            (checkpoint / "metadata.json").write_text(
+                json.dumps({"checkpoint_schema_version": 24}),
+                encoding="utf-8",
+            )
+            with mock.patch("training_checkpoint.torch.load") as torch_load:
+                with self.assertRaisesRegex(RuntimeError, "16-UAV.*retrained"):
+                    inspect_model_checkpoint(checkpoint)
+                torch_load.assert_not_called()
+
+                with self.assertRaisesRegex(RuntimeError, "16-UAV.*retrained"):
+                    preflight_full_resume_checkpoint_metadata(
+                        checkpoint,
+                        movement_state_dim=675,
+                        joint_action_dim=48,
+                        routing_state_dim=143,
+                        td3_gamma=1.0,
+                        ddqn_gamma=0.99,
+                        calibration=None,
+                    )
+                torch_load.assert_not_called()
 
 
 class StateAndAssignmentContractTest(unittest.TestCase):
@@ -106,7 +157,7 @@ class StateAndAssignmentContractTest(unittest.TestCase):
         discovered = self.movement_state()
         global_base = NUM_UAV * 26 + 16 * 16
         self.assertAlmostEqual(discovered[global_base + 1], 1.0 / 8.0)
-        self.assertEqual(discovered.shape, (519,))
+        self.assertEqual(discovered.shape, (675,))
 
     def test_reserved_search_is_outside_solver_and_release_reassigns_all(self):
         gt = self.env.gts[0]
@@ -153,6 +204,93 @@ class StateAndAssignmentContractTest(unittest.TestCase):
             ],
             ["Hovering"],
         )
+
+    def test_deferred_search_release_reassigns_once_at_next_boundary(self):
+        assignments_before = copy.deepcopy(self.env.multi_tasks)
+        invocation_before = self.env.assignment_invocations
+        self.env.visited_bitmap[:] = True
+        self.env.current_time = 4.0
+
+        self.env.convert_search_to_hovering(defer_assignment=True)
+
+        self.assertEqual(self.env.assignment_invocations, invocation_before)
+        self.assertEqual(self.env.multi_tasks, assignments_before)
+        self.assertTrue(self.env.search_release_reassignment_pending)
+        self.assertTrue(self.env.need_reassign)
+        self.assertEqual(self.env.search_to_hover_conversions, 1)
+        self.assertTrue(
+            any(
+                task["task_type"] == "Search"
+                for tasks in self.env.multi_tasks.values()
+                for task in tasks
+            )
+        )
+
+        self.assertTrue(self.env.prepare_next_movement_interval(1))
+        self.assertEqual(self.env.assignment_invocations, invocation_before + 1)
+        self.assertFalse(self.env.search_release_reassignment_pending)
+        self.assertFalse(self.env.need_reassign)
+        self.assertFalse(
+            any(
+                task["task_type"] == "Search"
+                for tasks in self.env.multi_tasks.values()
+                for task in tasks
+            )
+        )
+        self.assertEqual(
+            [
+                task["task_type"]
+                for task in self.env.multi_tasks[PERMANENT_GS_GATEWAY_UAV_ID]
+            ],
+            ["Hovering"],
+        )
+
+        self.env.convert_search_to_hovering(defer_assignment=True)
+        self.assertEqual(self.env.assignment_invocations, invocation_before + 1)
+        self.assertEqual(self.env.search_to_hover_conversions, 1)
+
+    def test_terminal_interval_search_release_stays_pending_and_finishes_safely(self):
+        config = TrainingConfig(
+            total_episodes=1,
+            mode="custom",
+            episode_seconds=1,
+            warmup_joint_transitions=10_000,
+            batch_size=1,
+            enable_model_checkpoints=False,
+            enable_full_resume=False,
+            enable_plots=False,
+            enable_csv=False,
+            random_seed=2048,
+        )
+
+        def cover_at_terminal_boundary(environment):
+            environment.visited_bitmap[:] = True
+            return ()
+
+        with mock.patch(
+            "HRL_task_aware._mark_search_observations",
+            side_effect=cover_at_terminal_boundary,
+        ):
+            result = train(
+                config,
+                scenario_manifest=generate_manifest(
+                    "test", 2048, 1, num_gt=2
+                ),
+                method_spec=MethodSpec.parse(
+                    "kkm_random_action_random_routing"
+                ),
+                evaluation=True,
+            )
+
+        assignment = result["relay_diagnostics"]["episodes"][0]["assignment"]
+        self.assertTrue(assignment["search_phase_over"])
+        self.assertTrue(assignment["search_completed"])
+        self.assertTrue(assignment["search_release_reassignment_pending"])
+        self.assertFalse(assignment["search_release_assignment_applied"])
+        self.assertEqual(assignment["invocation"], 1)
+        self.assertEqual(result["assignment_invocations"], 1)
+        self.assertTrue(math.isfinite(result["search_release_time_seconds"]))
+        self.assertEqual(result["search_release_coverage"], 1.0)
 
     def test_fov_com_order_is_observation_potential_and_generation_invariant(self):
         uav_id = 1

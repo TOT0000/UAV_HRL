@@ -35,7 +35,7 @@ from Channel_model import (
 )
 
 
-NUM_UAV = 10
+NUM_UAV = 16
 ROUTING_ACTION_DIM = NUM_UAV + 1
 ROUTING_ACTION_FEATURE_GROUPS = (
     "effective_action_mask",
@@ -50,7 +50,7 @@ ROUTING_STATE_DIM = (
     ROUTING_NON_ACTION_FEATURE_DIM
     + len(ROUTING_ACTION_FEATURE_GROUPS) * ROUTING_ACTION_DIM
 )
-ROUTING_STATE_SCHEMA_VERSION = "action-wise-gs-progress-v1"
+ROUTING_STATE_SCHEMA_VERSION = "16-uav-action-wise-gs-progress-v2"
 ROI_COUNT_MIN = 2
 ROI_COUNT_MAX = 8
 RESERVED_SEARCH_UAV_IDS = (0, NUM_UAV - 1)
@@ -64,20 +64,26 @@ GS_GATEWAY_CONTRACT_VERSION = (
     "permanent-uav0-search-to-hover-altitude-feasible-3d-hard400-only-v3"
 )
 CANONICAL_UAV_INITIAL_XY_M = (
-    (50.0, 50.0),
-    (300.0, 250.0),
-    (500.0, 250.0),
-    (700.0, 250.0),
-    (900.0, 250.0),
-    (100.0, 750.0),
-    (300.0, 750.0),
-    (500.0, 750.0),
-    (700.0, 750.0),
-    (900.0, 750.0),
+    (100.0, 100.0),
+    (300.0, 100.0),
+    (500.0, 100.0),
+    (700.0, 100.0),
+    (100.0, 300.0),
+    (300.0, 300.0),
+    (500.0, 300.0),
+    (700.0, 300.0),
+    (100.0, 500.0),
+    (300.0, 500.0),
+    (500.0, 500.0),
+    (700.0, 500.0),
+    (100.0, 700.0),
+    (300.0, 700.0),
+    (500.0, 700.0),
+    (700.0, 700.0),
 )
-UAV_INITIAL_LAYOUT_VERSION = "gs-reachable-gateway-grid-v2"
+UAV_INITIAL_LAYOUT_VERSION = "original-fixed-4x4-grid-named-altitude-v3"
 INITIAL_COMMUNICATION_TOPOLOGY_CONTRACT_VERSION = (
-    "finite-3d-inclusive-unified-400m-gs-component-min-two-uavs-v2"
+    "finite-3d-inclusive-unified-400m-connected-16-uav-grid-v3"
 )
 ENVIRONMENT_WIDTH_M = 1000.0
 ENVIRONMENT_HEIGHT_M = 1000.0
@@ -85,14 +91,20 @@ GROUND_ALTITUDE_M = 0.0
 UAV_MAX_ALTITUDE_M = 150.0
 TASK_POTENTIAL_NORMALIZATION_EPSILON = 1e-12
 TASK_POTENTIAL_CONTRACT_VERSION = (
-    "vs-com-relay-boundary-aligned-decision-backlog-potential-v5"
+    "vs-com-relay-range-progress-boundary-aligned-potential-v6"
 )
 COM_CAPACITY_POTENTIAL_WEIGHT = 0.5
 COM_DISTANCE_POTENTIAL_WEIGHT = 0.5
-RELAY_TASK_CONTRACT_VERSION = "relay-expected-capacity-shortest-path-v1"
+RELAY_RECEIVE_CAPACITY_POTENTIAL_WEIGHT = 0.5
+RELAY_RECEIVE_DISTANCE_POTENTIAL_WEIGHT = 0.5
+RELAY_FORWARD_PATH_POTENTIAL_WEIGHT = 0.5
+RELAY_FORWARD_DISTANCE_POTENTIAL_WEIGHT = 0.5
+RELAY_TASK_CONTRACT_VERSION = (
+    "relay-expected-capacity-shortest-path-selection-range-progress-movement-v2"
+)
 RELAY_FORWARD_REFERENCE_SECONDS = 2.0
 RELAY_POTENTIAL_WEIGHT = 1.0
-METHOD_CONTRACT_VERSION = "centralized-relay-task-v1"
+METHOD_CONTRACT_VERSION = "centralized-16-uav-relay-range-progress-v2"
 DEFAULT_TRAINING_SEED = 20260817
 FORMAL_TRAINING_EPISODES = 1500
 FORMAL_CHECKPOINT_EPISODE = FORMAL_TRAINING_EPISODES
@@ -203,7 +215,7 @@ MOVEMENT_ACTION_PROJECTION_CONTRACT_VERSION = (
     "fieldwise-clamp-heading-wrap-relay-active-mask-uav0-hard400-v5"
 )
 MOVEMENT_REPLAY_CONTRACT_VERSION = (
-    "executed-action-boundary-aligned-next-state-and-potential-capacity-50000-v5"
+    "executed-action-boundary-aligned-next-state-relay-range-potential-capacity-50000-v6"
 )
 MOVEMENT_WARMUP_CONTRACT_VERSION = "global-joint-transition-boundary-10000-v1"
 PROPULSION_PARAMETERS = MappingProxyType(
@@ -244,7 +256,15 @@ def validate_task_potential_weights():
 
     groups = {
         "COM": (COM_CAPACITY_POTENTIAL_WEIGHT, COM_DISTANCE_POTENTIAL_WEIGHT),
-        "Relay": (RELAY_POTENTIAL_WEIGHT,),
+        "Relay Receive": (
+            RELAY_RECEIVE_CAPACITY_POTENTIAL_WEIGHT,
+            RELAY_RECEIVE_DISTANCE_POTENTIAL_WEIGHT,
+        ),
+        "Relay Forward": (
+            RELAY_FORWARD_PATH_POTENTIAL_WEIGHT,
+            RELAY_FORWARD_DISTANCE_POTENTIAL_WEIGHT,
+        ),
+        "Relay shaping": (RELAY_POTENTIAL_WEIGHT,),
     }
     for name, weights in groups.items():
         numeric = tuple(float(weight) for weight in weights)
@@ -298,9 +318,35 @@ def task_potential_contract_metadata():
             "normalization_epsilon": TASK_POTENTIAL_NORMALIZATION_EPSILON,
         },
         "relay": {
-            "definition": "mean(min(receive_score, forward_score))",
+            "selection_utility_definition": (
+                "min(backlog-weighted normalized expected U2U receive capacity, "
+                "expected-capacity shortest-path forward score)"
+            ),
+            "movement_potential_definition": (
+                "mean(min(0.5 * receive_capacity + 0.5 * receive_distance_progress, "
+                "0.5 * forward_path_score + 0.5 * forward_distance_progress))"
+            ),
             "aggregation": "mean over assigned Relay tasks",
             "beta": RELAY_POTENTIAL_WEIGHT,
+            "receive_capacity_weight": RELAY_RECEIVE_CAPACITY_POTENTIAL_WEIGHT,
+            "receive_distance_weight": RELAY_RECEIVE_DISTANCE_POTENTIAL_WEIGHT,
+            "forward_path_weight": RELAY_FORWARD_PATH_POTENTIAL_WEIGHT,
+            "forward_distance_weight": RELAY_FORWARD_DISTANCE_POTENTIAL_WEIGHT,
+            "distance_dimensionality": "three_dimensional_3d",
+            "communication_range_m": COMMUNICATION_RANGE_M,
+            "distance_progress_saturation": (
+                "range gap is zero and progress is one at or inside 400 m"
+            ),
+            "maximum_3d_distance_reference_m": distance_3d_reference,
+            "range_gap_normalization_reference_m": range_gap_reference,
+            "receive_distance_sources": (
+                "assignment-backlog-weighted non-gateway source UAVs with uniform "
+                "fallback when total source backlog is zero"
+            ),
+            "forward_distance_targets": (
+                "nearest UAV with a positive expected-capacity directed path "
+                "to GS, or GS"
+            ),
             "current_backlog_snapshot": "current decision-state boundary",
             "next_backlog_snapshot": "next decision-state boundary",
             "transition_alignment": (

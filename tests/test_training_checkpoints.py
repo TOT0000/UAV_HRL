@@ -57,8 +57,8 @@ from channel_fixtures import initialized_channel_lifecycle_state
 from routing_transition_fixtures import routing_transition_checkpoint_fixture
 
 
-ROUTING_STATE_DIM = 101
-ROUTING_ACTION_DIM = 11
+ROUTING_STATE_DIM = 143
+ROUTING_ACTION_DIM = 17
 
 
 def _model_provenance_fixture(episode_count):
@@ -851,7 +851,7 @@ class FullResumeCheckpointTest(unittest.TestCase):
             ) as load_networks:
                 with self.assertRaisesRegex(
                     RuntimeError,
-                    "boundary-aligned current/next decision-state Relay potential.*"
+                    "canonical 16-UAV.*range-progress movement potential.*"
                     "must be retrained",
                 ):
                     load_model_checkpoint(checkpoint_dir, td3, ddqn)
@@ -1119,7 +1119,7 @@ class FullResumeCheckpointTest(unittest.TestCase):
             ) as load_networks:
                 with self.assertRaisesRegex(
                     RuntimeError,
-                    "boundary-aligned current/next decision-state Relay potential.*"
+                    "canonical 16-UAV.*range-progress movement potential.*"
                     "must be retrained",
                 ):
                     load_full_resume_checkpoint(**common)
@@ -1190,7 +1190,7 @@ class TrainingCliTest(unittest.TestCase):
         )
 
     def test_checkpoint_schema_is_explicit(self):
-        self.assertEqual(CHECKPOINT_SCHEMA_VERSION, 24)
+        self.assertEqual(CHECKPOINT_SCHEMA_VERSION, 25)
 
 
 if __name__ == "__main__":

@@ -41,7 +41,7 @@ from experiment_config import (
 )
 
 
-SCENARIO_SCHEMA_VERSION = "uav-hrl-scenario-v7"
+SCENARIO_SCHEMA_VERSION = "uav-hrl-scenario-v8"
 OBSOLETE_SCHEMA_VERSIONS = frozenset(
     {
         "uav-hrl-scenario-v1",
@@ -50,11 +50,12 @@ OBSOLETE_SCHEMA_VERSIONS = frozenset(
         "uav-hrl-scenario-v4",
         "uav-hrl-scenario-v5",
         "uav-hrl-scenario-v6",
+        "uav-hrl-scenario-v7",
     }
 )
 # Singular compatibility name used by callers that construct an obsolete
 # manifest explicitly for fail-fast tests.
-OBSOLETE_SCHEMA_VERSION = "uav-hrl-scenario-v6"
+OBSOLETE_SCHEMA_VERSION = "uav-hrl-scenario-v7"
 UAV_INITIAL_LAYOUT = UAV_INITIAL_LAYOUT_VERSION
 SUPPORTED_SPLITS = frozenset({"train", "validation", "test"})
 POLICY_DEPENDENT_KEYS = frozenset(
@@ -691,7 +692,7 @@ class ScenarioManifest:
         }:
             raise ValueError(
                 "legacy 16-UAV scenario schema is incompatible; regenerate the "
-                "manifest with the 10-UAV v7 generator"
+                "manifest with the 16-UAV v8 generator"
             )
         if data.get("schema_version") == "uav-hrl-scenario-v3":
             raise ValueError(
@@ -714,6 +715,11 @@ class ScenarioManifest:
                 "legacy soft-compressed 360-400 m UAV 0 gateway projection is "
                 "incompatible; regenerate the manifest with the continuous "
                 "hard-only 400 m v7 generator"
+            )
+        if data.get("schema_version") == "uav-hrl-scenario-v7":
+            raise ValueError(
+                "legacy 10-UAV scenario schema is incompatible; regenerate the "
+                "manifest with the 16-UAV v8 generator"
             )
         if data.get("schema_version") != SCENARIO_SCHEMA_VERSION:
             raise ValueError(

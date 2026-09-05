@@ -453,21 +453,21 @@ class RoutingQScoreNoBehaviorChangeTest(unittest.TestCase):
 
     @staticmethod
     def _run_formal_slot(*, diagnostics_enabled):
-        env = Simulator(num_UAV=10, rng_streams=NamedRNGStreams(20260901))
+        env = Simulator(num_UAV=16, rng_streams=NamedRNGStreams(20260901))
         env.num_GT = 2
         env.reset_environment()
         env.source_uavs = set()
         env.current_time = 0.0
-        env.get_routing_action_mask = lambda _uid: np.ones(11, dtype=bool)
+        env.get_routing_action_mask = lambda _uid: np.ones(17, dtype=bool)
         env.update_u2u_channels()
         env.update_u2g_channels()
 
-        engine = PacketEngine(num_uav=10, step_time=0.25)
+        engine = PacketEngine(num_uav=16, step_time=0.25)
         packet = engine.create_packet(0, "COM", 100.0, 0.0)
         packet["deadline_abs"] = 0.25
-        replay = ReplayBufferDiscrete(101, 11, max_size=16, n_step=1)
-        q_r = np.asarray([2.0, 1.0, *([0.0] * 9)])
-        agent = fixed_agent(q_r, np.zeros(11), lambda_cost=15.0)
+        replay = ReplayBufferDiscrete(143, 17, max_size=16, n_step=1)
+        q_r = np.asarray([2.0, 1.0, *([0.0] * 15)])
+        agent = fixed_agent(q_r, np.zeros(17), lambda_cost=15.0)
         accumulator = (
             RoutingQScoreDiagnosticAccumulator() if diagnostics_enabled else None
         )

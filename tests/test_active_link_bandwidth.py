@@ -11,11 +11,11 @@ from Simulator import Simulator
 
 class ActiveLinkBandwidthTest(unittest.TestCase):
     def setUp(self):
-        self.env = Simulator(num_UAV=10)
-        self.env.PL_uu_cache = np.full((10, 10), 100.0, dtype=float)
+        self.env = Simulator(num_UAV=16)
+        self.env.PL_uu_cache = np.full((16, 16), 100.0, dtype=float)
         np.fill_diagonal(self.env.PL_uu_cache, 0.0)
-        self.env.PL_ug_cache = np.full(10, 105.0, dtype=float)
-        positions = np.zeros((10, 3), dtype=float)
+        self.env.PL_ug_cache = np.full(16, 105.0, dtype=float)
+        positions = np.zeros((16, 3), dtype=float)
         positions[:, 2] = 100.0
         self.env.channel.reset_episode(
             uav_positions=positions,

@@ -9,11 +9,11 @@ process. The registry keys are `td3_dinkelbach`, `ddpg_dinkelbach`,
 `km_td3_dinkelbach`, `random_assignment_td3_dinkelbach`,
 `km_ddpg_dinkelbach`, `ddpg_dinkelbach_wo_ta`,
 `td3_dinkelbach_random_routing`, and `td3_dinkelbach_dqn_wo_ta`. All sixteen methods share
-10 UAVs, the common Simulator and synchronous movement flow,
+16 UAVs, the common Simulator and synchronous movement flow,
 energy/delivery accounting, evaluation, and logging.
 
 The added baselines are orthogonal configurations of that shared flow. The
-`wo_ta` method keeps the 429-D/101-D layouts but zeros named task-assignment
+`wo_ta` method keeps the 675-D/143-D layouts but zeros named task-assignment
 observation fields. The controlled DQN method replaces safe-DDQN with a masked
 standard DQN. The combined random baseline uses K-KM, the common projected
 continuous movement domain, and uniform random routing over each slot's current
@@ -21,14 +21,14 @@ effective mask. The assignment baselines use one KM round and one seeded
 shuffle-and-pair random round, respectively.
 
 All assignment solvers exclude Search and Hovering. Below 0.99 coverage UAVs
-0 and 9 are reserved for Search, while the other UAVs solve only discovered FOV
+0 and 15 are reserved for Search, while the other UAVs solve only discovered FOV
 and COM service tasks; unassigned UAVs fall back to Search. UAV 0 is permanently
 excluded from service assignment: it is Search plus GS gateway below the release
-threshold and Hovering plus GS gateway after release. UAV 9 keeps the ordinary
+threshold and Hovering plus GS gateway after release. UAV 15 keeps the ordinary
 reserved-Search lifecycle and may be reassigned after release. FOV raw utility
 uses global feasible-pair min/max normalization (equal values map to 0.5), while
 COM uses canonical S2U capacity at the candidate's actual 3-D geometry,
-computed with `10 MHz / 18` from the sampled one-second A2G LoS/NLoS state and
+computed with `10 MHz / 24` from the sampled one-second A2G LoS/NLoS state and
 the corresponding deterministic Rician/Rayleigh expected capacity. It is
 divided by the fixed 50 m AGL LoS-Rician expected-capacity reference. This
 denominator is independent of candidates and traffic rate. A separate feasibility mask and
@@ -218,13 +218,14 @@ and horizontal target geometry and is independent of the communication range.
 `Phi_COM` is the arithmetic mean over COM tasks, or zero when none exist.
 Both blends use weights `0.5/0.5` and are finite in `[0,1]`.
 
-The contract is `vs-horizontal-proximity-com-400m-range-gap-blend-v2`. TD3 and DDPG
+The task-potential contract is
+`vs-com-relay-range-progress-boundary-aligned-potential-v6`. TD3 and DDPG
 consume the same potential definitions, random-movement methods publish the
 same environment/reward contract, and `*_no_task_potential` methods disable all
-Search/VS/COM shaping. Existing observations already contain UAV and task
+Search/VS/COM/Relay shaping. Existing observations already contain UAV and task
 positions plus COM capacity. Movement state and joint action dimensions remain
-429 and 30; routing state is 101-D after adding the 11 action-wise GS-progress
-features in UAV-0-through-UAV-9-then-GS order.
+675 and 48; routing state is 143-D after adding the 17 action-wise GS-progress
+features in UAV-0-through-UAV-15-then-GS order.
 
 ## Stochastic channel contract
 
@@ -321,18 +322,17 @@ seeds, the critical value is approximately `2.776`.
 
 ## Scenario manifests
 
-The `uav-hrl-scenario-v7` JSON schema records the split, manifest seed, episode
+The `uav-hrl-scenario-v8` JSON schema records the split, manifest seed, episode
 count, generation profile, generator/config fingerprint, content hash, permanent
-gateway contract, and one entry per scenario. Schemas v1-v6 are obsolete and
+gateway contract, and one entry per scenario. Schemas v1-v7 are obsolete and
 must be regenerated. Each
 entry contains its profile-aware ID and seed, GT/RoI data, UAV initial state,
 SR initial state and deterministic motion primitive, and traffic/load
 primitives.
 
-The ground station is fixed at `(0, 0, 0)`. Canonical UAV 0 starts at
-`(50, 50, z)` while UAVs 1-9 retain `(300,250)`, `(500,250)`, `(700,250)`,
-`(900,250)`, `(100,750)`, `(300,750)`, `(500,750)`, `(700,750)`, and
-`(900,750)` respectively. Every UAV still consumes exactly one deterministic
+The ground station is fixed at `(0, 0, 0)`. Canonical UAVs 0-15 start on the
+fixed 4x4 Cartesian product of `x,y in {100,300,500,700}` in row-major order.
+Every UAV still consumes exactly one deterministic
 `z ~ Uniform(80,120)` draw and starts with 10,000 J. This is only an initial
 geometry contract. UAV 0 is the permanent GS gateway. The single common movement
 proposal/execution path applies a continuous, hard-only 3-D GS projection to
@@ -343,7 +343,7 @@ boundary. Feasible UAV altitude is retained and the horizontal component is
 shortened to at most `sqrt(400^2 - dz^2)`, avoiding naïve radial scaling below
 minimum altitude; the final point must also obey environment XY bounds. The
 legacy 360 m soft radius remains metadata-only with
-`gs_gateway_soft_radius_operational=false`. UAV 9 is not projected.
+`gs_gateway_soft_radius_operational=false`. UAV 15 is not projected.
 Replay records the executed net movement, state/channel/task geometry observes
 the projected position, and propulsion energy uses the executed displacement.
 The fixed movement warm-up remains 10,000 joint transitions.
@@ -421,7 +421,7 @@ uses the ordinary deterministic evaluation dataflow with no exploration or
 action perturbation and never updates learning or Dinkelbach state. Its atomic
 artifacts are `design_transitions.npz`, `design_dataset_metadata.json`, and a
 design-local `per_episode.csv`/`per_episode.jsonl`. The NPZ stores each complete
-429-D state, projected 30-D raw actor action, 429-D next state, terminal flags,
+675-D state, projected 48-D raw actor action, 675-D next state, terminal flags,
 delivery/energy and potential reward components, checkpoint lambda, and
 episode/step/scenario identity. Metadata records the authoritative state/action
 schema from `centralized_movement.py`; it deliberately does not select
@@ -489,23 +489,23 @@ python -X utf8 comparison_experiment.py aggregate --input-dir runs/comparison/ev
 
 Exact-resume checkpoints validate the method fingerprint, training-manifest
 relationship, training seed, the complete Dinkelbach block state, and its configuration.
-Checkpoint schema v24 is the current action-wise-GS-progress,
+Checkpoint schema v25 is the current 16-UAV action-wise-GS-progress,
 continuous-hard-only-gateway,
 unified-400-m communication, permanent-gateway, coverage-weighted useful
 goodput, boundary-aligned stochastic-channel,
 movement/routing replay, utility/QoS, routing-ID causality/credit,
-boundary-aligned current/next decision-state Relay potential plus soft-GS-progress
+boundary-aligned current/next decision-state Relay range-progress potential plus soft-GS-progress
 reward, GS-reachable initial topology, distance-aware VS/COM task potentials,
 hard-range/COM-session, atomic-FOV, seed-ratio
 aggregation, propulsion, and four-slot/fifty-block movement-channel contract.
-Schema v23 and every older schema is rejected before weights or replay state are
+Schema v24 and every older schema is rejected before weights or replay state are
 restored and must be retrained; no legacy checkpoint migration is attempted.
 The current schema
-stores the 519/30/101 dimensions, Relay-aware movement feature schema,
+stores the 675/48/143 dimensions, Relay-aware movement feature schema,
 direct-ratio bit/J
 objective, shared gateway/channel/packet contracts, active FOV capture-coverage
 snapshots, raw/useful counters, inject buffers, adaptive routing lifecycle, and
-FOV-EMA state. The scenario schema is v7. Schema-19 checkpoints use the
+FOV-EMA state. The scenario schema is v8. Schema-19 checkpoints use the
 discontinuous 360-400 m soft
 compression and must be retrained under the hard-only projection dynamics.
 Schema-18 checkpoints use the previous split 200 m A2G / 400 m
@@ -524,7 +524,7 @@ block never triggers a forced update. Full-resume logging schema v2 separately
 persists `lambda_used_log` and `lambda_after_episode_log`; a legacy ambiguous
 single-lambda log is rejected for exact resume without changing model-only
 checkpoint compatibility. Formal evaluation validates model-only type, schema,
-429/30/101 dimensions, movement-agent/DDQN gamma, COM normalization, method/seed,
+675/48/143 dimensions, movement-agent/DDQN gamma, COM normalization, method/seed,
 the formal core configuration before loading weights. The checkpoint's own
 planned horizon may be smaller than the current run horizon only when
 `total_episodes` is the sole formal-config difference, the checkpoint episode is
@@ -722,7 +722,7 @@ ID, checkpoint episode, and RoI. A failed point is marked failed, later points
 remain pending, and already completed point outputs are preserved.
 
 The trajectory manifest contains exactly the requested evaluation episode
-count (one by default). Its artifact records all 10 UAVs and paths, explicit
+count (one by default). Its artifact records all 16 UAVs and paths, explicit
 target UAV and phase, RoIs/detection, SR paths, GS, actual selected U2U/U2G
 links, sensing footprint geometry, requested/actual times, scenario identity,
 method configuration, checkpoint provenance, and Git SHA.
@@ -758,7 +758,7 @@ provenance triplet are intentionally rejected.
 
 Each sweep point writes per-episode data plus `aggregated_plot_data.csv/json`.
 Its metadata also persists the actual manifest path and canonical hash,
-scenario IDs, evaluation count/horizon/seed, 10-UAV count, and fully resolved
+scenario IDs, evaluation count/horizon/seed, 16-UAV count, and fully resolved
 traffic-rate/deadline/cutoff overrides. The deadline-violation (Fig. 6) sweep
 uses a scoped `57.0 s` packet-injection cutoff so its maximum `3.0 s` deadline
 can resolve within the 60-second horizon; other training and evaluation suites
@@ -842,7 +842,7 @@ screenshot references, visual contracts, and intentional changes.
 Each standalone trajectory JSON uses schema
 `uav-hrl-standalone-trajectory-v1` and contains the complete scene needed for
 an independent redraw: requested/actual time and phase, scenario/manifest and
-checkpoint provenance, Git SHA, GS and ground targets, all 10 UAV snapshots and
+checkpoint provenance, Git SHA, GS and ground targets, all 16 UAV snapshots and
 their assignments, every UAV path truncated at the selected actual time, SR
 snapshots and truncated paths, active links, sensing coverage, camera, axes,
 labels, and registry style. Its long-form CSV uses `record_type` values

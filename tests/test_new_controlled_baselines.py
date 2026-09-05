@@ -19,6 +19,7 @@ from centralized_movement import (
 from dinkelbach_blocks import DinkelbachBlockState, dinkelbach_config_metadata
 from experiment_config import (
     MethodSpec,
+    ROUTING_ACTION_DIM,
     effective_training_config,
     exploration_schedule_configuration,
 )
@@ -70,15 +71,15 @@ class MaskedTaskObservationTest(unittest.TestCase):
             movement, "masked", "movement"
         )
         masked_routing = apply_observation_strategy(routing, "masked", "routing")
-        self.assertEqual(masked_movement.shape, (519,))
-        self.assertEqual(masked_routing.shape, (101,))
+        self.assertEqual(masked_movement.shape, (675,))
+        self.assertEqual(masked_routing.shape, (143,))
         np.testing.assert_array_equal(
             masked_movement[list(MOVEMENT_TASK_ASSIGNMENT_INDICES)], 0.0
         )
         np.testing.assert_array_equal(
             masked_routing[list(ROUTING_TASK_ASSIGNMENT_INDICES)], 0.0
         )
-        movement_keep = np.ones(519, dtype=bool)
+        movement_keep = np.ones(675, dtype=bool)
         movement_keep[list(MOVEMENT_TASK_ASSIGNMENT_INDICES)] = False
         routing_keep = np.ones(ROUTING_STATE_DIM, dtype=bool)
         routing_keep[list(ROUTING_TASK_ASSIGNMENT_INDICES)] = False
@@ -110,15 +111,15 @@ class MaskedTaskObservationTest(unittest.TestCase):
             train(config, scenario_manifest=manifest, method_spec=method)
             checkpoint = root / "full" / "ep_0001"
             with np.load(checkpoint / "joint_replay.npz", allow_pickle=False) as replay:
-                self.assertEqual(replay["state"].shape, (1, 519))
+                self.assertEqual(replay["state"].shape, (1, 675))
                 np.testing.assert_array_equal(
                     replay["state"][:, list(MOVEMENT_TASK_ASSIGNMENT_INDICES)], 0.0
                 )
                 np.testing.assert_array_equal(
                     replay["next_state"][:, list(MOVEMENT_TASK_ASSIGNMENT_INDICES)], 0.0
                 )
-                self.assertEqual(replay["current_movement_mask"].shape, (1, 10))
-                self.assertEqual(replay["next_movement_mask"].shape, (1, 10))
+                self.assertEqual(replay["current_movement_mask"].shape, (1, 16))
+                self.assertEqual(replay["next_movement_mask"].shape, (1, 16))
                 self.assertTrue(replay["movement_mask_valid"].all())
                 self.assertTrue(replay["current_movement_mask"].any())
             with np.load(checkpoint / "routing_replay.npz", allow_pickle=False) as replay:
@@ -340,24 +341,32 @@ class ControlledDQNTest(unittest.TestCase):
             routing_warmup_transitions=1,
         )
         formal_config = effective_training_config(config, method)
-        movement = TD3(4, 2, 1.0, gamma=1.0)
-        routing = ControlledDQN(101, 3, hidden_dim=8)
+        movement = TD3(MOVEMENT_STATE_DIM, JOINT_ACTION_DIM, 1.0, gamma=1.0)
+        routing = ControlledDQN(
+            ROUTING_STATE_DIM, ROUTING_ACTION_DIM, hidden_dim=8
+        )
         routing.num_training = 1
         routing.target_update_count = 1
         routing.reward_optimizer_update_count = 1
         routing.reward_target_update_count = 1
         routing.loss_log = [1.25]
-        joint = ReplayBufferJoint(4, 2, max_size=8)
+        joint = ReplayBufferJoint(
+            MOVEMENT_STATE_DIM, JOINT_ACTION_DIM, max_size=8
+        )
         joint.add(
-            np.zeros(4), np.zeros(2), np.ones(4), True,
+            np.zeros(MOVEMENT_STATE_DIM),
+            np.zeros(JOINT_ACTION_DIM),
+            np.ones(MOVEMENT_STATE_DIM),
+            True,
             delivered_mbits=1.0, total_mobility_energy=2.0,
             phi_search_t=0.0, phi_search_t1=0.0,
             phi_vs_t=0.0, phi_vs_t1=0.0,
             phi_com_t=0.0, phi_com_t1=0.0,
         )
-        routing_replay = ReplayBufferDiscrete(101, 3, max_size=8, n_step=1)
-        routing_state = np.zeros(101, dtype=np.float32)
-        routing_state[10:13] = [1.0, 0.0, 1.0]
+        routing_replay = ReplayBufferDiscrete(
+            ROUTING_STATE_DIM, ROUTING_ACTION_DIM, max_size=8, n_step=1
+        )
+        routing_state = np.zeros(ROUTING_STATE_DIM, dtype=np.float32)
         routing_replay.add(
             routing_state, 0, routing_state, reward=1.0, cost=3.0, done=False
         )
@@ -404,9 +413,9 @@ class ControlledDQNTest(unittest.TestCase):
                 routing_replay=routing_replay,
                 training_state=training_state,
                 formal_config=formal_config,
-                movement_state_dim=4,
-                joint_action_dim=2,
-                routing_state_dim=101,
+                movement_state_dim=MOVEMENT_STATE_DIM,
+                joint_action_dim=JOINT_ACTION_DIM,
+                routing_state_dim=ROUTING_STATE_DIM,
                 calibration={"fixture": "dqn"},
                 experiment_metadata=experiment,
             )
@@ -419,19 +428,27 @@ class ControlledDQNTest(unittest.TestCase):
             self.assertNotIn("cost_network", payload["networks"]["routing_agent"])
             self.assertNotIn("ddqn_optimizers", payload)
 
-            restored_movement = TD3(4, 2, 1.0, gamma=1.0)
-            restored_routing = ControlledDQN(101, 3, hidden_dim=8)
-            restored_joint = ReplayBufferJoint(4, 2, max_size=8)
-            restored_replay = ReplayBufferDiscrete(101, 3, max_size=8, n_step=1)
+            restored_movement = TD3(
+                MOVEMENT_STATE_DIM, JOINT_ACTION_DIM, 1.0, gamma=1.0
+            )
+            restored_routing = ControlledDQN(
+                ROUTING_STATE_DIM, ROUTING_ACTION_DIM, hidden_dim=8
+            )
+            restored_joint = ReplayBufferJoint(
+                MOVEMENT_STATE_DIM, JOINT_ACTION_DIM, max_size=8
+            )
+            restored_replay = ReplayBufferDiscrete(
+                ROUTING_STATE_DIM, ROUTING_ACTION_DIM, max_size=8, n_step=1
+            )
             load_full_resume_checkpoint(
                 checkpoint,
                 td3=restored_movement,
                 ddqn=restored_routing,
                 joint_replay=restored_joint,
                 routing_replay=restored_replay,
-                movement_state_dim=4,
-                joint_action_dim=2,
-                routing_state_dim=101,
+                movement_state_dim=MOVEMENT_STATE_DIM,
+                joint_action_dim=JOINT_ACTION_DIM,
+                routing_state_dim=ROUTING_STATE_DIM,
                 calibration={"fixture": "dqn"},
                 expected_experiment_metadata={
                     "method_spec_fingerprint": method.compatible_fingerprints
@@ -454,10 +471,10 @@ class RandomMovementRoutingTest(unittest.TestCase):
         self.assertTrue(np.all(first >= -1.0))
         self.assertTrue(np.all(first <= 1.0))
 
-        env = Simulator(num_UAV=10)
+        env = Simulator(num_UAV=16)
         env.num_GT = 2
         env.reset_environment()
-        packet_engine = PacketEngine(num_uav=10, step_time=0.25)
+        packet_engine = PacketEngine(num_uav=16, step_time=0.25)
         state = get_global_movement_state(
             env, packet_engine, packet_engine.backlog_bits, 1.0, 1.0
         )

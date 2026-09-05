@@ -11,8 +11,8 @@ class EpisodeScopedRoutingStateTest(unittest.TestCase):
     def test_scenario_b_first_observation_is_independent_of_scenario_a(self):
         manifest = generate_manifest("test", 4401, 2)
         scenario_a, scenario_b = manifest.episodes
-        env = Simulator(num_UAV=10)
-        reused = PacketEngine(num_uav=10, step_time=0.25)
+        env = Simulator(num_UAV=16)
+        reused = PacketEngine(num_uav=16, step_time=0.25)
 
         env.apply_scenario_entry(scenario_a)
         for _ in range(3):
@@ -36,7 +36,7 @@ class EpisodeScopedRoutingStateTest(unittest.TestCase):
             action_mask=env.get_routing_action_mask(0),
         )
 
-        fresh = PacketEngine(num_uav=10, step_time=0.25)
+        fresh = PacketEngine(num_uav=16, step_time=0.25)
         fresh_state = fresh.get_state_ta(
             env,
             0,
@@ -44,12 +44,12 @@ class EpisodeScopedRoutingStateTest(unittest.TestCase):
             action_mask=env.get_routing_action_mask(0),
         )
 
-        self.assertEqual(reset_state.shape, (101,))
+        self.assertEqual(reset_state.shape, (143,))
         np.testing.assert_array_equal(reset_state, fresh_state)
         self.assertEqual(reused.fov_ema, fresh.fov_ema)
 
     def test_reset_clears_only_episode_packet_and_observation_state(self):
-        engine = PacketEngine(num_uav=10, step_time=0.25)
+        engine = PacketEngine(num_uav=16, step_time=0.25)
         norm_cfg = {"ema_alpha": 0.7, "sentinel": 123}
         engine.norm_cfg = norm_cfg
         engine.fov_ema = {

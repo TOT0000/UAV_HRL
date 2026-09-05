@@ -33,7 +33,7 @@ from rng_contract import NamedRNGStreams, RNG_STREAM_IDS
 
 def make_environment(seed=20260817, *, evaluation=False):
     env = Simulator(
-        10,
+        16,
         rng_streams=NamedRNGStreams(seed),
         evaluation=evaluation,
     )
@@ -349,7 +349,7 @@ class ChannelLifecycleTest(unittest.TestCase):
 class ObservationFdmaAndPacketServiceTest(unittest.TestCase):
     def test_observation_uses_expected_csi_and_does_not_consume_fading_rng(self):
         env = make_environment(80)
-        engine = PacketEngine(10)
+        engine = PacketEngine(16)
         env.update_source_uavs()
         engine.create_packet(0, "COM", 256.0, 0.0)
         env.update_u2u_channels()
@@ -379,8 +379,8 @@ class ObservationFdmaAndPacketServiceTest(unittest.TestCase):
         u2g_reference = env.routing_capacity_reference_mbps(0, env.GS_ID)
         ratios = np.concatenate(
             (
-                env.Capacity_matrix[~np.eye(10, dtype=bool)] / u2u_reference,
-                env.gs_capacity[:10] / u2g_reference,
+                env.Capacity_matrix[~np.eye(16, dtype=bool)] / u2u_reference,
+                env.gs_capacity[:16] / u2g_reference,
             )
         )
         self.assertTrue(np.all(np.isfinite(ratios)))

@@ -49,10 +49,10 @@ class CentralizedTrainingFlowTest(unittest.TestCase):
         self.assertEqual(defaults.warmup_joint_transitions, PRODUCTION_WARMUP_TRANSITIONS)
         self.assertEqual(defaults.batch_size, PRODUCTION_BATCH_SIZE)
         self.assertEqual(defaults.policy_delay, PRODUCTION_POLICY_DELAY)
-        self.assertEqual(ROUTING_STATE_DIM, 101)
-        self.assertEqual(self.result["movement_state_dim"], 519)
-        self.assertEqual(self.result["routing_state_dim"], 101)
-        self.assertEqual(self.result["joint_action_dim"], 30)
+        self.assertEqual(ROUTING_STATE_DIM, 143)
+        self.assertEqual(self.result["movement_state_dim"], 675)
+        self.assertEqual(self.result["routing_state_dim"], 143)
+        self.assertEqual(self.result["joint_action_dim"], 48)
         self.assertEqual(self.result["centralized_td3_gamma"], 1.0)
         self.assertEqual(self.result["routing_ddqn_gamma"], 0.99)
 
@@ -99,7 +99,7 @@ class CentralizedTrainingFlowTest(unittest.TestCase):
 
     def test_energy_terminal_and_update_counts(self):
         self.assertEqual(
-            self.result["energy_evaluations"], 2 * 10 * MOVEMENT_CONTROL_INTERVAL
+            self.result["energy_evaluations"], 2 * 16 * MOVEMENT_CONTROL_INTERVAL
         )
         self.assertEqual(self.result["terminal_joint_transitions"], 1)
         self.assertEqual(self.result["critic_updates"], 2)

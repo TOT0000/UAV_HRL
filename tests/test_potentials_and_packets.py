@@ -24,10 +24,10 @@ from com_capacity_calibration import calibrate_com_capacity
 
 class VisualSensingPacketGenerationTest(unittest.TestCase):
     def setUp(self):
-        self.env = Simulator(num_UAV=10)
+        self.env = Simulator(num_UAV=16)
         self.env.num_GT = 2
         self.env.reset_environment()
-        self.packet_engine = PacketEngine(num_uav=10, step_time=0.25)
+        self.packet_engine = PacketEngine(num_uav=16, step_time=0.25)
         self.uav = self.env.uav_dict[0]
         self.target = self.env.gts[0]
         self.uav.x_u = self.target.x
@@ -39,7 +39,7 @@ class VisualSensingPacketGenerationTest(unittest.TestCase):
             "target_obj_id": 0,
             "target_pos": self.target.get_position(),
         }
-        self.env.multi_tasks = {uid: [] for uid in range(10)}
+        self.env.multi_tasks = {uid: [] for uid in range(16)}
         self.env.multi_tasks[0] = [self.task]
         self.env.source_uavs = {0}
 
@@ -120,13 +120,13 @@ class VisualSensingPacketGenerationTest(unittest.TestCase):
 
 class ComStateCalibrationAndDeliveryTest(unittest.TestCase):
     def setUp(self):
-        self.env = Simulator(num_UAV=10)
+        self.env = Simulator(num_UAV=16)
         self.env.num_GT = 2
         self.env.reset_environment()
 
     def test_com_only_uav_is_projected_as_movable(self):
         sr = self.env.SR_teams[0]
-        self.env.multi_tasks = {uid: [] for uid in range(10)}
+        self.env.multi_tasks = {uid: [] for uid in range(16)}
         self.env.multi_tasks[5] = [
             {
                 "task_type": "COM",
@@ -135,7 +135,7 @@ class ComStateCalibrationAndDeliveryTest(unittest.TestCase):
                 "target_pos": sr.get_position(),
             }
         ]
-        packet_engine = PacketEngine(num_uav=10, step_time=0.25)
+        packet_engine = PacketEngine(num_uav=16, step_time=0.25)
         state = get_global_movement_state(
             self.env,
             packet_engine,
@@ -146,9 +146,9 @@ class ComStateCalibrationAndDeliveryTest(unittest.TestCase):
         com_flag_index = 5 * LOCAL_MOVEMENT_DIM + 2
         self.assertEqual(state[com_flag_index], 1.0)
         raw = np.zeros(JOINT_ACTION_DIM, dtype=np.float32)
-        raw.reshape(10, 3)[5] = [0.75, 0.25, -0.5]
-        projected = project_joint_action(raw, state).reshape(10, 3)
-        np.testing.assert_array_equal(projected[5], raw.reshape(10, 3)[5])
+        raw.reshape(16, 3)[5] = [0.75, 0.25, -0.5]
+        projected = project_joint_action(raw, state).reshape(16, 3)
+        np.testing.assert_array_equal(projected[5], raw.reshape(16, 3)[5])
 
     def test_calibration_is_reproducible_and_restores_geometry(self):
         original_uav = self.env.uav_dict[0].get_position()
@@ -159,8 +159,8 @@ class ComStateCalibrationAndDeliveryTest(unittest.TestCase):
         self.assertEqual(
             first["schema"], "fixed-s2u-los-rician-expected-maximum-v2"
         )
-        self.assertEqual(first["reference_bandwidth_denominator"], 18)
-        self.assertAlmostEqual(first["reference_bandwidth_hz"], 10e6 / 18)
+        self.assertEqual(first["reference_bandwidth_denominator"], 24)
+        self.assertAlmostEqual(first["reference_bandwidth_hz"], 10e6 / 24)
         self.assertEqual(first["offered_rate_bps"], 50 * 256)
         self.assertGreater(first["reference_s2u_max_capacity_mbps"], 0.0)
         self.assertEqual(
@@ -181,7 +181,7 @@ class ComStateCalibrationAndDeliveryTest(unittest.TestCase):
             a2g_expected_capacity_mbps(
                 uav.get_position(),
                 sr.get_position(),
-                10e6 / 18,
+                10e6 / 24,
                 23.0,
                 self.env.channel.a2g_state("S2U", 0, 0),
             )
@@ -217,9 +217,9 @@ class ComStateCalibrationAndDeliveryTest(unittest.TestCase):
             "target_obj_id": 0,
             "target_pos": sr.get_position(),
         }
-        self.env.multi_tasks = {uid: [] for uid in range(10)}
+        self.env.multi_tasks = {uid: [] for uid in range(16)}
         self.env.multi_tasks[0] = [task_dict]
-        packet_engine = PacketEngine(num_uav=10, step_time=0.25)
+        packet_engine = PacketEngine(num_uav=16, step_time=0.25)
         with patch.object(
             self.env, "get_sr_uav_normalized_utility", return_value=0.5
         ) as utility_helper:

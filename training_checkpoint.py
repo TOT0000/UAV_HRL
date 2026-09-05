@@ -92,7 +92,8 @@ from dinkelbach_blocks import (
     dinkelbach_config_metadata,
 )
 
-CHECKPOINT_SCHEMA_VERSION = 24
+CHECKPOINT_SCHEMA_VERSION = 25
+PRE_16_UAV_RELAY_RANGE_PROGRESS_CHECKPOINT_SCHEMA_VERSION = 24
 PRE_BOUNDARY_ALIGNED_RELAY_POTENTIAL_CHECKPOINT_SCHEMA_VERSION = 23
 PRE_RELAY_TASK_CHECKPOINT_SCHEMA_VERSION = 22
 PRE_GS_PROGRESS_CHECKPOINT_SCHEMA_VERSION = 21
@@ -1073,7 +1074,7 @@ def _base_metadata(
         "num_uav": NUM_UAV,
         "movement_feature_schema_version": MOVEMENT_FEATURE_SCHEMA_VERSION,
         "movement_state_feature_schema": movement_state_feature_schema(),
-        "state_contract": "10-uav-relay-task-aware-v2",
+        "state_contract": "16-uav-relay-range-progress-task-aware-v3",
         "packet_lifecycle_contract": "sr-fifo-s2u-next-slot-routing-v1",
         "channel_contract": CHANNEL_ENVIRONMENT_CONTRACT_VERSION,
         "channel_model_version": CHANNEL_MODEL_VERSION,
@@ -1445,7 +1446,8 @@ def _validate_checkpoint_schema(metadata):
     schema = metadata.get("checkpoint_schema_version")
     if schema != CHECKPOINT_SCHEMA_VERSION:
         raise RuntimeError(
-            "checkpoint_schema_version is incompatible with the boundary-aligned "
+            "checkpoint_schema_version is incompatible with the canonical 16-UAV "
+            "boundary-aligned "
             "stochastic channel, routing-stage frozen-queue immediate cost, "
             "fixed-reference Safe-DDQN dual update, all-participant FOV, "
             "GS-reachable initial topology, sensing-only VS and range-gap COM "
@@ -1453,10 +1455,10 @@ def _validate_checkpoint_schema(metadata):
             "permanent GS gateway, capture-weighted timely useful goodput, "
             "continuous hard-only 400 m UAV 0 gateway projection, "
             "unified inclusive 400 m S2U/U2G/U2U communication range, "
-            "101-D action-wise GS-progress routing state and v7 routing reward, "
+            "143-D action-wise GS-progress routing state and v7 routing reward, "
             "2.5 s FOV / 2.0 s COM QoS deadlines, "
-            "Relay assignment, 519-D Relay-aware movement state and boundary-aligned "
-            "current/next decision-state Relay potential, "
+            "Relay assignment, 675-D Relay-aware movement state, range-progress "
+            "movement potential and boundary-aligned current/next decision state, "
             "named-RNG, projected-action and replay "
             "contract and must be retrained: "
             f"checkpoint={schema}, expected={CHECKPOINT_SCHEMA_VERSION}"
@@ -2740,11 +2742,11 @@ def _validate_full_metadata(
     current_training_manifest=None,
     movement_agent_kind=None,
 ):
+    schema = _validate_checkpoint_schema(metadata)
     if metadata.get("checkpoint_type") != FULL_CHECKPOINT_TYPE:
         raise RuntimeError(
             "model-only checkpoint can only be used for evaluation, not exact resume"
         )
-    schema = _validate_checkpoint_schema(metadata)
     if schema < ROUTING_LIFECYCLE_CHECKPOINT_SCHEMA_VERSION:
         raise RuntimeError(
             "legacy full-resume checkpoint lacks unambiguous routing cadence and "

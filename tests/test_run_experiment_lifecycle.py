@@ -412,7 +412,7 @@ class SimpleRunnerLifecycleIntegrationTest(unittest.TestCase):
             run_dir = next((output / "td3_dinkelbach_wo_ta").iterdir())
             first = run_dir / "checkpoints" / "full" / "ep_0001"
             with np.load(first / "joint_replay.npz", allow_pickle=False) as replay:
-                self.assertEqual(replay["current_movement_mask"].shape, (1, 10))
+                self.assertEqual(replay["current_movement_mask"].shape, (1, 16))
                 self.assertTrue(replay["movement_mask_valid"].all())
                 np.testing.assert_array_equal(
                     replay["state"][:, list(MOVEMENT_TASK_ASSIGNMENT_INDICES)],
@@ -422,8 +422,8 @@ class SimpleRunnerLifecycleIntegrationTest(unittest.TestCase):
             self.assertEqual(main(["resume", str(run_dir)]), 0)
             final = run_dir / "checkpoints" / "full" / "ep_0002"
             with np.load(final / "joint_replay.npz", allow_pickle=False) as replay:
-                self.assertEqual(replay["current_movement_mask"].shape, (2, 10))
-                self.assertEqual(replay["next_movement_mask"].shape, (2, 10))
+                self.assertEqual(replay["current_movement_mask"].shape, (2, 16))
+                self.assertEqual(replay["next_movement_mask"].shape, (2, 16))
                 self.assertTrue(replay["movement_mask_valid"].all())
                 self.assertTrue(replay["current_movement_mask"].any())
                 np.testing.assert_array_equal(

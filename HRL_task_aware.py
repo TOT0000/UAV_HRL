@@ -96,6 +96,7 @@ from routing_q_score_diagnostics import (
     ROUTING_Q_SCORE_DIAGNOSTIC_DEFINITIONS,
     RoutingQScoreDiagnosticAccumulator,
 )
+from relay_diagnostics import aggregate_relay_episode_diagnostics
 from routing_agents import create_routing_agent
 from routing_lifecycle import RoutingLearnerLifecycle
 from routing_transition_ledger import RoutingTransitionLedger
@@ -3443,38 +3444,9 @@ def train(
         "search_release_time_seconds": env.search_release_time,
         "search_release_coverage": env.search_release_coverage,
         "assignment_invocations": int(env.assignment_invocations),
-        "relay_diagnostics": {
-            "forwarding_packet_semantics": "completed packet hops",
-            "traversed_relay_semantics": (
-                "bits and completed packet hops received by a UAV while assigned Relay"
-            ),
-            "episodes": relay_episode_diagnostics,
-            "relay_role_change_count": sum(
-                episode["assignment"]["relay_role_change_count"]
-                for episode in relay_episode_diagnostics
-            ),
-            "forwarding": {
-                group: {
-                    "bits": sum(
-                        episode["forwarding"][group]["bits"]
-                        for episode in relay_episode_diagnostics
-                    ),
-                    "completed_packet_hops": sum(
-                        episode["forwarding"][group]["completed_packet_hops"]
-                        for episode in relay_episode_diagnostics
-                    ),
-                    "packets": sum(
-                        episode["forwarding"][group]["packets"]
-                        for episode in relay_episode_diagnostics
-                    ),
-                }
-                for group in (
-                    "assigned_relay_forwarding",
-                    "nonassigned_uav_forwarding",
-                    "traversed_assigned_relay",
-                )
-            },
-        },
+        "relay_diagnostics": aggregate_relay_episode_diagnostics(
+            relay_episode_diagnostics
+        ),
         "movement_agent_kind": movement_agent.agent_kind,
         "movement_agent_gamma": movement_agent.gamma,
         "movement_agent_configuration": movement_agent_configuration(

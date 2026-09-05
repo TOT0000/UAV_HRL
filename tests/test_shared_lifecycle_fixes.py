@@ -37,13 +37,13 @@ class UnconstrainedGsDistanceLifecycleTest(unittest.TestCase):
 
 class FovEmaLifecycleTest(unittest.TestCase):
     def setUp(self):
-        self.env = Simulator(num_UAV=10)
+        self.env = Simulator(num_UAV=16)
         self.env.num_GT = 2
         self.env.reset_environment()
         self.env.update_source_uavs()
         self.env.update_u2u_channels()
         self.env.update_u2g_channels()
-        self.engine = PacketEngine(num_uav=10)
+        self.engine = PacketEngine(num_uav=16)
 
     def _state(self, engine=None):
         engine = engine or self.engine
@@ -73,14 +73,14 @@ class FovEmaLifecycleTest(unittest.TestCase):
         self.env.visited_bitmap[0, 0] = True
         self.engine.update_fov_ema(self.env, "map-transition-1")
         saved = self.engine.fov_ema_state()
-        restored = PacketEngine(num_uav=10)
+        restored = PacketEngine(num_uav=16)
         restored.load_fov_ema_state(saved)
         self.assertEqual(restored.fov_ema_state(), saved)
         np.testing.assert_array_equal(self._state(self.engine), self._state(restored))
 
     def test_hol_slack_uses_instance_deadline_override(self):
         overridden = PacketEngine(
-            num_uav=10,
+            num_uav=16,
             task_deadlines_seconds={"FOV": 0.5, "COM": 1.0},
         )
         overridden.create_packet(0, "FOV", 100.0, 0.0)
@@ -91,7 +91,7 @@ class FovEmaLifecycleTest(unittest.TestCase):
 
 class SrRouteLifecycleTest(unittest.TestCase):
     def test_common_simulator_uses_the_shared_route_and_no_duplicate_samples(self):
-        env = Simulator(num_UAV=10)
+        env = Simulator(num_UAV=16)
         env.num_GT = 2
         env.reset_environment()
         for index, team in enumerate(env.SR_teams):
@@ -103,7 +103,7 @@ class SrRouteLifecycleTest(unittest.TestCase):
         self.assertEqual(assigned.path[-1], (2.5, 0.0))
         env.advance_sr_teams()
         saved = env.sr_route_state()
-        restored = Simulator(num_UAV=10)
+        restored = Simulator(num_UAV=16)
         restored.num_GT = 2
         restored.reset_environment()
         restored.load_sr_route_state(saved)

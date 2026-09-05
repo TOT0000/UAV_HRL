@@ -41,7 +41,7 @@ class HardRangeAndComSessionContractTest(unittest.TestCase):
             validate_communication_range_aliases(400.0, 200.0)
 
     def _routing_boundary_result(self, link_type, distance):
-        env = Simulator(num_UAV=10)
+        env = Simulator(num_UAV=16)
         env.apply_scenario_entry(self.scenario)
         for uav_id, uav in env.uav_dict.items():
             uav.x_u = 800.0 + 10.0 * uav_id
@@ -70,7 +70,7 @@ class HardRangeAndComSessionContractTest(unittest.TestCase):
             receiver = env.GS_ID
         env.update_u2u_channels()
         env.update_u2g_channels()
-        engine = PacketEngine(num_uav=10)
+        engine = PacketEngine(num_uav=16)
         packet = engine.create_packet(0, "COM", 256.0, 0.0)
         physical_mask = env.get_routing_action_mask(0).astype(bool)
         state = engine.get_state_ta(env, 0, action_mask=physical_mask)
@@ -98,7 +98,7 @@ class HardRangeAndComSessionContractTest(unittest.TestCase):
         }
 
     def _s2u_boundary_result(self, distance):
-        env = Simulator(num_UAV=10)
+        env = Simulator(num_UAV=16)
         env.apply_scenario_entry(self.scenario)
         env.SR_teams[0].x, env.SR_teams[0].y, env.SR_teams[0].z = (0.0, 0.0, 0.0)
         env.uav_dict[0].x_u, env.uav_dict[0].y_u, env.uav_dict[0].z_u = (
@@ -111,7 +111,7 @@ class HardRangeAndComSessionContractTest(unittest.TestCase):
             {"task_type": "COM", "target_obj_id": 0, "target_pos": (0.0, 0.0, 0.0)}
         ]
         env.SR_teams[0].assigned_gt_id = 0
-        engine = PacketEngine(num_uav=10)
+        engine = PacketEngine(num_uav=16)
         engine.create_sr_packet(0, 256.0, generation_time=0.0)
         env.prepare_channel_routing_slot(0)
         _, bandwidths = env.allocate_active_link_capacities({}, s2u_links={0: 0})
@@ -161,7 +161,7 @@ class HardRangeAndComSessionContractTest(unittest.TestCase):
                     self.assertEqual(result["bandwidths"], {})
 
     def test_horizontal_distance_below_limit_is_illegal_when_3d_distance_exceeds_it(self):
-        env = Simulator(num_UAV=10)
+        env = Simulator(num_UAV=16)
         env.apply_scenario_entry(self.scenario)
         env.GS_pos = np.array([0.0, 0.0, 0.0])
         env.uav_dict[0].x_u, env.uav_dict[0].y_u, env.uav_dict[0].z_u = (
@@ -188,14 +188,14 @@ class HardRangeAndComSessionContractTest(unittest.TestCase):
         self.assertEqual(env.Capacity_matrix[0, 1], 0.0)
 
     def test_com_generation_activates_on_first_entry_and_then_persists(self):
-        env = Simulator(num_UAV=10)
+        env = Simulator(num_UAV=16)
         env.apply_scenario_entry(self.scenario)
         env.source_uavs = set()
         env.multi_tasks = {uav_id: [] for uav_id in range(env.num_UAV)}
         env.multi_tasks[0] = [{"task_type": "COM", "target_obj_id": 0}]
         env.SR_teams[0].assigned_gt_id = 0
         env.SR_teams[0].x, env.SR_teams[0].y, env.SR_teams[0].z = (0.0, 0.0, 0.0)
-        engine = PacketEngine(num_uav=10)
+        engine = PacketEngine(num_uav=16)
         for slot, expected in ((0, 0), (1, 1), (2, 2)):
             env.uav_dict[0].x_u = 400.0 if slot == 1 else 400.001
             env.uav_dict[0].y_u = 0.0
@@ -220,8 +220,8 @@ class HardRangeAndComSessionContractTest(unittest.TestCase):
         self.assertEqual(len(engine.sr_queues[0]), 2)
 
     def test_s2u_inclusive_3d_boundary_and_range_independent_rng_draws(self):
-        first = Simulator(num_UAV=10)
-        second = Simulator(num_UAV=10)
+        first = Simulator(num_UAV=16)
+        second = Simulator(num_UAV=16)
         first.apply_scenario_entry(self.scenario)
         second.apply_scenario_entry(self.scenario)
         for env in (first, second):
@@ -257,13 +257,13 @@ class HardRangeAndComSessionContractTest(unittest.TestCase):
         )
 
     def test_out_of_range_partial_hop_waits_and_resumes_without_restart(self):
-        env = Simulator(num_UAV=10)
+        env = Simulator(num_UAV=16)
         env.apply_scenario_entry(self.scenario)
         env.uav_dict[0].x_u, env.uav_dict[0].y_u, env.uav_dict[0].z_u = (0.0, 0.0, 100.0)
         env.uav_dict[1].x_u, env.uav_dict[1].y_u, env.uav_dict[1].z_u = (100.0, 0.0, 100.0)
         env.update_u2u_channels()
         engine = PacketEngine(
-            num_uav=10,
+            num_uav=16,
             enable_packet_diagnostic_artifacts=True,
         )
         pkt = engine.create_packet(0, "COM", 1_000.0, 0.0)
@@ -410,7 +410,7 @@ class RoutingCreditAndRewardContractTest(unittest.TestCase):
 
 class AtomicFovAndAggregationContractTest(unittest.TestCase):
     def test_search_uavs_observe_same_precommit_bitmap(self):
-        env = Simulator(num_UAV=10)
+        env = Simulator(num_UAV=16)
         env.apply_scenario_entry(
             generate_manifest("test", 9402, 1).episodes[0]
         )

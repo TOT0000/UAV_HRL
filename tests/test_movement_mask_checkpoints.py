@@ -48,10 +48,10 @@ class MovementMaskCheckpointTest(unittest.TestCase):
     def _components():
         return (
             TD3(MOVEMENT_STATE_DIM, JOINT_ACTION_DIM, 1.0, gamma=1.0),
-            DDQN(ROUTING_STATE_DIM, 11, hidden_dim=16),
+            DDQN(ROUTING_STATE_DIM, 17, hidden_dim=16),
             ReplayBufferJoint(MOVEMENT_STATE_DIM, JOINT_ACTION_DIM, max_size=4),
             ReplayBufferDiscrete(
-                ROUTING_STATE_DIM, 11, max_size=4, n_step=1, gamma=0.99
+                ROUTING_STATE_DIM, 17, max_size=4, n_step=1, gamma=0.99
             ),
         )
 

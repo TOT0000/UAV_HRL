@@ -18,16 +18,16 @@ class FixedRoutingPolicy:
 
 class RoutingTransitionTerminalTest(unittest.TestCase):
     def setUp(self):
-        self.env = Simulator(num_UAV=10)
+        self.env = Simulator(num_UAV=16)
         self.env.num_GT = 2
         self.env.reset_environment()
         self.env.source_uavs = set()
         self.env.current_time = 0.0
         self.env.update_u2u_channels()
         self.env.update_u2g_channels()
-        self.engine = PacketEngine(num_uav=10, step_time=0.25)
+        self.engine = PacketEngine(num_uav=16, step_time=0.25)
         self.masks = {
-            uid: np.ones(11, dtype=bool) for uid in range(10)
+            uid: np.ones(17, dtype=bool) for uid in range(16)
         }
         self.stats = {
             "FOV": {
@@ -52,7 +52,7 @@ class RoutingTransitionTerminalTest(unittest.TestCase):
                 {},
             )
         )
-        replay = ReplayBufferDiscrete(101, 11, max_size=16, n_step=1)
+        replay = ReplayBufferDiscrete(143, 17, max_size=16, n_step=1)
         _run_routing_slot(
             self.env,
             self.engine,

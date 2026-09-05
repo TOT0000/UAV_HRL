@@ -25,7 +25,7 @@ def _module_equal(test, left, right):
 
 
 def _add_transition(replay, value=0.0):
-    mask = np.asarray([True, False] + [True] * 8, dtype=bool)
+    mask = np.asarray([True, False] + [True] * 14, dtype=bool)
     state = np.full(4, value, dtype=np.float32)
     action = np.linspace(-1.2, 1.2, JOINT_ACTION_DIM, dtype=np.float32)
     replay.add(
@@ -150,7 +150,7 @@ class ProjectionSmoothingReplayTest(unittest.TestCase):
     def test_projection_clamps_speed_vertical_wraps_heading_then_masks(self):
         raw = np.zeros(JOINT_ACTION_DIM, dtype=np.float32)
         raw[:9] = [2.0, 1.0, -2.0, -2.0, 3.25, 2.0, 0.5, -3.25, 0.5]
-        mask = np.asarray([True, False, True] + [False] * 7, dtype=bool)
+        mask = np.asarray([True, False, True] + [False] * 13, dtype=bool)
         expected = np.asarray([1.0, -1.0, -1.0, -1.0, 0.0, 0.0, 0.5, 0.75, 0.5])
         projected = project_joint_action(raw, movement_mask=mask)
         np.testing.assert_allclose(projected[:9], expected)
@@ -187,8 +187,8 @@ class ProjectionSmoothingReplayTest(unittest.TestCase):
         second_noise = second.last_joint_update["target_policy_noise"].numpy()
         np.testing.assert_array_equal(first_noise, second_noise)
         self.assertLessEqual(float(np.abs(first_noise).max()), 0.25)
-        np.testing.assert_array_equal(first_noise.reshape(1, 10, 3)[:, 1], 0.0)
-        smoothed = first.last_joint_update["target_smoothed_action"].numpy().reshape(1, 10, 3)
+        np.testing.assert_array_equal(first_noise.reshape(1, 16, 3)[:, 1], 0.0)
+        smoothed = first.last_joint_update["target_smoothed_action"].numpy().reshape(1, 16, 3)
         self.assertTrue(np.all(smoothed[..., 1] >= -1.0))
         self.assertTrue(np.all(smoothed[..., 1] < 1.0))
 
@@ -210,7 +210,7 @@ class ProjectionSmoothingReplayTest(unittest.TestCase):
                 "newest_age": 0,
             },
         )
-        inactive = replay.action[: replay.size].reshape(-1, 10, 3)[:, 1]
+        inactive = replay.action[: replay.size].reshape(-1, 16, 3)[:, 1]
         np.testing.assert_array_equal(
             inactive,
             np.tile(np.asarray([-1.0, 0.0, 0.0]), (replay.size, 1)),

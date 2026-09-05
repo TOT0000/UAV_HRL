@@ -10,7 +10,7 @@ from Packet_scheduler_v1 import (
 
 class PaperPacketMetricTest(unittest.TestCase):
     def test_terminal_outcomes_are_mutually_exclusive_and_conserved(self):
-        engine = PacketEngine(num_uav=10, step_time=0.25)
+        engine = PacketEngine(num_uav=16, step_time=0.25)
 
         on_time = engine.create_packet(0, "FOV", 100.0, 0.0)
         engine.mark_packet_done(on_time, current_time=0.5, reason="delivered")
@@ -47,7 +47,7 @@ class PaperPacketMetricTest(unittest.TestCase):
         self.assertEqual(engine.deadline_drops, 4)
 
     def test_no_delivered_packet_is_missing_not_fake_zero(self):
-        engine = PacketEngine(num_uav=10)
+        engine = PacketEngine(num_uav=16)
         engine.create_packet(0, "COM", 100.0, 0.0)
         summary = engine.finalize_episode(0.5)
         self.assertIsNone(summary["COM"]["average_e2e_delay_seconds"])
@@ -55,10 +55,10 @@ class PaperPacketMetricTest(unittest.TestCase):
     def test_deadline_override_is_instance_scoped(self):
         production = dict(TASK_DEADLINE_SECONDS)
         short = PacketEngine(
-            num_uav=10,
+            num_uav=16,
             task_deadlines_seconds={"FOV": 0.5, "COM": 2.5},
         )
-        normal = PacketEngine(num_uav=10)
+        normal = PacketEngine(num_uav=16)
         self.assertEqual(short.create_packet(0, "FOV", 1.0, 0.0)["deadline"], 0.5)
         self.assertEqual(normal.create_packet(0, "FOV", 1.0, 0.0)["deadline"], 2.5)
         self.assertEqual(TASK_DEADLINE_SECONDS, production)

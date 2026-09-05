@@ -56,7 +56,7 @@ def violation_stats():
 
 
 def deferred_environment(seed=20260817):
-    env = Simulator(10, rng_streams=NamedRNGStreams(seed))
+    env = Simulator(16, rng_streams=NamedRNGStreams(seed))
     env.defer_initial_channel_boundary = True
     env.num_GT = 2
     env.reset_environment()
@@ -255,7 +255,7 @@ class MovementBoundaryReplayTest(unittest.TestCase):
 
 class RoutingBoundaryReplayTest(unittest.TestCase):
     def _environment_and_engine(self):
-        env = Simulator(10, rng_streams=NamedRNGStreams(105))
+        env = Simulator(16, rng_streams=NamedRNGStreams(105))
         env.num_GT = 2
         env.reset_environment()
         env.uav_dict[0].x_u = 100.0
@@ -265,13 +265,13 @@ class RoutingBoundaryReplayTest(unittest.TestCase):
         env.channel.s2u_los_state[:] = True
         env.update_u2g_channels()
         env.need_reassign = False
-        return env, PacketEngine(10)
+        return env, PacketEngine(16)
 
     def test_pending_transition_uses_next_actual_observation_and_lock_mask(self):
         env, engine = self._environment_and_engine()
         packet = engine.create_packet(0, "COM", 1e12, 0.75)
         packet["deadline_abs"] = 10.0
-        replay = ReplayBufferDiscrete(101, 11, max_size=16, n_step=1)
+        replay = ReplayBufferDiscrete(143, 17, max_size=16, n_step=1)
         pending = {}
         policy = RecordingRoutingPolicy(env.GS_ID)
         stats = violation_stats()
@@ -325,7 +325,7 @@ class RoutingBoundaryReplayTest(unittest.TestCase):
         env, engine = self._environment_and_engine()
         packet = engine.create_packet(0, "COM", 1e12, 0.75)
         packet["deadline_abs"] = 1.0
-        replay = ReplayBufferDiscrete(101, 11, max_size=16, n_step=1)
+        replay = ReplayBufferDiscrete(143, 17, max_size=16, n_step=1)
         pending = {}
         policy = RecordingRoutingPolicy(env.GS_ID)
         stats = violation_stats()
@@ -385,7 +385,7 @@ class CompatibilityAndRegistryTest(unittest.TestCase):
         original_slot = Simulator.prepare_channel_routing_slot
         original_reset = Simulator.reset_environment
 
-        fixed_action = np.tile(np.asarray(HOVER_ACTION, dtype=np.float32), 10)
+        fixed_action = np.tile(np.asarray(HOVER_ACTION, dtype=np.float32), 16)
         fixed_action[:3] = (1.0, 0.0, 0.0)
 
         def run_with_capture(config):
@@ -558,7 +558,7 @@ class CompatibilityAndRegistryTest(unittest.TestCase):
         )
 
     def test_old_boundary_checkpoint_is_rejected_before_restore(self):
-        self.assertEqual(CHECKPOINT_SCHEMA_VERSION, 24)
+        self.assertEqual(CHECKPOINT_SCHEMA_VERSION, 25)
         with self.assertRaisesRegex(RuntimeError, "must be retrained"):
             _validate_checkpoint_schema({"checkpoint_schema_version": 12})
 
