@@ -1,7 +1,9 @@
 import contextlib
+import copy
 from dataclasses import asdict
 import io
 import json
+import math
 import random
 import tempfile
 import unittest
@@ -187,6 +189,54 @@ def _interleaved_useful_goodput_training_state():
     return state
 
 
+def _large_roundoff_useful_goodput_training_state():
+    """Build valid counters whose independent accumulation differs by a few ULPs."""
+
+    state = _interleaved_useful_goodput_training_state()
+    packet_state = state["packet_engine_state"]
+    raw_events = [
+        1_000_000.0 if index % 2 == 0 else 0.1 + (index % 17) * 0.001
+        for index in range(5_000)
+    ]
+    generated_raw = 0.0
+    delivered_raw = 0.0
+    for bits in raw_events:
+        generated_raw += bits
+    for bits in sorted(raw_events):
+        delivered_raw += bits
+    if delivered_raw <= generated_raw:
+        generated_raw, delivered_raw = delivered_raw, generated_raw
+
+    fov_useful = math.nextafter(delivered_raw, math.inf)
+    com_delivered = 4_000_000_000.125
+    total_useful = fov_useful + com_delivered
+    timely_goodput = math.nextafter(total_useful, math.inf)
+    coverage_count = 100_000_000
+    coverage_sum = float(coverage_count)
+    for _ in range(3):
+        coverage_sum = math.nextafter(coverage_sum, math.inf)
+
+    packet_state.update(
+        {
+            "next_packet_id": coverage_count + 1,
+            "generated_packet_counts": {"FOV": coverage_count, "COM": 1},
+            "eligible_packet_counts": {"FOV": coverage_count, "COM": 1},
+            "raw_final_hop_bits": delivered_raw + com_delivered,
+            "timely_goodput_bits": timely_goodput,
+            "fov_generated_raw_bits": generated_raw,
+            "fov_timely_delivered_raw_bits": delivered_raw,
+            "fov_timely_useful_bits": fov_useful,
+            "fov_capture_coverage_sum": coverage_sum,
+            "fov_capture_coverage_count": coverage_count,
+            "fov_zero_coverage_packet_count": 0,
+            "com_timely_delivered_bits": com_delivered,
+            "total_timely_useful_bits": total_useful,
+            "system_eligible_packets": coverage_count + 1,
+        }
+    )
+    return state
+
+
 def _assert_module_equal(testcase, expected, actual):
     expected_state = expected.state_dict()
     actual_state = actual.state_dict()
@@ -311,8 +361,8 @@ class FullResumeCheckpointTest(unittest.TestCase):
             )
         message = str(raised.exception)
         for field in (
-            "fov=",
-            "com=",
+            "fov_timely_useful_bits=",
+            "com_timely_delivered_bits=",
             "expected_sum=",
             "total=",
             "absolute_difference=",
@@ -320,7 +370,120 @@ class FullResumeCheckpointTest(unittest.TestCase):
         ):
             self.assertIn(field, message)
 
-    def _preflight_checkpoint(self, root, *, planned=1, completed=1):
+    def test_all_float_useful_goodput_invariants_accept_few_ulp_roundoff(self):
+        state = _large_roundoff_useful_goodput_training_state()
+        packet_state = state["packet_engine_state"]
+        before = copy.deepcopy(packet_state)
+
+        roundoff_pairs = (
+            (
+                packet_state["fov_timely_delivered_raw_bits"],
+                packet_state["fov_generated_raw_bits"],
+            ),
+            (
+                packet_state["fov_timely_useful_bits"],
+                packet_state["fov_timely_delivered_raw_bits"],
+            ),
+            (
+                packet_state["timely_goodput_bits"],
+                packet_state["total_timely_useful_bits"],
+            ),
+            (
+                packet_state["fov_capture_coverage_sum"],
+                packet_state["fov_capture_coverage_count"],
+            ),
+        )
+        for left, right in roundoff_pairs:
+            with self.subTest(left=left, right=right):
+                difference = left - right
+                self.assertGreater(difference, 1e-9)
+                self.assertLessEqual(
+                    difference,
+                    32.0 * math.ulp(max(abs(left), abs(float(right)), 1.0)),
+                )
+
+        _validate_full_resume_logging_state(
+            state,
+            completed_episode=1,
+            routing_agent_kind="safe_ddqn",
+            checkpoint_schema_version=CHECKPOINT_SCHEMA_VERSION,
+        )
+        self.assertEqual(packet_state, before)
+
+    def test_useful_goodput_float_invariants_reject_true_one_bit_errors(self):
+        cases = (
+            (
+                "alias",
+                "timely_goodput_bits",
+                "timely_goodput_bits",
+            ),
+            (
+                "FOV useful versus delivered",
+                "fov_timely_useful_bits",
+                "fov_timely_useful_bits",
+            ),
+            (
+                "FOV delivered versus generated",
+                "fov_timely_delivered_raw_bits",
+                "fov_timely_delivered_raw_bits",
+            ),
+        )
+        for label, field, expected_message_field in cases:
+            with self.subTest(label=label):
+                state = _large_roundoff_useful_goodput_training_state()
+                state["packet_engine_state"][field] += 1.0
+                with self.assertRaisesRegex(
+                    RuntimeError, expected_message_field
+                ) as raised:
+                    _validate_full_resume_logging_state(
+                        state,
+                        completed_episode=1,
+                        routing_agent_kind="safe_ddqn",
+                        checkpoint_schema_version=CHECKPOINT_SCHEMA_VERSION,
+                    )
+                message = str(raised.exception)
+                self.assertIn("allowed_tolerance=", message)
+                self.assertTrue(
+                    "absolute_difference=" in message
+                    or "inequality_excess=" in message
+                )
+
+    def test_coverage_float_and_integer_errors_remain_strict(self):
+        state = _large_roundoff_useful_goodput_training_state()
+        packet_state = state["packet_engine_state"]
+        packet_state["fov_capture_coverage_sum"] += 1.0
+        with self.assertRaisesRegex(
+            RuntimeError, "fov_capture_coverage_sum"
+        ) as raised:
+            _validate_full_resume_logging_state(
+                state,
+                completed_episode=1,
+                routing_agent_kind="safe_ddqn",
+                checkpoint_schema_version=CHECKPOINT_SCHEMA_VERSION,
+            )
+        self.assertIn("inequality_excess=", str(raised.exception))
+        self.assertIn("allowed_tolerance=", str(raised.exception))
+
+        state = _large_roundoff_useful_goodput_training_state()
+        packet_state = state["packet_engine_state"]
+        packet_state["fov_zero_coverage_packet_count"] = (
+            packet_state["fov_capture_coverage_count"] + 1
+        )
+        with self.assertRaisesRegex(
+            RuntimeError, "fov_zero_coverage_packet_count"
+        ) as raised:
+            _validate_full_resume_logging_state(
+                state,
+                completed_episode=1,
+                routing_agent_kind="safe_ddqn",
+                checkpoint_schema_version=CHECKPOINT_SCHEMA_VERSION,
+            )
+        self.assertIn("inequality_excess=1", str(raised.exception))
+        self.assertIn("allowed_tolerance=0", str(raised.exception))
+
+    def _preflight_checkpoint(
+        self, root, *, planned=1, completed=1, packet_state=None
+    ):
         td3, ddqn, joint, routing = self._components()
         calibration = {"seed": 77, "c_ref_com": 10.0}
         formal_config = asdict(
@@ -346,6 +509,8 @@ class FullResumeCheckpointTest(unittest.TestCase):
             **_lifecycle_training_state(completed),
             **dinkelbach_state.training_state(),
         }
+        if packet_state is not None:
+            training_state["packet_engine_state"] = copy.deepcopy(packet_state)
         manifest = generate_manifest("train", 77, planned)
         manifest.save(Path(root) / "scenario_manifest.json")
         checkpoint_dir = Path(root) / "checkpoints" / "full" / f"ep_{completed:04d}"
@@ -381,7 +546,45 @@ class FullResumeCheckpointTest(unittest.TestCase):
             "calibration": calibration,
             "formal_config": formal_config,
             "manifest": manifest,
+            "training_state": training_state,
         }
+
+    def test_large_roundoff_state_full_checkpoint_save_load_is_lossless(self):
+        state = _large_roundoff_useful_goodput_training_state()
+        expected_packet_state = copy.deepcopy(state["packet_engine_state"])
+        with tempfile.TemporaryDirectory() as temp_dir:
+            fixture = self._preflight_checkpoint(
+                temp_dir,
+                packet_state=expected_packet_state,
+            )
+            saved_payload = torch.load(
+                fixture["checkpoint_dir"] / "training_state.pt",
+                map_location="cpu",
+                weights_only=False,
+            )
+            self.assertEqual(
+                saved_payload["training_state"]["packet_engine_state"],
+                expected_packet_state,
+            )
+
+            td3, ddqn, joint, routing = self._components()
+            restored = load_full_resume_checkpoint(
+                fixture["checkpoint_dir"],
+                td3=td3,
+                ddqn=ddqn,
+                joint_replay=joint,
+                routing_replay=routing,
+                movement_state_dim=MOVEMENT_STATE_DIM,
+                joint_action_dim=JOINT_ACTION_DIM,
+                routing_state_dim=ROUTING_STATE_DIM,
+                calibration=fixture["calibration"],
+                expected_formal_config=fixture["formal_config"],
+                current_training_manifest=fixture["manifest"],
+            )
+            self.assertEqual(
+                restored["training_state"]["packet_engine_state"],
+                expected_packet_state,
+            )
 
     def _inspect_preflight_fixture(self, fixture, current_config, current_manifest):
         return inspect_full_resume_checkpoint(

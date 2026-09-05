@@ -2410,10 +2410,57 @@ def save_full_resume_checkpoint(
     return saved
 
 
-def _bit_counter_tolerance(*values):
+def _floating_counter_tolerance(
+    *values, absolute_floor, maximum_tolerance=0.5
+):
+    """Return a strict, scale-aware allowance for accumulated float counters."""
+
     scale = max((abs(float(value)) for value in values), default=0.0)
     ulp_tolerance = 32.0 * math.ulp(scale if scale > 0.0 else 1.0)
-    return min(0.5, max(1e-9, ulp_tolerance))
+    return min(
+        float(maximum_tolerance),
+        max(float(absolute_floor), ulp_tolerance),
+    )
+
+
+def _bit_counter_tolerance(*values):
+    return _floating_counter_tolerance(*values, absolute_floor=1e-9)
+
+
+def _coverage_counter_tolerance(*values):
+    return _floating_counter_tolerance(*values, absolute_floor=1e-12)
+
+
+def _validate_float_counter_equal(
+    left_name, left_value, right_name, right_value, tolerance_fn
+):
+    left = float(left_value)
+    right = float(right_value)
+    difference = abs(left - right)
+    tolerance = tolerance_fn(left, right)
+    if difference > tolerance:
+        raise RuntimeError(
+            "checkpoint packet useful-goodput equality invariant failed: "
+            f"{left_name}={left!r}, {right_name}={right!r}, "
+            f"absolute_difference={difference!r}, "
+            f"allowed_tolerance={tolerance!r}"
+        )
+
+
+def _validate_float_counter_not_greater(
+    left_name, left_value, right_name, right_value, tolerance_fn
+):
+    left = float(left_value)
+    right = float(right_value)
+    excess = left - right
+    tolerance = tolerance_fn(left, right)
+    if excess > tolerance:
+        raise RuntimeError(
+            "checkpoint packet useful-goodput inequality invariant failed: "
+            f"{left_name}={left!r}, {right_name}={right!r}, "
+            f"inequality_excess={excess!r}, "
+            f"allowed_tolerance={tolerance!r}"
+        )
 
 
 def _validate_full_resume_logging_state(
@@ -2564,23 +2611,45 @@ def _validate_full_resume_logging_state(
             for field in useful_count_fields
         ):
             raise RuntimeError("checkpoint packet coverage counters are invalid")
-        if (
-            not np.isclose(
-                packet_state["timely_goodput_bits"],
-                packet_state["total_timely_useful_bits"],
-                rtol=0.0,
-                atol=1e-9,
+        _validate_float_counter_equal(
+            "timely_goodput_bits",
+            packet_state["timely_goodput_bits"],
+            "total_timely_useful_bits",
+            packet_state["total_timely_useful_bits"],
+            _bit_counter_tolerance,
+        )
+        _validate_float_counter_not_greater(
+            "fov_timely_useful_bits",
+            packet_state["fov_timely_useful_bits"],
+            "fov_timely_delivered_raw_bits",
+            packet_state["fov_timely_delivered_raw_bits"],
+            _bit_counter_tolerance,
+        )
+        _validate_float_counter_not_greater(
+            "fov_timely_delivered_raw_bits",
+            packet_state["fov_timely_delivered_raw_bits"],
+            "fov_generated_raw_bits",
+            packet_state["fov_generated_raw_bits"],
+            _bit_counter_tolerance,
+        )
+        _validate_float_counter_not_greater(
+            "fov_capture_coverage_sum",
+            packet_state["fov_capture_coverage_sum"],
+            "fov_capture_coverage_count",
+            packet_state["fov_capture_coverage_count"],
+            _coverage_counter_tolerance,
+        )
+        zero_coverage_count = packet_state["fov_zero_coverage_packet_count"]
+        coverage_count = packet_state["fov_capture_coverage_count"]
+        if zero_coverage_count > coverage_count:
+            raise RuntimeError(
+                "checkpoint packet useful-goodput integer inequality invariant "
+                "failed: "
+                f"fov_zero_coverage_packet_count={zero_coverage_count!r}, "
+                f"fov_capture_coverage_count={coverage_count!r}, "
+                f"inequality_excess={zero_coverage_count - coverage_count!r}, "
+                "allowed_tolerance=0"
             )
-            or packet_state["fov_timely_useful_bits"]
-            > packet_state["fov_timely_delivered_raw_bits"] + 1e-9
-            or packet_state["fov_timely_delivered_raw_bits"]
-            > packet_state["fov_generated_raw_bits"] + 1e-9
-            or packet_state["fov_capture_coverage_sum"]
-            > packet_state["fov_capture_coverage_count"] + 1e-9
-            or packet_state["fov_zero_coverage_packet_count"]
-            > packet_state["fov_capture_coverage_count"]
-        ):
-            raise RuntimeError("checkpoint packet useful-goodput state is inconsistent")
         fov_useful = float(packet_state["fov_timely_useful_bits"])
         com_delivered = float(packet_state["com_timely_delivered_bits"])
         expected_total = fov_useful + com_delivered
@@ -2590,7 +2659,8 @@ def _validate_full_resume_logging_state(
         if difference > tolerance:
             raise RuntimeError(
                 "checkpoint packet useful-goodput class-sum invariant failed: "
-                f"fov={fov_useful!r}, com={com_delivered!r}, "
+                f"fov_timely_useful_bits={fov_useful!r}, "
+                f"com_timely_delivered_bits={com_delivered!r}, "
                 f"expected_sum={expected_total!r}, total={total_useful!r}, "
                 f"absolute_difference={difference!r}, "
                 f"allowed_tolerance={tolerance!r}"
