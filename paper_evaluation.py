@@ -717,7 +717,12 @@ def run_paper_evaluation(
             },
             "scenario_manifest": str((point_dir / "scenario_manifest.json").resolve()),
         }
-        outputs = write_evaluation_outputs(point_dir, result["episode_metrics"], run_metadata)
+        outputs = write_evaluation_outputs(
+            point_dir,
+            result["episode_metrics"],
+            run_metadata,
+            relay_diagnostics=result["relay_diagnostics"],
+        )
         outputs["packet_outcomes_jsonl"] = packet_outcomes_path.resolve()
         outputs.update(diagnostic_outputs)
         outputs.update(routing_q_score_outputs)

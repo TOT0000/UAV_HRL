@@ -23,6 +23,7 @@ from experiment_paths import (
     write_run_status,
 )
 from scenario_manifest import generate_manifest
+from relay_diagnostics import RELAY_DIAGNOSTICS_FILENAME
 from training_checkpoint import (
     CHECKPOINT_SCHEMA_VERSION,
     FULL_CHECKPOINT_TYPE,
@@ -30,6 +31,36 @@ from training_checkpoint import (
     MODEL_CHECKPOINT_TYPE,
     calibration_fingerprint,
 )
+
+
+def relay_diagnostics_fixture():
+    forwarding = {
+        group: {"bits": 0.0, "packets": 0, "completed_packet_hops": 0}
+        for group in (
+            "assigned_relay_forwarding",
+            "nonassigned_uav_forwarding",
+            "traversed_assigned_relay",
+        )
+    }
+    return {
+        "forwarding_packet_semantics": "completed packet hops",
+        "traversed_relay_semantics": "fixture traversal semantics",
+        "episodes": [
+            {
+                "episode_index": 0,
+                "scenario_id": "fixture-scenario",
+                "assignment": {
+                    "relay_assignment_history": [],
+                    "relay_candidate_metrics": {},
+                    "selected_relay_uav_ids": [],
+                    "relay_role_change_count": 0,
+                },
+                "forwarding": forwarding,
+            }
+        ],
+        "relay_role_change_count": 0,
+        "forwarding": forwarding,
+    }
 
 
 class ExperimentPreflightTest(unittest.TestCase):
@@ -211,12 +242,24 @@ class ExperimentPreflightTest(unittest.TestCase):
             run_dir = training_run_directory(output, self.method, manifest, 17)
 
             with mock.patch(
-                "comparison_experiment.train", return_value={"run_metadata": {}}
+                "comparison_experiment.train",
+                return_value={
+                    "run_metadata": {},
+                    "relay_diagnostics": relay_diagnostics_fixture(),
+                },
             ):
                 comparison_main(self._train_args(manifest_path, output))
 
             identity = json.loads(
                 (run_dir / "run_identity.json").read_text(encoding="utf-8")
+            )
+            self.assertTrue((run_dir / RELAY_DIAGNOSTICS_FILENAME).is_file())
+            run_metadata = json.loads(
+                (run_dir / "run_metadata.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(
+                run_metadata["relay_diagnostics_filename"],
+                RELAY_DIAGNOSTICS_FILENAME,
             )
             status = read_run_status(run_dir)
             self.assertEqual(identity["method_id"], self.method.method_id)
@@ -244,7 +287,10 @@ class ExperimentPreflightTest(unittest.TestCase):
 
             resume = run_dir / "checkpoints" / "full" / "ep_0001"
             resume.mkdir(parents=True)
-            resumed_result = {"run_metadata": {}}
+            resumed_result = {
+                "run_metadata": {},
+                "relay_diagnostics": relay_diagnostics_fixture(),
+            }
             training_state = {
                 key: [0.0]
                 for key in (
@@ -521,6 +567,7 @@ class ExperimentPreflightTest(unittest.TestCase):
                 "run_metadata": {},
                 "evaluation_invariants": {"weights_unchanged": True},
                 "episode_metrics": [],
+                "relay_diagnostics": relay_diagnostics_fixture(),
             }
 
             with mock.patch("HRL_task_aware.train", return_value=result):

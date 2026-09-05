@@ -93,6 +93,15 @@ class DistanceProgressHelperTest(unittest.TestCase):
         self.assertEqual(metadata["com"]["s2u_range_m"], S2U_COMMUNICATION_RANGE_M)
         self.assertEqual(metadata["com"]["s2u_range_m"], 400.0)
         self.assertTrue(metadata["search"]["unchanged"])
+        self.assertEqual(
+            metadata["relay"]["current_backlog_snapshot"],
+            "current decision-state boundary",
+        )
+        self.assertEqual(
+            metadata["relay"]["next_backlog_snapshot"],
+            "next decision-state boundary",
+        )
+        self.assertNotIn("frozen", metadata["relay"]["transition_alignment"])
         self.assertFalse(metadata["lifecycle"]["delivery_or_connectivity_potential"])
 
         with mock.patch(

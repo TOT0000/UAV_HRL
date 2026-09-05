@@ -28,6 +28,8 @@ from evaluation_metrics import (
     PACKET_METRIC_COLUMNS,
 )
 from experiment_config import (
+    MOVEMENT_REPLAY_CONTRACT_VERSION,
+    TASK_POTENTIAL_CONTRACT_VERSION,
     FORMAL_EXPERIMENT_DEFAULTS,
     MethodSpec,
     effective_training_config,
@@ -49,7 +51,7 @@ from training_checkpoint import (
 )
 
 
-DESIGN_DATASET_SCHEMA_VERSION = 3
+DESIGN_DATASET_SCHEMA_VERSION = 4
 DESIGN_TRANSITIONS_FILENAME = "design_transitions.npz"
 DESIGN_METADATA_FILENAME = "design_dataset_metadata.json"
 DESIGN_EPISODES_CSV = "per_episode.csv"
@@ -491,6 +493,12 @@ def _build_metadata(preflight, arrays, result, run_dir, reference_rows):
             "beta_com": float(formal_config["beta_com"]),
             "beta_relay": float(formal_config["beta_relay"]),
         },
+        "task_potential_contract_version": TASK_POTENTIAL_CONTRACT_VERSION,
+        "movement_replay_contract_version": MOVEMENT_REPLAY_CONTRACT_VERSION,
+        "potential_boundary_semantics": (
+            "phi_current uses current decision-state backlog; phi_next uses next "
+            "decision-state backlog; terminal phi_next is zero"
+        ),
         "reward_components": {
             "definition": (
                 "delivered_mbits - lambda * total_mobility_energy_j + "

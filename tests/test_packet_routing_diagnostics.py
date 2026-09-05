@@ -18,6 +18,10 @@ from packet_outcome_artifacts import (
     validate_packet_outcome,
     write_packet_routing_diagnostic_artifacts,
 )
+from relay_diagnostics import (
+    RELAY_DIAGNOSTICS_FILENAME,
+    RELAY_DIAGNOSTICS_OUTPUT_CONTRACT_VERSION,
+)
 
 
 def routing_env(
@@ -984,6 +988,7 @@ class PacketRoutingPaperEvaluationIntegrationTest(unittest.TestCase):
                 "packet_routing_diagnostics.json",
                 "packet_routing_diagnostics.csv",
                 "terminal_uav_distribution.csv",
+                RELAY_DIAGNOSTICS_FILENAME,
             ):
                 self.assertTrue((output_directory / filename).is_file())
             metadata = json.loads(
@@ -993,6 +998,11 @@ class PacketRoutingPaperEvaluationIntegrationTest(unittest.TestCase):
             )
             diagnostics = json.loads(
                 (output_directory / "packet_routing_diagnostics.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            relay_diagnostics = json.loads(
+                (output_directory / RELAY_DIAGNOSTICS_FILENAME).read_text(
                     encoding="utf-8"
                 )
             )
@@ -1013,6 +1023,14 @@ class PacketRoutingPaperEvaluationIntegrationTest(unittest.TestCase):
         self.assertEqual(
             diagnostics["packet_routing_diagnostic_contract_version"],
             PACKET_ROUTING_DIAGNOSTIC_CONTRACT_VERSION,
+        )
+        self.assertEqual(len(relay_diagnostics["episodes"]), 1)
+        self.assertEqual(
+            metadata["relay_diagnostics_output_contract_version"],
+            RELAY_DIAGNOSTICS_OUTPUT_CONTRACT_VERSION,
+        )
+        self.assertIn(
+            "relay_diagnostics", result["points"][0]["outputs"]
         )
         self.assertEqual(
             set(diagnostics["groups"]), {"ALL", "COM", "FOV"}

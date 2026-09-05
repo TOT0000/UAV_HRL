@@ -24,6 +24,7 @@ from experiment_paths import (
     validate_run_directory_preflight,
     write_run_status,
 )
+from relay_diagnostics import write_relay_diagnostics
 from scenario_manifest import (
     ScenarioManifest,
     validate_manifest_initial_topologies,
@@ -740,9 +741,18 @@ def validate_formal_aggregation_rows(
     return episode_rows
 
 
-def write_evaluation_outputs(output_dir, episode_rows, run_metadata):
+def write_evaluation_outputs(
+    output_dir, episode_rows, run_metadata, *, relay_diagnostics=None
+):
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    run_metadata = dict(run_metadata)
+    relay_diagnostics_path = None
+    if relay_diagnostics is not None:
+        relay_metadata, relay_diagnostics_path = write_relay_diagnostics(
+            output_dir, relay_diagnostics
+        )
+        run_metadata.update(relay_metadata)
     normalized_rows = [
         {column: row.get(column) for column in EPISODE_COLUMNS}
         for row in episode_rows
@@ -796,7 +806,7 @@ def write_evaluation_outputs(output_dir, episode_rows, run_metadata):
         + "\n",
         encoding="utf-8",
     )
-    return {
+    outputs = {
         "per_episode_csv": per_episode_csv,
         "per_episode_jsonl": per_episode_jsonl,
         "per_training_seed_csv": seed_csv,
@@ -805,6 +815,9 @@ def write_evaluation_outputs(output_dir, episode_rows, run_metadata):
         "canonical_cross_seed_aggregation_json": canonical_cross_seed_json,
         "run_metadata": metadata_path,
     }
+    if relay_diagnostics_path is not None:
+        outputs["relay_diagnostics"] = relay_diagnostics_path
+    return outputs
 
 
 def _read_episode_csvs(input_dir):
@@ -849,7 +862,10 @@ def run_evaluation_command(args):
             "run_status_file": str(run_dir / "run_status.json"),
         }
         paths = write_evaluation_outputs(
-            run_dir, result["episode_metrics"], metadata
+            run_dir,
+            result["episode_metrics"],
+            metadata,
+            relay_diagnostics=result["relay_diagnostics"],
         )
         write_run_status(run_dir, "COMPLETED")
         print(

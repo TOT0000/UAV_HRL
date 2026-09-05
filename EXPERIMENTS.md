@@ -489,22 +489,24 @@ python -X utf8 comparison_experiment.py aggregate --input-dir runs/comparison/ev
 
 Exact-resume checkpoints validate the method fingerprint, training-manifest
 relationship, training seed, the complete Dinkelbach block state, and its configuration.
-Checkpoint schema v22 is the current action-wise-GS-progress,
+Checkpoint schema v24 is the current action-wise-GS-progress,
 continuous-hard-only-gateway,
 unified-400-m communication, permanent-gateway, coverage-weighted useful
 goodput, boundary-aligned stochastic-channel,
 movement/routing replay, utility/QoS, routing-ID causality/credit,
-frozen-backlog plus soft-GS-progress reward, GS-reachable initial topology, distance-aware VS/COM
-task potentials, hard-range/COM-session, atomic-FOV, seed-ratio
+boundary-aligned current/next decision-state Relay potential plus soft-GS-progress
+reward, GS-reachable initial topology, distance-aware VS/COM task potentials,
+hard-range/COM-session, atomic-FOV, seed-ratio
 aggregation, propulsion, and four-slot/fifty-block movement-channel contract.
-Schema v21 and every older schema is rejected before weights or replay state are
+Schema v23 and every older schema is rejected before weights or replay state are
 restored and must be retrained; no legacy checkpoint migration is attempted.
 The current schema
-stores the 429/30/101 dimensions, movement feature schema, direct-ratio bit/J
+stores the 519/30/101 dimensions, Relay-aware movement feature schema,
+direct-ratio bit/J
 objective, shared gateway/channel/packet contracts, active FOV capture-coverage
 snapshots, raw/useful counters, inject buffers, adaptive routing lifecycle, and
-FOV-EMA state. The movement feature schema remains unchanged; the scenario
-schema is v7. Schema-19 checkpoints use the discontinuous 360-400 m soft
+FOV-EMA state. The scenario schema is v7. Schema-19 checkpoints use the
+discontinuous 360-400 m soft
 compression and must be retrained under the hard-only projection dynamics.
 Schema-18 checkpoints use the previous split 200 m A2G / 400 m
 A2A environment and older COM range-gap semantics, so they must be retrained.
@@ -561,8 +563,11 @@ Zero or invalid per-episode energy produces an episode diagnostic EE value of
 `0.0`, never NaN or infinity. Canonical aggregation treats a zero pooled
 denominator as missing.
 Each evaluation directory contains `per_episode.csv`, `per_episode.jsonl`,
-`per_training_seed_summary.csv`, `per_training_seed_summary.json`, and
-`run_metadata.json`. Formal aggregation defaults to exactly five seeds and 100
+`per_training_seed_summary.csv`, `per_training_seed_summary.json`,
+`relay_diagnostics.json`, and `run_metadata.json`. Training and exact-resume run
+directories also write the same Relay diagnostics artifact; resume atomically
+replaces it with the checkpoint history followed once by newly executed episodes.
+Formal aggregation defaults to exactly five seeds and 100
 rows per seed, requires identical scenario sets and compatible identities, and
 rejects duplicate reruns or non-finite values. For smaller deterministic tests,
 override `--expected-seed-count` and `--expected-episodes-per-seed` explicitly.

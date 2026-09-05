@@ -92,7 +92,8 @@ from dinkelbach_blocks import (
     dinkelbach_config_metadata,
 )
 
-CHECKPOINT_SCHEMA_VERSION = 23
+CHECKPOINT_SCHEMA_VERSION = 24
+PRE_BOUNDARY_ALIGNED_RELAY_POTENTIAL_CHECKPOINT_SCHEMA_VERSION = 23
 PRE_RELAY_TASK_CHECKPOINT_SCHEMA_VERSION = 22
 PRE_GS_PROGRESS_CHECKPOINT_SCHEMA_VERSION = 21
 PRE_ROUTING_IMMEDIATE_COST_CHECKPOINT_SCHEMA_VERSION = 20
@@ -189,6 +190,7 @@ FORMAL_CORE_CONFIG_FIELDS = (
     "task_potential_enabled",
     "task_potential_contract_version",
     "task_potential_configuration",
+    "movement_replay_contract_version",
     "relay_task_contract_version",
     "relay_count_rule",
     "relay_forward_reference_seconds",
@@ -1453,8 +1455,8 @@ def _validate_checkpoint_schema(metadata):
             "unified inclusive 400 m S2U/U2G/U2U communication range, "
             "101-D action-wise GS-progress routing state and v7 routing reward, "
             "2.5 s FOV / 2.0 s COM QoS deadlines, "
-            "Relay assignment, 519-D Relay-aware movement state and frozen-backlog "
-            "Relay potential, "
+            "Relay assignment, 519-D Relay-aware movement state and boundary-aligned "
+            "current/next decision-state Relay potential, "
             "named-RNG, projected-action and replay "
             "contract and must be retrained: "
             f"checkpoint={schema}, expected={CHECKPOINT_SCHEMA_VERSION}"

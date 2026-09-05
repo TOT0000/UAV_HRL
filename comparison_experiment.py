@@ -32,6 +32,7 @@ from HRL_task_aware import (
     smoke_training_config,
     train,
 )
+from relay_diagnostics import write_relay_diagnostics
 from resume_recovery import (
     execute_resume_reconciliation,
     plan_resume_reconciliation,
@@ -90,9 +91,19 @@ def _load_manifest(path, expected_split=None):
 def _write_run_metadata(output_dir, result):
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    relay_metadata, _relay_path = write_relay_diagnostics(
+        output_dir, result["relay_diagnostics"]
+    )
+    result["run_metadata"].update(relay_metadata)
     path = output_dir / "run_metadata.json"
     path.write_text(
-        json.dumps(result["run_metadata"], indent=2, ensure_ascii=False) + "\n",
+        json.dumps(
+            result["run_metadata"],
+            indent=2,
+            ensure_ascii=False,
+            allow_nan=False,
+        )
+        + "\n",
         encoding="utf-8",
     )
     return path

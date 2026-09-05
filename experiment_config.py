@@ -85,7 +85,7 @@ GROUND_ALTITUDE_M = 0.0
 UAV_MAX_ALTITUDE_M = 150.0
 TASK_POTENTIAL_NORMALIZATION_EPSILON = 1e-12
 TASK_POTENTIAL_CONTRACT_VERSION = (
-    "vs-com-relay-frozen-backlog-potential-v4"
+    "vs-com-relay-boundary-aligned-decision-backlog-potential-v5"
 )
 COM_CAPACITY_POTENTIAL_WEIGHT = 0.5
 COM_DISTANCE_POTENTIAL_WEIGHT = 0.5
@@ -203,7 +203,7 @@ MOVEMENT_ACTION_PROJECTION_CONTRACT_VERSION = (
     "fieldwise-clamp-heading-wrap-relay-active-mask-uav0-hard400-v5"
 )
 MOVEMENT_REPLAY_CONTRACT_VERSION = (
-    "executed-action-boundary-aligned-next-state-relay-frozen-potential-capacity-50000-v4"
+    "executed-action-boundary-aligned-next-state-and-potential-capacity-50000-v5"
 )
 MOVEMENT_WARMUP_CONTRACT_VERSION = "global-joint-transition-boundary-10000-v1"
 PROPULSION_PARAMETERS = MappingProxyType(
@@ -301,12 +301,21 @@ def task_potential_contract_metadata():
             "definition": "mean(min(receive_score, forward_score))",
             "aggregation": "mean over assigned Relay tasks",
             "beta": RELAY_POTENTIAL_WEIGHT,
-            "backlog_snapshot": "frozen once at movement-transition start",
+            "current_backlog_snapshot": "current decision-state boundary",
+            "next_backlog_snapshot": "next decision-state boundary",
+            "transition_alignment": (
+                "phi_current uses the current state backlog; phi_next uses the "
+                "boundary-prepared next state backlog"
+            ),
             "capacity_source": "expected large-scale U2U/U2G capacity",
             "forward_reference_seconds": RELAY_FORWARD_REFERENCE_SECONDS,
         },
         "lifecycle": {
             "form": "beta * (gamma * phi_next - phi_current)",
+            "nonterminal_boundary_continuity": (
+                "all four phi_next values equal the next transition phi_current"
+            ),
+            "terminal_next_potential": 0.0,
             "delivery_or_connectivity_potential": False,
         },
     }
@@ -879,6 +888,7 @@ def comparison_method_configuration(method_spec: MethodSpec) -> dict:
         "task_potential_enabled": bool(method_spec.task_potential_enabled),
         "task_potential_contract_version": TASK_POTENTIAL_CONTRACT_VERSION,
         "task_potential_configuration": task_potential_contract_metadata(),
+        "movement_replay_contract_version": MOVEMENT_REPLAY_CONTRACT_VERSION,
         "relay_task_contract_version": RELAY_TASK_CONTRACT_VERSION,
         "relay_count_rule": "floor(discovered_roi_count / 2)",
         "relay_forward_reference_seconds": RELAY_FORWARD_REFERENCE_SECONDS,

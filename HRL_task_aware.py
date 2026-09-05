@@ -2199,6 +2199,15 @@ def train(
                 "resume checkpoint Relay diagnostic history is inconsistent "
                 "with resume episode"
             )
+        if any(
+            not isinstance(entry, dict)
+            or entry.get("episode_index") != episode_index
+            for episode_index, entry in enumerate(relay_episode_diagnostics)
+        ):
+            raise RuntimeError(
+                "resume checkpoint Relay diagnostic episode indexes are "
+                "inconsistent or duplicated"
+            )
         if method_spec.learns_routing:
             routing_lifecycle = RoutingLearnerLifecycle.from_state(
                 training_state.get("routing_lifecycle_state"),
@@ -2474,7 +2483,7 @@ def train(
                     raise AssertionError(
                         "movement replay next mask differs from the next policy mask"
                     )
-                if tuple(potentials_t[:3]) != tuple(expected_next_movement_potentials):
+                if tuple(potentials_t) != tuple(expected_next_movement_potentials):
                     raise AssertionError(
                         "movement replay next potentials differ from the next transition"
                     )
@@ -2649,7 +2658,7 @@ def train(
                     }
                 )
             potentials_t1 = calculate_movement_potentials(
-                env, c_ref_com, backlog_bits=backlog_before
+                env, c_ref_com, backlog_bits=backlog_after
             )
             physical_next_state = get_global_movement_state(
                 env,
@@ -2665,10 +2674,13 @@ def train(
                 "movement",
             )
             next_movement_mask = movement_mask_from_state(physical_next_state)
+            effective_potentials_t1 = (
+                (0.0, 0.0, 0.0, 0.0) if done else potentials_t1
+            )
             if not done:
                 expected_next_movement_state = next_state.copy()
                 expected_next_movement_mask = next_movement_mask.copy()
-                expected_next_movement_potentials = tuple(potentials_t1[:3])
+                expected_next_movement_potentials = tuple(potentials_t1)
             terminal_joint_transitions += int(done)
             episode_delivered_mbits += interval_delivered_mbits
             episode_energy += interval_energy
@@ -2688,13 +2700,13 @@ def train(
                     total_mobility_energy=interval_energy,
                     ratio_objective_reward=ratio_objective_reward,
                     phi_search_t=potentials_t[0],
-                    phi_search_t1=potentials_t1[0],
+                    phi_search_t1=effective_potentials_t1[0],
                     phi_vs_t=potentials_t[1],
-                    phi_vs_t1=potentials_t1[1],
+                    phi_vs_t1=effective_potentials_t1[1],
                     phi_com_t=potentials_t[2],
-                    phi_com_t1=potentials_t1[2],
+                    phi_com_t1=effective_potentials_t1[2],
                     phi_relay_t=potentials_t[3],
-                    phi_relay_t1=potentials_t1[3],
+                    phi_relay_t1=effective_potentials_t1[3],
                     current_movement_mask=current_movement_mask,
                     next_movement_mask=next_movement_mask,
                 )
@@ -2713,7 +2725,7 @@ def train(
                 episode_lambda,
                 movement_agent.gamma,
                 potentials_t,
-                potentials_t1,
+                effective_potentials_t1,
                 done,
                 config,
                 reward_mode=method_spec.reward_mode,
@@ -2722,9 +2734,6 @@ def train(
             )
             episode_reward += interval_reward
             if transition_observer is not None:
-                effective_potentials_t1 = (
-                    (0.0, 0.0, 0.0, 0.0) if done else potentials_t1
-                )
                 transition_observer(
                     {
                         "state": state.copy(),
@@ -2780,6 +2789,7 @@ def train(
         )
         relay_episode_diagnostics.append(
             {
+                "episode_index": int(episode),
                 "scenario_id": scenario_id,
                 "assignment": copy.deepcopy(env.assignment_metadata()),
                 "forwarding": packet_engine.relay_forwarding_summary(),

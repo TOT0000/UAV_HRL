@@ -10,11 +10,137 @@ import torch
 from observation_strategy import MOVEMENT_TASK_ASSIGNMENT_INDICES
 from evaluation_selection import resolve_training_run_checkpoint
 from run_experiment import main
+from relay_diagnostics import (
+    RELAY_DIAGNOSTICS_FILENAME,
+    RELAY_DIAGNOSTICS_OUTPUT_CONTRACT_VERSION,
+)
 from scenario_manifest import ScenarioManifest, manifest_prefix
 from Simulator import Simulator
 
 
 class SimpleRunnerLifecycleIntegrationTest(unittest.TestCase):
+    def test_relay_diagnostics_cover_train_resume_and_evaluation_without_relay(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output = Path(temp_dir) / "results"
+            self.assertEqual(
+                main(
+                    [
+                        "td3_ratio",
+                        "--episodes",
+                        "1",
+                        "--episode-seconds",
+                        "1",
+                        "--checkpoint-interval",
+                        "1",
+                        "--roi-count",
+                        "2",
+                        "--output-root",
+                        str(output),
+                    ]
+                ),
+                0,
+            )
+            run_dir = next((output / "td3_ratio").iterdir())
+            first = json.loads(
+                (run_dir / RELAY_DIAGNOSTICS_FILENAME).read_text(
+                    encoding="utf-8"
+                )
+            )
+            first_metadata = json.loads(
+                (run_dir / "run_metadata.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(
+                [episode["episode_index"] for episode in first["episodes"]],
+                [0],
+            )
+            self.assertEqual(
+                first["episodes"][0]["assignment"]["assigned_relay_count"],
+                0,
+            )
+            self.assertEqual(
+                first_metadata["relay_diagnostics_filename"],
+                RELAY_DIAGNOSTICS_FILENAME,
+            )
+
+            self.assertEqual(
+                main(["resume", str(run_dir), "--target-episodes", "2"]),
+                0,
+            )
+            resumed = json.loads(
+                (run_dir / RELAY_DIAGNOSTICS_FILENAME).read_text(
+                    encoding="utf-8"
+                )
+            )
+            resumed_metadata = json.loads(
+                (run_dir / "run_metadata.json").read_text(encoding="utf-8")
+            )
+            resolved = json.loads(
+                (run_dir / "resolved_config.json").read_text(encoding="utf-8")
+            )
+            active_manifest = ScenarioManifest.load(
+                run_dir / resolved["training_manifest_path"]
+            )
+            self.assertEqual(
+                [episode["episode_index"] for episode in resumed["episodes"]],
+                [0, 1],
+            )
+            self.assertEqual(
+                [episode["scenario_id"] for episode in resumed["episodes"]],
+                [
+                    entry["scenario_id"]
+                    for entry in active_manifest.episodes[:2]
+                ],
+            )
+            self.assertEqual(
+                resumed_metadata["relay_diagnostics_episode_count"], 2
+            )
+            self.assertEqual(
+                resumed_metadata["relay_diagnostics_output_contract_version"],
+                RELAY_DIAGNOSTICS_OUTPUT_CONTRACT_VERSION,
+            )
+
+            self.assertEqual(
+                main(
+                    [
+                        "evaluate",
+                        str(run_dir),
+                        "--checkpoint-episode",
+                        "2",
+                        "--smoke",
+                    ]
+                ),
+                0,
+            )
+            evaluation_dir = next(
+                (run_dir / "evaluation" / "ep_2").iterdir()
+            )
+            evaluated = json.loads(
+                (evaluation_dir / RELAY_DIAGNOSTICS_FILENAME).read_text(
+                    encoding="utf-8"
+                )
+            )
+            evaluation_metadata = json.loads(
+                (evaluation_dir / "run_metadata.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            evaluation_rows = [
+                json.loads(line)
+                for line in (evaluation_dir / "per_episode.jsonl")
+                .read_text(encoding="utf-8")
+                .splitlines()
+                if line
+            ]
+            self.assertEqual(len(evaluated["episodes"]), 1)
+            self.assertEqual(evaluated["episodes"][0]["episode_index"], 0)
+            self.assertEqual(
+                evaluated["episodes"][0]["scenario_id"],
+                evaluation_rows[0]["scenario_id"],
+            )
+            self.assertEqual(
+                evaluation_metadata["relay_diagnostics_episode_count"], 1
+            )
+
     def test_explicit_horizon_extension_preserves_old_checkpoint_and_history(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             output = Path(temp_dir) / "results"

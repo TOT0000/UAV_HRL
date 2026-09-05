@@ -17,6 +17,7 @@ from com_capacity_calibration import load_com_capacity_reference
 from comparison_experiment import main as comparison_main
 from design_dataset import (
     ARRAY_NAMES,
+    DESIGN_DATASET_SCHEMA_VERSION,
     DESIGN_EPISODES_CSV,
     DESIGN_METADATA_FILENAME,
     DESIGN_TRANSITIONS_FILENAME,
@@ -28,7 +29,12 @@ from design_dataset import (
 )
 from dinkelbach_blocks import DinkelbachBlockState, dinkelbach_config_metadata
 from evaluation_metrics import EPISODE_COLUMNS, write_evaluation_outputs
-from experiment_config import MethodSpec, effective_training_config
+from experiment_config import (
+    MOVEMENT_REPLAY_CONTRACT_VERSION,
+    TASK_POTENTIAL_CONTRACT_VERSION,
+    MethodSpec,
+    effective_training_config,
+)
 from experiment_paths import design_run_directory, read_run_status
 from HRL_task_aware import TrainingConfig, formal_training_config, train
 from scenario_manifest import generate_manifest
@@ -183,6 +189,16 @@ class DesignDatasetIntegrationTest(unittest.TestCase):
 
     def test_two_episodes_produce_120_ordered_joint_transitions(self):
         arrays = self.arrays_one
+        self.assertEqual(DESIGN_DATASET_SCHEMA_VERSION, 4)
+        self.assertEqual(self.metadata_one["schema_version"], 4)
+        self.assertEqual(
+            self.metadata_one["task_potential_contract_version"],
+            TASK_POTENTIAL_CONTRACT_VERSION,
+        )
+        self.assertEqual(
+            self.metadata_one["movement_replay_contract_version"],
+            MOVEMENT_REPLAY_CONTRACT_VERSION,
+        )
         self.assertEqual(set(arrays), set(ARRAY_NAMES))
         self.assertEqual(arrays["state"].shape, (120, 519))
         self.assertEqual(arrays["projected_joint_action"].shape, (120, 30))

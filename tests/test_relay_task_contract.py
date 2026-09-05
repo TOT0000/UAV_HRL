@@ -5,7 +5,7 @@ from unittest import mock
 
 import numpy as np
 
-from HRL_task_aware import TrainingConfig, _interval_reward
+from HRL_task_aware import TrainingConfig, _interval_reward, train
 from Packet_scheduler_v1 import PacketEngine
 from Simulator import Simulator
 from Task_assignment import Task, UAVAssigner
@@ -18,7 +18,10 @@ from centralized_movement import (
 )
 from observation_strategy import apply_observation_strategy, routing_state_feature_names
 from relay_contract import relay_metrics, requested_relay_count
+from scenario_manifest import generate_manifest
 from training_checkpoint import CHECKPOINT_SCHEMA_VERSION, _validate_checkpoint_schema
+from experiment_config import MethodSpec
+from utils_update_v2 import ReplayBufferJoint
 
 
 def discover_all(env):
@@ -260,10 +263,98 @@ class RelayRoutingCheckpointDiagnosticsTest(unittest.TestCase):
         )
         self.assertEqual(reward, 0.0)
 
+    def test_replay_relay_potential_is_boundary_aligned_and_telescopes(self):
+        captured = []
+        original_add = ReplayBufferJoint.add
+
+        def capture_add(replay, state, action, next_state, **kwargs):
+            captured.append(
+                {
+                    "state": np.asarray(state).copy(),
+                    "next_state": np.asarray(next_state).copy(),
+                    **copy.deepcopy(kwargs),
+                }
+            )
+            return original_add(replay, state, action, next_state, **kwargs)
+
+        config = TrainingConfig(
+            total_episodes=1,
+            mode="custom",
+            episode_seconds=5,
+            warmup_joint_transitions=10_000,
+            batch_size=1,
+            enable_model_checkpoints=False,
+            enable_full_resume=False,
+            enable_plots=False,
+            enable_csv=False,
+            random_seed=20260817,
+        )
+        manifest = generate_manifest(
+            "train", 20260817, 1, num_gt=8
+        )
+        with mock.patch.object(ReplayBufferJoint, "add", new=capture_add):
+            result = train(
+                config,
+                scenario_manifest=manifest,
+                method_spec=MethodSpec.parse("td3_ratio"),
+            )
+
+        self.assertEqual(len(captured), 5)
+        schema = movement_state_feature_schema()["features"]
+        backlog_indices = [
+            feature["index"]
+            for feature in schema
+            if feature["name"].endswith(".backlog")
+        ]
+        relay_flag_indices = [
+            feature["index"]
+            for feature in schema
+            if feature["name"].endswith(".task_relay")
+        ]
+        self.assertTrue(
+            any(
+                np.any(record["state"][relay_flag_indices])
+                and np.any(
+                    record["state"][backlog_indices]
+                    != record["next_state"][backlog_indices]
+                )
+                and not record["done"]
+                for record in captured
+            )
+        )
+        self.assertGreater(
+            result["relay_diagnostics"]["episodes"][0]["assignment"][
+                "assigned_relay_count"
+            ],
+            0,
+        )
+
+        potential_names = ("search", "vs", "com", "relay")
+        for current, following in zip(captured, captured[1:]):
+            np.testing.assert_array_equal(
+                current["next_state"], following["state"]
+            )
+            for name in potential_names:
+                self.assertEqual(
+                    current[f"phi_{name}_t1"], following[f"phi_{name}_t"]
+                )
+        for name in potential_names:
+            self.assertEqual(captured[-1][f"phi_{name}_t1"], 0.0)
+
+        relay_shaping_sum = sum(
+            record["phi_relay_t1"] - record["phi_relay_t"]
+            for record in captured
+        )
+        self.assertAlmostEqual(
+            relay_shaping_sum, -captured[0]["phi_relay_t"], places=12
+        )
+        self.assertEqual(captured[0]["phi_relay_t"], 0.0)
+        self.assertAlmostEqual(relay_shaping_sum, 0.0, places=12)
+
     def test_old_checkpoint_fails_before_loading(self):
-        self.assertEqual(CHECKPOINT_SCHEMA_VERSION, 23)
+        self.assertEqual(CHECKPOINT_SCHEMA_VERSION, 24)
         with self.assertRaisesRegex(RuntimeError, "Relay.*retrained"):
-            _validate_checkpoint_schema({"checkpoint_schema_version": 22})
+            _validate_checkpoint_schema({"checkpoint_schema_version": 23})
 
     def test_diagnostics_are_rng_observational_and_publish_forwarding_groups(self):
         state = copy.deepcopy(self.env.assignment_rng.bit_generator.state)
