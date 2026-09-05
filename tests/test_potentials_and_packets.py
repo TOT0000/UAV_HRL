@@ -14,6 +14,7 @@ from centralized_movement import (
     blended_com_progress,
     calculate_movement_potentials,
     get_global_movement_state,
+    movement_state_feature_schema,
     normalized_s2u_range_gap_proximity,
     project_joint_action,
     vs_data_valid,
@@ -81,7 +82,7 @@ class VisualSensingPacketGenerationTest(unittest.TestCase):
         self.assertEqual(old_packet["current"], self.env.GS_ID)
 
     def test_vs_potential_is_continuous_and_positive_for_full_coverage(self):
-        _, phi_vs, _ = calculate_movement_potentials(self.env, c_ref_com=1.0)
+        _, phi_vs, _, _ = calculate_movement_potentials(self.env, c_ref_com=1.0)
         self.assertGreater(phi_vs, 0.0)
         self.assertLessEqual(phi_vs, 1.0)
 
@@ -229,7 +230,7 @@ class ComStateCalibrationAndDeliveryTest(unittest.TestCase):
                 c_ref_com=24.0,
                 remaining_time=1.0,
             )
-            _, _, phi_com = calculate_movement_potentials(
+            _, _, phi_com, _ = calculate_movement_potentials(
                 self.env, c_ref_com=24.0
             )
             assigner = UAVAssigner(self.env)
@@ -257,7 +258,11 @@ class ComStateCalibrationAndDeliveryTest(unittest.TestCase):
                 K=1,
             )
 
-        com_capacity_index = LOCAL_MOVEMENT_DIM - 1
+        com_capacity_index = next(
+            feature["index"]
+            for feature in movement_state_feature_schema()["features"]
+            if feature["name"] == "uav_0.com_capacity"
+        )
         self.assertEqual(state[com_capacity_index], 0.5)
         expected_distance = normalized_s2u_range_gap_proximity(
             self.env.uav_dict[0].get_position(),

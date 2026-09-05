@@ -49,7 +49,7 @@ from training_checkpoint import (
 )
 
 
-DESIGN_DATASET_SCHEMA_VERSION = 2
+DESIGN_DATASET_SCHEMA_VERSION = 3
 DESIGN_TRANSITIONS_FILENAME = "design_transitions.npz"
 DESIGN_METADATA_FILENAME = "design_dataset_metadata.json"
 DESIGN_EPISODES_CSV = "per_episode.csv"
@@ -69,6 +69,8 @@ ARRAY_NAMES = (
     "phi_vs_t1",
     "phi_com_t",
     "phi_com_t1",
+    "phi_relay_t",
+    "phi_relay_t1",
     "reward_at_checkpoint_lambda",
     "checkpoint_lambda",
     "episode_index",
@@ -87,6 +89,8 @@ FLOAT_COMPONENTS = (
     "phi_vs_t1",
     "phi_com_t",
     "phi_com_t1",
+    "phi_relay_t",
+    "phi_relay_t1",
     "reward_at_checkpoint_lambda",
     "checkpoint_lambda",
 )
@@ -164,7 +168,7 @@ class DesignTransitionCollector:
         return arrays
 
 
-def reconstruct_reward(arrays, *, beta_search, beta_vs, beta_com):
+def reconstruct_reward(arrays, *, beta_search, beta_vs, beta_com, beta_relay):
     return (
         arrays["delivered_mbits"]
         - arrays["checkpoint_lambda"]
@@ -173,6 +177,8 @@ def reconstruct_reward(arrays, *, beta_search, beta_vs, beta_com):
         * (arrays["phi_search_t1"] - arrays["phi_search_t"])
         + float(beta_vs) * (arrays["phi_vs_t1"] - arrays["phi_vs_t"])
         + float(beta_com) * (arrays["phi_com_t1"] - arrays["phi_com_t"])
+        + float(beta_relay)
+        * (arrays["phi_relay_t1"] - arrays["phi_relay_t"])
     )
 
 
@@ -184,6 +190,7 @@ def validate_design_arrays(
     beta_search,
     beta_vs,
     beta_com,
+    beta_relay,
 ):
     missing = set(ARRAY_NAMES).difference(arrays)
     extra = set(arrays).difference(ARRAY_NAMES)
@@ -268,6 +275,7 @@ def validate_design_arrays(
         beta_search=beta_search,
         beta_vs=beta_vs,
         beta_com=beta_com,
+        beta_relay=beta_relay,
     )
     if not np.allclose(
         reconstructed,
@@ -481,6 +489,7 @@ def _build_metadata(preflight, arrays, result, run_dir, reference_rows):
             "beta_search": float(formal_config["beta_search"]),
             "beta_vs": float(formal_config["beta_vs"]),
             "beta_com": float(formal_config["beta_com"]),
+            "beta_relay": float(formal_config["beta_relay"]),
         },
         "reward_components": {
             "definition": (
@@ -746,6 +755,7 @@ def run_design_dataset_command(args):
             beta_search=formal_config["beta_search"],
             beta_vs=formal_config["beta_vs"],
             beta_com=formal_config["beta_com"],
+            beta_relay=formal_config["beta_relay"],
         )
         if preflight["reference_rows"] is not None:
             validate_reference_metrics(

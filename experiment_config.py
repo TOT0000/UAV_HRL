@@ -8,6 +8,8 @@ import json
 import math
 from types import MappingProxyType
 
+from movement_feature_schema import LOCAL_MOVEMENT_DIM
+
 from communication_contract import (
     COMMUNICATION_RANGE_BOUNDARY_RULE,
     MAX_3D_COMMUNICATION_DISTANCE_M,
@@ -83,10 +85,14 @@ GROUND_ALTITUDE_M = 0.0
 UAV_MAX_ALTITUDE_M = 150.0
 TASK_POTENTIAL_NORMALIZATION_EPSILON = 1e-12
 TASK_POTENTIAL_CONTRACT_VERSION = (
-    "vs-sensing-only-com-400m-range-gap-blend-v3"
+    "vs-com-relay-frozen-backlog-potential-v4"
 )
 COM_CAPACITY_POTENTIAL_WEIGHT = 0.5
 COM_DISTANCE_POTENTIAL_WEIGHT = 0.5
+RELAY_TASK_CONTRACT_VERSION = "relay-expected-capacity-shortest-path-v1"
+RELAY_FORWARD_REFERENCE_SECONDS = 2.0
+RELAY_POTENTIAL_WEIGHT = 1.0
+METHOD_CONTRACT_VERSION = "centralized-relay-task-v1"
 DEFAULT_TRAINING_SEED = 20260817
 FORMAL_TRAINING_EPISODES = 1500
 FORMAL_CHECKPOINT_EPISODE = FORMAL_TRAINING_EPISODES
@@ -194,10 +200,10 @@ MOVEMENT_CHANNEL_TIMING_VERSION = (
 )
 PROPULSION_MODEL_ID = "canonical-3d-quadrotor-v1"
 MOVEMENT_ACTION_PROJECTION_CONTRACT_VERSION = (
-    "fieldwise-clamp-heading-wrap-mask-uav0-continuous-hard400-3d-position-v4"
+    "fieldwise-clamp-heading-wrap-relay-active-mask-uav0-hard400-v5"
 )
 MOVEMENT_REPLAY_CONTRACT_VERSION = (
-    "executed-net-displacement-action-boundary-aligned-next-state-capacity-50000-v3"
+    "executed-action-boundary-aligned-next-state-relay-frozen-potential-capacity-50000-v4"
 )
 MOVEMENT_WARMUP_CONTRACT_VERSION = "global-joint-transition-boundary-10000-v1"
 PROPULSION_PARAMETERS = MappingProxyType(
@@ -238,6 +244,7 @@ def validate_task_potential_weights():
 
     groups = {
         "COM": (COM_CAPACITY_POTENTIAL_WEIGHT, COM_DISTANCE_POTENTIAL_WEIGHT),
+        "Relay": (RELAY_POTENTIAL_WEIGHT,),
     }
     for name, weights in groups.items():
         numeric = tuple(float(weight) for weight in weights)
@@ -289,6 +296,14 @@ def task_potential_contract_metadata():
             "maximum_3d_distance_reference_m": distance_3d_reference,
             "range_gap_normalization_reference_m": range_gap_reference,
             "normalization_epsilon": TASK_POTENTIAL_NORMALIZATION_EPSILON,
+        },
+        "relay": {
+            "definition": "mean(min(receive_score, forward_score))",
+            "aggregation": "mean over assigned Relay tasks",
+            "beta": RELAY_POTENTIAL_WEIGHT,
+            "backlog_snapshot": "frozen once at movement-transition start",
+            "capacity_source": "expected large-scale U2U/U2G capacity",
+            "forward_reference_seconds": RELAY_FORWARD_REFERENCE_SECONDS,
         },
         "lifecycle": {
             "form": "beta * (gamma * phi_next - phi_current)",
@@ -455,6 +470,7 @@ class MethodSpec:
     agent: str = "td3"
     reward_mode: str = "dinkelbach"
     task_potential_enabled: bool = True
+    method_contract_version: str = METHOD_CONTRACT_VERSION
     label: str = "TD3 + Dinkelbach"
 
     def __post_init__(self):
@@ -476,6 +492,7 @@ class MethodSpec:
             "agent": definition["agent"],
             "reward_mode": definition["reward_mode"],
             "task_potential_enabled": definition["task_potential_enabled"],
+            "method_contract_version": METHOD_CONTRACT_VERSION,
             "label": definition["label"],
         }
         actual = {
@@ -562,6 +579,7 @@ class MethodSpec:
             agent=definition["agent"],
             reward_mode=definition["reward_mode"],
             task_potential_enabled=definition["task_potential_enabled"],
+            method_contract_version=METHOD_CONTRACT_VERSION,
             label=definition["label"],
         )
 
@@ -582,7 +600,7 @@ FORMAL_EXPERIMENT_DEFAULTS = {
     "movement_hyperparameters": {
         # Derived from the authoritative feature/action schemas.  These values
         # are asserted against centralized_movement at experiment preflight.
-        "state_dim": NUM_UAV * 17 + 16 * 16 + 3,
+        "state_dim": NUM_UAV * LOCAL_MOVEMENT_DIM + 16 * 16 + 3,
         "joint_action_dim": NUM_UAV * 3,
         "max_action": 1.0,
         "hidden_layers": [256, 256, 256, 256],
@@ -861,6 +879,15 @@ def comparison_method_configuration(method_spec: MethodSpec) -> dict:
         "task_potential_enabled": bool(method_spec.task_potential_enabled),
         "task_potential_contract_version": TASK_POTENTIAL_CONTRACT_VERSION,
         "task_potential_configuration": task_potential_contract_metadata(),
+        "relay_task_contract_version": RELAY_TASK_CONTRACT_VERSION,
+        "relay_count_rule": "floor(discovered_roi_count / 2)",
+        "relay_forward_reference_seconds": RELAY_FORWARD_REFERENCE_SECONDS,
+        "relay_potential_weight": RELAY_POTENTIAL_WEIGHT,
+        "relay_assignment_mode": {
+            "k_km": "relay_first_quota_then_two_round_fov_com",
+            "km": "single_joint_relay_fov_com_hungarian",
+            "random_one_to_one": "single_joint_relay_fov_com_named_rng",
+        }[method_spec.assignment],
         "ground_station_position_m": list(GROUND_STATION_POSITION_M),
         "permanent_gs_gateway_uav_id": PERMANENT_GS_GATEWAY_UAV_ID,
         "gs_gateway_soft_radius_m": GS_GATEWAY_SOFT_RADIUS_M,

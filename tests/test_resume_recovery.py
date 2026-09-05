@@ -121,7 +121,7 @@ class ResumeRecoveryTest(unittest.TestCase):
             "checkpoint_schema_version": CHECKPOINT_SCHEMA_VERSION,
             "checkpoint_type": checkpoint_type,
             "episode": completed_episode - 1,
-            "movement_state_dim": 429,
+            "movement_state_dim": 519,
             "joint_action_dim": 30,
             "routing_state_dim": 101,
             "movement_agent_kind": "td3",
@@ -235,7 +235,7 @@ class ResumeRecoveryTest(unittest.TestCase):
 
     def _inspectors(self):
         common = {
-            "movement_state_dim": 429,
+            "movement_state_dim": 519,
             "joint_action_dim": 30,
             "routing_state_dim": 101,
             "td3_gamma": 1.0,

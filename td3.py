@@ -289,6 +289,7 @@ class TD3():
         beta_search=1.0,
         beta_vs=1.0,
         beta_com=1.0,
+        beta_relay=1.0,
         reward_mode="dinkelbach",
         task_potential_enabled=True,
     ):
@@ -307,6 +308,7 @@ class TD3():
             beta_search=beta_search,
             beta_vs=beta_vs,
             beta_com=beta_com,
+            beta_relay=beta_relay,
             reward_mode=reward_mode,
             task_potential_enabled=task_potential_enabled,
             include_movement_masks=True,

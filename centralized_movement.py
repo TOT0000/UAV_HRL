@@ -19,10 +19,16 @@ from experiment_config import (
     UAV_MAX_ALTITUDE_M,
 )
 from Fov_model_phase import FovModel
+from movement_feature_schema import (
+    ACTIVE_MOVEMENT_TASK_TYPES,
+    LOCAL_MOVEMENT_DIM,
+    LOCAL_MOVEMENT_FEATURES,
+    MOVEMENT_FEATURE_SCHEMA_VERSION,
+    TASK_TYPES,
+)
+from relay_contract import relay_metrics
 
 
-TASK_TYPES = ("Search", "FOV", "COM", "Hovering")
-LOCAL_MOVEMENT_DIM = 17
 COVERAGE_GRID_SIZE = 16
 GLOBAL_MOVEMENT_DIM = 3
 MOVEMENT_STATE_DIM = (
@@ -33,51 +39,6 @@ BACKLOG_NORM_REF_BITS = 5e7
 GT_COUNT_MAX = ROI_COUNT_MAX
 VS_COVERAGE_EPS = 1e-6
 HOVER_ACTION = (-1.0, 0.0, 0.0)
-MOVEMENT_FEATURE_SCHEMA_VERSION = 3
-
-LOCAL_MOVEMENT_FEATURES = (
-    ("task_search", "binary", 0.0, 1.0, "Search task is active"),
-    ("task_fov", "binary", 0.0, 1.0, "FOV task is active"),
-    ("task_com", "binary", 0.0, 1.0, "COM task is active"),
-    ("task_hovering", "binary", 0.0, 1.0, "Hovering task is active"),
-    ("position_x", "continuous", 0.0, 1.0, "x / environment width"),
-    ("position_y", "continuous", 0.0, 1.0, "y / environment height"),
-    (
-        "position_z",
-        "continuous",
-        0.0,
-        1.0,
-        "(z - UAV min AGL) / (UAV max AGL - UAV min AGL)",
-    ),
-    ("energy", "continuous", 0.0, 1.0, "remaining energy / E_max"),
-    (
-        "backlog",
-        "continuous",
-        0.0,
-        1.0,
-        "log1p(non-negative backlog bits) / log1p(5e7 bits)",
-    ),
-    (
-        "fov_error",
-        "continuous",
-        -1.0,
-        1.0,
-        "clip((FOV image score - 1) / 3, -1, 1); zero without FOV task",
-    ),
-    ("fov_target_x", "continuous", 0.0, 1.0, "FOV target x / width"),
-    ("fov_target_y", "continuous", 0.0, 1.0, "FOV target y / height"),
-    ("fov_target_z", "continuous", 0.0, 1.0, "FOV target z / UAV max AGL"),
-    ("com_target_x", "continuous", 0.0, 1.0, "COM target x / width"),
-    ("com_target_y", "continuous", 0.0, 1.0, "COM target y / height"),
-    ("com_target_z", "continuous", 0.0, 1.0, "COM target z / UAV max AGL"),
-    (
-        "com_capacity",
-        "continuous",
-        0.0,
-        1.0,
-        "reference S2U capacity / fixed best-feasible S2U capacity",
-    ),
-)
 
 
 def movement_state_feature_schema():
@@ -222,7 +183,7 @@ def _tasks_by_type(env, uav_id):
 
 
 def _assert_unique_target_tasks(uav_id, grouped_tasks):
-    for task_type in ("FOV", "COM"):
+    for task_type in ("FOV", "COM", "Relay"):
         tasks = grouped_tasks[task_type]
         if len(tasks) > 1:
             target_ids = [
@@ -415,13 +376,40 @@ def get_global_movement_state(
             ]
             com_capacity_norm = normalized_com_link_quality(env, uav_id, task)
 
+        relay_features = [0.0] * 8
+        if grouped["Relay"]:
+            metrics = relay_metrics(env, uav_id, backlog_bits=backlog_bits)
+
+            def relative_vector(target):
+                if target is None:
+                    return [0.0, 0.0, 0.0]
+                tx, ty, tz = map(float, target)
+                return [
+                    float(
+                        np.clip(
+                            (tx - float(uav.x_u)) / float(env.env_width), -1.0, 1.0
+                        )
+                    ),
+                    float(
+                        np.clip(
+                            (ty - float(uav.y_u)) / float(env.env_height), -1.0, 1.0
+                        )
+                    ),
+                    float(np.clip((tz - float(uav.z_u)) / z_span, -1.0, 1.0)),
+                ]
+
+            relay_features = [metrics.receive_score, metrics.forward_score]
+            relay_features += relative_vector(metrics.receive_centroid)
+            relay_features += relative_vector(metrics.forward_target)
+
         uav_features = np.asarray(
             task_flags
             + position
             + [energy_norm, backlog_norm, fov_error]
             + fov_target
             + com_target
-            + [com_capacity_norm],
+            + [com_capacity_norm]
+            + relay_features,
             dtype=np.float32,
         )
         if uav_features.shape != (LOCAL_MOVEMENT_DIM,):
@@ -466,7 +454,7 @@ def movement_mask_from_state(state):
         local = state[..., : NUM_UAV * LOCAL_MOVEMENT_DIM].reshape(
             *state.shape[:-1], NUM_UAV, LOCAL_MOVEMENT_DIM
         )
-        return local[..., :3].amax(dim=-1) > 0.5
+        return local[..., : len(ACTIVE_MOVEMENT_TASK_TYPES)].amax(dim=-1) > 0.5
 
     state_array = np.asarray(state)
     if state_array.shape[-1] != MOVEMENT_STATE_DIM:
@@ -474,7 +462,7 @@ def movement_mask_from_state(state):
     local = state_array[..., : NUM_UAV * LOCAL_MOVEMENT_DIM].reshape(
         *state_array.shape[:-1], NUM_UAV, LOCAL_MOVEMENT_DIM
     )
-    return np.max(local[..., :3], axis=-1) > 0.5
+    return np.max(local[..., : len(ACTIVE_MOVEMENT_TASK_TYPES)], axis=-1) > 0.5
 
 
 def validate_movement_mask(movement_mask):
@@ -697,10 +685,11 @@ def vs_data_valid(env, uav_id, task):
     )
 
 
-def calculate_movement_potentials(env, c_ref_com):
+def calculate_movement_potentials(env, c_ref_com, backlog_bits=None):
     phi_search = float(np.asarray(env.visited_bitmap, dtype=bool).mean())
     vs_progress = []
     com_progress = []
+    relay_progress = []
     for uav_id in range(env.num_UAV):
         grouped = _tasks_by_type(env, uav_id)
         _assert_unique_target_tasks(uav_id, grouped)
@@ -723,9 +712,14 @@ def calculate_movement_potentials(env, c_ref_com):
             com_progress.append(
                 blended_com_progress(capacity_progress, distance_progress)
             )
+        for _task in grouped["Relay"]:
+            relay_progress.append(
+                relay_metrics(env, uav_id, backlog_bits=backlog_bits).utility
+            )
     phi_vs = float(np.mean(vs_progress)) if vs_progress else 0.0
     phi_com = float(np.mean(com_progress)) if com_progress else 0.0
-    return phi_search, phi_vs, phi_com
+    phi_relay = float(np.mean(relay_progress)) if relay_progress else 0.0
+    return phi_search, phi_vs, phi_com, phi_relay
 
 
 def decode_joint_velocity_commands(model, projected_joint_action):

@@ -43,7 +43,7 @@ from training_checkpoint import CHECKPOINT_SCHEMA_VERSION, _validate_checkpoint_
 class Uav10ConfigurationContractTest(unittest.TestCase):
     def test_dimensions_and_manifest_layout_are_authoritative(self):
         self.assertEqual(NUM_UAV, 10)
-        self.assertEqual(MOVEMENT_STATE_DIM, 429)
+        self.assertEqual(MOVEMENT_STATE_DIM, 519)
         self.assertEqual(JOINT_ACTION_DIM, 30)
         self.assertEqual(ROUTING_STATE_DIM, 101)
         self.assertEqual(RESERVED_SEARCH_UAV_IDS, (0, 9))
@@ -78,7 +78,7 @@ class Uav10ConfigurationContractTest(unittest.TestCase):
         data["schema_version"] = "uav-hrl-scenario-v2"
         with self.assertRaisesRegex(ValueError, "16-UAV.*incompatible"):
             ScenarioManifest.from_dict(data)
-        self.assertEqual(CHECKPOINT_SCHEMA_VERSION, 22)
+        self.assertEqual(CHECKPOINT_SCHEMA_VERSION, 23)
         with self.assertRaisesRegex(RuntimeError, "must be retrained"):
             _validate_checkpoint_schema({"checkpoint_schema_version": 9})
 
@@ -104,9 +104,9 @@ class StateAndAssignmentContractTest(unittest.TestCase):
 
         self.env.gts[0].is_found = True
         discovered = self.movement_state()
-        global_base = NUM_UAV * 17 + 16 * 16
+        global_base = NUM_UAV * 26 + 16 * 16
         self.assertAlmostEqual(discovered[global_base + 1], 1.0 / 8.0)
-        self.assertEqual(discovered.shape, (429,))
+        self.assertEqual(discovered.shape, (519,))
 
     def test_reserved_search_is_outside_solver_and_release_reassigns_all(self):
         gt = self.env.gts[0]

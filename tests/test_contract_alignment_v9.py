@@ -49,7 +49,7 @@ class FormalContractTest(unittest.TestCase):
         self.assertEqual(FORMAL_CHECKPOINT_EPISODE, 1500)
         self.assertEqual(FORMAL_EXPERIMENT_DEFAULTS["training_episodes_per_seed"], 1500)
         self.assertEqual(checkpoint_episode_schedule(1500, 50), list(range(50, 1501, 50)))
-        self.assertEqual(CHECKPOINT_SCHEMA_VERSION, 22)
+        self.assertEqual(CHECKPOINT_SCHEMA_VERSION, 23)
 
     def test_all_methods_publish_the_same_physical_contracts(self):
         shared_fields = (

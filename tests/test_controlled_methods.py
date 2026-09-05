@@ -133,7 +133,7 @@ class ControlledMethodRegistryTest(unittest.TestCase):
                     method_spec=spec,
                 )
                 self.assertEqual(result["movement_agent_kind"], spec.agent)
-                self.assertEqual(result["movement_state_dim"], 429)
+                self.assertEqual(result["movement_state_dim"], 519)
                 self.assertEqual(result["joint_action_dim"], 30)
                 self.assertEqual(result["proposal_batches"], 4)
                 self.assertIsNone(result["packet_outcome_artifacts"])
@@ -241,8 +241,8 @@ class ControlledMethodRegistryTest(unittest.TestCase):
 class ControlledRewardTest(unittest.TestCase):
     def setUp(self):
         self.config = formal_training_config(1)
-        self.potential_t = (0.2, 0.3, 0.4)
-        self.potential_t1 = (0.5, 0.6, 0.7)
+        self.potential_t = (0.2, 0.3, 0.4, 0.1)
+        self.potential_t1 = (0.5, 0.6, 0.7, 0.8)
 
     def test_task_potential_flag_changes_only_shaping_term(self):
         shaped = _interval_reward(
@@ -313,8 +313,8 @@ class ControlledRewardTest(unittest.TestCase):
                     energy,
                     current_lambda=999.0,
                     gamma=1.0,
-                    potentials_t=(phi_t, 0.0, 0.0),
-                    potentials_t1=(phi_t1, 0.0, 0.0),
+                    potentials_t=(phi_t, 0.0, 0.0, 0.0),
+                    potentials_t1=(phi_t1, 0.0, 0.0, 0.0),
                     done=done,
                     config=self.config,
                     reward_mode="ratio",

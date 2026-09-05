@@ -22,6 +22,7 @@ from centralized_movement import (
     MOVEMENT_STATE_DIM,
     MOVEMENT_FEATURE_SCHEMA_VERSION,
     movement_mask_from_state,
+    movement_state_feature_schema,
 )
 from experiment_config import (
     COM_SESSION_LIFECYCLE_VERSION,
@@ -42,6 +43,7 @@ from experiment_config import (
     NUM_UAV,
     PACKET_QOS_CONTRACT_VERSION,
     PERMANENT_GS_GATEWAY_UAV_ID,
+    RELAY_TASK_CONTRACT_VERSION,
     PRODUCTION_EPISODE_HORIZON_SECONDS,
     PRODUCTION_PACKET_INJECTION_CUTOFF_SECONDS,
     PRODUCTION_TASK_DEADLINE_SECONDS,
@@ -90,7 +92,8 @@ from dinkelbach_blocks import (
     dinkelbach_config_metadata,
 )
 
-CHECKPOINT_SCHEMA_VERSION = 22
+CHECKPOINT_SCHEMA_VERSION = 23
+PRE_RELAY_TASK_CHECKPOINT_SCHEMA_VERSION = 22
 PRE_GS_PROGRESS_CHECKPOINT_SCHEMA_VERSION = 21
 PRE_ROUTING_IMMEDIATE_COST_CHECKPOINT_SCHEMA_VERSION = 20
 PRE_CONTINUOUS_GATEWAY_PROJECTION_CHECKPOINT_SCHEMA_VERSION = 19
@@ -129,6 +132,8 @@ LEGACY_JOINT_REPLAY_FIELDS = (
     "phi_vs_t1",
     "phi_com_t",
     "phi_com_t1",
+    "phi_relay_t",
+    "phi_relay_t1",
 )
 PRE_MOVEMENT_MASK_JOINT_REPLAY_FIELDS = (
     *LEGACY_JOINT_REPLAY_FIELDS,
@@ -162,6 +167,7 @@ FORMAL_CORE_CONFIG_FIELDS = (
     "beta_search",
     "beta_vs",
     "beta_com",
+    "beta_relay",
     "search_coverage_threshold",
     "replay_max_size",
     "routing_warmup_transitions",
@@ -183,6 +189,11 @@ FORMAL_CORE_CONFIG_FIELDS = (
     "task_potential_enabled",
     "task_potential_contract_version",
     "task_potential_configuration",
+    "relay_task_contract_version",
+    "relay_count_rule",
+    "relay_forward_reference_seconds",
+    "relay_potential_weight",
+    "relay_assignment_mode",
     "ground_station_position_m",
     "permanent_gs_gateway_uav_id",
     "gs_gateway_soft_radius_m",
@@ -1059,7 +1070,8 @@ def _base_metadata(
         "routing_action_feature_groups": list(ROUTING_ACTION_FEATURE_GROUPS),
         "num_uav": NUM_UAV,
         "movement_feature_schema_version": MOVEMENT_FEATURE_SCHEMA_VERSION,
-        "state_contract": "10-uav-no-hidden-num-gt-v1",
+        "movement_state_feature_schema": movement_state_feature_schema(),
+        "state_contract": "10-uav-relay-task-aware-v2",
         "packet_lifecycle_contract": "sr-fifo-s2u-next-slot-routing-v1",
         "channel_contract": CHANNEL_ENVIRONMENT_CONTRACT_VERSION,
         "channel_model_version": CHANNEL_MODEL_VERSION,
@@ -1111,6 +1123,7 @@ def _base_metadata(
         ),
         "task_potential_contract_version": TASK_POTENTIAL_CONTRACT_VERSION,
         "task_potential_configuration": task_potential_contract_metadata(),
+        "relay_task_contract_version": RELAY_TASK_CONTRACT_VERSION,
         "routing_cost_attribution_contract_version": (
             ROUTING_COST_ATTRIBUTION_CONTRACT_VERSION
         ),
@@ -1440,6 +1453,8 @@ def _validate_checkpoint_schema(metadata):
             "unified inclusive 400 m S2U/U2G/U2U communication range, "
             "101-D action-wise GS-progress routing state and v7 routing reward, "
             "2.5 s FOV / 2.0 s COM QoS deadlines, "
+            "Relay assignment, 519-D Relay-aware movement state and frozen-backlog "
+            "Relay potential, "
             "named-RNG, projected-action and replay "
             "contract and must be retrained: "
             f"checkpoint={schema}, expected={CHECKPOINT_SCHEMA_VERSION}"
@@ -1481,6 +1496,7 @@ def _validate_checkpoint_schema(metadata):
                 COMMUNICATION_RANGE_CONTRACT_VERSION
             ),
             "task_potential_contract_version": TASK_POTENTIAL_CONTRACT_VERSION,
+            "relay_task_contract_version": RELAY_TASK_CONTRACT_VERSION,
             "com_session_lifecycle_version": COM_SESSION_LIFECYCLE_VERSION,
             "fov_packet_generation_contract_version": (
                 FOV_PACKET_GENERATION_CONTRACT_VERSION

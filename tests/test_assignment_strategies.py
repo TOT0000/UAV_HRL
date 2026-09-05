@@ -231,11 +231,12 @@ class AssignmentLifecycleTest(unittest.TestCase):
         self.assertEqual(self.env.assignment_invocations, before + 1)
         self.assertEqual(self.env.search_to_hover_conversions, 1)
         self.assertTrue(self.env._search_phase_over)
+        task_types = [
+            tasks[0]["task_type"] for tasks in self.env.multi_tasks.values()
+        ]
+        self.assertEqual(task_types.count("Relay"), 1)
         self.assertTrue(
-            all(
-                tasks[0]["task_type"] == "Hovering"
-                for tasks in self.env.multi_tasks.values()
-            )
+            all(task_type in {"Relay", "Hovering"} for task_type in task_types)
         )
         self.assertFalse(any(task.task_type == "Search" for task in self.env.task_list))
 

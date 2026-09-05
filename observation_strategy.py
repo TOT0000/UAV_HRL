@@ -18,6 +18,7 @@ _MOVEMENT_TASK_SUFFIXES = {
     "task_search",
     "task_fov",
     "task_com",
+    "task_relay",
     "task_hovering",
     "fov_error",
     "fov_target_x",
@@ -27,6 +28,14 @@ _MOVEMENT_TASK_SUFFIXES = {
     "com_target_y",
     "com_target_z",
     "com_capacity",
+    "relay_receive_score",
+    "relay_forward_score",
+    "relay_receive_dx",
+    "relay_receive_dy",
+    "relay_receive_dz",
+    "relay_forward_dx",
+    "relay_forward_dy",
+    "relay_forward_dz",
 }
 
 

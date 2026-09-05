@@ -246,7 +246,7 @@ class MovementBoundaryReplayTest(unittest.TestCase):
             movement_mask_from_state(records[1]["state"]),
         )
         self.assertEqual(records[0]["phi_com_t1"], records[1]["phi_com_t"])
-        com_feature = LOCAL_MOVEMENT_DIM + 16
+        com_feature = LOCAL_MOVEMENT_DIM + 17
         self.assertNotEqual(
             float(records[0]["state"][com_feature]),
             float(records[0]["next_state"][com_feature]),
@@ -558,7 +558,7 @@ class CompatibilityAndRegistryTest(unittest.TestCase):
         )
 
     def test_old_boundary_checkpoint_is_rejected_before_restore(self):
-        self.assertEqual(CHECKPOINT_SCHEMA_VERSION, 22)
+        self.assertEqual(CHECKPOINT_SCHEMA_VERSION, 23)
         with self.assertRaisesRegex(RuntimeError, "must be retrained"):
             _validate_checkpoint_schema({"checkpoint_schema_version": 12})
 

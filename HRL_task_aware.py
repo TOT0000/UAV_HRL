@@ -40,6 +40,7 @@ from centralized_movement import (
     executed_joint_action_from_displacement,
     get_global_movement_state,
     movement_mask_from_state,
+    movement_state_feature_schema,
     project_joint_action,
 )
 from com_capacity_calibration import load_com_capacity_reference
@@ -231,6 +232,7 @@ class TrainingConfig:
     beta_search: float = 1.0
     beta_vs: float = 1.0
     beta_com: float = 1.0
+    beta_relay: float = 1.0
     search_coverage_threshold: float = 0.99
     dinkelbach_initial_lambda: float = DINKELBACH_INITIAL_LAMBDA
     dinkelbach_update_interval_episodes: int = DINKELBACH_UPDATE_INTERVAL_EPISODES
@@ -1048,11 +1050,12 @@ def _interval_reward(
     task_potential_enabled=True,
     ratio_objective_reward=0.0,
 ):
-    next_values = (0.0, 0.0, 0.0) if done else potentials_t1
+    next_values = (0.0, 0.0, 0.0, 0.0) if done else potentials_t1
     shaping = float(bool(task_potential_enabled)) * (
         config.beta_search * (gamma * next_values[0] - potentials_t[0])
         + config.beta_vs * (gamma * next_values[1] - potentials_t[1])
         + config.beta_com * (gamma * next_values[2] - potentials_t[2])
+        + config.beta_relay * (gamma * next_values[3] - potentials_t[3])
     )
     if reward_mode == "dinkelbach":
         objective = float(delivered_mbits) - float(current_lambda) * float(energy)
@@ -1150,6 +1153,7 @@ def _full_training_state(
     routing_epsilon_log,
     warmup_joint_transitions,
     training_history_rows,
+    relay_episode_diagnostics=None,
     dinkelbach_active=True,
     lambda_cost_used_log=None,
     lambda_cost_after_episode_log=None,
@@ -1167,6 +1171,8 @@ def _full_training_state(
         lambda_cost_used_log = [0.0] * completed_episode_count
     if lambda_cost_after_episode_log is None:
         lambda_cost_after_episode_log = [0.0] * completed_episode_count
+    if relay_episode_diagnostics is None:
+        relay_episode_diagnostics = []
     if fov_ema_state is None:
         fov_ema_state = {
             "lifecycle_version": FOV_EMA_LIFECYCLE_VERSION,
@@ -1275,6 +1281,7 @@ def _full_training_state(
         "fov_ema_state": copy.deepcopy(fov_ema_state),
         "sr_route_state": copy.deepcopy(sr_route_state),
         "training_history_rows": list(training_history_rows),
+        "relay_episode_diagnostics": copy.deepcopy(relay_episode_diagnostics),
         "named_rng_state": copy.deepcopy(named_rng_state),
         "channel_lifecycle_state": copy.deepcopy(channel_lifecycle_state),
         "routing_transition_state": copy.deepcopy(routing_transition_state),
@@ -1357,6 +1364,7 @@ def _experiment_identity(
         "rng_contract_version": RNG_CONTRACT_VERSION,
         "rng_contract": copy.deepcopy(rng_contract_metadata),
         "movement_agent": method_spec.agent,
+        "movement_state_feature_schema": movement_state_feature_schema(),
         "movement_agent_configuration": movement_agent_configuration(
             method_spec, config
         ),
@@ -1601,6 +1609,8 @@ def _evaluation_state_snapshot(
                     "phi_vs_t1",
                     "phi_com_t",
                     "phi_com_t1",
+                    "phi_relay_t",
+                    "phi_relay_t1",
                 ),
             ),
             "routing": replay_snapshot(
@@ -2102,6 +2112,7 @@ def train(
     lambda_cost_used_log = []
     lambda_cost_after_episode_log = []
     episode_metrics = []
+    relay_episode_diagnostics = []
     trajectory_artifacts = []
     packet_outcome_artifacts = (
         [] if packet_outcome_mode == PACKET_OUTCOME_MODE_BOUNDED else None
@@ -2180,6 +2191,14 @@ def train(
         routing_slots_executed = int(training_state["global_routing_slot"])
         td3_noise_log = list(training_state["td3_noise_log"])
         routing_epsilon_log = list(training_state["routing_epsilon_log"])
+        relay_episode_diagnostics = copy.deepcopy(
+            training_state.get("relay_episode_diagnostics", [])
+        )
+        if len(relay_episode_diagnostics) != start_episode:
+            raise RuntimeError(
+                "resume checkpoint Relay diagnostic history is inconsistent "
+                "with resume episode"
+            )
         if method_spec.learns_routing:
             routing_lifecycle = RoutingLearnerLifecycle.from_state(
                 training_state.get("routing_lifecycle_state"),
@@ -2436,7 +2455,9 @@ def train(
                     method_spec.task_observation,
                     "movement",
                 )
-                potentials_t = calculate_movement_potentials(env, c_ref_com)
+                potentials_t = calculate_movement_potentials(
+                    env, c_ref_com, backlog_bits=backlog_before
+                )
                 current_movement_mask = movement_mask_from_state(physical_state)
             except ValueError as exc:
                 if "duplicate" in str(exc):
@@ -2453,7 +2474,7 @@ def train(
                     raise AssertionError(
                         "movement replay next mask differs from the next policy mask"
                     )
-                if tuple(potentials_t) != tuple(expected_next_movement_potentials):
+                if tuple(potentials_t[:3]) != tuple(expected_next_movement_potentials):
                     raise AssertionError(
                         "movement replay next potentials differ from the next transition"
                     )
@@ -2601,6 +2622,8 @@ def train(
                 env.convert_search_to_hovering(defer_assignment=True)
 
             interval_delivered_mbits = interval_delivered_bits / 1e6
+            backlog_after = _active_backlog(packet_engine)
+            env.set_assignment_backlog_snapshot(backlog_after)
             done = interval == config.episode_seconds - 1
             if not done:
                 env.prepare_next_movement_interval(interval + 1)
@@ -2625,8 +2648,9 @@ def train(
                         **copy.deepcopy(trajectory_history[-1]),
                     }
                 )
-            backlog_after = _active_backlog(packet_engine)
-            potentials_t1 = calculate_movement_potentials(env, c_ref_com)
+            potentials_t1 = calculate_movement_potentials(
+                env, c_ref_com, backlog_bits=backlog_before
+            )
             physical_next_state = get_global_movement_state(
                 env,
                 packet_engine,
@@ -2644,7 +2668,7 @@ def train(
             if not done:
                 expected_next_movement_state = next_state.copy()
                 expected_next_movement_mask = next_movement_mask.copy()
-                expected_next_movement_potentials = tuple(potentials_t1)
+                expected_next_movement_potentials = tuple(potentials_t1[:3])
             terminal_joint_transitions += int(done)
             episode_delivered_mbits += interval_delivered_mbits
             episode_energy += interval_energy
@@ -2669,6 +2693,8 @@ def train(
                     phi_vs_t1=potentials_t1[1],
                     phi_com_t=potentials_t[2],
                     phi_com_t1=potentials_t1[2],
+                    phi_relay_t=potentials_t[3],
+                    phi_relay_t1=potentials_t1[3],
                     current_movement_mask=current_movement_mask,
                     next_movement_mask=next_movement_mask,
                 )
@@ -2697,7 +2723,7 @@ def train(
             episode_reward += interval_reward
             if transition_observer is not None:
                 effective_potentials_t1 = (
-                    (0.0, 0.0, 0.0) if done else potentials_t1
+                    (0.0, 0.0, 0.0, 0.0) if done else potentials_t1
                 )
                 transition_observer(
                     {
@@ -2715,6 +2741,8 @@ def train(
                         "phi_vs_t1": effective_potentials_t1[1],
                         "phi_com_t": potentials_t[2],
                         "phi_com_t1": effective_potentials_t1[2],
+                        "phi_relay_t": potentials_t[3],
+                        "phi_relay_t1": effective_potentials_t1[3],
                         "reward_at_checkpoint_lambda": interval_reward,
                         "checkpoint_lambda": (
                             episode_lambda if method_spec.uses_dinkelbach else None
@@ -2740,6 +2768,7 @@ def train(
                     beta_search=config.beta_search,
                     beta_vs=config.beta_vs,
                     beta_com=config.beta_com,
+                    beta_relay=config.beta_relay,
                     reward_mode=method_spec.reward_mode,
                     task_potential_enabled=method_spec.task_potential_enabled,
                 )
@@ -2748,6 +2777,13 @@ def train(
             raise AssertionError("terminal routing transitions remained pending")
         packet_metrics = packet_engine.finalize_episode(
             float(config.episode_seconds)
+        )
+        relay_episode_diagnostics.append(
+            {
+                "scenario_id": scenario_id,
+                "assignment": copy.deepcopy(env.assignment_metadata()),
+                "forwarding": packet_engine.relay_forwarding_summary(),
+            }
         )
         if not evaluation and method_spec.learns_routing:
             routing_transition_ledger.finalize_causality(
@@ -3240,6 +3276,7 @@ def train(
                     },
                     warmup_joint_transitions=config.warmup_joint_transitions,
                     training_history_rows=training_history_rows,
+                    relay_episode_diagnostics=relay_episode_diagnostics,
                     dinkelbach_active=method_spec.uses_dinkelbach,
                     named_rng_state=rng_streams.state_dict(),
                     channel_lifecycle_state=env.channel_state_dict(),
@@ -3396,6 +3433,38 @@ def train(
         "search_release_time_seconds": env.search_release_time,
         "search_release_coverage": env.search_release_coverage,
         "assignment_invocations": int(env.assignment_invocations),
+        "relay_diagnostics": {
+            "forwarding_packet_semantics": "completed packet hops",
+            "traversed_relay_semantics": (
+                "bits and completed packet hops received by a UAV while assigned Relay"
+            ),
+            "episodes": relay_episode_diagnostics,
+            "relay_role_change_count": sum(
+                episode["assignment"]["relay_role_change_count"]
+                for episode in relay_episode_diagnostics
+            ),
+            "forwarding": {
+                group: {
+                    "bits": sum(
+                        episode["forwarding"][group]["bits"]
+                        for episode in relay_episode_diagnostics
+                    ),
+                    "completed_packet_hops": sum(
+                        episode["forwarding"][group]["completed_packet_hops"]
+                        for episode in relay_episode_diagnostics
+                    ),
+                    "packets": sum(
+                        episode["forwarding"][group]["packets"]
+                        for episode in relay_episode_diagnostics
+                    ),
+                }
+                for group in (
+                    "assigned_relay_forwarding",
+                    "nonassigned_uav_forwarding",
+                    "traversed_assigned_relay",
+                )
+            },
+        },
         "movement_agent_kind": movement_agent.agent_kind,
         "movement_agent_gamma": movement_agent.gamma,
         "movement_agent_configuration": movement_agent_configuration(

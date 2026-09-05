@@ -47,7 +47,7 @@ class CentralizedMovementStateTest(unittest.TestCase):
         self.env.reset_environment()
         self.packet_engine = PacketEngine(num_uav=10, step_time=0.25)
 
-    def test_state_is_429_finite_side_effect_free_and_routing_is_101(self):
+    def test_state_is_519_finite_side_effect_free_and_routing_is_101(self):
         positions_before = [uav.get_position() for uav in self.env.UAVs]
         tasks_before = {
             uid: [dict(task) for task in tasks]
@@ -66,7 +66,7 @@ class CentralizedMovementStateTest(unittest.TestCase):
 
         self.assertEqual(state.shape, (MOVEMENT_STATE_DIM,))
         self.assertTrue(np.isfinite(state).all())
-        self.assertEqual(state[428], 0.75)
+        self.assertEqual(state[-1], 0.75)
         self.assertEqual(positions_before, [uav.get_position() for uav in self.env.UAVs])
         self.assertEqual(tasks_before, self.env.multi_tasks)
         np.testing.assert_array_equal(bitmap_before, self.env.visited_bitmap)
@@ -83,7 +83,7 @@ class CentralizedMovementStateTest(unittest.TestCase):
     def test_search_potential_is_full_boolean_map_mean(self):
         self.env.visited_bitmap[:] = False
         self.env.visited_bitmap[:100, :250] = True
-        phi_search, _, _ = calculate_movement_potentials(self.env, 1.0)
+        phi_search, _, _, _ = calculate_movement_potentials(self.env, 1.0)
         self.assertAlmostEqual(phi_search, self.env.visited_bitmap.mean())
 
     def test_duplicate_fov_and_com_targets_fail_fast(self):
@@ -127,8 +127,8 @@ class CentralizedMovementStateTest(unittest.TestCase):
             1.0,
             remaining_time=0.0,
         )
-        self.assertEqual(start[428], 1.0)
-        self.assertEqual(terminal[428], 0.0)
+        self.assertEqual(start[-1], 1.0)
+        self.assertEqual(terminal[-1], 0.0)
         with self.assertRaisesRegex(ValueError, "remaining_time"):
             get_global_movement_state(
                 self.env,

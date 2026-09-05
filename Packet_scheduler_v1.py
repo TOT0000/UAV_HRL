@@ -209,6 +209,66 @@ class BlockServiceCursor:
 
 
 class PacketEngine:
+    @staticmethod
+    def _empty_relay_forwarding_diagnostics():
+        return {
+            "assigned_relay_forwarding": {
+                "bits": 0.0,
+                "packets": 0,
+                "completed_packet_hops": 0,
+            },
+            "nonassigned_uav_forwarding": {
+                "bits": 0.0,
+                "packets": 0,
+                "completed_packet_hops": 0,
+            },
+            "traversed_assigned_relay": {
+                "bits": 0.0,
+                "packets": 0,
+                "completed_packet_hops": 0,
+            },
+        }
+
+    @staticmethod
+    def _uav_has_relay_assignment(env, uav_id):
+        return any(
+            task.get("task_type") == "Relay"
+            for task in getattr(env, "multi_tasks", {}).get(int(uav_id), ())
+        )
+
+    def _record_relay_forwarding_observation(
+        self, env, sender, receiver, bits, completed_hop
+    ):
+        sender_group = (
+            "assigned_relay_forwarding"
+            if self._uav_has_relay_assignment(env, sender)
+            else "nonassigned_uav_forwarding"
+        )
+        self.relay_forwarding_diagnostics[sender_group]["bits"] += float(bits)
+        self.relay_forwarding_diagnostics[sender_group][
+            "completed_packet_hops"
+        ] += int(bool(completed_hop))
+        self.relay_forwarding_diagnostics[sender_group]["packets"] += int(
+            bool(completed_hop)
+        )
+        if int(receiver) != int(env.GS_ID) and self._uav_has_relay_assignment(
+            env, receiver
+        ):
+            group = self.relay_forwarding_diagnostics["traversed_assigned_relay"]
+            group["bits"] += float(bits)
+            group["completed_packet_hops"] += int(bool(completed_hop))
+            group["packets"] += int(bool(completed_hop))
+
+    def relay_forwarding_summary(self):
+        return {
+            group: {
+                "bits": float(values["bits"]),
+                "packets": int(values["packets"]),
+                "completed_packet_hops": int(values["completed_packet_hops"]),
+            }
+            for group, values in self.relay_forwarding_diagnostics.items()
+        }
+
     def __init__(
         self,
         num_uav,
@@ -275,6 +335,7 @@ class PacketEngine:
         self.buffer_info = {}
         self.actual_backlog = {}
         self.forwarding_rate = {}
+        self.relay_forwarding_diagnostics = self._empty_relay_forwarding_diagnostics()
         self.total_delivered = 0
         self.total_violated = 0
         self.fov_delivered= 0
@@ -1975,6 +2036,9 @@ class PacketEngine:
                 completed_hop = self.record_hop_transmission(
                     pkt, sender, receiver, bits_used
                 )
+                self._record_relay_forwarding_observation(
+                    env, sender, receiver, bits_used, completed_hop
+                )
                 transmitted_on_link += bits_used
                 if receiver == env.GS_ID:
                     pkt["final_hop_accum_bits"] = float(
@@ -2986,6 +3050,7 @@ class PacketEngine:
         self.buffer_info = {}
         self.actual_backlog = {}
         self.forwarding_rate = {}
+        self.relay_forwarding_diagnostics = self._empty_relay_forwarding_diagnostics()
         self.total_delivered = 0
         self.total_violated = 0
         self.fov_delivered= 0

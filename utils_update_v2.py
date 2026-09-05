@@ -197,6 +197,8 @@ class ReplayBufferJoint:
         self.phi_vs_t1 = np.zeros((self.max_size, 1), dtype=np.float32)
         self.phi_com_t = np.zeros((self.max_size, 1), dtype=np.float32)
         self.phi_com_t1 = np.zeros((self.max_size, 1), dtype=np.float32)
+        self.phi_relay_t = np.zeros((self.max_size, 1), dtype=np.float32)
+        self.phi_relay_t1 = np.zeros((self.max_size, 1), dtype=np.float32)
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     @torch.no_grad()
@@ -214,6 +216,8 @@ class ReplayBufferJoint:
         phi_vs_t1,
         phi_com_t,
         phi_com_t1,
+        phi_relay_t=0.0,
+        phi_relay_t1=0.0,
         ratio_objective_reward=0.0,
         current_movement_mask=None,
         next_movement_mask=None,
@@ -256,6 +260,8 @@ class ReplayBufferJoint:
         self.phi_vs_t1[index, 0] = float(phi_vs_t1)
         self.phi_com_t[index, 0] = float(phi_com_t)
         self.phi_com_t1[index, 0] = float(phi_com_t1)
+        self.phi_relay_t[index, 0] = float(phi_relay_t)
+        self.phi_relay_t1[index, 0] = float(phi_relay_t1)
         self.ptr = (self.ptr + 1) % self.max_size
         self.size = min(self.size + 1, self.max_size)
         self.total_added += 1
@@ -287,6 +293,7 @@ class ReplayBufferJoint:
         beta_search=1.0,
         beta_vs=1.0,
         beta_com=1.0,
+        beta_relay=1.0,
         reward_mode="dinkelbach",
         task_potential_enabled=True,
     ):
@@ -308,6 +315,8 @@ class ReplayBufferJoint:
             * (float(gamma) * not_done * self.phi_vs_t1[indices] - self.phi_vs_t[indices])
             + float(beta_com)
             * (float(gamma) * not_done * self.phi_com_t1[indices] - self.phi_com_t[indices])
+            + float(beta_relay)
+            * (float(gamma) * not_done * self.phi_relay_t1[indices] - self.phi_relay_t[indices])
         )
         return reward.astype(np.float32, copy=False)
 
@@ -319,6 +328,7 @@ class ReplayBufferJoint:
         beta_search=1.0,
         beta_vs=1.0,
         beta_com=1.0,
+        beta_relay=1.0,
         reward_mode="dinkelbach",
         task_potential_enabled=True,
         include_movement_masks=False,
@@ -333,6 +343,7 @@ class ReplayBufferJoint:
             beta_search=beta_search,
             beta_vs=beta_vs,
             beta_com=beta_com,
+            beta_relay=beta_relay,
             reward_mode=reward_mode,
             task_potential_enabled=task_potential_enabled,
         )

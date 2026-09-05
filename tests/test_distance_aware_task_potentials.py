@@ -158,7 +158,7 @@ class DistanceAwarePotentialLifecycleTest(unittest.TestCase):
             "centralized_movement.fov_task_metrics",
             return_value=(0.9, 0.8, False),
         ):
-            _, phi_vs, _ = calculate_movement_potentials(self.env, 1.0)
+            _, phi_vs, _, _ = calculate_movement_potentials(self.env, 1.0)
         self.assertEqual(phi_vs, 0.0)
         self.assertTrue(math.isfinite(phi_vs))
         self.assertTrue(0.0 <= phi_vs <= 1.0)
@@ -215,7 +215,7 @@ class DistanceAwarePotentialLifecycleTest(unittest.TestCase):
             self.env.env_width,
             self.env.env_height,
         )
-        _, _, phi_com = calculate_movement_potentials(self.env, 1.0)
+        _, _, phi_com, _ = calculate_movement_potentials(self.env, 1.0)
 
         self.assertGreater(capacity, 0.0)
         self.assertAlmostEqual(
@@ -250,7 +250,7 @@ class DistanceAwarePotentialLifecycleTest(unittest.TestCase):
         self.env.visited_bitmap[:] = False
         self.assertEqual(
             calculate_movement_potentials(self.env, 1.0),
-            (0.0, 0.0, 0.0),
+            (0.0, 0.0, 0.0, 0.0),
         )
 
         self.env.multi_tasks[0] = [self._fov_task(0)]
@@ -261,7 +261,7 @@ class DistanceAwarePotentialLifecycleTest(unittest.TestCase):
             "centralized_movement.fov_task_metrics",
             return_value=(0.0, 0.0, True),
         ):
-            _, phi_vs, _ = calculate_movement_potentials(self.env, 1.0)
+            _, phi_vs, _, _ = calculate_movement_potentials(self.env, 1.0)
         self.assertEqual(phi_vs, 0.0)
 
     def test_search_potential_remains_global_coverage_mean(self):
@@ -270,7 +270,7 @@ class DistanceAwarePotentialLifecycleTest(unittest.TestCase):
         expected = float(self.env.visited_bitmap.mean())
         self.env.multi_tasks[0] = [self._fov_task()]
         self.env.multi_tasks[1] = [self._com_task()]
-        phi_search, _, _ = calculate_movement_potentials(self.env, 1.0)
+        phi_search, _, _, _ = calculate_movement_potentials(self.env, 1.0)
         self.assertEqual(phi_search, expected)
 
     def test_multiple_com_tasks_use_arithmetic_mean(self):
@@ -283,7 +283,7 @@ class DistanceAwarePotentialLifecycleTest(unittest.TestCase):
             "get_sr_uav_normalized_utility",
             return_value=0.25,
         ):
-            _, _, phi_com = calculate_movement_potentials(self.env, 1.0)
+            _, _, phi_com, _ = calculate_movement_potentials(self.env, 1.0)
         per_task = [
             blended_com_progress(
                 0.25,
@@ -299,8 +299,8 @@ class DistanceAwarePotentialLifecycleTest(unittest.TestCase):
         self.assertAlmostEqual(phi_com, float(np.mean(per_task)))
 
     def test_no_task_potential_disables_all_new_shaping(self):
-        current = (0.2, 0.3, 0.4)
-        following = (0.4, 0.7, 0.8)
+        current = (0.2, 0.3, 0.4, 0.1)
+        following = (0.4, 0.7, 0.8, 0.5)
         self.assertGreater(self._shaping(current, following, enabled=True), 0.0)
         self.assertEqual(self._shaping(current, following, enabled=False), 0.0)
 
@@ -323,7 +323,7 @@ class TaskPotentialMethodContractTest(unittest.TestCase):
                 if shared is None:
                     shared = config["task_potential_configuration"]
                 self.assertEqual(config["task_potential_configuration"], shared)
-        self.assertEqual(MOVEMENT_STATE_DIM, 429)
+        self.assertEqual(MOVEMENT_STATE_DIM, 519)
         self.assertEqual(JOINT_ACTION_DIM, 30)
         self.assertEqual(ROUTING_STATE_DIM, 101)
         self.assertEqual(SCENARIO_SCHEMA_VERSION, "uav-hrl-scenario-v7")

@@ -504,6 +504,8 @@ class SimpleRunnerLifecycleIntegrationTest(unittest.TestCase):
                     - replay["phi_vs_t"][:, 0]
                     + not_done * replay["phi_com_t1"][:, 0]
                     - replay["phi_com_t"][:, 0]
+                    + not_done * replay["phi_relay_t1"][:, 0]
+                    - replay["phi_relay_t"][:, 0]
                 )
             np.testing.assert_array_equal(not_done, [1.0, 0.0] * 3)
             np.testing.assert_array_equal(objectives[::2], np.zeros(3))

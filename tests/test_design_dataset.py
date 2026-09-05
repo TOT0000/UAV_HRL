@@ -45,8 +45,8 @@ class DesignSchemaTest(unittest.TestCase):
         continuous = set(state["continuous_indices"])
         discrete = set(state["discrete_indices"])
         self.assertFalse(continuous.intersection(discrete))
-        self.assertEqual(continuous | discrete, set(range(429)))
-        self.assertEqual([item["index"] for item in state["features"]], list(range(429)))
+        self.assertEqual(continuous | discrete, set(range(519)))
+        self.assertEqual([item["index"] for item in state["features"]], list(range(519)))
         self.assertEqual(len(action["features"]), 30)
         self.assertEqual(
             {item["index"] for item in action["features"]}, set(range(30))
@@ -81,7 +81,7 @@ class DesignDatasetIntegrationTest(unittest.TestCase):
             episode=1499,
             td3=td3,
             ddqn=ddqn,
-            movement_state_dim=429,
+            movement_state_dim=519,
             joint_action_dim=30,
             routing_state_dim=101,
             calibration=calibration,
@@ -184,9 +184,9 @@ class DesignDatasetIntegrationTest(unittest.TestCase):
     def test_two_episodes_produce_120_ordered_joint_transitions(self):
         arrays = self.arrays_one
         self.assertEqual(set(arrays), set(ARRAY_NAMES))
-        self.assertEqual(arrays["state"].shape, (120, 429))
+        self.assertEqual(arrays["state"].shape, (120, 519))
         self.assertEqual(arrays["projected_joint_action"].shape, (120, 30))
-        self.assertEqual(arrays["next_state"].shape, (120, 429))
+        self.assertEqual(arrays["next_state"].shape, (120, 519))
         self.assertEqual(int(arrays["done"].sum()), 2)
         self.assertEqual(self.metadata_one["centralized_actor_calls"], 120)
         np.testing.assert_array_equal(arrays["global_transition_index"], np.arange(120))
@@ -203,6 +203,7 @@ class DesignDatasetIntegrationTest(unittest.TestCase):
             beta_search=self.formal_config["beta_search"],
             beta_vs=self.formal_config["beta_vs"],
             beta_com=self.formal_config["beta_com"],
+            beta_relay=self.formal_config["beta_relay"],
         )
         np.testing.assert_allclose(
             reward,
@@ -214,6 +215,7 @@ class DesignDatasetIntegrationTest(unittest.TestCase):
             self.assertEqual(self.arrays_one["phi_search_t1"][terminal], 0.0)
             self.assertEqual(self.arrays_one["phi_vs_t1"][terminal], 0.0)
             self.assertEqual(self.arrays_one["phi_com_t1"][terminal], 0.0)
+            self.assertEqual(self.arrays_one["phi_relay_t1"][terminal], 0.0)
 
     def test_repeated_collection_is_bitwise_deterministic(self):
         for name in ARRAY_NAMES:
