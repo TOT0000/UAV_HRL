@@ -2411,12 +2411,14 @@ def save_full_resume_checkpoint(
 
 
 def _floating_counter_tolerance(
-    *values, absolute_floor, maximum_tolerance=0.5
+    *values, absolute_floor, ulp_multiplier=32.0, maximum_tolerance=0.5
 ):
     """Return a strict, scale-aware allowance for accumulated float counters."""
 
     scale = max((abs(float(value)) for value in values), default=0.0)
-    ulp_tolerance = 32.0 * math.ulp(scale if scale > 0.0 else 1.0)
+    ulp_tolerance = float(ulp_multiplier) * math.ulp(
+        scale if scale > 0.0 else 1.0
+    )
     return min(
         float(maximum_tolerance),
         max(float(absolute_floor), ulp_tolerance),
@@ -2424,7 +2426,11 @@ def _floating_counter_tolerance(
 
 
 def _bit_counter_tolerance(*values):
-    return _floating_counter_tolerance(*values, absolute_floor=1e-9)
+    return _floating_counter_tolerance(
+        *values,
+        absolute_floor=1e-9,
+        ulp_multiplier=128.0,
+    )
 
 
 def _coverage_counter_tolerance(*values):

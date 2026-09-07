@@ -49,6 +49,7 @@ from training_checkpoint import (
     load_full_resume_checkpoint,
     load_model_checkpoint,
     inspect_full_resume_checkpoint,
+    _bit_counter_tolerance,
     _validate_full_resume_logging_state,
     save_full_resume_checkpoint,
     save_model_checkpoint,
@@ -137,7 +138,7 @@ def _lifecycle_training_state(
     }
 
 
-def _interleaved_useful_goodput_training_state():
+def _interleaved_useful_goodput_training_state(event_count=100_000):
     state = {
         "full_resume_logging_schema_version": FULL_RESUME_LOGGING_SCHEMA_VERSION,
         "reward_log": [0.0],
@@ -155,7 +156,7 @@ def _interleaved_useful_goodput_training_state():
     total_useful = 0.0
     fov_count = 0
     com_count = 0
-    for event_index in range(100_000):
+    for event_index in range(int(event_count)):
         if event_index % 3:
             useful_bits = 250_000.0 + (event_index % 17) * 0.125
             com_delivered += useful_bits
@@ -336,6 +337,71 @@ class FullResumeCheckpointTest(unittest.TestCase):
         )
         self.assertGreater(packet_state["total_timely_useful_bits"], 1e10)
         self.assertGreater(difference, 1e-9)
+
+        _validate_full_resume_logging_state(
+            state,
+            completed_episode=1,
+            routing_agent_kind="safe_ddqn",
+            checkpoint_schema_version=CHECKPOINT_SCHEMA_VERSION,
+        )
+
+    def test_formal_episode_1400_class_sum_roundoff_is_accepted_unchanged(self):
+        state = _interleaved_useful_goodput_training_state()
+        packet_state = state["packet_engine_state"]
+        packet_state.update(
+            {
+                "fov_timely_useful_bits": 3567175.7469552914,
+                "com_timely_delivered_bits": 3295744.0,
+                "total_timely_useful_bits": 6862919.746955337,
+                "timely_goodput_bits": 6862919.746955337,
+            }
+        )
+        before = copy.deepcopy(packet_state)
+        expected_sum = (
+            packet_state["fov_timely_useful_bits"]
+            + packet_state["com_timely_delivered_bits"]
+        )
+        difference = abs(
+            expected_sum - packet_state["total_timely_useful_bits"]
+        )
+        scale = max(expected_sum, packet_state["total_timely_useful_bits"])
+
+        self.assertEqual(difference, 4.563480615615845e-08)
+        self.assertEqual(32.0 * math.ulp(scale), 2.9802322387695312e-08)
+        self.assertGreater(difference, 32.0 * math.ulp(scale))
+        self.assertLessEqual(
+            difference,
+            _bit_counter_tolerance(
+                expected_sum,
+                packet_state["total_timely_useful_bits"],
+            ),
+        )
+
+        _validate_full_resume_logging_state(
+            state,
+            completed_episode=1,
+            routing_agent_kind="safe_ddqn",
+            checkpoint_schema_version=CHECKPOINT_SCHEMA_VERSION,
+        )
+        self.assertEqual(packet_state, before)
+
+    def test_long_interleaved_class_sum_accepts_ninety_one_ulp_roundoff(self):
+        state = _interleaved_useful_goodput_training_state(500_000)
+        packet_state = state["packet_engine_state"]
+        expected_sum = (
+            packet_state["fov_timely_useful_bits"]
+            + packet_state["com_timely_delivered_bits"]
+        )
+        total = packet_state["total_timely_useful_bits"]
+        difference = abs(expected_sum - total)
+        ulp = math.ulp(max(abs(expected_sum), abs(total), 1.0))
+
+        self.assertEqual(difference / ulp, 91.0)
+        self.assertGreater(difference, 32.0 * ulp)
+        self.assertLessEqual(
+            difference,
+            _bit_counter_tolerance(expected_sum, total),
+        )
 
         _validate_full_resume_logging_state(
             state,
