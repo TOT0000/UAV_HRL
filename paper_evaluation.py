@@ -27,6 +27,7 @@ from experiment_config import (
     PRODUCTION_TASK_DEADLINE_SECONDS,
     comparison_method_configuration,
 )
+from visual_sensing import VISUAL_SENSING_CONTRACT_VERSION, visual_sensing_metadata
 from HRL_task_aware import TrainingConfig, train
 from Packet_scheduler_v1 import TASK_DEADLINE_SECONDS
 from packet_outcome_artifacts import (
@@ -531,6 +532,8 @@ def run_paper_evaluation(
             ),
             "git_sha": git_sha,
             "training_history_only": True,
+            "visual_sensing_contract_version": VISUAL_SENSING_CONTRACT_VERSION,
+            "visual_sensing_configuration": visual_sensing_metadata(),
             "new_training_started": False,
             "collect_packet_outcomes": False,
             "packet_outcome_artifact_mode": PACKET_OUTCOME_MODE_DISABLED,
@@ -898,6 +901,8 @@ def run_paper_evaluation(
         },
         "target_uav_id": int(target_uav_id) if target_uav_id is not None else None,
         "git_sha": git_sha,
+        "visual_sensing_contract_version": VISUAL_SENSING_CONTRACT_VERSION,
+        "visual_sensing_configuration": visual_sensing_metadata(),
         "new_training_started": False,
         "aggregation": {
             "delay": "sum delivered E2E delay / sum delivered packets",

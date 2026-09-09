@@ -1,3 +1,4 @@
+from visual_sensing import VISUAL_SENSING_CONTRACT_VERSION, visual_sensing_metadata
 from dataclasses import asdict
 import json
 import tempfile
@@ -94,6 +95,8 @@ class ExperimentPreflightTest(unittest.TestCase):
             dinkelbach_state.record_episode(1.0, 2.0)
         metadata = {
             "checkpoint_schema_version": CHECKPOINT_SCHEMA_VERSION,
+            "visual_sensing_contract_version": VISUAL_SENSING_CONTRACT_VERSION,
+            "visual_sensing_configuration": visual_sensing_metadata(),
             "checkpoint_type": MODEL_CHECKPOINT_TYPE,
             "episode": 1499,
             "movement_state_dim": 675,
@@ -391,6 +394,8 @@ class ExperimentPreflightTest(unittest.TestCase):
             metadata_state.record_episode(0.0, 1.0)
             metadata = {
                 "checkpoint_schema_version": CHECKPOINT_SCHEMA_VERSION,
+                "visual_sensing_contract_version": VISUAL_SENSING_CONTRACT_VERSION,
+                "visual_sensing_configuration": visual_sensing_metadata(),
                 "checkpoint_type": FULL_CHECKPOINT_TYPE,
                 "episode": 0,
                 "movement_state_dim": 675,

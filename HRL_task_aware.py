@@ -12,7 +12,7 @@ import numpy as np
 import pandas as pd
 import torch
 
-from Fov_model_phase import FovModel
+from visual_sensing import VISUAL_SENSING_CONTRACT_VERSION, visual_sensing_metadata, vs_geometry
 from dinkelbach_blocks import (
     DINKELBACH_DENOMINATOR_UNIT,
     DINKELBACH_INITIAL_LAMBDA,
@@ -489,14 +489,12 @@ def _uav_task_phase(env, uav_id):
     return "Hover"
 
 
-def _sensing_footprint(env, uav_id):
+def _search_footprint_metadata(env, uav_id):
     """Return the exact rectangular footprint used by search coverage."""
 
     uav = env.uav_dict[int(uav_id)]
-    model = FovModel(
-        f=0.004, wl=0.008, i_l=0.012, z_u=uav.z_u, gamma_g=80
-    )
-    width, height = model.get_ground_fov_size(uav.z_u)
+    footprint = env.search_footprint(uav_id)
+    width, height = footprint.width, footprint.height
     x_min = max(0.0, float(uav.x_u) - float(width) / 2.0)
     x_max = min(float(env.env_width), float(uav.x_u) + float(width) / 2.0)
     y_min = max(0.0, float(uav.y_u) - float(height) / 2.0)
@@ -515,8 +513,35 @@ def _sensing_footprint(env, uav_id):
             "y_min": y_min,
             "y_max": y_max,
         },
-        "model": {"f_m": 0.004, "image_width_m": 0.008, "image_length_m": 0.012},
+        "model": visual_sensing_metadata()["camera"],
     }
+
+
+def _sensing_coverage(env, uav_id):
+    """Export the active camera pose, including the actual rotated VS polygon."""
+    if uav_id is None:
+        return []
+    if env.is_search_contributor(uav_id):
+        return [_search_footprint_metadata(env, uav_id)]
+    records = []
+    for task in env.multi_tasks.get(uav_id, ()):
+        if task.get("task_type") != "FOV":
+            continue
+        target = env.gts[int(task["target_obj_id"])]
+        geometry = vs_geometry(env.uav_dict[uav_id].get_position(),
+                               target.get_position(), target.radius)
+        records.append({
+            "uav_id": int(uav_id), "target_obj_id": int(target.id),
+            "geometry": "oblique_ground_polygon", "ground_z": float(target.z),
+            "polygon": [list(point) for point in geometry.polygon],
+            "footprint_area_m2": geometry.footprint_area,
+            "image_quantity": geometry.image_quantity,
+            "coverage_ratio": geometry.coverage_ratio,
+            "sensing_valid_now": geometry.sensing_valid_now,
+            "diagnostics": geometry.diagnostics,
+            "model": visual_sensing_metadata()["camera"],
+        })
+    return records
 
 
 def _trajectory_state(
@@ -581,11 +606,7 @@ def _trajectory_state(
         },
         "active_links": copy.deepcopy(list(active_links or [])),
         "assignment_metadata": copy.deepcopy(env.assignment_metadata()),
-        "sensing_coverage": (
-            [_sensing_footprint(env, target_uav_id)]
-            if target_uav_id is not None
-            else []
-        ),
+        "sensing_coverage": _sensing_coverage(env, target_uav_id),
     }
 
 
@@ -975,18 +996,19 @@ def _mark_search_observations(env):
     if not search_uav_ids:
         return ()
     visited_precommit = env.visited_bitmap.copy()
-    # Discovery/geometry is evaluated first and does not mutate coverage.
+    footprints = {uid: env.search_footprint(uid) for uid in search_uav_ids}
+    # One frozen continuous footprint drives discovery and bitmap sampling.
     for uav_id in search_uav_ids:
-        env.update_visited_grid(uav_id)
+        env.update_visited_grid(uav_id, footprint=footprints[uav_id])
     search_uav_ids = frozenset(search_uav_ids)
-    # Observation participation is intentionally broader than coverage
-    # contribution: every UAV freezes its raw FOV sample from the same V_pre.
+    # Non-Search participants carry an empty sample, never a camera footprint.
     transitions = tuple(
         env.mark_search_coverage(
             uav_id,
             visited_snapshot=visited_precommit,
             commit=False,
             coverage_contributor=uav_id in search_uav_ids,
+            footprint=footprints.get(uav_id),
         )
         for uav_id in range(env.num_UAV)
     )
@@ -3615,6 +3637,8 @@ def train(
             for artifact in trajectory_artifacts
         ],
         "run_metadata": {
+            "visual_sensing_contract_version": VISUAL_SENSING_CONTRACT_VERSION,
+            "visual_sensing_configuration": visual_sensing_metadata(),
             **experiment_identity,
             **checkpoint_provenance,
             "resume_checkpoint_compatibility": resume_checkpoint_compatibility,

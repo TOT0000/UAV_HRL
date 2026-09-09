@@ -82,7 +82,7 @@ class UAV:
         dz_m = float(np.clip(float(dz) * step_time, -dz_cap, dz_cap))
 
         fov_model = FovModel(
-            f=0.004, wl=0.008, i_l=0.012, z_u=self.z_u, gamma_g=80
+            z_u=self.z_u, gamma_g=80
         )
         fov_w, _ = fov_model.get_ground_fov_size(self.z_u)
         horizontal_cap = min(max_step_ratio * fov_w, v_max_phys * step_time)
@@ -177,7 +177,7 @@ class UAV:
         dy_m = dy * step_time
         dz_m = dz * step_time
         # 2) 依當前高度計 FOV 寬，設定上下限
-        self.FovModel = FovModel(f=0.004, wl=0.008, i_l=0.012, z_u=self.z_u, gamma_g=80)
+        self.FovModel = FovModel(z_u=self.z_u, gamma_g=80)
         fov_w, _ = self.FovModel.get_ground_fov_size(self.z_u)
         min_step = min_step_ratio * fov_w
         phys_cap = float(v_max_phys) * float(step_time)

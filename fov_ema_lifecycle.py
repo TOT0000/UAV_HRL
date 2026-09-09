@@ -84,6 +84,8 @@ def _ema_values(value, *, num_uav):
 
 
 def _footprint(value, *, uav_id):
+    if value is None:
+        return None  # Non-Search UAVs have no camera footprint in this lifecycle.
     if not isinstance(value, (list, tuple)) or len(value) != 4:
         _fail(f"has invalid previous-footprint length for UAV {uav_id}")
     indices = []

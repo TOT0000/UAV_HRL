@@ -1,3 +1,4 @@
+from visual_sensing import VISUAL_SENSING_CONTRACT_VERSION, visual_sensing_metadata
 from copy import deepcopy
 import unittest
 
@@ -64,6 +65,8 @@ class CheckpointEvaluationProvenanceTest(unittest.TestCase):
         }
         metadata = {
             "checkpoint_schema_version": CHECKPOINT_SCHEMA_VERSION,
+            "visual_sensing_contract_version": VISUAL_SENSING_CONTRACT_VERSION,
+            "visual_sensing_configuration": visual_sensing_metadata(),
             "checkpoint_type": MODEL_CHECKPOINT_TYPE,
             "episode": 1499,
             "movement_state_dim": 675,

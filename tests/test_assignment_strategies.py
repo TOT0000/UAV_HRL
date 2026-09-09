@@ -38,8 +38,9 @@ class AssignmentUtilityTest(unittest.TestCase):
         assigner = UAVAssigner(self.env)
         with (
             mock.patch(
-                "Task_assignment.assignment_fov_pair_metrics",
-                side_effect=[(0.25, 1.0, True), (1.0, 1.0, True)],
+                "Task_assignment.assignment_fov_pair_geometry",
+                side_effect=[SimpleNamespace(coverage_ratio=0.25, image_quantity=1.0, pair_score=0.4),
+                             SimpleNamespace(coverage_ratio=1.0, image_quantity=1.0, pair_score=1.0)],
             ),
             mock.patch.object(
                 self.env,
@@ -53,7 +54,7 @@ class AssignmentUtilityTest(unittest.TestCase):
         np.testing.assert_allclose(problem.utility_matrix[:, 0], [0.0, 1.0])
         np.testing.assert_allclose(problem.utility_matrix[:, 1], [0.5, 1.0])
         self.assertTrue(problem.feasible_mask.all())
-        np.testing.assert_allclose(problem.raw_fov_utility[:, 0], [0.25, 1.0])
+        np.testing.assert_allclose(problem.raw_fov_utility[:, 0], [0.4, 1.0])
         np.testing.assert_allclose(problem.raw_fov_coverage[:, 0], [0.25, 1.0])
         np.testing.assert_allclose(problem.raw_fov_image_quality[:, 0], [1.0, 1.0])
         self.assertTrue(np.isfinite(problem.utility_matrix).all())
@@ -80,11 +81,11 @@ class AssignmentUtilityTest(unittest.TestCase):
         gt.is_found = True
         task = Task(0, "FOV", gt, gt.id)
         with mock.patch(
-            "Task_assignment.assignment_fov_pair_metrics",
-            return_value=(0.4, 2.0, True),
+            "Task_assignment.assignment_fov_pair_geometry",
+            return_value=SimpleNamespace(coverage_ratio=0.4, image_quantity=2.0, pair_score=0.52),
         ):
             problem = UAVAssigner(self.env).build_problem([0], [task])
-        self.assertAlmostEqual(problem.raw_fov_utility[0, 0], 0.4)
+        self.assertAlmostEqual(problem.raw_fov_utility[0, 0], 0.52)
         self.assertTrue(problem.feasible_mask[0, 0])
         self.assertAlmostEqual(problem.utility_matrix[0, 0], 0.5)
 
@@ -267,7 +268,7 @@ class AssignmentLifecycleTest(unittest.TestCase):
         )
         random.seed(1234)
         with mock.patch(
-            "Task_assignment.assignment_fov_pair_metrics",
+            "Task_assignment.assignment_fov_pair_geometry",
             side_effect=AssertionError("random assignment must not score utilities"),
         ):
             self.env.assign_tasks()

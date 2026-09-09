@@ -161,7 +161,7 @@ class AllParticipantFovSnapshotContractTest(unittest.TestCase):
         env.uav_dict[1].x_u, env.uav_dict[1].y_u = 900.0, 900.0
         return env
 
-    def test_non_search_observes_precommit_without_contributing_coverage(self):
+    def test_non_search_has_no_footprint_or_search_observation(self):
         env = self._environment()
         transitions = _mark_search_observations(env)
         by_uav = {transition.uav_id: transition for transition in transitions}
@@ -172,9 +172,8 @@ class AllParticipantFovSnapshotContractTest(unittest.TestCase):
         self.assertTrue(search.coverage_contributor)
         self.assertFalse(non_search.coverage_contributor)
         self.assertEqual(search.raw_unvisited, 1.0)
-        self.assertEqual(non_search.raw_unvisited, 1.0)
-        bx0, bx1, by0, by1 = non_search.current_footprint
-        self.assertFalse(env.visited_bitmap[bx0 : bx1 + 1, by0 : by1 + 1].any())
+        self.assertEqual(non_search.raw_unvisited, 0.0)
+        self.assertIsNone(non_search.current_footprint)
 
         first = PacketEngine(num_uav=16)
         second = PacketEngine(num_uav=16)
@@ -185,7 +184,7 @@ class AllParticipantFovSnapshotContractTest(unittest.TestCase):
         self.assertEqual(first.fov_ema_state(), second.fov_ema_state())
         self.assertEqual(first.fov_ema_update_count, 1)
         self.assertEqual(len(first.fov_ema), env.num_UAV)
-        self.assertAlmostEqual(first.fov_ema[1]["unvisited"], 0.3)
+        self.assertAlmostEqual(first.fov_ema[1]["unvisited"], 0.0)
 
         env.update_u2u_channels()
         env.update_u2g_channels()
@@ -196,7 +195,7 @@ class AllParticipantFovSnapshotContractTest(unittest.TestCase):
             action_mask=env.get_routing_action_mask(1),
         )
         index = routing_state_feature_names().index("coverage_unvisited_ema")
-        self.assertAlmostEqual(float(state[index]), 0.3)
+        self.assertAlmostEqual(float(state[index]), 0.0)
 
     def test_missing_participant_batch_is_rejected_after_commit(self):
         env = self._environment()

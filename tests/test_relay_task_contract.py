@@ -374,7 +374,14 @@ class RelayRoutingCheckpointDiagnosticsTest(unittest.TestCase):
         manifest = generate_manifest(
             "train", 20260817, 1, num_gt=8
         )
-        with mock.patch.object(ReplayBufferJoint, "add", new=capture_add):
+        # Exercise Relay boundary timing independently of whether this short
+        # manifest happens to place two ROI centers in narrow Search footprints.
+        # Discovery fires at the first real Search boundary; sensing/packets and
+        # assignment still use the production canonical geometry.
+        with (
+            mock.patch.object(ReplayBufferJoint, "add", new=capture_add),
+            mock.patch.object(Simulator, "is_visible", return_value=True),
+        ):
             result = train(
                 config,
                 scenario_manifest=manifest,
@@ -434,7 +441,7 @@ class RelayRoutingCheckpointDiagnosticsTest(unittest.TestCase):
         self.assertAlmostEqual(relay_shaping_sum, 0.0, places=12)
 
     def test_old_checkpoint_fails_before_loading(self):
-        self.assertEqual(CHECKPOINT_SCHEMA_VERSION, 25)
+        self.assertEqual(CHECKPOINT_SCHEMA_VERSION, 26)
         with self.assertRaisesRegex(RuntimeError, "Relay.*retrained"):
             _validate_checkpoint_schema({"checkpoint_schema_version": 23})
 

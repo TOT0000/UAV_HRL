@@ -1,3 +1,4 @@
+from visual_sensing import VISUAL_SENSING_CONTRACT_VERSION, visual_sensing_metadata
 from copy import deepcopy
 from dataclasses import asdict
 import csv
@@ -217,6 +218,8 @@ class SyntheticFigureBuildTest(unittest.TestCase):
             )
         metadata = {
             "checkpoint_schema_version": CHECKPOINT_SCHEMA_VERSION,
+            "visual_sensing_contract_version": VISUAL_SENSING_CONTRACT_VERSION,
+            "visual_sensing_configuration": visual_sensing_metadata(),
             "checkpoint_type": MODEL_CHECKPOINT_TYPE,
             "episode": 1499,
             "movement_agent_kind": method.agent,
@@ -440,7 +443,7 @@ class SyntheticFigureBuildTest(unittest.TestCase):
                     {"sender_id": 0, "receiver_id": 1, "link_type": "U2U", "bandwidth_hz": 5e6, "capacity_bits_per_second": 1e6},
                     {"sender_id": 0, "receiver_id": 2, "link_type": "S2U", "bandwidth_hz": 5e6, "capacity_bits_per_second": 0.5e6},
                 ],
-                "sensing_coverage": [{"uav_id": 0, "geometry": "axis_aligned_ground_rectangle", "center_x": 100 + time, "center_y": 100, "ground_z": 0, "width_m": 200, "height_m": 200, "clipped_bounds": {"x_min": 0, "x_max": 200 + time, "y_min": 0, "y_max": 200}, "model": {"f_m": 0.004, "image_width_m": 0.008, "image_length_m": 0.012}}],
+                "sensing_coverage": [{"uav_id": 0, "geometry": "axis_aligned_ground_rectangle", "center_x": 100 + time, "center_y": 100, "ground_z": 0, "width_m": 200, "height_m": 200, "clipped_bounds": {"x_min": 0, "x_max": 200 + time, "y_min": 0, "y_max": 200}, "model": visual_sensing_metadata()["camera"]}],
             })
         return {
             "scenario_id": manifest.episodes[0]["scenario_id"],

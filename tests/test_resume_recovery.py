@@ -1,3 +1,4 @@
+from visual_sensing import VISUAL_SENSING_CONTRACT_VERSION, visual_sensing_metadata
 from functools import partial
 import json
 import tempfile
@@ -119,6 +120,8 @@ class ResumeRecoveryTest(unittest.TestCase):
     def _metadata(self, checkpoint_type, completed_episode):
         metadata = {
             "checkpoint_schema_version": CHECKPOINT_SCHEMA_VERSION,
+            "visual_sensing_contract_version": VISUAL_SENSING_CONTRACT_VERSION,
+            "visual_sensing_configuration": visual_sensing_metadata(),
             "checkpoint_type": checkpoint_type,
             "episode": completed_episode - 1,
             "movement_state_dim": 675,

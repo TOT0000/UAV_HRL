@@ -2,7 +2,6 @@ import math
 
 import numpy as np
 import torch
-from scipy.integrate import quad
 
 from experiment_config import (
     COM_CAPACITY_POTENTIAL_WEIGHT,
@@ -18,7 +17,7 @@ from experiment_config import (
     TASK_POTENTIAL_NORMALIZATION_EPSILON,
     UAV_MAX_ALTITUDE_M,
 )
-from Fov_model_phase import FovModel
+from visual_sensing import DEFAULT_ROI_RADIUS_M, vs_geometry
 from movement_feature_schema import (
     ACTIVE_MOVEMENT_TASK_TYPES,
     LOCAL_MOVEMENT_DIM,
@@ -37,7 +36,6 @@ MOVEMENT_STATE_DIM = (
 JOINT_ACTION_DIM = NUM_UAV * 3
 BACKLOG_NORM_REF_BITS = 5e7
 GT_COUNT_MAX = ROI_COUNT_MAX
-VS_COVERAGE_EPS = 1e-6
 HOVER_ACTION = (-1.0, 0.0, 0.0)
 
 
@@ -349,12 +347,7 @@ def get_global_movement_state(
         if grouped["FOV"]:
             task = grouped["FOV"][0]
             tx, ty, tz = map(float, task["target_pos"])
-            fov_model = FovModel(
-                f=0.004, wl=0.008, i_l=0.012, z_u=float(uav.z_u), gamma_g=80
-            )
-            image_score, _ = fov_model.calculate_fov_single(
-                float(uav.x_u), float(uav.y_u), float(uav.z_u), tx, ty, tz
-            )
+            _, image_score, _ = fov_task_metrics(env, uav_id, task)
             if math.isfinite(float(image_score)):
                 fov_error = float(np.clip((float(image_score) - 1.0) / 3.0, -1.0, 1.0))
             fov_target = [
@@ -611,78 +604,17 @@ def project_local_action(raw_action):
     return project_action_domain(action)
 
 
-def _circle_rectangle_intersection_area(cx, cy, radius, xmin, xmax, ymin, ymax):
-    if radius <= 0 or xmin >= xmax or ymin >= ymax:
-        return 0.0
-    if xmax <= cx - radius or xmin >= cx + radius:
-        return 0.0
-    if ymax <= cy - radius or ymin >= cy + radius:
-        return 0.0
-    if xmin <= cx - radius and xmax >= cx + radius and ymin <= cy - radius and ymax >= cy + radius:
-        return math.pi * radius * radius
-
-    x0 = max(xmin, cx - radius)
-    x1 = min(xmax, cx + radius)
-
-    def vertical_overlap(x_value):
-        half_height = math.sqrt(max(radius * radius - (x_value - cx) ** 2, 0.0))
-        lower = max(ymin, cy - half_height)
-        upper = min(ymax, cy + half_height)
-        return max(upper - lower, 0.0)
-
-    area, _ = quad(vertical_overlap, x0, x1, epsabs=1e-7, epsrel=1e-7, limit=100)
-    return float(np.clip(area, 0.0, math.pi * radius * radius))
+def fov_task_geometry(env, uav_id, task):
+    target = env.gts[_target_object_id(task, "FOV")]
+    return vs_geometry(
+        env.uav_dict[uav_id].get_position(), target.get_position(),
+        float(getattr(target, "radius", DEFAULT_ROI_RADIUS_M)),
+    )
 
 
 def fov_task_metrics(env, uav_id, task):
-    uav = env.uav_dict[uav_id]
-    tx, ty, tz = map(float, task["target_pos"])
-    target_obj_id = _target_object_id(task, "FOV")
-    target = env.gts[target_obj_id]
-    radius = float(getattr(target, "radius", 80.0))
-    model = FovModel(f=0.004, wl=0.008, i_l=0.012, z_u=float(uav.z_u), gamma_g=radius)
-    fov_width, fov_height = model.get_ground_fov_size(float(uav.z_u))
-    image_score, _ = model.calculate_fov_single(
-        float(uav.x_u), float(uav.y_u), float(uav.z_u), tx, ty, tz
-    )
-
-    z_min = float(getattr(uav, "min_AGL", 50.0))
-    z_max = float(getattr(uav, "max_AGL", 200.0))
-    geometry_valid = bool(
-        z_min <= float(uav.z_u) <= z_max
-        and float(uav.z_u) > tz
-        and math.isfinite(float(fov_width))
-        and math.isfinite(float(fov_height))
-        and fov_width > 0
-        and fov_height > 0
-        and math.isfinite(float(image_score))
-    )
-    if not geometry_valid:
-        return 0.0, 0.0, False
-
-    xmin = float(uav.x_u) - fov_width / 2.0
-    xmax = float(uav.x_u) + fov_width / 2.0
-    ymin = float(uav.y_u) - fov_height / 2.0
-    ymax = float(uav.y_u) + fov_height / 2.0
-    overlap_area = _circle_rectangle_intersection_area(
-        tx, ty, radius, xmin, xmax, ymin, ymax
-    )
-    roi_area = math.pi * radius * radius
-    coverage_ratio = float(np.clip(overlap_area / max(roi_area, 1e-12), 0.0, 1.0))
-    return coverage_ratio, float(image_score), True
-
-
-def vs_data_valid(env, uav_id, task):
-    coverage_ratio, image_score, geometry_valid = fov_task_metrics(
-        env, uav_id, task
-    )
-    return bool(
-        geometry_valid
-        and math.isfinite(coverage_ratio)
-        and math.isfinite(image_score)
-        and coverage_ratio >= 1.0 - VS_COVERAGE_EPS
-        and 0.0 < image_score <= 1.0 + VS_COVERAGE_EPS
-    )
+    geometry = fov_task_geometry(env, uav_id, task)
+    return geometry.coverage_ratio, geometry.image_quantity, geometry.sensing_valid_now
 
 
 def calculate_movement_potentials(env, c_ref_com, backlog_bits=None):
@@ -694,12 +626,7 @@ def calculate_movement_potentials(env, c_ref_com, backlog_bits=None):
         grouped = _tasks_by_type(env, uav_id)
         _assert_unique_target_tasks(uav_id, grouped)
         for task in grouped["FOV"]:
-            coverage, image_score, geometry_valid = fov_task_metrics(env, uav_id, task)
-            vs_progress.append(
-                fov_sensing_progress(coverage, image_score)
-                if geometry_valid
-                else 0.0
-            )
+            vs_progress.append(fov_task_geometry(env, uav_id, task).pair_score)
         for task in grouped["COM"]:
             sr_id = _target_object_id(task, "COM")
             capacity_progress = normalized_com_link_quality(env, uav_id, task)

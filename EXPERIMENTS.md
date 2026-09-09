@@ -37,12 +37,14 @@ solver-only infinities never enter the domain utility matrix. K-KM uses at most
 two rounds, and FOV+COM is its only legal two-task combination, with current
 horizontal targets no more than 200 m apart.
 
-FOV assignment uses the production pair geometry from
-`centralized_movement.fov_task_metrics`. Its raw utility is
-`coverage * q(I)`, where `q(I)=0` for non-finite or non-positive `I`, `q(I)=I`
-for `0<I<=1`, and `q(I)=1/I` for `I>1`. Geometry feasibility remains a separate
-mask, so a finite pair with `I>1` stays feasible. No FOV/COM blend, clipping,
-bonus, penalty, or all-zero fallback is applied. The seeded random-assignment
+FOV assignment uses `visual_sensing.vs_geometry` through
+`centralized_movement.fov_task_geometry`. Its raw utility is
+`0.8 * coverage * min(I, 1) + 0.2 * G`, with
+`G = min(1, b1 * relative_altitude / (horizontal_distance + epsilon))`.
+Assignment eligibility is independent of current sensing validity: UAVs outside
+the oblique range can accept a task and approach it. Existing target, altitude,
+role and task-count checks still apply. Equal normalized values remain 0.5.
+The seeded random-assignment
 baseline bypasses these utilities entirely. Equal dummy candidates are reported
 as `dummy_1`, `dummy_2`, ... in deterministic row/ID order.
 
@@ -138,10 +140,10 @@ design-dataset collection, aggregation, and exact-resume workflows.
   `size_bits` remains the queue, service, partial-hop, and routing-reward load.
   Timely FOV useful bits are `size_bits * capture_coverage_ratio`; timely COM
   useful bits are the full `size_bits`; late packets contribute zero useful bits
-- At each one-second Search boundary every FOV-observation participant computes
-  raw unvisited, frontier, overlap, and `map_changed` from the same immutable
-  pre-commit bitmap. Observation participation is separate from coverage
-  contribution: only Search-UAV footprints enter the atomic coverage union.
+- At each one-second Search boundary each Search contributor freezes one nadir
+  footprint for both inclusive ROI-center discovery and bitmap updates. Its
+  unvisited, frontier, overlap, and `map_changed` use the immutable pre-commit
+  bitmap. Non-Search UAVs contribute empty samples and have no Search footprint.
   The frozen all-UAV samples update EMA after coverage commit and before
   Search-to-Hover conversion, assignment, or state construction. No post-commit
   bitmap fallback is permitted. Routing state
@@ -197,13 +199,30 @@ Search remains exactly the global `mean(visited_bitmap)`. It does not use the
 Search target position, a frontier target, or any target-distance term, and the
 pre-commit coverage lifecycle is unchanged.
 
-For every assigned FOV task, VS progress is an equal blend of the existing
-`coverage_ratio * clip(image_score, 0, 1)` sensing progress and horizontal
-target proximity. Horizontal proximity is
-`1 - clip(d_xy / sqrt(W^2 + H^2), 0, 1)` and deliberately ignores altitude.
-Invalid sensing geometry contributes zero sensing progress while finite UAV
-and target coordinates still produce distance progress. `Phi_VS` is the
-arithmetic mean over FOV tasks, or zero when none exist.
+The canonical camera in `visual_sensing.CAMERA` has focal length 0.035 m,
+image width 0.0156 m and image height 0.0235 m. `search_footprint` produces a
+44.57 by 67.14 m nadir rectangle at 100 m altitude. `vs_geometry` instead aims
+at the assigned ROI center and projects all four sensor rays onto its ground
+plane. Sensor width follows the tilt plane and sensor height is cross-track;
+the polygon rotates with bearing (nadir deterministically uses +x).
+Continuous analytical circle/polygon intersection gives partial coverage.
+ROI radius comes from the target object, defaulting to 80 m. Raw `I` is ROI
+area divided by this same polygon area and can exceed one.
+
+VS potential and assignment share `0.8 * coverage * min(I,1) + 0.2 * G`.
+`G = min(1, b1*z_relative/(d_horizontal+epsilon))`, where `b1=2*f/width`.
+Outside `d_horizontal <= b1*z_relative`, or with invalid/singular rays,
+`I=coverage=Q=0`. The exact inclusive range boundary has a horizontal corner
+ray, so it is model-range-valid but sensing-invalid; G remains one. There is
+no coverage threshold. `Phi_VS` averages all assigned FOV pairs, including
+invalid current poses, or is zero when no pair is assigned.
+
+The independent traffic-model maximum is exactly 31,600 bits. Assigned VS
+continues the existing 5 packets/s rate accumulator and injection cutoff,
+including zero-coverage and zero-bit captures. Each packet freezes
+`size_bits = 31600 * min(I,1)` and `capture_coverage_ratio` at creation. Timely
+useful VS bits are timely physical bits times that frozen coverage. COM and
+the QoS denominator are unchanged.
 
 For every assigned COM task, progress is an equal blend of the existing
 deterministic expected S2U capacity normalization and 3-D S2U range-gap
@@ -489,7 +508,7 @@ python -X utf8 comparison_experiment.py aggregate --input-dir runs/comparison/ev
 
 Exact-resume checkpoints validate the method fingerprint, training-manifest
 relationship, training seed, the complete Dinkelbach block state, and its configuration.
-Checkpoint schema v25 is the current 16-UAV action-wise-GS-progress,
+Checkpoint schema v26 adds the canonical visual-sensing contract to the 16-UAV action-wise-GS-progress,
 continuous-hard-only-gateway,
 unified-400-m communication, permanent-gateway, coverage-weighted useful
 goodput, boundary-aligned stochastic-channel,
@@ -498,8 +517,15 @@ boundary-aligned current/next decision-state Relay range-progress potential plus
 reward, GS-reachable initial topology, distance-aware VS/COM task potentials,
 hard-range/COM-session, atomic-FOV, seed-ratio
 aggregation, propulsion, and four-slot/fifty-block movement-channel contract.
-Schema v24 and every older schema is rejected before weights or replay state are
+Schema v25 and every older schema is rejected before weights or replay state are
 restored and must be retrained; no legacy checkpoint migration is attempted.
+Model-only evaluation checkpoints also validate the visual version and complete
+camera/coverage/packet/weight/validity configuration. Training and evaluation
+metadata record the same configuration. Scenario manifests, seeds, CRN and
+evaluation pairing are unchanged. `Simulator_KM` and `Simulator_Rand` remain
+aliases of `Simulator`; all 16 registered methods share the same sensing APIs.
+`Fov_model_phase.FovModel` remains a delegating compatibility facade used for
+movement footprint dimensions, with no independent camera or VS formula.
 The current schema
 stores the 675/48/143 dimensions, Relay-aware movement feature schema,
 direct-ratio bit/J

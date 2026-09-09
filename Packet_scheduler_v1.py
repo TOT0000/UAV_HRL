@@ -3,7 +3,7 @@ from copy import deepcopy
 from collections import defaultdict, deque
 from dataclasses import replace
 from Energy_model import EnergyConsumptionModel
-from Fov_model_phase import FovModel
+from visual_sensing import VS_PACKET_MAX_BITS
 from Channel_model import (
     ChannelModel,
     FADING_BLOCK_SECONDS,
@@ -89,7 +89,7 @@ def action_wise_gs_progress(env, sender):
         ],
         dtype=float,
     )
-FOV_PACKET_PAYLOAD_FACTOR = 0.005 * (0.008 * 0.012 / (3.9e-6**2))
+FOV_PACKET_PAYLOAD_FACTOR = VS_PACKET_MAX_BITS
 
 
 def sanitize_capture_coverage_ratio(value):
@@ -105,7 +105,7 @@ def sanitize_capture_coverage_ratio(value):
 
 
 def fov_physical_packet_size_bits(image_quantity):
-    """Preserve the established payload formula with finite-value sanitizing."""
+    """Fixed traffic-model maximum, independent of camera dimensions."""
 
     try:
         quantity = float(image_quantity)
@@ -495,10 +495,7 @@ class PacketEngine:
 
     def _commit_fov_footprints(self, env, current_footprints):
         for uav_id, footprint in current_footprints.items():
-            if footprint is None:
-                self.fov_previous_footprints.pop(uav_id, None)
-            else:
-                self.fov_previous_footprints[uav_id] = footprint
+            self.fov_previous_footprints[uav_id] = footprint
             env.uav_dict[uav_id].last_box_idx = footprint
 
     def process_fov_transitions(
@@ -600,7 +597,7 @@ class PacketEngine:
                     uav_id,
                     visited_snapshot=snapshot,
                     commit=False,
-                    coverage_contributor=False,
+                    coverage_contributor=env.is_search_contributor(uav_id),
                 )
             if any(
                 value is None
@@ -653,7 +650,7 @@ class PacketEngine:
             },
             "initialized_uav_ids": sorted(self.fov_ema_initialized),
             "previous_footprints": {
-                str(uav_id): list(footprint)
+                str(uav_id): list(footprint) if footprint is not None else None
                 for uav_id, footprint in sorted(
                     self.fov_previous_footprints.items()
                 )
@@ -3388,14 +3385,7 @@ class PacketEngine:
         try:
             if fov_task is not None:
                 tx, ty, tz = fov_task["target_pos"]
-                state_fov_model = FovModel(
-                    f=0.004,
-                    wl=0.008,
-                    i_l=0.012,
-                    z_u=float(z_u),
-                    gamma_g=80,
-                )
-                fov_now, _ = state_fov_model.calculate_fov_single(float(x_u), float(y_u), float(z_u), tx, ty, tz)
+                _, fov_now, _ = fov_task_metrics(env, uav_id, fov_task)
                 fov_now_clip = float(np.clip(fov_now, 0.0, 3.0))
                 fov_err_clip = float(np.clip(fov_now - 1.0, -3.0, 3.0))
         except Exception:

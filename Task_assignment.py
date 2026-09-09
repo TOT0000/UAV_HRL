@@ -10,8 +10,7 @@ from scipy.optimize import linear_sum_assignment
 
 from centralized_movement import (
     fov_quality_transform,
-    fov_sensing_progress,
-    fov_task_metrics,
+    fov_task_geometry,
 )
 from experiment_config import (
     ASSIGNMENT_DUMMY_UTILITY,
@@ -44,7 +43,7 @@ class AssignmentProblem:
     relay_metrics_by_uav: dict[int, object] | None = None
 
 
-def assignment_fov_pair_metrics(env, uav_id, task):
+def assignment_fov_pair_geometry(env, uav_id, task):
     """Reuse the movement path's ROI coverage and geometric image quantity."""
 
     target = task.target_obj
@@ -57,18 +56,12 @@ def assignment_fov_pair_metrics(env, uav_id, task):
             float(getattr(target, "z", 0.0)),
         ),
     }
-    coverage, image_quality, geometry_valid = fov_task_metrics(
-        env, int(uav_id), descriptor
-    )
-    coverage = float(coverage)
-    if not math.isfinite(coverage):
-        coverage = 0.0
-    coverage = min(max(coverage, 0.0), 1.0)
-    return (
-        coverage,
-        float(image_quality),
-        bool(geometry_valid),
-    )
+    return fov_task_geometry(env, int(uav_id), descriptor)
+
+
+def assignment_fov_pair_metrics(env, uav_id, task):
+    geometry = assignment_fov_pair_geometry(env, uav_id, task)
+    return geometry.coverage_ratio, geometry.image_quantity, geometry.sensing_valid_now
 
 
 def normalize_feasible_values(raw_values, feasible_mask):
@@ -285,16 +278,21 @@ class UAVAssigner:
                     gt = self.env.gts[int(task.target_obj_id)]
                     if not bool(gt.is_found):
                         continue
-                    coverage, image_quality, geometry_valid = (
-                        assignment_fov_pair_metrics(self.env, uav_id, task)
-                    )
+                    geometry = assignment_fov_pair_geometry(self.env, uav_id, task)
+                    coverage, image_quality = geometry.coverage_ratio, geometry.image_quantity
                     raw_fov_coverage[row, column] = coverage
                     raw_fov_image_quality[row, column] = image_quality
-                    raw_fov[row, column] = fov_sensing_progress(
-                        coverage, image_quality
+                    raw_fov[row, column] = geometry.pair_score
+                    # Assignment can precede flight into valid sensing range.
+                    uav = self.env.uav_dict[uav_id]
+                    assignment_eligible = bool(
+                        np.isfinite(uav.get_position()).all()
+                        and np.isfinite(gt.get_position()).all()
+                        and uav.min_AGL <= uav.z_u <= uav.max_AGL
+                        and uav.z_u > gt.z
+                        and math.isfinite(gt.radius) and gt.radius > 0
                     )
-                    if geometry_valid:
-                        fov_feasible[row, column] = True
+                    fov_feasible[row, column] = assignment_eligible
                 elif task.task_type == "COM":
                     sr = self.env.SR_teams[int(task.target_obj_id)]
                     if sr.assigned_gt_id is None:

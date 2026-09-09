@@ -1261,13 +1261,18 @@ def render_standalone_trajectory_source(source):
             color="magenta" if target_row["detected"] else "gray",
         )
     for coverage in source["sensing_coverage"]:
-        bounds = coverage["clipped_bounds"]
-        vertices = [[
-            (bounds["x_min"], bounds["y_min"], 0.0),
-            (bounds["x_max"], bounds["y_min"], 0.0),
-            (bounds["x_max"], bounds["y_max"], 0.0),
-            (bounds["x_min"], bounds["y_max"], 0.0),
-        ]]
+        if coverage.get("geometry") == "oblique_ground_polygon":
+            if not coverage.get("polygon"):
+                continue
+            vertices = [[(x, y, coverage["ground_z"]) for x, y in coverage["polygon"]]]
+        else:
+            bounds = coverage["clipped_bounds"]
+            vertices = [[
+                (bounds["x_min"], bounds["y_min"], 0.0),
+                (bounds["x_max"], bounds["y_min"], 0.0),
+                (bounds["x_max"], bounds["y_max"], 0.0),
+                (bounds["x_min"], bounds["y_max"], 0.0),
+            ]]
         axis.add_collection3d(
             Poly3DCollection(
                 vertices,

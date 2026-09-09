@@ -12,6 +12,7 @@ from centralized_movement import (
     blended_com_progress,
     calculate_movement_potentials,
     fov_sensing_progress,
+    fov_task_geometry,
     normalized_com_link_quality,
     normalized_s2u_range_gap_proximity,
 )
@@ -84,7 +85,7 @@ class DistanceProgressHelperTest(unittest.TestCase):
         self.assertEqual(
             metadata["contract_version"], TASK_POTENTIAL_CONTRACT_VERSION
         )
-        self.assertFalse(metadata["vs"]["target_distance_used"])
+        self.assertTrue(metadata["vs"]["target_distance_used"])
         self.assertNotIn("distance_weight", metadata["vs"])
         self.assertEqual(
             metadata["com"]["distance_dimensionality"],
@@ -158,38 +159,21 @@ class DistanceAwarePotentialLifecycleTest(unittest.TestCase):
             task_potential_enabled=enabled,
         )
 
-    def test_invalid_sensing_geometry_has_zero_vs_progress(self):
+    def test_outside_sensing_range_retains_proximity_and_signed_shaping(self):
         self.env.multi_tasks[0] = [self._fov_task()]
         target = self.env.gts[0]
-        self.env.uav_dict[0].x_u = target.x + 100.0
-        self.env.uav_dict[0].y_u = target.y
-        with mock.patch(
-            "centralized_movement.fov_task_metrics",
-            return_value=(0.9, 0.8, False),
-        ):
-            _, phi_vs, _, _ = calculate_movement_potentials(self.env, 1.0)
-        self.assertEqual(phi_vs, 0.0)
-        self.assertTrue(math.isfinite(phi_vs))
-        self.assertTrue(0.0 <= phi_vs <= 1.0)
-
-    def test_vs_horizontal_distance_change_alone_does_not_change_potential(self):
-        self.env.multi_tasks[0] = [self._fov_task()]
-        target = self.env.gts[0]
-        with mock.patch(
-            "centralized_movement.fov_task_metrics",
-            return_value=(0.4, 0.5, True),
-        ):
-            self.env.uav_dict[0].x_u = 0.0
-            self.env.uav_dict[0].y_u = 0.0
-            far = calculate_movement_potentials(self.env, 1.0)
-            self.env.uav_dict[0].x_u = target.x
-            self.env.uav_dict[0].y_u = target.y
-            near = calculate_movement_potentials(self.env, 1.0)
+        uav = self.env.uav_dict[0]
+        uav.y_u, uav.z_u = target.y, target.z + 100.0
+        uav.x_u = target.x + 900.0
+        far = calculate_movement_potentials(self.env, 1.0)
+        uav.x_u = target.x + 700.0
+        near = calculate_movement_potentials(self.env, 1.0)
+        self.assertGreater(near[1], far[1])
+        self.assertGreater(far[1], 0.0)
+        self.assertLess(near[1], 0.2)
         self.assertEqual(self._shaping(far, far), 0.0)
-        self.assertEqual(far[1], 0.2)
-        self.assertEqual(near[1], 0.2)
-        self.assertEqual(self._shaping(far, near), 0.0)
-        self.assertEqual(self._shaping(near, far), 0.0)
+        self.assertGreater(self._shaping(far, near), 0.0)
+        self.assertLess(self._shaping(near, far), 0.0)
         self.assertAlmostEqual(self._shaping(near, far, done=True), -sum(near))
 
     def test_com_approach_unchanged_and_retreat_have_signed_differences(self):
@@ -238,22 +222,17 @@ class DistanceAwarePotentialLifecycleTest(unittest.TestCase):
         self.env.uav_dict[0].x_u = target.x + 123.0
         self.env.uav_dict[0].y_u = target.y + 45.0
         with mock.patch(
-            "centralized_movement.fov_task_metrics",
-            return_value=(0.6, 0.8, True),
-        ), mock.patch(
             "centralized_movement.S2U_COMMUNICATION_RANGE_M", 200.0
         ):
             old_range_potential = calculate_movement_potentials(self.env, 1.0)
         with mock.patch(
-            "centralized_movement.fov_task_metrics",
-            return_value=(0.6, 0.8, True),
-        ), mock.patch(
             "centralized_movement.S2U_COMMUNICATION_RANGE_M", 400.0
         ):
             unified_range_potential = calculate_movement_potentials(self.env, 1.0)
 
         self.assertEqual(old_range_potential, unified_range_potential)
-        self.assertAlmostEqual(unified_range_potential[1], 0.6 * 0.8)
+        expected = fov_task_geometry(self.env, 0, self._fov_task()).pair_score
+        self.assertAlmostEqual(unified_range_potential[1], expected)
 
     def test_no_tasks_are_zero_and_multiple_tasks_use_arithmetic_mean(self):
         self.env.visited_bitmap[:] = False
@@ -266,12 +245,10 @@ class DistanceAwarePotentialLifecycleTest(unittest.TestCase):
         self.env.multi_tasks[1] = [self._fov_task(1)]
         self.env.uav_dict[0].x_u, self.env.uav_dict[0].y_u = 0.0, 0.0
         self.env.uav_dict[1].x_u, self.env.uav_dict[1].y_u = 500.0, 500.0
-        with mock.patch(
-            "centralized_movement.fov_task_metrics",
-            return_value=(0.0, 0.0, True),
-        ):
-            _, phi_vs, _, _ = calculate_movement_potentials(self.env, 1.0)
-        self.assertEqual(phi_vs, 0.0)
+        _, phi_vs, _, _ = calculate_movement_potentials(self.env, 1.0)
+        expected = sum(fov_task_geometry(self.env, uid, self._fov_task(uid)).pair_score
+                       for uid in (0, 1)) / 2
+        self.assertAlmostEqual(phi_vs, expected)
 
     def test_search_potential_remains_global_coverage_mean(self):
         self.env.visited_bitmap[:] = False

@@ -17,7 +17,7 @@ from centralized_movement import (
     movement_state_feature_schema,
     normalized_s2u_range_gap_proximity,
     project_joint_action,
-    vs_data_valid,
+    fov_task_metrics,
 )
 from com_capacity_calibration import calibrate_com_capacity
 
@@ -44,7 +44,7 @@ class VisualSensingPacketGenerationTest(unittest.TestCase):
         self.env.source_uavs = {0}
 
     def test_assignment_generates_for_valid_and_zero_coverage_geometry(self):
-        self.assertTrue(vs_data_valid(self.env, 0, self.task))
+        self.assertTrue(fov_task_metrics(self.env, 0, self.task)[2])
         self.packet_engine.inject_packets(
             self.env,
             delay_bound_steps=20,
@@ -57,7 +57,7 @@ class VisualSensingPacketGenerationTest(unittest.TestCase):
 
         self.uav.x_u = 0.0 if self.target.x > 300.0 else 1000.0
         self.uav.y_u = 0.0 if self.target.y > 300.0 else 1000.0
-        self.assertFalse(vs_data_valid(self.env, 0, self.task))
+        self.assertFalse(fov_task_metrics(self.env, 0, self.task)[2])
         self.packet_engine.inject_packets(
             self.env,
             delay_bound_steps=20,
@@ -85,20 +85,6 @@ class VisualSensingPacketGenerationTest(unittest.TestCase):
         _, phi_vs, _, _ = calculate_movement_potentials(self.env, c_ref_com=1.0)
         self.assertGreater(phi_vs, 0.0)
         self.assertLessEqual(phi_vs, 1.0)
-
-    def test_full_coverage_still_requires_finite_bounded_image_score(self):
-        for image_score in (0.0, -0.1, 1.01, float("nan"), float("inf")):
-            with self.subTest(image_score=image_score), patch(
-                "centralized_movement.fov_task_metrics",
-                return_value=(1.0, image_score, True),
-            ):
-                self.assertFalse(vs_data_valid(self.env, 0, self.task))
-
-        with patch(
-            "centralized_movement.fov_task_metrics",
-            return_value=(float("nan"), 0.5, True),
-        ):
-            self.assertFalse(vs_data_valid(self.env, 0, self.task))
 
     def test_image_score_outside_old_validity_gate_still_injects(self):
         with patch(

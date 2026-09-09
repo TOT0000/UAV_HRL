@@ -1,3 +1,4 @@
+from visual_sensing import VISUAL_SENSING_CONTRACT_VERSION, visual_sensing_metadata
 from copy import deepcopy
 import json
 import tempfile
@@ -46,6 +47,8 @@ class FormalCheckpointMetadataTest(unittest.TestCase):
             dinkelbach_state.record_episode(1.0, 2.0)
         self.metadata = {
             "checkpoint_schema_version": CHECKPOINT_SCHEMA_VERSION,
+            "visual_sensing_contract_version": VISUAL_SENSING_CONTRACT_VERSION,
+            "visual_sensing_configuration": visual_sensing_metadata(),
             "checkpoint_type": MODEL_CHECKPOINT_TYPE,
             "episode": 1499,
             "movement_state_dim": MOVEMENT_STATE_DIM,
@@ -363,6 +366,8 @@ class FormalCheckpointLoadOrderTest(unittest.TestCase):
                 json.dumps(
                     {
                         "checkpoint_schema_version": CHECKPOINT_SCHEMA_VERSION,
+                        "visual_sensing_contract_version": VISUAL_SENSING_CONTRACT_VERSION,
+                        "visual_sensing_configuration": visual_sensing_metadata(),
                         "checkpoint_type": MODEL_CHECKPOINT_TYPE,
                         "movement_state_dim": 531,
                     }

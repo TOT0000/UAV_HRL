@@ -12,6 +12,8 @@ import zipfile
 import numpy as np
 import torch
 
+from visual_sensing import VISUAL_SENSING_CONTRACT_VERSION, visual_sensing_metadata
+
 from Channel_model import (
     CHANNEL_ENVIRONMENT_CONTRACT_VERSION,
     CHANNEL_MODEL_VERSION,
@@ -92,7 +94,7 @@ from dinkelbach_blocks import (
     dinkelbach_config_metadata,
 )
 
-CHECKPOINT_SCHEMA_VERSION = 25
+CHECKPOINT_SCHEMA_VERSION = 26
 PRE_16_UAV_RELAY_RANGE_PROGRESS_CHECKPOINT_SCHEMA_VERSION = 24
 PRE_BOUNDARY_ALIGNED_RELAY_POTENTIAL_CHECKPOINT_SCHEMA_VERSION = 23
 PRE_RELAY_TASK_CHECKPOINT_SCHEMA_VERSION = 22
@@ -1062,6 +1064,8 @@ def _base_metadata(
     resolved_routing = formal_config.get("routing_agent_configuration")
     metadata = {
         "checkpoint_schema_version": CHECKPOINT_SCHEMA_VERSION,
+        "visual_sensing_contract_version": VISUAL_SENSING_CONTRACT_VERSION,
+        "visual_sensing_configuration": visual_sensing_metadata(),
         "checkpoint_type": checkpoint_type,
         "episode": int(episode),
         "movement_state_dim": int(movement_state_dim),
@@ -1449,8 +1453,8 @@ def _validate_checkpoint_schema(metadata):
             "checkpoint_schema_version is incompatible with the canonical 16-UAV "
             "boundary-aligned "
             "stochastic channel, routing-stage frozen-queue immediate cost, "
-            "fixed-reference Safe-DDQN dual update, all-participant FOV, "
-            "GS-reachable initial topology, sensing-only VS and range-gap COM "
+            "fixed-reference Safe-DDQN dual update, Search-only footprints, "
+            "GS-reachable initial topology, canonical oblique VS quality/proximity and range-gap COM "
             "potentials, "
             "permanent GS gateway, capture-weighted timely useful goodput, "
             "continuous hard-only 400 m UAV 0 gateway projection, "
@@ -1470,6 +1474,9 @@ def _validate_checkpoint_schema(metadata):
             "GS-progress schema and must be retrained: "
             f"checkpoint={routing_state_dim}, expected={ROUTING_STATE_DIM}"
         )
+    if (metadata.get("visual_sensing_contract_version") != VISUAL_SENSING_CONTRACT_VERSION
+            or metadata.get("visual_sensing_configuration") != visual_sensing_metadata()):
+        raise RuntimeError("checkpoint visual sensing contract is incompatible; retraining required")
     if schema in {
         CHECKPOINT_SCHEMA_VERSION,
         ROUTING_LIFECYCLE_CHECKPOINT_SCHEMA_VERSION,

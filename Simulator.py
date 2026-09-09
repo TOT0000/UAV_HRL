@@ -27,7 +27,7 @@ from Channel_model import (
     normalized_s2u_capacity_utility,
     reference_s2u_max_capacity_mbps,
 )
-from Fov_model_phase import FovModel
+from visual_sensing import search_footprint
 from collections import defaultdict
 from Energy_model import EnergyConsumptionModel
 from Task_assignment import UAVAssigner, Task
@@ -327,7 +327,7 @@ class Simulator:
         )
         self.last_assignment_metadata = self.assignment_metadata()
 
-    def update_visited_grid(self, uav_id):
+    def update_visited_grid(self, uav_id, *, footprint=None, coverage_contributor=True):
         """
         根據 UAV 的 FOV 更新 visited_grid，並判斷是否有 Ground Target 被發現。
         """
@@ -339,7 +339,7 @@ class Simulator:
         for gt in self.gts:
             # print(f"  └─ [GT {gt.id}] 位置=({gt.x}, {gt.y}), is_found={gt.is_found}")
 
-            if (not gt.is_found) and self.is_visible(uav_id, gt):
+            if (not gt.is_found) and self.is_visible(uav_id, gt, footprint=footprint, coverage_contributor=coverage_contributor):
                 # print(f"[觸發] UAV {uav_id}  發現 GT {gt.id}，觸發 FOV + COM")
                 sr = self.SR_team_gogo(gt)
                 gt.mark_found(uav_id)
@@ -363,14 +363,16 @@ class Simulator:
                                     )
                 self.need_reassign = True
 
-    def fov_footprint_indices(self, uav_id):
-        """Return one UAV's current camera footprint without mutating state."""
+    def fov_footprint_indices(self, uav_id, *, footprint=None):
+        """Rasterize the current Search footprint; VS never uses this API."""
 
         uav = self.uav_dict[uav_id]
-        model = FovModel(
-            f=0.004, wl=0.008, i_l=0.012, z_u=uav.z_u, gamma_g=80
-        )
-        fov_w, fov_h = model.get_ground_fov_size(uav.z_u)
+        if not self.is_search_contributor(uav_id):
+            return None
+        footprint = footprint if footprint is not None else self.search_footprint(uav_id)
+        if footprint is None:
+            return None
+        fov_w, fov_h = footprint.width, footprint.height
         bx_min, bx_max, by_min, by_max, _, _ = self.fov_to_indices_and_patch(
             uav.x_u,
             uav.y_u,
@@ -392,11 +394,13 @@ class Simulator:
         visited_snapshot=None,
         commit=True,
         coverage_contributor=True,
+        footprint=None,
     ):
         """Freeze one FOV sample; only Search contributors may mutate coverage."""
 
         uav = self.uav_dict[uav_id]
-        current = self.fov_footprint_indices(uav_id)
+        coverage_contributor = bool(coverage_contributor and self.is_search_contributor(uav_id))
+        current = self.fov_footprint_indices(uav_id, footprint=footprint) if coverage_contributor else None
         previous = getattr(uav, "last_box_idx", None)
         previous = tuple(int(value) for value in previous) if previous is not None else None
         snapshot = (
@@ -463,59 +467,21 @@ class Simulator:
         #         self.multi_tasks[uid] = [t for t in self.multi_tasks[uid] if t["task_type"] != "Search"]
 
     # ===============判斷TG是否有被發現=====================
-    def is_visible(self, uav_id, target):
-        # =========方法一===============
-        uav = self.uav_dict[uav_id]
-        if not hasattr(self, "FovModel"):
-            self.FovModel = FovModel(f=0.004, wl=0.008, i_l=0.012, z_u=uav.z_u, gamma_g=80)
-        fov_w, fov_h = self.FovModel.get_ground_fov_size(uav.z_u)
-        # print(fov_w, fov_h)
-        fc = self.FovModel.f
-        wc = self.FovModel.wl
-        lc = self.FovModel.il
+    def is_search_contributor(self, uav_id):
+        return not self._search_phase_over and any(
+            task.get("task_type") == "Search"
+            for task in self.multi_tasks.get(uav_id, ())
+        )
 
-        # 幾何位置
-        x_u, y_u, z_u = uav.get_position()
-        x_g, y_g, z_g = target.x, target.y, getattr(target, "z", 0.0)
-        r_g = getattr(target, "radius", self.FovModel.gamma_g)  # 目標半徑
-        zu = z_u - z_g
+    def search_footprint(self, uav_id):
+        return search_footprint(self.uav_dict[uav_id].get_position())
 
-        if zu <= 0:
-            return False  # 相機不在目標上方，直接不可見
-
-        zu = float(z_u - z_g)
-        # ===== 檢查式(2)：FoV 圓錐/半徑約束（確保目標落在視野範圍內）=====
-        # 式(2) 等價 r <= (2 f_c / w_c) * z_u
-        r = math.hypot(x_u - x_g, y_u - y_g)
-        alpha = (2.0 * fc) / wc
-        beta  = (2.0 * fc) / lc
-        # if r > alpha * zu + 1e-9:
-        #     # print(f"[WARN] r={r:.3f} > r_max={r_max:.3f}  (units wrong or (2) not enforced)")
-        #     return False
-
-        # ===== 檢查式(3)：目標整個圓要被影像平面包住 =====
-        # --- 式(3) 嚴格幾何版
-        # 水平左右邊距
-        dL = (zu*zu + r*r) / (alpha * zu + r)
-        dR = (zu*zu + r*r) / max(alpha * zu - r, 1e-9)  # 防除以零
-
-        # 垂直上下邊距（用 ℓ_c 與同型式；若要更嚴謹可把 r 換成沿 y 方向的投影距離）
-        dB = (zu*zu + r*r) / (beta * zu + r)
-        dT = (zu*zu + r*r) / max(beta * zu - r, 1e-9)
-
-        if min(dL, dR, dB, dT) < r_g:
+    def is_visible(self, uav_id, target, *, footprint=None, coverage_contributor=True):
+        if not coverage_contributor or not self.is_search_contributor(uav_id):
             return False
-            
+        footprint = footprint if footprint is not None else self.search_footprint(uav_id)
+        return bool(footprint and not target.is_found and footprint.contains(target.x, target.y))
 
-        # 額外：可在這裡計算 I_raw（原式(1)），作為權重或拍攝質量參考
-        # I_raw, _ = self.calculate_fov_single(x_u, y_u, z_u, x_g, y_g, z_g)
-        # 例如你要避免「幾何合法但 I 極小」的觸發，也能在這裡加門檻：
-        # if I_raw < 1e-3: return False
-
-        return (not target.is_found)
-
-
-       
     def count_found_targets(self) -> int:
         return sum(1 for gt in self.gts if gt.is_found)
 
@@ -775,31 +741,12 @@ class Simulator:
         self.sr_trajectory = restored_trajectory
     def get_unexplored_ratio(self, uav_id):
         uav = self.uav_dict[uav_id]
-        if not hasattr(self, "FovModel"):
-            self.FovModel = FovModel(f=0.004, wl=0.008, i_l=0.012, z_u=uav.z_u, gamma_g=80)
-
-        fov_w, fov_h = self.FovModel.get_ground_fov_size(uav.z_u)
-        x, y, _ = uav.get_position()
-
-        x_min = max(0, x - fov_w / 2)
-        x_max = min(self.env_width, x + fov_w / 2)
-        y_min = max(0, y - fov_h / 2)
-        y_max = min(self.env_height, y + fov_h / 2)
-
-        bx_min = int(x_min / self.bit_resolution)
-        bx_max = int(x_max / self.bit_resolution)
-        by_min = int(y_min / self.bit_resolution)
-        by_max = int(y_max / self.bit_resolution)
-
-        bx_min = min(max(0, bx_min), self.map_width - 1)
-        bx_max = min(max(0, bx_max), self.map_width - 1)
-        by_min = min(max(0, by_min), self.map_height - 1)
-        by_max = min(max(0, by_max), self.map_height - 1)
-
-        submap = self.visited_bitmap[bx_min:bx_max + 1, by_min:by_max + 1]
-        total = submap.size
-        unexplored = np.sum(~submap)
-        return unexplored / total if total > 0 else 0.0
+        indices = self.fov_footprint_indices(uav_id)
+        if indices is None:
+            return 0.0
+        bx_min, bx_max, by_min, by_max = indices
+        submap = self.visited_bitmap[bx_min:bx_max+1, by_min:by_max+1]
+        return float((~submap).mean()) if submap.size else 0.0
 
     #=====================通訊如何======================== 
     def _channel_geometry(self):
@@ -1235,341 +1182,6 @@ class Simulator:
                     break  # 一旦有一個符合就可以加入，跳出這台 UAV 的任務迴圈
         # print(f"[DEBUG] Source UAVs: {sorted(self.source_uavs)}")
     
-    def calculate_fov_reward(self, uav_id, lamda_EE, E_mob=None):
-
-        uav = self.uav_dict[uav_id]
-
-        if E_mob is None:
-            E_mob = float(getattr(uav, "move_energy_step", 0.0))
-
-        # =========================================================
-        # 1) 計算目前 FOV
-        # =========================================================
-        tx, ty, tz = uav.target_position
-        # print(tx, ty, tz)
-        if not hasattr(self, "FovModel"):
-            self.FovModel = FovModel(
-                f=0.004, wl=0.008, i_l=0.012, z_u=uav.z_u, gamma_g=80
-            )
-        else:
-            if hasattr(self.FovModel, "z_u"):
-                self.FovModel.z_u = uav.z_u
-
-        fov, _ = self.FovModel.calculate_fov_single(
-            uav.x_u, uav.y_u, uav.z_u, tx, ty, tz
-        )
-        fov = float(fov)
-
-        # =========================================================
-        # 2) FOV 主 reward：越接近 1 越好
-        #    >1 的 overshoot 要罰更重，避免只靠降高度硬修
-        # =========================================================
-        err = abs(fov - 1.0)
-
-        if fov > 1.0:
-            r_fov = 1.0 - 1.8 * (err ** 1.5)
-        else:
-            r_fov = 1.0 - 1.0 * (err ** 1.2)
-
-        r_fov = float(np.clip(r_fov, -4.0, 1.2))
-
-        # =========================================================
-        # 3) XY 對位 reward：離 target 越近越好
-        # =========================================================
-        dist_xy = float(np.hypot(uav.x_u - tx, uav.y_u - ty))
-        env_diag = float(np.hypot(self.env_width, self.env_height))
-        dist_xy_norm = dist_xy / (env_diag + 1e-9)
-
-        # 靜態距離懲罰
-        r_xy = -1.5 * dist_xy_norm
-
-        # 動態進步獎勵：比上一刻更接近就加分
-        prev_dist_xy = getattr(uav, "prev_dist_xy", None)
-        if prev_dist_xy is None:
-            delta_dist = 0.0
-        else:
-            delta_dist = float(prev_dist_xy - dist_xy)
-
-        uav.prev_dist_xy = dist_xy
-
-        # 正向靠近比負向遠離更重要
-        r_xy_progress = 4.0 * delta_dist
-        r_xy_progress = float(np.clip(r_xy_progress, -1.0, 1.0))
-
-        # =========================================================
-        # 4) 水平幾乎不動的懲罰
-        # =========================================================
-        move_xy = float(np.hypot(getattr(uav, "last_dx", 0.0), getattr(uav, "last_dy", 0.0)))
-        r_stall_xy = -0.20 if move_xy < 0.15 else 0.0
-
-        # =========================================================
-        # 5) 高度 shaping
-        #    FOV 任務偏中低高度，但不要只靠高度解問題
-        # =========================================================
-        z = float(uav.z_u)
-        z_min = float(getattr(uav, "min_AGL", 50.0))
-        z_max = float(getattr(uav, "max_AGL", 150.0))
-        z_norm = (z - z_min) / (z_max - z_min + 1e-9)
-
-        z_mid = 0.30
-        r_alt = -0.35 * ((z_norm - z_mid) ** 2)
-
-        # =========================================================
-        # 6) 邊界懲罰
-        # =========================================================
-        edge_penalty = 0.0
-        if z_norm > 0.90:
-            edge_penalty -= 2.0 * ((z_norm - 0.90) / 0.10) ** 2
-        elif z_norm < 0.10:
-            edge_penalty -= 1.2 * ((0.10 - z_norm) / 0.10) ** 2
-
-        # =========================================================
-        # 7) 能耗項
-        # =========================================================
-        E_ref = float(max(getattr(self, "_E_move_ref", 500.0), 1e-3))
-        energy_term = float(np.clip(E_mob / E_ref, 0.0, 10.0))
-        r_energy = -lamda_EE * energy_term
-
-        # =========================================================
-        # 8) 合成 reward
-        # =========================================================
-        reward = (
-            2.2 * r_fov
-            + 1.2 * r_xy
-            + 1.5 * r_xy_progress
-            + r_stall_xy
-            + r_alt
-            + edge_penalty
-            + r_energy
-        )
-
-        reward = float(np.clip(reward, -6.0, 6.0))
-
-        return reward, err, fov
-    def calculate_fov_reward_wo_Dinkel(self, uav_id, E_mob=None, debug=False):
-        uav = self.uav_dict[uav_id]
-
-        # --- 能耗正規化 ---
-        if E_mob is None:
-            E_mob = float(getattr(uav, "move_energy_step", 0.0))
-        if not hasattr(self, "_E_move_ref"):
-            self._E_move_ref = max(E_mob, 1.0)
-        else:
-            self._E_move_ref = 0.9*self._E_move_ref + 0.1*max(E_mob, 1e-3)
-        e_norm = max(E_mob / self._E_move_ref, 1e-3)
-
-        # --- FOV ---
-        if not hasattr(self, "FovModel"):
-            self.FovModel = FovModel(f=0.004, wl=0.008, i_l=0.012, z_u=uav.z_u, gamma_g=80)
-        else:
-            if hasattr(self.FovModel, "z_u"):
-                self.FovModel.z_u = uav.z_u
-
-        tx, ty, tz = uav.target_position
-        fov, _ = self.FovModel.calculate_fov_single(uav.x_u, uav.y_u, uav.z_u, tx, ty, tz)
-
-        # --- 以 1 為目標的對稱形狀獎勵（峰值在 1，兩側都下降）---
-        # 高斯形狀：r_shape ∈ (0, A]，err=0 時達到 A
-        A = 2.5          # 形狀峰值（每步不宜太大，避免主導整體）
-        sigma = 0.45    # 允許帶寬；越小越尖銳
-        err = abs(fov - 1.0)
-        r_shape = A * np.exp(-(err / sigma)**2)
-
-        # **基準扣除**：讓 FOV=0.5 的回饋≈0，避免 0.5 成為「穩賺」點
-        baseline = A * np.exp(-((1.0 - 0.3) / sigma)**2)
-        r_centered = r_shape - baseline   # 1.0 附近為正、0.5 附近為 0、遠離為負
-
-        # 進步獎勵（限制幅度，避免一次大跳過衝）
-        last_err = getattr(uav, "last_fov_err", None)
-        uav.last_fov_err = err
-        d_err = 0.0 if last_err is None else (last_err - err)
-        r_gain = 0.5 * max(0.0, min(d_err, 0.2))  # 小步前進才加分
-
-        # overshoot 懲罰（柔化，避免一次過衝災難性負分）
-        overshoot = max(fov - 1.0, 0.0)
-        r_overpen = 1 * np.sqrt(overshoot)      # 原本是 2*x，改為 sqrt 以降低斜率
-
-        # 能耗（保持很輕）
-        r_energy = 0.1 * max(np.log(e_norm), 0.0)
-        if r_energy <= 0:
-            reward = -1.0   # 或一個小負值
-        else:
-            reward = (r_centered + r_gain - r_overpen) / r_energy
-
-        # reward = (r_centered + r_gain - r_overpen) / r_energy
-
-        # 近目標帶小獎金（幫助穩在 1），但不要太大
-        if err < 0.15: reward += 0.2
-        if err < 0.05: reward += 0.6
-
-        # 不要太緊的截斷，避免壓掉「接近 1」的區分度
-        reward = float(np.clip(reward, -2.0, 4.0))
-
-        if debug:
-            print(f"[UAV {uav_id}] FOV={fov:.3f}, err={err:.3f}, e_norm={e_norm:.3f}")
-            print(f"  r_shape={r_shape:.3f}, baseline={baseline:.3f}, r_centered={r_centered:.3f}, "
-                f"r_gain={r_gain:.3f}, r_overpen={r_overpen:.3f}, r_energy={r_energy:.3f}, "
-                f"Total={reward:.3f}")
-
-        return reward, err, fov
-    def calculate_search_reward(self, uav_id, lamda_EE, E_mob=None):
-        uav = self.uav_dict[uav_id]
-        if E_mob is None:
-            E_mob = float(getattr(uav, "move_energy_step", 0.0))
-
-        # === FOV 邊界（連續→格點）===
-        fov_w, fov_h = self.FovModel.get_ground_fov_size(uav.z_u)
-        x, y, _ = uav.get_position()
-        bx_min, bx_max, by_min, by_max, patch, fov_cells = self.fov_to_indices_and_patch(
-            x, y, fov_w, fov_h,
-            self.env_width, self.env_height,
-            self.bit_resolution, self.visited_bitmap
-        )
-        if not (bx_max >= bx_min and by_max >= by_min):
-            return 0.0, 0.0, 0.0
-        fov_cells = max(1, fov_cells)
-
-        # --- 新探索：只看「本次FOV」區塊 ---
-        cur_map = getattr(self, "_pre_map", self.visited_bitmap)
-        cur = cur_map[bx_min:bx_max+1, by_min:by_max+1]
-        newly_explored = int((~cur).sum())
-        p = newly_explored / float(fov_cells)   # 0~1
-
-        # --- 與上一張FOV的局部重疊，用來懲罰 ---
-        if uav.last_box_idx is not None:
-            lbx0, lbx1, lby0, lby1 = uav.last_box_idx
-            ix0 = max(bx_min, lbx0)
-            iy0 = max(by_min, lby0)
-            ix1 = min(bx_max, lbx1)
-            iy1 = min(by_max, lby1)
-            inter_cells = (ix1 - ix0 + 1) * (iy1 - iy0 + 1) if (ix1 >= ix0 and iy1 >= iy0) else 0
-            overlap_rate_local = inter_cells / float(fov_cells)
-        else:
-            overlap_rate_local = 0.0
-
-        # --- 局部重疊懲罰 ---
-        overlap_penalty = max(0.0, overlap_rate_local - 0.5) ** 2
-
-        # --- 幾乎沒動的懲罰 ---
-        no_move_penalty = 0.1 if overlap_rate_local >= 0.95 else 0.0
-
-        # --- 能耗項 ---
-        E_ref = float(max(getattr(self, "_E_move_ref", 500.0), 1e-3))
-        energy_term = np.clip(E_mob / E_ref, 0.0, 10.0)
-
-        # =========================================================
-        # 1) 原本的 Search 主回饋
-        # =========================================================
-        explore = 1.2 * (p ** 0.6) + 0.6 * p
-        raw = (explore - overlap_penalty - no_move_penalty) - lamda_EE * energy_term
-
-        # =========================================================
-        # 2) Search 高度 shaping：偏好較高，但不要貼頂
-        # =========================================================
-        z = float(uav.z_u)
-        z_min = float(getattr(uav, "min_AGL", 50.0))
-        z_max = float(getattr(uav, "max_AGL", 150.0))
-        z_norm = (z - z_min) / (z_max - z_min + 1e-9)
-
-        # Search 希望在偏高高度帶，而不是直接衝到最上界
-        z_target = 0.72
-        z_band = 0.22
-        r_alt_search = -0.45 * ((z_norm - z_target) / z_band) ** 2
-        r_alt_search = float(np.clip(r_alt_search, -0.8, 0.0))
-
-        # =========================================================
-        # 3) 邊界懲罰：避免吸到上下界
-        # =========================================================
-        edge_penalty = 0.0
-        if z_norm > 0.90:
-            edge_penalty -= 1.5 * ((z_norm - 0.90) / 0.10) ** 2
-        elif z_norm < 0.10:
-            edge_penalty -= 1.5 * ((0.10 - z_norm) / 0.10) ** 2
-
-        # =========================================================
-        # 4) 合成 reward
-        # =========================================================
-        reward = raw + r_alt_search + edge_penalty
-        reward = float(np.clip(reward, -3.5, 3.5))
-
-        # 外部事件獎勵（例如找到 GT）
-        evt_ext = float(getattr(uav, "explore_reward_bonus", 0.0))
-        total_reward = reward + evt_ext
-
-        # --- 狀態更新 ---
-        self.visited_bitmap[bx_min:bx_max+1, by_min:by_max+1] = True
-        uav.last_box_idx = (bx_min, bx_max, by_min, by_max)
-        uav.explore_reward_bonus = 0.0
-
-        return total_reward, 0.0, 0.0
-    
-    def calculate_search_reward_wo_Dinkel(self, uav_id, t, E_mob=None):
-        uav = self.uav_dict[uav_id]
-        if E_mob is None:
-            E_mob = float(getattr(uav, "move_energy_step", 0.0))
-
-        # === FOV 邊界（連續→格點）===
-        fov_w, fov_h = self.FovModel.get_ground_fov_size(uav.z_u)
-        x, y, _ = uav.get_position()
-        bx_min, bx_max, by_min, by_max, patch, fov_cells = self.fov_to_indices_and_patch(
-            x, y, fov_w, fov_h,
-            self.env_width, self.env_height,
-            self.bit_resolution, self.visited_bitmap
-        )
-        if not (bx_max >= bx_min and by_max >= by_min):
-            return 0.0, 0.0, 0.0
-        fov_cells = max(1, fov_cells)
-
-        # --- 新探索：只看「本次FOV」區塊（關鍵）---
-        cur_map = getattr(self, "_pre_map", self.visited_bitmap)
-        cur = cur_map[bx_min:bx_max+1, by_min:by_max+1]
-        newly_explored = int((~cur).sum())
-        p = newly_explored / float(fov_cells)   # 0~1
-
-        # --- 與上一張FOV的局部重疊，用來懲罰 ---
-        if uav.last_box_idx is not None:
-            lbx0, lbx1, lby0, lby1 = uav.last_box_idx
-            ix0 = max(bx_min, lbx0);  iy0 = max(by_min, lby0)
-            ix1 = min(bx_max, lbx1);  iy1 = min(by_max, lby1)
-            inter_cells = (ix1 - ix0 + 1) * (iy1 - iy0 + 1) if (ix1 >= ix0 and iy1 >= iy0) else 0
-            overlap_rate_local = inter_cells / float(fov_cells)
-        else:
-            overlap_rate_local = 0.0
-
-        # 局部重疊懲罰（>0.5 才懲罰）
-        overlap_penalty = max(0.0, overlap_rate_local - 0.5) ** 2
-
-        # 「幾乎沒動」的極小懲罰（可關掉）
-        no_move_penalty = 0.1 if overlap_rate_local >= 0.95 else 0.0
-
-        # --- 能耗項（保持量級穩定）---
-        E_ref = float(max(getattr(self, "_E_move_ref", 500.0), 1e-3))
-        energy_term = np.clip(E_mob / E_ref, 0.0, 10.0)
-
-        # --- Stationary shaping（拿掉 early_scale 與 tanh）---
-        explore = 1.2 * (p ** 0.6) + 0.6 * p       # 典型 0~1.8
-        if energy_term  <= 0:
-            raw = -1.0   # 或一個小負值
-        else:
-            raw = (explore -  overlap_penalty - no_move_penalty) / energy_term
-        # raw = (explore -  overlap_penalty - no_move_penalty) /  energy_term 
-        reward = float(np.clip(raw, -3.0, 3.0))
-        # print(lamda_EE * energy_term)
-        # 外部事件獎勵（建議量級 10~20，而非 100）
-        evt_ext = float(getattr(uav, "explore_reward_bonus", 0.0))
-        total_reward = reward + evt_ext
-
-        # --- 狀態更新 ---
-        self.visited_bitmap[bx_min:bx_max+1, by_min:by_max+1] = True
-        uav.last_box_idx = (bx_min, bx_max, by_min, by_max)
-        # 當步把 bonus 吃完就清零，避免跨步殘留
-        uav.explore_reward_bonus = 0.0
-        # 事件獎勵是否清除，建議在「事件觸發處」清；若要在此清：
-        # uav.explore_reward_bonus = 0.0
-
-        return total_reward, 0.0, 0.0
-
-        
     def fov_to_indices_and_patch(self, x, y, fov_w, fov_h,
                              env_width, env_height,
                              bit_resolution, visited_bitmap):

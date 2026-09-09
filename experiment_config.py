@@ -10,6 +10,7 @@ from types import MappingProxyType
 
 from movement_feature_schema import LOCAL_MOVEMENT_DIM
 
+from visual_sensing import VISUAL_SENSING_CONTRACT_VERSION, visual_sensing_metadata
 from communication_contract import (
     COMMUNICATION_RANGE_BOUNDARY_RULE,
     MAX_3D_COMMUNICATION_DISTANCE_M,
@@ -91,7 +92,7 @@ GROUND_ALTITUDE_M = 0.0
 UAV_MAX_ALTITUDE_M = 150.0
 TASK_POTENTIAL_NORMALIZATION_EPSILON = 1e-12
 TASK_POTENTIAL_CONTRACT_VERSION = (
-    "vs-com-relay-range-progress-boundary-aligned-potential-v6"
+    "oblique-vs-quality-proximity-com-relay-potential-v7"
 )
 COM_CAPACITY_POTENTIAL_WEIGHT = 0.5
 COM_DISTANCE_POTENTIAL_WEIGHT = 0.5
@@ -140,12 +141,12 @@ ASSIGNMENT_DUMMY_UTILITY = -1e-9
 UTILITY_NORMALIZATION_MODE = "fov-global-minmax-com-fading-aware-reference-v3"
 COM_UTILITY_CONTRACT_VERSION = "fixed-s2u-los-rician-expected-maximum-v2"
 TASK_COMPATIBILITY_POLICY = "fov_com_type_only_no_distance_limit"
-FOV_ASSIGNMENT_UTILITY_VERSION = "coverage_times_saturated_image_quality-v2"
+FOV_ASSIGNMENT_UTILITY_VERSION = "oblique-quality-proximity-v3"
 FOV_QUALITY_TRANSFORM = (
     "q(I)=0 for non-finite or I<=0; clip(I,0,1) otherwise"
 )
 FOV_COVERAGE_SOURCE = (
-    "centralized_movement.fov_task_metrics circle-ROI/rectangular-FOV "
+    "visual_sensing.vs_geometry circle-ROI/oblique-polygon "
     "intersection ratio [0,1]"
 )
 SAFE_DDQN_QOS_TARGET_PROBABILITY = 0.05
@@ -174,7 +175,7 @@ ROUTING_LEARNING_RATE = 1e-3
 ROUTING_GAMMA = 0.99
 ROUTING_TAU = 0.005
 ROUTING_OPTIMIZER_UPDATE_SCOPE = "every_4_routing_slots"
-FOV_EMA_LIFECYCLE_VERSION = "all-participant-precommit-search-union-v5"
+FOV_EMA_LIFECYCLE_VERSION = "search-only-footprints-empty-nonsearch-samples-v6"
 SR_ROUTE_LIFECYCLE_VERSION = "assigned-and-arrived-derived-state-v2"
 PACKET_QOS_CONTRACT_VERSION = (
     "assigned-fov-and-activated-com-immediate-qos-v8"
@@ -298,9 +299,10 @@ def task_potential_contract_metadata():
             "target_distance_used": False,
         },
         "vs": {
-            "definition": "coverage_ratio * q(image_quality)",
+            "definition": "0.8 * coverage_ratio * q(image_quality) + 0.2 * G",
+            "visual_sensing": visual_sensing_metadata(),
             "quality_transform": FOV_QUALITY_TRANSFORM,
-            "target_distance_used": False,
+            "target_distance_used": True,
             "aggregation": "mean over assigned FOV tasks",
         },
         "com": {
@@ -968,6 +970,8 @@ def comparison_method_configuration(method_spec: MethodSpec) -> dict:
         "task_compatibility_policy": TASK_COMPATIBILITY_POLICY,
         "hover_assignment_candidate": False,
         "assignment_dummy_utility": ASSIGNMENT_DUMMY_UTILITY,
+        "visual_sensing_contract_version": VISUAL_SENSING_CONTRACT_VERSION,
+        "visual_sensing_configuration": visual_sensing_metadata(),
         "fov_assignment_utility_version": FOV_ASSIGNMENT_UTILITY_VERSION,
         "fov_quality_transform": FOV_QUALITY_TRANSFORM,
         "fov_coverage_source": FOV_COVERAGE_SOURCE,
