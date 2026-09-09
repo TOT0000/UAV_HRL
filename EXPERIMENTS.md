@@ -131,12 +131,13 @@ design-dataset collection, aggregation, and exact-resume workflows.
   is timely
 - production packet injection cutoff `57.5 s`, derived as the 60-second horizon
   minus the maximum production deadline
-- every assigned FOV source runs its existing rate integrator beginning with the
-  first normal post-assignment injection event. Generation is not gated by full
-  RoI coverage, geometry validity, or image-quality validity, and assignment
-  does not create a burst. Every generated FOV packet freezes the authoritative
-  `fov_task_metrics` overlap ratio as `capture_coverage_ratio`, clipped to
-  `[0,1]`; invalid geometry and non-finite values map to `0.0`. The full physical
+- every assigned FOV source runs its rate integrator only when canonical
+  `fov_task_geometry` reports `sensing_valid_now=True`. Invalid intervals create
+  no packets and clear fractional credit; removal, ROI/task reassignment and
+  episode reset also discard that assignment's credit. Valid partial or zero
+  coverage has no separate generation gate. Every generated FOV packet freezes
+  physical size, raw image quantity, ROI/task identity and the authoritative
+  overlap ratio as `capture_coverage_ratio`, clipped to `[0,1]`. The full physical
   `size_bits` remains the queue, service, partial-hop, and routing-reward load.
   Timely FOV useful bits are `size_bits * capture_coverage_ratio`; timely COM
   useful bits are the full `size_bits`; late packets contribute zero useful bits
@@ -217,12 +218,15 @@ ray, so it is model-range-valid but sensing-invalid; G remains one. There is
 no coverage threshold. `Phi_VS` averages all assigned FOV pairs, including
 invalid current poses, or is zero when no pair is assigned.
 
-The independent traffic-model maximum is exactly 31,600 bits. Assigned VS
-continues the existing 5 packets/s rate accumulator and injection cutoff,
-including zero-coverage and zero-bit captures. Each packet freezes
-`size_bits = 31600 * min(I,1)` and `capture_coverage_ratio` at creation. Timely
-useful VS bits are timely physical bits times that frozen coverage. COM and
-the QoS denominator are unchanged.
+The independent traffic-model maximum is exactly 31,600 bits. Assigned VS uses
+the existing 5 packets/s rate accumulator only during valid sensing, retaining
+the injection cutoff. Invalid intervals do not generate or accrue deferred
+credit. Each packet freezes `size_bits = 31600 * min(I,1)`,
+`capture_coverage_ratio`, `capture_image_quantity`, `capture_roi_id` and
+`capture_task_id`. Valid geometry must yield positive finite physical bits;
+inconsistent geometry raises an error before credit or counters change. Timely
+useful VS bits are physical bits times frozen coverage. COM is unchanged;
+the VS QoS denominator now includes only captures generated during valid sensing.
 
 For every assigned COM task, progress is an equal blend of the existing
 deterministic expected S2U capacity normalization and 3-D S2U range-gap
@@ -405,7 +409,7 @@ The randomness audit separates:
   routing decisions, and delivered bits.
 
 Traffic packet creation remains gated by the policy-dependent task assignment.
-Once assigned, a FOV source is not gated by FOV validity; the manifest stores
+An assigned FOV source additionally requires canonical sensing validity; the manifest stores
 only the underlying demand primitive and no policy-dependent coverage snapshot.
 
 ## Commands
@@ -508,7 +512,8 @@ python -X utf8 comparison_experiment.py aggregate --input-dir runs/comparison/ev
 
 Exact-resume checkpoints validate the method fingerprint, training-manifest
 relationship, training seed, the complete Dinkelbach block state, and its configuration.
-Checkpoint schema v26 adds the canonical visual-sensing contract to the 16-UAV action-wise-GS-progress,
+Checkpoint schema v27 requires valid-sensing VS generation and assignment-local
+rate credit in the canonical visual-sensing contract, alongside the 16-UAV action-wise-GS-progress,
 continuous-hard-only-gateway,
 unified-400-m communication, permanent-gateway, coverage-weighted useful
 goodput, boundary-aligned stochastic-channel,
@@ -517,7 +522,7 @@ boundary-aligned current/next decision-state Relay range-progress potential plus
 reward, GS-reachable initial topology, distance-aware VS/COM task potentials,
 hard-range/COM-session, atomic-FOV, seed-ratio
 aggregation, propulsion, and four-slot/fifty-block movement-channel contract.
-Schema v25 and every older schema is rejected before weights or replay state are
+Schema v26 and every older schema is rejected before weights or replay state are
 restored and must be retrained; no legacy checkpoint migration is attempted.
 Model-only evaluation checkpoints also validate the visual version and complete
 camera/coverage/packet/weight/validity configuration. Training and evaluation

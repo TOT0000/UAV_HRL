@@ -20,7 +20,7 @@ DEFAULT_ROI_RADIUS_M = 80.0
 VS_PACKET_MAX_BITS = 31_600.0
 VS_QUALITY_WEIGHT = 0.8
 VS_PROXIMITY_WEIGHT = 0.2
-VISUAL_SENSING_CONTRACT_VERSION = "nadir-search-oblique-vs-partial-v1"
+VISUAL_SENSING_CONTRACT_VERSION = "nadir-search-oblique-vs-valid-capture-v2"
 DISTANCE_EPSILON_M = 1e-9
 SINGULAR_RAY_EPSILON = 1e-8
 
@@ -45,7 +45,10 @@ def visual_sensing_metadata():
         "distance_epsilon_m": DISTANCE_EPSILON_M,
         "singular_ray_epsilon": SINGULAR_RAY_EPSILON,
         "assignment_eligibility": "independent of sensing_valid_now; existing target/role/energy constraints",
-        "invalid_sensing": "I=c=Q=0; assigned VS continues rate-accumulator injection",
+        "packet_generation": "assigned VS generates only while sensing_valid_now is true; no coverage threshold",
+        "invalid_sensing": "I=c=Q=0; no packets or deferred rate credit; fractional credit cleared",
+        "rate_credit_lifecycle": "per UAV/ROI/task; cleared on invalid sensing, removal, reassignment and episode reset",
+        "capture_snapshot": "physical size, coverage, raw image quantity, ROI identity and task identity",
     }
 
 

@@ -1,9 +1,84 @@
 # Canonical visual sensing change record
 
-Base: `feature/centralized-td3`, HEAD `84531f859ed6ab3291d14091e67ba0c8cce6398d`.
+Original geometry change base: `feature/centralized-td3`, HEAD
+`84531f859ed6ab3291d14091e67ba0c8cce6398d`.
 The remote branch was fetched and matched this HEAD before editing. The existing
 untracked ZIP and `tmp/` directory were preserved. No experiment results or PDFs
 were edited, and no push is part of this change.
+
+The valid-capture follow-up below starts from `85d8032`, fetched and confirmed
+equal to `origin/feature/centralized-td3`. The contract descriptions in this
+document reflect that follow-up; the original file inventory and validation
+results are explicitly labeled as historical.
+
+## Valid-capture follow-up
+
+`PacketEngine.inject_packets` reads `fov_task_geometry` before adding credit.
+An invalid result removes that assignment's credit and skips `create_packet`;
+there is no packet object, queue entry, generated/eligible count, or physical
+bit increment. Current assignments use `FOV:<UAV>:<ROI>:<task>` buffer keys.
+At each injection event, keys absent from the current assignment set are
+pruned, including when the source set is empty. Switching ROI or task identity
+therefore starts at zero; returning to an old identity cannot recover its
+discarded credit. `reset_packet_state` clears the whole buffer at episode reset.
+COM buffer keys and generation remain unchanged.
+
+Only valid intervals contribute to the existing rate integrator. At 5 packets/s
+and 0.25 seconds, continuous-valid cumulative counts are 1, 2, 3, 5. Invalid
+intervals discard fractions rather than deferring a burst. Partial coverage is
+accepted, and coverage zero alone does not gate generation. Physical size is
+`31600*min(I,1)`; positive finite image quantity/size are asserted before credit
+changes. Packet fields freeze size, coverage, raw I, ROI ID and task ID, and
+delivery uses the original coverage for useful bits even after reassignment.
+
+Assignment feasibility and movement potential were not edited. In an ordinary
+outside-range pose, Q=0 while G remains positive and increases on approach;
+the pair score stays `0.8*Q+0.2*G`. All 16 registry methods retain the same
+training/evaluation/paper-evaluation route through `HRL_task_aware.train`,
+`_run_routing_slot` and this scheduler. No comparison-specific gate exists.
+
+Visual contract: `nadir-search-oblique-vs-valid-capture-v2`.
+FOV generation contract: `assigned-valid-sensing-rate-integrator-capture-snapshot-v3`.
+Checkpoint schema: **27**, rejecting schema 26 and older before weight loading.
+The shared metadata publishes the gate, credit lifetime and capture snapshot.
+Seeds, CRN, manifests and evaluation pairing are unchanged.
+
+Follow-up files:
+
+- Production: `Packet_scheduler_v1.py`, `visual_sensing.py`,
+  `experiment_config.py`, `training_checkpoint.py`.
+- Documentation: `EXPERIMENTS.md`, `docs/visual_sensing_contract.md`.
+- Behavior tests: `tests/test_vs_packet_generation_gate.py`,
+  `tests/test_visual_sensing.py`, `tests/test_potentials_and_packets.py`,
+  `tests/test_permanent_gateway_useful_goodput.py`.
+- Schema expectations only: `tests/test_channel_boundary_alignment.py`,
+  `tests/test_contract_alignment_v9.py`, `tests/test_design_dataset.py`,
+  `tests/test_gs_progress_routing_contract.py`,
+  `tests/test_initial_topology_contract.py`, `tests/test_relay_task_contract.py`,
+  `tests/test_training_checkpoints.py`, `tests/test_uav16_contract.py`.
+
+The formal VS injection call is the only production caller of `create_packet`.
+It cannot create a zero-bit VS capture: invalid sensing skips creation, and
+inconsistent valid geometry raises. The generic constructor still permits
+explicit zero-sized packets for compatibility; it is not an alternate formal
+VS generation path. No FIFO rewrite was needed.
+
+Follow-up validation used `anaconda3/envs/LLM_HRL/python.exe`:
+
+- Targeted packet, visual sensing, assignment and movement potential tests:
+  **129 passed, 51 subtests passed** in 7.21 seconds.
+- Training/model-checkpoint/evaluation round-trip, paper registry and evaluation
+  smoke tests: **28 passed, 26 subtests passed** in 9.99 seconds.
+- Full suite: `python -u -m pytest tests -q -p no:cacheprovider --tb=short
+  --disable-warnings --durations=5`: **637 passed, 373 subtests passed**, with
+  228 non-failing warnings, in 359.59 seconds.
+- `git diff --check` passed. `rg` found only the shared formal injection call
+  and its single VS constructor call, and no obsolete active metadata claiming
+  that invalid sensing continues injection. Production episode reset calls
+  `reset_packet_state`, which clears all injection buffers.
+
+The original untracked ZIP and `tmp/` are preserved. No PDF or existing
+experiment result was changed, and no push was performed.
 
 ## Geometry and shared execution paths
 
@@ -39,7 +114,8 @@ TD3/DDPG, Dinkelbach/ratio, task observation/potential ablations and
 safe-DDQN/DQN/random routing therefore share the visual model.
 
 `centralized_movement.fov_task_geometry` resolves the assigned target object;
-`fov_task_metrics` is its tuple adapter for packet generation and observations.
+`fov_task_metrics` is its tuple adapter for observations; packet injection reads
+the canonical geometry result directly.
 Assignment uses the same geometry result. Eligibility retains valid positions,
 altitude and target checks, plus existing orchestration/role/task-count rules;
 it never masks a pair merely because `sensing_valid_now` is false. Outside the
@@ -54,13 +130,19 @@ VS polygon. `paper_figures` draws oblique polygons at the ROI ground altitude.
 
 `VS_PACKET_MAX_BITS=31600` is an independent traffic-model constant.
 `Packet_scheduler_v1.fov_physical_packet_size_bits` applies `31600*min(I,1)`
-with the existing finite-value sanitization. The 5 packets/s accumulator,
-injection cutoff, zero-coverage/zero-bit injection, QoS eligibility and COM
-behavior are unchanged. Each capture freezes physical size and coverage;
+with the existing finite-value sanitization. The formal injection path first
+requires `sensing_valid_now`, then asserts positive finite image quantity and
+physical size. Only valid sensing accrues the 5 packets/s accumulator; invalid
+intervals clear fractional credit without creating packets or updating counters.
+Credit is scoped to UAV/ROI/task and pruned on removal/reassignment; episode
+reset clears it. Partial or zero coverage is not another generation gate.
+The injection cutoff, generic FIFO, QoS eligibility definition and COM behavior
+are unchanged. Each capture freezes physical size, coverage, raw image quantity
+and ROI/task identity; the VS QoS denominator excludes invalid intervals;
 timely useful VS bits equal timely physical bits times capture coverage.
 
-Checkpoint schema 26 requires the complete visual contract configuration and
-version for both full resume and model-only evaluation. Schema 25 and older,
+Checkpoint schema 27 requires the complete visual contract configuration and
+version for both full resume and model-only evaluation. Schema 26 and older,
 missing visual metadata, or changed camera/coverage/packet/weight/validity
 metadata fail before loading weights. All affected methods must be retrained.
 Training/evaluation configs and metadata publish the canonical configuration.
@@ -89,7 +171,7 @@ in `object.py` remains disabled; its camera construction now uses the facade's
 canonical defaults. Historical packet-state helper field layouts are retained
 and obtain image quantity through `fov_task_metrics`.
 
-## Changed files
+## Original geometry change: files
 
 Production and documentation:
 
@@ -132,7 +214,7 @@ expectations affected by this change):
 - `tests/test_training_checkpoints.py`
 - `tests/test_uav16_contract.py`
 
-## Validation
+## Original geometry change: validation
 
 Deterministic geometry tests cover camera ownership, nadir size, inclusive
 Search discovery, footprint identity, non-Search exclusion, bearing rotation,

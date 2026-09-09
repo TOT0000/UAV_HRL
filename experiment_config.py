@@ -181,7 +181,7 @@ PACKET_QOS_CONTRACT_VERSION = (
     "assigned-fov-and-activated-com-immediate-qos-v8"
 )
 FOV_PACKET_GENERATION_CONTRACT_VERSION = (
-    "assigned-source-rate-integrator-capture-coverage-snapshot-v2"
+    "assigned-valid-sensing-rate-integrator-capture-snapshot-v3"
 )
 TIMELY_USEFUL_GOODPUT_CONTRACT_VERSION = (
     "fov-capture-coverage-weighted-com-full-timely-bits-v1"

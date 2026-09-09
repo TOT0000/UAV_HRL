@@ -1,5 +1,6 @@
 import inspect
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import numpy as np
@@ -43,7 +44,7 @@ class VisualSensingPacketGenerationTest(unittest.TestCase):
         self.env.multi_tasks[0] = [self.task]
         self.env.source_uavs = {0}
 
-    def test_assignment_generates_for_valid_and_zero_coverage_geometry(self):
+    def test_assignment_generates_only_for_valid_geometry(self):
         self.assertTrue(fov_task_metrics(self.env, 0, self.task)[2])
         self.packet_engine.inject_packets(
             self.env,
@@ -65,10 +66,8 @@ class VisualSensingPacketGenerationTest(unittest.TestCase):
             step_time=0.25,
             base_fov_rate=4,
         )
-        self.assertEqual(self.packet_engine.active_count(), 2)
-        new_packet = self.packet_engine.get_active_packets()[1]
-        self.assertEqual(new_packet["capture_coverage_ratio"], 0.0)
-        self.assertEqual(self.packet_engine.eligible_packet_counts["FOV"], 2)
+        self.assertEqual(self.packet_engine.active_count(), 1)
+        self.assertEqual(self.packet_engine.eligible_packet_counts["FOV"], 1)
 
         # Capture quality is frozen per packet and does not change physical FIFO.
         result = self.packet_engine.serve_active_links(
@@ -88,8 +87,8 @@ class VisualSensingPacketGenerationTest(unittest.TestCase):
 
     def test_image_score_outside_old_validity_gate_still_injects(self):
         with patch(
-            "Packet_scheduler_v1.fov_task_metrics",
-            return_value=(1.0, 1.5, True),
+            "Packet_scheduler_v1.fov_task_geometry",
+            return_value=SimpleNamespace(coverage_ratio=1.0, image_quantity=1.5, sensing_valid_now=True),
         ):
             self.packet_engine.inject_packets(
                 self.env,

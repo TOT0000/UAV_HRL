@@ -441,7 +441,7 @@ class RelayRoutingCheckpointDiagnosticsTest(unittest.TestCase):
         self.assertAlmostEqual(relay_shaping_sum, 0.0, places=12)
 
     def test_old_checkpoint_fails_before_loading(self):
-        self.assertEqual(CHECKPOINT_SCHEMA_VERSION, 26)
+        self.assertEqual(CHECKPOINT_SCHEMA_VERSION, 27)
         with self.assertRaisesRegex(RuntimeError, "Relay.*retrained"):
             _validate_checkpoint_schema({"checkpoint_schema_version": 23})
 

@@ -12,7 +12,7 @@ from Channel_model import (
     reference_u2g_max_capacity_mbps,
     reference_u2u_max_capacity_mbps,
 )
-from centralized_movement import fov_task_metrics
+from centralized_movement import fov_task_geometry, fov_task_metrics
 from communication_contract import normalized_gs_progress
 from experiment_config import (
     COM_SESSION_LIFECYCLE_VERSION,
@@ -906,6 +906,9 @@ class PacketEngine:
         generation_time,
         *,
         capture_coverage_ratio=None,
+        capture_image_quantity=None,
+        capture_roi_id=None,
+        capture_task_id=None,
     ):
         """Create a UAV-origin FOV packet and enqueue it at its source UAV."""
 
@@ -918,6 +921,14 @@ class PacketEngine:
             qos_eligible=True,
             capture_coverage_ratio=capture_coverage_ratio,
         )
+        if pkt["task_type"] == "FOV":
+            pkt.update(
+                capture_image_quantity=(
+                    None if capture_image_quantity is None else float(capture_image_quantity)
+                ),
+                capture_roi_id=None if capture_roi_id is None else int(capture_roi_id),
+                capture_task_id=None if capture_task_id is None else int(capture_task_id),
+            )
         self.enqueue_packet(pkt, source, generation_time)
         return pkt
 
@@ -2299,50 +2310,50 @@ class PacketEngine:
         base_fov_rate  = base_fov_rate  * load_factor
         base_ctrl_rate = base_ctrl_rate * load_factor
 
-        for uav_id in env.source_uavs:
-            task_list = env.multi_tasks.get(uav_id, [])
-            for task in task_list:
-                task_type = task["task_type"]
-                if task_type != "FOV":
-                    continue
-                rate = base_fov_rate
-                
-                # === 基於速率積分的封包計數 ===
-                key = f"{uav_id}_{task_type}"
-                self.inject_buffer[key] += rate * step_time
-                num_packets = int(self.inject_buffer[key])
-                if num_packets <= 0:
-                    continue
-                self.inject_buffer[key] -= num_packets
+        # Credit belongs to the current UAV/ROI/task assignment. Prune even
+        # when there are no sources, so removal cannot preserve a fraction.
+        fov_assignments = {
+            f"FOV:{int(uav_id)}:{int(task['target_obj_id'])}:{task.get('target_id')}":
+                (uav_id, task)
+            for uav_id in env.source_uavs
+            for task in env.multi_tasks.get(uav_id, [])
+            if task["task_type"] == "FOV"
+        }
+        for key in list(self.inject_buffer):
+            if key.startswith("FOV:") and key not in fov_assignments:
+                del self.inject_buffer[key]
 
-                # === 檢查剩餘封包名額 ===
-                # if self.target_total_packets is not None:
-                #     remain = self.target_total_packets - self.total_injected_packets
-                #     if remain <= 0:
-                #         return
-                #     if num_packets > remain:
-                #         num_packets = remain
+        for key, (uav_id, task) in fov_assignments.items():
+            geometry = fov_task_geometry(env, uav_id, task)
+            if not geometry.sensing_valid_now:
+                self.inject_buffer.pop(key, None)
+                continue
 
-                coverage_ratio, image_quantity, _geometry_valid = fov_task_metrics(
-                    env, uav_id, task
+            # Invalid captures never reach credit, packet creation or counters.
+            # A valid canonical footprint has positive finite I. Fail loudly
+            # on inconsistent geometry instead of sanitizing it into zero bits.
+            image_quantity = float(geometry.image_quantity)
+            pkt_bits = fov_physical_packet_size_bits(image_quantity)
+            if (not math.isfinite(image_quantity) or image_quantity <= 0.0
+                    or not math.isfinite(pkt_bits) or pkt_bits <= 0.0):
+                raise ValueError("valid VS geometry must yield positive finite packet size")
+            capture_coverage_ratio = sanitize_capture_coverage_ratio(
+                geometry.coverage_ratio
+            )
+            self.inject_buffer[key] += base_fov_rate * step_time
+            num_packets = int(self.inject_buffer[key])
+            self.inject_buffer[key] -= num_packets
+            for _ in range(num_packets):
+                self.create_packet(
+                    uav_id,
+                    "FOV",
+                    pkt_bits,
+                    current_time,
+                    capture_coverage_ratio=capture_coverage_ratio,
+                    capture_image_quantity=image_quantity,
+                    capture_roi_id=task["target_obj_id"],
+                    capture_task_id=task.get("target_id"),
                 )
-                capture_coverage_ratio = sanitize_capture_coverage_ratio(
-                    coverage_ratio
-                )
-                pkt_bits = fov_physical_packet_size_bits(image_quantity)
-
-                for _ in range(num_packets):
-                    self.create_packet(
-                        uav_id,
-                        task_type,
-                        pkt_bits,
-                        current_time,
-                        capture_coverage_ratio=capture_coverage_ratio,
-                    )
-                    # self.total_injected_packets += 1
-                    # if self.total_injected_packets >= self.target_total_packets:
-                    #     print(f"✅ Packet quota reached: {self.total_injected_packets}")
-                    #     return
 
         # COM generation begins only after its assigned UAV first enters the
         # inclusive canonical 400 m S2U range. Activation persists for the

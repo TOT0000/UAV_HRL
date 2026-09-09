@@ -310,7 +310,7 @@ class PermanentGatewayProjectionTest(unittest.TestCase):
 
 
 class CoverageWeightedUsefulGoodputTest(unittest.TestCase):
-    def test_zero_and_invalid_coverage_still_generate_qos_packets(self):
+    def test_valid_geometry_zero_coverage_still_generates_qos_packets(self):
         env = Simulator(num_UAV=NUM_UAV)
         env.num_GT = 2
         env.reset_environment()
@@ -326,8 +326,8 @@ class CoverageWeightedUsefulGoodputTest(unittest.TestCase):
         env.source_uavs = {1}
         engine = PacketEngine(num_uav=NUM_UAV)
         with mock.patch(
-            "Packet_scheduler_v1.fov_task_metrics",
-            return_value=(float("nan"), 0.8, False),
+            "Packet_scheduler_v1.fov_task_geometry",
+            return_value=SimpleNamespace(coverage_ratio=0.0, image_quantity=0.8, sensing_valid_now=True),
         ):
             engine.inject_packets(
                 env,

@@ -206,7 +206,7 @@ def test_fixed_packet_size(quantity, expected):
         assert fov_physical_packet_size_bits(quantity) == expected
 
 
-def test_injection_rate_zero_coverage_capture_freeze_and_useful_bits():
+def test_invalid_injection_capture_freeze_and_useful_bits():
     env, target, uav, descriptor = environment()
     env.multi_tasks[1] = [descriptor]
     env.source_uavs = {1}
@@ -219,10 +219,10 @@ def test_injection_rate_zero_coverage_capture_freeze_and_useful_bits():
     uav.x_u = target.x+1000
     for time in (.25,.5,.75):
         engine.inject_packets(env,delay_bound_steps=20,current_time=time,step_time=.25)
-    assert engine.generated_packet_counts['FOV'] == 5
-    assert engine.eligible_packet_counts['FOV'] == 5
-    assert all(p['size_bits'] == p['capture_coverage_ratio'] == 0
-               for p in engine.get_active_packets()[1:])
+    assert engine.generated_packet_counts['FOV'] == 1
+    assert engine.eligible_packet_counts['FOV'] == 1
+    assert engine.active_count() == 1
+    assert not engine.inject_buffer
     assert (first['size_bits'],first['capture_coverage_ratio']) == captured
     # Move into GS range; old capture stays unchanged during delivery.
     uav.x_u, uav.y_u, uav.z_u = env.GS_pos[0], env.GS_pos[1], 100
@@ -249,7 +249,15 @@ def test_all_method_assignments_share_visual_model(method_id):
     assert cfg['visual_sensing_configuration'] == visual_sensing_metadata()
     env.source_uavs = {uid}
     engine = PacketEngine(num_uav=16, step_time=.25)
+    # Every registry method follows the same invalid -> valid scheduler gate.
+    selected_uav = env.uav_dict[uid]
+    selected_uav.x_u, selected_uav.y_u, selected_uav.z_u = target.x+1000, target.y, 100
     engine.inject_packets(env, delay_bound_steps=20, current_time=0, step_time=.25)
+    assert not engine.packet_pool
+    assert not engine.inject_buffer
+    selected_uav.x_u = target.x
+    g = fov_task_geometry(env,uid,descriptor)
+    engine.inject_packets(env, delay_bound_steps=20, current_time=.25, step_time=.25)
     packet = engine.get_active_packets()[0]
     assert packet['size_bits'] == fov_physical_packet_size_bits(g.image_quantity)
     assert packet['capture_coverage_ratio'] == g.coverage_ratio
