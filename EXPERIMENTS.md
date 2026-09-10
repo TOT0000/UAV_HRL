@@ -325,7 +325,7 @@ and horizontal target geometry and is independent of the communication range.
 Both blends use weights `0.5/0.5` and are finite in `[0,1]`.
 
 The task-potential contract is
-`oblique-vs-com-final-witness-relay-potential-v10`. TD3 and DDPG
+`oblique-vs-com-final-witness-relay-potential-v11`. TD3 and DDPG
 consume the same potential definitions, random-movement methods publish the
 same environment/reward contract, and `*_no_task_potential` methods disable all
 Search/VS/COM/Relay shaping. Existing observations already contain UAV and task

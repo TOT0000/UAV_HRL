@@ -13,7 +13,7 @@ from evaluation_aggregation import aggregate_relay_planning
 
 RELAY_DIAGNOSTICS_FILENAME = "relay_diagnostics.json"
 RELAY_DIAGNOSTICS_OUTPUT_CONTRACT_VERSION = (
-    "snapshot-virtual-relay-planning-forwarding-json-v5"
+    "snapshot-virtual-relay-planning-forwarding-json-v6"
 )
 RELAY_BITS_SUM_REL_TOL = 1e-15
 RELAY_BITS_SUM_ABS_TOL = 1e-6
@@ -86,6 +86,36 @@ def validate_relay_plan(plan):
         raise ValueError("Relay slot mapping/count mismatch")
     if len(set(plan["slot_to_uav"].values())) != assigned:
         raise ValueError("Relay UAV assignments must be exclusive")
+    consistency_converged = plan["final_witness_consistency_converged"]
+    fallback_used = plan["final_witness_consistency_fallback_used"]
+    iterations = plan["final_witness_consistency_iterations"]
+    iteration_cap = plan["final_witness_consistency_iteration_cap"]
+    if type(consistency_converged) is not bool or type(fallback_used) is not bool:
+        raise ValueError("Relay final-witness consistency flags must be boolean")
+    if (
+        type(iterations) is not int
+        or type(iteration_cap) is not int
+        or not 0 <= iterations <= iteration_cap
+        or iteration_cap <= 0
+    ):
+        raise ValueError("Relay final-witness consistency iteration count is invalid")
+    if fallback_used:
+        if consistency_converged:
+            raise ValueError("Relay final-witness fallback cannot be converged")
+        if plan["final_witness_consistency_fallback_reason"] not in {
+            "cycle_detected", "iteration_cap"
+        }:
+            raise ValueError("Relay final-witness fallback reason is invalid")
+        if plan["final_witness_consistency_fallback_policy"] != (
+            "frozen_validated_pre_budget_positions"
+        ):
+            raise ValueError("Relay final-witness fallback policy is invalid")
+    elif (
+        not consistency_converged
+        or plan["final_witness_consistency_fallback_reason"] is not None
+        or plan["final_witness_consistency_fallback_policy"] is not None
+    ):
+        raise ValueError("Relay final-witness convergence diagnostics disagree")
     retained_slot_ids = {slot["slot_id"] for slot in plan["slots"]}
     predicted_groups = (
         set(plan["predicted_fully_supported_source_ids"]),
@@ -150,10 +180,15 @@ def validate_relay_plan(plan):
             raise ValueError("Relay active neighbors disagree with final witnesses")
         if slot["support_status"] not in {"full", "partial", "infeasible"}:
             raise ValueError("Relay slot support status is invalid")
-        if bool(slot["shared"]) != (
-            len(set(slot["supported_source_ids_before_budget"])) >= 2
-        ):
-            raise ValueError("Relay shared status must use distinct planning sources")
+        supported_after_budget = sorted(set(
+            slot["fully_supported_source_ids_after_budget"]
+        ).union(slot["partially_supported_source_ids_after_budget"]))
+        if slot["supported_source_ids"] != supported_after_budget:
+            raise ValueError("Relay final supported sources disagree with support classes")
+        if bool(slot["shared"]) != (len(supported_after_budget) >= 2):
+            raise ValueError(
+                "Relay shared status must use final distinct planning sources"
+            )
     _validate_finite_json_value(plan)
     return plan
 

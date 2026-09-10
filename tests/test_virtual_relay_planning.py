@@ -14,8 +14,9 @@ from relay_contract import (
     movement_bounds, pair_relay_slots, plan_relays,
     rebuild_after_budget_metadata, refresh_relay_targets,
     predicted_post_assignment_diagnostics, relay_potential, relay_snapshot,
-    reverse_bfs, valid_in_air_backlog, virtual_positions,
+    reverse_bfs, valid_in_air_backlog, virtual_positions, witness_paths,
 )
+from relay_diagnostics import validate_relay_plan
 
 
 def environment(points, weights=None):
@@ -281,6 +282,178 @@ def test_after_budget_active_neighbors_follow_final_witness_without_stale_nodes(
     assert slot['active_neighbor_ids_after_budget'] == [1,3]
     assert 2 not in slot['active_neighbor_ids_after_budget']
     assert slot['missing_neighbor_ids_after_budget'] == []
+
+
+def test_final_two_source_support_promotes_shared_and_uses_active_minimax():
+    env = environment([
+        (0,0,100),
+        (900,0,100),
+        (900,100,100),
+        (300,0,100),
+    ])
+    slot = {
+        'slot_id': 'relay-0001-0001',
+        'virtual_position': [600.,0.,100.],
+        'shared': False,
+        'L_s': 1,
+        'F_s': 3,
+        'chain_index': 1,
+        'chain_count': 1,
+        'neighbor_ids': [1,3],
+        'neighbor_ids_before_budget': [1,3],
+        'active_neighbor_ids_after_budget': [1,3],
+        'missing_neighbor_ids_after_budget': [],
+        'supported_source_ids': [1],
+        'supported_source_ids_before_budget': [1],
+        'fully_supported_source_ids_after_budget': [],
+        'partially_supported_source_ids_after_budget': [],
+        'support_status': 'infeasible',
+        'witness_paths': {'1': [1, 'relay-0001-0001', 3, env.GS_ID]},
+    }
+    rebuilt = rebuild_after_budget_metadata(
+        env, [slot], {slot['slot_id']: slot['virtual_position']},
+        [1,2], {1:1., 2:1.},
+    )
+    assert slot['supported_source_ids'] == [1,2]
+    assert slot['shared'] is True
+    assert slot['active_neighbor_ids_after_budget'] == [1,2,3]
+    expected, _ = bounded_minimax_center(
+        [env.uav_dict[uid].position for uid in [1,2,3]],
+        movement_bounds(env),
+    )
+    np.testing.assert_allclose(slot['virtual_position'], expected, atol=1e-6)
+    assert rebuilt['consistency_converged'] is True
+    assert rebuilt['consistency_fallback_used'] is False
+
+
+def test_final_one_source_support_demotes_shared_and_keeps_bridge_interpolation():
+    env = environment([
+        (0,0,100),
+        (900,0,100),
+        (100,0,100),
+        (300,0,100),
+    ])
+    slot = {
+        'slot_id': 'relay-0001-0001',
+        'virtual_position': [600.,0.,100.],
+        'shared': True,
+        'L_s': 1,
+        'F_s': 3,
+        'chain_index': 1,
+        'chain_count': 1,
+        'neighbor_ids': [1,2,3],
+        'neighbor_ids_before_budget': [1,2,3],
+        'active_neighbor_ids_after_budget': [1,2,3],
+        'missing_neighbor_ids_after_budget': [],
+        'supported_source_ids': [1,2],
+        'supported_source_ids_before_budget': [1,2],
+        'fully_supported_source_ids_after_budget': [],
+        'partially_supported_source_ids_after_budget': [],
+        'support_status': 'infeasible',
+        'witness_paths': {
+            '1': [1, 'relay-0001-0001', 3, env.GS_ID],
+            '2': [2, env.GS_ID],
+        },
+    }
+    rebuilt = rebuild_after_budget_metadata(
+        env, [slot], {slot['slot_id']: slot['virtual_position']},
+        [1,2], {1:1., 2:1.},
+    )
+    assert slot['supported_source_ids'] == [1]
+    assert slot['shared'] is False
+    assert slot['active_neighbor_ids_after_budget'] == [1,3]
+    np.testing.assert_allclose(slot['virtual_position'], [600.,0.,100.])
+    assert rebuilt['consistency_converged'] is True
+    assert rebuilt['consistency_fallback_used'] is False
+
+
+def test_after_budget_position_cycle_uses_deterministic_frozen_fallback():
+    env = environment([(0,0,100),(700,0,100),(0,0,100)], {1:10})
+    plan = plan_relays(env, [1], [2])
+    pair_relay_slots(env, plan, [2])
+    original_mapping = copy.deepcopy(plan['slot_to_uav'])
+    original_count = len(plan['slots'])
+    frozen = {
+        slot['slot_id']: np.asarray(slot['virtual_position'], dtype=float)
+        for slot in plan['slots']
+    }
+
+    def run_once():
+        local_slots = copy.deepcopy(plan['slots'])
+        calls = 0
+
+        def oscillating_positions(environment, slots):
+            nonlocal calls
+            calls += 1
+            offset = 10. if calls % 2 else 0.
+            updated = {
+                sid: position + np.array([offset, 0., 0.])
+                for sid, position in frozen.items()
+            }
+            return updated, {sid: {'mock': True} for sid in updated}
+
+        with mock.patch(
+            'relay_contract.virtual_positions', side_effect=oscillating_positions
+        ):
+            rebuilt = rebuild_after_budget_metadata(
+                env, local_slots, frozen, [1], {1:10.}
+            )
+        return local_slots, rebuilt
+
+    first_slots, first = run_once()
+    second_slots, second = run_once()
+    def comparable(rebuilt):
+        result = copy.deepcopy(rebuilt)
+        result['positions'] = {
+            sid: position.tolist() for sid, position in result['positions'].items()
+        }
+        return result
+
+    assert comparable(first) == comparable(second)
+    assert first['consistency_converged'] is False
+    assert first['consistency_fallback_used'] is True
+    assert first['consistency_fallback_reason'] == 'cycle_detected'
+    assert first['consistency_fallback_policy'] == (
+        'frozen_validated_pre_budget_positions'
+    )
+    assert first_slots == second_slots
+    assert first['witness_paths'] == second['witness_paths']
+    assert first['position_status'] == second['position_status']
+    for sid, position in frozen.items():
+        np.testing.assert_array_equal(first['positions'][sid], position)
+        np.testing.assert_array_equal(second['positions'][sid], position)
+    expected_paths = witness_paths(
+        connectivity_graph(env, frozen), env.GS_ID, [1]
+    )
+    assert first['witness_paths'] == expected_paths
+    slot = first_slots[0]
+    assert slot['active_neighbor_ids_after_budget'] == [1,env.GS_ID]
+    assert slot['fully_supported_source_ids_after_budget'] == [1]
+
+    plan['slots'] = first_slots
+    plan['budget_witness_paths'] = {
+        str(source): path for source, path in first['witness_paths'].items()
+    }
+    plan['position_status'] = first['position_status']
+    plan['final_witness_consistency_converged'] = first['consistency_converged']
+    plan['final_witness_consistency_fallback_used'] = first[
+        'consistency_fallback_used'
+    ]
+    plan['final_witness_consistency_fallback_reason'] = first[
+        'consistency_fallback_reason'
+    ]
+    plan['final_witness_consistency_fallback_policy'] = first[
+        'consistency_fallback_policy'
+    ]
+    plan['final_witness_consistency_iterations'] = first[
+        'consistency_iterations'
+    ]
+    plan['final_witness_consistency_iteration_cap'] = first[
+        'consistency_iteration_cap'
+    ]
+    validate_relay_plan(plan)
+    assert len(plan['slots']) == original_count
+    assert plan['slot_to_uav'] == original_mapping
 
 
 def test_predicted_assignment_topology_has_one_position_per_uav_and_is_pure():

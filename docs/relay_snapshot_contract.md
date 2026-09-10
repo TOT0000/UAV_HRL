@@ -1,7 +1,7 @@
 # Relay snapshot 規劃與 TD3 movement shaping 變更
 
 日期：2026-09-10。分支：`feature/centralized-td3`。
-本次修正前 HEAD：`a37cec7122eea795f69c9c6beb18eebf14cbcb3a`。
+本次修正前 HEAD：`50c19a5440b1969e5a8992a13765aefebfa804d7`。
 
 ## 修改前的 production 行為
 
@@ -19,8 +19,8 @@
 3. Planning sources 為有效且未過期的 in-air FOV／COM queue owners，加上本輪 prospective service UAV。SR ground backlog 不計；prospective zero backlog 權重為零。
 4. 使用全部合法 routing UAV 節點，以 3D 400 m 圖與 reverse BFS 求 GS reachability。U2G 判斷共用原 production 的距離 eligibility，不參考 channel samples。
 5. 各斷聯來源取最近的實體 source／GS component endpoints，建立 `ceil(d/400)-1` 個等距 candidates；以固定順序逐一測試 zero-loss deletion。
-6. 從 deterministic witnesses 收集固定 neighbors。只有支援至少兩個不同 source ID 的 slot 才標記 shared；單一來源的普通兩鄰居 chain 保持 non-shared。shared 使用 bounded minimax，non-shared 使用原 bridge interpolation。數值失敗有 deterministic fallback；規劃時無效 merge 會恢復 candidates，必要時回到原始 bridge-chain witnesses。
-7. 不足時每一步重新計算 marginal backlog loss，按 loss、斷聯來源數、slot ID 刪除。保留 budget 前 required、available、assigned、shortage 四個不同數值。pruning 後，full source 的 active neighbors 只取 deterministic final witness 上的直接前驅／後繼 union；partial slot 保留原路徑中仍存在的直接鄰居，已 pruning 的虛擬鄰居只列為 missing。bounded deterministic iteration 同步 witness、virtual position 與 metadata，但不改 slot 或 owner；partial slot 繼續分配。
+6. 從 deterministic witnesses 收集固定 neighbors。Budget 後的 `shared` 只看 final full 與 partial support 的 source-ID union：至少兩個來源才是 shared，零或一個來源是 non-shared；`supported_source_ids`、`shared`、final witness metadata 與位置更新使用同一份結果。shared 使用 final active neighbors 的 bounded minimax，non-shared 使用原 bridge interpolation。數值失敗有 deterministic fallback；規劃時無效 merge 會恢復 candidates，必要時回到原始 bridge-chain witnesses。
+7. 不足時每一步重新計算 marginal backlog loss，按 loss、斷聯來源數、slot ID 刪除。保留 budget 前 required、available、assigned、shortage 四個不同數值。pruning 後，full source 的 active neighbors 只取 deterministic final witness 上的直接前驅／後繼 union；partial slot 保留原路徑中仍存在的直接鄰居，已 pruning 的虛擬鄰居只列為 missing。bounded deterministic iteration 以 position、witness path 與 metadata 的完整 signature 判斷固定點。偵測到 signature cycle 或達 iteration cap 時，恢復傳入函式且已通過 pre-budget validation 的 retained positions，以 frozen positions 一次重建 graph、final witnesses、active/missing neighbors、support classes 與 shared，之後不再移動位置。這個 fallback 不改 slot、owner、priority、mapping 或任務；partial slot 繼續分配。
 8. K-KM／KM 按 slot 重要性，依 raw 3D distance greedy 配對剩餘 UAV；Random 使用正式 assignment RNG。Relay 永遠 exclusive，沒有 Relay utility matrix／Hungarian。
 9. Greedy mapping 後建立唯讀 predicted topology：assigned Relay UAV 只在 virtual position 出現一次，其餘 UAV 保留 physical position，再以 reverse BFS 分類 full／partial／unsupported source 並記錄 self-neighbor 與 relocated-anchor conflicts。physical anchor 被重新配置時，只有 required predicted 3D edge 實際不存在才列為 conflict；仍在 inclusive 400 m 內不列入。診斷不改 mapping、任務或數量。
 10. 兩次 RoI boundary 間固定 slot／UAV／anchor／neighbor 身分，只更新位置。Search release 只轉 Hover，不再重新分配服務或 Relay。
@@ -37,7 +37,7 @@ Safe-DDQN 的 143-D observation、48-D joint movement action、routing actions�
 
 ## Diagnostics 與限制
 
-`relay_diagnostics.json` v5 包含完整 assignment planning events、candidate removal tests、budget loss tests、mapping／raw assignment distances、final-witness budget support、predicted topology／實際斷鏈 identity conflicts、角色變更，以及各 movement boundary 的 compact targets／potential／feasibility／physical reachability snapshots。每筆 movement transition 另記 `relay_assignment_changed_at_boundary`、`relay_shaping_enabled`、raw difference 與 applied shaping。
+`relay_diagnostics.json` v6 包含完整 assignment planning events、candidate removal tests、budget loss tests、mapping／raw assignment distances、final-witness budget support、predicted topology／實際斷鏈 identity conflicts、角色變更，以及各 movement boundary 的 compact targets／potential／feasibility／physical reachability snapshots。Final-witness consistency 另記是否收斂、是否使用 fallback、`cycle_detected`／`iteration_cap` 原因、`frozen_validated_pre_budget_positions` policy、實際 iteration 數與 cap。每筆 movement transition 另記 `relay_assignment_changed_at_boundary`、`relay_shaping_enabled`、raw difference 與 applied shaping。
 
 Evaluation aggregation 分別加總 episode-final required、available、assigned、shortage，並統計 disconnected source-boundary 與 infeasible slot-boundary observations。零 Relay 的各方法仍使用一致 schema 與輸出檔案。Validation 檢查 count／mapping／summary 一致性及有限值。
 
@@ -64,9 +64,9 @@ Evaluation aggregation 分別加總 episode-final required、available、assigne
 - Evaluation smoke：K-KM／KM／Random 三方法各先產生小型 model checkpoint，再經正式 checkpoint loading 執行 1-second evaluation，驗證零 Relay artifact round trip。
 - 全部 regression：`python -u -m pytest tests -q -p no:cacheprovider --tb=short --disable-warnings`。
 
-最終完整 regression：**668 passed、373 subtests passed**，356.73 秒。
-Relay contract／task-reset／diagnostics suite：**78 passed、16 subtests passed**。
-Replay／checkpoint／assignment／integration suite：**132 passed、67 subtests passed**。
+最終完整 regression：**671 passed、373 subtests passed**，360.54 秒。
+Relay planning／diagnostics direct suite：**47 passed**。
+Relay／task-reset／replay／checkpoint／assignment／integration suite：**166 passed、95 subtests passed**。
 完整 suite 包含上述 training 與 evaluation smoke；沒有未解決的測試失敗。
 Pytest 另輸出 228 個第三方／既有 warning，未停用其收集，只以 `--disable-warnings` 隱藏冗長列表。
 `git diff --check` 通過。

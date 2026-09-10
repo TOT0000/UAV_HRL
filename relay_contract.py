@@ -207,6 +207,12 @@ def empty_plan():
             "unsupported_source_ids_after_budget": [],
             "supported_backlog_bits_after_budget": 0.,
             "unsupported_backlog_bits_after_budget": 0.,
+            "final_witness_consistency_converged": True,
+            "final_witness_consistency_fallback_used": False,
+            "final_witness_consistency_fallback_reason": None,
+            "final_witness_consistency_fallback_policy": None,
+            "final_witness_consistency_iterations": 0,
+            "final_witness_consistency_iteration_cap": POSITION_MAX_ITER,
             "slots": [], "slot_to_uav": {}, "position_status": {},
             "current_source_reachability": {},
             "predicted_post_assignment_reachability": {},
@@ -310,8 +316,16 @@ def virtual_positions(env, slots):
 
 
 def rebuild_after_budget_metadata(env, slots, positions, sources, weights):
-    """Synchronize final witnesses, positions and neighbor metadata after pruning."""
+    """Synchronize budget-final witnesses, positions, support and neighbors.
+
+    A repeated state or iteration cap freezes the validated incoming positions
+    and rebuilds diagnostics once without any further target movement.
+    """
     retained = set(positions)
+    frozen_positions = {
+        sid: np.asarray(position, dtype=float).copy()
+        for sid, position in positions.items()
+    }
 
     def apply_metadata(final_paths):
         fully = sorted(source for source, path in final_paths.items() if path)
@@ -371,7 +385,7 @@ def rebuild_after_budget_metadata(env, slots, positions, sources, weights):
                     else "partial" if partial_for_slot
                     else "infeasible"
                 ),
-                shared=len(set(slot["supported_source_ids_before_budget"])) >= 2,
+                shared=len(set(supported_after_budget)) >= 2,
                 budget_witness_paths={
                     str(source): list(final_paths[source])
                     for source in full_for_slot
@@ -393,14 +407,68 @@ def rebuild_after_budget_metadata(env, slots, positions, sources, weights):
         )
         return fully, partial, unsupported, signature
 
-    positions = {
-        sid: np.asarray(position, dtype=float) for sid, position in positions.items()
-    }
-    for _ in range(POSITION_MAX_ITER):
+    def consistency_signature(current_positions, metadata_signature):
+        return (
+            tuple(
+                (sid, tuple(map(float, current_positions[sid])))
+                for sid in sorted(current_positions)
+            ),
+            metadata_signature,
+        )
+
+    def frozen_position_status(iterations):
+        nodes = physical_positions(env)
+        nodes[env.GS_ID] = np.asarray(env.GS_pos, dtype=float)
+        nodes.update(frozen_positions)
+        low, high = movement_bounds(env)
+        status = {}
+        for slot in slots:
+            sid = slot["slot_id"]
+            neighbor_ids = slot["active_neighbor_ids_after_budget"]
+            missing = [neighbor for neighbor in neighbor_ids if neighbor not in nodes]
+            radius = max(
+                (
+                    math.dist(frozen_positions[sid], nodes[neighbor])
+                    for neighbor in neighbor_ids
+                    if neighbor in nodes
+                ),
+                default=0.,
+            )
+            budget_missing = list(slot["missing_neighbor_ids_after_budget"])
+            status[sid] = {
+                "clipped": bool(np.any(
+                    frozen_positions[sid] != np.clip(frozen_positions[sid], low, high)
+                )),
+                "minimax": None,
+                "position": frozen_positions[sid].tolist(),
+                "radius_m": radius,
+                "active_neighbors_feasible": not missing and radius <= RANGE_M,
+                "feasible": (
+                    not missing and not budget_missing and radius <= RANGE_M
+                ),
+                "missing_neighbor_ids": missing,
+                "coupled_converged": False,
+                "coupled_fallback": "frozen_validated_pre_budget_positions",
+                "coupled_iterations": iterations,
+                "coupled_iteration_cap": POSITION_MAX_ITER,
+            }
+        return status
+
+    positions = {sid: position.copy() for sid, position in frozen_positions.items()}
+    seen_signatures = set()
+    consistency_converged = False
+    fallback_reason = None
+    consistency_iterations = 0
+    for iteration in range(1, POSITION_MAX_ITER + 1):
         final_paths = witness_paths(
             connectivity_graph(env, positions), env.GS_ID, sources
         )
         _, _, _, signature = apply_metadata(final_paths)
+        state_signature = consistency_signature(positions, signature)
+        if state_signature in seen_signatures:
+            fallback_reason = "cycle_detected"
+            break
+        seen_signatures.add(state_signature)
         updated_positions, position_status = virtual_positions(env, slots)
         updated_paths = witness_paths(
             connectivity_graph(env, updated_positions), env.GS_ID, sources
@@ -408,27 +476,31 @@ def rebuild_after_budget_metadata(env, slots, positions, sources, weights):
         fully, partial, unsupported, updated_signature = apply_metadata(
             updated_paths
         )
-        if updated_signature == signature:
-            positions, position_status = virtual_positions(env, slots)
-            final_paths = witness_paths(
-                connectivity_graph(env, positions), env.GS_ID, sources
-            )
-            final_fully, final_partial, final_unsupported, final_signature = (
-                apply_metadata(final_paths)
-            )
-            if final_signature != updated_signature:
-                raise RuntimeError(
-                    "budget-pruned Relay metadata lost deterministic consistency"
-                )
-            fully, partial, unsupported = (
-                final_fully, final_partial, final_unsupported
-            )
+        consistency_iterations = iteration
+        updated_state_signature = consistency_signature(
+            updated_positions, updated_signature
+        )
+        if updated_state_signature == state_signature:
+            positions = updated_positions
+            final_paths = updated_paths
+            consistency_converged = True
+            break
+        if updated_state_signature in seen_signatures:
+            fallback_reason = "cycle_detected"
             break
         positions = updated_positions
     else:
-        raise RuntimeError(
-            "budget-pruned Relay witness/position metadata did not converge"
+        fallback_reason = "iteration_cap"
+
+    if not consistency_converged:
+        positions = {
+            sid: position.copy() for sid, position in frozen_positions.items()
+        }
+        final_paths = witness_paths(
+            connectivity_graph(env, positions), env.GS_ID, sources
         )
+        fully, partial, unsupported, _ = apply_metadata(final_paths)
+        position_status = frozen_position_status(consistency_iterations)
 
     for slot in slots:
         slot["virtual_position"] = positions[slot["slot_id"]].tolist()
@@ -438,6 +510,15 @@ def rebuild_after_budget_metadata(env, slots, positions, sources, weights):
         "unsupported": unsupported,
         "supported_backlog": math.fsum(weights[source] for source in fully),
         "unsupported_backlog": math.fsum(weights[source] for source in partial + unsupported),
+        "consistency_converged": consistency_converged,
+        "consistency_fallback_used": not consistency_converged,
+        "consistency_fallback_reason": fallback_reason,
+        "consistency_fallback_policy": (
+            None if consistency_converged
+            else "frozen_validated_pre_budget_positions"
+        ),
+        "consistency_iterations": consistency_iterations,
+        "consistency_iteration_cap": POSITION_MAX_ITER,
     }
 
 
@@ -600,7 +681,13 @@ def plan_relays(env, prospective, available_uavs):
                 unsupported_backlog_bits_after_budget=rebuilt["unsupported_backlog"],
                 unsupported_source_ids=rebuilt["partial"] + rebuilt["unsupported"],
                 unsupported_backlog=rebuilt["unsupported_backlog"],
-                position_status=rebuilt["position_status"])
+                position_status=rebuilt["position_status"],
+                final_witness_consistency_converged=rebuilt["consistency_converged"],
+                final_witness_consistency_fallback_used=rebuilt["consistency_fallback_used"],
+                final_witness_consistency_fallback_reason=rebuilt["consistency_fallback_reason"],
+                final_witness_consistency_fallback_policy=rebuilt["consistency_fallback_policy"],
+                final_witness_consistency_iterations=rebuilt["consistency_iterations"],
+                final_witness_consistency_iteration_cap=rebuilt["consistency_iteration_cap"])
     return plan
 
 

@@ -92,15 +92,15 @@ GROUND_ALTITUDE_M = 0.0
 UAV_MAX_ALTITUDE_M = 150.0
 TASK_POTENTIAL_NORMALIZATION_EPSILON = 1e-12
 TASK_POTENTIAL_CONTRACT_VERSION = (
-    "oblique-vs-com-final-witness-relay-potential-v10"
+    "oblique-vs-com-final-witness-relay-potential-v11"
 )
 COM_CAPACITY_POTENTIAL_WEIGHT = 0.5
 COM_DISTANCE_POTENTIAL_WEIGHT = 0.5
 RELAY_TASK_CONTRACT_VERSION = (
-    "snapshot-virtual-relay-service-first-greedy-v5"
+    "snapshot-virtual-relay-service-first-greedy-v6"
 )
 RELAY_POTENTIAL_WEIGHT = 1.0
-METHOD_CONTRACT_VERSION = "centralized-16-uav-virtual-relay-v5"
+METHOD_CONTRACT_VERSION = "centralized-16-uav-virtual-relay-v6"
 DEFAULT_TRAINING_SEED = 20260817
 FORMAL_TRAINING_EPISODES = 1500
 FORMAL_CHECKPOINT_EPISODE = FORMAL_TRAINING_EPISODES
