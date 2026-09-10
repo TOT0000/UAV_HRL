@@ -11,7 +11,8 @@ from Simulator import Simulator
 from Task_assignment import Task, UAVAssigner
 from relay_contract import (
     COUNT_RULE, bounded_minimax_center, connectivity_graph, initial_relay_count,
-    movement_bounds, pair_relay_slots, plan_relays, refresh_relay_targets,
+    movement_bounds, pair_relay_slots, plan_relays,
+    rebuild_after_budget_metadata, refresh_relay_targets,
     predicted_post_assignment_diagnostics, relay_potential, relay_snapshot,
     reverse_bfs, valid_in_air_backlog, virtual_positions,
 )
@@ -247,6 +248,41 @@ def test_budget_pruned_partial_relay_is_retained_and_uses_only_active_links():
     assert relay_potential(env, 2, empty_active)['P_link'] == 0.0
 
 
+def test_after_budget_active_neighbors_follow_final_witness_without_stale_nodes():
+    env = environment([
+        (0,0,100),       # GS-connected physical component
+        (900,0,100),     # planning source
+        (600,300,100),   # old neighbor, still within 400 m of the Relay
+        (300,0,100),     # final witness neighbor
+    ])
+    slot = {
+        'slot_id': 'relay-0001-0001',
+        'virtual_position': [600.,0.,100.],
+        'shared': False,
+        'L_s': 1,
+        'F_s': 3,
+        'chain_index': 1,
+        'chain_count': 1,
+        'neighbor_ids': [1,2],
+        'neighbor_ids_before_budget': [1,2],
+        'active_neighbor_ids_after_budget': [1,2],
+        'missing_neighbor_ids_after_budget': [],
+        'supported_source_ids': [1],
+        'supported_source_ids_before_budget': [1],
+        'fully_supported_source_ids_after_budget': [],
+        'partially_supported_source_ids_after_budget': [],
+        'support_status': 'infeasible',
+        'witness_paths': {'1': [1, 'relay-0001-0001', 2, env.GS_ID]},
+    }
+    rebuilt = rebuild_after_budget_metadata(
+        env, [slot], {slot['slot_id']: slot['virtual_position']}, [1], {1:1.}
+    )
+    assert rebuilt['witness_paths'][1] == [1, slot['slot_id'], 3, env.GS_ID]
+    assert slot['active_neighbor_ids_after_budget'] == [1,3]
+    assert 2 not in slot['active_neighbor_ids_after_budget']
+    assert slot['missing_neighbor_ids_after_budget'] == []
+
+
 def test_predicted_assignment_topology_has_one_position_per_uav_and_is_pure():
     env = environment([(0,0,100),(700,0,100),(0,0,100)], {1:10})
     plan = plan_relays(env, [1], [2])
@@ -266,7 +302,7 @@ def test_predicted_assignment_topology_has_one_position_per_uav_and_is_pure():
     assert plan == before
 
 
-def test_predicted_support_classes_and_assignment_identity_conflicts():
+def test_predicted_support_classes_and_only_broken_relocated_anchor_conflicts():
     partial_env = environment([(0,0,100),(1000,0,100),(0,0,100)], {1:5})
     partial_plan = plan_relays(partial_env, [1], [2])
     pair_relay_slots(partial_env, partial_plan, [2])
@@ -291,10 +327,22 @@ def test_predicted_support_classes_and_assignment_identity_conflicts():
         slots[0]['slot_id']: 2,
         slots[1]['slot_id']: 1,
     }
-    diagnostics = predicted_post_assignment_diagnostics(
+    broken = predicted_post_assignment_diagnostics(
         relocated_env, relocated_plan
     )
-    assert len(diagnostics['relocated_anchor_conflicts']) == 2
+    assert len(broken['relocated_anchor_conflicts']) == 2
+    assert all(
+        conflict['predicted_distance_m'] > 400.
+        and not conflict['predicted_edge_exists']
+        for conflict in broken['relocated_anchor_conflicts']
+    )
+
+    slots[0]['virtual_position'] = [300.,0.,100.]
+    slots[1]['virtual_position'] = [0.,250.,100.]
+    still_connected = predicted_post_assignment_diagnostics(
+        relocated_env, relocated_plan
+    )
+    assert still_connected['relocated_anchor_conflicts'] == []
 
 
 def test_fixed_identity_target_motion_and_infeasible_diagnostics():

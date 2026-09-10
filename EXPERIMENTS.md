@@ -99,7 +99,7 @@ marks a non-formal evaluation and may be combined with
 `comparison_experiment.py` remains available for manifest-driven evaluation,
 design-dataset collection, aggregation, and exact-resume workflows.
 
-## Snapshot Relay planning (contract v4)
+## Snapshot Relay planning (contract v5)
 
 At a newly discovered RoI's next existing assignment boundary, first assign
 FOV/COM (K-KM: up to two KM rounds; KM: one; Random: two named-RNG rounds).
@@ -135,7 +135,11 @@ slot ID. `required_before_budget`, available, assigned and shortage are distinct
 Retained slots record their before-budget neighbors, active and missing
 after-budget neighbors, and full/partial/infeasible source support. Partial slots
 remain assigned. Their link potential takes the minimum only over active
-neighbors; a slot with no active neighbor has zero link potential.
+neighbors; a slot with no active neighbor has zero link potential. Fully
+supported slots rebuild active neighbors from the deterministic final witnesses,
+while partial slots retain only still-existing direct planning neighbors. A
+bounded deterministic iteration keeps witness paths, virtual positions and this
+metadata synchronized without changing Relay slots or owners.
 K-KM/KM then process slots by descending removal backlog loss and source count,
 and choose the nearest free UAV in raw 3D distance, breaking ties by UAV ID.
 Random pairs slots using the formal assignment RNG.
@@ -149,6 +153,9 @@ once at its virtual target and every other UAV remains at its physical position.
 Reverse BFS classifies each planning source as fully supported, partially
 supported, or unsupported and reports self-neighbor and relocated-anchor
 identity conflicts. These diagnostics never repair or alter the plan.
+Reconfiguring a physical anchor is reported as a conflict only when its required
+predicted 3D edge is actually absent; a relocated anchor that remains within the
+inclusive 400 m edge is not a conflict.
 
 Movement observation is now 595-D (schema 6): each UAV has three normalized
 Relay target displacement fields, zero when unassigned or task-masked. Relay
@@ -157,16 +164,16 @@ per UAV/task. U2U uses deterministic Rician expected capacity; a GS neighbor
 uses deterministic expected-path-loss A2G capacity. The common reference is
 `reference_u2u_max_capacity_mbps(10 MHz)`. Neighbor virtual IDs resolve to their
 assigned physical UAV for the link term. Relay shares COM's outer task weight.
-Only the existing boundary-aligned `gamma*Phi_next-Phi_current` contributes
-reward, with terminal potential zero and `no_task_potential` disabling all terms.
+Ordinary transitions use `gamma*Phi_next-Phi_current`, with terminal potential
+zero and `no_task_potential` disabling all terms.
 When a newly discovered RoI changes Relay assignment at the next boundary, that
 single transition stores raw Relay potentials but masks applied Relay shaping to
-exactly zero. Search/VS/COM and objective terms remain active, and Relay shaping
-returns to enabled on the following transition.
+exactly zero. Search/FOV(VS)/COM and objective terms remain active, and Relay
+shaping returns to enabled on the following movement interval.
 Routing actions, masks, observations (143-D), FDMA, FIFO, deadlines and rewards
 remain unchanged; any legal UAV may still forward packets.
 
-`relay_diagnostics.json` v4 includes full planning/deletion/pruning history,
+`relay_diagnostics.json` v5 includes full planning/deletion/pruning history,
 slot mapping and raw assignment distances, current targets/minimax status,
 post-budget and predicted source support, potential components, assignment
 identity conflicts, and per-transition raw/applied Relay shaping. Evaluation
@@ -318,7 +325,7 @@ and horizontal target geometry and is independent of the communication range.
 Both blends use weights `0.5/0.5` and are finite in `[0,1]`.
 
 The task-potential contract is
-`oblique-vs-com-task-reset-virtual-relay-potential-v9`. TD3 and DDPG
+`oblique-vs-com-final-witness-relay-potential-v10`. TD3 and DDPG
 consume the same potential definitions, random-movement methods publish the
 same environment/reward contract, and `*_no_task_potential` methods disable all
 Search/VS/COM/Relay shaping. Existing observations already contain UAV and task

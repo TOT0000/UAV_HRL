@@ -13,7 +13,7 @@ from evaluation_aggregation import aggregate_relay_planning
 
 RELAY_DIAGNOSTICS_FILENAME = "relay_diagnostics.json"
 RELAY_DIAGNOSTICS_OUTPUT_CONTRACT_VERSION = (
-    "snapshot-virtual-relay-planning-forwarding-json-v4"
+    "snapshot-virtual-relay-planning-forwarding-json-v5"
 )
 RELAY_BITS_SUM_REL_TOL = 1e-15
 RELAY_BITS_SUM_ABS_TOL = 1e-6
@@ -70,7 +70,7 @@ def _validate_forwarding(forwarding, label):
 
 
 def validate_relay_plan(plan):
-    from relay_contract import empty_plan, COUNT_RULE, TRIGGER
+    from relay_contract import empty_plan, COUNT_RULE, TRIGGER, node_key
     for key in empty_plan():
         if key not in plan:
             raise ValueError(f"Relay planning is missing {key}")
@@ -86,6 +86,7 @@ def validate_relay_plan(plan):
         raise ValueError("Relay slot mapping/count mismatch")
     if len(set(plan["slot_to_uav"].values())) != assigned:
         raise ValueError("Relay UAV assignments must be exclusive")
+    retained_slot_ids = {slot["slot_id"] for slot in plan["slots"]}
     predicted_groups = (
         set(plan["predicted_fully_supported_source_ids"]),
         set(plan["predicted_partially_supported_source_ids"]),
@@ -115,10 +116,44 @@ def validate_relay_plan(plan):
         before = set(slot["neighbor_ids_before_budget"])
         active = set(slot["active_neighbor_ids_after_budget"])
         missing = set(slot["missing_neighbor_ids_after_budget"])
-        if active.intersection(missing) or active.union(missing) != before:
+        if active.intersection(missing) or not missing.issubset(before):
             raise ValueError("Relay budget neighbor accounting mismatch")
+        if any(
+            isinstance(neighbor, str) and neighbor not in retained_slot_ids
+            for neighbor in active
+        ):
+            raise ValueError("Relay active neighbors contain a pruned virtual slot")
+        if any(
+            not isinstance(neighbor, str) or neighbor in retained_slot_ids
+            for neighbor in missing
+        ):
+            raise ValueError("Relay missing neighbors must be pruned virtual slots")
+        if slot["active_neighbor_ids_after_budget"] != sorted(active, key=node_key):
+            raise ValueError("Relay active neighbors are not deterministic")
+        if slot["missing_neighbor_ids_after_budget"] != sorted(missing, key=node_key):
+            raise ValueError("Relay missing neighbors are not deterministic")
+        witness_neighbors = set()
+        for path in slot.get("budget_witness_paths", {}).values():
+            if slot["slot_id"] not in path:
+                raise ValueError("Relay budget witness omits its declared slot")
+            index = path.index(slot["slot_id"])
+            if index > 0:
+                witness_neighbors.add(path[index - 1])
+            if index + 1 < len(path):
+                witness_neighbors.add(path[index + 1])
+        partial_neighbors = (
+            before - missing
+            if slot["partially_supported_source_ids_after_budget"]
+            else set()
+        )
+        if active != witness_neighbors.union(partial_neighbors):
+            raise ValueError("Relay active neighbors disagree with final witnesses")
         if slot["support_status"] not in {"full", "partial", "infeasible"}:
             raise ValueError("Relay slot support status is invalid")
+        if bool(slot["shared"]) != (
+            len(set(slot["supported_source_ids_before_budget"])) >= 2
+        ):
+            raise ValueError("Relay shared status must use distinct planning sources")
     _validate_finite_json_value(plan)
     return plan
 

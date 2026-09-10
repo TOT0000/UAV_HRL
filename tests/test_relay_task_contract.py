@@ -125,7 +125,7 @@ class RelayRoutingCheckpointDiagnosticsTest(unittest.TestCase):
         ).ravel()
         np.testing.assert_array_equal(disabled_all, [0.0, 0.0])
 
-    def test_replay_relay_potential_is_boundary_aligned_and_telescopes(self):
+    def test_replay_relay_potential_continuity_and_task_reset_mask(self):
         captured = []
         original_add = ReplayBufferJoint.add
 
@@ -214,15 +214,7 @@ class RelayRoutingCheckpointDiagnosticsTest(unittest.TestCase):
         for name in potential_names:
             self.assertEqual(captured[-1][f"phi_{name}_t1"], 0.0)
 
-        relay_shaping_sum = sum(
-            record["phi_relay_t1"] - record["phi_relay_t"]
-            for record in captured
-        )
-        self.assertAlmostEqual(
-            relay_shaping_sum, -captured[0]["phi_relay_t"], places=12
-        )
         self.assertEqual(captured[0]["phi_relay_t"], 0.0)
-        self.assertAlmostEqual(relay_shaping_sum, 0.0, places=12)
         shaping_history = result["relay_diagnostics"]["episodes"][0][
             "assignment"
         ]["relay_shaping_history"]
@@ -231,9 +223,14 @@ class RelayRoutingCheckpointDiagnosticsTest(unittest.TestCase):
         ])
         self.assertFalse(shaping_history[0]["relay_shaping_enabled"])
         self.assertEqual(shaping_history[0]["applied_relay_shaping"], 0.0)
-        self.assertTrue(all(
-            entry["relay_shaping_enabled"] for entry in shaping_history[1:]
-        ))
+        for entry in shaping_history[1:]:
+            self.assertTrue(entry["relay_shaping_enabled"])
+            self.assertAlmostEqual(
+                entry["applied_relay_shaping"],
+                config.beta_relay
+                * entry["raw_relay_potential_difference"],
+                places=12,
+            )
 
     def test_old_checkpoint_fails_before_loading(self):
         self.assertEqual(CHECKPOINT_SCHEMA_VERSION, 29)

@@ -310,60 +310,127 @@ def virtual_positions(env, slots):
 
 
 def rebuild_after_budget_metadata(env, slots, positions, sources, weights):
-    """Rebuild final witnesses while retaining incomplete bridge provenance."""
+    """Synchronize final witnesses, positions and neighbor metadata after pruning."""
     retained = set(positions)
-    final_graph = connectivity_graph(env, positions)
-    final_paths = witness_paths(final_graph, env.GS_ID, sources)
-    fully = sorted(source for source, path in final_paths.items() if path)
-    fully_set = set(fully)
-    partial = sorted(source for source in sources if source not in fully_set and any(
-        source in slot["supported_source_ids_before_budget"] for slot in slots))
-    unsupported = sorted(set(sources) - fully_set - set(partial))
-    for slot in slots:
-        before_neighbors = list(slot["neighbor_ids_before_budget"])
-        active = [neighbor for neighbor in before_neighbors
-                  if not isinstance(neighbor, str) or neighbor in retained]
-        missing = [neighbor for neighbor in before_neighbors
-                   if isinstance(neighbor, str) and neighbor not in retained]
-        full_for_slot = [source for source in fully
-                         if slot["slot_id"] in final_paths[source]]
-        partial_for_slot = [source for source in partial
-                            if source in slot["supported_source_ids_before_budget"]]
-        if full_for_slot:
-            support_status = "full"
-        elif partial_for_slot:
-            support_status = "partial"
-        else:
-            support_status = "infeasible"
-        slot.update(
-            active_neighbor_ids_after_budget=sorted(active, key=node_key),
-            missing_neighbor_ids_after_budget=sorted(missing, key=node_key),
-            fully_supported_source_ids_after_budget=full_for_slot,
-            partially_supported_source_ids_after_budget=partial_for_slot,
-            support_status=support_status,
-            budget_witness_paths={str(source): list(final_paths[source])
-                                  for source in full_for_slot},
+
+    def apply_metadata(final_paths):
+        fully = sorted(source for source, path in final_paths.items() if path)
+        fully_set = set(fully)
+        partial = sorted(
+            source for source in sources
+            if source not in fully_set and any(
+                source in slot["supported_source_ids_before_budget"]
+                for slot in slots
+            )
         )
-    positions, position_status = virtual_positions(env, slots)
-    # Rebuild once more at the final updated targets, which is the actual
-    # budget-pruned augmented topology used by planning diagnostics.
-    final_paths = witness_paths(connectivity_graph(env, positions), env.GS_ID, sources)
-    fully = sorted(source for source, path in final_paths.items() if path)
-    fully_set = set(fully)
-    partial = sorted(source for source in sources if source not in fully_set and any(
-        source in slot["supported_source_ids_before_budget"] for slot in slots))
-    unsupported = sorted(set(sources) - fully_set - set(partial))
+        unsupported = sorted(set(sources) - fully_set - set(partial))
+        full_neighbors = {slot["slot_id"]: set() for slot in slots}
+        for source in fully:
+            path = final_paths[source]
+            for index, node in enumerate(path):
+                if node not in full_neighbors:
+                    continue
+                if index > 0:
+                    full_neighbors[node].add(path[index - 1])
+                if index + 1 < len(path):
+                    full_neighbors[node].add(path[index + 1])
+        for slot in slots:
+            sid = slot["slot_id"]
+            full_for_slot = [
+                source for source in fully if sid in final_paths[source]
+            ]
+            partial_for_slot = [
+                source for source in partial
+                if source in slot["supported_source_ids_before_budget"]
+            ]
+            partial_neighbors = {
+                neighbor
+                for neighbor in slot["neighbor_ids_before_budget"]
+                if partial_for_slot
+                and (not isinstance(neighbor, str) or neighbor in retained)
+            }
+            missing = {
+                neighbor
+                for neighbor in slot["neighbor_ids_before_budget"]
+                if partial_for_slot
+                and isinstance(neighbor, str)
+                and neighbor not in retained
+            }
+            active = full_neighbors[sid] | partial_neighbors
+            supported_after_budget = sorted(
+                set(full_for_slot) | set(partial_for_slot)
+            )
+            slot.update(
+                active_neighbor_ids_after_budget=sorted(active, key=node_key),
+                missing_neighbor_ids_after_budget=sorted(missing, key=node_key),
+                supported_source_ids=supported_after_budget,
+                fully_supported_source_ids_after_budget=full_for_slot,
+                partially_supported_source_ids_after_budget=partial_for_slot,
+                support_status=(
+                    "full" if full_for_slot
+                    else "partial" if partial_for_slot
+                    else "infeasible"
+                ),
+                shared=len(set(slot["supported_source_ids_before_budget"])) >= 2,
+                budget_witness_paths={
+                    str(source): list(final_paths[source])
+                    for source in full_for_slot
+                },
+            )
+        signature = (
+            tuple((source, tuple(final_paths[source])) for source in sorted(sources)),
+            tuple(
+                (
+                    slot["slot_id"],
+                    tuple(slot["active_neighbor_ids_after_budget"]),
+                    tuple(slot["missing_neighbor_ids_after_budget"]),
+                    tuple(slot["fully_supported_source_ids_after_budget"]),
+                    tuple(slot["partially_supported_source_ids_after_budget"]),
+                    bool(slot["shared"]),
+                )
+                for slot in sorted(slots, key=lambda item: item["slot_id"])
+            ),
+        )
+        return fully, partial, unsupported, signature
+
+    positions = {
+        sid: np.asarray(position, dtype=float) for sid, position in positions.items()
+    }
+    for _ in range(POSITION_MAX_ITER):
+        final_paths = witness_paths(
+            connectivity_graph(env, positions), env.GS_ID, sources
+        )
+        _, _, _, signature = apply_metadata(final_paths)
+        updated_positions, position_status = virtual_positions(env, slots)
+        updated_paths = witness_paths(
+            connectivity_graph(env, updated_positions), env.GS_ID, sources
+        )
+        fully, partial, unsupported, updated_signature = apply_metadata(
+            updated_paths
+        )
+        if updated_signature == signature:
+            positions, position_status = virtual_positions(env, slots)
+            final_paths = witness_paths(
+                connectivity_graph(env, positions), env.GS_ID, sources
+            )
+            final_fully, final_partial, final_unsupported, final_signature = (
+                apply_metadata(final_paths)
+            )
+            if final_signature != updated_signature:
+                raise RuntimeError(
+                    "budget-pruned Relay metadata lost deterministic consistency"
+                )
+            fully, partial, unsupported = (
+                final_fully, final_partial, final_unsupported
+            )
+            break
+        positions = updated_positions
+    else:
+        raise RuntimeError(
+            "budget-pruned Relay witness/position metadata did not converge"
+        )
+
     for slot in slots:
-        full_for_slot = [source for source in fully
-                         if slot["slot_id"] in final_paths[source]]
-        partial_for_slot = [source for source in partial
-                            if source in slot["supported_source_ids_before_budget"]]
-        slot["fully_supported_source_ids_after_budget"] = full_for_slot
-        slot["partially_supported_source_ids_after_budget"] = partial_for_slot
-        slot["support_status"] = ("full" if full_for_slot else
-                                  "partial" if partial_for_slot else "infeasible")
-        slot["budget_witness_paths"] = {
-            str(source): list(final_paths[source]) for source in full_for_slot}
         slot["virtual_position"] = positions[slot["slot_id"]].tolist()
     return {
         "positions": positions, "position_status": position_status,
@@ -456,6 +523,8 @@ def plan_relays(env, prospective, available_uavs):
         attach_witness_metadata(slots, paths)
         for slot in slots:
             slot["neighbor_ids_before_budget"] = list(slot["neighbor_ids"])
+            slot["active_neighbor_ids_after_budget"] = list(slot["neighbor_ids"])
+            slot["missing_neighbor_ids_after_budget"] = []
             slot["supported_source_ids_before_budget"] = list(
                 slot["supported_source_ids"])
         updated, status = virtual_positions(env, slots)
@@ -479,6 +548,10 @@ def plan_relays(env, prospective, available_uavs):
             attach_witness_metadata(slots, paths)
             for slot in slots:
                 slot["neighbor_ids_before_budget"] = list(slot["neighbor_ids"])
+                slot["active_neighbor_ids_after_budget"] = list(
+                    slot["neighbor_ids"]
+                )
+                slot["missing_neighbor_ids_after_budget"] = []
                 slot["supported_source_ids_before_budget"] = list(
                     slot["supported_source_ids"])
             updated, status = virtual_positions(env, slots)
@@ -595,16 +668,29 @@ def predicted_post_assignment_diagnostics(env, plan):
                 self_conflicts.append({"slot_id": slot["slot_id"],
                                        "assigned_uav_id": uid,
                                        "physical_neighbor_id": int(neighbor)})
-            elif isinstance(neighbor, int) and neighbor in relay_by_uav:
-                relocated_conflicts.append({
-                    "slot_id": slot["slot_id"], "assigned_uav_id": uid,
-                    "physical_neighbor_id": int(neighbor),
-                    "neighbor_relay_slot_id": relay_by_uav[neighbor]["slot_id"],
-                    "neighbor_original_position": list(map(
-                        float, env.uav_dict[neighbor].get_position())),
-                    "neighbor_predicted_position": list(map(
-                        float, predicted_positions[neighbor])),
-                })
+            elif isinstance(neighbor, (int, np.integer)):
+                neighbor_uid = int(neighbor)
+                if neighbor_uid in relay_by_uav and neighbor_uid not in graph[uid]:
+                    predicted_distance = math.dist(
+                        predicted_positions[uid], predicted_positions[neighbor_uid]
+                    )
+                    relocated_conflicts.append({
+                        "slot_id": slot["slot_id"], "assigned_uav_id": uid,
+                        "physical_neighbor_id": neighbor_uid,
+                        "neighbor_relay_slot_id": relay_by_uav[neighbor_uid]["slot_id"],
+                        "neighbor_original_position": list(map(
+                            float, env.uav_dict[neighbor_uid].get_position())),
+                        "neighbor_predicted_position": list(map(
+                            float, predicted_positions[neighbor_uid])),
+                        "predicted_distance_m": float(predicted_distance),
+                        "predicted_edge_exists": False,
+                    })
+    self_conflicts.sort(key=lambda item: (
+        item["slot_id"], item["assigned_uav_id"], item["physical_neighbor_id"]
+    ))
+    relocated_conflicts.sort(key=lambda item: (
+        item["slot_id"], item["assigned_uav_id"], item["physical_neighbor_id"]
+    ))
     source_backlog = plan.get("source_backlog_bits", {})
     weights = {int(source): float(source_backlog.get(
         str(source), source_backlog.get(source, 0.)))

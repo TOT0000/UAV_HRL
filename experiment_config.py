@@ -92,15 +92,15 @@ GROUND_ALTITUDE_M = 0.0
 UAV_MAX_ALTITUDE_M = 150.0
 TASK_POTENTIAL_NORMALIZATION_EPSILON = 1e-12
 TASK_POTENTIAL_CONTRACT_VERSION = (
-    "oblique-vs-com-task-reset-virtual-relay-potential-v9"
+    "oblique-vs-com-final-witness-relay-potential-v10"
 )
 COM_CAPACITY_POTENTIAL_WEIGHT = 0.5
 COM_DISTANCE_POTENTIAL_WEIGHT = 0.5
 RELAY_TASK_CONTRACT_VERSION = (
-    "snapshot-virtual-relay-service-first-greedy-v4"
+    "snapshot-virtual-relay-service-first-greedy-v5"
 )
 RELAY_POTENTIAL_WEIGHT = 1.0
-METHOD_CONTRACT_VERSION = "centralized-16-uav-virtual-relay-v4"
+METHOD_CONTRACT_VERSION = "centralized-16-uav-virtual-relay-v5"
 DEFAULT_TRAINING_SEED = 20260817
 FORMAL_TRAINING_EPISODES = 1500
 FORMAL_CHECKPOINT_EPISODE = FORMAL_TRAINING_EPISODES
@@ -319,10 +319,17 @@ def task_potential_contract_metadata():
             "assignment_cost": "raw 3D distance greedy; no utility matrix",
             "current_backlog_snapshot": "current decision-state boundary",
             "next_backlog_snapshot": "next decision-state boundary",
-            "transition_alignment": "current and boundary-prepared next decision potentials share the existing replay telescoping convention",
+            "transition_alignment": (
+                "ordinary transitions use gamma * phi_next - phi_current; "
+                "a transition ending in new-RoI reassignment masks only Relay "
+                "shaping to zero, then the following movement interval restores it"
+            ),
         },
         "lifecycle": {
-            "form": "beta * (gamma * phi_next - phi_current)",
+            "form": (
+                "ordinary beta * (gamma * phi_next - phi_current); new-RoI "
+                "reassignment masks Relay only while Search/FOV(VS)/COM remain active"
+            ),
             "nonterminal_boundary_continuity": (
                 "all four phi_next values equal the next transition phi_current"
             ),
