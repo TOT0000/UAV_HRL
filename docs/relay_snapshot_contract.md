@@ -23,13 +23,15 @@
 7. 不足時每一步重新計算 marginal backlog loss，按 loss、斷聯來源數、slot ID 刪除。保留 budget 前 required、available、assigned、shortage 四個不同數值。pruning 後，full source 的 active neighbors 只取 deterministic final witness 上的直接前驅／後繼 union；partial slot 保留原路徑中仍存在的直接鄰居，已 pruning 的虛擬鄰居只列為 missing。bounded deterministic iteration 以 position、witness path 與 metadata 的完整 signature 判斷固定點。偵測到 signature cycle 或達 iteration cap 時，恢復傳入函式且已通過 pre-budget validation 的 retained positions，以 frozen positions 一次重建 graph、final witnesses、active/missing neighbors、support classes 與 shared，之後不再移動位置。這個 fallback 不改 slot、owner、priority、mapping 或任務；partial slot 繼續分配。
 8. K-KM／KM 按 slot 重要性，依 raw 3D distance greedy 配對剩餘 UAV；Random 使用正式 assignment RNG。Relay 永遠 exclusive，沒有 Relay utility matrix／Hungarian。
 9. Greedy mapping 後建立唯讀 predicted topology：assigned Relay UAV 只在 virtual position 出現一次，其餘 UAV 保留 physical position，再以 reverse BFS 分類 full／partial／unsupported source 並記錄 self-neighbor 與 relocated-anchor conflicts。physical anchor 被重新配置時，只有 required predicted 3D edge 實際不存在才列為 conflict；仍在 inclusive 400 m 內不列入。診斷不改 mapping、任務或數量。
-10. 兩次 RoI boundary 間固定 slot／UAV／anchor／neighbor 身分，只更新位置。Search release 只轉 Hover，不再重新分配服務或 Relay。
+10. 兩次 RoI boundary 間固定 slot／UAV／anchor／neighbor 身分。正常收斂 plan 透過共用 resolver 依固定 identities 更新位置；cycle／iteration-cap fallback plan 則持續使用 slot 中的 frozen validated pre-budget target，直到下一次新 RoI 完整重分配。Search release 只轉 Hover，不再重新分配服務或 Relay。
 
 ## Movement 與 routing
 
 每架 UAV 的舊 Relay 8 個欄位改為 3 個 normalized target displacement，非 Relay 與 masked observation 為零。Movement observation 現為 **595-D，schema 6**；checkpoint schema **29**，schema 28 與更舊 checkpoint 在 restore weights／replay 前拒絕並要求重新訓練。
 
 Relay potential 為 `0.3 * exp(-distance/400) + 0.7 * min(clip(C_bar/C_ref,0,1))`。`P_link` 只取 active neighbors 的最小值，missing neighbor 不參與，active 集合為空時是 0。U2U capacity 為 deterministic Rician expectation；GS neighbor 使用 expected-path-loss A2G estimate。Reference 是 `reference_u2u_max_capacity_mbps(10 MHz)`，各 slot diagnostics 記錄其數值。Virtual neighbor 的 link term 使用分配到該 slot 的實體 UAV 位置。
+
+Relay potential、完整／compact snapshots、target refresh，以及 centralized movement observation／potential 都使用同一個 pure deterministic position resolver。正常 plan 呼叫既有 `virtual_positions()`；fallback plan 直接複製已保存的 frozen slot targets，不再執行 minimax。Fallback 的 feasibility、距離、capacity、`P_pos` 與 `P_link` 仍依目前 UAV geometry 觀測，因此 anchors 移動會改變 metrics，但不會改寫 target、fallback reason、policy 或 convergence flag。
 
 Relay 外層權重與 COM 相同。一般 transition 使用 `gamma*Phi_next-Phi_current`，並保留 terminal-zero convention。若 transition 結束時因新 RoI 完整重分配，該 transition 的 replay mask 只關閉 Relay shaping，applied 值嚴格為 0；raw `Phi_t/Phi_t1` 保留，Search／FOV(VS)／COM 與 objective reward 照常，下一個 movement interval 恢復 Relay shaping。沒有額外 per-step、arrival 或 distance bonus；`no_task_potential` 可完整停用所有 task shaping。
 
@@ -64,9 +66,9 @@ Evaluation aggregation 分別加總 episode-final required、available、assigne
 - Evaluation smoke：K-KM／KM／Random 三方法各先產生小型 model checkpoint，再經正式 checkpoint loading 執行 1-second evaluation，驗證零 Relay artifact round trip。
 - 全部 regression：`python -u -m pytest tests -q -p no:cacheprovider --tb=short --disable-warnings`。
 
-最終完整 regression：**671 passed、373 subtests passed**，360.54 秒。
-Relay planning／diagnostics direct suite：**47 passed**。
-Relay／task-reset／replay／checkpoint／assignment／integration suite：**166 passed、95 subtests passed**。
+最終完整 regression：**673 passed、373 subtests passed**，354.65 秒。
+Relay planning／fallback／potential／snapshot／refresh／diagnostics direct suite：**57 passed**。
+Relay／task-reset／replay／checkpoint／assignment／integration suite：**174 passed、97 subtests passed**。
 完整 suite 包含上述 training 與 evaluation smoke；沒有未解決的測試失敗。
 Pytest 另輸出 228 個第三方／既有 warning，未停用其收集，只以 `--disable-warnings` 隱藏冗長列表。
 `git diff --check` 通過。

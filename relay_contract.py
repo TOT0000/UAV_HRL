@@ -315,6 +315,72 @@ def virtual_positions(env, slots):
     return positions, status
 
 
+def _frozen_position_status(env, slots, positions, *, iterations, iteration_cap):
+    """Observe fixed Relay targets without running target repositioning."""
+    nodes = physical_positions(env)
+    nodes[env.GS_ID] = np.asarray(env.GS_pos, dtype=float)
+    nodes.update(positions)
+    low, high = movement_bounds(env)
+    status = {}
+    for slot in slots:
+        sid = slot["slot_id"]
+        neighbor_ids = slot.get(
+            "active_neighbor_ids_after_budget", slot["neighbor_ids"]
+        )
+        missing = [neighbor for neighbor in neighbor_ids if neighbor not in nodes]
+        radius = max(
+            (
+                math.dist(positions[sid], nodes[neighbor])
+                for neighbor in neighbor_ids
+                if neighbor in nodes
+            ),
+            default=0.,
+        )
+        budget_missing = list(slot.get("missing_neighbor_ids_after_budget", ()))
+        status[sid] = {
+            "clipped": bool(np.any(
+                positions[sid] != np.clip(positions[sid], low, high)
+            )),
+            "minimax": None,
+            "position": positions[sid].tolist(),
+            "radius_m": radius,
+            "active_neighbors_feasible": not missing and radius <= RANGE_M,
+            "feasible": not missing and not budget_missing and radius <= RANGE_M,
+            "missing_neighbor_ids": missing,
+            "coupled_converged": False,
+            "coupled_fallback": "frozen_validated_pre_budget_positions",
+            "coupled_iterations": iterations,
+            "coupled_iteration_cap": iteration_cap,
+        }
+    return status
+
+
+def resolve_relay_positions(env, plan=None):
+    """Pure target resolver honoring a plan's final-witness fallback policy."""
+    if plan is None:
+        plan = getattr(env, "relay_plan", empty_plan())
+    slots = plan.get("slots", ())
+    if not plan.get("final_witness_consistency_fallback_used", False):
+        return virtual_positions(env, slots)
+    policy = plan.get("final_witness_consistency_fallback_policy")
+    if policy != "frozen_validated_pre_budget_positions":
+        raise ValueError("unsupported Relay final-witness fallback policy")
+    positions = {
+        slot["slot_id"]: np.asarray(slot["virtual_position"], dtype=float).copy()
+        for slot in slots
+    }
+    status = _frozen_position_status(
+        env,
+        slots,
+        positions,
+        iterations=int(plan.get("final_witness_consistency_iterations", 0)),
+        iteration_cap=int(plan.get(
+            "final_witness_consistency_iteration_cap", POSITION_MAX_ITER
+        )),
+    )
+    return positions, status
+
+
 def rebuild_after_budget_metadata(env, slots, positions, sources, weights):
     """Synchronize budget-final witnesses, positions, support and neighbors.
 
@@ -416,44 +482,6 @@ def rebuild_after_budget_metadata(env, slots, positions, sources, weights):
             metadata_signature,
         )
 
-    def frozen_position_status(iterations):
-        nodes = physical_positions(env)
-        nodes[env.GS_ID] = np.asarray(env.GS_pos, dtype=float)
-        nodes.update(frozen_positions)
-        low, high = movement_bounds(env)
-        status = {}
-        for slot in slots:
-            sid = slot["slot_id"]
-            neighbor_ids = slot["active_neighbor_ids_after_budget"]
-            missing = [neighbor for neighbor in neighbor_ids if neighbor not in nodes]
-            radius = max(
-                (
-                    math.dist(frozen_positions[sid], nodes[neighbor])
-                    for neighbor in neighbor_ids
-                    if neighbor in nodes
-                ),
-                default=0.,
-            )
-            budget_missing = list(slot["missing_neighbor_ids_after_budget"])
-            status[sid] = {
-                "clipped": bool(np.any(
-                    frozen_positions[sid] != np.clip(frozen_positions[sid], low, high)
-                )),
-                "minimax": None,
-                "position": frozen_positions[sid].tolist(),
-                "radius_m": radius,
-                "active_neighbors_feasible": not missing and radius <= RANGE_M,
-                "feasible": (
-                    not missing and not budget_missing and radius <= RANGE_M
-                ),
-                "missing_neighbor_ids": missing,
-                "coupled_converged": False,
-                "coupled_fallback": "frozen_validated_pre_budget_positions",
-                "coupled_iterations": iterations,
-                "coupled_iteration_cap": POSITION_MAX_ITER,
-            }
-        return status
-
     positions = {sid: position.copy() for sid, position in frozen_positions.items()}
     seen_signatures = set()
     consistency_converged = False
@@ -500,7 +528,13 @@ def rebuild_after_budget_metadata(env, slots, positions, sources, weights):
             connectivity_graph(env, positions), env.GS_ID, sources
         )
         fully, partial, unsupported, _ = apply_metadata(final_paths)
-        position_status = frozen_position_status(consistency_iterations)
+        position_status = _frozen_position_status(
+            env,
+            slots,
+            frozen_positions,
+            iterations=consistency_iterations,
+            iteration_cap=POSITION_MAX_ITER,
+        )
 
     for slot in slots:
         slot["virtual_position"] = positions[slot["slot_id"]].tolist()
@@ -799,7 +833,7 @@ def predicted_post_assignment_diagnostics(env, plan):
 def relay_potential(env, uid, slot, positions=None):
     plan = getattr(env, "relay_plan", empty_plan())
     if positions is None:
-        positions, _ = virtual_positions(env, plan["slots"])
+        positions, _ = resolve_relay_positions(env, plan)
     target = positions.get(slot["slot_id"], slot["virtual_position"])
     point = env.uav_dict[uid].get_position()
     p_pos = math.exp(-math.dist(point, target) / RANGE_M)
@@ -829,7 +863,7 @@ def relay_potential(env, uid, slot, positions=None):
 def relay_snapshot(env):
     """Observational current geometry/potential diagnostics; never mutate plan."""
     snapshot = deepcopy(getattr(env, "relay_plan", empty_plan()))
-    positions, status = virtual_positions(env, snapshot["slots"])
+    positions, status = resolve_relay_positions(env, snapshot)
     reachable = reverse_bfs(connectivity_graph(env), env.GS_ID)
     snapshot["current_source_reachability"] = {
         str(s): s in reachable for s in snapshot["planning_source_ids"]}
@@ -844,7 +878,7 @@ def relay_snapshot(env):
 def relay_position_snapshot(env):
     """Compact movement observation; immutable planning details live in events."""
     plan = getattr(env, "relay_plan", empty_plan())
-    positions, status = virtual_positions(env, plan["slots"])
+    positions, status = resolve_relay_positions(env, plan)
     reachable = reverse_bfs(connectivity_graph(env), env.GS_ID)
     return {
         "assignment_invocation": int(getattr(env, "assignment_invocations", 0)),
@@ -864,7 +898,7 @@ def refresh_relay_targets(env):
     plan = getattr(env, "relay_plan", None)
     if plan is None:
         return
-    positions, status = virtual_positions(env, plan["slots"])
+    positions, status = resolve_relay_positions(env, plan)
     plan["position_status"] = status
     for slot in plan["slots"]:
         sid, uid = slot["slot_id"], slot["assigned_uav_id"]

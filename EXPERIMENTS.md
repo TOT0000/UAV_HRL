@@ -139,7 +139,11 @@ neighbors; a slot with no active neighbor has zero link potential. Fully
 supported slots rebuild active neighbors from the deterministic final witnesses,
 while partial slots retain only still-existing direct planning neighbors. A
 bounded deterministic iteration keeps witness paths, virtual positions and this
-metadata synchronized without changing Relay slots or owners.
+metadata synchronized without changing Relay slots or owners. All downstream
+target consumers share one resolver. Normally it refreshes positions from the
+fixed identities; after a detected cycle or iteration cap it keeps the saved
+validated pre-budget targets frozen until the next full new-RoI reassignment,
+while observational feasibility and potential continue to use current geometry.
 K-KM/KM then process slots by descending removal backlog loss and source count,
 and choose the nearest free UAV in raw 3D distance, breaking ties by UAV ID.
 Random pairs slots using the formal assignment RNG.
@@ -147,7 +151,8 @@ Random pairs slots using the formal assignment RNG.
 Only a new RoI causes complete reassignment after initialization. Search release
 converts Search to Hover without reallocating service or Relay roles. Between
 RoI boundaries, slot count, IDs, owners, anchors and neighbors stay fixed;
-virtual coordinates follow those identities. Assignment diagnostics also build a
+virtual coordinates follow those identities unless the final-witness fallback
+has frozen the validated targets. Assignment diagnostics also build a
 read-only predicted topology in which every assigned Relay UAV appears exactly
 once at its virtual target and every other UAV remains at its physical position.
 Reverse BFS classifies each planning source as fully supported, partially

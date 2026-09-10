@@ -25,7 +25,7 @@ from movement_feature_schema import (
     MOVEMENT_FEATURE_SCHEMA_VERSION,
     TASK_TYPES,
 )
-from relay_contract import virtual_positions, relay_potential
+from relay_contract import resolve_relay_positions, relay_potential
 
 
 COVERAGE_GRID_SIZE = 16
@@ -315,7 +315,9 @@ def get_global_movement_state(
     if backlog_bits is None:
         backlog_bits = packet_engine.backlog_bits
 
-    relay_positions, _ = virtual_positions(env, getattr(env, "relay_plan", {}).get("slots", []))
+    relay_positions, _ = resolve_relay_positions(
+        env, getattr(env, "relay_plan", {})
+    )
     local_features = []
     for uav_id in range(NUM_UAV):
         uav = env.uav_dict[uav_id]
@@ -605,7 +607,9 @@ def calculate_movement_potentials(env, c_ref_com, backlog_bits=None):
     vs_progress = []
     com_progress = []
     relay_progress = []
-    positions, _ = virtual_positions(env, getattr(env, "relay_plan", {}).get("slots", []))
+    positions, _ = resolve_relay_positions(
+        env, getattr(env, "relay_plan", {})
+    )
     for uav_id in range(env.num_UAV):
         grouped = _tasks_by_type(env, uav_id)
         _assert_unique_target_tasks(uav_id, grouped)

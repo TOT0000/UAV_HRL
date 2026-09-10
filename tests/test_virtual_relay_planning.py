@@ -10,11 +10,13 @@ import pytest
 from Simulator import Simulator
 from Task_assignment import Task, UAVAssigner
 from relay_contract import (
-    COUNT_RULE, bounded_minimax_center, connectivity_graph, initial_relay_count,
+    COUNT_RULE, POSITION_MAX_ITER, bounded_minimax_center, connectivity_graph,
+    initial_relay_count,
     movement_bounds, pair_relay_slots, plan_relays,
     rebuild_after_budget_metadata, refresh_relay_targets,
-    predicted_post_assignment_diagnostics, relay_potential, relay_snapshot,
-    reverse_bfs, valid_in_air_backlog, virtual_positions, witness_paths,
+    predicted_post_assignment_diagnostics, relay_position_snapshot,
+    relay_potential, relay_snapshot, resolve_relay_positions, reverse_bfs,
+    valid_in_air_backlog, virtual_positions, witness_paths,
 )
 from relay_diagnostics import validate_relay_plan
 
@@ -456,6 +458,140 @@ def test_after_budget_position_cycle_uses_deterministic_frozen_fallback():
     assert plan['slot_to_uav'] == original_mapping
 
 
+@pytest.mark.parametrize(
+    'fallback_mode, expected_reason',
+    [('cycle', 'cycle_detected'), ('cap', 'iteration_cap')],
+)
+def test_downstream_target_resolution_preserves_frozen_fallback(
+    fallback_mode, expected_reason
+):
+    env = environment([(0,0,100),(700,0,100),(0,0,100)], {1:10})
+    plan = plan_relays(env, [1], [2])
+    frozen = {
+        slot['slot_id']: np.asarray(slot['virtual_position'], dtype=float).copy()
+        for slot in plan['slots']
+    }
+    slots = copy.deepcopy(plan['slots'])
+    calls = 0
+
+    def nonconverging_positions(environment, relay_slots):
+        nonlocal calls
+        calls += 1
+        if fallback_mode == 'cycle':
+            offset = 10. if calls % 2 else 0.
+        else:
+            offset = 10. * calls
+        positions = {
+            sid: position + np.array([offset, 0., 0.])
+            for sid, position in frozen.items()
+        }
+        return positions, {sid: {'mock': True} for sid in positions}
+
+    cap = 2 if fallback_mode == 'cap' else POSITION_MAX_ITER
+    with (
+        mock.patch(
+            'relay_contract.virtual_positions',
+            side_effect=nonconverging_positions,
+        ),
+        mock.patch('relay_contract.POSITION_MAX_ITER', cap),
+    ):
+        rebuilt = rebuild_after_budget_metadata(
+            env, slots, frozen, [1], {1:10.}
+        )
+
+    plan.update(
+        slots=slots,
+        budget_witness_paths={
+            str(source): path for source, path in rebuilt['witness_paths'].items()
+        },
+        position_status=rebuilt['position_status'],
+        fully_supported_source_ids_after_budget=rebuilt['fully'],
+        partially_supported_source_ids_after_budget=rebuilt['partial'],
+        unsupported_source_ids_after_budget=rebuilt['unsupported'],
+        final_witness_consistency_converged=rebuilt['consistency_converged'],
+        final_witness_consistency_fallback_used=rebuilt[
+            'consistency_fallback_used'
+        ],
+        final_witness_consistency_fallback_reason=rebuilt[
+            'consistency_fallback_reason'
+        ],
+        final_witness_consistency_fallback_policy=rebuilt[
+            'consistency_fallback_policy'
+        ],
+        final_witness_consistency_iterations=rebuilt['consistency_iterations'],
+        final_witness_consistency_iteration_cap=rebuilt[
+            'consistency_iteration_cap'
+        ],
+    )
+    assert plan['final_witness_consistency_fallback_used'] is True
+    assert plan['final_witness_consistency_converged'] is False
+    assert plan['final_witness_consistency_fallback_reason'] == expected_reason
+    assert plan['final_witness_consistency_fallback_policy'] == (
+        'frozen_validated_pre_budget_positions'
+    )
+    install(env, plan, [2])
+    validate_relay_plan(plan)
+    slot = plan['slots'][0]
+    sid, uid = slot['slot_id'], slot['assigned_uav_id']
+    frozen_target = frozen[sid].copy()
+    env.uav_dict[uid].position[:] = frozen_target
+    env.uav_dict[uid].target_position = tuple(frozen_target)
+    original_count = len(plan['slots'])
+    original_mapping = copy.deepcopy(plan['slot_to_uav'])
+    original_priorities = [item['planning_priority'] for item in plan['slots']]
+    original_roles = {
+        uav_id: [task['task_type'] for task in tasks]
+        for uav_id, tasks in env.multi_tasks.items()
+    }
+
+    with mock.patch(
+        'relay_contract.virtual_positions',
+        side_effect=AssertionError('fallback target must remain frozen'),
+    ):
+        before_metrics = relay_potential(env, uid, slot)
+        snapshot = relay_snapshot(env)
+        position_snapshot = relay_position_snapshot(env)
+        refresh_relay_targets(env)
+
+        assert before_metrics['P_pos'] == pytest.approx(1.)
+        np.testing.assert_array_equal(
+            snapshot['slots'][0]['virtual_position'], frozen_target
+        )
+        np.testing.assert_array_equal(
+            position_snapshot['slots'][0]['virtual_position'], frozen_target
+        )
+        assert snapshot['final_witness_consistency_fallback_used'] is True
+        assert snapshot['final_witness_consistency_fallback_reason'] == expected_reason
+        assert position_snapshot['position_status'][sid]['coupled_fallback'] == (
+            'frozen_validated_pre_budget_positions'
+        )
+        np.testing.assert_array_equal(slot['virtual_position'], frozen_target)
+        assert env.multi_tasks[uid][0]['target_pos'] == tuple(frozen_target)
+        assert env.uav_dict[uid].target_position == tuple(frozen_target)
+
+        env.uav_dict[1].position[:] = (1200.,0.,100.)
+        after_metrics = relay_potential(env, uid, slot)
+        moved_snapshot = relay_position_snapshot(env)
+        refresh_relay_targets(env)
+
+    assert after_metrics['P_link'] != before_metrics['P_link']
+    assert moved_snapshot['position_status'][sid]['feasible'] is False
+    np.testing.assert_array_equal(slot['virtual_position'], frozen_target)
+    assert env.multi_tasks[uid][0]['target_pos'] == tuple(frozen_target)
+    assert env.uav_dict[uid].target_position == tuple(frozen_target)
+    assert plan['final_witness_consistency_fallback_used'] is True
+    assert plan['final_witness_consistency_converged'] is False
+    assert plan['final_witness_consistency_fallback_reason'] == expected_reason
+    validate_relay_plan(plan)
+    assert len(plan['slots']) == original_count
+    assert plan['slot_to_uav'] == original_mapping
+    assert [item['planning_priority'] for item in plan['slots']] == original_priorities
+    assert {
+        uav_id: [task['task_type'] for task in tasks]
+        for uav_id, tasks in env.multi_tasks.items()
+    } == original_roles
+
+
 def test_predicted_assignment_topology_has_one_position_per_uav_and_is_pure():
     env = environment([(0,0,100),(700,0,100),(0,0,100)], {1:10})
     plan = plan_relays(env, [1], [2])
@@ -523,7 +659,12 @@ def test_fixed_identity_target_motion_and_infeasible_diagnostics():
     install(env,plan_relays(env,[1],[2]),[2])
     before = copy.deepcopy(env.relay_plan['slots'][0])
     env.uav_dict[1].position[0] = 1100.
-    refresh_relay_targets(env)
+    assert env.relay_plan['final_witness_consistency_fallback_used'] is False
+    with mock.patch(
+        'relay_contract.virtual_positions', wraps=virtual_positions
+    ) as dynamic_positions:
+        refresh_relay_targets(env)
+    dynamic_positions.assert_called_once()
     slot = env.relay_plan['slots'][0]
     for key in ('slot_id','assigned_uav_id','neighbor_ids','L_s','F_s'):
         assert slot[key] == before[key]
@@ -632,7 +773,7 @@ def test_new_roi_boundary_only_and_normalized_masked_observation(production_env)
     state=get_global_movement_state(env,PacketEngine(16),{},1.,remaining_time=.5)
     assert state.shape==(595,) and np.isfinite(state).all()
     features={f['name']:f['index'] for f in movement_state_feature_schema()['features']}
-    positions,_=virtual_positions(env,env.relay_plan['slots'])
+    positions,_=resolve_relay_positions(env,env.relay_plan)
     for uid in range(16):
         indices=[features[f'uav_{uid}.relay_target_d{a}'] for a in 'xyz']
         assigned=[s for s in env.relay_plan['slots'] if s['assigned_uav_id']==uid]
