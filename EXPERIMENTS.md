@@ -99,7 +99,7 @@ marks a non-formal evaluation and may be combined with
 `comparison_experiment.py` remains available for manifest-driven evaluation,
 design-dataset collection, aggregation, and exact-resume workflows.
 
-## Snapshot Relay planning (contract v3)
+## Snapshot Relay planning (contract v4)
 
 At a newly discovered RoI's next existing assignment boundary, first assign
 FOV/COM (K-KM: up to two KM rounds; KM: one; Random: two named-RNG rounds).
@@ -120,9 +120,10 @@ Candidates from all sources share one augmented graph. Sorted candidate IDs
 are tested for zero-loss deletion using reverse BFS until a complete pass
 removes none. This is a deletion-minimal greedy heuristic, not a global minimum.
 Shortest witnesses use numeric physical node IDs before lexical virtual IDs.
-Witness-adjacent neighbor identities are fixed. Two or more required neighbors
-mark a slot shared, including ordinary two-neighbor chains. Shared positions
-use bounded minimax, not a centroid. SLSQP uses a 1e-10 objective tolerance,
+Witness-adjacent neighbor identities are fixed. A slot is shared only when its
+witnesses support at least two distinct source IDs; an ordinary single-source
+two-neighbor chain remains non-shared. Shared positions use bounded minimax,
+not a centroid. SLSQP uses a 1e-10 objective tolerance,
 200 iterations and a 1e-6 m feasibility tolerance; a deterministic support/box-face
 fallback consumes no RNG. Simultaneous virtual-neighbor updates start from
 bridge interpolation and use at most 100 Jacobi steps. Failed planning merge
@@ -131,6 +132,10 @@ validation restores candidates in reverse deletion order and rebuilds witnesses.
 If demand exceeds free UAVs, recompute every remaining candidate's marginal
 backlog loss at each deletion. Break ties by fewer disconnected sources, then
 slot ID. `required_before_budget`, available, assigned and shortage are distinct.
+Retained slots record their before-budget neighbors, active and missing
+after-budget neighbors, and full/partial/infeasible source support. Partial slots
+remain assigned. Their link potential takes the minimum only over active
+neighbors; a slot with no active neighbor has zero link potential.
 K-KM/KM then process slots by descending removal backlog loss and source count,
 and choose the nearest free UAV in raw 3D distance, breaking ties by UAV ID.
 Random pairs slots using the formal assignment RNG.
@@ -138,11 +143,12 @@ Random pairs slots using the formal assignment RNG.
 Only a new RoI causes complete reassignment after initialization. Search release
 converts Search to Hover without reallocating service or Relay roles. Between
 RoI boundaries, slot count, IDs, owners, anchors and neighbors stay fixed;
-virtual coordinates follow those identities. Anchor motion may make a slot
-infeasible or disconnect a source. This policy does not predict or guarantee
-connectivity after movement, including movement of free UAVs used in a snapshot
-witness. Budget pruning may leave a slot's required virtual neighbor unassigned;
-its missing link contributes zero potential and is diagnosed as infeasible.
+virtual coordinates follow those identities. Assignment diagnostics also build a
+read-only predicted topology in which every assigned Relay UAV appears exactly
+once at its virtual target and every other UAV remains at its physical position.
+Reverse BFS classifies each planning source as fully supported, partially
+supported, or unsupported and reports self-neighbor and relocated-anchor
+identity conflicts. These diagnostics never repair or alter the plan.
 
 Movement observation is now 595-D (schema 6): each UAV has three normalized
 Relay target displacement fields, zero when unassigned or task-masked. Relay
@@ -153,13 +159,18 @@ uses deterministic expected-path-loss A2G capacity. The common reference is
 assigned physical UAV for the link term. Relay shares COM's outer task weight.
 Only the existing boundary-aligned `gamma*Phi_next-Phi_current` contributes
 reward, with terminal potential zero and `no_task_potential` disabling all terms.
+When a newly discovered RoI changes Relay assignment at the next boundary, that
+single transition stores raw Relay potentials but masks applied Relay shaping to
+exactly zero. Search/VS/COM and objective terms remain active, and Relay shaping
+returns to enabled on the following transition.
 Routing actions, masks, observations (143-D), FDMA, FIFO, deadlines and rewards
 remain unchanged; any legal UAV may still forward packets.
 
-`relay_diagnostics.json` v3 includes full planning/deletion/pruning history,
+`relay_diagnostics.json` v4 includes full planning/deletion/pruning history,
 slot mapping and raw assignment distances, current targets/minimax status,
-per-movement-boundary source connectivity and potential components, and explicit
-snapshot-policy limitations. Evaluation summaries separately aggregate required,
+post-budget and predicted source support, potential components, assignment
+identity conflicts, and per-transition raw/applied Relay shaping. Evaluation
+summaries separately aggregate required,
 available, assigned and shortage counts over episode-final plans, and count
 infeasible/disconnected movement-boundary observations. Zero-Relay runs use the
 same schema and output files. Diagnostics are read-only and consume no RNG.
@@ -307,7 +318,7 @@ and horizontal target geometry and is independent of the communication range.
 Both blends use weights `0.5/0.5` and are finite in `[0,1]`.
 
 The task-potential contract is
-`oblique-vs-com-virtual-relay-potential-v8`. TD3 and DDPG
+`oblique-vs-com-task-reset-virtual-relay-potential-v9`. TD3 and DDPG
 consume the same potential definitions, random-movement methods publish the
 same environment/reward contract, and `*_no_task_potential` methods disable all
 Search/VS/COM/Relay shaping. Existing observations already contain UAV and task
@@ -577,7 +588,9 @@ python -X utf8 comparison_experiment.py aggregate --input-dir runs/comparison/ev
 
 Exact-resume checkpoints validate the method fingerprint, training-manifest
 relationship, training seed, the complete Dinkelbach block state, and its configuration.
-Checkpoint schema v28 requires the virtual Relay observation/planning contract and valid-sensing VS generation and assignment-local
+Checkpoint schema v29 requires the task-reset Relay shaping replay mask,
+predicted Relay diagnostics, the virtual Relay observation/planning contract,
+valid-sensing VS generation and assignment-local
 rate credit in the canonical visual-sensing contract, alongside the 16-UAV action-wise-GS-progress,
 continuous-hard-only-gateway,
 unified-400-m communication, permanent-gateway, coverage-weighted useful
@@ -587,7 +600,7 @@ boundary-aligned current/next decision-state virtual Relay target/link potential
 reward, GS-reachable initial topology, distance-aware VS/COM task potentials,
 hard-range/COM-session, atomic-FOV, seed-ratio
 aggregation, propulsion, and four-slot/fifty-block movement-channel contract.
-Schema v27 and every older schema is rejected before weights or replay state are
+Schema v28 and every older schema is rejected before weights or replay state are
 restored and must be retrained; no legacy checkpoint migration is attempted.
 Model-only evaluation checkpoints also validate the visual version and complete
 camera/coverage/packet/weight/validity configuration. Training and evaluation

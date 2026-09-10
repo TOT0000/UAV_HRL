@@ -132,6 +132,7 @@ class RelayDiagnosticsOutputTest(unittest.TestCase):
                     "assignment": {
                         "relay_assignment_history": [],
                         "relay_planning": __import__("relay_contract").empty_plan(),
+                        "relay_shaping_history": [],
                         "selected_relay_uav_ids": [],
                         "relay_role_change_count": index % 2,
                     },

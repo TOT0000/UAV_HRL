@@ -13,7 +13,7 @@ from evaluation_aggregation import aggregate_relay_planning
 
 RELAY_DIAGNOSTICS_FILENAME = "relay_diagnostics.json"
 RELAY_DIAGNOSTICS_OUTPUT_CONTRACT_VERSION = (
-    "snapshot-virtual-relay-planning-forwarding-json-v3"
+    "snapshot-virtual-relay-planning-forwarding-json-v4"
 )
 RELAY_BITS_SUM_REL_TOL = 1e-15
 RELAY_BITS_SUM_ABS_TOL = 1e-6
@@ -86,15 +86,39 @@ def validate_relay_plan(plan):
         raise ValueError("Relay slot mapping/count mismatch")
     if len(set(plan["slot_to_uav"].values())) != assigned:
         raise ValueError("Relay UAV assignments must be exclusive")
+    predicted_groups = (
+        set(plan["predicted_fully_supported_source_ids"]),
+        set(plan["predicted_partially_supported_source_ids"]),
+        set(plan["predicted_unsupported_source_ids"]),
+    )
+    if any(
+        predicted_groups[first].intersection(predicted_groups[second])
+        for first in range(3)
+        for second in range(first + 1, 3)
+    ):
+        raise ValueError("predicted Relay source support classes overlap")
+    if set.union(*predicted_groups) != set(plan["planning_source_ids"]):
+        raise ValueError("predicted Relay source support classes are incomplete")
     for slot in plan["slots"]:
         for key in ("slot_id", "virtual_position", "neighbor_ids", "shared", "L_s", "F_s",
                     "chain_index", "chain_count", "witness_paths", "supported_source_ids",
+                    "neighbor_ids_before_budget", "active_neighbor_ids_after_budget",
+                    "missing_neighbor_ids_after_budget", "supported_source_ids_before_budget",
+                    "fully_supported_source_ids_after_budget",
+                    "partially_supported_source_ids_after_budget", "support_status",
                     "planning_priority", "removal_backlog_loss", "assigned_uav_id",
                     "assignment_distance_m", "shortage", "budget_pruned_slot_ids"):
             if key not in slot:
                 raise ValueError(f"Relay slot is missing {key}")
         if plan["slot_to_uav"].get(slot["slot_id"]) != slot["assigned_uav_id"]:
             raise ValueError("Relay slot owner mismatch")
+        before = set(slot["neighbor_ids_before_budget"])
+        active = set(slot["active_neighbor_ids_after_budget"])
+        missing = set(slot["missing_neighbor_ids_after_budget"])
+        if active.intersection(missing) or active.union(missing) != before:
+            raise ValueError("Relay budget neighbor accounting mismatch")
+        if slot["support_status"] not in {"full", "partial", "infeasible"}:
+            raise ValueError("Relay slot support status is invalid")
     _validate_finite_json_value(plan)
     return plan
 
@@ -145,6 +169,7 @@ def validate_relay_diagnostics(diagnostics):
             "relay_planning",
             "selected_relay_uav_ids",
             "relay_role_change_count",
+            "relay_shaping_history",
         ):
             if field not in assignment:
                 raise ValueError(f"{label}.assignment is missing {field}")
@@ -162,6 +187,24 @@ def validate_relay_diagnostics(diagnostics):
                 for key in ("slot_id", "assigned_uav_id", "virtual_position", "P_pos", "P_link", "Phi_relay"):
                     if key not in slot:
                         raise ValueError(f"Relay position slot is missing {key}")
+        for entry in assignment["relay_shaping_history"]:
+            for key in (
+                "movement_step",
+                "relay_assignment_changed_at_boundary",
+                "relay_shaping_enabled",
+                "raw_relay_potential_difference",
+                "applied_relay_shaping",
+            ):
+                if key not in entry:
+                    raise ValueError(f"Relay shaping observation is missing {key}")
+            if entry["relay_shaping_enabled"] == entry[
+                "relay_assignment_changed_at_boundary"
+            ]:
+                raise ValueError("Relay shaping mask disagrees with assignment boundary")
+            if not entry["relay_shaping_enabled"] and not math.isclose(
+                float(entry["applied_relay_shaping"]), 0.0, rel_tol=0.0, abs_tol=0.0
+            ):
+                raise ValueError("disabled Relay shaping must be exactly zero")
         if not isinstance(assignment["selected_relay_uav_ids"], list):
             raise ValueError(f"{label}.selected Relay IDs must be a list")
         role_changes = assignment["relay_role_change_count"]

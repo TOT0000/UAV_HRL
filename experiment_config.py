@@ -92,15 +92,15 @@ GROUND_ALTITUDE_M = 0.0
 UAV_MAX_ALTITUDE_M = 150.0
 TASK_POTENTIAL_NORMALIZATION_EPSILON = 1e-12
 TASK_POTENTIAL_CONTRACT_VERSION = (
-    "oblique-vs-com-virtual-relay-potential-v8"
+    "oblique-vs-com-task-reset-virtual-relay-potential-v9"
 )
 COM_CAPACITY_POTENTIAL_WEIGHT = 0.5
 COM_DISTANCE_POTENTIAL_WEIGHT = 0.5
 RELAY_TASK_CONTRACT_VERSION = (
-    "snapshot-virtual-relay-service-first-greedy-v3"
+    "snapshot-virtual-relay-service-first-greedy-v4"
 )
 RELAY_POTENTIAL_WEIGHT = 1.0
-METHOD_CONTRACT_VERSION = "centralized-16-uav-virtual-relay-v3"
+METHOD_CONTRACT_VERSION = "centralized-16-uav-virtual-relay-v4"
 DEFAULT_TRAINING_SEED = 20260817
 FORMAL_TRAINING_EPISODES = 1500
 FORMAL_CHECKPOINT_EPISODE = FORMAL_TRAINING_EPISODES
@@ -211,7 +211,7 @@ MOVEMENT_ACTION_PROJECTION_CONTRACT_VERSION = (
     "fieldwise-clamp-heading-wrap-relay-active-mask-uav0-hard400-v5"
 )
 MOVEMENT_REPLAY_CONTRACT_VERSION = (
-    "executed-action-boundary-aligned-next-state-relay-range-potential-capacity-50000-v6"
+    "executed-action-boundary-aligned-next-state-relay-reset-mask-capacity-50000-v7"
 )
 MOVEMENT_WARMUP_CONTRACT_VERSION = "global-joint-transition-boundary-10000-v1"
 PROPULSION_PARAMETERS = MappingProxyType(

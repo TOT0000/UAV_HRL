@@ -12,7 +12,8 @@ from Task_assignment import Task, UAVAssigner
 from relay_contract import (
     COUNT_RULE, bounded_minimax_center, connectivity_graph, initial_relay_count,
     movement_bounds, pair_relay_slots, plan_relays, refresh_relay_targets,
-    relay_potential, relay_snapshot, reverse_bfs, valid_in_air_backlog, virtual_positions,
+    predicted_post_assignment_diagnostics, relay_potential, relay_snapshot,
+    reverse_bfs, valid_in_air_backlog, virtual_positions,
 )
 
 
@@ -198,6 +199,9 @@ def test_nonshared_chain_interpolation_clips_and_preserves_identity():
     env = environment([(0,0,100),(1000,0,100),(0,0,100)])
     plan = plan_relays(env,[1],[2])
     slot = plan['slots'][0]
+    assert len(slot['neighbor_ids_before_budget']) == 2
+    assert slot['supported_source_ids_before_budget'] == [1]
+    assert not slot['shared']
     slot['shared'] = False
     slot['neighbor_ids'] = [0,1]
     env.uav_dict[1].position[0] = 1200
@@ -208,6 +212,89 @@ def test_nonshared_chain_interpolation_clips_and_preserves_identity():
     env.uav_dict[1].position[0]=10000
     _,status=virtual_positions(env,[slot])
     assert status[slot['slot_id']]['clipped']
+
+
+def test_budget_pruned_partial_relay_is_retained_and_uses_only_active_links():
+    env = environment([(0,0,100),(1000,0,100),(0,0,100)], {1:500})
+    plan = plan_relays(env, [1], [2])
+    pair_relay_slots(env, plan, [2])
+    assert plan['required_before_budget'] == 2
+    assert plan['assigned_relay_count'] == 1
+    assert plan['partially_supported_source_ids_after_budget'] == [1]
+    assert plan['unsupported_source_ids_after_budget'] == []
+    slot = plan['slots'][0]
+    assert slot['support_status'] == 'partial'
+    assert slot['fully_supported_source_ids_after_budget'] == []
+    assert slot['partially_supported_source_ids_after_budget'] == [1]
+    assert slot['active_neighbor_ids_after_budget'] == [env.GS_ID]
+    assert slot['missing_neighbor_ids_after_budget'] == ['relay-0001-0001']
+    assert not plan['position_status'][slot['slot_id']]['feasible']
+
+    from Channel_model import reference_u2u_max_capacity_mbps
+    from experiment_config import TOTAL_COMMUNICATION_BANDWIDTH_HZ
+    reference = reference_u2u_max_capacity_mbps(TOTAL_COMMUNICATION_BANDWIDTH_HZ)
+    with mock.patch('relay_contract.a2g_capacity_mbps', return_value=.8 * reference):
+        metrics = relay_potential(env, 2, slot)
+    assert metrics['P_link'] == pytest.approx(.8)
+    assert plan['predicted_partially_supported_source_ids'] == [1]
+    assert plan['predicted_fully_supported_source_ids'] == []
+
+    empty_active = copy.deepcopy(slot)
+    empty_active['active_neighbor_ids_after_budget'] = []
+    empty_active['missing_neighbor_ids_after_budget'] = list(
+        empty_active['neighbor_ids_before_budget']
+    )
+    assert relay_potential(env, 2, empty_active)['P_link'] == 0.0
+
+
+def test_predicted_assignment_topology_has_one_position_per_uav_and_is_pure():
+    env = environment([(0,0,100),(700,0,100),(0,0,100)], {1:10})
+    plan = plan_relays(env, [1], [2])
+    pair_relay_slots(env, plan, [2])
+    before = copy.deepcopy(plan)
+    with mock.patch(
+        'relay_contract.graph_from_node_positions',
+        wraps=__import__('relay_contract').graph_from_node_positions,
+    ) as graph_builder:
+        diagnostics = predicted_post_assignment_diagnostics(env, plan)
+    positions = graph_builder.call_args.args[1]
+    assert set(positions) == set(range(env.num_UAV))
+    assert not any(isinstance(node, str) for node in positions)
+    assert diagnostics['predicted_fully_supported_source_ids'] == [1]
+    assert diagnostics['predicted_partially_supported_source_ids'] == []
+    assert diagnostics['predicted_unsupported_source_ids'] == []
+    assert plan == before
+
+
+def test_predicted_support_classes_and_assignment_identity_conflicts():
+    partial_env = environment([(0,0,100),(1000,0,100),(0,0,100)], {1:5})
+    partial_plan = plan_relays(partial_env, [1], [2])
+    pair_relay_slots(partial_env, partial_plan, [2])
+    assert partial_plan['predicted_partially_supported_source_ids'] == [1]
+
+    unsupported_plan = plan_relays(partial_env, [1], [])
+    pair_relay_slots(partial_env, unsupported_plan, [])
+    assert unsupported_plan['predicted_unsupported_source_ids'] == [1]
+
+    self_env = environment([(0,0,100),(700,0,100)], {1:5})
+    self_plan = plan_relays(self_env, [1], [1])
+    pair_relay_slots(self_env, self_plan, [1])
+    assert self_plan['self_neighbor_conflicts'][0]['assigned_uav_id'] == 1
+
+    relocated_env = environment(
+        [(0,0,100),(700,0,100),(0,700,100)], {1:5, 2:5}
+    )
+    relocated_plan = plan_relays(relocated_env, [1,2], [1,2])
+    slots = relocated_plan['slots']
+    slots[0]['assigned_uav_id'], slots[1]['assigned_uav_id'] = 2, 1
+    relocated_plan['slot_to_uav'] = {
+        slots[0]['slot_id']: 2,
+        slots[1]['slot_id']: 1,
+    }
+    diagnostics = predicted_post_assignment_diagnostics(
+        relocated_env, relocated_plan
+    )
+    assert len(diagnostics['relocated_anchor_conflicts']) == 2
 
 
 def test_fixed_identity_target_motion_and_infeasible_diagnostics():

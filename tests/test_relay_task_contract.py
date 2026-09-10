@@ -67,13 +67,63 @@ class RelayRoutingCheckpointDiagnosticsTest(unittest.TestCase):
             0.0,
             0.0,
             1.0,
-            (0.0, 0.0, 0.0, 0.1),
-            (0.0, 0.0, 0.0, 0.9),
+            (0.2, 0.3, 0.4, 0.1),
+            (0.8, 0.7, 0.6, 0.9),
             False,
             config,
             task_potential_enabled=False,
         )
         self.assertEqual(reward, 0.0)
+
+    def test_new_roi_boundary_masks_only_relay_shaping_at_gamma_point_99(self):
+        config = TrainingConfig(total_episodes=1)
+        current = (0.2, 0.3, 0.4, 0.5)
+        following = (0.8, 0.7, 0.6, 0.9)
+        reward = _interval_reward(
+            0.0, 0.0, 0.0, 0.99, current, following, False, config,
+            relay_shaping_enabled=False,
+        )
+        expected_other = (
+            config.beta_search * (0.99 * following[0] - current[0])
+            + config.beta_vs * (0.99 * following[1] - current[1])
+            + config.beta_com * (0.99 * following[2] - current[2])
+        )
+        self.assertEqual(reward, expected_other)
+        normal = _interval_reward(
+            0.0, 0.0, 0.0, 0.99, current, following, False, config,
+            relay_shaping_enabled=True,
+        )
+        self.assertEqual(
+            normal - reward,
+            config.beta_relay * (0.99 * following[3] - current[3]),
+        )
+
+    def test_joint_replay_persists_and_applies_relay_shaping_mask(self):
+        replay = ReplayBufferJoint(1, 1, max_size=2)
+        for enabled in (False, True):
+            replay.add(
+                [0.0], [0.0], [0.0], done=False,
+                delivered_mbits=0.0, total_mobility_energy=0.0,
+                phi_search_t=0.0, phi_search_t1=0.0,
+                phi_vs_t=0.0, phi_vs_t1=0.0,
+                phi_com_t=0.0, phi_com_t1=0.0,
+                phi_relay_t=0.5, phi_relay_t1=0.9,
+                relay_shaping_enabled=enabled,
+            )
+        np.testing.assert_array_equal(
+            replay.relay_shaping_enabled[:2, 0], [False, True]
+        )
+        reward = replay._reward_numpy(
+            np.array([0, 1]), current_lambda=0.0, gamma=0.99,
+            beta_relay=1.0,
+        ).ravel()
+        self.assertEqual(reward[0], 0.0)
+        self.assertAlmostEqual(reward[1], 0.99 * 0.9 - 0.5, places=6)
+        disabled_all = replay._reward_numpy(
+            np.array([0, 1]), current_lambda=0.0, gamma=0.99,
+            task_potential_enabled=False,
+        ).ravel()
+        np.testing.assert_array_equal(disabled_all, [0.0, 0.0])
 
     def test_replay_relay_potential_is_boundary_aligned_and_telescopes(self):
         captured = []
@@ -128,6 +178,10 @@ class RelayRoutingCheckpointDiagnosticsTest(unittest.TestCase):
             )
 
         self.assertEqual(len(captured), 5)
+        self.assertFalse(captured[0]["relay_shaping_enabled"])
+        self.assertTrue(all(
+            record["relay_shaping_enabled"] for record in captured[1:]
+        ))
         schema = movement_state_feature_schema()["features"]
         backlog_indices = [
             feature["index"]
@@ -169,11 +223,23 @@ class RelayRoutingCheckpointDiagnosticsTest(unittest.TestCase):
         )
         self.assertEqual(captured[0]["phi_relay_t"], 0.0)
         self.assertAlmostEqual(relay_shaping_sum, 0.0, places=12)
+        shaping_history = result["relay_diagnostics"]["episodes"][0][
+            "assignment"
+        ]["relay_shaping_history"]
+        self.assertTrue(shaping_history[0][
+            "relay_assignment_changed_at_boundary"
+        ])
+        self.assertFalse(shaping_history[0]["relay_shaping_enabled"])
+        self.assertEqual(shaping_history[0]["applied_relay_shaping"], 0.0)
+        self.assertTrue(all(
+            entry["relay_shaping_enabled"] for entry in shaping_history[1:]
+        ))
 
     def test_old_checkpoint_fails_before_loading(self):
-        self.assertEqual(CHECKPOINT_SCHEMA_VERSION, 28)
-        with self.assertRaisesRegex(RuntimeError, "Relay.*retrained"):
-            _validate_checkpoint_schema({"checkpoint_schema_version": 23})
+        self.assertEqual(CHECKPOINT_SCHEMA_VERSION, 29)
+        for schema in (28, 23):
+            with self.assertRaisesRegex(RuntimeError, "Relay.*retrained"):
+                _validate_checkpoint_schema({"checkpoint_schema_version": schema})
 
     def test_diagnostics_are_rng_observational_and_publish_forwarding_groups(self):
         state = copy.deepcopy(self.env.assignment_rng.bit_generator.state)

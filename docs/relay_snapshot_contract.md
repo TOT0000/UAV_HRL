@@ -1,7 +1,7 @@
 # Relay snapshot 規劃與 TD3 movement shaping 變更
 
 日期：2026-09-10。分支：`feature/centralized-td3`。
-修改前 HEAD：`5119e4efb28844a3f2d22166ed78b376ce17f283`。
+本次修正前 HEAD：`a37cec7122eea795f69c9c6beb18eebf14cbcb3a`。
 
 ## 修改前的 production 行為
 
@@ -19,28 +19,29 @@
 3. Planning sources 為有效且未過期的 in-air FOV／COM queue owners，加上本輪 prospective service UAV。SR ground backlog 不計；prospective zero backlog 權重為零。
 4. 使用全部合法 routing UAV 節點，以 3D 400 m 圖與 reverse BFS 求 GS reachability。U2G 判斷共用原 production 的距離 eligibility，不參考 channel samples。
 5. 各斷聯來源取最近的實體 source／GS component endpoints，建立 `ceil(d/400)-1` 個等距 candidates；以固定順序逐一測試 zero-loss deletion。
-6. 從 deterministic witnesses 收集固定 neighbors。兩個以上必要鄰居即標記 shared；以 bounded minimax 更新位置。數值失敗有 deterministic fallback；規劃時無效 merge 會恢復 candidates，必要時回到原始 bridge-chain witnesses。
-7. 不足時每一步重新計算 marginal backlog loss，按 loss、斷聯來源數、slot ID 刪除。保留 budget 前 required、available、assigned、shortage 四個不同數值。
+6. 從 deterministic witnesses 收集固定 neighbors。只有支援至少兩個不同 source ID 的 slot 才標記 shared；單一來源的普通兩鄰居 chain 保持 non-shared。shared 使用 bounded minimax，non-shared 使用原 bridge interpolation。數值失敗有 deterministic fallback；規劃時無效 merge 會恢復 candidates，必要時回到原始 bridge-chain witnesses。
+7. 不足時每一步重新計算 marginal backlog loss，按 loss、斷聯來源數、slot ID 刪除。保留 budget 前 required、available、assigned、shortage 四個不同數值。pruning 後重建 augmented graph、reachability、witness、active/missing neighbors 及 full/partial/infeasible support；partial slot 繼續分配。
 8. K-KM／KM 按 slot 重要性，依 raw 3D distance greedy 配對剩餘 UAV；Random 使用正式 assignment RNG。Relay 永遠 exclusive，沒有 Relay utility matrix／Hungarian。
-9. 兩次 RoI boundary 間固定 slot／UAV／anchor／neighbor 身分，只更新位置。Search release 只轉 Hover，不再重新分配服務或 Relay。
+9. Greedy mapping 後建立唯讀 predicted topology：assigned Relay UAV 只在 virtual position 出現一次，其餘 UAV 保留 physical position，再以 reverse BFS 分類 full／partial／unsupported source 並記錄 self-neighbor 與 relocated-anchor conflicts。診斷不改 mapping、任務或數量。
+10. 兩次 RoI boundary 間固定 slot／UAV／anchor／neighbor 身分，只更新位置。Search release 只轉 Hover，不再重新分配服務或 Relay。
 
 ## Movement 與 routing
 
-每架 UAV 的舊 Relay 8 個欄位改為 3 個 normalized target displacement，非 Relay 與 masked observation 為零。Movement observation 現為 **595-D，schema 6**；checkpoint schema **28**，舊 checkpoint 在 restore weights 前拒絕並要求重新訓練。
+每架 UAV 的舊 Relay 8 個欄位改為 3 個 normalized target displacement，非 Relay 與 masked observation 為零。Movement observation 現為 **595-D，schema 6**；checkpoint schema **29**，schema 28 與更舊 checkpoint 在 restore weights／replay 前拒絕並要求重新訓練。
 
-Relay potential 為 `0.3 * exp(-distance/400) + 0.7 * min(clip(C_bar/C_ref,0,1))`。U2U capacity 為 deterministic Rician expectation；GS neighbor 使用 expected-path-loss A2G estimate。Reference 是 `reference_u2u_max_capacity_mbps(10 MHz)`，各 slot diagnostics 記錄其數值。Virtual neighbor 的 link term 使用分配到該 slot 的實體 UAV 位置。
+Relay potential 為 `0.3 * exp(-distance/400) + 0.7 * min(clip(C_bar/C_ref,0,1))`。`P_link` 只取 active neighbors 的最小值，missing neighbor 不參與，active 集合為空時是 0。U2U capacity 為 deterministic Rician expectation；GS neighbor 使用 expected-path-loss A2G estimate。Reference 是 `reference_u2u_max_capacity_mbps(10 MHz)`，各 slot diagnostics 記錄其數值。Virtual neighbor 的 link term 使用分配到該 slot 的實體 UAV 位置。
 
-Relay 外層權重與 COM 相同，沿用既有 `gamma*Phi_next-Phi_current`、boundary replay continuity 與 terminal-zero convention。沒有額外 per-step、arrival 或 distance bonus；`no_task_potential` 可完整停用。
+Relay 外層權重與 COM 相同，沿用既有 `gamma*Phi_next-Phi_current`、boundary replay continuity 與 terminal-zero convention。若新 RoI 在 boundary 改變 Relay assignment，該 transition 的 replay mask 關閉 Relay shaping，applied 值嚴格為 0；raw `Phi_t/Phi_t1` 保留，Search／VS／COM 與 objective reward 照常，下一筆恢復啟用。沒有額外 per-step、arrival 或 distance bonus；`no_task_potential` 可完整停用所有 task shaping。
 
 Safe-DDQN 的 143-D observation、48-D joint movement action、routing actions／masks、next-hop semantics、FDMA、FIFO、deadlines 與 routing reward 均保留。唯一與 GS API 相關的整理是把相同的距離 eligibility 提取成可接受虛擬位置的共用方法。
 
 ## Diagnostics 與限制
 
-`relay_diagnostics.json` v3 包含完整 assignment planning events、candidate removal tests、budget loss tests、mapping／raw assignment distances、角色變更，以及各 movement boundary 的 compact targets／potential／feasibility／physical reachability snapshots。
+`relay_diagnostics.json` v4 包含完整 assignment planning events、candidate removal tests、budget loss tests、mapping／raw assignment distances、budget 後 support、predicted topology／identity conflicts、角色變更，以及各 movement boundary 的 compact targets／potential／feasibility／physical reachability snapshots。每筆 movement transition 另記 `relay_assignment_changed_at_boundary`、`relay_shaping_enabled`、raw difference 與 applied shaping。
 
 Evaluation aggregation 分別加總 episode-final required、available、assigned、shortage，並統計 disconnected source-boundary 與 infeasible slot-boundary observations。零 Relay 的各方法仍使用一致 schema 與輸出檔案。Validation 檢查 count／mapping／summary 一致性及有限值。
 
-這是 snapshot greedy heuristic，沒有全域最少 Relay 保證，也不預測 UAV 移動後的圖。Physical witness 中的 UAV 自己也可能移動；anchors 分離後可能永久斷聯，直到下一個新 RoI。Budget pruning 可能留下需要已移除 virtual neighbor 的 slot，此缺失 link 為零並記錄 infeasible。若沒有任何實體 GS component，來源記為 unsupported，不發明 projection／gateway 規則。
+這是 snapshot greedy heuristic，沒有全域最少 Relay 保證。Predicted topology 是 assignment 當下的診斷，不保證 UAV 實際移動後持續連通。Physical witness 中的 UAV 自己也可能移動；anchors 分離後可能永久斷聯，直到下一個新 RoI。Budget pruning 可能留下需要已移除 virtual neighbor 的 partial slot；缺失 neighbor 不壓低其 active-link potential，但 source 不因此升級為 fully supported。若沒有任何實體 GS component，來源記為 unsupported，不發明 projection／gateway 規則。
 
 ## 主要修改檔案
 
@@ -64,9 +65,9 @@ Evaluation aggregation 分別加總 episode-final required、available、assigne
 - 額外固定 seed 的 80 組稀疏 3D snapshots 檢查，涵蓋最多 12 個 budget 前 Relay slots。
 - 全部 regression：`python -u -m pytest tests -q -p no:cacheprovider --tb=short --disable-warnings`。
 
-最終完整 regression：**661 passed、373 subtests passed**，355.58 秒。
-Targeted related suite：**93 passed、27 subtests passed**；另執行含最新三鄰居共用情境的完整 Relay planner suite：**37 passed**。
-Preflight／assignment fixture 修正後：**24 passed、15 subtests passed**。
+最終完整 regression：**667 passed、373 subtests passed**，361.68 秒。
+Targeted related suite：**164 passed、56 subtests passed**。
+獨立 training／K-KM、KM、Random evaluation smoke：**4 passed**。
 完整 suite 包含上述 training 與 evaluation smoke；沒有未解決的測試失敗。
 Pytest 另輸出 228 個第三方／既有 warning，未停用其收集，只以 `--disable-warnings` 隱藏冗長列表。
-`git diff --check` 通過。過程中曾失敗的舊 schema／release／preflight fixture 已依新契約更新。
+`git diff --check` 通過。空白 assignment mock 與手工 diagnostics fixture 已依新版 predicted／shaping diagnostics 契約更新。

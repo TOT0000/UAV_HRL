@@ -94,7 +94,7 @@ from dinkelbach_blocks import (
     dinkelbach_config_metadata,
 )
 
-CHECKPOINT_SCHEMA_VERSION = 28
+CHECKPOINT_SCHEMA_VERSION = 29
 PRE_16_UAV_RELAY_RANGE_PROGRESS_CHECKPOINT_SCHEMA_VERSION = 24
 PRE_BOUNDARY_ALIGNED_RELAY_POTENTIAL_CHECKPOINT_SCHEMA_VERSION = 23
 PRE_RELAY_TASK_CHECKPOINT_SCHEMA_VERSION = 22
@@ -148,6 +148,7 @@ JOINT_REPLAY_FIELDS = (
     "current_movement_mask",
     "next_movement_mask",
     "movement_mask_valid",
+    "relay_shaping_enabled",
 )
 ROUTING_REPLAY_FIELDS = (
     "state",
@@ -1463,7 +1464,7 @@ def _validate_checkpoint_schema(metadata):
             "Relay assignment, 595-D virtual Relay movement state, target/link "
             "movement potential and boundary-aligned current/next decision state, "
             "named-RNG, projected-action and replay "
-            "contract and must be retrained: "
+            "contract, including task-reset Relay shaping masks, and must be retrained: "
             f"checkpoint={schema}, expected={CHECKPOINT_SCHEMA_VERSION}"
         )
     routing_state_dim = metadata.get("routing_state_dim")
@@ -1982,12 +1983,13 @@ def _validate_joint_replay_projection_masks(checkpoint_dir, metadata):
         "current_movement_mask",
         "next_movement_mask",
         "movement_mask_valid",
+        "relay_shaping_enabled",
     }
     with np.load(replay_path, allow_pickle=False) as arrays:
         missing = sorted(required.difference(arrays.files))
         if missing:
             raise RuntimeError(
-                "full-resume checkpoint is missing movement projection mask "
+                "full-resume checkpoint is missing joint replay contract "
                 f"fields: {missing}"
             )
         if int(metadata.get("movement_state_dim", -1)) == MOVEMENT_STATE_DIM:

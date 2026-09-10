@@ -49,7 +49,8 @@ def relay_diagnostics_fixture():
         "scenario_id": "fixture-scenario",
         "assignment": {
             "relay_assignment_history": [], "relay_planning": empty_plan(),
-            "relay_position_history": [], "selected_relay_uav_ids": [],
+            "relay_position_history": [], "relay_shaping_history": [],
+            "selected_relay_uav_ids": [],
             "relay_role_change_count": 0,
         },
         "forwarding": forwarding,

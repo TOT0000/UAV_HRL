@@ -148,6 +148,23 @@ def connectivity_graph(env, virtual=None):
     return graph
 
 
+def graph_from_node_positions(env, positions):
+    """Build the canonical deterministic graph for an explicit node snapshot."""
+    positions = {node: np.asarray(position, dtype=float)
+                 for node, position in positions.items()}
+    graph = {node: set() for node in positions}
+    graph[env.GS_ID] = set()
+    for first, second in combinations(sorted(positions, key=node_key), 2):
+        if math.dist(positions[first], positions[second]) <= RANGE_M:
+            graph[first].add(second)
+            graph[second].add(first)
+    for node, position in positions.items():
+        if env.is_u2g_position_in_range(position):
+            graph[node].add(env.GS_ID)
+            graph[env.GS_ID].add(node)
+    return graph
+
+
 def reverse_bfs(graph, root):
     parents = {root: None}
     queue = deque([root])
@@ -185,8 +202,20 @@ def empty_plan():
             "merge_validation": [], "required_before_budget": 0,
             "available_relay_uavs": 0, "assigned_relay_count": 0, "shortage": 0,
             "budget_pruning": [], "unsupported_source_ids": [], "unsupported_backlog": 0.,
+            "fully_supported_source_ids_after_budget": [],
+            "partially_supported_source_ids_after_budget": [],
+            "unsupported_source_ids_after_budget": [],
+            "supported_backlog_bits_after_budget": 0.,
+            "unsupported_backlog_bits_after_budget": 0.,
             "slots": [], "slot_to_uav": {}, "position_status": {},
-            "current_source_reachability": {}}
+            "current_source_reachability": {},
+            "predicted_post_assignment_reachability": {},
+            "predicted_fully_supported_source_ids": [],
+            "predicted_partially_supported_source_ids": [],
+            "predicted_unsupported_source_ids": [],
+            "predicted_supported_backlog_bits": 0.,
+            "predicted_unsupported_backlog_bits": 0.,
+            "self_neighbor_conflicts": [], "relocated_anchor_conflicts": []}
 
 
 def attach_witness_metadata(slots, paths):
@@ -202,7 +231,7 @@ def attach_witness_metadata(slots, paths):
                 slot_paths[str(source)] = list(path)
         slot.update(neighbor_ids=sorted(neighbors, key=node_key),
                     supported_source_ids=sorted(supported), witness_paths=slot_paths,
-                    shared=len(neighbors) >= 2)
+                    shared=len(set(supported)) >= 2)
 
 
 def original_chain_witnesses(env, slots, sources):
@@ -248,8 +277,10 @@ def virtual_positions(env, slots):
         positions = {}
         for slot in slots:
             sid = slot["slot_id"]
-            neighbors = [nodes[n] for n in slot["neighbor_ids"] if n in nodes]
-            if slot["shared"] and len(neighbors) == len(slot["neighbor_ids"]) and neighbors:
+            neighbor_ids = slot.get("active_neighbor_ids_after_budget",
+                                    slot["neighbor_ids"])
+            neighbors = [nodes[n] for n in neighbor_ids if n in nodes]
+            if slot["shared"] and len(neighbors) == len(neighbor_ids) and neighbors:
                 positions[sid], solver = bounded_minimax_center(neighbors, bounds)
                 status[sid]["minimax"] = solver
             else:
@@ -262,16 +293,85 @@ def virtual_positions(env, slots):
     nodes = {**physical, **positions}
     for slot in slots:
         sid = slot["slot_id"]
-        missing = [n for n in slot["neighbor_ids"] if n not in nodes]
+        neighbor_ids = slot.get("active_neighbor_ids_after_budget",
+                                slot["neighbor_ids"])
+        missing = [n for n in neighbor_ids if n not in nodes]
         radius = max((math.dist(positions[sid], nodes[n])
-                      for n in slot["neighbor_ids"] if n in nodes), default=0.)
+                      for n in neighbor_ids if n in nodes), default=0.)
+        budget_missing = list(slot.get("missing_neighbor_ids_after_budget", ()))
         status[sid].update(position=positions[sid].tolist(), radius_m=radius,
-                           feasible=not missing and radius <= RANGE_M,
+                           active_neighbors_feasible=not missing and radius <= RANGE_M,
+                           feasible=not missing and not budget_missing and radius <= RANGE_M,
                            missing_neighbor_ids=missing, coupled_converged=converged,
                            coupled_fallback=None if converged else "last_bounded_finite_iterate",
                            coupled_iterations=iteration + 1,
                            coupled_iteration_cap=POSITION_MAX_ITER)
     return positions, status
+
+
+def rebuild_after_budget_metadata(env, slots, positions, sources, weights):
+    """Rebuild final witnesses while retaining incomplete bridge provenance."""
+    retained = set(positions)
+    final_graph = connectivity_graph(env, positions)
+    final_paths = witness_paths(final_graph, env.GS_ID, sources)
+    fully = sorted(source for source, path in final_paths.items() if path)
+    fully_set = set(fully)
+    partial = sorted(source for source in sources if source not in fully_set and any(
+        source in slot["supported_source_ids_before_budget"] for slot in slots))
+    unsupported = sorted(set(sources) - fully_set - set(partial))
+    for slot in slots:
+        before_neighbors = list(slot["neighbor_ids_before_budget"])
+        active = [neighbor for neighbor in before_neighbors
+                  if not isinstance(neighbor, str) or neighbor in retained]
+        missing = [neighbor for neighbor in before_neighbors
+                   if isinstance(neighbor, str) and neighbor not in retained]
+        full_for_slot = [source for source in fully
+                         if slot["slot_id"] in final_paths[source]]
+        partial_for_slot = [source for source in partial
+                            if source in slot["supported_source_ids_before_budget"]]
+        if full_for_slot:
+            support_status = "full"
+        elif partial_for_slot:
+            support_status = "partial"
+        else:
+            support_status = "infeasible"
+        slot.update(
+            active_neighbor_ids_after_budget=sorted(active, key=node_key),
+            missing_neighbor_ids_after_budget=sorted(missing, key=node_key),
+            fully_supported_source_ids_after_budget=full_for_slot,
+            partially_supported_source_ids_after_budget=partial_for_slot,
+            support_status=support_status,
+            budget_witness_paths={str(source): list(final_paths[source])
+                                  for source in full_for_slot},
+        )
+    positions, position_status = virtual_positions(env, slots)
+    # Rebuild once more at the final updated targets, which is the actual
+    # budget-pruned augmented topology used by planning diagnostics.
+    final_paths = witness_paths(connectivity_graph(env, positions), env.GS_ID, sources)
+    fully = sorted(source for source, path in final_paths.items() if path)
+    fully_set = set(fully)
+    partial = sorted(source for source in sources if source not in fully_set and any(
+        source in slot["supported_source_ids_before_budget"] for slot in slots))
+    unsupported = sorted(set(sources) - fully_set - set(partial))
+    for slot in slots:
+        full_for_slot = [source for source in fully
+                         if slot["slot_id"] in final_paths[source]]
+        partial_for_slot = [source for source in partial
+                            if source in slot["supported_source_ids_before_budget"]]
+        slot["fully_supported_source_ids_after_budget"] = full_for_slot
+        slot["partially_supported_source_ids_after_budget"] = partial_for_slot
+        slot["support_status"] = ("full" if full_for_slot else
+                                  "partial" if partial_for_slot else "infeasible")
+        slot["budget_witness_paths"] = {
+            str(source): list(final_paths[source]) for source in full_for_slot}
+        slot["virtual_position"] = positions[slot["slot_id"]].tolist()
+    return {
+        "positions": positions, "position_status": position_status,
+        "witness_paths": final_paths, "fully": fully, "partial": partial,
+        "unsupported": unsupported,
+        "supported_backlog": math.fsum(weights[source] for source in fully),
+        "unsupported_backlog": math.fsum(weights[source] for source in partial + unsupported),
+    }
 
 
 def removal_loss(env, positions, candidate, sources, weights):
@@ -318,7 +418,14 @@ def plan_relays(env, prospective, available_uavs):
                           "virtual_position": position.tolist(), "shared": False,
                           "L_s": left, "F_s": far, "chain_index": q, "chain_count": count,
                           "origin_source_id": source, "neighbor_ids": [],
+                          "neighbor_ids_before_budget": [],
+                          "active_neighbor_ids_after_budget": [],
+                          "missing_neighbor_ids_after_budget": [],
                           "supported_source_ids": [], "witness_paths": {},
+                          "supported_source_ids_before_budget": [],
+                          "fully_supported_source_ids_after_budget": [],
+                          "partially_supported_source_ids_after_budget": [],
+                          "support_status": "infeasible",
                           "planning_priority": None, "removal_backlog_loss": 0.,
                           "assigned_uav_id": None, "assignment_distance_m": None,
                           "clipped": bool(np.any(raw != position))})
@@ -347,6 +454,10 @@ def plan_relays(env, prospective, available_uavs):
         slots = [deepcopy(s) for s in initial if s["slot_id"] in positions]
         paths = witness_paths(connectivity_graph(env, positions), env.GS_ID, sources)
         attach_witness_metadata(slots, paths)
+        for slot in slots:
+            slot["neighbor_ids_before_budget"] = list(slot["neighbor_ids"])
+            slot["supported_source_ids_before_budget"] = list(
+                slot["supported_source_ids"])
         updated, status = virtual_positions(env, slots)
         reachable = reverse_bfs(connectivity_graph(env, updated), env.GS_ID)
         invalid = [sid for sid, st in status.items()
@@ -366,6 +477,10 @@ def plan_relays(env, prospective, available_uavs):
             # coupled minimax iteration reached its cap.
             paths = original_chain_witnesses(env, slots, sources)
             attach_witness_metadata(slots, paths)
+            for slot in slots:
+                slot["neighbor_ids_before_budget"] = list(slot["neighbor_ids"])
+                slot["supported_source_ids_before_budget"] = list(
+                    slot["supported_source_ids"])
             updated, status = virtual_positions(env, slots)
             reachable = reverse_bfs(connectivity_graph(env, updated), env.GS_ID)
             valid = all(st["feasible"] for st in status.values()) and all(
@@ -381,14 +496,16 @@ def plan_relays(env, prospective, available_uavs):
         positions[restored] = next(s["virtual_position"] for s in initial if s["slot_id"] == restored)
         validation["restored_candidate"] = restored
     plan["required_before_budget"] = len(slots)
-    # Store validated witness identities before pruning: a removed neighbor is
-    # explicitly unsupported, never silently replaced by a different identity.
+    # Keep the validated pre-budget identities. Partial bridges remain assigned
+    # after pruning, with missing virtual neighbors diagnosed separately.
     while len(positions) > len(available_uavs):
         tests = [removal_loss(env, positions, sid, sources, weights) for sid in sorted(positions)]
         chosen = min(tests, key=lambda t: (t["backlog_loss"], len(t["lost_source_ids"]), t["slot_id"]))
         plan["budget_pruning"].append({**chosen, "candidate_tests": tests})
         del positions[chosen["slot_id"]]
     slots = [s for s in slots if s["slot_id"] in positions]
+    rebuilt = rebuild_after_budget_metadata(env, slots, positions, sources, weights)
+    positions = rebuilt["positions"]
     for slot in slots:
         loss = removal_loss(env, positions, slot["slot_id"], sources, weights)
         slot.update(virtual_position=list(map(float, positions[slot["slot_id"]])),
@@ -399,19 +516,18 @@ def plan_relays(env, prospective, available_uavs):
     slots.sort(key=lambda s: (-s["removal_backlog_loss"], -len(s["removal_source_ids"]), s["slot_id"]))
     for priority, slot in enumerate(slots):
         slot["planning_priority"] = priority
-    final_paths = witness_paths(connectivity_graph(env, positions), env.GS_ID, sources)
-    for slot in slots:
-        slot["supported_source_ids_before_budget"] = slot["supported_source_ids"]
-        slot["supported_source_ids"] = [s for s, path in final_paths.items() if slot["slot_id"] in path]
-        slot["budget_witness_paths"] = {
-            str(s): path for s, path in final_paths.items() if slot["slot_id"] in path}
-    unsupported = [s for s in sources if not final_paths[s]]
+    final_paths = rebuilt["witness_paths"]
     plan.update(slots=slots, witness_paths={str(k): v for k, v in paths.items()},
                 budget_witness_paths={str(k): v for k, v in final_paths.items()},
                 assigned_relay_count=len(slots), shortage=plan["required_before_budget"]-len(slots),
-                unsupported_source_ids=unsupported,
-                unsupported_backlog=math.fsum(weights[s] for s in unsupported),
-                position_status=status)
+                fully_supported_source_ids_after_budget=rebuilt["fully"],
+                partially_supported_source_ids_after_budget=rebuilt["partial"],
+                unsupported_source_ids_after_budget=rebuilt["unsupported"],
+                supported_backlog_bits_after_budget=rebuilt["supported_backlog"],
+                unsupported_backlog_bits_after_budget=rebuilt["unsupported_backlog"],
+                unsupported_source_ids=rebuilt["partial"] + rebuilt["unsupported"],
+                unsupported_backlog=rebuilt["unsupported_backlog"],
+                position_status=rebuilt["position_status"])
     return plan
 
 
@@ -426,6 +542,85 @@ def pair_relay_slots(env, plan, available_uavs, *, random=False):
         slot["assigned_uav_id"] = uid
         slot["assignment_distance_m"] = math.dist(env.uav_dict[uid].get_position(), slot["virtual_position"])
         plan["slot_to_uav"][slot["slot_id"]] = uid
+    plan.update(predicted_post_assignment_diagnostics(env, plan))
+
+
+def predicted_post_assignment_diagnostics(env, plan):
+    """Predict topology after assigned Relay UAVs reach their targets.
+
+    This function is observational. It replaces each assigned Relay UAV's
+    physical coordinate with its virtual target exactly once and never adds an
+    anonymous virtual copy. Results cannot change mapping, counts, or tasks.
+    """
+    sources = list(plan.get("planning_source_ids", ()))
+    if not plan["slots"] and not sources:
+        return {
+            "predicted_post_assignment_reachability": {},
+            "predicted_fully_supported_source_ids": [],
+            "predicted_partially_supported_source_ids": [],
+            "predicted_unsupported_source_ids": [],
+            "predicted_supported_backlog_bits": 0.,
+            "predicted_unsupported_backlog_bits": 0.,
+            "self_neighbor_conflicts": [],
+            "relocated_anchor_conflicts": [],
+        }
+    relay_by_uav = {int(slot["assigned_uav_id"]): slot for slot in plan["slots"]
+                    if slot.get("assigned_uav_id") is not None}
+    num_uav = getattr(env, "num_UAV", None)
+    if num_uav is None:
+        num_uav = len(env.uav_dict)
+    num_uav = int(num_uav)
+    predicted_positions = {
+        uid: np.asarray(relay_by_uav[uid]["virtual_position"], dtype=float)
+        if uid in relay_by_uav
+        else np.asarray(env.uav_dict[uid].get_position(), dtype=float)
+        for uid in range(num_uav)
+    }
+    graph = graph_from_node_positions(env, predicted_positions)
+    reachable = reverse_bfs(graph, env.GS_ID)
+    fully = sorted(source for source in sources if source in reachable)
+    full_set = set(fully)
+    retained_support = {
+        source for slot in plan["slots"]
+        for source in slot.get("supported_source_ids_before_budget", ())}
+    partial = sorted(source for source in sources
+                     if source not in full_set and source in retained_support)
+    unsupported = sorted(set(sources) - full_set - set(partial))
+    self_conflicts = []
+    relocated_conflicts = []
+    for slot in plan["slots"]:
+        uid = int(slot["assigned_uav_id"])
+        for neighbor in slot.get("active_neighbor_ids_after_budget", ()):
+            if neighbor == uid:
+                self_conflicts.append({"slot_id": slot["slot_id"],
+                                       "assigned_uav_id": uid,
+                                       "physical_neighbor_id": int(neighbor)})
+            elif isinstance(neighbor, int) and neighbor in relay_by_uav:
+                relocated_conflicts.append({
+                    "slot_id": slot["slot_id"], "assigned_uav_id": uid,
+                    "physical_neighbor_id": int(neighbor),
+                    "neighbor_relay_slot_id": relay_by_uav[neighbor]["slot_id"],
+                    "neighbor_original_position": list(map(
+                        float, env.uav_dict[neighbor].get_position())),
+                    "neighbor_predicted_position": list(map(
+                        float, predicted_positions[neighbor])),
+                })
+    source_backlog = plan.get("source_backlog_bits", {})
+    weights = {int(source): float(source_backlog.get(
+        str(source), source_backlog.get(source, 0.)))
+               for source in sources}
+    return {
+        "predicted_post_assignment_reachability": {
+            str(source): source in reachable for source in sources},
+        "predicted_fully_supported_source_ids": fully,
+        "predicted_partially_supported_source_ids": partial,
+        "predicted_unsupported_source_ids": unsupported,
+        "predicted_supported_backlog_bits": math.fsum(weights[s] for s in fully),
+        "predicted_unsupported_backlog_bits": math.fsum(
+            weights[s] for s in partial + unsupported),
+        "self_neighbor_conflicts": self_conflicts,
+        "relocated_anchor_conflicts": relocated_conflicts,
+    }
 
 
 def relay_potential(env, uid, slot, positions=None):
@@ -437,11 +632,12 @@ def relay_potential(env, uid, slot, positions=None):
     p_pos = math.exp(-math.dist(point, target) / RANGE_M)
     capacities = []
     reference = float(reference_u2u_max_capacity_mbps(TOTAL_COMMUNICATION_BANDWIDTH_HZ))
-    for neighbor in slot["neighbor_ids"]:
+    for neighbor in slot.get("active_neighbor_ids_after_budget",
+                             slot["neighbor_ids"]):
         if neighbor == env.GS_ID:
             capacity = (a2g_capacity_mbps(point, env.GS_pos, TOTAL_COMMUNICATION_BANDWIDTH_HZ,
                                           U2U_U2G_TX_POWER_DBM)
-                        if env.is_u2g_in_range(uid) else 0.)
+                        if env.is_u2g_position_in_range(point) else 0.)
             capacities.append(float(np.clip(capacity / reference, 0., 1.)))
             continue
         neighbor_uid = neighbor if isinstance(neighbor, int) else plan["slot_to_uav"].get(neighbor)

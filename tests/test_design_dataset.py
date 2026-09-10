@@ -189,9 +189,9 @@ class DesignDatasetIntegrationTest(unittest.TestCase):
 
     def test_two_episodes_produce_120_ordered_joint_transitions(self):
         arrays = self.arrays_one
-        self.assertEqual(DESIGN_DATASET_SCHEMA_VERSION, 5)
-        self.assertEqual(self.metadata_one["schema_version"], 5)
-        self.assertEqual(self.metadata_one["checkpoint_schema_version"], 28)
+        self.assertEqual(DESIGN_DATASET_SCHEMA_VERSION, 6)
+        self.assertEqual(self.metadata_one["schema_version"], 6)
+        self.assertEqual(self.metadata_one["checkpoint_schema_version"], 29)
         self.assertEqual(self.metadata_one["scenario_schema_version"], "uav-hrl-scenario-v8")
         self.assertEqual(self.metadata_one["num_uav"], 16)
         self.assertEqual(

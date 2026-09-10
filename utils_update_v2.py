@@ -199,6 +199,7 @@ class ReplayBufferJoint:
         self.phi_com_t1 = np.zeros((self.max_size, 1), dtype=np.float32)
         self.phi_relay_t = np.zeros((self.max_size, 1), dtype=np.float32)
         self.phi_relay_t1 = np.zeros((self.max_size, 1), dtype=np.float32)
+        self.relay_shaping_enabled = np.ones((self.max_size, 1), dtype=bool)
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     @torch.no_grad()
@@ -221,6 +222,7 @@ class ReplayBufferJoint:
         ratio_objective_reward=0.0,
         current_movement_mask=None,
         next_movement_mask=None,
+        relay_shaping_enabled=True,
     ):
         index = self.ptr
         state_array = _to_np_float32(state)
@@ -262,6 +264,7 @@ class ReplayBufferJoint:
         self.phi_com_t1[index, 0] = float(phi_com_t1)
         self.phi_relay_t[index, 0] = float(phi_relay_t)
         self.phi_relay_t1[index, 0] = float(phi_relay_t1)
+        self.relay_shaping_enabled[index, 0] = bool(relay_shaping_enabled)
         self.ptr = (self.ptr + 1) % self.max_size
         self.size = min(self.size + 1, self.max_size)
         self.total_added += 1
@@ -315,7 +318,8 @@ class ReplayBufferJoint:
             * (float(gamma) * not_done * self.phi_vs_t1[indices] - self.phi_vs_t[indices])
             + float(beta_com)
             * (float(gamma) * not_done * self.phi_com_t1[indices] - self.phi_com_t[indices])
-            + float(beta_relay)
+            + self.relay_shaping_enabled[indices].astype(np.float32)
+            * float(beta_relay)
             * (float(gamma) * not_done * self.phi_relay_t1[indices] - self.phi_relay_t[indices])
         )
         return reward.astype(np.float32, copy=False)

@@ -2,6 +2,7 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest import mock
 
 import numpy as np
 import torch
@@ -98,6 +99,7 @@ class MovementMaskCheckpointTest(unittest.TestCase):
             phi_com_t1=0.0,
             current_movement_mask=current_mask,
             next_movement_mask=next_mask,
+            relay_shaping_enabled=False,
         )
         dinkelbach = DinkelbachBlockState.from_config(config)
         event = dinkelbach.record_episode(1.0, 2.0)
@@ -175,6 +177,7 @@ class MovementMaskCheckpointTest(unittest.TestCase):
                     "current_movement_mask",
                     "next_movement_mask",
                     "movement_mask_valid",
+                    "relay_shaping_enabled",
                 }
             }
         np.savez_compressed(replay_path, **arrays)
@@ -213,6 +216,7 @@ class MovementMaskCheckpointTest(unittest.TestCase):
                     replay["next_movement_mask"][0], saved["next_mask"]
                 )
                 self.assertTrue(replay["movement_mask_valid"].all())
+                self.assertFalse(replay["relay_shaping_enabled"][0, 0])
             _, restored, _ = self._load(saved)
         np.testing.assert_array_equal(
             restored.current_movement_mask[0], saved["current_mask"]
@@ -221,6 +225,27 @@ class MovementMaskCheckpointTest(unittest.TestCase):
             restored.next_movement_mask[0], saved["next_mask"]
         )
         self.assertTrue(restored.movement_mask_valid[0, 0])
+        self.assertFalse(restored.relay_shaping_enabled[0, 0])
+
+    def test_schema_28_is_rejected_before_weights_or_replay_restore(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            saved = self._save_checkpoint(temp_dir, "td3_dinkelbach")
+            metadata_path = saved["checkpoint"] / "metadata.json"
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            metadata["checkpoint_schema_version"] = 28
+            metadata_path.write_text(
+                json.dumps(metadata, indent=2) + "\n", encoding="utf-8"
+            )
+            with (
+                mock.patch("training_checkpoint._load_network_states") as weights,
+                mock.patch("training_checkpoint._load_replay") as replay_restore,
+            ):
+                with self.assertRaisesRegex(
+                    RuntimeError, "incompatible.*must be retrained"
+                ):
+                    self._load(saved)
+            weights.assert_not_called()
+            replay_restore.assert_not_called()
 
     def test_pre_adaptive_safe_checkpoint_is_rejected_before_restore(self):
         with tempfile.TemporaryDirectory() as temp_dir:

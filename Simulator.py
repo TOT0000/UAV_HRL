@@ -216,6 +216,7 @@ class Simulator:
             uav_id: 0.0 for uav_id in range(self.num_UAV)
         }
         self.relay_position_history = []
+        self.relay_shaping_history = []
         self.relay_plan = empty_plan()
         self.assignment_history = []
         self.relay_role_change_count = 0
@@ -584,6 +585,7 @@ class Simulator:
             "relay_planning": planning,
             "relay_assignment_history": copy.deepcopy(self.assignment_history),
             "relay_position_history": copy.deepcopy(self.relay_position_history),
+            "relay_shaping_history": copy.deepcopy(self.relay_shaping_history),
             "relay_reassignment_pending": bool(self.need_reassign),
             "search_release_reassignment_pending": bool(
                 self.search_release_reassignment_pending
@@ -1221,6 +1223,7 @@ class Simulator:
             uav_id: 0.0 for uav_id in range(self.num_UAV)
         }
         self.relay_position_history = []
+        self.relay_shaping_history = []
         self.relay_plan = empty_plan()
         self.assignment_history = []
         self.relay_role_change_count = 0

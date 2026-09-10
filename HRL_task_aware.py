@@ -1074,13 +1074,15 @@ def _interval_reward(
     reward_mode="dinkelbach",
     task_potential_enabled=True,
     ratio_objective_reward=0.0,
+    relay_shaping_enabled=True,
 ):
     next_values = (0.0, 0.0, 0.0, 0.0) if done else potentials_t1
     shaping = float(bool(task_potential_enabled)) * (
         config.beta_search * (gamma * next_values[0] - potentials_t[0])
         + config.beta_vs * (gamma * next_values[1] - potentials_t[1])
         + config.beta_com * (gamma * next_values[2] - potentials_t[2])
-        + config.beta_relay * (gamma * next_values[3] - potentials_t[3])
+        + float(bool(relay_shaping_enabled))
+        * config.beta_relay * (gamma * next_values[3] - potentials_t[3])
     )
     if reward_mode == "dinkelbach":
         objective = float(delivered_mbits) - float(current_lambda) * float(energy)
@@ -1636,6 +1638,7 @@ def _evaluation_state_snapshot(
                     "phi_com_t1",
                     "phi_relay_t",
                     "phi_relay_t1",
+                    "relay_shaping_enabled",
                 ),
             ),
             "routing": replay_snapshot(
@@ -2659,10 +2662,14 @@ def train(
             backlog_after = _active_backlog(packet_engine)
             env.set_assignment_backlog_snapshot(valid_in_air_backlog(packet_engine, env.current_time))
             done = interval == config.episode_seconds - 1
+            relay_assignment_changed_at_boundary = False
             if not done:
-                env.prepare_next_movement_interval(interval + 1)
+                relay_assignment_changed_at_boundary = bool(
+                    env.prepare_next_movement_interval(interval + 1)
+                )
             else:
                 refresh_relay_targets(env)
+            relay_shaping_enabled = not relay_assignment_changed_at_boundary
             env.relay_position_history.append({"time_seconds": float(interval + 1),
                                                "planning": relay_position_snapshot(env)})
             env.update_source_uavs()
@@ -2738,6 +2745,7 @@ def train(
                     phi_relay_t1=effective_potentials_t1[3],
                     current_movement_mask=current_movement_mask,
                     next_movement_mask=next_movement_mask,
+                    relay_shaping_enabled=relay_shaping_enabled,
                 )
             global_transition_index = (
                 evaluation_observation_transition_index
@@ -2760,6 +2768,30 @@ def train(
                 reward_mode=method_spec.reward_mode,
                 task_potential_enabled=method_spec.task_potential_enabled,
                 ratio_objective_reward=ratio_objective_reward,
+                relay_shaping_enabled=relay_shaping_enabled,
+            )
+            raw_relay_potential_difference = float(
+                movement_agent.gamma * effective_potentials_t1[3]
+                - potentials_t[3]
+            )
+            applied_relay_shaping = float(
+                bool(method_spec.task_potential_enabled)
+                * bool(relay_shaping_enabled)
+                * config.beta_relay
+                * raw_relay_potential_difference
+            )
+            env.relay_shaping_history.append(
+                {
+                    "movement_step": int(interval),
+                    "relay_assignment_changed_at_boundary": bool(
+                        relay_assignment_changed_at_boundary
+                    ),
+                    "relay_shaping_enabled": bool(relay_shaping_enabled),
+                    "raw_relay_potential_difference": (
+                        raw_relay_potential_difference
+                    ),
+                    "applied_relay_shaping": applied_relay_shaping,
+                }
             )
             episode_reward += interval_reward
             if transition_observer is not None:
@@ -2781,6 +2813,15 @@ def train(
                         "phi_com_t1": effective_potentials_t1[2],
                         "phi_relay_t": potentials_t[3],
                         "phi_relay_t1": effective_potentials_t1[3],
+                        "relay_assignment_changed_at_boundary": bool(
+                            relay_assignment_changed_at_boundary
+                        ),
+                        "relay_shaping_enabled": bool(relay_shaping_enabled),
+                        "raw_relay_potential_difference": (
+                            raw_relay_potential_difference
+                        ),
+                        "applied_relay_shaping": applied_relay_shaping,
+                        "movement_gamma": float(movement_agent.gamma),
                         "reward_at_checkpoint_lambda": interval_reward,
                         "checkpoint_lambda": (
                             episode_lambda if method_spec.uses_dinkelbach else None

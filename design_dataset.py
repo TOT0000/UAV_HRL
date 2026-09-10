@@ -54,7 +54,7 @@ from training_checkpoint import (
 )
 
 
-DESIGN_DATASET_SCHEMA_VERSION = 5
+DESIGN_DATASET_SCHEMA_VERSION = 6
 DESIGN_TRANSITIONS_FILENAME = "design_transitions.npz"
 DESIGN_METADATA_FILENAME = "design_dataset_metadata.json"
 DESIGN_EPISODES_CSV = "per_episode.csv"
@@ -76,6 +76,11 @@ ARRAY_NAMES = (
     "phi_com_t1",
     "phi_relay_t",
     "phi_relay_t1",
+    "relay_assignment_changed_at_boundary",
+    "relay_shaping_enabled",
+    "raw_relay_potential_difference",
+    "applied_relay_shaping",
+    "movement_gamma",
     "reward_at_checkpoint_lambda",
     "checkpoint_lambda",
     "episode_index",
@@ -96,6 +101,9 @@ FLOAT_COMPONENTS = (
     "phi_com_t1",
     "phi_relay_t",
     "phi_relay_t1",
+    "raw_relay_potential_difference",
+    "applied_relay_shaping",
+    "movement_gamma",
     "reward_at_checkpoint_lambda",
     "checkpoint_lambda",
 )
@@ -170,20 +178,29 @@ class DesignTransitionCollector:
         arrays["scenario_id"] = np.asarray(
             [str(row["scenario_id"]) for row in self._records], dtype=np.str_
         )
+        for field in (
+            "relay_assignment_changed_at_boundary",
+            "relay_shaping_enabled",
+        ):
+            arrays[field] = np.asarray(
+                [row[field] for row in self._records], dtype=np.bool_
+            )
         return arrays
 
 
 def reconstruct_reward(arrays, *, beta_search, beta_vs, beta_com, beta_relay):
+    gamma = arrays["movement_gamma"]
     return (
         arrays["delivered_mbits"]
         - arrays["checkpoint_lambda"]
         * arrays["total_mobility_energy_j"]
         + float(beta_search)
-        * (arrays["phi_search_t1"] - arrays["phi_search_t"])
-        + float(beta_vs) * (arrays["phi_vs_t1"] - arrays["phi_vs_t"])
-        + float(beta_com) * (arrays["phi_com_t1"] - arrays["phi_com_t"])
-        + float(beta_relay)
-        * (arrays["phi_relay_t1"] - arrays["phi_relay_t"])
+        * (gamma * arrays["phi_search_t1"] - arrays["phi_search_t"])
+        + float(beta_vs)
+        * (gamma * arrays["phi_vs_t1"] - arrays["phi_vs_t"])
+        + float(beta_com)
+        * (gamma * arrays["phi_com_t1"] - arrays["phi_com_t"])
+        + arrays["applied_relay_shaping"]
     )
 
 
@@ -272,6 +289,34 @@ def validate_design_arrays(
     failed = [name for name, passed in checks.items() if not passed]
     if failed:
         raise RuntimeError(f"design transition ordering is invalid: {failed}")
+    if not np.array_equal(
+        arrays["relay_shaping_enabled"],
+        ~arrays["relay_assignment_changed_at_boundary"],
+    ):
+        raise RuntimeError("Relay shaping mask disagrees with assignment boundary")
+    expected_raw_relay = (
+        arrays["movement_gamma"] * arrays["phi_relay_t1"]
+        - arrays["phi_relay_t"]
+    )
+    if not np.allclose(
+        arrays["raw_relay_potential_difference"],
+        expected_raw_relay,
+        rtol=0.0,
+        atol=1e-12,
+    ):
+        raise RuntimeError("raw Relay potential difference is inconsistent")
+    expected_applied_relay = (
+        arrays["relay_shaping_enabled"].astype(np.float64)
+        * float(beta_relay)
+        * expected_raw_relay
+    )
+    if not np.allclose(
+        arrays["applied_relay_shaping"],
+        expected_applied_relay,
+        rtol=0.0,
+        atol=1e-12,
+    ):
+        raise RuntimeError("applied Relay shaping disagrees with its mask")
     scenario_ids = arrays["scenario_id"].reshape(episode_count, episode_seconds)
     if any(len(set(row.tolist())) != 1 for row in scenario_ids):
         raise RuntimeError("scenario_id changes within an episode")
