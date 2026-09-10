@@ -133,7 +133,7 @@ class ControlledMethodRegistryTest(unittest.TestCase):
                     method_spec=spec,
                 )
                 self.assertEqual(result["movement_agent_kind"], spec.agent)
-                self.assertEqual(result["movement_state_dim"], 675)
+                self.assertEqual(result["movement_state_dim"], 595)
                 self.assertEqual(result["joint_action_dim"], 48)
                 self.assertEqual(result["proposal_batches"], 4)
                 self.assertIsNone(result["packet_outcome_artifacts"])
@@ -220,7 +220,7 @@ class ControlledMethodRegistryTest(unittest.TestCase):
                 "km", "td3", "dinkelbach", "full", "safe_ddqn", 1
             ),
             "random_assignment_td3_dinkelbach": (
-                "random_one_to_one", "td3", "dinkelbach", "full", "safe_ddqn", 1
+                "random_one_to_one", "td3", "dinkelbach", "full", "safe_ddqn", 2
             ),
         }
         for method_key, values in expected.items():

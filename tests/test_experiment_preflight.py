@@ -24,7 +24,8 @@ from experiment_paths import (
     write_run_status,
 )
 from scenario_manifest import generate_manifest
-from relay_diagnostics import RELAY_DIAGNOSTICS_FILENAME
+from relay_diagnostics import RELAY_DIAGNOSTICS_FILENAME, aggregate_relay_episode_diagnostics
+from relay_contract import empty_plan
 from training_checkpoint import (
     CHECKPOINT_SCHEMA_VERSION,
     FULL_CHECKPOINT_TYPE,
@@ -43,25 +44,16 @@ def relay_diagnostics_fixture():
             "traversed_assigned_relay",
         )
     }
-    return {
-        "forwarding_packet_semantics": "completed packet hops",
-        "traversed_relay_semantics": "fixture traversal semantics",
-        "episodes": [
-            {
-                "episode_index": 0,
-                "scenario_id": "fixture-scenario",
-                "assignment": {
-                    "relay_assignment_history": [],
-                    "relay_candidate_metrics": {},
-                    "selected_relay_uav_ids": [],
-                    "relay_role_change_count": 0,
-                },
-                "forwarding": forwarding,
-            }
-        ],
-        "relay_role_change_count": 0,
+    return aggregate_relay_episode_diagnostics([{
+        "episode_index": 0,
+        "scenario_id": "fixture-scenario",
+        "assignment": {
+            "relay_assignment_history": [], "relay_planning": empty_plan(),
+            "relay_position_history": [], "selected_relay_uav_ids": [],
+            "relay_role_change_count": 0,
+        },
         "forwarding": forwarding,
-    }
+    }])
 
 
 class ExperimentPreflightTest(unittest.TestCase):
@@ -99,7 +91,7 @@ class ExperimentPreflightTest(unittest.TestCase):
             "visual_sensing_configuration": visual_sensing_metadata(),
             "checkpoint_type": MODEL_CHECKPOINT_TYPE,
             "episode": 1499,
-            "movement_state_dim": 675,
+            "movement_state_dim": 595,
             "joint_action_dim": 48,
             "routing_state_dim": 143,
             "movement_agent_kind": "td3",
@@ -398,7 +390,7 @@ class ExperimentPreflightTest(unittest.TestCase):
                 "visual_sensing_configuration": visual_sensing_metadata(),
                 "checkpoint_type": FULL_CHECKPOINT_TYPE,
                 "episode": 0,
-                "movement_state_dim": 675,
+                "movement_state_dim": 595,
                 "joint_action_dim": 48,
                 "routing_state_dim": 143,
                 "centralized_td3_gamma": 1.0,

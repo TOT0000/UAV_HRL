@@ -1,7 +1,7 @@
 """Authoritative local feature ordering for centralized UAV movement."""
 
 
-MOVEMENT_FEATURE_SCHEMA_VERSION = 5
+MOVEMENT_FEATURE_SCHEMA_VERSION = 6
 
 TASK_TYPES = ("Search", "FOV", "COM", "Relay", "Hovering")
 ACTIVE_MOVEMENT_TASK_TYPES = ("Search", "FOV", "COM", "Relay")
@@ -49,62 +49,9 @@ LOCAL_MOVEMENT_FEATURES = (
         1.0,
         "reference S2U capacity / fixed best-feasible S2U capacity",
     ),
-    (
-        "relay_receive_score",
-        "continuous",
-        0.0,
-        1.0,
-        "weighted normalized expected U2U receive capacity",
-    ),
-    (
-        "relay_forward_score",
-        "continuous",
-        0.0,
-        1.0,
-        "1 / (1 + expected shortest-path cost / 2 seconds)",
-    ),
-    (
-        "relay_receive_dx",
-        "continuous",
-        -1.0,
-        1.0,
-        "capacity-weighted receive centroid, falling back to backlog-weighted source centroid, relative x / environment width",
-    ),
-    (
-        "relay_receive_dy",
-        "continuous",
-        -1.0,
-        1.0,
-        "capacity-weighted receive centroid, falling back to backlog-weighted source centroid, relative y / environment height",
-    ),
-    (
-        "relay_receive_dz",
-        "continuous",
-        -1.0,
-        1.0,
-        "capacity-weighted receive centroid, falling back to backlog-weighted source centroid, relative z / UAV altitude span",
-    ),
-    (
-        "relay_forward_dx",
-        "continuous",
-        -1.0,
-        1.0,
-        "best-path first hop, falling back to nearest GS-connected component node or GS, relative x / environment width",
-    ),
-    (
-        "relay_forward_dy",
-        "continuous",
-        -1.0,
-        1.0,
-        "best-path first hop, falling back to nearest GS-connected component node or GS, relative y / environment height",
-    ),
-    (
-        "relay_forward_dz",
-        "continuous",
-        -1.0,
-        1.0,
-        "best-path first hop, falling back to nearest GS-connected component node or GS, relative z / UAV altitude span",
-    ),
+    ("relay_target_dx", "continuous", -1.0, 1.0, "virtual target relative x / environment width; zero without Relay"),
+    ("relay_target_dy", "continuous", -1.0, 1.0, "virtual target relative y / environment height; zero without Relay"),
+    ("relay_target_dz", "continuous", -1.0, 1.0, "virtual target relative z / UAV altitude span; zero without Relay"),
 )
 
 LOCAL_MOVEMENT_DIM = len(LOCAL_MOVEMENT_FEATURES)

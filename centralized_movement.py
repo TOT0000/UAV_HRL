@@ -25,7 +25,7 @@ from movement_feature_schema import (
     MOVEMENT_FEATURE_SCHEMA_VERSION,
     TASK_TYPES,
 )
-from relay_contract import relay_metrics
+from relay_contract import virtual_positions, relay_potential
 
 
 COVERAGE_GRID_SIZE = 16
@@ -315,6 +315,7 @@ def get_global_movement_state(
     if backlog_bits is None:
         backlog_bits = packet_engine.backlog_bits
 
+    relay_positions, _ = virtual_positions(env, getattr(env, "relay_plan", {}).get("slots", []))
     local_features = []
     for uav_id in range(NUM_UAV):
         uav = env.uav_dict[uav_id]
@@ -369,31 +370,13 @@ def get_global_movement_state(
             ]
             com_capacity_norm = normalized_com_link_quality(env, uav_id, task)
 
-        relay_features = [0.0] * 8
+        relay_features = [0.0] * 3
         if grouped["Relay"]:
-            metrics = relay_metrics(env, uav_id, backlog_bits=backlog_bits)
-
-            def relative_vector(target):
-                if target is None:
-                    return [0.0, 0.0, 0.0]
-                tx, ty, tz = map(float, target)
-                return [
-                    float(
-                        np.clip(
-                            (tx - float(uav.x_u)) / float(env.env_width), -1.0, 1.0
-                        )
-                    ),
-                    float(
-                        np.clip(
-                            (ty - float(uav.y_u)) / float(env.env_height), -1.0, 1.0
-                        )
-                    ),
-                    float(np.clip((tz - float(uav.z_u)) / z_span, -1.0, 1.0)),
-                ]
-
-            relay_features = [metrics.receive_score, metrics.forward_score]
-            relay_features += relative_vector(metrics.receive_direction_target)
-            relay_features += relative_vector(metrics.forward_direction_target)
+            targets = [relay_positions[task["target_id"]] for task in grouped["Relay"]]
+            displacement = np.mean(targets, axis=0) - np.asarray(uav.get_position())
+            relay_features = np.clip(displacement / [env.env_width, env.env_height, z_span], -1., 1.).tolist()
+        if not np.isfinite(relay_features).all():
+            raise ValueError("Relay target displacement must be finite")
 
         uav_features = np.asarray(
             task_flags
@@ -622,6 +605,7 @@ def calculate_movement_potentials(env, c_ref_com, backlog_bits=None):
     vs_progress = []
     com_progress = []
     relay_progress = []
+    positions, _ = virtual_positions(env, getattr(env, "relay_plan", {}).get("slots", []))
     for uav_id in range(env.num_UAV):
         grouped = _tasks_by_type(env, uav_id)
         _assert_unique_target_tasks(uav_id, grouped)
@@ -639,12 +623,10 @@ def calculate_movement_potentials(env, c_ref_com, backlog_bits=None):
             com_progress.append(
                 blended_com_progress(capacity_progress, distance_progress)
             )
-        for _task in grouped["Relay"]:
-            relay_progress.append(
-                relay_metrics(
-                    env, uav_id, backlog_bits=backlog_bits
-                ).movement_utility
-            )
+        if grouped["Relay"]:
+            relay_progress.append(float(np.mean([
+                relay_potential(env, uav_id, task["relay_slot"], positions)["Phi_relay"]
+                for task in grouped["Relay"]])))
     phi_vs = float(np.mean(vs_progress)) if vs_progress else 0.0
     phi_com = float(np.mean(com_progress)) if com_progress else 0.0
     phi_relay = float(np.mean(relay_progress)) if relay_progress else 0.0

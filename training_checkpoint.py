@@ -94,7 +94,7 @@ from dinkelbach_blocks import (
     dinkelbach_config_metadata,
 )
 
-CHECKPOINT_SCHEMA_VERSION = 27
+CHECKPOINT_SCHEMA_VERSION = 28
 PRE_16_UAV_RELAY_RANGE_PROGRESS_CHECKPOINT_SCHEMA_VERSION = 24
 PRE_BOUNDARY_ALIGNED_RELAY_POTENTIAL_CHECKPOINT_SCHEMA_VERSION = 23
 PRE_RELAY_TASK_CHECKPOINT_SCHEMA_VERSION = 22
@@ -196,7 +196,6 @@ FORMAL_CORE_CONFIG_FIELDS = (
     "movement_replay_contract_version",
     "relay_task_contract_version",
     "relay_count_rule",
-    "relay_forward_reference_seconds",
     "relay_potential_weight",
     "relay_assignment_mode",
     "ground_station_position_m",
@@ -1078,7 +1077,7 @@ def _base_metadata(
         "num_uav": NUM_UAV,
         "movement_feature_schema_version": MOVEMENT_FEATURE_SCHEMA_VERSION,
         "movement_state_feature_schema": movement_state_feature_schema(),
-        "state_contract": "16-uav-relay-range-progress-task-aware-v3",
+        "state_contract": "16-uav-virtual-relay-task-aware-v4",
         "packet_lifecycle_contract": "sr-fifo-s2u-next-slot-routing-v1",
         "channel_contract": CHANNEL_ENVIRONMENT_CONTRACT_VERSION,
         "channel_model_version": CHANNEL_MODEL_VERSION,
@@ -1461,7 +1460,7 @@ def _validate_checkpoint_schema(metadata):
             "unified inclusive 400 m S2U/U2G/U2U communication range, "
             "143-D action-wise GS-progress routing state and v7 routing reward, "
             "2.5 s FOV / 2.0 s COM QoS deadlines, "
-            "Relay assignment, 675-D Relay-aware movement state, range-progress "
+            "Relay assignment, 595-D virtual Relay movement state, target/link "
             "movement potential and boundary-aligned current/next decision state, "
             "named-RNG, projected-action and replay "
             "contract and must be retrained: "

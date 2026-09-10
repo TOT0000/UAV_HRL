@@ -1,6 +1,7 @@
 import argparse
 from collections import defaultdict
 import copy
+from relay_contract import valid_in_air_backlog, relay_position_snapshot, refresh_relay_targets
 from dataclasses import dataclass
 import hashlib
 import os
@@ -257,6 +258,7 @@ class TrainingConfig:
     packet_outcome_collection_limit: int = 0
 
     def __post_init__(self):
+        self.beta_relay = self.beta_com  # Relay shares the COM outer task weight.
         if self.mode not in {"smoke", "train", "custom"}:
             raise ValueError(f"unsupported training mode: {self.mode}")
         if self.packet_outcome_artifact_mode not in PACKET_OUTCOME_ARTIFACT_MODES:
@@ -2655,10 +2657,14 @@ def train(
 
             interval_delivered_mbits = interval_delivered_bits / 1e6
             backlog_after = _active_backlog(packet_engine)
-            env.set_assignment_backlog_snapshot(backlog_after)
+            env.set_assignment_backlog_snapshot(valid_in_air_backlog(packet_engine, env.current_time))
             done = interval == config.episode_seconds - 1
             if not done:
                 env.prepare_next_movement_interval(interval + 1)
+            else:
+                refresh_relay_targets(env)
+            env.relay_position_history.append({"time_seconds": float(interval + 1),
+                                               "planning": relay_position_snapshot(env)})
             env.update_source_uavs()
             actual_time_seconds = float(interval + 1)
             trajectory_history.append(

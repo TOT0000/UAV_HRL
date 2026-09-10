@@ -19,10 +19,10 @@ from experiment_config import (
     RESERVED_SEARCH_UAV_IDS,
     SEARCH_COVERAGE_THRESHOLD,
 )
-from relay_contract import relay_metrics_by_candidate
+from relay_contract import plan_relays, pair_relay_slots
 
 
-SERVICE_TASK_TYPES = ("Relay", "FOV", "COM")
+SERVICE_TASK_TYPES = ("FOV", "COM")
 FOV_COM_TASK_TYPES = ("FOV", "COM")
 
 
@@ -37,10 +37,8 @@ class AssignmentProblem:
     feasible_mask: np.ndarray
     raw_fov_utility: np.ndarray
     raw_com_utility: np.ndarray
-    raw_relay_utility: np.ndarray | None = None
     raw_fov_coverage: np.ndarray | None = None
     raw_fov_image_quality: np.ndarray | None = None
-    relay_metrics_by_uav: dict[int, object] | None = None
 
 
 def assignment_fov_pair_geometry(env, uav_id, task):
@@ -169,11 +167,9 @@ class UAVAssigner:
         self.env = env
         self.assignments = {}
         self.last_round_problems = []
-        self.last_relay_metrics = {}
         self.relay_handling_mode = None
         self.requested_relay_count = 0
         self.selected_relay_uav_ids = []
-        self.last_relay_hungarian_plan = []
 
     def assign_tasks(
         self,
@@ -205,30 +201,30 @@ class UAVAssigner:
             if coverage_threshold is None
             else coverage_threshold
         )
+        # Only FOV/COM enter a utility matrix. Relay is planned afterwards.
         if strategy == "random_one_to_one":
-            result = self.random_assign_tasks(
-                uav_id_list,
-                task_list,
-                coverage_threshold=coverage_threshold,
-            )
-            self.relay_handling_mode = "single_joint_relay_fov_com_named_rng"
-            return result
-        if strategy == "k_km":
-            self.relay_handling_mode = "relay_first_quota_then_two_round_fov_com"
-            return self.assign_relay_first_k_km(
-                uav_id_list,
-                task_list,
-                K=min(int(K), 2),
-                coverage_threshold=coverage_threshold,
-            )
-        self.relay_handling_mode = "single_joint_relay_fov_com_hungarian"
-        return self.assign_uav_tasks_k_times(
-            uav_id_list,
-            task_list,
-            K=1,
-            coverage_threshold=coverage_threshold,
-            candidate_task_types=SERVICE_TASK_TYPES,
-        )
+            self.random_assign_tasks(uav_id_list, task_list,
+                                     coverage_threshold=coverage_threshold)
+        else:
+            self.assign_uav_tasks_k_times(
+                uav_id_list, task_list, K=1 if strategy == "km" else min(int(K), 2),
+                coverage_threshold=coverage_threshold)
+        self.relay_handling_mode = ("service_first_named_rng_relay" if strategy == "random_one_to_one"
+                                    else "service_first_distance_greedy_relay")
+        free = [uid for uid in uav_id_list if not self.assignments[uid]]
+        prospective = [uid for uid, tasks in self.assignments.items() if tasks]
+        self.relay_plan = plan_relays(self.env, prospective, free)
+        pair_relay_slots(self.env, self.relay_plan, free,
+                         random=strategy == "random_one_to_one")
+        self.requested_relay_count = self.relay_plan["required_before_budget"]
+        for slot in self.relay_plan["slots"]:
+            task = Task(slot["slot_id"], "Relay", None, None)
+            task.relay_slot = slot
+            index = len(self._snapshot_tasks)
+            self._snapshot_tasks.append(task)
+            self.assignments[slot["assigned_uav_id"]] = [(index, "Relay", None)]
+        self.selected_relay_uav_ids = sorted(self.relay_plan["slot_to_uav"].values())
+        return self.assignments
 
     def _candidate_tasks(
         self, task_list, coverage_threshold, candidate_task_types=SERVICE_TASK_TYPES
@@ -236,7 +232,7 @@ class UAVAssigner:
         del coverage_threshold
         candidates = []
         for index, task in enumerate(task_list):
-            if task.task_type == "Hovering":
+            if task.task_type not in FOV_COM_TASK_TYPES:
                 continue
             if task.task_type not in candidate_task_types:
                 continue
@@ -260,17 +256,10 @@ class UAVAssigner:
         shape = (len(uav_ids), len(tasks))
         raw_fov = np.zeros(shape, dtype=float)
         raw_com = np.zeros(shape, dtype=float)
-        raw_relay = np.zeros(shape, dtype=float)
         raw_fov_coverage = np.zeros(shape, dtype=float)
         raw_fov_image_quality = np.zeros(shape, dtype=float)
         fov_feasible = np.zeros(shape, dtype=bool)
         com_feasible = np.zeros(shape, dtype=bool)
-        relay_feasible = np.zeros(shape, dtype=bool)
-        relay_candidate_metrics = relay_metrics_by_candidate(
-            self.env,
-            uav_ids,
-            backlog_bits=getattr(self.env, "assignment_backlog_snapshot", {}),
-        ) if any(task.task_type == "Relay" for task in tasks) else {}
 
         for row, uav_id in enumerate(uav_ids):
             for column, task in enumerate(tasks):
@@ -303,16 +292,12 @@ class UAVAssigner:
                     if math.isfinite(raw):
                         raw_com[row, column] = raw
                         com_feasible[row, column] = True
-                elif task.task_type == "Relay":
-                    raw_relay[row, column] = relay_candidate_metrics[uav_id].utility
-                    relay_feasible[row, column] = True
 
         normalized_fov = normalize_feasible_values(raw_fov, fov_feasible)
         utility = np.zeros(shape, dtype=float)
         utility[fov_feasible] = normalized_fov[fov_feasible]
         utility[com_feasible] = raw_com[com_feasible]
-        utility[relay_feasible] = raw_relay[relay_feasible]
-        feasible = fov_feasible | com_feasible | relay_feasible
+        feasible = fov_feasible | com_feasible
         if not np.isfinite(utility).all():
             raise AssertionError("production assignment utility contains NaN or Inf")
         return AssignmentProblem(
@@ -323,10 +308,8 @@ class UAVAssigner:
             feasible_mask=feasible,
             raw_fov_utility=raw_fov,
             raw_com_utility=raw_com,
-            raw_relay_utility=raw_relay,
             raw_fov_coverage=raw_fov_coverage,
             raw_fov_image_quality=raw_fov_image_quality,
-            relay_metrics_by_uav=relay_candidate_metrics,
         )
 
     def _round_feasible_mask(
@@ -385,11 +368,6 @@ class UAVAssigner:
             coverage_threshold=coverage_threshold,
             candidate_task_types=candidate_task_types,
         )
-        if problem.relay_metrics_by_uav:
-            self.last_relay_metrics = dict(problem.relay_metrics_by_uav)
-            self.requested_relay_count = sum(
-                task.task_type == "Relay" for task in problem.tasks
-            )
         available = set(problem.original_task_indices)
         self.last_round_problems = []
         for round_index in range(rounds):
@@ -425,130 +403,25 @@ class UAVAssigner:
         )
         return self.assignments
 
-    def assign_relay_first_k_km(
-        self,
-        uav_list,
-        task_list,
-        K=2,
-        *,
-        coverage_threshold=SEARCH_COVERAGE_THRESHOLD,
-    ):
-        """Fill identical Relay slots first, then retain formal FOV/COM rounds."""
-
-        uav_ids = tuple(sorted({int(uid) for uid in uav_list}))
-        relay_tasks = sorted(
-            (
-                (index, task)
-                for index, task in enumerate(task_list)
-                if task.task_type == "Relay"
-            ),
-            key=lambda item: (str(item[1].task_id), item[0]),
-        )
-        self.requested_relay_count = len(relay_tasks)
-        self.last_relay_metrics = (
-            relay_metrics_by_candidate(
-                self.env,
-                uav_ids,
-                backlog_bits=getattr(self.env, "assignment_backlog_snapshot", {}),
-            )
-            if relay_tasks
-            else {}
-        )
-        quota = min(len(relay_tasks), len(uav_ids))
-        # No dummy columns are admitted in this Relay-only Hungarian stage, so
-        # the real quota is filled even when every utility is zero. Independent
-        # slots reduce the optimum to the top-quota set; UAV id then provides
-        # the canonical exact-tie solution without perturbing real utilities.
-        if quota:
-            relay_utility = np.asarray(
-                [
-                    [self.last_relay_metrics[uid].utility] * quota
-                    for uid in uav_ids
-                ],
-                dtype=float,
-            )
-            solver_rows, solver_columns = linear_sum_assignment(-relay_utility)
-            solver_total = float(relay_utility[solver_rows, solver_columns].sum())
-            selected = sorted(
-                sorted(
-                    uav_ids,
-                    key=lambda uid: (-self.last_relay_metrics[uid].utility, uid),
-                )[:quota]
-            )
-            canonical_total = sum(
-                self.last_relay_metrics[uid].utility for uid in selected
-            )
-            if not math.isclose(
-                canonical_total, solver_total, rel_tol=1e-12, abs_tol=1e-12
-            ):
-                raise AssertionError("canonical Relay tie-break changed KM optimum")
-            self.last_relay_hungarian_plan = [
-                (uid, relay_tasks[column][0])
-                for column, uid in enumerate(selected)
-            ]
-        else:
-            selected = []
-            self.last_relay_hungarian_plan = []
-        self.selected_relay_uav_ids = selected
-        assignments = {uid: [] for uid in uav_ids}
-        for uid, (task_index, _task) in zip(selected, relay_tasks):
-            assignments[uid].append(
-                (
-                    int(task_index),
-                    "Relay",
-                    float(self.last_relay_metrics[uid].utility),
-                )
-            )
-        remaining = [uid for uid in uav_ids if uid not in set(selected)]
-        return self.assign_uav_tasks_k_times(
-            remaining,
-            task_list,
-            K=K,
-            coverage_threshold=coverage_threshold,
-            candidate_task_types=FOV_COM_TASK_TYPES,
-            initial_assignments=assignments,
-        )
-
-    def random_assign_tasks(
-        self,
-        uav_list,
-        task_list,
-        *,
-        coverage_threshold=SEARCH_COVERAGE_THRESHOLD,
-    ):
-        candidates = self._candidate_tasks(
-            task_list, coverage_threshold, SERVICE_TASK_TYPES
-        )
-        uav_ids = tuple(int(uid) for uid in uav_list)
-        self.requested_relay_count = sum(
-            task.task_type == "Relay" for _index, task in candidates
-        )
-        self.last_relay_metrics = (
-            relay_metrics_by_candidate(
-                self.env,
-                uav_ids,
-                backlog_bits=getattr(self.env, "assignment_backlog_snapshot", {}),
-            )
-            if self.requested_relay_count
-            else {}
-        )
-        task_indices = [index for index, _ in candidates]
-        rng = getattr(self.env, "assignment_rng", None)
-        if rng is None:
-            rng = np.random.default_rng(0)
-        rng.shuffle(task_indices)
+    def random_assign_tasks(self, uav_list, task_list, *, coverage_threshold=SEARCH_COVERAGE_THRESHOLD):
+        """Two random feasible FOV/COM rounds using the official assignment RNG."""
         self.assignments = {int(uid): [] for uid in uav_list}
-        for uav_id, task_index in zip(uav_list, task_indices):
-            task = task_list[task_index]
-            self.assignments[int(uav_id)].append(
-                (int(task_index), task.task_type, 0.0)
-            )
+        problem = self.build_problem(uav_list, task_list, coverage_threshold=coverage_threshold)
+        available = set(problem.original_task_indices)
         self.last_round_problems = []
-        self.selected_relay_uav_ids = sorted(
-            uid
-            for uid, assignments in self.assignments.items()
-            if any(task_type == "Relay" for _index, task_type, _utility in assignments)
-        )
+        for round_index in range(2):
+            feasible = self._round_feasible_mask(problem, self.assignments, available, round_index)
+            rows = list(range(len(problem.uav_ids)))
+            self.env.assignment_rng.shuffle(rows)
+            for row in rows:
+                choices = [col for col, idx in enumerate(problem.original_task_indices)
+                           if feasible[row, col] and idx in available]
+                if not choices:
+                    continue
+                column = int(self.env.assignment_rng.choice(choices))
+                index = problem.original_task_indices[column]
+                self.assignments[problem.uav_ids[row]].append((index, problem.tasks[column].task_type, 0.0))
+                available.remove(index)
         return self.assignments
 
     def build_uav_tasks_from_assignment(self):
@@ -587,7 +460,7 @@ class UAVAssigner:
                     position = target.get_position()
                     target_object_id = int(task.target_obj_id)
                 elif task_type == "Relay":
-                    position = None
+                    position = task.relay_slot["virtual_position"]
                     target_object_id = None
                 else:
                     raise AssertionError(f"non-candidate task was assigned: {task_type}")
@@ -605,15 +478,7 @@ class UAVAssigner:
                         ),
                         **(
                             {
-                                "relay_receive_score_at_assignment": float(
-                                    self.last_relay_metrics[uav_id].receive_score
-                                ),
-                                "relay_forward_score_at_assignment": float(
-                                    self.last_relay_metrics[uav_id].forward_score
-                                ),
-                                "relay_utility_at_assignment": float(
-                                    self.last_relay_metrics[uav_id].utility
-                                ),
+                                "relay_slot": task.relay_slot,
                             }
                             if task_type == "Relay"
                             else {}

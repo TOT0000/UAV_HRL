@@ -47,7 +47,7 @@ class CentralizedMovementStateTest(unittest.TestCase):
         self.env.reset_environment()
         self.packet_engine = PacketEngine(num_uav=16, step_time=0.25)
 
-    def test_state_is_675_finite_side_effect_free_and_routing_is_143(self):
+    def test_state_is_595_finite_side_effect_free_and_routing_is_143(self):
         positions_before = [uav.get_position() for uav in self.env.UAVs]
         tasks_before = {
             uid: [dict(task) for task in tasks]

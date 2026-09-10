@@ -1120,7 +1120,7 @@ class FullResumeCheckpointTest(unittest.TestCase):
             ) as load_networks:
                 with self.assertRaisesRegex(
                     RuntimeError,
-                    "canonical 16-UAV.*range-progress movement potential.*"
+                    "canonical 16-UAV.*target/link movement potential.*"
                     "must be retrained",
                 ):
                     load_model_checkpoint(checkpoint_dir, td3, ddqn)
@@ -1388,7 +1388,7 @@ class FullResumeCheckpointTest(unittest.TestCase):
             ) as load_networks:
                 with self.assertRaisesRegex(
                     RuntimeError,
-                    "canonical 16-UAV.*range-progress movement potential.*"
+                    "canonical 16-UAV.*target/link movement potential.*"
                     "must be retrained",
                 ):
                     load_full_resume_checkpoint(**common)
@@ -1459,7 +1459,7 @@ class TrainingCliTest(unittest.TestCase):
         )
 
     def test_checkpoint_schema_is_explicit(self):
-        self.assertEqual(CHECKPOINT_SCHEMA_VERSION, 27)
+        self.assertEqual(CHECKPOINT_SCHEMA_VERSION, 28)
 
 
 if __name__ == "__main__":

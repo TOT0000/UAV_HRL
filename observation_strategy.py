@@ -28,14 +28,9 @@ _MOVEMENT_TASK_SUFFIXES = {
     "com_target_y",
     "com_target_z",
     "com_capacity",
-    "relay_receive_score",
-    "relay_forward_score",
-    "relay_receive_dx",
-    "relay_receive_dy",
-    "relay_receive_dz",
-    "relay_forward_dx",
-    "relay_forward_dy",
-    "relay_forward_dz",
+    "relay_target_dx",
+    "relay_target_dy",
+    "relay_target_dz",
 }
 
 

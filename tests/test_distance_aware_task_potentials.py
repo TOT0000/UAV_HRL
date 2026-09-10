@@ -309,7 +309,7 @@ class TaskPotentialMethodContractTest(unittest.TestCase):
                 if shared is None:
                     shared = config["task_potential_configuration"]
                 self.assertEqual(config["task_potential_configuration"], shared)
-        self.assertEqual(MOVEMENT_STATE_DIM, 675)
+        self.assertEqual(MOVEMENT_STATE_DIM, 595)
         self.assertEqual(JOINT_ACTION_DIM, 48)
         self.assertEqual(ROUTING_STATE_DIM, 143)
         self.assertEqual(SCENARIO_SCHEMA_VERSION, "uav-hrl-scenario-v8")

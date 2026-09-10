@@ -92,20 +92,15 @@ GROUND_ALTITUDE_M = 0.0
 UAV_MAX_ALTITUDE_M = 150.0
 TASK_POTENTIAL_NORMALIZATION_EPSILON = 1e-12
 TASK_POTENTIAL_CONTRACT_VERSION = (
-    "oblique-vs-quality-proximity-com-relay-potential-v7"
+    "oblique-vs-com-virtual-relay-potential-v8"
 )
 COM_CAPACITY_POTENTIAL_WEIGHT = 0.5
 COM_DISTANCE_POTENTIAL_WEIGHT = 0.5
-RELAY_RECEIVE_CAPACITY_POTENTIAL_WEIGHT = 0.5
-RELAY_RECEIVE_DISTANCE_POTENTIAL_WEIGHT = 0.5
-RELAY_FORWARD_PATH_POTENTIAL_WEIGHT = 0.5
-RELAY_FORWARD_DISTANCE_POTENTIAL_WEIGHT = 0.5
 RELAY_TASK_CONTRACT_VERSION = (
-    "relay-expected-capacity-shortest-path-selection-range-progress-movement-v2"
+    "snapshot-virtual-relay-service-first-greedy-v3"
 )
-RELAY_FORWARD_REFERENCE_SECONDS = 2.0
 RELAY_POTENTIAL_WEIGHT = 1.0
-METHOD_CONTRACT_VERSION = "centralized-16-uav-relay-range-progress-v2"
+METHOD_CONTRACT_VERSION = "centralized-16-uav-virtual-relay-v3"
 DEFAULT_TRAINING_SEED = 20260817
 FORMAL_TRAINING_EPISODES = 1500
 FORMAL_CHECKPOINT_EPISODE = FORMAL_TRAINING_EPISODES
@@ -257,14 +252,7 @@ def validate_task_potential_weights():
 
     groups = {
         "COM": (COM_CAPACITY_POTENTIAL_WEIGHT, COM_DISTANCE_POTENTIAL_WEIGHT),
-        "Relay Receive": (
-            RELAY_RECEIVE_CAPACITY_POTENTIAL_WEIGHT,
-            RELAY_RECEIVE_DISTANCE_POTENTIAL_WEIGHT,
-        ),
-        "Relay Forward": (
-            RELAY_FORWARD_PATH_POTENTIAL_WEIGHT,
-            RELAY_FORWARD_DISTANCE_POTENTIAL_WEIGHT,
-        ),
+        "Relay": (0.3, 0.7),
         "Relay shaping": (RELAY_POTENTIAL_WEIGHT,),
     }
     for name, weights in groups.items():
@@ -320,43 +308,18 @@ def task_potential_contract_metadata():
             "normalization_epsilon": TASK_POTENTIAL_NORMALIZATION_EPSILON,
         },
         "relay": {
-            "selection_utility_definition": (
-                "min(backlog-weighted normalized expected U2U receive capacity, "
-                "expected-capacity shortest-path forward score)"
-            ),
-            "movement_potential_definition": (
-                "mean(min(0.5 * receive_capacity + 0.5 * receive_distance_progress, "
-                "0.5 * forward_path_score + 0.5 * forward_distance_progress))"
-            ),
-            "aggregation": "mean over assigned Relay tasks",
+            "movement_potential_definition": "mean(0.3 * exp(-distance_to_virtual_target / 400) + 0.7 * min_neighbor_normalized_expected_capacity)",
+            "aggregation": "mean over Relay tasks per UAV, then mean over assigned Relay UAVs",
             "beta": RELAY_POTENTIAL_WEIGHT,
-            "receive_capacity_weight": RELAY_RECEIVE_CAPACITY_POTENTIAL_WEIGHT,
-            "receive_distance_weight": RELAY_RECEIVE_DISTANCE_POTENTIAL_WEIGHT,
-            "forward_path_weight": RELAY_FORWARD_PATH_POTENTIAL_WEIGHT,
-            "forward_distance_weight": RELAY_FORWARD_DISTANCE_POTENTIAL_WEIGHT,
+            "position_weight": 0.3, "link_weight": 0.7,
             "distance_dimensionality": "three_dimensional_3d",
             "communication_range_m": COMMUNICATION_RANGE_M,
-            "distance_progress_saturation": (
-                "range gap is zero and progress is one at or inside 400 m"
-            ),
-            "maximum_3d_distance_reference_m": distance_3d_reference,
-            "range_gap_normalization_reference_m": range_gap_reference,
-            "receive_distance_sources": (
-                "assignment-backlog-weighted non-gateway source UAVs with uniform "
-                "fallback when total source backlog is zero"
-            ),
-            "forward_distance_targets": (
-                "nearest UAV with a positive expected-capacity directed path "
-                "to GS, or GS"
-            ),
+            "reference_capacity": "reference_u2u_max_capacity_mbps(TOTAL_COMMUNICATION_BANDWIDTH_HZ)",
+            "capacity_source": "deterministic Rician expected U2U capacity; no channel state or RNG",
+            "assignment_cost": "raw 3D distance greedy; no utility matrix",
             "current_backlog_snapshot": "current decision-state boundary",
             "next_backlog_snapshot": "next decision-state boundary",
-            "transition_alignment": (
-                "phi_current uses the current state backlog; phi_next uses the "
-                "boundary-prepared next state backlog"
-            ),
-            "capacity_source": "expected large-scale U2U/U2G capacity",
-            "forward_reference_seconds": RELAY_FORWARD_REFERENCE_SECONDS,
+            "transition_alignment": "current and boundary-prepared next decision potentials share the existing replay telescoping convention",
         },
         "lifecycle": {
             "form": "beta * (gamma * phi_next - phi_current)",
@@ -470,7 +433,7 @@ _METHOD_DEFINITIONS = {
         "movement": "centralized_td3",
         "reward_mode": "dinkelbach",
         "assignment": "random_one_to_one",
-        "assignment_rounds": 1,
+        "assignment_rounds": 2,
         "label": "Random assignment + TD3 + Dinkelbach",
     },
     "km_ddpg_dinkelbach": {
@@ -938,13 +901,12 @@ def comparison_method_configuration(method_spec: MethodSpec) -> dict:
         "task_potential_configuration": task_potential_contract_metadata(),
         "movement_replay_contract_version": MOVEMENT_REPLAY_CONTRACT_VERSION,
         "relay_task_contract_version": RELAY_TASK_CONTRACT_VERSION,
-        "relay_count_rule": "floor(discovered_roi_count / 2)",
-        "relay_forward_reference_seconds": RELAY_FORWARD_REFERENCE_SECONDS,
+        "relay_count_rule": "snapshot_component_bridges_greedy_deletion_minimal",
         "relay_potential_weight": RELAY_POTENTIAL_WEIGHT,
         "relay_assignment_mode": {
-            "k_km": "relay_first_quota_then_two_round_fov_com",
-            "km": "single_joint_relay_fov_com_hungarian",
-            "random_one_to_one": "single_joint_relay_fov_com_named_rng",
+            "k_km": "service_first_distance_greedy_relay",
+            "km": "service_first_distance_greedy_relay",
+            "random_one_to_one": "service_first_named_rng_relay",
         }[method_spec.assignment],
         "ground_station_position_m": list(GROUND_STATION_POSITION_M),
         "permanent_gs_gateway_uav_id": PERMANENT_GS_GATEWAY_UAV_ID,

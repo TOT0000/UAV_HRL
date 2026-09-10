@@ -54,7 +54,7 @@ from training_checkpoint import (
 class Uav16ConfigurationContractTest(unittest.TestCase):
     def test_dimensions_and_manifest_layout_are_authoritative(self):
         self.assertEqual(NUM_UAV, 16)
-        self.assertEqual(MOVEMENT_STATE_DIM, 675)
+        self.assertEqual(MOVEMENT_STATE_DIM, 595)
         self.assertEqual(JOINT_ACTION_DIM, 48)
         self.assertEqual(ROUTING_STATE_DIM, 143)
         self.assertEqual(ROUTING_ACTION_DIM, 17)
@@ -105,7 +105,7 @@ class Uav16ConfigurationContractTest(unittest.TestCase):
         data["schema_version"] = "uav-hrl-scenario-v2"
         with self.assertRaisesRegex(ValueError, "16-UAV.*incompatible"):
             ScenarioManifest.from_dict(data)
-        self.assertEqual(CHECKPOINT_SCHEMA_VERSION, 27)
+        self.assertEqual(CHECKPOINT_SCHEMA_VERSION, 28)
         with self.assertRaisesRegex(RuntimeError, "must be retrained"):
             _validate_checkpoint_schema({"checkpoint_schema_version": 24})
 
@@ -124,7 +124,7 @@ class Uav16ConfigurationContractTest(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "16-UAV.*retrained"):
                     preflight_full_resume_checkpoint_metadata(
                         checkpoint,
-                        movement_state_dim=675,
+                        movement_state_dim=595,
                         joint_action_dim=48,
                         routing_state_dim=143,
                         td3_gamma=1.0,
@@ -155,11 +155,11 @@ class StateAndAssignmentContractTest(unittest.TestCase):
 
         self.env.gts[0].is_found = True
         discovered = self.movement_state()
-        global_base = NUM_UAV * 26 + 16 * 16
+        global_base = NUM_UAV * 21 + 16 * 16
         self.assertAlmostEqual(discovered[global_base + 1], 1.0 / 8.0)
-        self.assertEqual(discovered.shape, (675,))
+        self.assertEqual(discovered.shape, (595,))
 
-    def test_reserved_search_is_outside_solver_and_release_reassigns_all(self):
+    def test_reserved_search_is_outside_solver_and_release_preserves_service(self):
         gt = self.env.gts[0]
         sr = self.env.SR_teams[0]
         gt.is_found = True
@@ -183,7 +183,7 @@ class StateAndAssignmentContractTest(unittest.TestCase):
         self.env.visited_bitmap[:] = True
         self.env.current_time = 12.5
         self.env.convert_search_to_hovering()
-        self.assertGreater(self.env.assignment_invocations, previous_invocations)
+        self.assertEqual(self.env.assignment_invocations, previous_invocations)
         self.assertEqual(self.env.search_release_time, 12.5)
         self.assertAlmostEqual(self.env.search_release_coverage, 1.0)
         self.assertFalse(
@@ -195,7 +195,7 @@ class StateAndAssignmentContractTest(unittest.TestCase):
         )
         self.assertEqual(
             set(self.env.last_assignment.assignments),
-            set(range(NUM_UAV)) - {PERMANENT_GS_GATEWAY_UAV_ID},
+            solver_ids,
         )
         self.assertEqual(
             [
@@ -205,51 +205,23 @@ class StateAndAssignmentContractTest(unittest.TestCase):
             ["Hovering"],
         )
 
-    def test_deferred_search_release_reassigns_once_at_next_boundary(self):
-        assignments_before = copy.deepcopy(self.env.multi_tasks)
+    def test_search_release_never_triggers_full_reassignment(self):
         invocation_before = self.env.assignment_invocations
         self.env.visited_bitmap[:] = True
         self.env.current_time = 4.0
-
         self.env.convert_search_to_hovering(defer_assignment=True)
-
         self.assertEqual(self.env.assignment_invocations, invocation_before)
-        self.assertEqual(self.env.multi_tasks, assignments_before)
-        self.assertTrue(self.env.search_release_reassignment_pending)
-        self.assertTrue(self.env.need_reassign)
-        self.assertEqual(self.env.search_to_hover_conversions, 1)
-        self.assertTrue(
-            any(
-                task["task_type"] == "Search"
-                for tasks in self.env.multi_tasks.values()
-                for task in tasks
-            )
-        )
-
-        self.assertTrue(self.env.prepare_next_movement_interval(1))
-        self.assertEqual(self.env.assignment_invocations, invocation_before + 1)
         self.assertFalse(self.env.search_release_reassignment_pending)
         self.assertFalse(self.env.need_reassign)
-        self.assertFalse(
-            any(
-                task["task_type"] == "Search"
-                for tasks in self.env.multi_tasks.values()
-                for task in tasks
-            )
-        )
-        self.assertEqual(
-            [
-                task["task_type"]
-                for task in self.env.multi_tasks[PERMANENT_GS_GATEWAY_UAV_ID]
-            ],
-            ["Hovering"],
-        )
-
+        self.assertFalse(self.env.prepare_next_movement_interval(1))
+        self.assertEqual(self.env.assignment_invocations, invocation_before)
+        self.assertFalse(any(t["task_type"] == "Search"
+                             for tasks in self.env.multi_tasks.values() for t in tasks))
         self.env.convert_search_to_hovering(defer_assignment=True)
-        self.assertEqual(self.env.assignment_invocations, invocation_before + 1)
+        self.assertEqual(self.env.assignment_invocations, invocation_before)
         self.assertEqual(self.env.search_to_hover_conversions, 1)
 
-    def test_terminal_interval_search_release_stays_pending_and_finishes_safely(self):
+    def test_terminal_interval_search_release_only_converts_fallback_and_finishes_safely(self):
         config = TrainingConfig(
             total_episodes=1,
             mode="custom",
@@ -285,8 +257,8 @@ class StateAndAssignmentContractTest(unittest.TestCase):
         assignment = result["relay_diagnostics"]["episodes"][0]["assignment"]
         self.assertTrue(assignment["search_phase_over"])
         self.assertTrue(assignment["search_completed"])
-        self.assertTrue(assignment["search_release_reassignment_pending"])
-        self.assertFalse(assignment["search_release_assignment_applied"])
+        self.assertFalse(assignment["search_release_reassignment_pending"])
+        self.assertTrue(assignment["search_release_assignment_applied"])
         self.assertEqual(assignment["invocation"], 1)
         self.assertEqual(result["assignment_invocations"], 1)
         self.assertTrue(math.isfinite(result["search_release_time_seconds"]))

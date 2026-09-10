@@ -8,10 +8,12 @@ import os
 from pathlib import Path
 import uuid
 
+from evaluation_aggregation import aggregate_relay_planning
+
 
 RELAY_DIAGNOSTICS_FILENAME = "relay_diagnostics.json"
 RELAY_DIAGNOSTICS_OUTPUT_CONTRACT_VERSION = (
-    "relay-assignment-forwarding-stable-bits-sum-per-episode-json-v2"
+    "snapshot-virtual-relay-planning-forwarding-json-v3"
 )
 RELAY_BITS_SUM_REL_TOL = 1e-15
 RELAY_BITS_SUM_ABS_TOL = 1e-6
@@ -67,6 +69,36 @@ def _validate_forwarding(forwarding, label):
                 )
 
 
+def validate_relay_plan(plan):
+    from relay_contract import empty_plan, COUNT_RULE, TRIGGER
+    for key in empty_plan():
+        if key not in plan:
+            raise ValueError(f"Relay planning is missing {key}")
+    if plan["relay_count_rule"] != COUNT_RULE or plan["reassignment_trigger"] != TRIGGER:
+        raise ValueError("Relay planning policy contract mismatch")
+    required, assigned, available = (plan[key] for key in
+                                    ("required_before_budget", "assigned_relay_count", "available_relay_uavs"))
+    if any(type(n) is not int or n < 0 for n in (required, assigned, available)):
+        raise ValueError("Relay counts must be non-negative integers")
+    if assigned > available or assigned > required or plan["shortage"] != required - assigned:
+        raise ValueError("Relay shortage/count accounting mismatch")
+    if len(plan["slots"]) != assigned or len(plan["slot_to_uav"]) != assigned:
+        raise ValueError("Relay slot mapping/count mismatch")
+    if len(set(plan["slot_to_uav"].values())) != assigned:
+        raise ValueError("Relay UAV assignments must be exclusive")
+    for slot in plan["slots"]:
+        for key in ("slot_id", "virtual_position", "neighbor_ids", "shared", "L_s", "F_s",
+                    "chain_index", "chain_count", "witness_paths", "supported_source_ids",
+                    "planning_priority", "removal_backlog_loss", "assigned_uav_id",
+                    "assignment_distance_m", "shortage", "budget_pruned_slot_ids"):
+            if key not in slot:
+                raise ValueError(f"Relay slot is missing {key}")
+        if plan["slot_to_uav"].get(slot["slot_id"]) != slot["assigned_uav_id"]:
+            raise ValueError("Relay slot owner mismatch")
+    _validate_finite_json_value(plan)
+    return plan
+
+
 def validate_relay_diagnostics(diagnostics):
     """Validate one complete train/resume/evaluation Relay diagnostic payload."""
 
@@ -110,7 +142,7 @@ def validate_relay_diagnostics(diagnostics):
             raise ValueError(f"{label}.assignment must be an object")
         for field in (
             "relay_assignment_history",
-            "relay_candidate_metrics",
+            "relay_planning",
             "selected_relay_uav_ids",
             "relay_role_change_count",
         ):
@@ -118,8 +150,18 @@ def validate_relay_diagnostics(diagnostics):
                 raise ValueError(f"{label}.assignment is missing {field}")
         if not isinstance(assignment["relay_assignment_history"], list):
             raise ValueError(f"{label}.assignment history must be a list")
-        if not isinstance(assignment["relay_candidate_metrics"], dict):
-            raise ValueError(f"{label}.candidate metrics must be an object")
+        validate_relay_plan(assignment["relay_planning"])
+        for entry in assignment["relay_assignment_history"]:
+            validate_relay_plan(entry["planning"])
+        for entry in assignment.get("relay_position_history", []):
+            observation = entry["planning"]
+            for key in ("assignment_invocation", "slots", "position_status", "current_source_reachability"):
+                if key not in observation:
+                    raise ValueError(f"Relay position observation is missing {key}")
+            for slot in observation["slots"]:
+                for key in ("slot_id", "assigned_uav_id", "virtual_position", "P_pos", "P_link", "Phi_relay"):
+                    if key not in slot:
+                        raise ValueError(f"Relay position slot is missing {key}")
         if not isinstance(assignment["selected_relay_uav_ids"], list):
             raise ValueError(f"{label}.selected Relay IDs must be a list")
         role_changes = assignment["relay_role_change_count"]
@@ -143,6 +185,8 @@ def validate_relay_diagnostics(diagnostics):
         or diagnostics["relay_role_change_count"] != expected_role_changes
     ):
         raise ValueError("Relay role-change summary disagrees with episode records")
+    if diagnostics.get("planning_summary") != aggregate_relay_planning(diagnostics["episodes"]):
+        raise ValueError("Relay planning summary disagrees with episode records")
     _validate_forwarding(diagnostics["forwarding"], "relay_diagnostics.forwarding")
     for group in RELAY_FORWARDING_GROUPS:
         actual_bits = float(diagnostics["forwarding"][group]["bits"])
@@ -181,6 +225,7 @@ def aggregate_relay_episode_diagnostics(episodes):
             "bits and completed packet hops received by a UAV while assigned Relay"
         ),
         "episodes": records,
+        "planning_summary": aggregate_relay_planning(records),
         "relay_role_change_count": sum(
             int(episode["assignment"]["relay_role_change_count"])
             for episode in records
@@ -220,7 +265,7 @@ def relay_diagnostics_metadata(diagnostics):
         ),
         "relay_diagnostics_assignment_semantics": (
             "per-episode final assignment snapshot plus complete event assignment "
-            "history and Relay candidate metrics"
+            "history and virtual Relay planning/position diagnostics"
         ),
         "relay_diagnostics_forwarding_semantics": {
             "packets": diagnostics["forwarding_packet_semantics"],
@@ -231,6 +276,7 @@ def relay_diagnostics_metadata(diagnostics):
             "integer_counter_validation": "exact",
         },
         "relay_diagnostics_summary": {
+            "planning": diagnostics["planning_summary"],
             "relay_role_change_count": int(
                 diagnostics["relay_role_change_count"]
             ),

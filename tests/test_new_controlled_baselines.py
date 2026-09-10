@@ -71,7 +71,7 @@ class MaskedTaskObservationTest(unittest.TestCase):
             movement, "masked", "movement"
         )
         masked_routing = apply_observation_strategy(routing, "masked", "routing")
-        self.assertEqual(masked_movement.shape, (675,))
+        self.assertEqual(masked_movement.shape, (595,))
         self.assertEqual(masked_routing.shape, (143,))
         np.testing.assert_array_equal(
             masked_movement[list(MOVEMENT_TASK_ASSIGNMENT_INDICES)], 0.0
@@ -79,7 +79,7 @@ class MaskedTaskObservationTest(unittest.TestCase):
         np.testing.assert_array_equal(
             masked_routing[list(ROUTING_TASK_ASSIGNMENT_INDICES)], 0.0
         )
-        movement_keep = np.ones(675, dtype=bool)
+        movement_keep = np.ones(595, dtype=bool)
         movement_keep[list(MOVEMENT_TASK_ASSIGNMENT_INDICES)] = False
         routing_keep = np.ones(ROUTING_STATE_DIM, dtype=bool)
         routing_keep[list(ROUTING_TASK_ASSIGNMENT_INDICES)] = False
@@ -111,7 +111,7 @@ class MaskedTaskObservationTest(unittest.TestCase):
             train(config, scenario_manifest=manifest, method_spec=method)
             checkpoint = root / "full" / "ep_0001"
             with np.load(checkpoint / "joint_replay.npz", allow_pickle=False) as replay:
-                self.assertEqual(replay["state"].shape, (1, 675))
+                self.assertEqual(replay["state"].shape, (1, 595))
                 np.testing.assert_array_equal(
                     replay["state"][:, list(MOVEMENT_TASK_ASSIGNMENT_INDICES)], 0.0
                 )

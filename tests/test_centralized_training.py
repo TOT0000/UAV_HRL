@@ -50,7 +50,7 @@ class CentralizedTrainingFlowTest(unittest.TestCase):
         self.assertEqual(defaults.batch_size, PRODUCTION_BATCH_SIZE)
         self.assertEqual(defaults.policy_delay, PRODUCTION_POLICY_DELAY)
         self.assertEqual(ROUTING_STATE_DIM, 143)
-        self.assertEqual(self.result["movement_state_dim"], 675)
+        self.assertEqual(self.result["movement_state_dim"], 595)
         self.assertEqual(self.result["routing_state_dim"], 143)
         self.assertEqual(self.result["joint_action_dim"], 48)
         self.assertEqual(self.result["centralized_td3_gamma"], 1.0)

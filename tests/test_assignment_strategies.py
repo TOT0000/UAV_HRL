@@ -201,7 +201,8 @@ class AssignmentCompatibilityTest(unittest.TestCase):
             ("km", 1, 1),
         ):
             assigner = UAVAssigner(SimpleNamespace())
-            with mock.patch.object(assigner, "build_problem", return_value=problem):
+            with (mock.patch.object(assigner, "build_problem", return_value=problem),
+                  mock.patch("Task_assignment.plan_relays", return_value=__import__("relay_contract").empty_plan())):
                 assignments = assigner.assign_tasks(
                     [0, 1], tasks, K=99, strategy=strategy
                 )
@@ -220,7 +221,7 @@ class AssignmentLifecycleTest(unittest.TestCase):
         self.env.num_GT = 2
         self.env.reset_environment()
 
-    def test_search_release_immediately_reassigns(self):
+    def test_search_release_only_changes_fallback_roles(self):
         before = self.env.assignment_invocations
         for gt in self.env.gts:
             gt.is_found = True
@@ -229,20 +230,20 @@ class AssignmentLifecycleTest(unittest.TestCase):
 
         self.env.visited_bitmap[:] = True
         self.env.convert_search_to_hovering()
-        self.assertEqual(self.env.assignment_invocations, before + 1)
+        self.assertEqual(self.env.assignment_invocations, before)
         self.assertEqual(self.env.search_to_hover_conversions, 1)
         self.assertTrue(self.env._search_phase_over)
         task_types = [
             tasks[0]["task_type"] for tasks in self.env.multi_tasks.values()
         ]
-        self.assertEqual(task_types.count("Relay"), 1)
+        self.assertEqual(task_types.count("Relay"), 0)
         self.assertTrue(
             all(task_type in {"Relay", "Hovering"} for task_type in task_types)
         )
         self.assertFalse(any(task.task_type == "Search" for task in self.env.task_list))
 
         self.env.assign_tasks()
-        self.assertEqual(self.env.assignment_invocations, before + 2)
+        self.assertEqual(self.env.assignment_invocations, before + 1)
         self.assertEqual(self.env.last_assignment.last_round_problems, [])
 
     def test_phase_fallback_is_search_below_threshold_and_hover_after(self):
@@ -255,7 +256,7 @@ class AssignmentLifecycleTest(unittest.TestCase):
         before = self.env.assignment_invocations
         self.env.visited_bitmap[:] = True
         self.env.convert_search_to_hovering()
-        self.assertEqual(self.env.assignment_invocations, before + 1)
+        self.assertEqual(self.env.assignment_invocations, before)
         self.assertTrue(
             all(tasks[0]["task_type"] == "Hovering" for tasks in self.env.multi_tasks.values())
         )

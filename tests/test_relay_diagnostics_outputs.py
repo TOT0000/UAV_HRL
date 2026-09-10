@@ -131,7 +131,7 @@ class RelayDiagnosticsOutputTest(unittest.TestCase):
                     "scenario_id": f"scenario-{index}",
                     "assignment": {
                         "relay_assignment_history": [],
-                        "relay_candidate_metrics": {},
+                        "relay_planning": __import__("relay_contract").empty_plan(),
                         "selected_relay_uav_ids": [],
                         "relay_role_change_count": index % 2,
                     },
