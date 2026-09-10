@@ -92,14 +92,18 @@ GROUND_ALTITUDE_M = 0.0
 UAV_MAX_ALTITUDE_M = 150.0
 TASK_POTENTIAL_NORMALIZATION_EPSILON = 1e-12
 TASK_POTENTIAL_CONTRACT_VERSION = (
-    "oblique-vs-com-final-witness-relay-potential-v11"
+    "task-selected-camera-uniform-beta3-potential-v12"
 )
+TASK_POTENTIAL_BETA_SEARCH = 3.0
+TASK_POTENTIAL_BETA_VS = 3.0
+TASK_POTENTIAL_BETA_COM = 3.0
+TASK_POTENTIAL_BETA_RELAY = 3.0
 COM_CAPACITY_POTENTIAL_WEIGHT = 0.5
 COM_DISTANCE_POTENTIAL_WEIGHT = 0.5
 RELAY_TASK_CONTRACT_VERSION = (
     "snapshot-virtual-relay-service-first-greedy-v6"
 )
-RELAY_POTENTIAL_WEIGHT = 1.0
+RELAY_POTENTIAL_WEIGHT = TASK_POTENTIAL_BETA_RELAY
 METHOD_CONTRACT_VERSION = "centralized-16-uav-virtual-relay-v6"
 DEFAULT_TRAINING_SEED = 20260817
 FORMAL_TRAINING_EPISODES = 1500
@@ -253,7 +257,6 @@ def validate_task_potential_weights():
     groups = {
         "COM": (COM_CAPACITY_POTENTIAL_WEIGHT, COM_DISTANCE_POTENTIAL_WEIGHT),
         "Relay": (0.3, 0.7),
-        "Relay shaping": (RELAY_POTENTIAL_WEIGHT,),
     }
     for name, weights in groups.items():
         numeric = tuple(float(weight) for weight in weights)
@@ -263,6 +266,26 @@ def validate_task_potential_weights():
             )
         if not math.isclose(sum(numeric), 1.0, rel_tol=0.0, abs_tol=1e-12):
             raise ValueError(f"{name} task-potential weights must sum to 1")
+    shaping_coefficients = (
+        TASK_POTENTIAL_BETA_SEARCH,
+        TASK_POTENTIAL_BETA_VS,
+        TASK_POTENTIAL_BETA_COM,
+        TASK_POTENTIAL_BETA_RELAY,
+    )
+    if not all(
+        math.isfinite(float(coefficient)) and float(coefficient) >= 0.0
+        for coefficient in shaping_coefficients
+    ):
+        raise ValueError(
+            "task-potential shaping coefficients must be finite and non-negative"
+        )
+    if not math.isclose(
+        TASK_POTENTIAL_BETA_RELAY,
+        TASK_POTENTIAL_BETA_COM,
+        rel_tol=0.0,
+        abs_tol=0.0,
+    ):
+        raise ValueError("Relay and COM shaping coefficients must match")
     return groups
 
 
@@ -281,6 +304,14 @@ def task_potential_contract_metadata():
     )
     return {
         "contract_version": TASK_POTENTIAL_CONTRACT_VERSION,
+        "shaping_coefficients": {
+            "beta_search": TASK_POTENTIAL_BETA_SEARCH,
+            "beta_vs": TASK_POTENTIAL_BETA_VS,
+            "beta_com": TASK_POTENTIAL_BETA_COM,
+            "beta_relay": TASK_POTENTIAL_BETA_RELAY,
+        },
+        "pbrs": "beta_i * (gamma * phi_i_next - phi_i_current)",
+        "no_task_potential": "all four shaping contributions are zero",
         "search": {
             "unchanged": True,
             "definition": "mean(visited_bitmap)",
@@ -310,7 +341,7 @@ def task_potential_contract_metadata():
         "relay": {
             "movement_potential_definition": "mean(0.3 * exp(-distance_to_virtual_target / 400) + 0.7 * min_neighbor_normalized_expected_capacity)",
             "aggregation": "mean over Relay tasks per UAV, then mean over assigned Relay UAVs",
-            "beta": RELAY_POTENTIAL_WEIGHT,
+            "beta": TASK_POTENTIAL_BETA_RELAY,
             "position_weight": 0.3, "link_weight": 0.7,
             "distance_dimensionality": "three_dimensional_3d",
             "communication_range_m": COMMUNICATION_RANGE_M,
@@ -889,6 +920,21 @@ def effective_training_config(config, method_spec: MethodSpec) -> dict:
         exploration_schedule_configuration(config, method_spec)
     )
     values.update(comparison_method_configuration(method_spec))
+    configured_coefficients = {
+        "beta_search": float(values.get(
+            "beta_search", TASK_POTENTIAL_BETA_SEARCH
+        )),
+        "beta_vs": float(values.get("beta_vs", TASK_POTENTIAL_BETA_VS)),
+        "beta_com": float(values.get("beta_com", TASK_POTENTIAL_BETA_COM)),
+        "beta_relay": float(values.get(
+            "beta_relay", TASK_POTENTIAL_BETA_RELAY
+        )),
+    }
+    values["task_potential_shaping_coefficients"] = configured_coefficients
+    values["effective_task_potential_shaping_coefficients"] = {
+        name: coefficient if method_spec.task_potential_enabled else 0.0
+        for name, coefficient in configured_coefficients.items()
+    }
     return values
 
 
@@ -896,6 +942,12 @@ def comparison_method_configuration(method_spec: MethodSpec) -> dict:
     """Resolve orthogonal comparison strategies and shared assignment constants."""
 
     method_spec = MethodSpec.parse(method_spec.method_id)
+    configured_coefficients = {
+        "beta_search": TASK_POTENTIAL_BETA_SEARCH,
+        "beta_vs": TASK_POTENTIAL_BETA_VS,
+        "beta_com": TASK_POTENTIAL_BETA_COM,
+        "beta_relay": TASK_POTENTIAL_BETA_RELAY,
+    }
     return {
         "assignment_strategy": method_spec.assignment,
         "assignment_rounds": int(method_spec.assignment_rounds),
@@ -906,6 +958,11 @@ def comparison_method_configuration(method_spec: MethodSpec) -> dict:
         "task_potential_enabled": bool(method_spec.task_potential_enabled),
         "task_potential_contract_version": TASK_POTENTIAL_CONTRACT_VERSION,
         "task_potential_configuration": task_potential_contract_metadata(),
+        "task_potential_shaping_coefficients": configured_coefficients,
+        "effective_task_potential_shaping_coefficients": {
+            name: coefficient if method_spec.task_potential_enabled else 0.0
+            for name, coefficient in configured_coefficients.items()
+        },
         "movement_replay_contract_version": MOVEMENT_REPLAY_CONTRACT_VERSION,
         "relay_task_contract_version": RELAY_TASK_CONTRACT_VERSION,
         "relay_count_rule": "snapshot_component_bridges_greedy_deletion_minimal",

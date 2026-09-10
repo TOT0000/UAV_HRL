@@ -417,18 +417,18 @@ class AtomicFovAndAggregationContractTest(unittest.TestCase):
         env._search_phase_over = False
         env.visited_bitmap[:] = False
         env.multi_tasks = {uid: [] for uid in range(env.num_UAV)}
-        env.multi_tasks[0] = [{"task_type": "Search"}]
         env.multi_tasks[1] = [{"task_type": "Search"}]
-        env.uav_dict[1].x_u = env.uav_dict[0].x_u
-        env.uav_dict[1].y_u = env.uav_dict[0].y_u
-        env.uav_dict[1].z_u = env.uav_dict[0].z_u
+        env.multi_tasks[2] = [{"task_type": "Search"}]
+        env.uav_dict[2].x_u = env.uav_dict[1].x_u
+        env.uav_dict[2].y_u = env.uav_dict[1].y_u
+        env.uav_dict[2].z_u = env.uav_dict[1].z_u
         transitions = _mark_search_observations(env)
         self.assertEqual(len(transitions), env.num_UAV)
-        self.assertEqual(transitions[0].raw_unvisited, 1.0)
         self.assertEqual(transitions[1].raw_unvisited, 1.0)
-        self.assertTrue(transitions[0].map_changed)
+        self.assertEqual(transitions[2].raw_unvisited, 1.0)
         self.assertTrue(transitions[1].map_changed)
-        footprint = transitions[0].current_footprint
+        self.assertTrue(transitions[2].map_changed)
+        footprint = transitions[1].current_footprint
         self.assertTrue(
             env.visited_bitmap[
                 footprint[0] : footprint[1] + 1,

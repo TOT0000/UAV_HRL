@@ -8,6 +8,12 @@ from centralized_movement import (
     project_joint_action,
     validate_movement_mask,
 )
+from experiment_config import (
+    TASK_POTENTIAL_BETA_COM,
+    TASK_POTENTIAL_BETA_RELAY,
+    TASK_POTENTIAL_BETA_SEARCH,
+    TASK_POTENTIAL_BETA_VS,
+)
 
 
 def _to_np_float32(x):
@@ -293,10 +299,10 @@ class ReplayBufferJoint:
         indices,
         current_lambda,
         gamma,
-        beta_search=1.0,
-        beta_vs=1.0,
-        beta_com=1.0,
-        beta_relay=1.0,
+        beta_search=TASK_POTENTIAL_BETA_SEARCH,
+        beta_vs=TASK_POTENTIAL_BETA_VS,
+        beta_com=TASK_POTENTIAL_BETA_COM,
+        beta_relay=TASK_POTENTIAL_BETA_RELAY,
         reward_mode="dinkelbach",
         task_potential_enabled=True,
     ):
@@ -329,10 +335,10 @@ class ReplayBufferJoint:
         batch_size,
         current_lambda,
         gamma,
-        beta_search=1.0,
-        beta_vs=1.0,
-        beta_com=1.0,
-        beta_relay=1.0,
+        beta_search=TASK_POTENTIAL_BETA_SEARCH,
+        beta_vs=TASK_POTENTIAL_BETA_VS,
+        beta_com=TASK_POTENTIAL_BETA_COM,
+        beta_relay=TASK_POTENTIAL_BETA_RELAY,
         reward_mode="dinkelbach",
         task_potential_enabled=True,
         include_movement_masks=False,

@@ -527,6 +527,20 @@ class ExperimentPreflightTest(unittest.TestCase):
                 "batch_size",
             ),
             (
+                "old-beta",
+                lambda metadata: metadata["experiment"]["formal_config"].update(
+                    {"beta_search": 1.0}
+                ),
+                "beta_search",
+            ),
+            (
+                "old-search-camera",
+                lambda metadata: metadata["visual_sensing_configuration"][
+                    "search_camera"
+                ].update({"f_m": 0.035}),
+                "visual sensing",
+            ),
+            (
                 "dinkelbach-interval",
                 lambda metadata: metadata["experiment"]["formal_config"].update(
                     {"dinkelbach_update_interval_episodes": 25}

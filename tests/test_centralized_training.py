@@ -203,7 +203,7 @@ class CentralizedTrainingFlowTest(unittest.TestCase):
             canonical["dinkelbach_lambda_after_episode"],
         )
 
-    def test_finite_horizon_potential_shaping_uses_unit_discount(self):
+    def test_finite_horizon_potential_shaping_uses_unit_discount_and_beta3(self):
         config = TrainingConfig(total_episodes=1)
         reward = _interval_reward(
             delivered_mbits=0.0,
@@ -215,7 +215,7 @@ class CentralizedTrainingFlowTest(unittest.TestCase):
             done=False,
             config=config,
         )
-        self.assertAlmostEqual(reward, 1.2)
+        self.assertAlmostEqual(reward, 3.6)
 
     def test_normal_training_end_writes_episode_boundary_full_checkpoint(self):
         with tempfile.TemporaryDirectory() as temp_dir:

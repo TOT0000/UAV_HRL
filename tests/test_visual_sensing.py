@@ -1,7 +1,6 @@
 """Deterministic physical geometry and shared-production-path contract tests."""
 import ast
 import copy
-from dataclasses import replace
 import math
 from pathlib import Path
 from unittest.mock import patch
@@ -10,7 +9,8 @@ import numpy as np
 import pytest
 
 from visual_sensing import (
-    CAMERA, VISUAL_SENSING_CONTRACT_VERSION, VS_PACKET_MAX_BITS,
+    CAMERA, SEARCH_CAMERA, VS_CAMERA, VISUAL_SENSING_CONTRACT_VERSION,
+    VS_PACKET_MAX_BITS,
     circle_polygon_intersection_area, search_footprint, vs_geometry,
     visual_sensing_metadata,
 )
@@ -37,20 +37,58 @@ def environment():
     return env, target, uav, descriptor
 
 
-def test_single_camera_source_and_nadir_dimensions():
+def test_task_specific_camera_configs_and_search_dimensions():
     root = Path(__file__).resolve().parents[1]
     sources = []
     for file in root.glob('*.py'):
         if file.name.startswith('update_visual'):
             continue
         tree = ast.parse(file.read_text(encoding='utf-8-sig'))
-        if any(isinstance(node, ast.Constant) and node.value in (0.035, 0.0156, 0.0235)
-               for node in ast.walk(tree)):
+        if any(
+            isinstance(node, ast.Constant)
+            and node.value in (0.0175, 0.035, 0.0156, 0.0235)
+            for node in ast.walk(tree)
+        ):
             sources.append(file.name)
     assert sources == ['visual_sensing.py']
+    assert CAMERA is VS_CAMERA
+    assert SEARCH_CAMERA.f_m == pytest.approx(0.0175)
+    assert VS_CAMERA.f_m == pytest.approx(0.035)
+    assert SEARCH_CAMERA.image_width_m == VS_CAMERA.image_width_m == pytest.approx(
+        0.0156
+    )
+    assert SEARCH_CAMERA.image_length_m == VS_CAMERA.image_length_m == pytest.approx(
+        0.0235
+    )
     fp = search_footprint((0, 0, 100))
-    assert fp.width == pytest.approx(44.5714285714)
-    assert fp.height == pytest.approx(67.1428571429)
+    old_fp = search_footprint((0, 0, 100), camera=VS_CAMERA)
+    assert fp.width == pytest.approx(89.1428571429)
+    assert fp.height == pytest.approx(134.2857142857)
+    assert fp.width == pytest.approx(2 * old_fp.width)
+    assert fp.height == pytest.approx(2 * old_fp.height)
+    assert fp.width * fp.height == pytest.approx(4 * old_fp.width * old_fp.height)
+
+
+def test_visual_metadata_records_modes_and_no_resolution_thresholds():
+    metadata = visual_sensing_metadata()
+    assert metadata['search_camera']['f_m'] == pytest.approx(0.0175)
+    assert metadata['vs_camera']['f_m'] == pytest.approx(0.035)
+    assert (
+        metadata['search_camera']['image_width_m']
+        == metadata['vs_camera']['image_width_m']
+    )
+    assert (
+        metadata['search_camera']['image_length_m']
+        == metadata['vs_camera']['image_length_m']
+    )
+    assert 'nadir' in metadata['search_model']
+    assert 'ROI-center-inclusive' in metadata['search_model']
+    assert 'oblique' in metadata['vs_model']
+    assert metadata['minimum_resolution_hard_constraint'] == {
+        'search': False,
+        'vs': False,
+    }
+    assert 'FOV or FOV+COM -> VS camera' in metadata['camera_mode_selection']
 
 
 def test_search_boundary_outside_and_one_frozen_footprint():
@@ -78,10 +116,12 @@ def test_search_boundary_outside_and_one_frozen_footprint():
     assert calculate_movement_potentials(env, 1)[0] == expected.mean()
 
 
-@pytest.mark.parametrize('role', ['FOV', 'COM', 'Relay', 'Hovering'])
-def test_nonsearch_cannot_discover_or_contribute(role):
+@pytest.mark.parametrize('roles', [
+    ['FOV'], ['FOV', 'COM'], ['COM'], ['Relay'], ['Hovering'],
+])
+def test_nonsearch_cannot_discover_or_contribute(roles):
     env, target, _, descriptor = environment()
-    env.multi_tasks[1] = [{**descriptor, 'task_type': role}]
+    env.multi_tasks[1] = [{**descriptor, 'task_type': role} for role in roles]
     env.visited_bitmap[:] = False
     env.update_visited_grid(1)
     transition = env.mark_search_coverage(1, coverage_contributor=True)
@@ -95,11 +135,28 @@ def test_nonsearch_cannot_discover_or_contribute(role):
     assert env.mark_search_coverage(1, coverage_contributor=False).current_footprint is None
 
 
+def test_permanent_gateway_never_contributes_search_sensing():
+    env, target, _, _ = environment()
+    gateway_id = env.permanent_gs_gateway_uav_id
+    gateway = env.uav_dict[gateway_id]
+    gateway.x_u, gateway.y_u, gateway.z_u = target.x, target.y, 100.0
+    env.multi_tasks[gateway_id] = [{'task_type': 'Search'}]
+    before = env.visited_bitmap.copy()
+    assert not env.is_search_contributor(gateway_id)
+    assert not env.is_visible(gateway_id, target)
+    transition = env.mark_search_coverage(gateway_id)
+    assert not transition.coverage_contributor
+    assert transition.current_footprint is None
+    np.testing.assert_array_equal(env.visited_bitmap, before)
+
+
 def test_nadir_vs_area_raw_quantity_and_relative_altitude():
     geometry = vs_geometry((0, 0, 125), (0, 0, 25), 80)
-    fp = search_footprint((0, 0, 125), ground_z=25)
+    fp = search_footprint((0, 0, 125), ground_z=25, camera=VS_CAMERA)
     assert geometry.sensing_valid_now
     assert geometry.relative_altitude == 100
+    assert fp.width == pytest.approx(44.5714285714)
+    assert fp.height == pytest.approx(67.1428571429)
     np.testing.assert_allclose(np.ptp(geometry.polygon, axis=0), [fp.width, fp.height])
     assert geometry.footprint_area == pytest.approx(fp.width*fp.height)
     assert geometry.image_quantity == pytest.approx(math.pi*80**2/geometry.footprint_area)
@@ -118,6 +175,13 @@ def test_evaluation_exports_active_camera_pose_and_actual_roi_radius():
     np.testing.assert_allclose(exported['polygon'],geometry.polygon)
     assert exported['image_quantity'] == geometry.image_quantity
     assert fov_task_metrics(env,1,descriptor)[1] == geometry.image_quantity
+    env.multi_tasks[1] = [descriptor, {'task_type': 'COM', 'target_obj_id': 0}]
+    assert (
+        _sensing_coverage(env, 1)[0]['model']
+        == visual_sensing_metadata()['vs_camera']
+    )
+    env.multi_tasks[1] = [{'task_type':'COM'}]
+    assert _sensing_coverage(env,1) == []
     env.multi_tasks[1] = [{'task_type':'Relay'}]
     assert _sensing_coverage(env,1) == []
 
@@ -133,7 +197,7 @@ def test_oblique_rotation_area_and_original_image_quantity(angle):
     assert rotated.footprint_area == pytest.approx(base.footprint_area)
     # Independent original model formula, used only as an analytical test oracle.
     z, d = 100, 180
-    f, w, h = CAMERA.f_m, CAMERA.image_width_m, CAMERA.image_length_m
+    f, w, h = VS_CAMERA.f_m, VS_CAMERA.image_width_m, VS_CAMERA.image_length_m
     expected_i = f*f*math.pi*80**2*(z*z-w*w*d*d/(4*f*f))**2/(w*h*(d*d+z*z)**1.5*z**3)
     assert rotated.image_quantity == pytest.approx(expected_i)
 
@@ -155,13 +219,13 @@ def test_oblique_full_partial_and_finite_horizon_boundary():
     assert 0 < vs_geometry((0,0,100), (0,0,0), 80).coverage_ratio < 1
     for altitude in (1, 50, 100, 150):
         for fraction in (0, .1, .5, .9, .999, 1-1e-9, 1, 1+1e-9, 2):
-            g = vs_geometry((CAMERA.b1*altitude*fraction,0,altitude), (0,0,0))
+            g = vs_geometry((VS_CAMERA.b1*altitude*fraction,0,altitude), (0,0,0))
             assert np.isfinite([g.footprint_area, g.image_quantity, g.coverage_ratio, g.pair_score]).all()
             assert 0 <= g.coverage_ratio <= 1
             assert np.isfinite(g.polygon).all()
             if fraction >= 1:
                 assert (g.image_quantity, g.coverage_ratio, g.quality) == (0,0,0)
-    boundary = vs_geometry((CAMERA.b1*100,0,100), (0,0,0))
+    boundary = vs_geometry((VS_CAMERA.b1*100,0,100), (0,0,0))
     assert boundary.model_range_valid and not boundary.sensing_valid_now
     assert boundary.proximity == 1
 
@@ -202,8 +266,6 @@ def test_assignment_outside_range_and_shared_quality_proximity_potential():
 def test_fixed_packet_size(quantity, expected):
     assert VS_PACKET_MAX_BITS == 31600
     assert fov_physical_packet_size_bits(quantity) == expected
-    with patch('visual_sensing.CAMERA', replace(CAMERA, image_width_m=.5)):
-        assert fov_physical_packet_size_bits(quantity) == expected
 
 
 def test_invalid_injection_capture_freeze_and_useful_bits():
@@ -277,6 +339,6 @@ def test_checkpoint_rejects_old_missing_or_changed_visual_contract():
         del bad[key]
         with pytest.raises(RuntimeError, match='visual sensing'):
             _validate_checkpoint_schema(bad)
-    current['visual_sensing_configuration']['packet_max_bits'] = 120500
+    current['visual_sensing_configuration']['search_camera']['f_m'] = 0.035
     with pytest.raises(RuntimeError, match='visual sensing'):
         _validate_checkpoint_schema(current)

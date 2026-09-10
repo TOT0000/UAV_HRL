@@ -156,17 +156,17 @@ class AllParticipantFovSnapshotContractTest(unittest.TestCase):
         env._search_phase_over = False
         env.visited_bitmap[:] = False
         env.multi_tasks = {uav_id: [] for uav_id in range(env.num_UAV)}
-        env.multi_tasks[0] = [{"task_type": "Search"}]
-        env.uav_dict[0].x_u, env.uav_dict[0].y_u = 100.0, 100.0
-        env.uav_dict[1].x_u, env.uav_dict[1].y_u = 900.0, 900.0
+        env.multi_tasks[1] = [{"task_type": "Search"}]
+        env.uav_dict[1].x_u, env.uav_dict[1].y_u = 100.0, 100.0
+        env.uav_dict[2].x_u, env.uav_dict[2].y_u = 900.0, 900.0
         return env
 
     def test_non_search_has_no_footprint_or_search_observation(self):
         env = self._environment()
         transitions = _mark_search_observations(env)
         by_uav = {transition.uav_id: transition for transition in transitions}
-        search = by_uav[0]
-        non_search = by_uav[1]
+        search = by_uav[1]
+        non_search = by_uav[2]
 
         self.assertEqual(len(transitions), env.num_UAV)
         self.assertTrue(search.coverage_contributor)
@@ -184,15 +184,15 @@ class AllParticipantFovSnapshotContractTest(unittest.TestCase):
         self.assertEqual(first.fov_ema_state(), second.fov_ema_state())
         self.assertEqual(first.fov_ema_update_count, 1)
         self.assertEqual(len(first.fov_ema), env.num_UAV)
-        self.assertAlmostEqual(first.fov_ema[1]["unvisited"], 0.0)
+        self.assertAlmostEqual(first.fov_ema[2]["unvisited"], 0.0)
 
         env.update_u2u_channels()
         env.update_u2g_channels()
         state = first.get_state_ta(
             env,
-            1,
+            2,
             backlog_bits=first.backlog_bits,
-            action_mask=env.get_routing_action_mask(1),
+            action_mask=env.get_routing_action_mask(2),
         )
         index = routing_state_feature_names().index("coverage_unvisited_ema")
         self.assertAlmostEqual(float(state[index]), 0.0)

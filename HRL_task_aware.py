@@ -69,6 +69,10 @@ from experiment_config import (
     ROUTING_UPDATE_INTERVAL_SLOTS,
     ROUTING_WARMUP_TRANSITIONS,
     SR_ROUTE_LIFECYCLE_VERSION,
+    TASK_POTENTIAL_BETA_COM,
+    TASK_POTENTIAL_BETA_RELAY,
+    TASK_POTENTIAL_BETA_SEARCH,
+    TASK_POTENTIAL_BETA_VS,
     effective_training_config,
     exploration_schedule_configuration,
     movement_agent_configuration,
@@ -231,10 +235,10 @@ class TrainingConfig:
         MOVEMENT_EXPLORATION_DECAY_EPISODES
     )
     routing_epsilon_decay_episodes: int = ROUTING_EPSILON_DECAY_EPISODES
-    beta_search: float = 1.0
-    beta_vs: float = 1.0
-    beta_com: float = 1.0
-    beta_relay: float = 1.0
+    beta_search: float = TASK_POTENTIAL_BETA_SEARCH
+    beta_vs: float = TASK_POTENTIAL_BETA_VS
+    beta_com: float = TASK_POTENTIAL_BETA_COM
+    beta_relay: float = TASK_POTENTIAL_BETA_RELAY
     search_coverage_threshold: float = 0.99
     dinkelbach_initial_lambda: float = DINKELBACH_INITIAL_LAMBDA
     dinkelbach_update_interval_episodes: int = DINKELBACH_UPDATE_INTERVAL_EPISODES
@@ -515,7 +519,7 @@ def _search_footprint_metadata(env, uav_id):
             "y_min": y_min,
             "y_max": y_max,
         },
-        "model": visual_sensing_metadata()["camera"],
+        "model": visual_sensing_metadata()["search_camera"],
     }
 
 
@@ -541,7 +545,7 @@ def _sensing_coverage(env, uav_id):
             "coverage_ratio": geometry.coverage_ratio,
             "sensing_valid_now": geometry.sensing_valid_now,
             "diagnostics": geometry.diagnostics,
-            "model": visual_sensing_metadata()["camera"],
+            "model": visual_sensing_metadata()["vs_camera"],
         })
     return records
 
@@ -990,10 +994,7 @@ def _mark_search_observations(env):
     search_uav_ids = [
         uav_id
         for uav_id in range(env.num_UAV)
-        if any(
-            task.get("task_type") == "Search"
-            for task in env.multi_tasks.get(uav_id, [])
-        )
+        if env.is_search_contributor(uav_id)
     ]
     if not search_uav_ids:
         return ()

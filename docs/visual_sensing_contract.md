@@ -1,5 +1,36 @@
 # Canonical visual sensing change record
 
+## Task-selected Search/VS camera follow-up
+
+The current visual contract is
+`task-selected-search-17p5mm-vs-35mm-valid-capture-v3`. Both modes use the
+0.0156 m by 0.0235 m image plane. Search uses a 0.0175 m focal length and a
+fixed nadir footprint; VS keeps the 0.035 m focal length and the existing
+oblique camera aimed at the assigned ROI. At 100 m, the Search footprint is
+89.142857 m by 134.285714 m, twice the former length and width and four times
+its area.
+
+Only a non-gateway UAV with a current Search task contributes a Search
+footprint, changes `visited_bitmap`, or discovers an undiscovered ROI whose
+center is inside or on the footprint boundary. FOV and FOV+COM UAVs use VS
+mode. COM-only, Relay, Hovering and the permanent GS gateway do not perform
+Search sensing. The mode follows current task types; there is no separate
+camera action or camera-state transition.
+
+FOV assignment utility, VS potential, coverage, image quantity, packet
+generation and packet size continue to use `VS_CAMERA` and retain the original
+35 mm numerical geometry. Search and VS have no minimum-resolution hard
+constraint. Resolution remains an input to the existing VS utility, potential
+and packet-size calculations.
+
+All task-potential-enabled formal methods now resolve
+`beta_search = beta_vs = beta_com = beta_relay = 3.0`. The potential formulas
+and PBRS difference are unchanged; `no_task_potential` resolves all four
+effective shaping coefficients to zero. Training, evaluation and checkpoint
+validation use the same resolved configuration. A checkpoint containing the
+old visual contract or beta values is rejected before continuation. The
+checkpoint schema remains **29**.
+
 Original geometry change base: `feature/centralized-td3`, HEAD
 `84531f859ed6ab3291d14091e67ba0c8cce6398d`.
 The remote branch was fetched and matched this HEAD before editing. The existing
@@ -37,7 +68,7 @@ the pair score stays `0.8*Q+0.2*G`. All 16 registry methods retain the same
 training/evaluation/paper-evaluation route through `HRL_task_aware.train`,
 `_run_routing_slot` and this scheduler. No comparison-specific gate exists.
 
-Visual contract: `nadir-search-oblique-vs-valid-capture-v2`.
+Historical visual contract: `nadir-search-oblique-vs-valid-capture-v2`.
 FOV generation contract: `assigned-valid-sensing-rate-integrator-capture-snapshot-v3`.
 Checkpoint schema: **27**, rejecting schema 26 and older before weight loading.
 The shared metadata publishes the gate, credit lifetime and capture snapshot.
@@ -83,10 +114,12 @@ experiment result was changed, and no push was performed.
 ## Geometry and shared execution paths
 
 `visual_sensing.py` is the single camera configuration and geometry source.
-`CAMERA` is immutable: focal length 0.035 m, width 0.0156 m, height 0.0235 m.
-Target objects supply ROI radius (default 80 m) and ground altitude.
+`SEARCH_CAMERA` and `VS_CAMERA` are immutable and share the 0.0156 m by
+0.0235 m image plane. Target objects supply ROI radius (default 80 m) and
+ground altitude. `CAMERA` remains a compatibility alias for `VS_CAMERA` and is
+not used by Search production paths.
 
-- `search_footprint`: fixed nadir rectangle, 44.5714 by 67.1429 m at 100 m.
+- `search_footprint`: fixed nadir rectangle, 89.142857 by 134.285714 m at 100 m.
   `HRL_task_aware._mark_search_observations` freezes one continuous footprint
   per Search contributor and passes it to both discovery and bitmap sampling.
   Discovery tests the ROI center inclusively; it never uses full-ROI coverage.
@@ -141,8 +174,8 @@ are unchanged. Each capture freezes physical size, coverage, raw image quantity
 and ROI/task identity; the VS QoS denominator excludes invalid intervals;
 timely useful VS bits equal timely physical bits times capture coverage.
 
-Checkpoint schema 27 requires the complete visual contract configuration and
-version for both full resume and model-only evaluation. Schema 26 and older,
+Checkpoint schema 29 requires the complete visual contract configuration and
+version for both full resume and model-only evaluation. Older schemas,
 missing visual metadata, or changed camera/coverage/packet/weight/validity
 metadata fail before loading weights. All affected methods must be retrained.
 Training/evaluation configs and metadata publish the canonical configuration.

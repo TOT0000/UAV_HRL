@@ -194,6 +194,8 @@ FORMAL_CORE_CONFIG_FIELDS = (
     "task_potential_enabled",
     "task_potential_contract_version",
     "task_potential_configuration",
+    "task_potential_shaping_coefficients",
+    "effective_task_potential_shaping_coefficients",
     "movement_replay_contract_version",
     "relay_task_contract_version",
     "relay_count_rule",

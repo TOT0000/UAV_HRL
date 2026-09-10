@@ -1,10 +1,13 @@
 import math
+import inspect
 import unittest
 from unittest import mock
 
 import numpy as np
 
-from HRL_task_aware import TrainingConfig, _interval_reward
+from HRL_task_aware import TrainingConfig, _interval_reward, formal_training_config
+from centralized_ddpg import CentralizedDDPG
+from paper_evaluation import _evaluation_config
 from Simulator import Simulator
 from centralized_movement import (
     JOINT_ACTION_DIM,
@@ -22,6 +25,10 @@ from experiment_config import (
     METHOD_REGISTRY,
     S2U_COMMUNICATION_RANGE_M,
     TASK_POTENTIAL_CONTRACT_VERSION,
+    TASK_POTENTIAL_BETA_COM,
+    TASK_POTENTIAL_BETA_RELAY,
+    TASK_POTENTIAL_BETA_SEARCH,
+    TASK_POTENTIAL_BETA_VS,
     MethodSpec,
     comparison_method_configuration,
     task_potential_contract_metadata,
@@ -29,6 +36,8 @@ from experiment_config import (
 )
 from observation_strategy import ROUTING_STATE_DIM
 from scenario_manifest import SCENARIO_SCHEMA_VERSION
+from td3 import TD3
+from utils_update_v2 import ReplayBufferJoint
 
 
 class DistanceProgressHelperTest(unittest.TestCase):
@@ -104,6 +113,22 @@ class DistanceProgressHelperTest(unittest.TestCase):
         )
         self.assertNotIn("frozen", metadata["relay"]["transition_alignment"])
         self.assertFalse(metadata["lifecycle"]["delivery_or_connectivity_potential"])
+        expected_betas = {
+            "beta_search": 3.0,
+            "beta_vs": 3.0,
+            "beta_com": 3.0,
+            "beta_relay": 3.0,
+        }
+        self.assertEqual(metadata["shaping_coefficients"], expected_betas)
+        self.assertEqual(
+            (
+                TASK_POTENTIAL_BETA_SEARCH,
+                TASK_POTENTIAL_BETA_VS,
+                TASK_POTENTIAL_BETA_COM,
+                TASK_POTENTIAL_BETA_RELAY,
+            ),
+            (3.0, 3.0, 3.0, 3.0),
+        )
 
         with mock.patch(
             "experiment_config.COM_CAPACITY_POTENTIAL_WEIGHT", float("nan")
@@ -174,7 +199,21 @@ class DistanceAwarePotentialLifecycleTest(unittest.TestCase):
         self.assertEqual(self._shaping(far, far), 0.0)
         self.assertGreater(self._shaping(far, near), 0.0)
         self.assertLess(self._shaping(near, far), 0.0)
-        self.assertAlmostEqual(self._shaping(near, far, done=True), -sum(near))
+        expected_terminal = -sum(
+            beta * potential
+            for beta, potential in zip(
+                (
+                    self.config.beta_search,
+                    self.config.beta_vs,
+                    self.config.beta_com,
+                    self.config.beta_relay,
+                ),
+                near,
+            )
+        )
+        self.assertAlmostEqual(
+            self._shaping(near, far, done=True), expected_terminal
+        )
 
     def test_com_approach_unchanged_and_retreat_have_signed_differences(self):
         self.env.multi_tasks[0] = [self._com_task()]
@@ -292,6 +331,29 @@ class DistanceAwarePotentialLifecycleTest(unittest.TestCase):
 
 
 class TaskPotentialMethodContractTest(unittest.TestCase):
+    def test_training_evaluation_agents_and_replay_share_beta3_defaults(self):
+        names = ("beta_search", "beta_vs", "beta_com", "beta_relay")
+        training = formal_training_config(total_episodes=1500)
+        evaluation = _evaluation_config(episodes=1, episode_seconds=60, seed=17)
+        self.assertEqual(
+            tuple(getattr(training, name) for name in names), (3.0,) * 4
+        )
+        self.assertEqual(
+            tuple(getattr(evaluation, name) for name in names), (3.0,) * 4
+        )
+        for callable_obj in (
+            TD3.update_joint,
+            CentralizedDDPG.update_joint,
+            ReplayBufferJoint._reward_numpy,
+            ReplayBufferJoint.sample,
+        ):
+            with self.subTest(callable=callable_obj.__qualname__):
+                signature = inspect.signature(callable_obj)
+                self.assertEqual(
+                    tuple(signature.parameters[name].default for name in names),
+                    (3.0,) * 4,
+                )
+
     def test_all_methods_publish_one_contract_without_dimension_changes(self):
         shared = None
         for method_id in METHOD_REGISTRY:
@@ -305,6 +367,15 @@ class TaskPotentialMethodContractTest(unittest.TestCase):
                 self.assertEqual(
                     config["task_potential_enabled"],
                     method.task_potential_enabled,
+                )
+                configured = config["task_potential_shaping_coefficients"]
+                effective = config[
+                    "effective_task_potential_shaping_coefficients"
+                ]
+                self.assertEqual(set(configured.values()), {3.0})
+                self.assertEqual(
+                    set(effective.values()),
+                    {3.0} if method.task_potential_enabled else {0.0},
                 )
                 if shared is None:
                     shared = config["task_potential_configuration"]

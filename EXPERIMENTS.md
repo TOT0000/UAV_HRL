@@ -275,28 +275,40 @@ same schema and output files. Diagnostics are read-only and consume no RNG.
 
 ## Movement task-potential contract
 
-Movement shaping remains a potential difference with unit movement discount
-and unit task weights: `F_x = beta_x * (Phi_x(s_next) - Phi_x(s))`, where
-`beta_search = beta_vs = beta_com = 1` and `gamma = 1`. An unchanged potential
+Movement shaping remains a potential difference with unit movement discount:
+`F_x = beta_x * (Phi_x(s_next) - Phi_x(s))`, where
+`beta_search = beta_vs = beta_com = beta_relay = 3.0` and `gamma = 1` in every
+task-potential-enabled formal method. An unchanged potential
 therefore contributes zero, approaching a task target contributes positively,
 and retreating contributes negatively. Terminal transitions retain the existing
 terminal-zero potential lifecycle. No absolute per-step proximity bonus and no
 delivery or connectivity potential is present; routing reward is governed by
-the separate GS-progress routing contract above.
+the separate GS-progress routing contract above. The `no_task_potential`
+ablation makes all four effective coefficients zero.
 
 Search remains exactly the global `mean(visited_bitmap)`. It does not use the
 Search target position, a frontier target, or any target-distance term, and the
 pre-commit coverage lifecycle is unchanged.
 
-The canonical camera in `visual_sensing.CAMERA` has focal length 0.035 m,
-image width 0.0156 m and image height 0.0235 m. `search_footprint` produces a
-44.57 by 67.14 m nadir rectangle at 100 m altitude. `vs_geometry` instead aims
-at the assigned ROI center and projects all four sensor rays onto its ground
-plane. Sensor width follows the tilt plane and sensor height is cross-track;
-the polygon rotates with bearing (nadir deterministically uses +x).
+The shared image plane is 0.0156 m wide by 0.0235 m long. Search and VS use
+explicit task-mode camera configurations. `SEARCH_CAMERA` has focal length
+0.0175 m and `search_footprint` produces an 89.142857 by 134.285714 m nadir
+rectangle at 100 m altitude. This doubles both dimensions and quadruples the
+area of the former 0.035 m Search footprint. Only non-gateway UAVs with a
+current Search task update `visited_bitmap` or discover an undiscovered ROI
+whose center lies inside or on the footprint boundary.
+
+`VS_CAMERA` retains focal length 0.035 m. `vs_geometry` aims at the assigned ROI
+center and projects all four sensor rays onto its ground plane. FOV and FOV+COM
+use VS mode; COM-only, Relay, Hovering and the permanent GS gateway perform no
+Search sensing. Camera mode is derived from the current task types and has no
+independent per-step state transition. Sensor width follows the tilt plane and
+sensor height is cross-track; the polygon rotates with bearing (nadir
+deterministically uses +x).
 Continuous analytical circle/polygon intersection gives partial coverage.
 ROI radius comes from the target object, defaulting to 80 m. Raw `I` is ROI
-area divided by this same polygon area and can exceed one.
+area divided by this same polygon area and can exceed one. Neither camera mode
+has a minimum-resolution feasibility threshold.
 
 VS potential and assignment share `0.8 * coverage * min(I,1) + 0.2 * G`.
 `G = min(1, b1*z_relative/(d_horizontal+epsilon))`, where `b1=2*f/width`.

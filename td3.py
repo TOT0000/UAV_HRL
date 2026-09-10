@@ -11,6 +11,12 @@ from centralized_movement import (
     project_joint_action,
     project_local_action,
 )
+from experiment_config import (
+    TASK_POTENTIAL_BETA_COM,
+    TASK_POTENTIAL_BETA_RELAY,
+    TASK_POTENTIAL_BETA_SEARCH,
+    TASK_POTENTIAL_BETA_VS,
+)
 from rng_contract import NamedRNGStreams, build_torch_module
 
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -286,10 +292,10 @@ class TD3():
         replay_memory,
         current_lambda,
         batch_size=64,
-        beta_search=1.0,
-        beta_vs=1.0,
-        beta_com=1.0,
-        beta_relay=1.0,
+        beta_search=TASK_POTENTIAL_BETA_SEARCH,
+        beta_vs=TASK_POTENTIAL_BETA_VS,
+        beta_com=TASK_POTENTIAL_BETA_COM,
+        beta_relay=TASK_POTENTIAL_BETA_RELAY,
         reward_mode="dinkelbach",
         task_potential_enabled=True,
     ):

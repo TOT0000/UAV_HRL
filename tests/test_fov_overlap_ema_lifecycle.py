@@ -30,6 +30,9 @@ class FovOverlapEmaLifecycleTest(unittest.TestCase):
     def _environment(self):
         env = Simulator(num_UAV=16)
         env.apply_scenario_entry(self.scenario)
+        # These lifecycle cases exercise UAV 0 as an ordinary Search UAV;
+        # gateway exclusion is covered by the visual-sensing contract tests.
+        env.permanent_gs_gateway_uav_id = 15
         env._search_phase_over = False
         env.multi_tasks = {uav_id: [] for uav_id in range(env.num_UAV)}
         env.multi_tasks[0] = [{"task_type": "Search"}]

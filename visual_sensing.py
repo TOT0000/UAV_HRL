@@ -15,12 +15,30 @@ class CameraConfiguration:
         return 2 * self.f_m / self.image_width_m
 
 
-CAMERA = CameraConfiguration()
+IMAGE_PLANE_WIDTH_M = 0.0156
+IMAGE_PLANE_LENGTH_M = 0.0235
+SEARCH_FOCAL_LENGTH_M = 0.0175
+VS_FOCAL_LENGTH_M = 0.035
+SEARCH_CAMERA = CameraConfiguration(
+    f_m=SEARCH_FOCAL_LENGTH_M,
+    image_width_m=IMAGE_PLANE_WIDTH_M,
+    image_length_m=IMAGE_PLANE_LENGTH_M,
+)
+VS_CAMERA = CameraConfiguration(
+    f_m=VS_FOCAL_LENGTH_M,
+    image_width_m=IMAGE_PLANE_WIDTH_M,
+    image_length_m=IMAGE_PLANE_LENGTH_M,
+)
+# Compatibility alias for callers that historically imported the VS camera.
+# Production Search geometry never reads this alias.
+CAMERA = VS_CAMERA
 DEFAULT_ROI_RADIUS_M = 80.0
 VS_PACKET_MAX_BITS = 31_600.0
 VS_QUALITY_WEIGHT = 0.8
 VS_PROXIMITY_WEIGHT = 0.2
-VISUAL_SENSING_CONTRACT_VERSION = "nadir-search-oblique-vs-valid-capture-v2"
+VISUAL_SENSING_CONTRACT_VERSION = (
+    "task-selected-search-17p5mm-vs-35mm-valid-capture-v3"
+)
 DISTANCE_EPSILON_M = 1e-9
 SINGULAR_RAY_EPSILON = 1e-8
 
@@ -28,10 +46,32 @@ SINGULAR_RAY_EPSILON = 1e-8
 def visual_sensing_metadata():
     return {
         "version": VISUAL_SENSING_CONTRACT_VERSION,
-        "camera": asdict(CAMERA),
+        "camera": asdict(VS_CAMERA),
+        "camera_compatibility_alias": "camera is the legacy VS-camera alias",
+        "shared_image_plane": {
+            "image_width_m": IMAGE_PLANE_WIDTH_M,
+            "image_length_m": IMAGE_PLANE_LENGTH_M,
+        },
+        "search_camera": asdict(SEARCH_CAMERA),
+        "vs_camera": asdict(VS_CAMERA),
         "default_roi_radius_m": DEFAULT_ROI_RADIUS_M,
         "roi_radius_source": "scenario target object",
-        "search_model": "one nadir rectangle; inclusive ROI center; Search contributors only",
+        "search_model": (
+            "nadir rectangle; undiscovered ROI-center-inclusive detection; "
+            "Search contributors excluding permanent GS gateway"
+        ),
+        "vs_model": "oblique camera aimed at assigned ROI",
+        "camera_mode_selection": (
+            "Search task -> Search camera; FOV or FOV+COM -> VS camera; "
+            "COM-only, Relay, Hovering and permanent GS gateway -> no sensing"
+        ),
+        "camera_mode_state": (
+            "derived from current task types; no independent per-step transition"
+        ),
+        "minimum_resolution_hard_constraint": {
+            "search": False,
+            "vs": False,
+        },
         "coverage_model": "analytic circle-convex-oblique-polygon intersection / ROI area",
         "image_quantity": "ROI area / same oblique footprint area; raw I may exceed 1",
         "packet_max_bits": VS_PACKET_MAX_BITS,
@@ -41,7 +81,7 @@ def visual_sensing_metadata():
         "pair_score": "0.8 * coverage * min(I,1) + 0.2 * G",
         "proximity": "min(1,b1*relative_altitude/(horizontal_distance+1e-12))",
         "geometry_validity": "d2D <= b1*relative_altitude; positive altitude; all corner rays downward",
-        "b1": CAMERA.b1,
+        "b1": VS_CAMERA.b1,
         "distance_epsilon_m": DISTANCE_EPSILON_M,
         "singular_ray_epsilon": SINGULAR_RAY_EPSILON,
         "assignment_eligibility": "independent of sensing_valid_now; existing target/role/energy constraints",
@@ -73,7 +113,7 @@ class SearchFootprint:
                     and self.ymin - DISTANCE_EPSILON_M <= y <= self.ymax + DISTANCE_EPSILON_M)
 
 
-def search_footprint(position, ground_z=0.0, camera=CAMERA):
+def search_footprint(position, ground_z=0.0, camera=SEARCH_CAMERA):
     """Fixed nadir footprint, independent of any candidate ROI or VS pose."""
     x, y, z = map(float, position)
     altitude = z - float(ground_z)
@@ -146,7 +186,12 @@ class VSGeometry:
         return VS_QUALITY_WEIGHT*self.quality + VS_PROXIMITY_WEIGHT*self.proximity
 
 
-def vs_geometry(uav_position, roi_position, radius=DEFAULT_ROI_RADIUS_M, camera=CAMERA):
+def vs_geometry(
+    uav_position,
+    roi_position,
+    radius=DEFAULT_ROI_RADIUS_M,
+    camera=VS_CAMERA,
+):
     """Aim at ROI and project four camera rays onto its ground plane.
 
     Sensor width is along the tilt plane, height cross-track. Nadir uses +x

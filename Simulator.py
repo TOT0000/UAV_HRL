@@ -457,9 +457,13 @@ class Simulator:
 
     # ===============判斷TG是否有被發現=====================
     def is_search_contributor(self, uav_id):
-        return not self._search_phase_over and any(
-            task.get("task_type") == "Search"
-            for task in self.multi_tasks.get(uav_id, ())
+        return (
+            not self._search_phase_over
+            and int(uav_id) != int(self.permanent_gs_gateway_uav_id)
+            and any(
+                task.get("task_type") == "Search"
+                for task in self.multi_tasks.get(uav_id, ())
+            )
         )
 
     def search_footprint(self, uav_id):

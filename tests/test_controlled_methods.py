@@ -255,7 +255,19 @@ class ControlledRewardTest(unittest.TestCase):
             self.potential_t1, False, self.config,
             reward_mode="dinkelbach", task_potential_enabled=False,
         )
-        expected_shaping = sum(b - a for a, b in zip(self.potential_t, self.potential_t1))
+        expected_shaping = sum(
+            beta * (b - a)
+            for beta, a, b in zip(
+                (
+                    self.config.beta_search,
+                    self.config.beta_vs,
+                    self.config.beta_com,
+                    self.config.beta_relay,
+                ),
+                self.potential_t,
+                self.potential_t1,
+            )
+        )
         self.assertAlmostEqual(shaped - unshaped, expected_shaping)
         self.assertAlmostEqual(unshaped, 3.5)
 
@@ -339,11 +351,15 @@ class ControlledRewardTest(unittest.TestCase):
             np.asarray([0, 1]), current_lambda=999.0, gamma=1.0,
             reward_mode="ratio", task_potential_enabled=True,
         ).ravel()
-        self.assertTrue(np.allclose(shaped, [-1.25, 2_500_000.75]))
+        expected_shaped = np.asarray([
+            -self.config.beta_search * 1.25,
+            2_500_000.0 + self.config.beta_search * 0.75,
+        ])
+        self.assertTrue(np.allclose(shaped, expected_shaped))
         self.assertTrue(np.allclose(online_rewards, shaped))
         self.assertAlmostEqual(
             sum(online_rewards),
-            objectives[-1] + (-1.25 + 0.75),
+            objectives[-1] + self.config.beta_search * (-1.25 + 0.75),
         )
         same_ratio = replay._reward_numpy(
             np.asarray([0, 1]), current_lambda=-123.0, gamma=1.0,

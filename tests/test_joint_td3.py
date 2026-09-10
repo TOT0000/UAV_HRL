@@ -150,8 +150,8 @@ class JointReplayAndLearnerTest(unittest.TestCase):
         reward_lambda_4 = replay._reward_numpy(
             np.array([0, 1]), current_lambda=4.0, gamma=0.9
         ).ravel()
-        self.assertAlmostEqual(reward_lambda_3[0], 1.4, places=5)
-        self.assertAlmostEqual(reward_lambda_3[1], -4.0, places=5)
+        self.assertAlmostEqual(reward_lambda_3[0], 6.2, places=5)
+        self.assertAlmostEqual(reward_lambda_3[1], -10.0, places=5)
         np.testing.assert_allclose(reward_lambda_4, reward_lambda_3 - 2.0)
         self.assertEqual(replay.size, size_before)
         np.testing.assert_array_equal(replay.not_done[:2, 0], [1.0, 0.0])

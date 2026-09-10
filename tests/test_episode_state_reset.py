@@ -18,30 +18,32 @@ class EpisodeScopedRoutingStateTest(unittest.TestCase):
         for _ in range(3):
             reused.get_state_ta(
                 env,
-                0,
+                15,
                 backlog_bits=reused.backlog_bits,
-                action_mask=env.get_routing_action_mask(0),
+                action_mask=env.get_routing_action_mask(15),
             )
         self.assertEqual(reused.fov_ema, {})
         reused.update_fov_ema(env, "scenario-a-map")
-        self.assertIn(0, reused.fov_ema)
-        self.assertTrue(any(value != 0.0 for value in reused.fov_ema[0].values()))
+        self.assertIn(15, reused.fov_ema)
+        self.assertTrue(
+            any(value != 0.0 for value in reused.fov_ema[15].values())
+        )
 
         env.apply_scenario_entry(scenario_b)
         reused.reset_packet_state()
         reset_state = reused.get_state_ta(
             env,
-            0,
+            15,
             backlog_bits=reused.backlog_bits,
-            action_mask=env.get_routing_action_mask(0),
+            action_mask=env.get_routing_action_mask(15),
         )
 
         fresh = PacketEngine(num_uav=16, step_time=0.25)
         fresh_state = fresh.get_state_ta(
             env,
-            0,
+            15,
             backlog_bits=fresh.backlog_bits,
-            action_mask=env.get_routing_action_mask(0),
+            action_mask=env.get_routing_action_mask(15),
         )
 
         self.assertEqual(reset_state.shape, (143,))
