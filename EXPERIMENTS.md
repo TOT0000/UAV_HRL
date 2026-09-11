@@ -13,7 +13,7 @@ process. The registry keys are `td3_dinkelbach`, `ddpg_dinkelbach`,
 energy/delivery accounting, evaluation, and logging.
 
 The added baselines are orthogonal configurations of that shared flow. The
-`wo_ta` method keeps the 595-D/143-D layouts but zeros named task-assignment
+`wo_ta` method keeps the 531-D/143-D layouts but zeros named task-assignment
 observation fields. The controlled DQN method replaces safe-DDQN with a masked
 standard DQN. The combined random baseline uses K-KM, the common projected
 continuous movement domain, and uniform random routing over each slot's current
@@ -25,7 +25,7 @@ All assignment solvers exclude Search and Hovering. Below 0.99 coverage UAVs
 and COM service tasks; unassigned UAVs fall back to Search. UAV 0 is permanently
 excluded from service assignment: it is Search plus GS gateway below the release
 threshold and Hovering plus GS gateway after release. UAV 15 keeps the ordinary
-reserved-Search lifecycle and may enter service/Relay matching at a subsequent new-RoI boundary after release. FOV raw utility
+reserved-Search lifecycle and may enter service matching at a subsequent new-RoI boundary after release. FOV raw utility
 uses global feasible-pair min/max normalization (equal values map to 0.5), while
 COM uses canonical S2U capacity at the candidate's actual 3-D geometry,
 computed with `10 MHz / 24` from the sampled one-second A2G LoS/NLoS state and
@@ -33,8 +33,10 @@ the corresponding deterministic Rician/Rayleigh expected capacity. It is
 divided by the fixed 50 m AGL LoS-Rician expected-capacity reference. This
 denominator is independent of candidates and traffic rate. A separate feasibility mask and
 explicit dummy choices keep rows unmatched when no service task is available;
-solver-only infinities never enter the domain utility matrix. K-KM uses at most
-two FOV/COM rounds, and FOV+COM is its only legal two-task combination;
+solver-only infinities never enter the domain utility matrix. K-KM runs one
+FOV-only round followed by one COM-only round over all eligible UAVs, so a UAV
+may hold at most one FOV plus one COM task. KM runs one combined FOV/COM round
+and assigns at most one service task per UAV;
 the former target-distance compatibility gate is disabled.
 
 FOV assignment uses `visual_sensing.vs_geometry` through
@@ -99,94 +101,26 @@ marks a non-formal evaluation and may be combined with
 `comparison_experiment.py` remains available for manifest-driven evaluation,
 design-dataset collection, aggregation, and exact-resume workflows.
 
-## Snapshot Relay planning (contract v5)
+## Service-only task assignment contract
 
-At a newly discovered RoI's next existing assignment boundary, first assign
-FOV/COM (K-KM: up to two KM rounds; KM: one; Random: two named-RNG rounds).
-Only unassigned, eligible, non-reserved UAVs may take the exclusive Relay role.
-There is no Relay utility matrix, normalization, or Hungarian stage.
+The environment creates only Search, FOV, COM and Hovering task roles. It does
+not reserve UAVs for connectivity, create virtual communication targets, or
+alter assignment to repair a predicted topology. Packet forwarding remains a
+generic multi-hop routing function available to every UAV under the unchanged
+safe-DDQN, standard-DQN and random-routing contracts.
 
-Planning sources are the union of current valid, unexpired in-air FOV/COM
-queue owners and newly assigned prospective service UAVs. Ground SR backlog
-is excluded; prospective sources with no current backlog have zero weight.
-All physical routing UAV nodes participate in the deterministic 3D 400 m graph.
-Physical and virtual GS edges reuse `Simulator.is_u2g_position_in_range`;
-capacity, fading, deadlines and roles never decide topology. Initial bridges
-use the closest pair of physical source/GS-component endpoints, sorted by
-(distance, source-side UAV ID, GS-side UAV ID), with `ceil(d/400)-1` evenly
-spaced candidates. A missing physical GS component is reported as unsupported.
+K-KM solves exactly two service stages at each existing new-RoI assignment
+boundary: one FOV matching followed by one COM matching. Both stages receive the
+same eligible UAV set; a UAV can therefore carry one FOV and one COM task, while
+each service target is assigned at most once. KM solves one combined FOV/COM
+matching and assigns at most one service task per UAV. Random assignment keeps
+its seeded feasible-pair behavior. Search-to-Hover release does not introduce a
+new service assignment boundary.
 
-Candidates from all sources share one augmented graph. Sorted candidate IDs
-are tested for zero-loss deletion using reverse BFS until a complete pass
-removes none. This is a deletion-minimal greedy heuristic, not a global minimum.
-Shortest witnesses use numeric physical node IDs before lexical virtual IDs.
-Witness-adjacent neighbor identities are fixed. A slot is shared only when its
-witnesses support at least two distinct source IDs; an ordinary single-source
-two-neighbor chain remains non-shared. Shared positions use bounded minimax,
-not a centroid. SLSQP uses a 1e-10 objective tolerance,
-200 iterations and a 1e-6 m feasibility tolerance; a deterministic support/box-face
-fallback consumes no RNG. Simultaneous virtual-neighbor updates start from
-bridge interpolation and use at most 100 Jacobi steps. Failed planning merge
-validation restores candidates in reverse deletion order and rebuilds witnesses.
-
-If demand exceeds free UAVs, recompute every remaining candidate's marginal
-backlog loss at each deletion. Break ties by fewer disconnected sources, then
-slot ID. `required_before_budget`, available, assigned and shortage are distinct.
-Retained slots record their before-budget neighbors, active and missing
-after-budget neighbors, and full/partial/infeasible source support. Partial slots
-remain assigned. Their link potential takes the minimum only over active
-neighbors; a slot with no active neighbor has zero link potential. Fully
-supported slots rebuild active neighbors from the deterministic final witnesses,
-while partial slots retain only still-existing direct planning neighbors. A
-bounded deterministic iteration keeps witness paths, virtual positions and this
-metadata synchronized without changing Relay slots or owners. All downstream
-target consumers share one resolver. Normally it refreshes positions from the
-fixed identities; after a detected cycle or iteration cap it keeps the saved
-validated pre-budget targets frozen until the next full new-RoI reassignment,
-while observational feasibility and potential continue to use current geometry.
-K-KM/KM then process slots by descending removal backlog loss and source count,
-and choose the nearest free UAV in raw 3D distance, breaking ties by UAV ID.
-Random pairs slots using the formal assignment RNG.
-
-Only a new RoI causes complete reassignment after initialization. Search release
-converts Search to Hover without reallocating service or Relay roles. Between
-RoI boundaries, slot count, IDs, owners, anchors and neighbors stay fixed;
-virtual coordinates follow those identities unless the final-witness fallback
-has frozen the validated targets. Assignment diagnostics also build a
-read-only predicted topology in which every assigned Relay UAV appears exactly
-once at its virtual target and every other UAV remains at its physical position.
-Reverse BFS classifies each planning source as fully supported, partially
-supported, or unsupported and reports self-neighbor and relocated-anchor
-identity conflicts. These diagnostics never repair or alter the plan.
-Reconfiguring a physical anchor is reported as a conflict only when its required
-predicted 3D edge is actually absent; a relocated anchor that remains within the
-inclusive 400 m edge is not a conflict.
-
-Movement observation is now 595-D (schema 6): each UAV has three normalized
-Relay target displacement fields, zero when unassigned or task-masked. Relay
-potential is `0.3*exp(-distance/400) + 0.7*min(clip(C_bar/C_ref,0,1))`, averaged
-per UAV/task. U2U uses deterministic Rician expected capacity; a GS neighbor
-uses deterministic expected-path-loss A2G capacity. The common reference is
-`reference_u2u_max_capacity_mbps(10 MHz)`. Neighbor virtual IDs resolve to their
-assigned physical UAV for the link term. Relay shares COM's outer task weight.
-Ordinary transitions use `gamma*Phi_next-Phi_current`, with terminal potential
-zero and `no_task_potential` disabling all terms.
-When a newly discovered RoI changes Relay assignment at the next boundary, that
-single transition stores raw Relay potentials but masks applied Relay shaping to
-exactly zero. Search/FOV(VS)/COM and objective terms remain active, and Relay
-shaping returns to enabled on the following movement interval.
-Routing actions, masks, observations (143-D), FDMA, FIFO, deadlines and rewards
-remain unchanged; any legal UAV may still forward packets.
-
-`relay_diagnostics.json` v5 includes full planning/deletion/pruning history,
-slot mapping and raw assignment distances, current targets/minimax status,
-post-budget and predicted source support, potential components, assignment
-identity conflicts, and per-transition raw/applied Relay shaping. Evaluation
-summaries separately aggregate required,
-available, assigned and shortage counts over episode-final plans, and count
-infeasible/disconnected movement-boundary observations. Zero-Relay runs use the
-same schema and output files. Diagnostics are read-only and consume no RNG.
-
+Assignment metadata records the service-only contract and role changes. It does
+not contain task-role connectivity plans or target histories. Evaluation keeps
+neutral routing and connectivity diagnostics and does not write a dedicated
+Relay diagnostics artifact.
 ## Formal protocol
 
 - 1,500 training episodes for the centrally configured seed `20260817`
@@ -277,14 +211,14 @@ same schema and output files. Diagnostics are read-only and consume no RNG.
 
 Movement shaping remains a potential difference with unit movement discount:
 `F_x = beta_x * (Phi_x(s_next) - Phi_x(s))`, where
-`beta_search = beta_vs = beta_com = beta_relay = 3.0` and `gamma = 1` in every
+`beta_search = beta_vs = beta_com = 3.0` and `gamma = 1` in every
 task-potential-enabled formal method. An unchanged potential
 therefore contributes zero, approaching a task target contributes positively,
 and retreating contributes negatively. Terminal transitions retain the existing
 terminal-zero potential lifecycle. No absolute per-step proximity bonus and no
 delivery or connectivity potential is present; routing reward is governed by
 the separate GS-progress routing contract above. The `no_task_potential`
-ablation makes all four effective coefficients zero.
+ablation makes all three effective coefficients zero.
 
 Search remains exactly the global `mean(visited_bitmap)`. It does not use the
 Search target position, a frontier target, or any target-distance term, and the
@@ -300,7 +234,7 @@ whose center lies inside or on the footprint boundary.
 
 `VS_CAMERA` retains focal length 0.035 m. `vs_geometry` aims at the assigned ROI
 center and projects all four sensor rays onto its ground plane. FOV and FOV+COM
-use VS mode; COM-only, Relay, Hovering and the permanent GS gateway perform no
+use VS mode; COM-only, Hovering and the permanent GS gateway perform no
 Search sensing. Camera mode is derived from the current task types and has no
 independent per-step state transition. Sensor width follows the tilt plane and
 sensor height is cross-track; the polygon rotates with bearing (nadir
@@ -342,12 +276,12 @@ and horizontal target geometry and is independent of the communication range.
 Both blends use weights `0.5/0.5` and are finite in `[0,1]`.
 
 The task-potential contract is
-`oblique-vs-com-final-witness-relay-potential-v11`. TD3 and DDPG
+`search-vs-com-uniform-beta3-potential-v13`. TD3 and DDPG
 consume the same potential definitions, random-movement methods publish the
 same environment/reward contract, and `*_no_task_potential` methods disable all
-Search/VS/COM/Relay shaping. Existing observations already contain UAV and task
+Search/VS/COM shaping. Existing observations already contain UAV and task
 positions plus COM capacity. Movement state and joint action dimensions remain
-595 and 48; routing state is 143-D after adding the 17 action-wise GS-progress
+531 and 48; routing state is 143-D after adding the 17 action-wise GS-progress
 features in UAV-0-through-UAV-15-then-GS order.
 
 ## Stochastic channel contract
@@ -544,7 +478,7 @@ uses the ordinary deterministic evaluation dataflow with no exploration or
 action perturbation and never updates learning or Dinkelbach state. Its atomic
 artifacts are `design_transitions.npz`, `design_dataset_metadata.json`, and a
 design-local `per_episode.csv`/`per_episode.jsonl`. The NPZ stores each complete
-595-D state, projected 48-D raw actor action, 595-D next state, terminal flags,
+531-D state, projected 48-D raw actor action, 531-D next state, terminal flags,
 delivery/energy and potential reward components, checkpoint lambda, and
 episode/step/scenario identity. Metadata records the authoritative state/action
 schema from `centralized_movement.py`; it deliberately does not select
@@ -612,20 +546,21 @@ python -X utf8 comparison_experiment.py aggregate --input-dir runs/comparison/ev
 
 Exact-resume checkpoints validate the method fingerprint, training-manifest
 relationship, training seed, the complete Dinkelbach block state, and its configuration.
-Checkpoint schema v29 requires the task-reset Relay shaping replay mask,
-predicted Relay diagnostics, the virtual Relay observation/planning contract,
+Checkpoint schema v30 removes the explicit Relay task, its movement observation
+fields, potential, replay fields, checkpoint metadata and diagnostics. It requires
 valid-sensing VS generation and assignment-local
 rate credit in the canonical visual-sensing contract, alongside the 16-UAV action-wise-GS-progress,
 continuous-hard-only-gateway,
 unified-400-m communication, permanent-gateway, coverage-weighted useful
 goodput, boundary-aligned stochastic-channel,
 movement/routing replay, utility/QoS, routing-ID causality/credit,
-boundary-aligned current/next decision-state virtual Relay target/link potential plus soft-GS-progress
+boundary-aligned current/next decision-state Search/VS/COM potentials plus soft-GS-progress
 reward, GS-reachable initial topology, distance-aware VS/COM task potentials,
 hard-range/COM-session, atomic-FOV, seed-ratio
 aggregation, propulsion, and four-slot/fifty-block movement-channel contract.
-Schema v28 and every older schema is rejected before weights or replay state are
-restored and must be retrained; no legacy checkpoint migration is attempted.
+Schema v29 and every older schema is rejected before weights or replay state are
+restored and must be retrained; v29 receives an explicit retired-Relay-schema
+error and no legacy checkpoint migration is attempted.
 Model-only evaluation checkpoints also validate the visual version and complete
 camera/coverage/packet/weight/validity configuration. Training and evaluation
 metadata record the same configuration. Scenario manifests, seeds, CRN and
@@ -634,7 +569,7 @@ aliases of `Simulator`; all 16 registered methods share the same sensing APIs.
 `Fov_model_phase.FovModel` remains a delegating compatibility facade used for
 movement footprint dimensions, with no independent camera or VS formula.
 The current schema
-stores the 595/48/143 dimensions, Relay-aware movement feature schema,
+stores the 531/48/143 dimensions and service-only movement feature schema,
 direct-ratio bit/J
 objective, shared gateway/channel/packet contracts, active FOV capture-coverage
 snapshots, raw/useful counters, inject buffers, adaptive routing lifecycle, and
@@ -657,7 +592,7 @@ block never triggers a forced update. Full-resume logging schema v2 separately
 persists `lambda_used_log` and `lambda_after_episode_log`; a legacy ambiguous
 single-lambda log is rejected for exact resume without changing model-only
 checkpoint compatibility. Formal evaluation validates model-only type, schema,
-595/48/143 dimensions, movement-agent/DDQN gamma, COM normalization, method/seed,
+531/48/143 dimensions, movement-agent/DDQN gamma, COM normalization, method/seed,
 the formal core configuration before loading weights. The checkpoint's own
 planned horizon may be smaller than the current run horizon only when
 `total_episodes` is the sole formal-config difference, the checkpoint episode is
@@ -697,9 +632,8 @@ Zero or invalid per-episode energy produces an episode diagnostic EE value of
 denominator as missing.
 Each evaluation directory contains `per_episode.csv`, `per_episode.jsonl`,
 `per_training_seed_summary.csv`, `per_training_seed_summary.json`,
-`relay_diagnostics.json`, and `run_metadata.json`. Training and exact-resume run
-directories also write the same Relay diagnostics artifact; resume atomically
-replaces it with the checkpoint history followed once by newly executed episodes.
+and `run_metadata.json`. No explicit task-role diagnostics artifact is emitted;
+neutral routing and connectivity diagnostics remain in their existing outputs.
 Formal aggregation defaults to exactly five seeds and 100
 rows per seed, requires identical scenario sets and compatible identities, and
 rejects duplicate reruns or non-finite values. For smaller deterministic tests,

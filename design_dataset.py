@@ -30,7 +30,6 @@ from evaluation_metrics import (
 from experiment_config import (
     MOVEMENT_REPLAY_CONTRACT_VERSION,
     NUM_UAV,
-    RELAY_TASK_CONTRACT_VERSION,
     TASK_POTENTIAL_CONTRACT_VERSION,
     FORMAL_EXPERIMENT_DEFAULTS,
     MethodSpec,
@@ -54,7 +53,7 @@ from training_checkpoint import (
 )
 
 
-DESIGN_DATASET_SCHEMA_VERSION = 6
+DESIGN_DATASET_SCHEMA_VERSION = 7
 DESIGN_TRANSITIONS_FILENAME = "design_transitions.npz"
 DESIGN_METADATA_FILENAME = "design_dataset_metadata.json"
 DESIGN_EPISODES_CSV = "per_episode.csv"
@@ -74,12 +73,6 @@ ARRAY_NAMES = (
     "phi_vs_t1",
     "phi_com_t",
     "phi_com_t1",
-    "phi_relay_t",
-    "phi_relay_t1",
-    "relay_assignment_changed_at_boundary",
-    "relay_shaping_enabled",
-    "raw_relay_potential_difference",
-    "applied_relay_shaping",
     "movement_gamma",
     "reward_at_checkpoint_lambda",
     "checkpoint_lambda",
@@ -99,10 +92,6 @@ FLOAT_COMPONENTS = (
     "phi_vs_t1",
     "phi_com_t",
     "phi_com_t1",
-    "phi_relay_t",
-    "phi_relay_t1",
-    "raw_relay_potential_difference",
-    "applied_relay_shaping",
     "movement_gamma",
     "reward_at_checkpoint_lambda",
     "checkpoint_lambda",
@@ -178,17 +167,10 @@ class DesignTransitionCollector:
         arrays["scenario_id"] = np.asarray(
             [str(row["scenario_id"]) for row in self._records], dtype=np.str_
         )
-        for field in (
-            "relay_assignment_changed_at_boundary",
-            "relay_shaping_enabled",
-        ):
-            arrays[field] = np.asarray(
-                [row[field] for row in self._records], dtype=np.bool_
-            )
         return arrays
 
 
-def reconstruct_reward(arrays, *, beta_search, beta_vs, beta_com, beta_relay):
+def reconstruct_reward(arrays, *, beta_search, beta_vs, beta_com):
     gamma = arrays["movement_gamma"]
     return (
         arrays["delivered_mbits"]
@@ -200,7 +182,6 @@ def reconstruct_reward(arrays, *, beta_search, beta_vs, beta_com, beta_relay):
         * (gamma * arrays["phi_vs_t1"] - arrays["phi_vs_t"])
         + float(beta_com)
         * (gamma * arrays["phi_com_t1"] - arrays["phi_com_t"])
-        + arrays["applied_relay_shaping"]
     )
 
 
@@ -212,7 +193,6 @@ def validate_design_arrays(
     beta_search,
     beta_vs,
     beta_com,
-    beta_relay,
 ):
     missing = set(ARRAY_NAMES).difference(arrays)
     extra = set(arrays).difference(ARRAY_NAMES)
@@ -289,34 +269,6 @@ def validate_design_arrays(
     failed = [name for name, passed in checks.items() if not passed]
     if failed:
         raise RuntimeError(f"design transition ordering is invalid: {failed}")
-    if not np.array_equal(
-        arrays["relay_shaping_enabled"],
-        ~arrays["relay_assignment_changed_at_boundary"],
-    ):
-        raise RuntimeError("Relay shaping mask disagrees with assignment boundary")
-    expected_raw_relay = (
-        arrays["movement_gamma"] * arrays["phi_relay_t1"]
-        - arrays["phi_relay_t"]
-    )
-    if not np.allclose(
-        arrays["raw_relay_potential_difference"],
-        expected_raw_relay,
-        rtol=0.0,
-        atol=1e-12,
-    ):
-        raise RuntimeError("raw Relay potential difference is inconsistent")
-    expected_applied_relay = (
-        arrays["relay_shaping_enabled"].astype(np.float64)
-        * float(beta_relay)
-        * expected_raw_relay
-    )
-    if not np.allclose(
-        arrays["applied_relay_shaping"],
-        expected_applied_relay,
-        rtol=0.0,
-        atol=1e-12,
-    ):
-        raise RuntimeError("applied Relay shaping disagrees with its mask")
     scenario_ids = arrays["scenario_id"].reshape(episode_count, episode_seconds)
     if any(len(set(row.tolist())) != 1 for row in scenario_ids):
         raise RuntimeError("scenario_id changes within an episode")
@@ -325,7 +277,6 @@ def validate_design_arrays(
         beta_search=beta_search,
         beta_vs=beta_vs,
         beta_com=beta_com,
-        beta_relay=beta_relay,
     )
     if not np.allclose(
         reconstructed,
@@ -544,10 +495,8 @@ def _build_metadata(preflight, arrays, result, run_dir, reference_rows):
             "beta_search": float(formal_config["beta_search"]),
             "beta_vs": float(formal_config["beta_vs"]),
             "beta_com": float(formal_config["beta_com"]),
-            "beta_relay": float(formal_config["beta_relay"]),
         },
         "task_potential_contract_version": TASK_POTENTIAL_CONTRACT_VERSION,
-        "relay_task_contract_version": RELAY_TASK_CONTRACT_VERSION,
         "movement_replay_contract_version": MOVEMENT_REPLAY_CONTRACT_VERSION,
         "potential_boundary_semantics": (
             "phi_current uses current decision-state backlog; phi_next uses next "
@@ -817,7 +766,6 @@ def run_design_dataset_command(args):
             beta_search=formal_config["beta_search"],
             beta_vs=formal_config["beta_vs"],
             beta_com=formal_config["beta_com"],
-            beta_relay=formal_config["beta_relay"],
         )
         if preflight["reference_rows"] is not None:
             validate_reference_metrics(

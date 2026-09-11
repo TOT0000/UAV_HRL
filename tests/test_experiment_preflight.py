@@ -24,8 +24,6 @@ from experiment_paths import (
     write_run_status,
 )
 from scenario_manifest import generate_manifest
-from relay_diagnostics import RELAY_DIAGNOSTICS_FILENAME, aggregate_relay_episode_diagnostics
-from relay_contract import empty_plan
 from training_checkpoint import (
     CHECKPOINT_SCHEMA_VERSION,
     FULL_CHECKPOINT_TYPE,
@@ -33,28 +31,6 @@ from training_checkpoint import (
     MODEL_CHECKPOINT_TYPE,
     calibration_fingerprint,
 )
-
-
-def relay_diagnostics_fixture():
-    forwarding = {
-        group: {"bits": 0.0, "packets": 0, "completed_packet_hops": 0}
-        for group in (
-            "assigned_relay_forwarding",
-            "nonassigned_uav_forwarding",
-            "traversed_assigned_relay",
-        )
-    }
-    return aggregate_relay_episode_diagnostics([{
-        "episode_index": 0,
-        "scenario_id": "fixture-scenario",
-        "assignment": {
-            "relay_assignment_history": [], "relay_planning": empty_plan(),
-            "relay_position_history": [], "relay_shaping_history": [],
-            "selected_relay_uav_ids": [],
-            "relay_role_change_count": 0,
-        },
-        "forwarding": forwarding,
-    }])
 
 
 class ExperimentPreflightTest(unittest.TestCase):
@@ -92,7 +68,7 @@ class ExperimentPreflightTest(unittest.TestCase):
             "visual_sensing_configuration": visual_sensing_metadata(),
             "checkpoint_type": MODEL_CHECKPOINT_TYPE,
             "episode": 1499,
-            "movement_state_dim": 595,
+            "movement_state_dim": 531,
             "joint_action_dim": 48,
             "routing_state_dim": 143,
             "movement_agent_kind": "td3",
@@ -239,24 +215,18 @@ class ExperimentPreflightTest(unittest.TestCase):
 
             with mock.patch(
                 "comparison_experiment.train",
-                return_value={
-                    "run_metadata": {},
-                    "relay_diagnostics": relay_diagnostics_fixture(),
-                },
+                return_value={"run_metadata": {}},
             ):
                 comparison_main(self._train_args(manifest_path, output))
 
             identity = json.loads(
                 (run_dir / "run_identity.json").read_text(encoding="utf-8")
             )
-            self.assertTrue((run_dir / RELAY_DIAGNOSTICS_FILENAME).is_file())
             run_metadata = json.loads(
                 (run_dir / "run_metadata.json").read_text(encoding="utf-8")
             )
-            self.assertEqual(
-                run_metadata["relay_diagnostics_filename"],
-                RELAY_DIAGNOSTICS_FILENAME,
-            )
+            self.assertFalse((run_dir / "relay_diagnostics.json").exists())
+            self.assertNotIn("relay_diagnostics_filename", run_metadata)
             status = read_run_status(run_dir)
             self.assertEqual(identity["method_id"], self.method.method_id)
             self.assertEqual(identity["training_manifest_hash"], manifest.content_hash)
@@ -283,10 +253,7 @@ class ExperimentPreflightTest(unittest.TestCase):
 
             resume = run_dir / "checkpoints" / "full" / "ep_0001"
             resume.mkdir(parents=True)
-            resumed_result = {
-                "run_metadata": {},
-                "relay_diagnostics": relay_diagnostics_fixture(),
-            }
+            resumed_result = {"run_metadata": {}}
             training_state = {
                 key: [0.0]
                 for key in (
@@ -391,7 +358,7 @@ class ExperimentPreflightTest(unittest.TestCase):
                 "visual_sensing_configuration": visual_sensing_metadata(),
                 "checkpoint_type": FULL_CHECKPOINT_TYPE,
                 "episode": 0,
-                "movement_state_dim": 595,
+                "movement_state_dim": 531,
                 "joint_action_dim": 48,
                 "routing_state_dim": 143,
                 "centralized_td3_gamma": 1.0,
@@ -468,7 +435,7 @@ class ExperimentPreflightTest(unittest.TestCase):
             checkpoint = self._model_checkpoint(
                 root,
                 mutate=lambda metadata: metadata.update(
-                    {"movement_state_dim": 531}
+                    {"movement_state_dim": 530}
                 ),
             )
 
@@ -579,7 +546,6 @@ class ExperimentPreflightTest(unittest.TestCase):
                 "run_metadata": {},
                 "evaluation_invariants": {"weights_unchanged": True},
                 "episode_metrics": [],
-                "relay_diagnostics": relay_diagnostics_fixture(),
             }
 
             with mock.patch("HRL_task_aware.train", return_value=result):

@@ -81,7 +81,7 @@ class VisualSensingPacketGenerationTest(unittest.TestCase):
         self.assertEqual(old_packet["current"], self.env.GS_ID)
 
     def test_vs_potential_is_continuous_and_positive_for_full_coverage(self):
-        _, phi_vs, _, _ = calculate_movement_potentials(self.env, c_ref_com=1.0)
+        _, phi_vs, _ = calculate_movement_potentials(self.env, c_ref_com=1.0)
         self.assertGreater(phi_vs, 0.0)
         self.assertLessEqual(phi_vs, 1.0)
 
@@ -215,7 +215,7 @@ class ComStateCalibrationAndDeliveryTest(unittest.TestCase):
                 c_ref_com=24.0,
                 remaining_time=1.0,
             )
-            _, _, phi_com, _ = calculate_movement_potentials(
+            _, _, phi_com = calculate_movement_potentials(
                 self.env, c_ref_com=24.0
             )
             assigner = UAVAssigner(self.env)

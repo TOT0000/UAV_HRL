@@ -45,7 +45,7 @@ from experiment_config import (
     NUM_UAV,
     PACKET_QOS_CONTRACT_VERSION,
     PERMANENT_GS_GATEWAY_UAV_ID,
-    RELAY_TASK_CONTRACT_VERSION,
+    ASSIGNMENT_CONTRACT_VERSION,
     PRODUCTION_EPISODE_HORIZON_SECONDS,
     PRODUCTION_PACKET_INJECTION_CUTOFF_SECONDS,
     PRODUCTION_TASK_DEADLINE_SECONDS,
@@ -94,10 +94,8 @@ from dinkelbach_blocks import (
     dinkelbach_config_metadata,
 )
 
-CHECKPOINT_SCHEMA_VERSION = 29
-PRE_16_UAV_RELAY_RANGE_PROGRESS_CHECKPOINT_SCHEMA_VERSION = 24
-PRE_BOUNDARY_ALIGNED_RELAY_POTENTIAL_CHECKPOINT_SCHEMA_VERSION = 23
-PRE_RELAY_TASK_CHECKPOINT_SCHEMA_VERSION = 22
+CHECKPOINT_SCHEMA_VERSION = 30
+PRE_SERVICE_ONLY_CHECKPOINT_SCHEMA_VERSION = 29
 PRE_GS_PROGRESS_CHECKPOINT_SCHEMA_VERSION = 21
 PRE_ROUTING_IMMEDIATE_COST_CHECKPOINT_SCHEMA_VERSION = 20
 PRE_CONTINUOUS_GATEWAY_PROJECTION_CHECKPOINT_SCHEMA_VERSION = 19
@@ -123,7 +121,7 @@ FULL_RESUME_LOGGING_STATE_FIELDS = (
     "lambda_after_episode_log",
 )
 
-LEGACY_JOINT_REPLAY_FIELDS = (
+JOINT_REPLAY_FIELDS = (
     "state",
     "action",
     "next_state",
@@ -136,19 +134,10 @@ LEGACY_JOINT_REPLAY_FIELDS = (
     "phi_vs_t1",
     "phi_com_t",
     "phi_com_t1",
-    "phi_relay_t",
-    "phi_relay_t1",
-)
-PRE_MOVEMENT_MASK_JOINT_REPLAY_FIELDS = (
-    *LEGACY_JOINT_REPLAY_FIELDS,
     "ratio_objective_reward",
-)
-JOINT_REPLAY_FIELDS = (
-    *PRE_MOVEMENT_MASK_JOINT_REPLAY_FIELDS,
     "current_movement_mask",
     "next_movement_mask",
     "movement_mask_valid",
-    "relay_shaping_enabled",
 )
 ROUTING_REPLAY_FIELDS = (
     "state",
@@ -172,7 +161,6 @@ FORMAL_CORE_CONFIG_FIELDS = (
     "beta_search",
     "beta_vs",
     "beta_com",
-    "beta_relay",
     "search_coverage_threshold",
     "replay_max_size",
     "routing_warmup_transitions",
@@ -197,10 +185,8 @@ FORMAL_CORE_CONFIG_FIELDS = (
     "task_potential_shaping_coefficients",
     "effective_task_potential_shaping_coefficients",
     "movement_replay_contract_version",
-    "relay_task_contract_version",
-    "relay_count_rule",
-    "relay_potential_weight",
-    "relay_assignment_mode",
+    "assignment_contract_version",
+    "assignment_flow",
     "ground_station_position_m",
     "permanent_gs_gateway_uav_id",
     "gs_gateway_soft_radius_m",
@@ -1080,7 +1066,7 @@ def _base_metadata(
         "num_uav": NUM_UAV,
         "movement_feature_schema_version": MOVEMENT_FEATURE_SCHEMA_VERSION,
         "movement_state_feature_schema": movement_state_feature_schema(),
-        "state_contract": "16-uav-virtual-relay-task-aware-v4",
+        "state_contract": "16-uav-search-fov-com-task-aware-v5",
         "packet_lifecycle_contract": "sr-fifo-s2u-next-slot-routing-v1",
         "channel_contract": CHANNEL_ENVIRONMENT_CONTRACT_VERSION,
         "channel_model_version": CHANNEL_MODEL_VERSION,
@@ -1132,7 +1118,7 @@ def _base_metadata(
         ),
         "task_potential_contract_version": TASK_POTENTIAL_CONTRACT_VERSION,
         "task_potential_configuration": task_potential_contract_metadata(),
-        "relay_task_contract_version": RELAY_TASK_CONTRACT_VERSION,
+        "assignment_contract_version": ASSIGNMENT_CONTRACT_VERSION,
         "routing_cost_attribution_contract_version": (
             ROUTING_COST_ATTRIBUTION_CONTRACT_VERSION
         ),
@@ -1451,6 +1437,14 @@ def _checkpoint_uses_dinkelbach(metadata):
 def _validate_checkpoint_schema(metadata):
     schema = metadata.get("checkpoint_schema_version")
     if schema != CHECKPOINT_SCHEMA_VERSION:
+        if schema == PRE_SERVICE_ONLY_CHECKPOINT_SCHEMA_VERSION:
+            raise RuntimeError(
+                "checkpoint schema v29 contains the retired explicit Relay task, "
+                "595-D Relay movement observation, and Relay shaping replay fields; "
+                "the current service-only schema uses a 531-D Search/FOV/COM "
+                "movement state and must be retrained: "
+                f"checkpoint={schema}, expected={CHECKPOINT_SCHEMA_VERSION}"
+            )
         raise RuntimeError(
             "checkpoint_schema_version is incompatible with the canonical 16-UAV "
             "boundary-aligned "
@@ -1463,10 +1457,8 @@ def _validate_checkpoint_schema(metadata):
             "unified inclusive 400 m S2U/U2G/U2U communication range, "
             "143-D action-wise GS-progress routing state and v7 routing reward, "
             "2.5 s FOV / 2.0 s COM QoS deadlines, "
-            "Relay assignment, 595-D virtual Relay movement state, target/link "
-            "movement potential and boundary-aligned current/next decision state, "
-            "named-RNG, projected-action and replay "
-            "contract, including task-reset Relay shaping masks, and must be retrained: "
+            "531-D Search/FOV/COM movement state, named-RNG, projected-action "
+            "and service-only replay contract, and must be retrained: "
             f"checkpoint={schema}, expected={CHECKPOINT_SCHEMA_VERSION}"
         )
     routing_state_dim = metadata.get("routing_state_dim")
@@ -1509,7 +1501,7 @@ def _validate_checkpoint_schema(metadata):
                 COMMUNICATION_RANGE_CONTRACT_VERSION
             ),
             "task_potential_contract_version": TASK_POTENTIAL_CONTRACT_VERSION,
-            "relay_task_contract_version": RELAY_TASK_CONTRACT_VERSION,
+            "assignment_contract_version": ASSIGNMENT_CONTRACT_VERSION,
             "com_session_lifecycle_version": COM_SESSION_LIFECYCLE_VERSION,
             "fov_packet_generation_contract_version": (
                 FOV_PACKET_GENERATION_CONTRACT_VERSION
@@ -1985,7 +1977,6 @@ def _validate_joint_replay_projection_masks(checkpoint_dir, metadata):
         "current_movement_mask",
         "next_movement_mask",
         "movement_mask_valid",
-        "relay_shaping_enabled",
     }
     with np.load(replay_path, allow_pickle=False) as arrays:
         missing = sorted(required.difference(arrays.files))
@@ -3317,17 +3308,7 @@ def load_full_resume_checkpoint(
     if not isinstance(payload.get("networks"), dict):
         raise RuntimeError("checkpoint network payload is invalid")
     _validate_rng_state_payload(payload.get("rng_state"))
-    joint_fields = (
-        JOINT_REPLAY_FIELDS
-        if metadata["checkpoint_schema_version"]
-        >= ROUTING_LIFECYCLE_CHECKPOINT_SCHEMA_VERSION
-        else (
-            PRE_MOVEMENT_MASK_JOINT_REPLAY_FIELDS
-            if metadata["checkpoint_schema_version"]
-            >= PRE_MOVEMENT_MASK_CHECKPOINT_SCHEMA_VERSION
-            else LEGACY_JOINT_REPLAY_FIELDS
-        )
-    )
+    joint_fields = JOINT_REPLAY_FIELDS
     if movement_replay_enabled:
         if joint_replay is None:
             raise RuntimeError("learned movement requires a joint replay")

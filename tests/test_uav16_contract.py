@@ -54,7 +54,7 @@ from training_checkpoint import (
 class Uav16ConfigurationContractTest(unittest.TestCase):
     def test_dimensions_and_manifest_layout_are_authoritative(self):
         self.assertEqual(NUM_UAV, 16)
-        self.assertEqual(MOVEMENT_STATE_DIM, 595)
+        self.assertEqual(MOVEMENT_STATE_DIM, 531)
         self.assertEqual(JOINT_ACTION_DIM, 48)
         self.assertEqual(ROUTING_STATE_DIM, 143)
         self.assertEqual(ROUTING_ACTION_DIM, 17)
@@ -105,7 +105,7 @@ class Uav16ConfigurationContractTest(unittest.TestCase):
         data["schema_version"] = "uav-hrl-scenario-v2"
         with self.assertRaisesRegex(ValueError, "16-UAV.*incompatible"):
             ScenarioManifest.from_dict(data)
-        self.assertEqual(CHECKPOINT_SCHEMA_VERSION, 29)
+        self.assertEqual(CHECKPOINT_SCHEMA_VERSION, 30)
         with self.assertRaisesRegex(RuntimeError, "must be retrained"):
             _validate_checkpoint_schema({"checkpoint_schema_version": 24})
 
@@ -124,7 +124,7 @@ class Uav16ConfigurationContractTest(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "16-UAV.*retrained"):
                     preflight_full_resume_checkpoint_metadata(
                         checkpoint,
-                        movement_state_dim=595,
+                        movement_state_dim=531,
                         joint_action_dim=48,
                         routing_state_dim=143,
                         td3_gamma=1.0,
@@ -155,9 +155,9 @@ class StateAndAssignmentContractTest(unittest.TestCase):
 
         self.env.gts[0].is_found = True
         discovered = self.movement_state()
-        global_base = NUM_UAV * 21 + 16 * 16
+        global_base = NUM_UAV * 17 + 16 * 16
         self.assertAlmostEqual(discovered[global_base + 1], 1.0 / 8.0)
-        self.assertEqual(discovered.shape, (595,))
+        self.assertEqual(discovered.shape, (531,))
 
     def test_reserved_search_is_outside_solver_and_release_preserves_service(self):
         gt = self.env.gts[0]
@@ -254,12 +254,7 @@ class StateAndAssignmentContractTest(unittest.TestCase):
                 evaluation=True,
             )
 
-        assignment = result["relay_diagnostics"]["episodes"][0]["assignment"]
-        self.assertTrue(assignment["search_phase_over"])
-        self.assertTrue(assignment["search_completed"])
-        self.assertFalse(assignment["search_release_reassignment_pending"])
-        self.assertTrue(assignment["search_release_assignment_applied"])
-        self.assertEqual(assignment["invocation"], 1)
+        self.assertNotIn("relay_diagnostics", result)
         self.assertEqual(result["assignment_invocations"], 1)
         self.assertTrue(math.isfinite(result["search_release_time_seconds"]))
         self.assertEqual(result["search_release_coverage"], 1.0)

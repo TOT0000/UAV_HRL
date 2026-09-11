@@ -117,7 +117,7 @@ def test_search_boundary_outside_and_one_frozen_footprint():
 
 
 @pytest.mark.parametrize('roles', [
-    ['FOV'], ['FOV', 'COM'], ['COM'], ['Relay'], ['Hovering'],
+    ['FOV'], ['FOV', 'COM'], ['COM'], ['Hovering'],
 ])
 def test_nonsearch_cannot_discover_or_contribute(roles):
     env, target, _, descriptor = environment()
@@ -181,8 +181,6 @@ def test_evaluation_exports_active_camera_pose_and_actual_roi_radius():
         == visual_sensing_metadata()['vs_camera']
     )
     env.multi_tasks[1] = [{'task_type':'COM'}]
-    assert _sensing_coverage(env,1) == []
-    env.multi_tasks[1] = [{'task_type':'Relay'}]
     assert _sensing_coverage(env,1) == []
 
 

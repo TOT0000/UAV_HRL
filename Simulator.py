@@ -34,6 +34,8 @@ from Energy_model import EnergyConsumptionModel
 from Task_assignment import UAVAssigner, Task
 from object import UAV, SRTeam, GroundTarget
 from experiment_config import (
+    ASSIGNMENT_CONTRACT_VERSION,
+    ASSIGNMENT_FLOW_BY_STRATEGY,
     CANONICAL_UAV_INITIAL_XY_M,
     COMMUNICATION_RANGE_M,
     FOV_COM_PAIR_MAX_DISTANCE_M,
@@ -52,14 +54,11 @@ from experiment_config import (
     RESERVED_SEARCH_UAV_IDS,
     ROI_COUNT_MAX,
     ROI_COUNT_MIN,
-    RELAY_POTENTIAL_WEIGHT,
-    RELAY_TASK_CONTRACT_VERSION,
     SR_ROUTE_LIFECYCLE_VERSION,
     SEARCH_COVERAGE_THRESHOLD,
     TOTAL_COMMUNICATION_BANDWIDTH_HZ,
     TASK_COMPATIBILITY_POLICY,
 )
-from relay_contract import empty_plan, relay_snapshot, refresh_relay_targets, COUNT_RULE
 
 
 @dataclass(frozen=True)
@@ -212,15 +211,7 @@ class Simulator:
         self.search_release_reassignment_pending = False
         self.assignment_invocations = 0
         self.search_to_hover_conversions = 0
-        self.assignment_backlog_snapshot = {
-            uav_id: 0.0 for uav_id in range(self.num_UAV)
-        }
-        self.relay_position_history = []
-        self.relay_shaping_history = []
-        self.relay_plan = empty_plan()
         self.assignment_history = []
-        self.relay_role_change_count = 0
-        self._previous_relay_uav_ids = set()
 
     def configure_method(self, method_spec):
         """Install comparison strategies before any episode reset."""
@@ -244,15 +235,6 @@ class Simulator:
         return uav_ids
 
     # ==================任務分配===========================
-    def set_assignment_backlog_snapshot(self, backlog_bits):
-        snapshot = {}
-        for uav_id in range(self.num_UAV):
-            value = float(
-                backlog_bits.get(uav_id, backlog_bits.get(str(uav_id), 0.0))
-            )
-            snapshot[uav_id] = value if np.isfinite(value) and value > 0.0 else 0.0
-        self.assignment_backlog_snapshot = snapshot
-
     def assign_tasks(self):
         if self.channel.movement_interval_index is None:
             raise RuntimeError(
@@ -262,7 +244,9 @@ class Simulator:
             uid: sorted(task["task_type"] for task in self.multi_tasks.get(uid, []))
             for uid in range(self.num_UAV)
         }
-        service_tasks = [task for task in self.task_list if task.task_type != "Relay"]
+        service_tasks = [
+            task for task in self.task_list if task.task_type in {"FOV", "COM"}
+        ]
         coverage = float(np.asarray(self.visited_bitmap, dtype=bool).mean())
         search_active = not self._search_phase_over and coverage < self.search_coverage_threshold
         reserved = (
@@ -281,37 +265,21 @@ class Simulator:
             max_distance_m=self.fov_com_pair_max_distance_m,
             coverage_threshold=self.search_coverage_threshold,
         )
-        self.relay_plan = assigner.relay_plan
         self.task_list = list(assigner._snapshot_tasks)
         assigner.build_uav_tasks_from_assignment()
     # ====================更新探索區域=====================
         self.assignment_invocations += 1
         self.last_assignment = assigner
-        selected_relays = set(assigner.selected_relay_uav_ids)
-        role_changes = len(
-            self._previous_relay_uav_ids.symmetric_difference(selected_relays)
-        )
-        self.relay_role_change_count += role_changes
-        self._previous_relay_uav_ids = selected_relays
         self.assignment_history.append(
             {
                 "invocation": int(self.assignment_invocations),
                 "discovered_roi_count": int(self.count_found_targets()),
-                "requested_relay_count": int(assigner.requested_relay_count),
-                "assigned_relay_count": len(selected_relays),
-                "selected_relay_uav_ids": sorted(selected_relays),
-                "relay_role_changes": int(role_changes),
                 "role_changes": [
                     {"uav_id": uid, "before": previous_roles[uid], "after": current}
                     for uid in range(self.num_UAV)
                     if (current := sorted(task["task_type"] for task in self.multi_tasks[uid]))
                     != previous_roles[uid]
                 ],
-                "cumulative_relay_role_change_count": int(
-                    self.relay_role_change_count
-                ),
-                "relay_handling_mode": assigner.relay_handling_mode,
-                "planning": relay_snapshot(self),
             }
         )
         self.last_assignment_metadata = self.assignment_metadata()
@@ -502,7 +470,7 @@ class Simulator:
         self.search_release_coverage = float(self.visited_bitmap.mean())
         self.task_list = [task for task in self.task_list if task.task_type != "Search"]
         # Coverage release changes only Search fallback roles. Complete service
-        # and Relay reassignment remains exclusively a new-RoI boundary event.
+        # reassignment remains exclusively a new-RoI boundary event.
         for uid, tasks in self.multi_tasks.items():
             for task in tasks:
                 if task["task_type"] == "Search":
@@ -533,12 +501,9 @@ class Simulator:
             )
         assigned_service_targets = set()
         for uav_id, entries in self.multi_tasks.items():
-            task_types = [task["task_type"] for task in entries]
-            if "Relay" in task_types and task_types != ["Relay"]:
-                raise AssertionError("Relay must remain exclusive after Search release")
             for task in entries:
                 task_type = task["task_type"]
-                if task_type not in {"Relay", "FOV", "COM", "Hovering"}:
+                if task_type not in {"FOV", "COM", "Hovering"}:
                     raise AssertionError(
                         f"invalid task after Search release: UAV {uav_id} {task_type}"
                     )
@@ -551,12 +516,12 @@ class Simulator:
                     assigned_service_targets.add(key)
 
     def assignment_metadata(self):
-        assigner = getattr(self, "last_assignment", None)
-        selected = sorted(getattr(assigner, "selected_relay_uav_ids", []))
-        planning = relay_snapshot(self)
-        requested = planning["required_before_budget"]
         return {
+            "assignment_contract_version": ASSIGNMENT_CONTRACT_VERSION,
             "strategy": self.assignment_strategy,
+            "assignment_flow": ASSIGNMENT_FLOW_BY_STRATEGY[
+                self.assignment_strategy
+            ],
             "invocation": int(self.assignment_invocations),
             "channel_movement_interval_index": (
                 None
@@ -577,20 +542,9 @@ class Simulator:
             "task_compatibility_policy": TASK_COMPATIBILITY_POLICY,
             "fov_assignment_utility_version": FOV_ASSIGNMENT_UTILITY_VERSION,
             "fov_quality_transform": FOV_QUALITY_TRANSFORM,
-            "relay_task_contract_version": RELAY_TASK_CONTRACT_VERSION,
-            "relay_count_rule": COUNT_RULE,
-            "relay_potential_weight": RELAY_POTENTIAL_WEIGHT,
             "discovered_roi_count": int(self.count_found_targets()),
-            "requested_relay_count": int(requested),
-            "assigned_relay_count": len(selected),
-            "selected_relay_uav_ids": selected,
-            "relay_handling_mode": getattr(assigner, "relay_handling_mode", None),
-            "relay_role_change_count": int(self.relay_role_change_count),
-            "relay_planning": planning,
-            "relay_assignment_history": copy.deepcopy(self.assignment_history),
-            "relay_position_history": copy.deepcopy(self.relay_position_history),
-            "relay_shaping_history": copy.deepcopy(self.relay_shaping_history),
-            "relay_reassignment_pending": bool(self.need_reassign),
+            "assignment_history": copy.deepcopy(self.assignment_history),
+            "service_reassignment_pending": bool(self.need_reassign),
             "search_release_reassignment_pending": bool(
                 self.search_release_reassignment_pending
             ),
@@ -792,7 +746,6 @@ class Simulator:
             if released_search:
                 self._validate_search_release_assignment()
             assignment_performed = True
-        refresh_relay_targets(self)
         return assignment_performed
 
     def prepare_channel_routing_slot(self, routing_slot_index):
@@ -1223,15 +1176,7 @@ class Simulator:
         self.need_reassign = True   
         self.assignment_invocations = 0
         self.search_to_hover_conversions = 0
-        self.assignment_backlog_snapshot = {
-            uav_id: 0.0 for uav_id in range(self.num_UAV)
-        }
-        self.relay_position_history = []
-        self.relay_shaping_history = []
-        self.relay_plan = empty_plan()
         self.assignment_history = []
-        self.relay_role_change_count = 0
-        self._previous_relay_uav_ids = set()
         self.last_assignment = None
         self.search_release_time = None
         self.search_release_coverage = None

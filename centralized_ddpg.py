@@ -14,7 +14,6 @@ from centralized_movement import (
 )
 from experiment_config import (
     TASK_POTENTIAL_BETA_COM,
-    TASK_POTENTIAL_BETA_RELAY,
     TASK_POTENTIAL_BETA_SEARCH,
     TASK_POTENTIAL_BETA_VS,
 )
@@ -111,7 +110,6 @@ class CentralizedDDPG:
         beta_search=TASK_POTENTIAL_BETA_SEARCH,
         beta_vs=TASK_POTENTIAL_BETA_VS,
         beta_com=TASK_POTENTIAL_BETA_COM,
-        beta_relay=TASK_POTENTIAL_BETA_RELAY,
         reward_mode="dinkelbach",
         task_potential_enabled=True,
     ):
@@ -130,7 +128,6 @@ class CentralizedDDPG:
             beta_search=beta_search,
             beta_vs=beta_vs,
             beta_com=beta_com,
-            beta_relay=beta_relay,
             reward_mode=reward_mode,
             task_potential_enabled=task_potential_enabled,
             include_movement_masks=True,

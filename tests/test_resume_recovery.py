@@ -124,7 +124,7 @@ class ResumeRecoveryTest(unittest.TestCase):
             "visual_sensing_configuration": visual_sensing_metadata(),
             "checkpoint_type": checkpoint_type,
             "episode": completed_episode - 1,
-            "movement_state_dim": 595,
+            "movement_state_dim": 531,
             "joint_action_dim": 48,
             "routing_state_dim": 143,
             "movement_agent_kind": "td3",
@@ -238,7 +238,7 @@ class ResumeRecoveryTest(unittest.TestCase):
 
     def _inspectors(self):
         common = {
-            "movement_state_dim": 595,
+            "movement_state_dim": 531,
             "joint_action_dim": 48,
             "routing_state_dim": 143,
             "td3_gamma": 1.0,

@@ -9,7 +9,7 @@ from scipy.stats import t as student_t
 
 
 EVALUATION_AGGREGATION_SCHEMA_VERSION = (
-    "canonical-useful-goodput-single-artifact-source-v3"
+    "canonical-useful-goodput-service-only-v4"
 )
 
 CANONICAL_METRICS = (
@@ -20,31 +20,6 @@ CANONICAL_METRICS = (
     ("violation_probability", "COM"),
     ("violation_probability", "ALL"),
 )
-
-
-def aggregate_relay_planning(episodes):
-    """Summarize final snapshot counts and every observed movement boundary.
-
-    Required demand is never replaced by the budget-pruned/assigned count.
-    Count sums are across episode-final plans, not a second physical fleet.
-    """
-    plans = [episode["assignment"]["relay_planning"] for episode in episodes]
-    observations = [entry["planning"] for episode in episodes
-                    for entry in episode["assignment"].get("relay_position_history", [])]
-    reachability = [value for plan in observations
-                    for value in plan["current_source_reachability"].values()]
-    return {
-        "count_semantics": "sum of episode-final snapshot plans",
-        **{key + "_sum": sum(plan[key] for plan in plans) for key in (
-            "required_before_budget", "available_relay_uavs", "assigned_relay_count", "shortage")},
-        "unsupported_backlog_bits_sum": math.fsum(plan["unsupported_backlog"] for plan in plans),
-        "observed_movement_boundaries": len(observations),
-        "source_boundary_observations": len(reachability),
-        "disconnected_source_boundary_observations": sum(not value for value in reachability),
-        "infeasible_slot_boundary_observations": sum(
-            not status["feasible"] for plan in observations
-            for status in plan["position_status"].values()),
-    }
 
 
 def _row_number(row, key):

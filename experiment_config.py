@@ -92,19 +92,22 @@ GROUND_ALTITUDE_M = 0.0
 UAV_MAX_ALTITUDE_M = 150.0
 TASK_POTENTIAL_NORMALIZATION_EPSILON = 1e-12
 TASK_POTENTIAL_CONTRACT_VERSION = (
-    "task-selected-camera-uniform-beta3-potential-v12"
+    "search-vs-com-uniform-beta3-potential-v13"
 )
 TASK_POTENTIAL_BETA_SEARCH = 3.0
 TASK_POTENTIAL_BETA_VS = 3.0
 TASK_POTENTIAL_BETA_COM = 3.0
-TASK_POTENTIAL_BETA_RELAY = 3.0
 COM_CAPACITY_POTENTIAL_WEIGHT = 0.5
 COM_DISTANCE_POTENTIAL_WEIGHT = 0.5
-RELAY_TASK_CONTRACT_VERSION = (
-    "snapshot-virtual-relay-service-first-greedy-v6"
+ASSIGNMENT_CONTRACT_VERSION = "service-only-k-km-two-stage-km-single-stage-v1"
+ASSIGNMENT_FLOW_BY_STRATEGY = MappingProxyType(
+    {
+        "k_km": "FOV matching followed by COM matching with UAV reuse",
+        "km": "single matching over the combined FOV and COM task set",
+        "random_one_to_one": "two random feasible FOV/COM rounds",
+    }
 )
-RELAY_POTENTIAL_WEIGHT = TASK_POTENTIAL_BETA_RELAY
-METHOD_CONTRACT_VERSION = "centralized-16-uav-virtual-relay-v6"
+METHOD_CONTRACT_VERSION = "centralized-16-uav-service-only-v7"
 DEFAULT_TRAINING_SEED = 20260817
 FORMAL_TRAINING_EPISODES = 1500
 FORMAL_CHECKPOINT_EPISODE = FORMAL_TRAINING_EPISODES
@@ -212,10 +215,10 @@ MOVEMENT_CHANNEL_TIMING_VERSION = (
 )
 PROPULSION_MODEL_ID = "canonical-3d-quadrotor-v1"
 MOVEMENT_ACTION_PROJECTION_CONTRACT_VERSION = (
-    "fieldwise-clamp-heading-wrap-relay-active-mask-uav0-hard400-v5"
+    "fieldwise-clamp-heading-wrap-service-active-mask-uav0-hard400-v6"
 )
 MOVEMENT_REPLAY_CONTRACT_VERSION = (
-    "executed-action-boundary-aligned-next-state-relay-reset-mask-capacity-50000-v7"
+    "executed-action-boundary-aligned-next-state-three-potential-capacity-50000-v8"
 )
 MOVEMENT_WARMUP_CONTRACT_VERSION = "global-joint-transition-boundary-10000-v1"
 PROPULSION_PARAMETERS = MappingProxyType(
@@ -256,7 +259,6 @@ def validate_task_potential_weights():
 
     groups = {
         "COM": (COM_CAPACITY_POTENTIAL_WEIGHT, COM_DISTANCE_POTENTIAL_WEIGHT),
-        "Relay": (0.3, 0.7),
     }
     for name, weights in groups.items():
         numeric = tuple(float(weight) for weight in weights)
@@ -270,7 +272,6 @@ def validate_task_potential_weights():
         TASK_POTENTIAL_BETA_SEARCH,
         TASK_POTENTIAL_BETA_VS,
         TASK_POTENTIAL_BETA_COM,
-        TASK_POTENTIAL_BETA_RELAY,
     )
     if not all(
         math.isfinite(float(coefficient)) and float(coefficient) >= 0.0
@@ -279,13 +280,6 @@ def validate_task_potential_weights():
         raise ValueError(
             "task-potential shaping coefficients must be finite and non-negative"
         )
-    if not math.isclose(
-        TASK_POTENTIAL_BETA_RELAY,
-        TASK_POTENTIAL_BETA_COM,
-        rel_tol=0.0,
-        abs_tol=0.0,
-    ):
-        raise ValueError("Relay and COM shaping coefficients must match")
     return groups
 
 
@@ -308,10 +302,9 @@ def task_potential_contract_metadata():
             "beta_search": TASK_POTENTIAL_BETA_SEARCH,
             "beta_vs": TASK_POTENTIAL_BETA_VS,
             "beta_com": TASK_POTENTIAL_BETA_COM,
-            "beta_relay": TASK_POTENTIAL_BETA_RELAY,
         },
         "pbrs": "beta_i * (gamma * phi_i_next - phi_i_current)",
-        "no_task_potential": "all four shaping contributions are zero",
+        "no_task_potential": "all three shaping contributions are zero",
         "search": {
             "unchanged": True,
             "definition": "mean(visited_bitmap)",
@@ -338,31 +331,10 @@ def task_potential_contract_metadata():
             "range_gap_normalization_reference_m": range_gap_reference,
             "normalization_epsilon": TASK_POTENTIAL_NORMALIZATION_EPSILON,
         },
-        "relay": {
-            "movement_potential_definition": "mean(0.3 * exp(-distance_to_virtual_target / 400) + 0.7 * min_neighbor_normalized_expected_capacity)",
-            "aggregation": "mean over Relay tasks per UAV, then mean over assigned Relay UAVs",
-            "beta": TASK_POTENTIAL_BETA_RELAY,
-            "position_weight": 0.3, "link_weight": 0.7,
-            "distance_dimensionality": "three_dimensional_3d",
-            "communication_range_m": COMMUNICATION_RANGE_M,
-            "reference_capacity": "reference_u2u_max_capacity_mbps(TOTAL_COMMUNICATION_BANDWIDTH_HZ)",
-            "capacity_source": "deterministic Rician expected U2U capacity; no channel state or RNG",
-            "assignment_cost": "raw 3D distance greedy; no utility matrix",
-            "current_backlog_snapshot": "current decision-state boundary",
-            "next_backlog_snapshot": "next decision-state boundary",
-            "transition_alignment": (
-                "ordinary transitions use gamma * phi_next - phi_current; "
-                "a transition ending in new-RoI reassignment masks only Relay "
-                "shaping to zero, then the following movement interval restores it"
-            ),
-        },
         "lifecycle": {
-            "form": (
-                "ordinary beta * (gamma * phi_next - phi_current); new-RoI "
-                "reassignment masks Relay only while Search/FOV(VS)/COM remain active"
-            ),
+            "form": "beta * (gamma * phi_next - phi_current)",
             "nonterminal_boundary_continuity": (
-                "all four phi_next values equal the next transition phi_current"
+                "all three phi_next values equal the next transition phi_current"
             ),
             "terminal_next_potential": 0.0,
             "delivery_or_connectivity_potential": False,
@@ -926,9 +898,6 @@ def effective_training_config(config, method_spec: MethodSpec) -> dict:
         )),
         "beta_vs": float(values.get("beta_vs", TASK_POTENTIAL_BETA_VS)),
         "beta_com": float(values.get("beta_com", TASK_POTENTIAL_BETA_COM)),
-        "beta_relay": float(values.get(
-            "beta_relay", TASK_POTENTIAL_BETA_RELAY
-        )),
     }
     values["task_potential_shaping_coefficients"] = configured_coefficients
     values["effective_task_potential_shaping_coefficients"] = {
@@ -946,7 +915,6 @@ def comparison_method_configuration(method_spec: MethodSpec) -> dict:
         "beta_search": TASK_POTENTIAL_BETA_SEARCH,
         "beta_vs": TASK_POTENTIAL_BETA_VS,
         "beta_com": TASK_POTENTIAL_BETA_COM,
-        "beta_relay": TASK_POTENTIAL_BETA_RELAY,
     }
     return {
         "assignment_strategy": method_spec.assignment,
@@ -964,14 +932,8 @@ def comparison_method_configuration(method_spec: MethodSpec) -> dict:
             for name, coefficient in configured_coefficients.items()
         },
         "movement_replay_contract_version": MOVEMENT_REPLAY_CONTRACT_VERSION,
-        "relay_task_contract_version": RELAY_TASK_CONTRACT_VERSION,
-        "relay_count_rule": "snapshot_component_bridges_greedy_deletion_minimal",
-        "relay_potential_weight": RELAY_POTENTIAL_WEIGHT,
-        "relay_assignment_mode": {
-            "k_km": "service_first_distance_greedy_relay",
-            "km": "service_first_distance_greedy_relay",
-            "random_one_to_one": "service_first_named_rng_relay",
-        }[method_spec.assignment],
+        "assignment_contract_version": ASSIGNMENT_CONTRACT_VERSION,
+        "assignment_flow": ASSIGNMENT_FLOW_BY_STRATEGY[method_spec.assignment],
         "ground_station_position_m": list(GROUND_STATION_POSITION_M),
         "permanent_gs_gateway_uav_id": PERMANENT_GS_GATEWAY_UAV_ID,
         "gs_gateway_soft_radius_m": GS_GATEWAY_SOFT_RADIUS_M,

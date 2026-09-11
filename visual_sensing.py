@@ -63,7 +63,7 @@ def visual_sensing_metadata():
         "vs_model": "oblique camera aimed at assigned ROI",
         "camera_mode_selection": (
             "Search task -> Search camera; FOV or FOV+COM -> VS camera; "
-            "COM-only, Relay, Hovering and permanent GS gateway -> no sensing"
+            "COM-only, Hovering and permanent GS gateway -> no sensing"
         ),
         "camera_mode_state": (
             "derived from current task types; no independent per-step transition"

@@ -37,7 +37,6 @@ from HRL_task_aware import (
     train,
 )
 from observation_strategy import masked_observation_metadata
-from relay_diagnostics import write_relay_diagnostics
 from resume_recovery import (
     execute_resume_reconciliation,
     plan_resume_reconciliation,
@@ -426,15 +425,9 @@ def run(args):
             history_rows=len(result["training_history_rows"]),
             dinkelbach_update_count=result["dinkelbach_update_count"],
         )
-        relay_metadata, _relay_path = write_relay_diagnostics(
-            run_dir, result["relay_diagnostics"]
-        )
         _write_json(
             run_dir / "run_metadata.json",
-            {
-                **_merge_training_run_metadata(result["run_metadata"], resolved),
-                **relay_metadata,
-            },
+            _merge_training_run_metadata(result["run_metadata"], resolved),
         )
         _write_json(run_dir / "resolved_config.json", resolved)
     except BaseException as exc:
@@ -693,15 +686,9 @@ def run_resume(args):
             dinkelbach_update_count=result["dinkelbach_update_count"],
             resume_reconciliation=reconciliation,
         )
-        relay_metadata, _relay_path = write_relay_diagnostics(
-            run_dir, result["relay_diagnostics"]
-        )
         _write_json(
             run_dir / "run_metadata.json",
-            {
-                **_merge_training_run_metadata(result["run_metadata"], resolved),
-                **relay_metadata,
-            },
+            _merge_training_run_metadata(result["run_metadata"], resolved),
         )
         _write_json_atomic(run_dir / "resolved_config.json", resolved)
     except BaseException as exc:
@@ -862,7 +849,6 @@ def run_evaluate(args):
         output_dir,
         result["episode_metrics"],
         metadata,
-        relay_diagnostics=result["relay_diagnostics"],
     )
     plot_paths = _write_evaluation_plots(output_dir, result["episode_metrics"])
     print(json.dumps({"evaluation_directory": str(output_dir), "outputs": {key: str(value) for key, value in paths.items()}, "plots": plot_paths}))

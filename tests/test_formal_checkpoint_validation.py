@@ -276,7 +276,7 @@ class FormalCheckpointMetadataTest(unittest.TestCase):
 
     def test_dimension_gamma_calibration_seed_and_method_mismatches_fail(self):
         cases = (
-            (("movement_state_dim",), 531, "movement_state_dim"),
+            (("movement_state_dim",), 530, "movement_state_dim"),
             (("joint_action_dim",), 47, "joint_action_dim"),
             (("routing_state_dim",), 125, "routing_state_dim"),
             (("centralized_td3_gamma",), 0.9, "centralized_td3_gamma"),
@@ -369,7 +369,7 @@ class FormalCheckpointLoadOrderTest(unittest.TestCase):
                         "visual_sensing_contract_version": VISUAL_SENSING_CONTRACT_VERSION,
                         "visual_sensing_configuration": visual_sensing_metadata(),
                         "checkpoint_type": MODEL_CHECKPOINT_TYPE,
-                        "movement_state_dim": 531,
+                        "movement_state_dim": 530,
                     }
                 ),
                 encoding="utf-8",

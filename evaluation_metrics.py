@@ -24,7 +24,6 @@ from experiment_paths import (
     validate_run_directory_preflight,
     write_run_status,
 )
-from relay_diagnostics import write_relay_diagnostics
 from scenario_manifest import (
     ScenarioManifest,
     validate_manifest_initial_topologies,
@@ -741,18 +740,10 @@ def validate_formal_aggregation_rows(
     return episode_rows
 
 
-def write_evaluation_outputs(
-    output_dir, episode_rows, run_metadata, *, relay_diagnostics=None
-):
+def write_evaluation_outputs(output_dir, episode_rows, run_metadata):
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     run_metadata = dict(run_metadata)
-    relay_diagnostics_path = None
-    if relay_diagnostics is not None:
-        relay_metadata, relay_diagnostics_path = write_relay_diagnostics(
-            output_dir, relay_diagnostics
-        )
-        run_metadata.update(relay_metadata)
     normalized_rows = [
         {column: row.get(column) for column in EPISODE_COLUMNS}
         for row in episode_rows
@@ -815,8 +806,6 @@ def write_evaluation_outputs(
         "canonical_cross_seed_aggregation_json": canonical_cross_seed_json,
         "run_metadata": metadata_path,
     }
-    if relay_diagnostics_path is not None:
-        outputs["relay_diagnostics"] = relay_diagnostics_path
     return outputs
 
 
@@ -865,7 +854,6 @@ def run_evaluation_command(args):
             run_dir,
             result["episode_metrics"],
             metadata,
-            relay_diagnostics=result["relay_diagnostics"],
         )
         write_run_status(run_dir, "COMPLETED")
         print(

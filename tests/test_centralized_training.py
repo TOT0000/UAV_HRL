@@ -50,7 +50,7 @@ class CentralizedTrainingFlowTest(unittest.TestCase):
         self.assertEqual(defaults.batch_size, PRODUCTION_BATCH_SIZE)
         self.assertEqual(defaults.policy_delay, PRODUCTION_POLICY_DELAY)
         self.assertEqual(ROUTING_STATE_DIM, 143)
-        self.assertEqual(self.result["movement_state_dim"], 595)
+        self.assertEqual(self.result["movement_state_dim"], 531)
         self.assertEqual(self.result["routing_state_dim"], 143)
         self.assertEqual(self.result["joint_action_dim"], 48)
         self.assertEqual(self.result["centralized_td3_gamma"], 1.0)
@@ -145,8 +145,8 @@ class CentralizedTrainingFlowTest(unittest.TestCase):
                     energy=4.0,
                     current_lambda=lambda_used,
                     gamma=1.0,
-                    potentials_t=(0.0, 0.0, 0.0, 0.0),
-                    potentials_t1=(0.0, 0.0, 0.0, 0.0),
+                    potentials_t=(0.0, 0.0, 0.0),
+                    potentials_t1=(0.0, 0.0, 0.0),
                     done=False,
                     config=config,
                 )
@@ -210,12 +210,12 @@ class CentralizedTrainingFlowTest(unittest.TestCase):
             energy=0.0,
             current_lambda=0.0,
             gamma=1.0,
-            potentials_t=(0.1, 0.2, 0.3, 0.1),
-            potentials_t1=(0.4, 0.5, 0.6, 0.4),
+            potentials_t=(0.1, 0.2, 0.3),
+            potentials_t1=(0.4, 0.5, 0.6),
             done=False,
             config=config,
         )
-        self.assertAlmostEqual(reward, 3.6)
+        self.assertAlmostEqual(reward, 2.7)
 
     def test_normal_training_end_writes_episode_boundary_full_checkpoint(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -256,10 +256,8 @@ class CentralizedTrainingFlowTest(unittest.TestCase):
         self.assertEqual(state["next_episode_index"], 1)
         self.assertEqual(state["full_resume_logging_schema_version"], 2)
         self.assertIn("channel_lifecycle_state", state)
-        self.assertEqual(
-            state["relay_episode_diagnostics"],
-            result["relay_diagnostics"]["episodes"],
-        )
+        self.assertNotIn("relay_episode_diagnostics", state)
+        self.assertNotIn("relay_diagnostics", result)
         self.assertEqual(state["lambda_used_log"], result["lambda_used_log"])
         self.assertEqual(
             state["lambda_after_episode_log"],

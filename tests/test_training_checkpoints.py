@@ -41,7 +41,7 @@ from scenario_manifest import extend_training_manifest, generate_manifest
 from training_checkpoint import (
     CHECKPOINT_SCHEMA_VERSION,
     FULL_RESUME_LOGGING_SCHEMA_VERSION,
-    PRE_BOUNDARY_ALIGNED_RELAY_POTENTIAL_CHECKPOINT_SCHEMA_VERSION,
+    PRE_SERVICE_ONLY_CHECKPOINT_SCHEMA_VERSION,
     PRE_CONTINUOUS_GATEWAY_PROJECTION_CHECKPOINT_SCHEMA_VERSION,
     PRE_UNIFIED_400M_COMMUNICATION_CHECKPOINT_SCHEMA_VERSION,
     PRE_ROUTING_LIFECYCLE_CHECKPOINT_SCHEMA_VERSION,
@@ -1091,7 +1091,7 @@ class FullResumeCheckpointTest(unittest.TestCase):
                     load_model_checkpoint(checkpoint_dir, td3, ddqn)
                 load_networks.assert_not_called()
 
-    def test_frozen_relay_schema_23_model_is_rejected_before_network_restore(self):
+    def test_explicit_relay_schema_29_model_is_rejected_before_network_restore(self):
         td3, ddqn, _joint, _routing = self._components()
         with tempfile.TemporaryDirectory() as temp_dir:
             checkpoint_dir = Path(temp_dir) / "model"
@@ -1103,14 +1103,14 @@ class FullResumeCheckpointTest(unittest.TestCase):
                 movement_state_dim=MOVEMENT_STATE_DIM,
                 joint_action_dim=JOINT_ACTION_DIM,
                 routing_state_dim=ROUTING_STATE_DIM,
-                calibration={"fixture": "legacy-frozen-relay"},
+                calibration={"fixture": "legacy-explicit-relay"},
                 experiment_metadata=_model_provenance_fixture(1),
                 routing_lifecycle_state=_empty_routing_lifecycle(),
             )
             metadata_path = checkpoint_dir / "metadata.json"
             metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
             metadata["checkpoint_schema_version"] = (
-                PRE_BOUNDARY_ALIGNED_RELAY_POTENTIAL_CHECKPOINT_SCHEMA_VERSION
+                PRE_SERVICE_ONLY_CHECKPOINT_SCHEMA_VERSION
             )
             metadata_path.write_text(
                 json.dumps(metadata, indent=2) + "\n", encoding="utf-8"
@@ -1120,8 +1120,7 @@ class FullResumeCheckpointTest(unittest.TestCase):
             ) as load_networks:
                 with self.assertRaisesRegex(
                     RuntimeError,
-                    "canonical 16-UAV.*target/link movement potential.*"
-                    "must be retrained",
+                    "retired explicit Relay task.*must be retrained",
                 ):
                     load_model_checkpoint(checkpoint_dir, td3, ddqn)
                 load_networks.assert_not_called()
@@ -1351,7 +1350,7 @@ class FullResumeCheckpointTest(unittest.TestCase):
                 "calibration": calibration,
             }
             for field, value in (
-                ("movement_state_dim", 531),
+                ("movement_state_dim", MOVEMENT_STATE_DIM - 1),
                 ("joint_action_dim", JOINT_ACTION_DIM - 1),
                 ("routing_state_dim", 122),
             ):
@@ -1380,7 +1379,7 @@ class FullResumeCheckpointTest(unittest.TestCase):
             metadata_path = checkpoint_dir / "metadata.json"
             metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
             metadata["checkpoint_schema_version"] = (
-                PRE_BOUNDARY_ALIGNED_RELAY_POTENTIAL_CHECKPOINT_SCHEMA_VERSION
+                PRE_SERVICE_ONLY_CHECKPOINT_SCHEMA_VERSION
             )
             metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
             with mock.patch(
@@ -1388,8 +1387,7 @@ class FullResumeCheckpointTest(unittest.TestCase):
             ) as load_networks:
                 with self.assertRaisesRegex(
                     RuntimeError,
-                    "canonical 16-UAV.*target/link movement potential.*"
-                    "must be retrained",
+                    "retired explicit Relay task.*must be retrained",
                 ):
                     load_full_resume_checkpoint(**common)
                 load_networks.assert_not_called()
@@ -1459,7 +1457,7 @@ class TrainingCliTest(unittest.TestCase):
         )
 
     def test_checkpoint_schema_is_explicit(self):
-        self.assertEqual(CHECKPOINT_SCHEMA_VERSION, 29)
+        self.assertEqual(CHECKPOINT_SCHEMA_VERSION, 30)
 
 
 if __name__ == "__main__":

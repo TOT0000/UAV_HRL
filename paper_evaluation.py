@@ -724,7 +724,6 @@ def run_paper_evaluation(
             point_dir,
             result["episode_metrics"],
             run_metadata,
-            relay_diagnostics=result["relay_diagnostics"],
         )
         outputs["packet_outcomes_jsonl"] = packet_outcomes_path.resolve()
         outputs.update(diagnostic_outputs)

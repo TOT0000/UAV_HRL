@@ -1,16 +1,15 @@
 """Authoritative local feature ordering for centralized UAV movement."""
 
 
-MOVEMENT_FEATURE_SCHEMA_VERSION = 6
+MOVEMENT_FEATURE_SCHEMA_VERSION = 7
 
-TASK_TYPES = ("Search", "FOV", "COM", "Relay", "Hovering")
-ACTIVE_MOVEMENT_TASK_TYPES = ("Search", "FOV", "COM", "Relay")
+TASK_TYPES = ("Search", "FOV", "COM", "Hovering")
+ACTIVE_MOVEMENT_TASK_TYPES = ("Search", "FOV", "COM")
 
 LOCAL_MOVEMENT_FEATURES = (
     ("task_search", "binary", 0.0, 1.0, "Search task is active"),
     ("task_fov", "binary", 0.0, 1.0, "FOV task is active"),
     ("task_com", "binary", 0.0, 1.0, "COM task is active"),
-    ("task_relay", "binary", 0.0, 1.0, "Relay task is active"),
     ("task_hovering", "binary", 0.0, 1.0, "Hovering task is active"),
     ("position_x", "continuous", 0.0, 1.0, "x / environment width"),
     ("position_y", "continuous", 0.0, 1.0, "y / environment height"),
@@ -49,9 +48,6 @@ LOCAL_MOVEMENT_FEATURES = (
         1.0,
         "reference S2U capacity / fixed best-feasible S2U capacity",
     ),
-    ("relay_target_dx", "continuous", -1.0, 1.0, "virtual target relative x / environment width; zero without Relay"),
-    ("relay_target_dy", "continuous", -1.0, 1.0, "virtual target relative y / environment height; zero without Relay"),
-    ("relay_target_dz", "continuous", -1.0, 1.0, "virtual target relative z / UAV altitude span; zero without Relay"),
 )
 
 LOCAL_MOVEMENT_DIM = len(LOCAL_MOVEMENT_FEATURES)

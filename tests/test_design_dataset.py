@@ -51,8 +51,8 @@ class DesignSchemaTest(unittest.TestCase):
         continuous = set(state["continuous_indices"])
         discrete = set(state["discrete_indices"])
         self.assertFalse(continuous.intersection(discrete))
-        self.assertEqual(continuous | discrete, set(range(595)))
-        self.assertEqual([item["index"] for item in state["features"]], list(range(595)))
+        self.assertEqual(continuous | discrete, set(range(531)))
+        self.assertEqual([item["index"] for item in state["features"]], list(range(531)))
         self.assertEqual(len(action["features"]), 48)
         self.assertEqual(
             {item["index"] for item in action["features"]}, set(range(48))
@@ -87,7 +87,7 @@ class DesignDatasetIntegrationTest(unittest.TestCase):
             episode=1499,
             td3=td3,
             ddqn=ddqn,
-            movement_state_dim=595,
+            movement_state_dim=531,
             joint_action_dim=48,
             routing_state_dim=143,
             calibration=calibration,
@@ -189,9 +189,9 @@ class DesignDatasetIntegrationTest(unittest.TestCase):
 
     def test_two_episodes_produce_120_ordered_joint_transitions(self):
         arrays = self.arrays_one
-        self.assertEqual(DESIGN_DATASET_SCHEMA_VERSION, 6)
-        self.assertEqual(self.metadata_one["schema_version"], 6)
-        self.assertEqual(self.metadata_one["checkpoint_schema_version"], 29)
+        self.assertEqual(DESIGN_DATASET_SCHEMA_VERSION, 7)
+        self.assertEqual(self.metadata_one["schema_version"], 7)
+        self.assertEqual(self.metadata_one["checkpoint_schema_version"], 30)
         self.assertEqual(self.metadata_one["scenario_schema_version"], "uav-hrl-scenario-v8")
         self.assertEqual(self.metadata_one["num_uav"], 16)
         self.assertEqual(
@@ -203,9 +203,9 @@ class DesignDatasetIntegrationTest(unittest.TestCase):
             MOVEMENT_REPLAY_CONTRACT_VERSION,
         )
         self.assertEqual(set(arrays), set(ARRAY_NAMES))
-        self.assertEqual(arrays["state"].shape, (120, 595))
+        self.assertEqual(arrays["state"].shape, (120, 531))
         self.assertEqual(arrays["projected_joint_action"].shape, (120, 48))
-        self.assertEqual(arrays["next_state"].shape, (120, 595))
+        self.assertEqual(arrays["next_state"].shape, (120, 531))
         self.assertEqual(int(arrays["done"].sum()), 2)
         self.assertEqual(self.metadata_one["centralized_actor_calls"], 120)
         np.testing.assert_array_equal(arrays["global_transition_index"], np.arange(120))
@@ -222,7 +222,6 @@ class DesignDatasetIntegrationTest(unittest.TestCase):
             beta_search=self.formal_config["beta_search"],
             beta_vs=self.formal_config["beta_vs"],
             beta_com=self.formal_config["beta_com"],
-            beta_relay=self.formal_config["beta_relay"],
         )
         np.testing.assert_allclose(
             reward,
@@ -234,7 +233,6 @@ class DesignDatasetIntegrationTest(unittest.TestCase):
             self.assertEqual(self.arrays_one["phi_search_t1"][terminal], 0.0)
             self.assertEqual(self.arrays_one["phi_vs_t1"][terminal], 0.0)
             self.assertEqual(self.arrays_one["phi_com_t1"][terminal], 0.0)
-            self.assertEqual(self.arrays_one["phi_relay_t1"][terminal], 0.0)
 
     def test_repeated_collection_is_bitwise_deterministic(self):
         for name in ARRAY_NAMES:

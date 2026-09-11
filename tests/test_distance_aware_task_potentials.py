@@ -26,7 +26,6 @@ from experiment_config import (
     S2U_COMMUNICATION_RANGE_M,
     TASK_POTENTIAL_CONTRACT_VERSION,
     TASK_POTENTIAL_BETA_COM,
-    TASK_POTENTIAL_BETA_RELAY,
     TASK_POTENTIAL_BETA_SEARCH,
     TASK_POTENTIAL_BETA_VS,
     MethodSpec,
@@ -103,21 +102,11 @@ class DistanceProgressHelperTest(unittest.TestCase):
         self.assertEqual(metadata["com"]["s2u_range_m"], S2U_COMMUNICATION_RANGE_M)
         self.assertEqual(metadata["com"]["s2u_range_m"], 400.0)
         self.assertTrue(metadata["search"]["unchanged"])
-        self.assertEqual(
-            metadata["relay"]["current_backlog_snapshot"],
-            "current decision-state boundary",
-        )
-        self.assertEqual(
-            metadata["relay"]["next_backlog_snapshot"],
-            "next decision-state boundary",
-        )
-        self.assertNotIn("frozen", metadata["relay"]["transition_alignment"])
         self.assertFalse(metadata["lifecycle"]["delivery_or_connectivity_potential"])
         expected_betas = {
             "beta_search": 3.0,
             "beta_vs": 3.0,
             "beta_com": 3.0,
-            "beta_relay": 3.0,
         }
         self.assertEqual(metadata["shaping_coefficients"], expected_betas)
         self.assertEqual(
@@ -125,9 +114,8 @@ class DistanceProgressHelperTest(unittest.TestCase):
                 TASK_POTENTIAL_BETA_SEARCH,
                 TASK_POTENTIAL_BETA_VS,
                 TASK_POTENTIAL_BETA_COM,
-                TASK_POTENTIAL_BETA_RELAY,
             ),
-            (3.0, 3.0, 3.0, 3.0),
+            (3.0, 3.0, 3.0),
         )
 
         with mock.patch(
@@ -206,7 +194,6 @@ class DistanceAwarePotentialLifecycleTest(unittest.TestCase):
                     self.config.beta_search,
                     self.config.beta_vs,
                     self.config.beta_com,
-                    self.config.beta_relay,
                 ),
                 near,
             )
@@ -247,7 +234,7 @@ class DistanceAwarePotentialLifecycleTest(unittest.TestCase):
             self.env.env_width,
             self.env.env_height,
         )
-        _, _, phi_com, _ = calculate_movement_potentials(self.env, 1.0)
+        _, _, phi_com = calculate_movement_potentials(self.env, 1.0)
 
         self.assertGreater(capacity, 0.0)
         self.assertAlmostEqual(
@@ -277,14 +264,14 @@ class DistanceAwarePotentialLifecycleTest(unittest.TestCase):
         self.env.visited_bitmap[:] = False
         self.assertEqual(
             calculate_movement_potentials(self.env, 1.0),
-            (0.0, 0.0, 0.0, 0.0),
+            (0.0, 0.0, 0.0),
         )
 
         self.env.multi_tasks[0] = [self._fov_task(0)]
         self.env.multi_tasks[1] = [self._fov_task(1)]
         self.env.uav_dict[0].x_u, self.env.uav_dict[0].y_u = 0.0, 0.0
         self.env.uav_dict[1].x_u, self.env.uav_dict[1].y_u = 500.0, 500.0
-        _, phi_vs, _, _ = calculate_movement_potentials(self.env, 1.0)
+        _, phi_vs, _ = calculate_movement_potentials(self.env, 1.0)
         expected = sum(fov_task_geometry(self.env, uid, self._fov_task(uid)).pair_score
                        for uid in (0, 1)) / 2
         self.assertAlmostEqual(phi_vs, expected)
@@ -295,7 +282,7 @@ class DistanceAwarePotentialLifecycleTest(unittest.TestCase):
         expected = float(self.env.visited_bitmap.mean())
         self.env.multi_tasks[0] = [self._fov_task()]
         self.env.multi_tasks[1] = [self._com_task()]
-        phi_search, _, _, _ = calculate_movement_potentials(self.env, 1.0)
+        phi_search, _, _ = calculate_movement_potentials(self.env, 1.0)
         self.assertEqual(phi_search, expected)
 
     def test_multiple_com_tasks_use_arithmetic_mean(self):
@@ -308,7 +295,7 @@ class DistanceAwarePotentialLifecycleTest(unittest.TestCase):
             "get_sr_uav_normalized_utility",
             return_value=0.25,
         ):
-            _, _, phi_com, _ = calculate_movement_potentials(self.env, 1.0)
+            _, _, phi_com = calculate_movement_potentials(self.env, 1.0)
         per_task = [
             blended_com_progress(
                 0.25,
@@ -324,22 +311,22 @@ class DistanceAwarePotentialLifecycleTest(unittest.TestCase):
         self.assertAlmostEqual(phi_com, float(np.mean(per_task)))
 
     def test_no_task_potential_disables_all_new_shaping(self):
-        current = (0.2, 0.3, 0.4, 0.1)
-        following = (0.4, 0.7, 0.8, 0.5)
+        current = (0.2, 0.3, 0.4)
+        following = (0.4, 0.7, 0.8)
         self.assertGreater(self._shaping(current, following, enabled=True), 0.0)
         self.assertEqual(self._shaping(current, following, enabled=False), 0.0)
 
 
 class TaskPotentialMethodContractTest(unittest.TestCase):
     def test_training_evaluation_agents_and_replay_share_beta3_defaults(self):
-        names = ("beta_search", "beta_vs", "beta_com", "beta_relay")
+        names = ("beta_search", "beta_vs", "beta_com")
         training = formal_training_config(total_episodes=1500)
         evaluation = _evaluation_config(episodes=1, episode_seconds=60, seed=17)
         self.assertEqual(
-            tuple(getattr(training, name) for name in names), (3.0,) * 4
+            tuple(getattr(training, name) for name in names), (3.0,) * 3
         )
         self.assertEqual(
-            tuple(getattr(evaluation, name) for name in names), (3.0,) * 4
+            tuple(getattr(evaluation, name) for name in names), (3.0,) * 3
         )
         for callable_obj in (
             TD3.update_joint,
@@ -351,7 +338,7 @@ class TaskPotentialMethodContractTest(unittest.TestCase):
                 signature = inspect.signature(callable_obj)
                 self.assertEqual(
                     tuple(signature.parameters[name].default for name in names),
-                    (3.0,) * 4,
+                    (3.0,) * 3,
                 )
 
     def test_all_methods_publish_one_contract_without_dimension_changes(self):
@@ -380,7 +367,7 @@ class TaskPotentialMethodContractTest(unittest.TestCase):
                 if shared is None:
                     shared = config["task_potential_configuration"]
                 self.assertEqual(config["task_potential_configuration"], shared)
-        self.assertEqual(MOVEMENT_STATE_DIM, 595)
+        self.assertEqual(MOVEMENT_STATE_DIM, 531)
         self.assertEqual(JOINT_ACTION_DIM, 48)
         self.assertEqual(ROUTING_STATE_DIM, 143)
         self.assertEqual(SCENARIO_SCHEMA_VERSION, "uav-hrl-scenario-v8")

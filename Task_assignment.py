@@ -19,9 +19,6 @@ from experiment_config import (
     RESERVED_SEARCH_UAV_IDS,
     SEARCH_COVERAGE_THRESHOLD,
 )
-from relay_contract import plan_relays, pair_relay_slots
-
-
 SERVICE_TASK_TYPES = ("FOV", "COM")
 FOV_COM_TASK_TYPES = ("FOV", "COM")
 
@@ -167,9 +164,6 @@ class UAVAssigner:
         self.env = env
         self.assignments = {}
         self.last_round_problems = []
-        self.relay_handling_mode = None
-        self.requested_relay_count = 0
-        self.selected_relay_uav_ids = []
 
     def assign_tasks(
         self,
@@ -201,29 +195,38 @@ class UAVAssigner:
             if coverage_threshold is None
             else coverage_threshold
         )
-        # Only FOV/COM enter a utility matrix. Relay is planned afterwards.
         if strategy == "random_one_to_one":
             self.random_assign_tasks(uav_id_list, task_list,
                                      coverage_threshold=coverage_threshold)
-        else:
+        elif strategy == "km":
             self.assign_uav_tasks_k_times(
-                uav_id_list, task_list, K=1 if strategy == "km" else min(int(K), 2),
-                coverage_threshold=coverage_threshold)
-        self.relay_handling_mode = ("service_first_named_rng_relay" if strategy == "random_one_to_one"
-                                    else "service_first_distance_greedy_relay")
-        free = [uid for uid in uav_id_list if not self.assignments[uid]]
-        prospective = [uid for uid, tasks in self.assignments.items() if tasks]
-        self.relay_plan = plan_relays(self.env, prospective, free)
-        pair_relay_slots(self.env, self.relay_plan, free,
-                         random=strategy == "random_one_to_one")
-        self.requested_relay_count = self.relay_plan["required_before_budget"]
-        for slot in self.relay_plan["slots"]:
-            task = Task(slot["slot_id"], "Relay", None, None)
-            task.relay_slot = slot
-            index = len(self._snapshot_tasks)
-            self._snapshot_tasks.append(task)
-            self.assignments[slot["assigned_uav_id"]] = [(index, "Relay", None)]
-        self.selected_relay_uav_ids = sorted(self.relay_plan["slot_to_uav"].values())
+                uav_id_list,
+                task_list,
+                K=1,
+                coverage_threshold=coverage_threshold,
+                candidate_task_types=SERVICE_TASK_TYPES,
+            )
+        else:
+            # K-KM is explicitly two-stage: all discovered FOV tasks first,
+            # then all COM tasks.  The COM round may reuse a UAV selected by
+            # the FOV round, yielding at most one task of each type per UAV.
+            self.assign_uav_tasks_k_times(
+                uav_id_list,
+                task_list,
+                K=1,
+                coverage_threshold=coverage_threshold,
+                candidate_task_types=("FOV",),
+            )
+            fov_rounds = list(self.last_round_problems)
+            self.assign_uav_tasks_k_times(
+                uav_id_list,
+                task_list,
+                K=1,
+                coverage_threshold=coverage_threshold,
+                candidate_task_types=("COM",),
+                initial_assignments=self.assignments,
+            )
+            self.last_round_problems = fov_rounds + self.last_round_problems
         return self.assignments
 
     def _candidate_tasks(
@@ -396,11 +399,6 @@ class UAVAssigner:
                     )
                 )
                 available.remove(original_index)
-        self.selected_relay_uav_ids = sorted(
-            uid
-            for uid, assignments in self.assignments.items()
-            if any(task_type == "Relay" for _index, task_type, _utility in assignments)
-        )
         return self.assignments
 
     def random_assign_tasks(self, uav_list, task_list, *, coverage_threshold=SEARCH_COVERAGE_THRESHOLD):
@@ -447,7 +445,7 @@ class UAVAssigner:
             entries = []
             if uav_id == PERMANENT_GS_GATEWAY_UAV_ID and assigned:
                 raise AssertionError(
-                    "permanent GS gateway entered Relay/FOV/COM service assignment"
+                    "permanent GS gateway entered FOV/COM service assignment"
                 )
             for task_index, task_type, _ in assigned:
                 task = snapshot[task_index]
@@ -459,28 +457,16 @@ class UAVAssigner:
                     target = self.env.SR_teams[int(task.target_obj_id)]
                     position = target.get_position()
                     target_object_id = int(task.target_obj_id)
-                elif task_type == "Relay":
-                    position = task.relay_slot["virtual_position"]
-                    target_object_id = None
                 else:
                     raise AssertionError(f"non-candidate task was assigned: {task_type}")
                 entries.append(
                     {
                         "task_type": task_type,
-                        "target_id": (
-                            task.task_id if task_type == "Relay" else int(task_index)
-                        ),
+                        "target_id": int(task_index),
                         "target_obj_id": target_object_id,
                         **(
                             {"target_pos": tuple(position)}
                             if position is not None
-                            else {}
-                        ),
-                        **(
-                            {
-                                "relay_slot": task.relay_slot,
-                            }
-                            if task_type == "Relay"
                             else {}
                         ),
                     }
@@ -521,8 +507,6 @@ class UAVAssigner:
                         "phase_fallback": True,
                     }
                 )
-            if any(entry["task_type"] == "Relay" for entry in entries) and len(entries) != 1:
-                raise AssertionError("Relay assignment must be exclusive")
             self.env.multi_tasks[uav_id] = entries
             if not search_active and any(
                 entry["task_type"] == "Search" for entry in entries
@@ -531,7 +515,7 @@ class UAVAssigner:
             primary = sorted(
                 entries,
                 key=lambda item: (
-                    {"Relay": 0, "FOV": 1, "COM": 2, "Search": 3, "Hovering": 4}[
+                    {"FOV": 0, "COM": 1, "Search": 2, "Hovering": 3}[
                         item["task_type"]
                     ],
                     -1 if item.get("target_obj_id") is None else item["target_obj_id"],

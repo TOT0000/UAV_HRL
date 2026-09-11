@@ -13,7 +13,7 @@ its area.
 Only a non-gateway UAV with a current Search task contributes a Search
 footprint, changes `visited_bitmap`, or discovers an undiscovered ROI whose
 center is inside or on the footprint boundary. FOV and FOV+COM UAVs use VS
-mode. COM-only, Relay, Hovering and the permanent GS gateway do not perform
+mode. COM-only, Hovering and the permanent GS gateway do not perform
 Search sensing. The mode follows current task types; there is no separate
 camera action or camera-state transition.
 
@@ -24,8 +24,8 @@ constraint. Resolution remains an input to the existing VS utility, potential
 and packet-size calculations.
 
 All task-potential-enabled formal methods now resolve
-`beta_search = beta_vs = beta_com = beta_relay = 3.0`. The potential formulas
-and PBRS difference are unchanged; `no_task_potential` resolves all four
+`beta_search = beta_vs = beta_com = 3.0`. The potential formulas
+and PBRS difference are unchanged; `no_task_potential` resolves all three
 effective shaping coefficients to zero. Training, evaluation and checkpoint
 validation use the same resolved configuration. A checkpoint containing the
 old visual contract or beta values is rejected before continuation. The
@@ -85,7 +85,7 @@ Follow-up files:
 - Schema expectations only: `tests/test_channel_boundary_alignment.py`,
   `tests/test_contract_alignment_v9.py`, `tests/test_design_dataset.py`,
   `tests/test_gs_progress_routing_contract.py`,
-  `tests/test_initial_topology_contract.py`, `tests/test_relay_task_contract.py`,
+  `tests/test_initial_topology_contract.py`,
   `tests/test_training_checkpoints.py`, `tests/test_uav16_contract.py`.
 
 The formal VS injection call is the only production caller of `create_packet`.
@@ -174,7 +174,7 @@ are unchanged. Each capture freezes physical size, coverage, raw image quantity
 and ROI/task identity; the VS QoS denominator excludes invalid intervals;
 timely useful VS bits equal timely physical bits times capture coverage.
 
-Checkpoint schema 29 requires the complete visual contract configuration and
+Checkpoint schema 30 requires the complete visual contract configuration and
 version for both full resume and model-only evaluation. Older schemas,
 missing visual metadata, or changed camera/coverage/packet/weight/validity
 metadata fail before loading weights. All affected methods must be retrained.
@@ -183,7 +183,7 @@ FOV EMA lifecycle v6 represents non-Search footprints as null while preserving
 complete per-UAV checkpoint records and the existing transition/EMA cadence.
 
 Scenario generation, manifest schema/content rules, seeds, CRN, pairing,
-Dinkelbach/ratio objectives, Search/COM/Relay potential formulas, routing reward
+Dinkelbach/ratio objectives, Search/COM potential formulas, routing reward
 and energy formulas are unchanged. The narrower Search footprint intentionally
 changes discovery timing; a short smoke episode can have no routing packets.
 
@@ -242,7 +242,6 @@ expectations affected by this change):
 - `tests/test_paper_figures.py`
 - `tests/test_paper_method_smoke.py`
 - `tests/test_potentials_and_packets.py`
-- `tests/test_relay_task_contract.py`
 - `tests/test_resume_recovery.py`
 - `tests/test_training_checkpoints.py`
 - `tests/test_uav16_contract.py`
@@ -260,12 +259,12 @@ Validation used the existing `anaconda3/envs/LLM_HRL/python.exe` environment.
 
 - Focused Search/VS, assignment, packet and EMA checks: 61 tests and 46
   subtests passed in the initial targeted run.
-- Final geometry, Relay boundary and paper-method checkpoint smoke checks:
+- Final geometry and paper-method checkpoint smoke checks:
   66 tests and 4 subtests passed.
 - Full suite: `python -u -m pytest tests -q -p no:cacheprovider --tb=short
   --disable-warnings --durations=5` — **623 passed, 373 subtests passed**, with
   228 non-failing warnings, in 354.05 seconds. This includes formal runner,
-  evaluation, comparison-method, checkpoint round-trip, packet/COM/Relay,
+  evaluation, comparison-method, checkpoint round-trip, packet/COM,
   routing, energy, Search release and reproducibility regression tests.
 - `git diff --check` passed. A Python-source `rg` audit found no old camera
   constructor parameters, old pixel-derived packet factor, `vs_data_valid`,

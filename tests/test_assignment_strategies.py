@@ -182,37 +182,54 @@ class AssignmentCompatibilityTest(unittest.TestCase):
         np.testing.assert_array_equal(problem.utility_matrix, utility)
         self.assertEqual(solve_assignment_with_dummies(utility, feasible), [(0, 0)])
 
-    def test_k_km_is_capped_at_two_rounds_and_km_at_one(self):
+    def test_k_km_is_two_typed_stages_and_km_is_one_combined_stage(self):
         fov = self._task(0, "FOV", 0.0, 0.0)
         com = self._task(1, "COM", 100.0, 0.0)
         search = self._task(2, "Search", 0.0, 0.0)
         tasks = [fov, com, search]
-        problem = AssignmentProblem(
+        combined = AssignmentProblem(
             uav_ids=(0, 1),
-            tasks=tuple(tasks),
-            original_task_indices=(0, 1, 2),
-            utility_matrix=np.asarray([[1.0, 0.9, 0.1], [0.8, 1.0, 0.1]]),
-            feasible_mask=np.ones((2, 3), dtype=bool),
-            raw_fov_utility=np.zeros((2, 3)),
-            raw_com_utility=np.zeros((2, 3)),
+            tasks=(fov, com),
+            original_task_indices=(0, 1),
+            utility_matrix=np.asarray([[1.0, 0.9], [0.8, 1.0]]),
+            feasible_mask=np.ones((2, 2), dtype=bool),
+            raw_fov_utility=np.zeros((2, 2)),
+            raw_com_utility=np.zeros((2, 2)),
         )
-        for strategy, expected_rounds, max_tasks in (
-            ("k_km", 2, 2),
-            ("km", 1, 1),
-        ):
-            assigner = UAVAssigner(SimpleNamespace())
-            with (mock.patch.object(assigner, "build_problem", return_value=problem),
-                  mock.patch("Task_assignment.plan_relays", return_value=__import__("relay_contract").empty_plan())):
-                assignments = assigner.assign_tasks(
-                    [0, 1], tasks, K=99, strategy=strategy
-                )
-            self.assertLessEqual(len(assigner.last_round_problems), expected_rounds)
-            self.assertTrue(all(len(value) <= max_tasks for value in assignments.values()))
-            selected = [item[0] for value in assignments.values() for item in value]
-            self.assertEqual(len(selected), len(set(selected)))
-            for value in assignments.values():
-                if len(value) == 2:
-                    self.assertEqual({value[0][1], value[1][1]}, {"FOV", "COM"})
+        typed = {
+            ("FOV",): AssignmentProblem(
+                uav_ids=(0, 1), tasks=(fov,), original_task_indices=(0,),
+                utility_matrix=np.asarray([[1.0], [0.0]]),
+                feasible_mask=np.ones((2, 1), dtype=bool),
+                raw_fov_utility=np.zeros((2, 1)), raw_com_utility=np.zeros((2, 1)),
+            ),
+            ("COM",): AssignmentProblem(
+                uav_ids=(0, 1), tasks=(com,), original_task_indices=(1,),
+                utility_matrix=np.asarray([[1.0], [0.0]]),
+                feasible_mask=np.ones((2, 1), dtype=bool),
+                raw_fov_utility=np.zeros((2, 1)), raw_com_utility=np.zeros((2, 1)),
+            ),
+        }
+
+        kkm = UAVAssigner(SimpleNamespace())
+        stages = []
+        def typed_problem(*_args, candidate_task_types, **_kwargs):
+            stages.append(tuple(candidate_task_types))
+            return typed[tuple(candidate_task_types)]
+        with mock.patch.object(kkm, "build_problem", side_effect=typed_problem):
+            assignments = kkm.assign_tasks([0, 1], tasks, K=99, strategy="k_km")
+        self.assertEqual(stages, [("FOV",), ("COM",)])
+        self.assertEqual([item[1] for item in assignments[0]], ["FOV", "COM"])
+        self.assertTrue(all(len(value) <= 2 for value in assignments.values()))
+
+        km = UAVAssigner(SimpleNamespace())
+        with mock.patch.object(km, "build_problem", return_value=combined) as build:
+            assignments = km.assign_tasks([0, 1], tasks, K=99, strategy="km")
+        self.assertEqual(build.call_args.kwargs["candidate_task_types"], ("FOV", "COM"))
+        self.assertEqual(len(km.last_round_problems), 1)
+        self.assertTrue(all(len(value) <= 1 for value in assignments.values()))
+        selected = [item[0] for value in assignments.values() for item in value]
+        self.assertEqual(len(selected), len(set(selected)))
 
 
 class AssignmentLifecycleTest(unittest.TestCase):
@@ -236,10 +253,7 @@ class AssignmentLifecycleTest(unittest.TestCase):
         task_types = [
             tasks[0]["task_type"] for tasks in self.env.multi_tasks.values()
         ]
-        self.assertEqual(task_types.count("Relay"), 0)
-        self.assertTrue(
-            all(task_type in {"Relay", "Hovering"} for task_type in task_types)
-        )
+        self.assertTrue(all(task_type == "Hovering" for task_type in task_types))
         self.assertFalse(any(task.task_type == "Search" for task in self.env.task_list))
 
         self.env.assign_tasks()

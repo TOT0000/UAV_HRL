@@ -47,7 +47,7 @@ class CentralizedMovementStateTest(unittest.TestCase):
         self.env.reset_environment()
         self.packet_engine = PacketEngine(num_uav=16, step_time=0.25)
 
-    def test_state_is_595_finite_side_effect_free_and_routing_is_143(self):
+    def test_state_is_531_finite_side_effect_free_and_routing_is_143(self):
         positions_before = [uav.get_position() for uav in self.env.UAVs]
         tasks_before = {
             uid: [dict(task) for task in tasks]
@@ -83,7 +83,7 @@ class CentralizedMovementStateTest(unittest.TestCase):
     def test_search_potential_is_full_boolean_map_mean(self):
         self.env.visited_bitmap[:] = False
         self.env.visited_bitmap[:100, :250] = True
-        phi_search, _, _, _ = calculate_movement_potentials(self.env, 1.0)
+        phi_search, _, _ = calculate_movement_potentials(self.env, 1.0)
         self.assertAlmostEqual(phi_search, self.env.visited_bitmap.mean())
 
     def test_duplicate_fov_and_com_targets_fail_fast(self):
