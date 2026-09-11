@@ -1,5 +1,4 @@
 from types import SimpleNamespace
-import random
 import unittest
 from unittest import mock
 
@@ -275,33 +274,107 @@ class AssignmentLifecycleTest(unittest.TestCase):
             all(tasks[0]["task_type"] == "Hovering" for tasks in self.env.multi_tasks.values())
         )
 
-    def test_random_assignment_is_seeded_one_round_and_excludes_hover(self):
-        self.env.assignment_strategy = "random_one_to_one"
-        self.env.assignment_rounds = 1
-        self.env.task_list.append(
-            Task(99, "Hovering", self.env.uav_dict[0], 0)
-        )
-        random.seed(1234)
-        with mock.patch(
-            "Task_assignment.assignment_fov_pair_geometry",
-            side_effect=AssertionError("random assignment must not score utilities"),
+    def _service_tasks(self):
+        tasks = []
+        for gt in self.env.gts:
+            gt.is_found = True
+            sr = self.env.SR_teams[gt.id]
+            sr.assigned_gt_id = gt.id
+            tasks.extend(
+                [
+                    Task(len(tasks), "FOV", gt, gt.id),
+                    Task(len(tasks) + 1, "COM", sr, sr.id),
+                ]
+            )
+        return tasks
+
+    def test_random_assignment_round_count_and_typed_order(self):
+        tasks = self._service_tasks()
+        for rounds, expected_types in (
+            (0, set()),
+            (-1, set()),
+            (1, {"FOV"}),
+            (2, {"FOV", "COM"}),
+            (99, {"FOV", "COM"}),
         ):
-            self.env.assign_tasks()
-        first = {
-            uid: tuple(task["target_id"] for task in tasks)
-            for uid, tasks in self.env.multi_tasks.items()
-        }
-        random.seed(1234)
-        self.env.assign_tasks()
-        second = {
-            uid: tuple(task["target_id"] for task in tasks)
-            for uid, tasks in self.env.multi_tasks.items()
-        }
-        self.assertEqual(first, second)
-        self.assertTrue(all(len(tasks) == 1 for tasks in self.env.multi_tasks.values()))
-        self.assertTrue(
-            all(tasks[0]["task_type"] != "Hovering" for tasks in self.env.multi_tasks.values())
+            with self.subTest(rounds=rounds):
+                self.env.assignment_rng = np.random.default_rng(1234)
+                assigner = UAVAssigner(self.env)
+                assigned = assigner.assign_tasks(
+                    [1, 2], tasks, K=rounds, strategy="random_one_to_one"
+                )
+                observed = {item[1] for entries in assigned.values() for item in entries}
+                self.assertEqual(observed, expected_types)
+                self.assertEqual(len(assigner.last_round_problems), min(max(rounds, 0), 2))
+
+    def test_random_assignment_reuses_uav_by_type_and_preserves_uniqueness(self):
+        tasks = self._service_tasks()
+        assigned = UAVAssigner(self.env).assign_tasks(
+            [1], tasks[:2], K=2, strategy="random_one_to_one"
         )
+        self.assertEqual([item[1] for item in assigned[1]], ["FOV", "COM"])
+
+        assigned = UAVAssigner(self.env).assign_tasks(
+            [1, 2], tasks, K=2, strategy="random_one_to_one"
+        )
+        selected = [item[0] for entries in assigned.values() for item in entries]
+        self.assertEqual(len(selected), len(set(selected)))
+        for entries in assigned.values():
+            types = [item[1] for item in entries]
+            self.assertLessEqual(types.count("FOV"), 1)
+            self.assertLessEqual(types.count("COM"), 1)
+
+    def test_random_assignment_uses_named_rng_and_never_computes_utility(self):
+        tasks = self._service_tasks()
+
+        def run(seed):
+            self.env.assignment_rng = np.random.default_rng(seed)
+            assigner = UAVAssigner(self.env)
+            with (
+                mock.patch.object(
+                    assigner,
+                    "build_problem",
+                    side_effect=AssertionError("Random must not build utility matrices"),
+                ),
+                mock.patch(
+                    "Task_assignment.assignment_fov_pair_geometry",
+                    side_effect=AssertionError("Random must not score FOV utility"),
+                ),
+                mock.patch.object(
+                    self.env,
+                    "get_sr_uav_normalized_utility",
+                    side_effect=AssertionError("Random must not score COM utility"),
+                ),
+            ):
+                return assigner.assign_tasks(
+                    list(range(1, 8)), tasks, K=2, strategy="random_one_to_one"
+                )
+
+        first = run(1234)
+        second = run(1234)
+        third = run(4321)
+        self.assertEqual(first, second)
+        self.assertNotEqual(first, third)
+
+    def test_random_environment_excludes_gateway_reserved_and_fallback_tasks(self):
+        self.env.assignment_strategy = "random_one_to_one"
+        self.env.assignment_rounds = 2
+        self.env.task_list = self._service_tasks() + [
+            Task(4, "Search", self.env.uav_dict[3], 3),
+            Task(5, "Hovering", self.env.uav_dict[4], 4),
+        ]
+        self.env.assign_tasks()
+        for uid in (self.env.permanent_gs_gateway_uav_id, *self.env.reserved_search_uav_ids):
+            self.assertFalse(
+                any(task["task_type"] in {"FOV", "COM"} for task in self.env.multi_tasks[uid])
+            )
+        assigned_types = {
+            task["task_type"]
+            for tasks_by_uav in self.env.multi_tasks.values()
+            for task in tasks_by_uav
+            if task.get("target_id") is not None
+        }
+        self.assertEqual(assigned_types, {"FOV", "COM"})
 
     def test_crossing_distance_threshold_does_not_create_a_reassignment_event(self):
         before = self.env.assignment_invocations

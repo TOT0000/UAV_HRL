@@ -10,8 +10,10 @@ import pytest
 
 from visual_sensing import (
     CAMERA, SEARCH_CAMERA, VS_CAMERA, VISUAL_SENSING_CONTRACT_VERSION,
+    SEARCH_DETECTION_OVERLAP_THRESHOLD, SearchFootprint,
     VS_PACKET_MAX_BITS,
-    circle_polygon_intersection_area, search_footprint, vs_geometry,
+    circle_polygon_intersection_area, search_detection_overlap_ratio,
+    search_footprint, vs_geometry,
     visual_sensing_metadata,
 )
 from centralized_movement import calculate_movement_potentials, fov_task_geometry, fov_task_metrics
@@ -82,7 +84,9 @@ def test_visual_metadata_records_modes_and_no_resolution_thresholds():
         == metadata['vs_camera']['image_length_m']
     )
     assert 'nadir' in metadata['search_model']
-    assert 'ROI-center-inclusive' in metadata['search_model']
+    assert 'effective Search footprint' in metadata['search_model']
+    assert metadata['search_detection']['threshold'] == pytest.approx(0.25)
+    assert metadata['search_detection']['boundary_rule'] == 'inclusive_greater_than_or_equal'
     assert 'oblique' in metadata['vs_model']
     assert metadata['minimum_resolution_hard_constraint'] == {
         'search': False,
@@ -91,17 +95,17 @@ def test_visual_metadata_records_modes_and_no_resolution_thresholds():
     assert 'FOV or FOV+COM -> VS camera' in metadata['camera_mode_selection']
 
 
-def test_search_boundary_outside_and_one_frozen_footprint():
+def test_search_overlap_and_one_frozen_footprint():
     env, target, uav, _ = environment()
     env.multi_tasks[1] = [{"task_type": "Search"}]
     fp = env.search_footprint(1)
-    target.x, target.y = fp.xmax, fp.ymax
+    target.x, target.y = uav.x_u, uav.y_u
     assert env.is_visible(1, target)
-    target.x = fp.xmax + 1e-5
+    target.x = fp.xmax + target.radius
     assert not env.is_visible(1, target)
     target.x, target.y = uav.x_u + 450, uav.y_u + 450
     assert not env.is_visible(1, target)  # Old full-circle dL/dR gate could pass.
-    target.x, target.y = fp.xmax, fp.ymax
+    target.x, target.y = uav.x_u, uav.y_u
     expected = np.zeros_like(env.visited_bitmap)
     indices = env.fov_footprint_indices(1, footprint=fp)
     x0, x1, y0, y1 = indices
@@ -135,19 +139,103 @@ def test_nonsearch_cannot_discover_or_contribute(roles):
     assert env.mark_search_coverage(1, coverage_contributor=False).current_footprint is None
 
 
-def test_permanent_gateway_never_contributes_search_sensing():
+def test_permanent_gateway_contributes_search_sensing_while_searching():
     env, target, _, _ = environment()
     gateway_id = env.permanent_gs_gateway_uav_id
     gateway = env.uav_dict[gateway_id]
+    target.x, target.y = 100.0, 100.0
     gateway.x_u, gateway.y_u, gateway.z_u = target.x, target.y, 100.0
     env.multi_tasks[gateway_id] = [{'task_type': 'Search'}]
     before = env.visited_bitmap.copy()
-    assert not env.is_search_contributor(gateway_id)
-    assert not env.is_visible(gateway_id, target)
+    assert env.is_search_contributor(gateway_id)
+    assert env.is_visible(gateway_id, target)
+    env.update_visited_grid(gateway_id)
+    assert target.is_found
+    assert target.found_by == gateway_id
     transition = env.mark_search_coverage(gateway_id)
-    assert not transition.coverage_contributor
-    assert transition.current_footprint is None
-    np.testing.assert_array_equal(env.visited_bitmap, before)
+    assert transition.coverage_contributor
+    assert transition.current_footprint is not None
+    assert env.visited_bitmap.sum() > before.sum()
+    env.visited_bitmap[:] = True
+    env.convert_search_to_hovering()
+    assert env.multi_tasks[gateway_id][0]["task_type"] == "Hovering"
+    assert not env.is_search_contributor(gateway_id)
+
+
+def test_search_discovery_uses_inclusive_overlap_threshold_and_no_duplicates():
+    env, target, _, _ = environment()
+    env.multi_tasks[1] = [{"task_type": "Search"}]
+    footprint = SearchFootprint(100.0, 104.0, 100.0, 100.0 + math.pi)
+    target.x, target.y, target.radius = 102.0, 100.0 + math.pi / 2.0, 1.0
+    assert env.is_visible(1, target, footprint=footprint)
+    before = len(env.task_list)
+    env.update_visited_grid(1, footprint=footprint)
+    assert target.is_found
+    assert len(env.task_list) == before + 2
+    env.update_visited_grid(1, footprint=footprint)
+    assert len(env.task_list) == before + 2
+
+
+def test_search_overlap_ratio_threshold_boundary_radius_and_map_clipping():
+    footprint = SearchFootprint(0.0, 4.0, 0.0, math.pi)
+    bounds = (0.0, 4.0, 0.0, math.pi)
+    centered = (2.0, math.pi / 2.0)
+    exact = search_detection_overlap_ratio(
+        footprint, centered, 1.0, map_bounds=bounds
+    )
+    below = search_detection_overlap_ratio(
+        footprint,
+        centered,
+        math.sqrt(1.0 - 4e-6),
+        map_bounds=bounds,
+    )
+    above = search_detection_overlap_ratio(
+        footprint, centered, 1.01, map_bounds=bounds
+    )
+    assert SEARCH_DETECTION_OVERLAP_THRESHOLD == pytest.approx(0.25)
+    assert exact == pytest.approx(0.25, abs=1e-12)
+    assert below < SEARCH_DETECTION_OVERLAP_THRESHOLD
+    assert above > SEARCH_DETECTION_OVERLAP_THRESHOLD
+
+    clipped = SearchFootprint(-2.0, 2.0, 0.0, math.pi)
+    clipped_ratio = search_detection_overlap_ratio(
+        clipped, (1.0, math.pi / 2.0), 1.0,
+        map_bounds=(0.0, 4.0, 0.0, math.pi),
+    )
+    assert clipped_ratio == pytest.approx(0.5, abs=1e-12)
+    assert search_detection_overlap_ratio(
+        footprint, (20.0, 20.0), 1.0, map_bounds=bounds
+    ) == 0.0
+    assert search_detection_overlap_ratio(
+        footprint, centered, 0.5, map_bounds=bounds
+    ) == pytest.approx(0.0625, abs=1e-12)
+    assert search_detection_overlap_ratio(
+        None, centered, 1.0, map_bounds=bounds
+    ) == 0.0
+    assert search_detection_overlap_ratio(
+        SearchFootprint(1.0, 1.0, 0.0, 1.0),
+        centered,
+        1.0,
+        map_bounds=bounds,
+    ) == 0.0
+    assert search_detection_overlap_ratio(
+        footprint, centered, math.nan, map_bounds=bounds
+    ) == 0.0
+
+
+def test_search_center_can_be_outside_when_overlap_reaches_threshold():
+    footprint = SearchFootprint(0.0, 4.0, 0.0, math.pi)
+    center = (-0.2, math.pi / 2.0)
+    ratio = search_detection_overlap_ratio(
+        footprint, center, 2.0, map_bounds=(0.0, 4.0, 0.0, math.pi)
+    )
+    assert not footprint.contains(*center)
+    assert ratio >= SEARCH_DETECTION_OVERLAP_THRESHOLD
+    edge_ratio = search_detection_overlap_ratio(
+        footprint, (-0.19, math.pi / 2.0), 0.2,
+        map_bounds=(0.0, 4.0, 0.0, math.pi),
+    )
+    assert 0.0 < edge_ratio < SEARCH_DETECTION_OVERLAP_THRESHOLD
 
 
 def test_nadir_vs_area_raw_quantity_and_relative_altitude():
@@ -307,6 +395,9 @@ def test_all_method_assignments_share_visual_model(method_id):
     assert calculate_movement_potentials(env,1)[1] == pytest.approx(g.pair_score)
     cfg = effective_training_config(TrainingConfig(total_episodes=1),method)
     assert cfg['visual_sensing_configuration'] == visual_sensing_metadata()
+    assert cfg['search_detection_overlap_threshold'] == pytest.approx(0.25)
+    assert cfg['permanent_gateway_search_contributor'] is True
+    assert cfg['random_assignment_uses_utility'] is False
     env.source_uavs = {uid}
     engine = PacketEngine(num_uav=16, step_time=.25)
     # Every registry method follows the same invalid -> valid scheduler gate.
@@ -326,9 +417,29 @@ def test_all_method_assignments_share_visual_model(method_id):
     assert KM is Rand is Simulator
 
 
+@pytest.mark.parametrize('method_id', list(METHOD_REGISTRY))
+def test_all_methods_share_gateway_search_contribution(method_id):
+    env, target, _, _ = environment()
+    env.configure_method(MethodSpec.parse(method_id))
+    gateway_id = env.permanent_gs_gateway_uav_id
+    gateway = env.uav_dict[gateway_id]
+    target.x, target.y = gateway.x_u, gateway.y_u
+    env.multi_tasks[gateway_id] = [{"task_type": "Search"}]
+    assert env.is_search_contributor(gateway_id)
+    assert env.is_visible(gateway_id, target)
+    record = _sensing_coverage(env, gateway_id)
+    assert len(record) == 1
+    assert record[0]["model"] == visual_sensing_metadata()["search_camera"]
+
+
 def test_checkpoint_rejects_old_missing_or_changed_visual_contract():
-    with pytest.raises(RuntimeError, match='retrained'):
+    with pytest.raises(RuntimeError) as rejected:
         _validate_checkpoint_schema({'checkpoint_schema_version': CHECKPOINT_SCHEMA_VERSION-1})
+    message = str(rejected.value)
+    assert 'ROI-center Search discovery' in message
+    assert 'permanent gateway' in message
+    assert 'mixed Random assignment' in message
+    assert 'schema v31' in message
     current = {'checkpoint_schema_version': CHECKPOINT_SCHEMA_VERSION,
                'visual_sensing_contract_version': VISUAL_SENSING_CONTRACT_VERSION,
                'visual_sensing_configuration': visual_sensing_metadata()}

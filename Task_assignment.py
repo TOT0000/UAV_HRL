@@ -196,8 +196,12 @@ class UAVAssigner:
             else coverage_threshold
         )
         if strategy == "random_one_to_one":
-            self.random_assign_tasks(uav_id_list, task_list,
-                                     coverage_threshold=coverage_threshold)
+            self.random_assign_tasks(
+                uav_id_list,
+                task_list,
+                K=K,
+                coverage_threshold=coverage_threshold,
+            )
         elif strategy == "km":
             self.assign_uav_tasks_k_times(
                 uav_id_list,
@@ -401,24 +405,77 @@ class UAVAssigner:
                 available.remove(original_index)
         return self.assignments
 
-    def random_assign_tasks(self, uav_list, task_list, *, coverage_threshold=SEARCH_COVERAGE_THRESHOLD):
-        """Two random feasible FOV/COM rounds using the official assignment RNG."""
+    def _random_pair_is_feasible(self, uav_id, task):
+        """Evaluate assignment eligibility without computing assignment utility."""
+
+        uav = self.env.uav_dict[int(uav_id)]
+        if task.task_type == "FOV":
+            gt = self.env.gts[int(task.target_obj_id)]
+            return bool(
+                gt.is_found
+                and np.isfinite(uav.get_position()).all()
+                and np.isfinite(gt.get_position()).all()
+                and uav.min_AGL <= uav.z_u <= uav.max_AGL
+                and uav.z_u > gt.z
+                and math.isfinite(gt.radius)
+                and gt.radius > 0
+            )
+        if task.task_type == "COM":
+            sr = self.env.SR_teams[int(task.target_obj_id)]
+            return bool(
+                sr.assigned_gt_id is not None
+                and np.isfinite(uav.get_position()).all()
+                and np.isfinite(sr.get_position()).all()
+            )
+        return False
+
+    def random_assign_tasks(
+        self,
+        uav_list,
+        task_list,
+        K=2,
+        *,
+        coverage_threshold=SEARCH_COVERAGE_THRESHOLD,
+    ):
+        """Run seeded randomized greedy FOV then COM feasibility-only rounds."""
+
+        del coverage_threshold
         self.assignments = {int(uid): [] for uid in uav_list}
-        problem = self.build_problem(uav_list, task_list, coverage_threshold=coverage_threshold)
-        available = set(problem.original_task_indices)
         self.last_round_problems = []
-        for round_index in range(2):
-            feasible = self._round_feasible_mask(problem, self.assignments, available, round_index)
-            rows = list(range(len(problem.uav_ids)))
+        rounds = min(max(int(K), 0), 2)
+        typed_rounds = SERVICE_TASK_TYPES[:rounds]
+        uav_ids = tuple(int(uid) for uid in uav_list)
+        for task_type in typed_rounds:
+            candidates = self._candidate_tasks(
+                task_list,
+                SEARCH_COVERAGE_THRESHOLD,
+                candidate_task_types=(task_type,),
+            )
+            task_indices = tuple(index for index, _task in candidates)
+            tasks = tuple(task for _index, task in candidates)
+            feasible = np.asarray(
+                [
+                    [self._random_pair_is_feasible(uav_id, task) for task in tasks]
+                    for uav_id in uav_ids
+                ],
+                dtype=bool,
+            ).reshape((len(uav_ids), len(tasks)))
+            # Keep round diagnostics structurally compatible without evaluating
+            # FOV/COM utility: zeros are selection-neutral placeholders.
+            self.last_round_problems.append(
+                (np.zeros(feasible.shape, dtype=float), feasible.copy())
+            )
+            available = set(task_indices)
+            rows = list(range(len(uav_ids)))
             self.env.assignment_rng.shuffle(rows)
             for row in rows:
-                choices = [col for col, idx in enumerate(problem.original_task_indices)
+                choices = [col for col, idx in enumerate(task_indices)
                            if feasible[row, col] and idx in available]
                 if not choices:
                     continue
                 column = int(self.env.assignment_rng.choice(choices))
-                index = problem.original_task_indices[column]
-                self.assignments[problem.uav_ids[row]].append((index, problem.tasks[column].task_type, 0.0))
+                index = task_indices[column]
+                self.assignments[uav_ids[row]].append((index, task_type, 0.0))
                 available.remove(index)
         return self.assignments
 

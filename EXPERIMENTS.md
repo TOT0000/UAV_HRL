@@ -46,8 +46,10 @@ FOV assignment uses `visual_sensing.vs_geometry` through
 Assignment eligibility is independent of current sensing validity: UAVs outside
 the oblique range can accept a task and approach it. Existing target, altitude,
 role and task-count checks still apply. Equal normalized values remain 0.5.
-The seeded random-assignment
-baseline chooses among feasible pairs without using utility scores. Equal dummy candidates are reported
+The seeded random-assignment baseline uses `env.assignment_rng` and runs a
+feasibility-only FOV round followed, when requested, by a COM round. It does not
+build FOV/COM utility matrices; a first-round FOV UAV remains eligible for one
+COM task. Equal dummy candidates are reported
 as `dummy_1`, `dummy_2`, ... in deterministic row/ID order.
 
 ```powershell
@@ -164,7 +166,7 @@ Relay diagnostics artifact.
   Timely FOV useful bits are `size_bits * capture_coverage_ratio`; timely COM
   useful bits are the full `size_bits`; late packets contribute zero useful bits
 - At each one-second Search boundary each Search contributor freezes one nadir
-  footprint for both inclusive ROI-center discovery and bitmap updates. Its
+  footprint for both 25% effective-footprint overlap discovery and bitmap updates. Its
   unvisited, frontier, overlap, and `map_changed` use the immutable pre-commit
   bitmap. Non-Search UAVs contribute empty samples and have no Search footprint.
   The frozen all-UAV samples update EMA after coverage commit and before
@@ -228,14 +230,18 @@ The shared image plane is 0.0156 m wide by 0.0235 m long. Search and VS use
 explicit task-mode camera configurations. `SEARCH_CAMERA` has focal length
 0.0175 m and `search_footprint` produces an 89.142857 by 134.285714 m nadir
 rectangle at 100 m altitude. This doubles both dimensions and quadruples the
-area of the former 0.035 m Search footprint. Only non-gateway UAVs with a
-current Search task update `visited_bitmap` or discover an undiscovered ROI
-whose center lies inside or on the footprint boundary.
+area of the former 0.035 m Search footprint. Every UAV with a current Search
+task, including permanent gateway UAV 0, updates `visited_bitmap`. Discovery
+uses the analytic overlap between the circular ROI (with `gt.radius`) and the
+Search rectangle clipped to the map, divided by that clipped rectangle area;
+the inclusive threshold is 0.25. Empty or invalid effective geometry fails
+closed.
 
 `VS_CAMERA` retains focal length 0.035 m. `vs_geometry` aims at the assigned ROI
 center and projects all four sensor rays onto its ground plane. FOV and FOV+COM
-use VS mode; COM-only, Hovering and the permanent GS gateway perform no
-Search sensing. Camera mode is derived from the current task types and has no
+use VS mode; COM-only and Hovering UAVs perform no Search sensing. UAV 0 uses
+Search sensing while its task is Search and remains excluded from FOV/COM
+assignment. Camera mode is derived from the current task types and has no
 independent per-step state transition. Sensor width follows the tilt plane and
 sensor height is cross-track; the polygon rotates with bearing (nadir
 deterministically uses +x).
@@ -546,8 +552,13 @@ python -X utf8 comparison_experiment.py aggregate --input-dir runs/comparison/ev
 
 Exact-resume checkpoints validate the method fingerprint, training-manifest
 relationship, training seed, the complete Dinkelbach block state, and its configuration.
-Checkpoint schema v30 removes the explicit Relay task, its movement observation
-fields, potential, replay fields, checkpoint metadata and diagnostics. It requires
+Checkpoint schema v31 retains the service-only 531-D contract and adds the 25%
+effective-footprint Search discovery rule, gateway Search contribution, and
+typed feasibility-only Random rounds. Schema v30 used ROI-center discovery,
+excluded the gateway from Search, and used mixed Random rounds, so it is
+rejected before weights or replay are loaded. Schema v29 removed the explicit
+Relay task, its movement observation fields, potential, replay fields,
+checkpoint metadata and diagnostics. The current schema requires
 valid-sensing VS generation and assignment-local
 rate credit in the canonical visual-sensing contract, alongside the 16-UAV action-wise-GS-progress,
 continuous-hard-only-gateway,
@@ -558,7 +569,7 @@ boundary-aligned current/next decision-state Search/VS/COM potentials plus soft-
 reward, GS-reachable initial topology, distance-aware VS/COM task potentials,
 hard-range/COM-session, atomic-FOV, seed-ratio
 aggregation, propulsion, and four-slot/fifty-block movement-channel contract.
-Schema v29 and every older schema is rejected before weights or replay state are
+Schema v30 and every older schema is rejected before weights or replay state are
 restored and must be retrained; v29 receives an explicit retired-Relay-schema
 error and no legacy checkpoint migration is attempted.
 Model-only evaluation checkpoints also validate the visual version and complete

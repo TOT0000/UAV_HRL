@@ -3,19 +3,21 @@
 ## Task-selected Search/VS camera follow-up
 
 The current visual contract is
-`task-selected-search-17p5mm-vs-35mm-valid-capture-v3`. Both modes use the
+`task-selected-search-effective-overlap25-gateway-v4`. Both modes use the
 0.0156 m by 0.0235 m image plane. Search uses a 0.0175 m focal length and a
 fixed nadir footprint; VS keeps the 0.035 m focal length and the existing
 oblique camera aimed at the assigned ROI. At 100 m, the Search footprint is
 89.142857 m by 134.285714 m, twice the former length and width and four times
 its area.
 
-Only a non-gateway UAV with a current Search task contributes a Search
-footprint, changes `visited_bitmap`, or discovers an undiscovered ROI whose
-center is inside or on the footprint boundary. FOV and FOV+COM UAVs use VS
-mode. COM-only, Hovering and the permanent GS gateway do not perform
-Search sensing. The mode follows current task types; there is no separate
-camera action or camera-state transition.
+Every UAV with a current Search task, including permanent gateway UAV 0,
+contributes a Search footprint and changes `visited_bitmap`. An undiscovered
+circular ROI is detected when its intersection with the Search rectangle is at
+least 25% of the Search rectangle after clipping that rectangle to the map.
+The comparison is inclusive and uses `gt.radius`; an empty or invalid effective
+footprint cannot detect. FOV and FOV+COM UAVs use VS mode. COM-only and
+Hovering UAVs do not perform Search sensing. The mode follows current task
+types; there is no separate camera action or camera-state transition.
 
 FOV assignment utility, VS potential, coverage, image quantity, packet
 generation and packet size continue to use `VS_CAMERA` and retain the original
@@ -29,7 +31,7 @@ and PBRS difference are unchanged; `no_task_potential` resolves all three
 effective shaping coefficients to zero. Training, evaluation and checkpoint
 validation use the same resolved configuration. A checkpoint containing the
 old visual contract or beta values is rejected before continuation. The
-checkpoint schema remains **29**.
+current checkpoint schema is **31**.
 
 Original geometry change base: `feature/centralized-td3`, HEAD
 `84531f859ed6ab3291d14091e67ba0c8cce6398d`.
@@ -122,7 +124,8 @@ not used by Search production paths.
 - `search_footprint`: fixed nadir rectangle, 89.142857 by 134.285714 m at 100 m.
   `HRL_task_aware._mark_search_observations` freezes one continuous footprint
   per Search contributor and passes it to both discovery and bitmap sampling.
-  Discovery tests the ROI center inclusively; it never uses full-ROI coverage.
+  Discovery uses deterministic analytic circle/rectangle intersection divided
+  by the map-clipped effective rectangle area with an inclusive 0.25 threshold.
   Non-Search transitions contain no footprint and zero raw Search samples.
 - `vs_geometry`: target-pointing camera rays project all four sensor corners
   onto the ROI ground plane. Sensor width follows the tilt plane, sensor height
@@ -174,8 +177,10 @@ are unchanged. Each capture freezes physical size, coverage, raw image quantity
 and ROI/task identity; the VS QoS denominator excludes invalid intervals;
 timely useful VS bits equal timely physical bits times capture coverage.
 
-Checkpoint schema 30 requires the complete visual contract configuration and
-version for both full resume and model-only evaluation. Older schemas,
+Checkpoint schema 31 requires the complete visual contract configuration and
+version for both full resume and model-only evaluation. Schema 30 is rejected
+because it used ROI-center discovery, excluded the permanent gateway from
+Search contribution and used the former mixed Random rounds. Older schemas,
 missing visual metadata, or changed camera/coverage/packet/weight/validity
 metadata fail before loading weights. All affected methods must be retrained.
 Training/evaluation configs and metadata publish the canonical configuration.

@@ -37,8 +37,9 @@ VS_PACKET_MAX_BITS = 31_600.0
 VS_QUALITY_WEIGHT = 0.8
 VS_PROXIMITY_WEIGHT = 0.2
 VISUAL_SENSING_CONTRACT_VERSION = (
-    "task-selected-search-17p5mm-vs-35mm-valid-capture-v3"
+    "task-selected-search-effective-overlap25-gateway-v4"
 )
+SEARCH_DETECTION_OVERLAP_THRESHOLD = 0.25
 DISTANCE_EPSILON_M = 1e-9
 SINGULAR_RAY_EPSILON = 1e-8
 
@@ -57,14 +58,23 @@ def visual_sensing_metadata():
         "default_roi_radius_m": DEFAULT_ROI_RADIUS_M,
         "roi_radius_source": "scenario target object",
         "search_model": (
-            "nadir rectangle; undiscovered ROI-center-inclusive detection; "
-            "Search contributors excluding permanent GS gateway"
+            "nadir rectangle; undiscovered circular ROI detected when its "
+            "overlap with the map-clipped effective Search footprint is at "
+            "least 25%; permanent GS gateway contributes while assigned Search"
         ),
         "vs_model": "oblique camera aimed at assigned ROI",
         "camera_mode_selection": (
             "Search task -> Search camera; FOV or FOV+COM -> VS camera; "
-            "COM-only, Hovering and permanent GS gateway -> no sensing"
+            "COM-only and Hovering -> no sensing; permanent GS gateway uses "
+            "Search camera while its task is Search"
         ),
+        "search_detection": {
+            "metric": "area(effective_search_footprint intersect circular_roi) / area(effective_search_footprint)",
+            "threshold": SEARCH_DETECTION_OVERLAP_THRESHOLD,
+            "boundary_rule": "inclusive_greater_than_or_equal",
+            "effective_footprint": "Search footprint clipped to map bounds",
+            "roi_radius_source": "scenario target object gt.radius",
+        },
         "camera_mode_state": (
             "derived from current task types; no independent per-step transition"
         ),
@@ -122,6 +132,72 @@ def search_footprint(position, ground_z=0.0, camera=SEARCH_CAMERA):
     width = altitude * camera.image_width_m / camera.f_m
     height = altitude * camera.image_length_m / camera.f_m
     return SearchFootprint(x-width/2, x+width/2, y-height/2, y+height/2)
+
+
+def search_detection_overlap_ratio(
+    footprint,
+    roi_center,
+    roi_radius,
+    *,
+    map_bounds,
+):
+    """Return circular-RoI overlap divided by map-clipped footprint area.
+
+    Invalid or empty effective geometry fails closed with a zero ratio.  The
+    analytic circle/polygon routine keeps the result deterministic and avoids
+    coupling discovery to the coverage bitmap resolution.
+    """
+
+    if footprint is None:
+        return 0.0
+    try:
+        map_xmin, map_xmax, map_ymin, map_ymax = map(float, map_bounds)
+        center = np.asarray(roi_center, dtype=float)
+        radius = float(roi_radius)
+        values = (
+            float(footprint.xmin),
+            float(footprint.xmax),
+            float(footprint.ymin),
+            float(footprint.ymax),
+            map_xmin,
+            map_xmax,
+            map_ymin,
+            map_ymax,
+            radius,
+        )
+    except (AttributeError, TypeError, ValueError):
+        return 0.0
+    if (
+        center.shape != (2,)
+        or not np.isfinite(center).all()
+        or not all(math.isfinite(value) for value in values)
+        or radius <= 0.0
+        or map_xmax <= map_xmin
+        or map_ymax <= map_ymin
+    ):
+        return 0.0
+    xmin = max(float(footprint.xmin), map_xmin)
+    xmax = min(float(footprint.xmax), map_xmax)
+    ymin = max(float(footprint.ymin), map_ymin)
+    ymax = min(float(footprint.ymax), map_ymax)
+    width, height = xmax - xmin, ymax - ymin
+    effective_area = width * height
+    if not math.isfinite(effective_area) or effective_area <= 0.0:
+        return 0.0
+    center_x, center_y = map(float, center)
+    if (
+        center_x + radius <= xmin
+        or center_x - radius >= xmax
+        or center_y + radius <= ymin
+        or center_y - radius >= ymax
+    ):
+        return 0.0
+    polygon = ((xmin, ymin), (xmax, ymin), (xmax, ymax), (xmin, ymax))
+    overlap = circle_polygon_intersection_area(polygon, center, radius)
+    ratio = overlap / effective_area
+    if not math.isfinite(ratio):
+        return 0.0
+    return float(min(max(ratio, 0.0), 1.0))
 
 
 def _cross(a, b):

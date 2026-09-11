@@ -10,7 +10,11 @@ from types import MappingProxyType
 
 from movement_feature_schema import LOCAL_MOVEMENT_DIM
 
-from visual_sensing import VISUAL_SENSING_CONTRACT_VERSION, visual_sensing_metadata
+from visual_sensing import (
+    SEARCH_DETECTION_OVERLAP_THRESHOLD,
+    VISUAL_SENSING_CONTRACT_VERSION,
+    visual_sensing_metadata,
+)
 from communication_contract import (
     COMMUNICATION_RANGE_BOUNDARY_RULE,
     MAX_3D_COMMUNICATION_DISTANCE_M,
@@ -62,7 +66,7 @@ GS_GATEWAY_SOFT_RADIUS_OPERATIONAL = False
 GS_GATEWAY_HARD_RADIUS_M = MAX_3D_COMMUNICATION_DISTANCE_M
 GS_GATEWAY_PROJECTION_MODE = "gs_3d_hard_only"
 GS_GATEWAY_CONTRACT_VERSION = (
-    "permanent-uav0-search-to-hover-altitude-feasible-3d-hard400-only-v3"
+    "permanent-uav0-search-contributor-to-hover-3d-hard400-only-v4"
 )
 CANONICAL_UAV_INITIAL_XY_M = (
     (100.0, 100.0),
@@ -99,15 +103,20 @@ TASK_POTENTIAL_BETA_VS = 3.0
 TASK_POTENTIAL_BETA_COM = 3.0
 COM_CAPACITY_POTENTIAL_WEIGHT = 0.5
 COM_DISTANCE_POTENTIAL_WEIGHT = 0.5
-ASSIGNMENT_CONTRACT_VERSION = "service-only-k-km-two-stage-km-single-stage-v1"
+ASSIGNMENT_CONTRACT_VERSION = (
+    "service-only-k-km-two-stage-km-single-random-typed-rounds-v2"
+)
 ASSIGNMENT_FLOW_BY_STRATEGY = MappingProxyType(
     {
         "k_km": "FOV matching followed by COM matching with UAV reuse",
         "km": "single matching over the combined FOV and COM task set",
-        "random_one_to_one": "two random feasible FOV/COM rounds",
+        "random_one_to_one": (
+            "seeded feasibility-only FOV round followed by COM round; "
+            "assignment_rounds selects zero, FOV-only, or both"
+        ),
     }
 )
-METHOD_CONTRACT_VERSION = "centralized-16-uav-service-only-v7"
+METHOD_CONTRACT_VERSION = "centralized-16-uav-overlap-search-random-typed-v8"
 DEFAULT_TRAINING_SEED = 20260817
 FORMAL_TRAINING_EPISODES = 1500
 FORMAL_CHECKPOINT_EPISODE = FORMAL_TRAINING_EPISODES
@@ -934,8 +943,13 @@ def comparison_method_configuration(method_spec: MethodSpec) -> dict:
         "movement_replay_contract_version": MOVEMENT_REPLAY_CONTRACT_VERSION,
         "assignment_contract_version": ASSIGNMENT_CONTRACT_VERSION,
         "assignment_flow": ASSIGNMENT_FLOW_BY_STRATEGY[method_spec.assignment],
+        "random_assignment_algorithm": (
+            "seeded_randomized_greedy_typed_feasible_pairs"
+        ),
+        "random_assignment_uses_utility": False,
         "ground_station_position_m": list(GROUND_STATION_POSITION_M),
         "permanent_gs_gateway_uav_id": PERMANENT_GS_GATEWAY_UAV_ID,
+        "permanent_gateway_search_contributor": True,
         "gs_gateway_soft_radius_m": GS_GATEWAY_SOFT_RADIUS_M,
         "gs_gateway_soft_radius_operational": GS_GATEWAY_SOFT_RADIUS_OPERATIONAL,
         "gs_gateway_hard_radius_m": GS_GATEWAY_HARD_RADIUS_M,
@@ -948,6 +962,9 @@ def comparison_method_configuration(method_spec: MethodSpec) -> dict:
         "fov_com_pair_max_distance_m": FOV_COM_PAIR_MAX_DISTANCE_M,
         "reserved_search_uav_ids": list(RESERVED_SEARCH_UAV_IDS),
         "search_coverage_threshold": SEARCH_COVERAGE_THRESHOLD,
+        "search_detection_overlap_threshold": (
+            SEARCH_DETECTION_OVERLAP_THRESHOLD
+        ),
         "service_assignment_only": True,
         "utility_normalization_mode": UTILITY_NORMALIZATION_MODE,
         "com_utility_contract_version": COM_UTILITY_CONTRACT_VERSION,

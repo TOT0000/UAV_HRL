@@ -28,7 +28,11 @@ from Channel_model import (
     normalized_s2u_capacity_utility,
     reference_s2u_max_capacity_mbps,
 )
-from visual_sensing import search_footprint
+from visual_sensing import (
+    SEARCH_DETECTION_OVERLAP_THRESHOLD,
+    search_detection_overlap_ratio,
+    search_footprint,
+)
 from collections import defaultdict
 from Energy_model import EnergyConsumptionModel
 from Task_assignment import UAVAssigner, Task
@@ -427,7 +431,6 @@ class Simulator:
     def is_search_contributor(self, uav_id):
         return (
             not self._search_phase_over
-            and int(uav_id) != int(self.permanent_gs_gateway_uav_id)
             and any(
                 task.get("task_type") == "Search"
                 for task in self.multi_tasks.get(uav_id, ())
@@ -441,7 +444,23 @@ class Simulator:
         if not coverage_contributor or not self.is_search_contributor(uav_id):
             return False
         footprint = footprint if footprint is not None else self.search_footprint(uav_id)
-        return bool(footprint and not target.is_found and footprint.contains(target.x, target.y))
+        if target.is_found:
+            return False
+        overlap_ratio = search_detection_overlap_ratio(
+            footprint,
+            (target.x, target.y),
+            target.radius,
+            map_bounds=(0.0, self.env_width, 0.0, self.env_height),
+        )
+        return bool(
+            overlap_ratio >= SEARCH_DETECTION_OVERLAP_THRESHOLD
+            or math.isclose(
+                overlap_ratio,
+                SEARCH_DETECTION_OVERLAP_THRESHOLD,
+                rel_tol=0.0,
+                abs_tol=1e-12,
+            )
+        )
 
     def count_found_targets(self) -> int:
         return sum(1 for gt in self.gts if gt.is_found)
@@ -522,6 +541,11 @@ class Simulator:
             "assignment_flow": ASSIGNMENT_FLOW_BY_STRATEGY[
                 self.assignment_strategy
             ],
+            "assignment_rounds": int(self.assignment_rounds),
+            "random_assignment_algorithm": (
+                "seeded_randomized_greedy_typed_feasible_pairs"
+            ),
+            "random_assignment_uses_utility": False,
             "invocation": int(self.assignment_invocations),
             "channel_movement_interval_index": (
                 None
@@ -537,6 +561,10 @@ class Simulator:
                 GS_GATEWAY_SOFT_RADIUS_OPERATIONAL
             ),
             "gs_gateway_hard_radius_m": GS_GATEWAY_HARD_RADIUS_M,
+            "search_detection_overlap_threshold": (
+                SEARCH_DETECTION_OVERLAP_THRESHOLD
+            ),
+            "permanent_gateway_search_contributor": True,
             "fov_com_pair_max_distance_m": self.fov_com_pair_max_distance_m,
             "fov_com_pair_distance_gate": "disabled",
             "task_compatibility_policy": TASK_COMPATIBILITY_POLICY,

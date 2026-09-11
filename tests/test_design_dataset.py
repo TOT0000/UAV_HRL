@@ -189,9 +189,9 @@ class DesignDatasetIntegrationTest(unittest.TestCase):
 
     def test_two_episodes_produce_120_ordered_joint_transitions(self):
         arrays = self.arrays_one
-        self.assertEqual(DESIGN_DATASET_SCHEMA_VERSION, 7)
-        self.assertEqual(self.metadata_one["schema_version"], 7)
-        self.assertEqual(self.metadata_one["checkpoint_schema_version"], 30)
+        self.assertEqual(DESIGN_DATASET_SCHEMA_VERSION, 8)
+        self.assertEqual(self.metadata_one["schema_version"], 8)
+        self.assertEqual(self.metadata_one["checkpoint_schema_version"], 31)
         self.assertEqual(self.metadata_one["scenario_schema_version"], "uav-hrl-scenario-v8")
         self.assertEqual(self.metadata_one["num_uav"], 16)
         self.assertEqual(
@@ -202,6 +202,14 @@ class DesignDatasetIntegrationTest(unittest.TestCase):
             self.metadata_one["movement_replay_contract_version"],
             MOVEMENT_REPLAY_CONTRACT_VERSION,
         )
+        for key in (
+            "assignment_contract_version",
+            "visual_sensing_contract_version",
+            "visual_sensing_configuration",
+            "gs_gateway_contract_version",
+            "search_detection_overlap_threshold",
+        ):
+            self.assertEqual(self.metadata_one[key], self.formal_config[key])
         self.assertEqual(set(arrays), set(ARRAY_NAMES))
         self.assertEqual(arrays["state"].shape, (120, 531))
         self.assertEqual(arrays["projected_joint_action"].shape, (120, 48))

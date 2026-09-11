@@ -94,7 +94,8 @@ from dinkelbach_blocks import (
     dinkelbach_config_metadata,
 )
 
-CHECKPOINT_SCHEMA_VERSION = 30
+CHECKPOINT_SCHEMA_VERSION = 31
+PRE_SEARCH_OVERLAP_GATEWAY_RANDOM_CHECKPOINT_SCHEMA_VERSION = 30
 PRE_SERVICE_ONLY_CHECKPOINT_SCHEMA_VERSION = 29
 PRE_GS_PROGRESS_CHECKPOINT_SCHEMA_VERSION = 21
 PRE_ROUTING_IMMEDIATE_COST_CHECKPOINT_SCHEMA_VERSION = 20
@@ -162,6 +163,7 @@ FORMAL_CORE_CONFIG_FIELDS = (
     "beta_vs",
     "beta_com",
     "search_coverage_threshold",
+    "search_detection_overlap_threshold",
     "replay_max_size",
     "routing_warmup_transitions",
     "routing_update_interval_slots",
@@ -187,8 +189,11 @@ FORMAL_CORE_CONFIG_FIELDS = (
     "movement_replay_contract_version",
     "assignment_contract_version",
     "assignment_flow",
+    "random_assignment_algorithm",
+    "random_assignment_uses_utility",
     "ground_station_position_m",
     "permanent_gs_gateway_uav_id",
+    "permanent_gateway_search_contributor",
     "gs_gateway_soft_radius_m",
     "gs_gateway_soft_radius_operational",
     "gs_gateway_hard_radius_m",
@@ -1437,6 +1442,16 @@ def _checkpoint_uses_dinkelbach(metadata):
 def _validate_checkpoint_schema(metadata):
     schema = metadata.get("checkpoint_schema_version")
     if schema != CHECKPOINT_SCHEMA_VERSION:
+        if schema == PRE_SEARCH_OVERLAP_GATEWAY_RANDOM_CHECKPOINT_SCHEMA_VERSION:
+            raise RuntimeError(
+                "checkpoint schema v30 used ROI-center Search discovery, excluded "
+                "the permanent gateway from Search contribution, and used the old "
+                "two-round mixed Random assignment; schema v31 uses 25% "
+                "map-clipped effective-footprint overlap, gateway Search "
+                "contribution, and typed FOV-then-COM Random rounds. Retraining "
+                "is required before weights or replay can be loaded: "
+                f"checkpoint={schema}, expected={CHECKPOINT_SCHEMA_VERSION}"
+            )
         if schema == PRE_SERVICE_ONLY_CHECKPOINT_SCHEMA_VERSION:
             raise RuntimeError(
                 "checkpoint schema v29 contains the retired explicit Relay task, "

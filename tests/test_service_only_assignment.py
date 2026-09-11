@@ -59,7 +59,7 @@ def test_service_only_observation_potential_and_checkpoint_contracts():
     assert MOVEMENT_STATE_DIM == 531
     assert len(names) == MOVEMENT_STATE_DIM
     assert not any("relay" in name.lower() for name in names)
-    assert CHECKPOINT_SCHEMA_VERSION == 30
+    assert CHECKPOINT_SCHEMA_VERSION == 31
     assert "service-only" in ASSIGNMENT_CONTRACT_VERSION
 
     env = Simulator(16)

@@ -53,7 +53,7 @@ from training_checkpoint import (
 )
 
 
-DESIGN_DATASET_SCHEMA_VERSION = 7
+DESIGN_DATASET_SCHEMA_VERSION = 8
 DESIGN_TRANSITIONS_FILENAME = "design_transitions.npz"
 DESIGN_METADATA_FILENAME = "design_dataset_metadata.json"
 DESIGN_EPISODES_CSV = "per_episode.csv"
@@ -498,6 +498,17 @@ def _build_metadata(preflight, arrays, result, run_dir, reference_rows):
         },
         "task_potential_contract_version": TASK_POTENTIAL_CONTRACT_VERSION,
         "movement_replay_contract_version": MOVEMENT_REPLAY_CONTRACT_VERSION,
+        "assignment_contract_version": formal_config["assignment_contract_version"],
+        "visual_sensing_contract_version": formal_config[
+            "visual_sensing_contract_version"
+        ],
+        "visual_sensing_configuration": formal_config[
+            "visual_sensing_configuration"
+        ],
+        "gs_gateway_contract_version": formal_config["gs_gateway_contract_version"],
+        "search_detection_overlap_threshold": float(
+            formal_config["search_detection_overlap_threshold"]
+        ),
         "potential_boundary_semantics": (
             "phi_current uses current decision-state backlog; phi_next uses next "
             "decision-state backlog; terminal phi_next is zero"
