@@ -8,6 +8,7 @@ from pathlib import Path
 from centralized_movement import JOINT_ACTION_DIM, MOVEMENT_STATE_DIM
 from com_capacity_calibration import load_com_capacity_reference
 from experiment_config import (
+    ENVIRONMENT_SIZE_EVALUATION_VALUES_M,
     FORMAL_CHECKPOINT_EPISODE,
     ROI_COUNT_MAX,
     ROI_COUNT_MIN,
@@ -26,11 +27,16 @@ from training_checkpoint import (
 
 
 DEFAULT_FIXED_ROI_COUNTS = tuple(range(ROI_COUNT_MIN, ROI_COUNT_MAX + 1))
+SUPPORTED_ENVIRONMENT_SIZES_M = ENVIRONMENT_SIZE_EVALUATION_VALUES_M
+DEFAULT_ENVIRONMENT_SIZES_M = SUPPORTED_ENVIRONMENT_SIZES_M
 
 
-def _exclusive_values(single, multiple, *, label, default):
+def _exclusive_values(single, multiple, *, label, default, multiple_label=None):
     if single is not None and multiple is not None:
-        raise ValueError(f"use either --{label} or --{label}s, not both")
+        multiple_label = multiple_label or f"{label}s"
+        raise ValueError(
+            f"use either --{label} or --{multiple_label}, not both"
+        )
     values = multiple if multiple is not None else (
         (single,) if single is not None else default
     )
@@ -94,6 +100,28 @@ def resolve_roi_counts(roi_count=None, roi_counts=None):
             f"[{ROI_COUNT_MIN}, {ROI_COUNT_MAX}]: {invalid}"
         )
     return counts
+
+
+def resolve_environment_sizes_m(
+    environment_size_m=None,
+    environment_sizes_m=None,
+):
+    """Resolve singular/batch square-map selectors in caller-provided order."""
+
+    sizes = _exclusive_values(
+        environment_size_m,
+        environment_sizes_m,
+        label="environment-size-m",
+        default=DEFAULT_ENVIRONMENT_SIZES_M,
+        multiple_label="environment-sizes-m",
+    )
+    invalid = [size for size in sizes if size not in SUPPORTED_ENVIRONMENT_SIZES_M]
+    if invalid:
+        raise ValueError(
+            "environment sizes must be one of "
+            f"{list(SUPPORTED_ENVIRONMENT_SIZES_M)}: {invalid}"
+        )
+    return sizes
 
 
 def _read_json_object(path, label):

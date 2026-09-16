@@ -21,6 +21,9 @@ from experiment_config import (
     COMMUNICATION_RANGE_M,
     COMMUNICATION_RANGE_BOUNDARY_RULE,
     COMMUNICATION_RANGE_CONTRACT_VERSION,
+    ENVIRONMENT_HEIGHT_M,
+    ENVIRONMENT_SIZE_EVALUATION_VALUES_M,
+    ENVIRONMENT_WIDTH_M,
     GROUND_STATION_POSITION_M,
     GS_GATEWAY_CONTRACT_VERSION,
     GS_GATEWAY_HARD_RADIUS_M,
@@ -42,6 +45,7 @@ from experiment_config import (
 
 
 SCENARIO_SCHEMA_VERSION = "uav-hrl-scenario-v8"
+ENVIRONMENT_SIZE_SCENARIO_SCHEMA_VERSION = "uav-hrl-scenario-v9"
 OBSOLETE_SCHEMA_VERSIONS = frozenset(
     {
         "uav-hrl-scenario-v1",
@@ -302,15 +306,20 @@ def validate_permanent_gateway_initial_position(
     }
 
 
-def current_environment_config() -> dict[str, Any]:
+def current_environment_config(
+    environment_width_m=None,
+    environment_height_m=None,
+) -> dict[str, Any]:
+    width = 1000 if environment_width_m is None else int(environment_width_m)
+    height = 1000 if environment_height_m is None else int(environment_height_m)
     return {
         "num_uav": NUM_UAV,
         "roi_count_min": ROI_COUNT_MIN,
         "roi_count_max": ROI_COUNT_MAX,
         "episode_seconds": PRODUCTION_EPISODE_HORIZON_SECONDS,
         "routing_slot_seconds": 0.25,
-        "environment_width_m": 1000,
-        "environment_height_m": 1000,
+        "environment_width_m": width,
+        "environment_height_m": height,
         "bit_resolution_m": 2,
         "uav_energy_max_j": 10000.0,
         "active_link_bandwidth_hz": 10e6,
@@ -395,10 +404,19 @@ def _split_seed(
     manifest_seed: int,
     episode_index: int,
     generation_profile: dict[str, Any],
+    *,
+    schema_version=SCENARIO_SCHEMA_VERSION,
+    environment_size_m=None,
 ) -> int:
+    size_identity = (
+        ""
+        if environment_size_m is None
+        else f":map-{int(environment_size_m)}m"
+    )
     material = (
-        f"{SCENARIO_SCHEMA_VERSION}:{split}:{int(manifest_seed)}:"
-        f"{_profile_id(generation_profile)}:{int(episode_index)}"
+        f"{schema_version}:{split}:{int(manifest_seed)}:"
+        f"{_profile_id(generation_profile)}{size_identity}:"
+        f"{int(episode_index)}"
     ).encode("utf-8")
     return int.from_bytes(hashlib.sha256(material).digest()[:8], "big")
 
@@ -415,10 +433,14 @@ def _uav_initial_data(py_rng: random.Random) -> list[dict[str, Any]]:
 
 
 def _gt_initial_data(
-    py_rng: random.Random, num_gt: int
+    py_rng: random.Random,
+    num_gt: int,
+    environment_width_m=ENVIRONMENT_WIDTH_M,
+    environment_height_m=ENVIRONMENT_HEIGHT_M,
 ) -> list[dict[str, Any]]:
     radius = 80.0
-    width = height = 1000.0
+    width = float(environment_width_m)
+    height = float(environment_height_m)
     minimum_distance = int(2 * radius)
     tries = 0
     points: list[tuple[float, float]] = []
@@ -449,12 +471,18 @@ def _gt_initial_data(
     ]
 
 
-def _sr_initial_data(num_gt: int) -> list[dict[str, Any]]:
+def _sr_initial_data(
+    num_gt: int,
+    environment_width_m=ENVIRONMENT_WIDTH_M,
+    environment_height_m=ENVIRONMENT_HEIGHT_M,
+) -> list[dict[str, Any]]:
+    width = float(environment_width_m)
+    height = float(environment_height_m)
     boundary_points = (
-        (0.0, 500.0),
-        (1000.0, 500.0),
-        (500.0, 0.0),
-        (500.0, 1000.0),
+        (0.0, height / 2.0),
+        (width, height / 2.0),
+        (width / 2.0, 0.0),
+        (width / 2.0, height),
     )
     return [
         {
@@ -474,13 +502,38 @@ def generate_scenario_entry(
     manifest_seed: int,
     episode_index: int,
     num_gt: int | None = None,
+    environment_size_m: int | None = None,
 ) -> dict[str, Any]:
     if split not in SUPPORTED_SPLITS:
         raise ValueError(f"unsupported scenario split: {split}")
+    if (
+        environment_size_m is not None
+        and environment_size_m not in ENVIRONMENT_SIZE_EVALUATION_VALUES_M
+    ):
+        raise ValueError(
+            "environment size must be one of "
+            f"{list(ENVIRONMENT_SIZE_EVALUATION_VALUES_M)} metres"
+        )
     generation_profile = build_generation_profile(num_gt)
     profile_id = _profile_id(generation_profile)
+    schema_version = (
+        SCENARIO_SCHEMA_VERSION
+        if environment_size_m is None
+        else ENVIRONMENT_SIZE_SCENARIO_SCHEMA_VERSION
+    )
+    environment_width_m = int(
+        ENVIRONMENT_WIDTH_M if environment_size_m is None else environment_size_m
+    )
+    environment_height_m = int(
+        ENVIRONMENT_HEIGHT_M if environment_size_m is None else environment_size_m
+    )
     scenario_seed = _split_seed(
-        split, manifest_seed, episode_index, generation_profile
+        split,
+        manifest_seed,
+        episode_index,
+        generation_profile,
+        schema_version=schema_version,
+        environment_size_m=environment_size_m,
     )
     np_rng = np.random.default_rng(scenario_seed)
     py_rng = random.Random(scenario_seed)
@@ -491,16 +544,26 @@ def generate_scenario_entry(
     )
     entry = {
         "scenario_id": (
-            f"{split}:{SCENARIO_SCHEMA_VERSION}:{profile_id}:"
+            f"{split}:{schema_version}:{profile_id}:"
+            f"{'' if environment_size_m is None else f'map-{environment_size_m}m:'}"
             f"{int(manifest_seed)}:"
             f"{int(episode_index):06d}"
         ),
         "scenario_seed": scenario_seed,
         "generation_profile_id": profile_id,
         "num_GT": episode_num_gt,
-        "ground_targets": _gt_initial_data(py_rng, episode_num_gt),
+        "ground_targets": _gt_initial_data(
+            py_rng,
+            episode_num_gt,
+            environment_width_m,
+            environment_height_m,
+        ),
         "uavs": _uav_initial_data(py_rng),
-        "sr_teams": _sr_initial_data(episode_num_gt),
+        "sr_teams": _sr_initial_data(
+            episode_num_gt,
+            environment_width_m,
+            environment_height_m,
+        ),
         "traffic_primitives": {
             "load_factor": 1.0,
             "base_fov_packets_per_second": 5.0,
@@ -521,6 +584,14 @@ def generate_scenario_entry(
             "gs_gateway_contract_version": GS_GATEWAY_CONTRACT_VERSION,
         },
     }
+    if environment_size_m is not None:
+        entry.update(
+            {
+                "environment_width_m": environment_width_m,
+                "environment_height_m": environment_height_m,
+                "environment_size_m": int(environment_size_m),
+            }
+        )
     validate_scenario_entry(entry)
     return entry
 
@@ -545,6 +616,27 @@ def validate_scenario_entry(entry: dict[str, Any]) -> dict[str, Any]:
         raise ValueError(
             f"scenario entry contains policy-dependent fields: {sorted(forbidden)}"
         )
+    environment_fields = {
+        "environment_width_m",
+        "environment_height_m",
+        "environment_size_m",
+    }
+    present_environment_fields = environment_fields.intersection(entry)
+    if present_environment_fields and present_environment_fields != environment_fields:
+        raise ValueError("scenario environment geometry fields are incomplete")
+    width = float(entry.get("environment_width_m", 1000.0))
+    height = float(entry.get("environment_height_m", 1000.0))
+    if (
+        not math.isfinite(width)
+        or not math.isfinite(height)
+        or width <= 0.0
+        or height <= 0.0
+    ):
+        raise ValueError("scenario environment dimensions must be finite and positive")
+    if present_environment_fields:
+        size = float(entry["environment_size_m"])
+        if not math.isfinite(size) or size != width or size != height:
+            raise ValueError("environment-size scenario must use one square map size")
     if int(entry["num_GT"]) != len(entry["ground_targets"]):
         raise ValueError("scenario num_GT does not match ground target data")
     if not ROI_COUNT_MIN <= int(entry["num_GT"]) <= ROI_COUNT_MAX:
@@ -604,12 +696,45 @@ def validate_scenario_entry(entry: dict[str, Any]) -> dict[str, Any]:
                 "scenario UAV coordinates disagree with declared initial layout: "
                 f"scenario_id={entry['scenario_id']}; uav_id={item['uav_id']}"
             )
+        if not 0.0 <= x <= width or not 0.0 <= y <= height:
+            raise ValueError(
+                "scenario canonical UAV initial position is outside map bounds: "
+                f"scenario_id={entry['scenario_id']}; uav_id={item['uav_id']}"
+            )
         if not 80.0 <= z <= 120.0:
             raise ValueError("scenario UAV initial altitude must be in [80, 120] m")
         if not math.isfinite(energy) or energy != 10000.0:
             raise ValueError("scenario UAV initial energy is incompatible")
     if len(entry["sr_teams"]) != int(entry["num_GT"]):
         raise ValueError("scenario SR team count must equal num_GT")
+    for item in entry["ground_targets"]:
+        x, y, z = map(float, item["position"])
+        radius = float(item["radius_m"])
+        if (
+            not all(math.isfinite(value) for value in (x, y, z, radius))
+            or radius <= 0.0
+            or z != 0.0
+            or not radius <= x <= width - radius
+            or not radius <= y <= height - radius
+        ):
+            raise ValueError(
+                "scenario RoI is outside radius-safe map bounds: "
+                f"scenario_id={entry['scenario_id']}; gt_id={item.get('gt_id')}"
+            )
+    boundary_points = (
+        (0.0, height / 2.0),
+        (width, height / 2.0),
+        (width / 2.0, 0.0),
+        (width / 2.0, height),
+    )
+    for item in entry["sr_teams"]:
+        sr_id = int(item["sr_id"])
+        x, y, z = map(float, item["position"])
+        if (x, y) != boundary_points[sr_id % 4] or z != 0.0:
+            raise ValueError(
+                "scenario SR initial position disagrees with map boundary midpoint: "
+                f"scenario_id={entry['scenario_id']}; sr_id={sr_id}"
+            )
     return topology
 
 
@@ -637,9 +762,13 @@ class ScenarioManifest:
     generator_config: dict[str, Any]
     config_fingerprint: str
     content_hash: str
+    environment_width_m: int = 1000
+    environment_height_m: int = 1000
+    environment_size_m: int | None = None
+    fixed_num_gt: int | None = None
 
     def unsigned_dict(self) -> dict[str, Any]:
-        return {
+        result = {
             "schema_version": self.schema_version,
             "split": self.split,
             "manifest_seed": int(self.manifest_seed),
@@ -649,6 +778,16 @@ class ScenarioManifest:
             "generator_config": self.generator_config,
             "config_fingerprint": self.config_fingerprint,
         }
+        if self.schema_version == ENVIRONMENT_SIZE_SCENARIO_SCHEMA_VERSION:
+            result.update(
+                {
+                    "environment_width_m": int(self.environment_width_m),
+                    "environment_height_m": int(self.environment_height_m),
+                    "environment_size_m": int(self.environment_size_m),
+                    "fixed_num_gt": int(self.fixed_num_gt),
+                }
+            )
+        return result
 
     def to_dict(self) -> dict[str, Any]:
         return {**self.unsigned_dict(), "content_hash": self.content_hash}
@@ -721,7 +860,11 @@ class ScenarioManifest:
                 "legacy 10-UAV scenario schema is incompatible; regenerate the "
                 "manifest with the 16-UAV v8 generator"
             )
-        if data.get("schema_version") != SCENARIO_SCHEMA_VERSION:
+        schema_version = data.get("schema_version")
+        if schema_version not in {
+            SCENARIO_SCHEMA_VERSION,
+            ENVIRONMENT_SIZE_SCENARIO_SCHEMA_VERSION,
+        }:
             raise ValueError(
                 f"unsupported scenario schema: {data.get('schema_version')}"
             )
@@ -739,9 +882,48 @@ class ScenarioManifest:
         )
         if generation_profile != expected_profile:
             raise ValueError("manifest generation profile is invalid")
+        if schema_version == ENVIRONMENT_SIZE_SCENARIO_SCHEMA_VERSION:
+            required_geometry = {
+                "environment_width_m",
+                "environment_height_m",
+                "environment_size_m",
+                "fixed_num_gt",
+            }
+            missing_geometry = required_geometry.difference(data)
+            if missing_geometry:
+                raise ValueError(
+                    "environment-size manifest is missing fields: "
+                    f"{sorted(missing_geometry)}"
+                )
+            environment_width_m = int(data["environment_width_m"])
+            environment_height_m = int(data["environment_height_m"])
+            environment_size_m = int(data["environment_size_m"])
+            fixed_num_gt = int(data["fixed_num_gt"])
+            if (
+                environment_size_m not in ENVIRONMENT_SIZE_EVALUATION_VALUES_M
+                or environment_width_m != environment_size_m
+                or environment_height_m != environment_size_m
+                or generation_profile.get("fixed_num_gt") != fixed_num_gt
+            ):
+                raise ValueError(
+                    "environment-size manifest geometry or fixed RoI metadata is inconsistent"
+                )
+        else:
+            environment_width_m = 1000
+            environment_height_m = 1000
+            environment_size_m = None
+            fixed_num_gt = generation_profile.get("fixed_num_gt")
         profile_id = _profile_id(generation_profile)
         for entry in episodes:
             validate_scenario_entry(entry)
+            if schema_version == ENVIRONMENT_SIZE_SCENARIO_SCHEMA_VERSION and (
+                int(entry.get("environment_width_m", -1)) != environment_width_m
+                or int(entry.get("environment_height_m", -1)) != environment_height_m
+                or int(entry.get("environment_size_m", -1)) != environment_size_m
+            ):
+                raise ValueError(
+                    "manifest environment size disagrees with a scenario entry"
+                )
             if entry["generation_profile_id"] != profile_id:
                 raise ValueError("scenario generation profile identity mismatch")
             num_gt = int(entry["num_GT"])
@@ -757,11 +939,16 @@ class ScenarioManifest:
         expected_hash = sha256_json(unsigned)
         if data.get("content_hash") != expected_hash:
             raise ValueError("manifest content hash mismatch")
-        expected_config = environment_config_fingerprint()
+        expected_config = environment_config_fingerprint(
+            current_environment_config(
+                environment_width_m,
+                environment_height_m,
+            )
+        )
         if data.get("config_fingerprint") != expected_config:
             raise ValueError("manifest environment configuration is incompatible")
         return cls(
-            schema_version=SCENARIO_SCHEMA_VERSION,
+            schema_version=str(schema_version),
             split=split,
             manifest_seed=int(data["manifest_seed"]),
             episode_count=len(episodes),
@@ -770,6 +957,10 @@ class ScenarioManifest:
             generator_config=dict(data["generator_config"]),
             config_fingerprint=str(data["config_fingerprint"]),
             content_hash=str(data["content_hash"]),
+            environment_width_m=environment_width_m,
+            environment_height_m=environment_height_m,
+            environment_size_m=environment_size_m,
+            fixed_num_gt=fixed_num_gt,
         )
 
     @classmethod
@@ -782,12 +973,26 @@ def generate_manifest(
     manifest_seed: int,
     episode_count: int,
     num_gt: int | None = None,
+    environment_size_m: int | None = None,
 ) -> ScenarioManifest:
     if int(episode_count) <= 0:
         raise ValueError("episode_count must be positive")
     generation_profile = build_generation_profile(num_gt)
+    if environment_size_m is not None and num_gt is None:
+        raise ValueError("environment-size manifests require one fixed num_GT")
+    schema_version = (
+        SCENARIO_SCHEMA_VERSION
+        if environment_size_m is None
+        else ENVIRONMENT_SIZE_SCENARIO_SCHEMA_VERSION
+    )
+    environment_width_m = int(
+        ENVIRONMENT_WIDTH_M if environment_size_m is None else environment_size_m
+    )
+    environment_height_m = int(
+        ENVIRONMENT_HEIGHT_M if environment_size_m is None else environment_size_m
+    )
     unsigned = {
-        "schema_version": SCENARIO_SCHEMA_VERSION,
+        "schema_version": schema_version,
         "split": split,
         "manifest_seed": int(manifest_seed),
         "episode_count": int(episode_count),
@@ -795,7 +1000,11 @@ def generate_manifest(
             generate_scenario_entry(split, manifest_seed, index)
             if num_gt is None
             else generate_scenario_entry(
-                split, manifest_seed, index, num_gt=num_gt
+                split,
+                manifest_seed,
+                index,
+                num_gt=num_gt,
+                environment_size_m=environment_size_m,
             )
             for index in range(int(episode_count))
         ],
@@ -830,8 +1039,29 @@ def generate_manifest(
             "num_uav": NUM_UAV,
             "reserved_search_uav_ids": list(RESERVED_SEARCH_UAV_IDS),
         },
-        "config_fingerprint": environment_config_fingerprint(),
+        "config_fingerprint": environment_config_fingerprint(
+            current_environment_config(
+                environment_width_m,
+                environment_height_m,
+            )
+        ),
     }
+    if environment_size_m is not None:
+        unsigned["generator_config"].update(
+            {
+                "environment_width_m": environment_width_m,
+                "environment_height_m": environment_height_m,
+                "environment_size_m": int(environment_size_m),
+            }
+        )
+        unsigned.update(
+            {
+                "environment_width_m": environment_width_m,
+                "environment_height_m": environment_height_m,
+                "environment_size_m": int(environment_size_m),
+                "fixed_num_gt": int(num_gt),
+            }
+        )
     return ScenarioManifest.from_dict(
         {**unsigned, "content_hash": sha256_json(unsigned)}
     )

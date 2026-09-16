@@ -68,7 +68,7 @@ class CheckpointRoiSelectorTest(unittest.TestCase):
             resolve_checkpoint_episodes(0)
         with self.assertRaisesRegex(ValueError, "inclusive range"):
             resolve_roi_counts(roi_counts=(1, 4, 9))
-        with self.assertRaisesRegex(ValueError, "only for the fixed_roi"):
+        with self.assertRaisesRegex(ValueError, "only for fixed_roi or environment_size"):
             evaluation_sweep_points("uav_trajectory_snapshots", (2,))
 
     def test_cli_exposes_singular_and_batch_forms(self):

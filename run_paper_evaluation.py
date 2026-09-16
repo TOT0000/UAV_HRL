@@ -3,7 +3,11 @@
 import argparse
 import json
 
-from evaluation_selection import resolve_checkpoint_episodes, resolve_roi_counts
+from evaluation_selection import (
+    resolve_checkpoint_episodes,
+    resolve_environment_sizes_m,
+    resolve_roi_counts,
+)
 from experiment_config import METHOD_REGISTRY, MethodSpec
 from paper_evaluation import PAPER_EVALUATION_SUITES, run_paper_evaluation
 
@@ -34,6 +38,9 @@ def build_parser():
     roi = parser.add_mutually_exclusive_group()
     roi.add_argument("--roi-count", type=int)
     roi.add_argument("--roi-counts", type=int, nargs="+")
+    environment_size = parser.add_mutually_exclusive_group()
+    environment_size.add_argument("--environment-size-m", type=int)
+    environment_size.add_argument("--environment-sizes-m", type=int, nargs="+")
     parser.add_argument(
         "--target-uav-id",
         type=int,
@@ -61,11 +68,34 @@ def main(argv=None):
         or args.checkpoint_episodes is not None
     )
     explicit_roi = args.roi_count is not None or args.roi_counts is not None
-    if explicit_roi and args.suite != "fixed_roi":
-        raise ValueError("RoI selectors are available only for the fixed_roi suite")
-    roi_counts = (
-        resolve_roi_counts(args.roi_count, args.roi_counts)
-        if args.suite == "fixed_roi"
+    if explicit_roi and args.suite not in {"fixed_roi", "environment_size"}:
+        raise ValueError(
+            "RoI selectors are available only for fixed_roi or environment_size"
+        )
+    if args.suite == "environment_size" and args.roi_counts is not None:
+        raise ValueError("environment_size accepts --roi-count, not --roi-counts")
+    roi_counts = None
+    if args.suite == "fixed_roi":
+        roi_counts = resolve_roi_counts(args.roi_count, args.roi_counts)
+    elif args.suite == "environment_size":
+        roi_counts = resolve_roi_counts(
+            args.roi_count if args.roi_count is not None else 8,
+            None,
+        )
+    explicit_environment_size = (
+        args.environment_size_m is not None
+        or args.environment_sizes_m is not None
+    )
+    if explicit_environment_size and args.suite != "environment_size":
+        raise ValueError(
+            "environment-size selectors are available only for environment_size"
+        )
+    environment_sizes_m = (
+        resolve_environment_sizes_m(
+            args.environment_size_m,
+            args.environment_sizes_m,
+        )
+        if args.suite == "environment_size"
         else None
     )
     method = MethodSpec.parse(args.method)
@@ -111,6 +141,7 @@ def main(argv=None):
         output_root=args.output_root,
         checkpoint_episode=checkpoint_episodes[0],
         roi_counts=roi_counts,
+        environment_sizes_m=environment_sizes_m,
         deadline_seconds=args.deadline_seconds,
         allow_registered_fixed_roi_method=bool(
             args.suite == "fixed_roi" and (explicit_checkpoint or explicit_roi)

@@ -46,6 +46,8 @@ from experiment_config import (
     FOV_ASSIGNMENT_UTILITY_VERSION,
     FOV_QUALITY_TRANSFORM,
     COM_OFFERED_RATE_BPS,
+    ENVIRONMENT_HEIGHT_M,
+    ENVIRONMENT_WIDTH_M,
     GROUND_STATION_POSITION_M,
     GS_GATEWAY_CONTRACT_VERSION,
     GS_GATEWAY_HARD_RADIUS_M,
@@ -88,7 +90,15 @@ class Simulator:
     SR_UAV_LOS_EXCESS_DB = A2G_LOS_EXCESS_DB
     SR_UAV_NLOS_EXCESS_DB = A2G_NLOS_EXCESS_DB
 
-    def __init__(self, num_UAV, p_u=30, rng_streams=None, evaluation=False): #初始化
+    def __init__(
+        self,
+        num_UAV,
+        p_u=30,
+        rng_streams=None,
+        evaluation=False,
+        environment_width_m=ENVIRONMENT_WIDTH_M,
+        environment_height_m=ENVIRONMENT_HEIGHT_M,
+    ): #初始化
         self.dt = ROUTING_SLOT_SECONDS
         self.rng_streams = rng_streams
         environment_stream = (
@@ -172,9 +182,33 @@ class Simulator:
         self.UAVs = []
         self.SR_teams=[]
         self.num_SR = 4
-        self.env_width = 1000
-        self.env_height= 1000
+        raw_env_width = float(environment_width_m)
+        raw_env_height = float(environment_height_m)
+        self.env_width = int(raw_env_width)
+        self.env_height = int(raw_env_height)
         self.bit_resolution = 2   # 每 5 公尺為 1 像素單位
+        if (
+            not np.isfinite(raw_env_width)
+            or not np.isfinite(raw_env_height)
+            or raw_env_width != self.env_width
+            or raw_env_height != self.env_height
+            or self.env_width <= 0
+            or self.env_height <= 0
+            or self.env_width % self.bit_resolution
+            or self.env_height % self.bit_resolution
+        ):
+            raise ValueError(
+                "environment dimensions must be positive integer multiples of "
+                f"{self.bit_resolution} m"
+            )
+        if any(
+            not (0.0 <= x <= self.env_width and 0.0 <= y <= self.env_height)
+            for x, y in CANONICAL_UAV_INITIAL_XY_M
+        ):
+            raise ValueError(
+                "environment dimensions place the canonical UAV initial layout "
+                "outside map bounds"
+            )
         self.grid_size = 5  # 每格 20m，取決於你的 FOV 粒度
         self.map_width = self.env_width // self.bit_resolution
         self.map_height = self.env_height // self.bit_resolution
@@ -1183,6 +1217,14 @@ class Simulator:
             from scenario_manifest import validate_scenario_entry
 
             validate_scenario_entry(scenario_entry)
+            entry_width = int(scenario_entry.get("environment_width_m", 1000))
+            entry_height = int(scenario_entry.get("environment_height_m", 1000))
+            if (entry_width, entry_height) != (self.env_width, self.env_height):
+                raise ValueError(
+                    "scenario manifest environment size disagrees with Simulator: "
+                    f"manifest={entry_width}x{entry_height}, "
+                    f"simulator={self.env_width}x{self.env_height}"
+                )
             self.num_GT = int(scenario_entry["num_GT"])
             self.active_scenario_id = str(scenario_entry["scenario_id"])
             self.active_scenario_seed = int(scenario_entry["scenario_seed"])
@@ -1216,10 +1258,15 @@ class Simulator:
         self._search_phase_over: bool = False   # 是否已經完成搜尋相位（環境內部 guard）
         self._pending_search_done: bool = False # 本 step 是否有人達標（步末集中處理）
         self._pending_reason = None  
-        self.visited_bitmap  = np.zeros((self.env_width // self.bit_resolution, self.env_height // self.bit_resolution), dtype=bool)
+        bitmap_shape = (
+            self.env_width // self.bit_resolution,
+            self.env_height // self.bit_resolution,
+        )
+        self.map_width, self.map_height = bitmap_shape
+        self.visited_bitmap = np.zeros(bitmap_shape, dtype=bool)
         self.task_list = []
         # self.UAVs = []
-        self.explorer_id_map[:, :] = -1
+        self.explorer_id_map = np.full(bitmap_shape, -1, dtype=int)
         self.search_completed = False
         # self.last_energy = np.full(self.energy_model.N_u, self.energy_model.E_max)
         self.source_uavs = set()  #  清除封包來源
@@ -1398,7 +1445,22 @@ class Simulator:
 
         from scenario_manifest import generate_scenario_entry
 
-        return generate_scenario_entry(split, manifest_seed, episode_index)
+        if self.env_width != self.env_height:
+            raise ValueError("environment-size scenarios require a square map")
+        environment_size_m = (
+            None
+            if (
+                self.env_width == int(ENVIRONMENT_WIDTH_M)
+                and self.env_height == int(ENVIRONMENT_HEIGHT_M)
+            )
+            else self.env_width
+        )
+        return generate_scenario_entry(
+            split,
+            manifest_seed,
+            episode_index,
+            environment_size_m=environment_size_m,
+        )
 
     def apply_scenario_entry(self, scenario_entry):
         """Reset the corrected environment from one manifest episode entry."""

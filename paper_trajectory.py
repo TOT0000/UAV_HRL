@@ -109,6 +109,10 @@ def build_standalone_trajectory_source(
         raise ValueError(
             "standalone learned trajectory requires complete checkpoint provenance"
         )
+    environment_width = float(artifact.get("environment_width_m", 1000.0))
+    environment_height = float(artifact.get("environment_height_m", 1000.0))
+    if environment_width <= 0.0 or environment_height <= 0.0:
+        raise ValueError("standalone trajectory environment dimensions must be positive")
     source = {
         "schema_version": STANDALONE_TRAJECTORY_SCHEMA_VERSION,
         "figure_id": str(figure_id),
@@ -121,6 +125,8 @@ def build_standalone_trajectory_source(
         **checkpoint,
         "git_sha": str(git_sha),
         "target_uav_id": int(artifact["target_uav_id"]),
+        "environment_width_m": environment_width,
+        "environment_height_m": environment_height,
         "ground_station": copy.deepcopy(snapshot["ground_station"]),
         "ground_targets": copy.deepcopy(snapshot.get("ground_targets") or []),
         "uavs": uavs,
@@ -133,7 +139,11 @@ def build_standalone_trajectory_source(
         ),
         "render_contract": {
             "camera": copy.deepcopy(camera),
-            "axis_limits": {"x": [0.0, 1000.0], "y": [0.0, 1000.0], "z": [0.0, 180.0]},
+            "axis_limits": {
+                "x": [0.0, environment_width],
+                "y": [0.0, environment_height],
+                "z": [0.0, 180.0],
+            },
             "axis_labels": {"x": "X(m)", "y": "Y(m)", "z": "Z(m)"},
             "style_reference": "PLOT_STYLES.uav_trajectory_snapshots",
             "style": copy.deepcopy(style),

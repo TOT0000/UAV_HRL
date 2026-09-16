@@ -51,6 +51,9 @@ from experiment_config import (
     COM_PACKET_SIZE_BITS,
     COM_OFFERED_RATE_BPS,
     DEFAULT_TRAINING_SEED,
+    ENVIRONMENT_HEIGHT_M,
+    ENVIRONMENT_SIZE_EVALUATION_VALUES_M,
+    ENVIRONMENT_WIDTH_M,
     FOV_EMA_LIFECYCLE_VERSION,
     FORMAL_CHECKPOINT_EPISODE,
     FORMAL_EXPERIMENT_DEFAULTS,
@@ -426,12 +429,17 @@ def _active_backlog(packet_engine):
 
 def _normalize_evaluation_overrides(overrides):
     values = dict(overrides or {})
+    environment_size_evaluation = bool(
+        {"environment_width_m", "environment_height_m"}.intersection(values)
+    )
     allowed = {
         "fov_rate_packets_per_second",
         "com_rate_packets_per_second",
         "fov_deadline_seconds",
         "com_deadline_seconds",
         "packet_injection_cutoff_seconds",
+        "environment_width_m",
+        "environment_height_m",
     }
     unknown = set(values).difference(allowed)
     if unknown:
@@ -465,14 +473,43 @@ def _normalize_evaluation_overrides(overrides):
     )
     if not np.isfinite(injection_cutoff) or injection_cutoff < 0.0:
         raise ValueError("packet injection cutoff must be finite and non-negative")
+    environment_width = values.get("environment_width_m", ENVIRONMENT_WIDTH_M)
+    environment_height = values.get("environment_height_m", ENVIRONMENT_HEIGHT_M)
+    if isinstance(environment_width, bool) or isinstance(environment_height, bool):
+        raise ValueError("evaluation environment dimensions must be integer metres")
+    try:
+        raw_environment_width = float(environment_width)
+        raw_environment_height = float(environment_height)
+        environment_width = int(environment_width)
+        environment_height = int(environment_height)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("evaluation environment dimensions must be integer metres") from exc
+    if (
+        not np.isfinite(raw_environment_width)
+        or not np.isfinite(raw_environment_height)
+        or raw_environment_width != environment_width
+        or raw_environment_height != environment_height
+    ):
+        raise ValueError("evaluation environment dimensions must be integer metres")
+    if environment_width != environment_height:
+        raise ValueError("environment-size evaluation requires a square map")
+    if environment_width not in ENVIRONMENT_SIZE_EVALUATION_VALUES_M:
+        raise ValueError(
+            "evaluation environment size must be one of "
+            f"{list(ENVIRONMENT_SIZE_EVALUATION_VALUES_M)} metres"
+        )
     return {
         "traffic_rates_packets_per_second": rates,
         "task_deadlines_seconds": deadlines,
         "packet_injection_cutoff_seconds": injection_cutoff,
+        "environment_width_m": environment_width,
+        "environment_height_m": environment_height,
+        "environment_size_evaluation": environment_size_evaluation,
         "units": {
             "traffic_rate": "packets/s",
             "deadline": "seconds",
             "packet_injection_cutoff": "seconds",
+            "environment_dimensions": "metres",
         },
     }
 
@@ -1451,6 +1488,12 @@ def _evaluation_runtime_provenance(
     ddqn,
     evaluation_git_sha,
 ):
+    evaluation_width = int(resolved_evaluation["environment_width_m"])
+    evaluation_height = int(resolved_evaluation["environment_height_m"])
+    zero_shot_environment_shift = (
+        evaluation_width != int(ENVIRONMENT_WIDTH_M)
+        or evaluation_height != int(ENVIRONMENT_HEIGHT_M)
+    )
     return {
         "evaluation_episode_count": int(config.total_episodes),
         "evaluation_git_sha": str(evaluation_git_sha),
@@ -1478,6 +1521,19 @@ def _evaluation_runtime_provenance(
             "routing_slot_seconds": float(config.routing_slot_seconds),
             "evaluation_overrides": copy.deepcopy(resolved_evaluation),
             "learning_state_frozen": True,
+            "training_environment_width_m": int(ENVIRONMENT_WIDTH_M),
+            "training_environment_height_m": int(ENVIRONMENT_HEIGHT_M),
+            "evaluation_environment_width_m": evaluation_width,
+            "evaluation_environment_height_m": evaluation_height,
+            "zero_shot_environment_shift": zero_shot_environment_shift,
+            "environment_shift_type": (
+                "map_size"
+                if resolved_evaluation["environment_size_evaluation"]
+                else None
+            ),
+            "new_training_started": False,
+            "environment_size_observed_by_policy": False,
+            "coordinate_normalization": "current_environment_width_height",
         },
         "routing_lifecycle": (
             routing_lifecycle.state_dict()
@@ -1848,7 +1904,11 @@ def train(
 
     c_ref_com, calibration = load_com_capacity_reference()
     env = Simulator(
-        num_UAV=NUM_UAV, rng_streams=rng_streams, evaluation=evaluation
+        num_UAV=NUM_UAV,
+        rng_streams=rng_streams,
+        evaluation=evaluation,
+        environment_width_m=resolved_evaluation["environment_width_m"],
+        environment_height_m=resolved_evaluation["environment_height_m"],
     )
     env.configure_method(method_spec)
     # Formal execution initializes interval zero only after the canonical
@@ -2841,6 +2901,8 @@ def train(
             trajectory_artifacts.append(
                 {
                     "scenario_id": scenario_id,
+                    "environment_width_m": int(env.env_width),
+                    "environment_height_m": int(env.env_height),
                     "scenario_manifest_hash": (
                         scenario_manifest.content_hash
                         if scenario_manifest is not None
@@ -3604,6 +3666,26 @@ def train(
             "evaluation_runtime_provenance": copy.deepcopy(
                 evaluation_runtime
             ),
+            "training_environment_width_m": int(ENVIRONMENT_WIDTH_M),
+            "training_environment_height_m": int(ENVIRONMENT_HEIGHT_M),
+            "evaluation_environment_width_m": int(env.env_width),
+            "evaluation_environment_height_m": int(env.env_height),
+            "zero_shot_environment_shift": bool(
+                evaluation
+                and (
+                    env.env_width != int(ENVIRONMENT_WIDTH_M)
+                    or env.env_height != int(ENVIRONMENT_HEIGHT_M)
+                )
+            ),
+            "environment_shift_type": (
+                "map_size"
+                if evaluation
+                and resolved_evaluation["environment_size_evaluation"]
+                else None
+            ),
+            "new_training_started": False if evaluation else True,
+            "environment_size_observed_by_policy": False,
+            "coordinate_normalization": "current_environment_width_height",
             **(
                 evaluation_aliases
                 if evaluation

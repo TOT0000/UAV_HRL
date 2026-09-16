@@ -11,7 +11,9 @@ import subprocess
 
 from evaluation_metrics import write_evaluation_outputs
 from evaluation_selection import (
+    DEFAULT_ENVIRONMENT_SIZES_M,
     DEFAULT_FIXED_ROI_COUNTS,
+    resolve_environment_sizes_m,
     resolve_checkpoint_episodes,
     resolve_roi_counts,
     resolve_training_run_checkpoint,
@@ -19,10 +21,14 @@ from evaluation_selection import (
 )
 from experiment_config import (
     DEFAULT_TRAINING_SEED,
+    ENVIRONMENT_HEIGHT_M,
+    ENVIRONMENT_WIDTH_M,
     FORMAL_CHECKPOINT_EPISODE,
     FORMAL_EXPERIMENT_DEFAULTS,
+    METHOD_REGISTRY,
     MethodSpec,
     NUM_UAV,
+    ROI_COUNT_MAX,
     PRODUCTION_PACKET_INJECTION_CUTOFF_SECONDS,
     PRODUCTION_TASK_DEADLINE_SECONDS,
     comparison_method_configuration,
@@ -110,6 +116,10 @@ PAPER_EVALUATION_SUITES = {
         "requires_manifest": True,
     },
     "fixed_roi": {"methods": _FIXED_ROI_METHODS, "kind": "fixed_roi"},
+    "environment_size": {
+        "methods": tuple(METHOD_REGISTRY),
+        "kind": "environment_size",
+    },
 }
 
 DEPRECATED_SUITE_ALIASES = {
@@ -172,11 +182,18 @@ def evaluation_sweep_points(
     roi_counts=None,
     deadline_seconds=None,
     episode_seconds=None,
+    environment_sizes_m=None,
 ):
     suite = resolve_evaluation_suite(suite)
     kind = PAPER_EVALUATION_SUITES[suite]["kind"]
-    if roi_counts is not None and kind != "fixed_roi":
-        raise ValueError("RoI selectors are available only for the fixed_roi suite")
+    if roi_counts is not None and kind not in {"fixed_roi", "environment_size"}:
+        raise ValueError(
+            "RoI selectors are available only for fixed_roi or environment_size"
+        )
+    if environment_sizes_m is not None and kind != "environment_size":
+        raise ValueError(
+            "environment-size selectors are available only for the environment_size suite"
+        )
     if deadline_seconds is not None and kind != "deadline":
         raise ValueError(
             "deadline_seconds is available only for the "
@@ -280,6 +297,40 @@ def evaluation_sweep_points(
             }
             for num_gt in resolved_roi_counts
         )
+    if kind == "environment_size":
+        resolved_sizes = (
+            DEFAULT_ENVIRONMENT_SIZES_M
+            if environment_sizes_m is None
+            else resolve_environment_sizes_m(
+                environment_sizes_m=environment_sizes_m
+            )
+        )
+        resolved_roi_counts = (
+            (ROI_COUNT_MAX,)
+            if roi_counts is None
+            else resolve_roi_counts(roi_counts=roi_counts)
+        )
+        if len(resolved_roi_counts) != 1:
+            raise ValueError(
+                "environment_size requires exactly one fixed RoI count; "
+                "multi-RoI x multi-environment Cartesian sweeps are not supported"
+            )
+        fixed_num_gt = int(resolved_roi_counts[0])
+        return tuple(
+            {
+                "point_id": f"map_{size}m",
+                "overrides": {
+                    "environment_width_m": int(size),
+                    "environment_height_m": int(size),
+                },
+                "fixed_num_gt": fixed_num_gt,
+                "x_value": int(size),
+                "x_unit": "m",
+                "environment_width_m": int(size),
+                "environment_height_m": int(size),
+            }
+            for size in resolved_sizes
+        )
     raise RuntimeError(f"unsupported paper suite kind: {kind}")
 
 
@@ -364,6 +415,14 @@ def _evaluation_config(episodes, episode_seconds, seed):
 
 
 def _manifest_for_point(point, *, base_manifest, manifest_seed, episodes):
+    if "environment_width_m" in point:
+        return generate_manifest(
+            "test",
+            int(manifest_seed),
+            int(episodes),
+            num_gt=int(point["fixed_num_gt"]),
+            environment_size_m=int(point["environment_width_m"]),
+        )
     if "fixed_num_gt" in point:
         return generate_manifest(
             "test", int(manifest_seed), int(episodes), num_gt=int(point["fixed_num_gt"])
@@ -420,6 +479,7 @@ def run_paper_evaluation(
     output_root="results/paper_evaluations",
     checkpoint_episode=None,
     roi_counts=None,
+    environment_sizes_m=None,
     deadline_seconds=None,
     output_directory=None,
     fixed_roi_manifests=None,
@@ -457,15 +517,33 @@ def run_paper_evaluation(
     selected_checkpoint_episode = resolve_checkpoint_episodes(
         checkpoint_episode=checkpoint_episode
     )[0]
-    selected_roi_counts = (
-        resolve_roi_counts(roi_counts=roi_counts)
-        if suite == "fixed_roi"
+    if suite == "fixed_roi":
+        selected_roi_counts = resolve_roi_counts(roi_counts=roi_counts)
+    elif suite == "environment_size":
+        selected_roi_counts = (
+            (ROI_COUNT_MAX,)
+            if roi_counts is None
+            else resolve_roi_counts(roi_counts=roi_counts)
+        )
+        if len(selected_roi_counts) != 1:
+            raise ValueError("environment_size requires exactly one fixed RoI count")
+    else:
+        selected_roi_counts = None
+    if suite not in {"fixed_roi", "environment_size"} and roi_counts is not None:
+        raise ValueError(
+            "RoI selectors are available only for fixed_roi or environment_size"
+        )
+    if fixed_roi_manifests is not None and suite != "fixed_roi":
+        raise ValueError("fixed_roi_manifests is available only for fixed_roi")
+    if environment_sizes_m is not None and suite != "environment_size":
+        raise ValueError(
+            "environment-size selectors are available only for environment_size"
+        )
+    selected_environment_sizes = (
+        resolve_environment_sizes_m(environment_sizes_m=environment_sizes_m)
+        if suite == "environment_size"
         else None
     )
-    if suite != "fixed_roi" and (
-        roi_counts is not None or fixed_roi_manifests is not None
-    ):
-        raise ValueError("RoI selectors are available only for the fixed_roi suite")
 
     requested_manifest_seed = int(
         DEFAULT_TRAINING_SEED if manifest_seed is None else manifest_seed
@@ -485,6 +563,9 @@ def run_paper_evaluation(
         and context["checkpoint_episode"] == FORMAL_CHECKPOINT_EPISODE
     )
     evaluation_purpose = (
+        "zero_shot_environment_shift_evaluation"
+        if suite == "environment_size"
+        else
         "formal_checkpoint_evaluation"
         if is_formal_checkpoint
         else (
@@ -568,6 +649,7 @@ def run_paper_evaluation(
         selected_roi_counts,
         deadline_seconds=deadline_seconds,
         episode_seconds=resolved_seconds,
+        environment_sizes_m=selected_environment_sizes,
     )
     if flatten_single_point and len(points) != 1:
         raise ValueError("flatten_single_point requires exactly one evaluation point")
@@ -610,6 +692,11 @@ def run_paper_evaluation(
                 resolved_episodes,
                 requested_manifest_seed,
             )
+        if "environment_width_m" in point and (
+            int(manifest.environment_width_m) != int(point["environment_width_m"])
+            or int(manifest.environment_height_m) != int(point["environment_height_m"])
+        ):
+            raise ValueError("environment-size manifest dimensions disagree with sweep point")
         validate_manifest_initial_topologies(
             manifest, episode_count=resolved_episodes
         )
@@ -804,6 +891,29 @@ def run_paper_evaluation(
                 "formal_checkpoint_episode": FORMAL_CHECKPOINT_EPISODE,
                 "is_formal_checkpoint": is_formal_checkpoint,
                 "evaluation_purpose": evaluation_purpose,
+                "training_environment_width_m": result["run_metadata"][
+                    "training_environment_width_m"
+                ],
+                "training_environment_height_m": result["run_metadata"][
+                    "training_environment_height_m"
+                ],
+                "evaluation_environment_width_m": result["run_metadata"][
+                    "evaluation_environment_width_m"
+                ],
+                "evaluation_environment_height_m": result["run_metadata"][
+                    "evaluation_environment_height_m"
+                ],
+                "zero_shot_environment_shift": result["run_metadata"][
+                    "zero_shot_environment_shift"
+                ],
+                "environment_shift_type": result["run_metadata"][
+                    "environment_shift_type"
+                ],
+                "new_training_started": False,
+                "environment_size_observed_by_policy": False,
+                "coordinate_normalization": result["run_metadata"][
+                    "coordinate_normalization"
+                ],
                 **{
                     field: context.get(field)
                     for field in CHECKPOINT_HORIZON_COMPATIBILITY_FIELDS
@@ -903,6 +1013,25 @@ def run_paper_evaluation(
         "visual_sensing_contract_version": VISUAL_SENSING_CONTRACT_VERSION,
         "visual_sensing_configuration": visual_sensing_metadata(),
         "new_training_started": False,
+        "training_environment_width_m": int(ENVIRONMENT_WIDTH_M),
+        "training_environment_height_m": int(ENVIRONMENT_HEIGHT_M),
+        "evaluation_environment_sizes_m": (
+            list(selected_environment_sizes)
+            if selected_environment_sizes is not None
+            else None
+        ),
+        "zero_shot_environment_shift": bool(
+            selected_environment_sizes is not None
+            and any(
+                int(size) != int(ENVIRONMENT_WIDTH_M)
+                for size in selected_environment_sizes
+            )
+        ),
+        "environment_shift_type": (
+            "map_size" if selected_environment_sizes is not None else None
+        ),
+        "environment_size_observed_by_policy": False,
+        "coordinate_normalization": "current_environment_width_height",
         "aggregation": {
             "delay": "sum delivered E2E delay / sum delivered packets",
             "violation_probability": (

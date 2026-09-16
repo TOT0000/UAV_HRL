@@ -751,6 +751,44 @@ python -X utf8 run_paper_evaluation.py td3_dinkelbach --run-dir results/td3_dink
 python -X utf8 run_paper_evaluation.py kkm_random_action_random_routing --suite fixed_roi --manifest-seed 20260817
 ```
 
+The zero-shot map-size suite evaluates the same frozen policy and task/routing
+contracts on square maps of 750, 1000, 1250, 1500, 1750, and 2000 metres. It
+uses one fixed RoI count (8 by default) and never forms a map-size/RoI Cartesian
+product:
+
+```powershell
+python -X utf8 run_paper_evaluation.py td3_dinkelbach `
+  --run-dir results/td3_dinkelbach/<run-id> `
+  --suite environment_size
+
+python -X utf8 run_paper_evaluation.py kkm_random_action_random_routing `
+  --suite environment_size `
+  --environment-sizes-m 750 1000 2000 `
+  --roi-count 8
+```
+
+`--environment-size-m` and `--environment-sizes-m` are mutually exclusive;
+duplicates in the plural form are removed while preserving order. The suite
+accepts `--roi-count` only. It rejects `--roi-counts`, so each run has exactly
+one RoI count across all selected map sizes.
+
+The checkpoint training domain remains 1000 m by 1000 m. Evaluation changes
+only the square map geometry: the GS remains at the origin, the canonical UAV
+initial layout is unchanged, SR teams start at the selected map's boundary
+midpoints, and radius-80 m RoIs are regenerated inside the selected bounds.
+The visited bitmap and explorer map resize with the environment. Policy input
+dimensions remain unchanged because the aggregate coverage grid keeps its
+fixed shape and coordinates are normalized by the current environment width
+and height. The map size is not appended to the policy observation.
+
+Environment-size manifests use scenario schema `uav-hrl-scenario-v9`; existing
+fixed-RoI and training manifests remain byte-compatible v8 artifacts. Evaluation
+metadata records the 1000 m training environment, selected evaluation size,
+whether a zero-shot map-size shift occurred, `new_training_started=false`, and
+`environment_size_observed_by_policy=false`. Checkpoint schema and training
+configuration are unchanged, so existing compatible 1000 m checkpoints load
+without being treated as newly trained models.
+
 Fixed-RoI evaluation remains backward compatible: without checkpoint or RoI
 selectors it loads `FORMAL_CHECKPOINT_EPISODE` and evaluates RoI 2 through 8.
 Explicit selectors enable diagnostic checkpoint-progress evaluation without
