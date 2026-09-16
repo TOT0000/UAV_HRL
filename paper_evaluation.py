@@ -52,6 +52,7 @@ from routing_q_score_diagnostics import (
 )
 from paper_figure_registry import FIGURE_REGISTRY, PAPER_METHOD_MAPPINGS
 from paper_metrics import (
+    ENVIRONMENT_SIZE_AGGREGATE_CONTRACT_VERSION,
     PAPER_AGGREGATE_SCHEMA_VERSION,
     aggregate_paper_point_metrics,
     normalize_episode_ee,
@@ -316,21 +317,33 @@ def evaluation_sweep_points(
                 "multi-RoI x multi-environment Cartesian sweeps are not supported"
             )
         fixed_num_gt = int(resolved_roi_counts[0])
-        return tuple(
-            {
-                "point_id": f"map_{size}m",
-                "overrides": {
+        points = []
+        for size in resolved_sizes:
+            zero_shot_shift = int(size) != int(ENVIRONMENT_WIDTH_M)
+            points.append(
+                {
+                    "point_id": f"map_{size}m",
+                    "overrides": {
+                        "environment_width_m": int(size),
+                        "environment_height_m": int(size),
+                    },
+                    "fixed_num_gt": fixed_num_gt,
+                    "x_value": int(size),
+                    "x_unit": "m",
                     "environment_width_m": int(size),
                     "environment_height_m": int(size),
-                },
-                "fixed_num_gt": fixed_num_gt,
-                "x_value": int(size),
-                "x_unit": "m",
-                "environment_width_m": int(size),
-                "environment_height_m": int(size),
-            }
-            for size in resolved_sizes
-        )
+                    "zero_shot_environment_shift": zero_shot_shift,
+                    "environment_shift_type": (
+                        "map_size" if zero_shot_shift else None
+                    ),
+                    "point_evaluation_purpose": (
+                        "zero_shot_environment_shift_evaluation"
+                        if zero_shot_shift
+                        else "in_distribution_environment_size_baseline"
+                    ),
+                }
+            )
+        return tuple(points)
     raise RuntimeError(f"unsupported paper suite kind: {kind}")
 
 
@@ -563,7 +576,7 @@ def run_paper_evaluation(
         and context["checkpoint_episode"] == FORMAL_CHECKPOINT_EPISODE
     )
     evaluation_purpose = (
-        "zero_shot_environment_shift_evaluation"
+        "environment_size_sweep_evaluation"
         if suite == "environment_size"
         else
         "formal_checkpoint_evaluation"
@@ -801,6 +814,9 @@ def run_paper_evaluation(
             "formal_checkpoint_episode": FORMAL_CHECKPOINT_EPISODE,
             "is_formal_checkpoint": is_formal_checkpoint,
             "evaluation_purpose": evaluation_purpose,
+            "point_evaluation_purpose": point.get(
+                "point_evaluation_purpose", evaluation_purpose
+            ),
             **{
                 field: context.get(field)
                 for field in CHECKPOINT_HORIZON_COMPATIBILITY_FIELDS
@@ -811,6 +827,11 @@ def run_paper_evaluation(
             point_dir,
             result["episode_metrics"],
             run_metadata,
+            episode_context_columns=(
+                ("episode_horizon_seconds",)
+                if suite == "environment_size"
+                else ()
+            ),
         )
         outputs["packet_outcomes_jsonl"] = packet_outcomes_path.resolve()
         outputs.update(diagnostic_outputs)
@@ -831,7 +852,15 @@ def run_paper_evaluation(
             method.method_id, suite, point, result["episode_metrics"]
         )
         validate_canonical_aggregate_rows(
-            aggregates, method.method_id, point["point_id"]
+            aggregates,
+            method.method_id,
+            point["point_id"],
+            suite=suite,
+            suite_contract_version=(
+                ENVIRONMENT_SIZE_AGGREGATE_CONTRACT_VERSION
+                if suite == "environment_size"
+                else None
+            ),
         )
         _write_json(point_dir / "aggregated_plot_data.json", aggregates)
         _write_csv(point_dir / "aggregated_plot_data.csv", aggregates)
@@ -891,6 +920,9 @@ def run_paper_evaluation(
                 "formal_checkpoint_episode": FORMAL_CHECKPOINT_EPISODE,
                 "is_formal_checkpoint": is_formal_checkpoint,
                 "evaluation_purpose": evaluation_purpose,
+                "point_evaluation_purpose": point.get(
+                    "point_evaluation_purpose", evaluation_purpose
+                ),
                 "training_environment_width_m": result["run_metadata"][
                     "training_environment_width_m"
                 ],
@@ -937,6 +969,15 @@ def run_paper_evaluation(
     method_contracts = comparison_method_configuration(method)
     metadata = {
         "aggregate_schema_version": PAPER_AGGREGATE_SCHEMA_VERSION,
+        **(
+            {
+                "suite_aggregate_contract_version": (
+                    ENVIRONMENT_SIZE_AGGREGATE_CONTRACT_VERSION
+                )
+            }
+            if suite == "environment_size"
+            else {}
+        ),
         **{
             field: method_contracts[field]
             for field in (
@@ -1020,15 +1061,18 @@ def run_paper_evaluation(
             if selected_environment_sizes is not None
             else None
         ),
-        "zero_shot_environment_shift": bool(
-            selected_environment_sizes is not None
-            and any(
-                int(size) != int(ENVIRONMENT_WIDTH_M)
-                for size in selected_environment_sizes
-            )
-        ),
-        "environment_shift_type": (
-            "map_size" if selected_environment_sizes is not None else None
+        **(
+            {
+                "contains_zero_shot_environment_shift": any(
+                    int(size) != int(ENVIRONMENT_WIDTH_M)
+                    for size in selected_environment_sizes
+                )
+            }
+            if selected_environment_sizes is not None
+            else {
+                "zero_shot_environment_shift": False,
+                "environment_shift_type": None,
+            }
         ),
         "environment_size_observed_by_policy": False,
         "coordinate_normalization": "current_environment_width_height",
@@ -1041,6 +1085,29 @@ def run_paper_evaluation(
             "energy_efficiency": (
                 "per-seed sum timely useful Mbit / sum mobility J; "
                 "zero denominator is missing; valid seed values are equally weighted"
+            ),
+            **(
+                {
+                    "timely_throughput": (
+                        "per-seed sum total timely useful bits / 1000 / sum "
+                        "actual episode horizon seconds; valid seed values are "
+                        "equally weighted"
+                    ),
+                    "mobility_energy": (
+                        "per-seed sum mobility J / episode count; valid seed "
+                        "values are equally weighted"
+                    ),
+                    "roi_discovery": (
+                        "per-seed arithmetic mean of terminal found_GT_ratio; "
+                        "valid seed values are equally weighted"
+                    ),
+                    "terminal_coverage": (
+                        "per-seed arithmetic mean of terminal coverage; valid "
+                        "seed values are equally weighted"
+                    ),
+                }
+                if suite == "environment_size"
+                else {}
             ),
             "fov_coverage_snapshot_timing": "packet generation/capture time",
             "zero_delivered_delay": "null with missing=true",

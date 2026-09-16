@@ -6,6 +6,7 @@ import math
 
 from evaluation_aggregation import (
     EVALUATION_AGGREGATION_SCHEMA_VERSION,
+    aggregate_seed_metric_rows,
     canonical_aggregation,
 )
 
@@ -22,6 +23,33 @@ CANONICAL_AGGREGATE_ROWS = (
     ("violation_probability", "COM"),
     ("violation_probability", "ALL"),
 )
+ENVIRONMENT_SIZE_AGGREGATE_CONTRACT_VERSION = (
+    "uav-hrl-environment-size-aggregate-v1"
+)
+ENVIRONMENT_SIZE_AGGREGATE_ROWS = (
+    ("timely_throughput_kbit_per_s", None),
+    ("mobility_energy_j_per_episode", None),
+    ("roi_discovery_ratio", None),
+    ("terminal_coverage_ratio", None),
+)
+ENVIRONMENT_SIZE_METRIC_DEFINITIONS = {
+    "timely_throughput_kbit_per_s": {
+        "display_name": "Timely throughput",
+        "units": ("kbit", "seconds", "kbit/s"),
+    },
+    "mobility_energy_j_per_episode": {
+        "display_name": "Mobility energy",
+        "units": ("J", "episodes", "J/episode"),
+    },
+    "roi_discovery_ratio": {
+        "display_name": "RoI discovery ratio",
+        "units": ("ratio_sum", "episodes", "ratio"),
+    },
+    "terminal_coverage_ratio": {
+        "display_name": "Terminal coverage ratio",
+        "units": ("ratio_sum", "episodes", "ratio"),
+    },
+}
 AGGREGATE_COMPARE_FIELDS = (
     "aggregate_schema_version",
     "semantic_suite",
@@ -31,10 +59,13 @@ AGGREGATE_COMPARE_FIELDS = (
     "x_unit",
     "fixed_num_gt",
     "swept_task",
+    "environment_width_m",
+    "environment_height_m",
     "evaluation_episode_count",
     "metric",
     "task_type",
     "display_task_type",
+    "display_name",
     "numerator",
     "numerator_unit",
     "denominator",
@@ -43,6 +74,7 @@ AGGREGATE_COMPARE_FIELDS = (
     "value_unit",
     "missing",
     "canonical_aggregation_schema_version",
+    "suite_aggregate_contract_version",
     "aggregation_rule",
     "valid_training_seed_count",
     "sample_stddev",
@@ -52,6 +84,131 @@ AGGREGATE_COMPARE_FIELDS = (
     "ci95_lower",
     "ci95_upper",
 )
+
+
+def _environment_metric_input(row, field, *, positive=False, ratio=False):
+    value = row.get(field)
+    if value is None or value == "":
+        raise ValueError(f"environment-size aggregation input is missing: {field}")
+    try:
+        number = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"environment-size aggregation input is not numeric: {field}"
+        ) from exc
+    if not math.isfinite(number) or number < 0.0 or (positive and number <= 0.0):
+        qualifier = "positive" if positive else "non-negative"
+        raise ValueError(
+            f"environment-size aggregation input must be finite and {qualifier}: {field}"
+        )
+    if ratio and number > 1.0:
+        raise ValueError(
+            f"environment-size aggregation ratio is outside [0,1]: {field}"
+        )
+    return number
+
+
+def _environment_size_seed_metrics(episode_rows):
+    grouped = {}
+    for row in episode_rows:
+        seed_value = row.get("training_seed")
+        if seed_value is None or seed_value == "":
+            raise ValueError(
+                "environment-size aggregation input is missing: training_seed"
+            )
+        seed = int(seed_value)
+        grouped.setdefault(seed, []).append(row)
+    per_seed = []
+    for seed, rows in sorted(grouped.items()):
+        episode_count = len(rows)
+        timely_kbits = sum(
+            _environment_metric_input(row, "total_timely_useful_bits") / 1000.0
+            for row in rows
+        )
+        horizon_seconds = sum(
+            _environment_metric_input(
+                row, "episode_horizon_seconds", positive=True
+            )
+            for row in rows
+        )
+        energy_joules = sum(
+            _environment_metric_input(row, "total_mobility_energy_j")
+            for row in rows
+        )
+        discovery_sum = sum(
+            _environment_metric_input(row, "found_GT_ratio", ratio=True)
+            for row in rows
+        )
+        coverage_sum = sum(
+            _environment_metric_input(row, "coverage", ratio=True)
+            for row in rows
+        )
+        inputs = (
+            (
+                "timely_throughput_kbit_per_s",
+                timely_kbits,
+                horizon_seconds,
+                "kbit",
+                "seconds",
+                "kbit/s",
+            ),
+            (
+                "mobility_energy_j_per_episode",
+                energy_joules,
+                episode_count,
+                "J",
+                "episodes",
+                "J/episode",
+            ),
+            (
+                "roi_discovery_ratio",
+                discovery_sum,
+                episode_count,
+                "ratio_sum",
+                "episodes",
+                "ratio",
+            ),
+            (
+                "terminal_coverage_ratio",
+                coverage_sum,
+                episode_count,
+                "ratio_sum",
+                "episodes",
+                "ratio",
+            ),
+        )
+        for (
+            metric,
+            numerator,
+            denominator,
+            numerator_unit,
+            denominator_unit,
+            value_unit,
+        ) in inputs:
+            per_seed.append(
+                {
+                    "aggregation_schema_version": (
+                        EVALUATION_AGGREGATION_SCHEMA_VERSION
+                    ),
+                    "aggregation_level": "training_seed",
+                    "aggregation_rule": "ratio_of_episode_sums",
+                    "metric": metric,
+                    "task_type": None,
+                    "numerator": float(numerator),
+                    "numerator_unit": numerator_unit,
+                    "denominator": float(denominator),
+                    "denominator_unit": denominator_unit,
+                    "value": float(numerator) / float(denominator),
+                    "value_unit": value_unit,
+                    "missing": False,
+                    "training_seed": seed,
+                    "evaluation_episode_count": episode_count,
+                }
+            )
+    cross_seed = aggregate_seed_metric_rows(
+        per_seed, ENVIRONMENT_SIZE_AGGREGATE_ROWS
+    )
+    return per_seed, cross_seed
 
 
 def causal_trailing_average(values, window=50):
@@ -137,7 +294,14 @@ def normalize_episode_ee(method_id, history_rows, window=50):
     ]
 
 
-def aggregate_paper_point_metrics(method_id, suite, point, episode_rows):
+def aggregate_paper_point_metrics(
+    method_id,
+    suite,
+    point,
+    episode_rows,
+    *,
+    include_environment_size_metrics=None,
+):
     """Adapt the shared seed-ratio aggregation into paper plot rows."""
 
     rows = list(episode_rows)
@@ -145,6 +309,13 @@ def aggregate_paper_point_metrics(method_id, suite, point, episode_rows):
         raise ValueError(
             f"paper evaluation point has no episode rows: method={method_id}, "
             f"point={point.get('point_id')}"
+        )
+    if include_environment_size_metrics is None:
+        include_environment_size_metrics = suite == "environment_size"
+    include_environment_size_metrics = bool(include_environment_size_metrics)
+    if include_environment_size_metrics and suite != "environment_size":
+        raise ValueError(
+            "environment-size aggregate metrics require the environment_size suite"
         )
     common = {
         "aggregate_schema_version": PAPER_AGGREGATE_SCHEMA_VERSION,
@@ -159,6 +330,17 @@ def aggregate_paper_point_metrics(method_id, suite, point, episode_rows):
         "ee_numerator_definition": "total timely useful Mbit",
         "fov_coverage_snapshot_timing": "packet generation/capture time",
     }
+    if include_environment_size_metrics:
+        common.update(
+            {
+                "environment_width_m": point.get("environment_width_m"),
+                "environment_height_m": point.get("environment_height_m"),
+                "display_name": None,
+                "suite_aggregate_contract_version": (
+                    ENVIRONMENT_SIZE_AGGREGATE_CONTRACT_VERSION
+                ),
+            }
+        )
     per_seed, cross_seed = canonical_aggregation(rows)
     result = []
     for aggregate in cross_seed:
@@ -211,7 +393,63 @@ def aggregate_paper_point_metrics(method_id, suite, point, episode_rows):
                 ],
             }
         )
-    validate_canonical_aggregate_rows(result, method_id, point["point_id"])
+    if include_environment_size_metrics:
+        environment_per_seed, environment_cross_seed = (
+            _environment_size_seed_metrics(rows)
+        )
+        for aggregate in environment_cross_seed:
+            definition = ENVIRONMENT_SIZE_METRIC_DEFINITIONS[aggregate["metric"]]
+            result.append(
+                {
+                    **common,
+                    "canonical_aggregation_schema_version": (
+                        EVALUATION_AGGREGATION_SCHEMA_VERSION
+                    ),
+                    "aggregation_rule": aggregate["aggregation_rule"],
+                    "metric": aggregate["metric"],
+                    "task_type": None,
+                    "display_task_type": None,
+                    "display_name": definition["display_name"],
+                    "numerator": aggregate["pooled_numerator"],
+                    "numerator_unit": aggregate["numerator_unit"],
+                    "denominator": aggregate["pooled_denominator"],
+                    "denominator_unit": aggregate["denominator_unit"],
+                    "value": aggregate["mean"],
+                    "value_unit": aggregate["value_unit"],
+                    "missing": aggregate["missing"],
+                    "valid_training_seed_count": aggregate[
+                        "valid_training_seed_count"
+                    ],
+                    "missing_training_seed_count": aggregate[
+                        "missing_training_seed_count"
+                    ],
+                    "training_seed_count": aggregate["training_seed_count"],
+                    "valid_training_seeds": aggregate["valid_training_seeds"],
+                    "per_seed_numerators": aggregate["per_seed_numerators"],
+                    "per_seed_denominators": aggregate[
+                        "per_seed_denominators"
+                    ],
+                    "per_seed_values": aggregate["per_seed_values"],
+                    "sample_stddev": aggregate["sample_stddev"],
+                    "degrees_of_freedom": aggregate["degrees_of_freedom"],
+                    "confidence_interval_method": aggregate[
+                        "confidence_interval_method"
+                    ],
+                    "confidence_level": aggregate["confidence_level"],
+                    "t_critical_975": aggregate["t_critical_975"],
+                    "ci95_half_width": aggregate["ci95_half_width"],
+                    "ci95_lower": aggregate["ci95_lower"],
+                    "ci95_upper": aggregate["ci95_upper"],
+                    "per_seed_aggregation": [
+                        row
+                        for row in environment_per_seed
+                        if row["metric"] == aggregate["metric"]
+                    ],
+                }
+            )
+    validate_canonical_aggregate_rows(
+        result, method_id, point["point_id"], suite=suite
+    )
     return result
 
 
@@ -273,9 +511,48 @@ def _require_value(expected, actual, field, identity):
         )
 
 
-def validate_canonical_aggregate_rows(rows, method_id, point_id):
+def validate_canonical_aggregate_rows(
+    rows,
+    method_id,
+    point_id,
+    *,
+    suite=None,
+    suite_contract_version=None,
+):
     rows = list(rows)
-    expected_pairs = set(CANONICAL_AGGREGATE_ROWS)
+    if suite is None:
+        suites = {
+            str(row.get("semantic_suite"))
+            for row in rows
+            if row.get("semantic_suite") not in (None, "")
+        }
+        suite = next(iter(suites)) if len(suites) == 1 else None
+    advertised_contracts = {
+        row.get("suite_aggregate_contract_version")
+        for row in rows
+        if row.get("suite_aggregate_contract_version") not in (None, "")
+    }
+    if suite_contract_version not in (None, ""):
+        advertised_contracts.add(suite_contract_version)
+    unknown_contracts = advertised_contracts.difference(
+        {ENVIRONMENT_SIZE_AGGREGATE_CONTRACT_VERSION}
+    )
+    if unknown_contracts:
+        raise ValueError(
+            "unsupported suite aggregate contract version: "
+            f"{sorted(unknown_contracts)}"
+        )
+    environment_size = (
+        suite == "environment_size"
+        and ENVIRONMENT_SIZE_AGGREGATE_CONTRACT_VERSION
+        in advertised_contracts
+    )
+    expected_rows = (
+        (*CANONICAL_AGGREGATE_ROWS, *ENVIRONMENT_SIZE_AGGREGATE_ROWS)
+        if environment_size
+        else CANONICAL_AGGREGATE_ROWS
+    )
+    expected_pairs = set(expected_rows)
     seen = {}
     for row in rows:
         metric = row.get("metric")
@@ -304,10 +581,10 @@ def validate_canonical_aggregate_rows(rows, method_id, point_id):
             f"method={method_id}, point={point_id}: missing canonical aggregate rows: "
             f"expected={sorted(missing, key=str)}, actual={sorted(seen, key=str)}"
         )
-    if len(rows) != len(CANONICAL_AGGREGATE_ROWS):
+    if len(rows) != len(expected_rows):
         raise ValueError(
             f"method={method_id}, point={point_id}: aggregate row count mismatch: "
-            f"expected={len(CANONICAL_AGGREGATE_ROWS)}, actual={len(rows)}"
+            f"expected={len(expected_rows)}, actual={len(rows)}"
         )
     combined = seen[("violation_probability", "ALL")]
     task_rows = [
@@ -350,6 +627,13 @@ def validate_canonical_aggregate_rows(rows, method_id, point_id):
     for metric, task_type in CANONICAL_AGGREGATE_ROWS:
         row = seen[(metric, task_type)]
         identity = _identity(method_id, point_id, metric, task_type)
+        if environment_size:
+            _require_value(
+                ENVIRONMENT_SIZE_AGGREGATE_CONTRACT_VERSION,
+                row.get("suite_aggregate_contract_version"),
+                "suite_aggregate_contract_version",
+                identity,
+            )
         if type(row.get("missing")) is not bool:
             raise ValueError(
                 f"{identity}: missing must be boolean: actual={row.get('missing')!r}"
@@ -434,10 +718,185 @@ def validate_canonical_aggregate_rows(rows, method_id, point_id):
             raise ValueError(
                 f"{identity}: violation probability outside [0,1]: actual={expected_value}"
             )
+    if environment_size:
+        for metric, task_type in ENVIRONMENT_SIZE_AGGREGATE_ROWS:
+            row = seen[(metric, task_type)]
+            identity = _identity(method_id, point_id, metric, task_type)
+            definition = ENVIRONMENT_SIZE_METRIC_DEFINITIONS[metric]
+            _require_value(
+                ENVIRONMENT_SIZE_AGGREGATE_CONTRACT_VERSION,
+                row.get("suite_aggregate_contract_version"),
+                "suite_aggregate_contract_version",
+                identity,
+            )
+            _require_value(
+                definition["display_name"],
+                row.get("display_name"),
+                "display_name",
+                identity,
+            )
+            _require_value(
+                EVALUATION_AGGREGATION_SCHEMA_VERSION,
+                row.get("canonical_aggregation_schema_version"),
+                "canonical_aggregation_schema_version",
+                identity,
+            )
+            _require_value(
+                "equal_weight_valid_training_seed_values",
+                row.get("aggregation_rule"),
+                "aggregation_rule",
+                identity,
+            )
+            if type(row.get("missing")) is not bool:
+                raise ValueError(
+                    f"{identity}: missing must be boolean: "
+                    f"actual={row.get('missing')!r}"
+                )
+            per_seed = row.get("per_seed_aggregation")
+            if not isinstance(per_seed, list) or not per_seed:
+                raise ValueError(
+                    f"{identity}: per_seed_aggregation must be a non-empty list"
+                )
+            per_seed_values = row.get("per_seed_values")
+            per_seed_numerators = row.get("per_seed_numerators")
+            per_seed_denominators = row.get("per_seed_denominators")
+            if not all(
+                isinstance(values, list)
+                for values in (
+                    per_seed_values,
+                    per_seed_numerators,
+                    per_seed_denominators,
+                )
+            ):
+                raise ValueError(
+                    f"{identity}: per-seed values, numerators, and denominators "
+                    "must be lists"
+                )
+            if not (
+                len(per_seed)
+                == len(per_seed_values)
+                == len(per_seed_numerators)
+                == len(per_seed_denominators)
+            ):
+                raise ValueError(f"{identity}: per-seed list lengths differ")
+            units = definition["units"]
+            for field, expected in zip(
+                ("numerator_unit", "denominator_unit", "value_unit"), units
+            ):
+                _require_value(expected, row.get(field), field, identity)
+            calculated_values = []
+            for index, seed_row in enumerate(per_seed):
+                seed_identity = f"{identity}, seed_index={index}"
+                _require_value(
+                    metric, seed_row.get("metric"), "metric", seed_identity
+                )
+                _require_value(
+                    None,
+                    seed_row.get("task_type"),
+                    "task_type",
+                    seed_identity,
+                )
+                _require_value(
+                    "ratio_of_episode_sums",
+                    seed_row.get("aggregation_rule"),
+                    "aggregation_rule",
+                    seed_identity,
+                )
+                for field, expected in zip(
+                    ("numerator_unit", "denominator_unit", "value_unit"), units
+                ):
+                    _require_value(
+                        expected, seed_row.get(field), field, seed_identity
+                    )
+                numerator = _finite_nonnegative(
+                    seed_row.get("numerator"), "numerator", seed_identity
+                )
+                denominator = _finite_nonnegative(
+                    seed_row.get("denominator"), "denominator", seed_identity
+                )
+                if denominator <= 0.0:
+                    raise ValueError(
+                        f"{seed_identity}: denominator must be positive"
+                    )
+                expected_seed_value = numerator / denominator
+                _require_value(
+                    expected_seed_value,
+                    seed_row.get("value"),
+                    "value",
+                    seed_identity,
+                )
+                _require_value(
+                    numerator,
+                    per_seed_numerators[index],
+                    "per_seed_numerator",
+                    seed_identity,
+                )
+                _require_value(
+                    denominator,
+                    per_seed_denominators[index],
+                    "per_seed_denominator",
+                    seed_identity,
+                )
+                _require_value(
+                    expected_seed_value,
+                    per_seed_values[index],
+                    "per_seed_value",
+                    seed_identity,
+                )
+                if (
+                    metric
+                    in {"roi_discovery_ratio", "terminal_coverage_ratio"}
+                    and not 0.0 <= expected_seed_value <= 1.0
+                ):
+                    raise ValueError(
+                        f"{seed_identity}: ratio outside [0,1]: "
+                        f"actual={expected_seed_value}"
+                    )
+                calculated_values.append(expected_seed_value)
+            expected_value = sum(calculated_values) / len(calculated_values)
+            _require_value(
+                sum(float(value) for value in per_seed_numerators),
+                row.get("numerator"),
+                "per_seed_numerator_sum",
+                identity,
+            )
+            _require_value(
+                sum(float(value) for value in per_seed_denominators),
+                row.get("denominator"),
+                "per_seed_denominator_sum",
+                identity,
+            )
+            _require_value(expected_value, row.get("value"), "value", identity)
+            _require_value(False, row.get("missing"), "missing", identity)
+            _require_value(
+                len(calculated_values),
+                row.get("valid_training_seed_count"),
+                "valid_training_seed_count",
+                identity,
+            )
+            _require_value(
+                "Student-t",
+                row.get("confidence_interval_method"),
+                "confidence_interval_method",
+                identity,
+            )
+            _require_value(
+                0.95,
+                row.get("confidence_level"),
+                "confidence_level",
+                identity,
+            )
     return rows
 
 
-def validate_aggregate_collection(rows, method_id, point_ids):
+def validate_aggregate_collection(
+    rows,
+    method_id,
+    point_ids,
+    *,
+    suite=None,
+    suite_contract_version=None,
+):
     rows = list(rows)
     expected_points = tuple(str(point_id) for point_id in point_ids)
     grouped = {point_id: [] for point_id in expected_points}
@@ -450,7 +909,13 @@ def validate_aggregate_collection(rows, method_id, point_ids):
             )
         grouped[point_id].append(row)
     for point_id in expected_points:
-        validate_canonical_aggregate_rows(grouped[point_id], method_id, point_id)
+        validate_canonical_aggregate_rows(
+            grouped[point_id],
+            method_id,
+            point_id,
+            suite=suite,
+            suite_contract_version=suite_contract_version,
+        )
     return rows
 
 

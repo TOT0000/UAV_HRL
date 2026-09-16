@@ -1528,7 +1528,7 @@ def _evaluation_runtime_provenance(
             "zero_shot_environment_shift": zero_shot_environment_shift,
             "environment_shift_type": (
                 "map_size"
-                if resolved_evaluation["environment_size_evaluation"]
+                if zero_shot_environment_shift
                 else None
             ),
             "new_training_started": False,
@@ -3680,7 +3680,10 @@ def train(
             "environment_shift_type": (
                 "map_size"
                 if evaluation
-                and resolved_evaluation["environment_size_evaluation"]
+                and (
+                    env.env_width != int(ENVIRONMENT_WIDTH_M)
+                    or env.env_height != int(ENVIRONMENT_HEIGHT_M)
+                )
                 else None
             ),
             "new_training_started": False if evaluation else True,

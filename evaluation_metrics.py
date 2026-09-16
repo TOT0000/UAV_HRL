@@ -740,19 +740,24 @@ def validate_formal_aggregation_rows(
     return episode_rows
 
 
-def write_evaluation_outputs(output_dir, episode_rows, run_metadata):
+def write_evaluation_outputs(
+    output_dir, episode_rows, run_metadata, *, episode_context_columns=()
+):
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     run_metadata = dict(run_metadata)
+    episode_fields = (*EPISODE_COLUMNS, *tuple(episode_context_columns))
+    if len(episode_fields) != len(set(episode_fields)):
+        raise ValueError("episode output columns must be unique")
     normalized_rows = [
-        {column: row.get(column) for column in EPISODE_COLUMNS}
+        {column: row.get(column) for column in episode_fields}
         for row in episode_rows
     ]
     seed_summaries = summarize_training_seeds(normalized_rows)
     seed_fields = (*SEED_SUMMARY_IDENTITY_COLUMNS, *SEED_SUMMARY_METRIC_COLUMNS)
 
     per_episode_csv = _write_csv(
-        output_dir / "per_episode.csv", normalized_rows, EPISODE_COLUMNS
+        output_dir / "per_episode.csv", normalized_rows, episode_fields
     )
     per_episode_jsonl = output_dir / "per_episode.jsonl"
     per_episode_jsonl.write_text(

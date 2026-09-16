@@ -25,6 +25,7 @@ from paper_evaluation import (
     aggregate_paper_point_metrics,
     evaluation_sweep_points,
 )
+from paper_metrics import ENVIRONMENT_SIZE_AGGREGATE_CONTRACT_VERSION
 from paper_figure_registry import FIGURE_REGISTRY, PAPER_METHOD_MAPPINGS
 from paper_figures import (
     AmbiguousPaperRunError,
@@ -338,6 +339,7 @@ class SyntheticFigureBuildTest(unittest.TestCase):
             rows.append(
                 {
                     "episode": episode + 1,
+                    "training_seed": TRAINING_SEED,
                     "timely_goodput_mbits": 2.0 + point_index + method_offset / 10,
                     "total_mobility_energy_j": 4.0 + episode,
                     "fov_delivered_packets": fov_delivered,
@@ -587,6 +589,24 @@ class SyntheticFigureBuildTest(unittest.TestCase):
                     json.dumps([artifact]), encoding="utf-8"
                 )
             episode_rows = self._episode_rows(method_id, index)
+            if suite == "environment_size":
+                for episode_index, row in enumerate(episode_rows):
+                    row.update(
+                        {
+                            "total_timely_useful_mbits": row[
+                                "timely_goodput_mbits"
+                            ],
+                            "total_timely_useful_bits": row[
+                                "timely_goodput_mbits"
+                            ]
+                            * 1e6,
+                            "episode_horizon_seconds": (
+                                EVALUATION_HORIZON_SECONDS
+                            ),
+                            "found_GT_ratio": 0.5 + episode_index / 10.0,
+                            "coverage": 0.4 + episode_index / 10.0,
+                        }
+                    )
             per_episode_path = point_dir / "per_episode.jsonl"
             per_episode_path.write_text(
                 "".join(json.dumps(row) + "\n" for row in episode_rows),
@@ -647,6 +667,15 @@ class SyntheticFigureBuildTest(unittest.TestCase):
         )
         metadata = {
             "semantic_suite": suite,
+            **(
+                {
+                    "suite_aggregate_contract_version": (
+                        ENVIRONMENT_SIZE_AGGREGATE_CONTRACT_VERSION
+                    )
+                }
+                if suite == "environment_size"
+                else {}
+            ),
             "method_id": method_id,
             "method_spec": method.to_dict(),
             "training_run": str(training_run) if checkpoint_required else None,

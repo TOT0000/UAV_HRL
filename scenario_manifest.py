@@ -23,6 +23,7 @@ from experiment_config import (
     COMMUNICATION_RANGE_CONTRACT_VERSION,
     ENVIRONMENT_HEIGHT_M,
     ENVIRONMENT_SIZE_EVALUATION_VALUES_M,
+    ENVIRONMENT_SIZE_REFERENCE_M,
     ENVIRONMENT_WIDTH_M,
     GROUND_STATION_POSITION_M,
     GS_GATEWAY_CONTRACT_VERSION,
@@ -408,14 +409,9 @@ def _split_seed(
     schema_version=SCENARIO_SCHEMA_VERSION,
     environment_size_m=None,
 ) -> int:
-    size_identity = (
-        ""
-        if environment_size_m is None
-        else f":map-{int(environment_size_m)}m"
-    )
     material = (
         f"{schema_version}:{split}:{int(manifest_seed)}:"
-        f"{_profile_id(generation_profile)}{size_identity}:"
+        f"{_profile_id(generation_profile)}:"
         f"{int(episode_index)}"
     ).encode("utf-8")
     return int.from_bytes(hashlib.sha256(material).digest()[:8], "big")
@@ -469,6 +465,44 @@ def _gt_initial_data(
         }
         for gt_id, (x, y) in enumerate(points)
     ]
+
+
+def _paired_environment_size_gt_initial_data(
+    py_rng: random.Random,
+    num_gt: int,
+    environment_size_m: int,
+) -> list[dict[str, Any]]:
+    """Map one 750 m latent RoI layout into a requested legal map area."""
+
+    radius = 80.0
+    reference_size = float(ENVIRONMENT_SIZE_REFERENCE_M)
+    target_size = float(environment_size_m)
+    reference_span = reference_size - 2.0 * radius
+    target_span = target_size - 2.0 * radius
+    if reference_span <= 0.0 or target_span <= 0.0:
+        raise ValueError("environment size must exceed twice the RoI radius")
+    reference = _gt_initial_data(
+        py_rng,
+        num_gt,
+        reference_size,
+        reference_size,
+    )
+    result = []
+    for item in reference:
+        reference_x, reference_y, _ = map(float, item["position"])
+        normalized_x = (reference_x - radius) / reference_span
+        normalized_y = (reference_y - radius) / reference_span
+        result.append(
+            {
+                **item,
+                "position": [
+                    radius + normalized_x * target_span,
+                    radius + normalized_y * target_span,
+                    0.0,
+                ],
+            }
+        )
+    return result
 
 
 def _sr_initial_data(
@@ -552,11 +586,19 @@ def generate_scenario_entry(
         "scenario_seed": scenario_seed,
         "generation_profile_id": profile_id,
         "num_GT": episode_num_gt,
-        "ground_targets": _gt_initial_data(
-            py_rng,
-            episode_num_gt,
-            environment_width_m,
-            environment_height_m,
+        "ground_targets": (
+            _gt_initial_data(
+                py_rng,
+                episode_num_gt,
+                environment_width_m,
+                environment_height_m,
+            )
+            if environment_size_m is None
+            else _paired_environment_size_gt_initial_data(
+                py_rng,
+                episode_num_gt,
+                environment_size_m,
+            )
         ),
         "uavs": _uav_initial_data(py_rng),
         "sr_teams": _sr_initial_data(
@@ -572,7 +614,11 @@ def generate_scenario_entry(
         },
         "exogenous_primitives": {
             "channel_randomness": "none",
-            "gt_placement_model": "nonoverlap-away-from-gs-v1",
+            "gt_placement_model": (
+                "nonoverlap-away-from-gs-v1"
+                if environment_size_m is None
+                else "paired-radius-aware-normalized-layout-v1"
+            ),
             "uav_xy_layout": UAV_INITIAL_LAYOUT,
             "ground_station_position_m": list(GROUND_STATION_POSITION_M),
             "initial_communication_topology_contract_version": (
@@ -585,6 +631,15 @@ def generate_scenario_entry(
         },
     }
     if environment_size_m is not None:
+        entry["exogenous_primitives"].update(
+            {
+                "latent_layout_reference_environment_size_m": int(
+                    ENVIRONMENT_SIZE_REFERENCE_M
+                ),
+                "latent_layout_rng_paired_across_environment_sizes": True,
+                "latent_layout_mapping": "radius-aware-normalized-legal-area",
+            }
+        )
         entry.update(
             {
                 "environment_width_m": environment_width_m,
@@ -1052,6 +1107,11 @@ def generate_manifest(
                 "environment_width_m": environment_width_m,
                 "environment_height_m": environment_height_m,
                 "environment_size_m": int(environment_size_m),
+                "latent_layout_reference_environment_size_m": int(
+                    ENVIRONMENT_SIZE_REFERENCE_M
+                ),
+                "latent_layout_rng_paired_across_environment_sizes": True,
+                "latent_layout_mapping": "radius-aware-normalized-legal-area",
             }
         )
         unsigned.update(

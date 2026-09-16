@@ -145,14 +145,17 @@ def aggregate_episode_rows_by_seed(episode_rows, *, seed_field="training_seed"):
     return output
 
 
-def aggregate_seed_rows(seed_rows):
-    """Equal-weight valid seed values with sample SD and Student-t 95% CI."""
+def aggregate_seed_metric_rows(seed_rows, metric_tasks):
+    """Equal-weight seed metrics with the canonical Student-t statistics."""
 
+    metric_tasks = tuple(metric_tasks)
+    if len(metric_tasks) != len(set(metric_tasks)):
+        raise ValueError("aggregate metric identities must be unique")
     grouped = {}
     for row in seed_rows:
         grouped.setdefault((row["metric"], row.get("task_type")), []).append(row)
     output = []
-    for metric_task in CANONICAL_METRICS:
+    for metric_task in metric_tasks:
         rows = sorted(
             grouped.get(metric_task, []), key=lambda row: int(row["training_seed"])
         )
@@ -199,6 +202,12 @@ def aggregate_seed_rows(seed_rows):
             }
         )
     return output
+
+
+def aggregate_seed_rows(seed_rows):
+    """Equal-weight canonical seed values with sample SD and Student-t 95% CI."""
+
+    return aggregate_seed_metric_rows(seed_rows, CANONICAL_METRICS)
 
 
 def canonical_aggregation(episode_rows, *, seed_field="training_seed"):

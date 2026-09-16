@@ -751,7 +751,7 @@ python -X utf8 run_paper_evaluation.py td3_dinkelbach --run-dir results/td3_dink
 python -X utf8 run_paper_evaluation.py kkm_random_action_random_routing --suite fixed_roi --manifest-seed 20260817
 ```
 
-The zero-shot map-size suite evaluates the same frozen policy and task/routing
+The environment-size sweep evaluates the same frozen policy and task/routing
 contracts on square maps of 750, 1000, 1250, 1500, 1750, and 2000 metres. It
 uses one fixed RoI count (8 by default) and never forms a map-size/RoI Cartesian
 product:
@@ -775,16 +775,26 @@ one RoI count across all selected map sizes.
 The checkpoint training domain remains 1000 m by 1000 m. Evaluation changes
 only the square map geometry: the GS remains at the origin, the canonical UAV
 initial layout is unchanged, SR teams start at the selected map's boundary
-midpoints, and radius-80 m RoIs are regenerated inside the selected bounds.
+midpoints, and radius-80 m RoIs use paired latent layouts. For each manifest
+seed, episode, RoI count, and RoI ID, schema v9 first generates the layout in
+the legal `[80, 670]` area of the canonical 750 m reference map. It maps each
+coordinate to a legal target-map coordinate with
+`80 + ((x_750 - 80) / (750 - 160)) * (L - 160)`. The latent RNG seed is
+independent of `L`; map size remains part of the scenario ID, manifest hash,
+configuration fingerprint, and provenance. Thus sizes compare the same
+normalized layout while remaining distinct scenarios.
 The visited bitmap and explorer map resize with the environment. Policy input
 dimensions remain unchanged because the aggregate coverage grid keeps its
 fixed shape and coordinates are normalized by the current environment width
 and height. The map size is not appended to the policy observation.
 
 Environment-size manifests use scenario schema `uav-hrl-scenario-v9`; existing
-fixed-RoI and training manifests remain byte-compatible v8 artifacts. Evaluation
-metadata records the 1000 m training environment, selected evaluation size,
-whether a zero-shot map-size shift occurred, `new_training_started=false`, and
+fixed-RoI and training manifests remain byte-compatible v8 artifacts. Suite
+metadata uses `environment_size_sweep_evaluation` and reports whether it
+contains any zero-shot point. Each point is authoritative: 1000 m is the
+in-distribution baseline with a null shift type, while every other size is a
+`map_size` zero-shot shift. Metadata also records the 1000 m training
+environment, selected evaluation size, `new_training_started=false`, and
 `environment_size_observed_by_policy=false`. Checkpoint schema and training
 configuration are unchanged, so existing compatible 1000 m checkpoints load
 without being treated as newly trained models.
@@ -890,8 +900,8 @@ delivered packets, or violation probability with no eligible packets, is
 comparison points use each seed's summed timely useful Mbit divided by summed mobility
 joules, followed by the same equal-weight cross-seed rule.
 
-Every non-trajectory point has exactly the following six canonical aggregate
-rows, keyed by `(method_id, point_id, metric, task_type)`:
+Every non-trajectory point retains the following six canonical aggregate rows,
+keyed by `(method_id, point_id, metric, task_type)`:
 
 ```text
 energy_efficiency_mbit_per_j / null
@@ -901,6 +911,27 @@ violation_probability       / FOV
 violation_probability       / COM
 violation_probability       / ALL
 ```
+
+Environment-size points use the versioned
+`uav-hrl-environment-size-aggregate-v1` extension and append four rows, for ten
+rows total:
+
+```text
+timely_throughput_kbit_per_s / null  (kbit/s)
+mobility_energy_j_per_episode / null (J/episode)
+roi_discovery_ratio         / null   (ratio)
+terminal_coverage_ratio     / null   (ratio)
+```
+
+Within a seed, timely throughput is summed `total_timely_useful_bits` divided
+by 1000 and by summed actual episode horizon seconds. Mobility energy is summed
+`total_mobility_energy_j` divided by episode count. Discovery and coverage are
+the arithmetic means of the terminal `found_GT_ratio` and terminal global
+visited-bitmap `coverage`. The resulting seed values receive equal weight, the
+same sample standard deviation, and the same Student-t 95% interval as the six
+canonical rows. Missing fields, non-finite values, non-positive horizons, and
+ratios outside `[0,1]` fail validation. Historical six-row artifacts and all
+fixed-RoI outputs retain their existing contract.
 
 The shared canonical formulas live in `evaluation_aggregation.py`;
 `paper_metrics.py` adapts and validates these rows. Before figure-specific

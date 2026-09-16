@@ -27,6 +27,7 @@ from paper_figure_registry import (
     resolve_figure_ids,
 )
 from paper_metrics import (
+    ENVIRONMENT_SIZE_AGGREGATE_CONTRACT_VERSION,
     PAPER_AGGREGATE_SCHEMA_VERSION,
     aggregate_paper_point_metrics,
     causal_trailing_average as _causal_trailing_average,
@@ -502,7 +503,15 @@ def _validate_aggregate_layers(evaluation_dir, metadata, top_rows):
     point_ids = [point["point_id"] for point in points]
     combined = []
     try:
-        validate_aggregate_collection(top_rows, method_id, point_ids)
+        validate_aggregate_collection(
+            top_rows,
+            method_id,
+            point_ids,
+            suite=suite,
+            suite_contract_version=metadata.get(
+                "suite_aggregate_contract_version"
+            ),
+        )
         for point in points:
             point_id = point["point_id"]
             aggregate_path = Path(point.get("aggregated_plot_data", "")).resolve()
@@ -516,10 +525,27 @@ def _validate_aggregate_layers(evaluation_dir, metadata, top_rows):
                     f"mismatch: expected={expected_path}, actual={aggregate_path}"
                 )
             point_rows = _read_json(aggregate_path)
-            validate_canonical_aggregate_rows(point_rows, method_id, point_id)
+            validate_canonical_aggregate_rows(
+                point_rows,
+                method_id,
+                point_id,
+                suite=suite,
+                suite_contract_version=metadata.get(
+                    "suite_aggregate_contract_version"
+                ),
+            )
             episode_rows = _read_point_episode_rows(point, method_id=method_id)
             recomputed = aggregate_paper_point_metrics(
-                method_id, suite, point, episode_rows
+                method_id,
+                suite,
+                point,
+                episode_rows,
+                include_environment_size_metrics=(
+                    metadata.get("suite_aggregate_contract_version")
+                    == ENVIRONMENT_SIZE_AGGREGATE_CONTRACT_VERSION
+                )
+                if suite == "environment_size"
+                else None,
             )
             compare_aggregate_collections(
                 recomputed,
