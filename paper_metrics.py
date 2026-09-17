@@ -23,14 +23,21 @@ CANONICAL_AGGREGATE_ROWS = (
     ("violation_probability", "COM"),
     ("violation_probability", "ALL"),
 )
-ENVIRONMENT_SIZE_AGGREGATE_CONTRACT_VERSION = (
+LEGACY_ENVIRONMENT_SIZE_AGGREGATE_CONTRACT_VERSION = (
     "uav-hrl-environment-size-aggregate-v1"
 )
-ENVIRONMENT_SIZE_AGGREGATE_ROWS = (
+ENVIRONMENT_SIZE_AGGREGATE_CONTRACT_VERSION = (
+    "uav-hrl-environment-size-aggregate-v2"
+)
+LEGACY_ENVIRONMENT_SIZE_AGGREGATE_ROWS = (
     ("timely_throughput_kbit_per_s", None),
     ("mobility_energy_j_per_episode", None),
     ("roi_discovery_ratio", None),
     ("terminal_coverage_ratio", None),
+)
+ENVIRONMENT_SIZE_AGGREGATE_ROWS = (
+    *LEGACY_ENVIRONMENT_SIZE_AGGREGATE_ROWS,
+    ("all_rois_discovered_probability", None),
 )
 ENVIRONMENT_SIZE_METRIC_DEFINITIONS = {
     "timely_throughput_kbit_per_s": {
@@ -49,6 +56,10 @@ ENVIRONMENT_SIZE_METRIC_DEFINITIONS = {
         "display_name": "Terminal coverage ratio",
         "units": ("ratio_sum", "episodes", "ratio"),
     },
+    "all_rois_discovered_probability": {
+        "display_name": "All RoIs discovered probability",
+        "units": ("successful_episodes", "episodes", "probability"),
+    },
 }
 AGGREGATE_COMPARE_FIELDS = (
     "aggregate_schema_version",
@@ -61,6 +72,17 @@ AGGREGATE_COMPARE_FIELDS = (
     "swept_task",
     "environment_width_m",
     "environment_height_m",
+    "environment_size_m",
+    "training_episode_horizon_s",
+    "evaluation_episode_horizon_s",
+    "episode_horizon_s",
+    "movement_transition_count",
+    "routing_slot_count",
+    "packet_injection_cutoff_s",
+    "zero_shot_environment_shift",
+    "zero_shot_horizon_shift",
+    "environment_shift_types",
+    "evaluation_config_fingerprint",
     "evaluation_episode_count",
     "metric",
     "task_type",
@@ -108,7 +130,9 @@ def _environment_metric_input(row, field, *, positive=False, ratio=False):
     return number
 
 
-def _environment_size_seed_metrics(episode_rows):
+def _environment_size_seed_metrics(
+    episode_rows, *, contract_version=ENVIRONMENT_SIZE_AGGREGATE_CONTRACT_VERSION
+):
     grouped = {}
     for row in episode_rows:
         seed_value = row.get("training_seed")
@@ -143,7 +167,7 @@ def _environment_size_seed_metrics(episode_rows):
             _environment_metric_input(row, "coverage", ratio=True)
             for row in rows
         )
-        inputs = (
+        inputs = [
             (
                 "timely_throughput_kbit_per_s",
                 timely_kbits,
@@ -176,7 +200,28 @@ def _environment_size_seed_metrics(episode_rows):
                 "episodes",
                 "ratio",
             ),
-        )
+        ]
+        if contract_version == ENVIRONMENT_SIZE_AGGREGATE_CONTRACT_VERSION:
+            all_discovered_count = sum(
+                1
+                for row in rows
+                if type(row.get("all_rois_discovered")) is bool
+                and row["all_rois_discovered"]
+            )
+            if any(type(row.get("all_rois_discovered")) is not bool for row in rows):
+                raise ValueError(
+                    "environment-size aggregation input is missing: all_rois_discovered"
+                )
+            inputs.append(
+                (
+                    "all_rois_discovered_probability",
+                    all_discovered_count,
+                    episode_count,
+                    "successful_episodes",
+                    "episodes",
+                    "probability",
+                )
+            )
         for (
             metric,
             numerator,
@@ -205,9 +250,12 @@ def _environment_size_seed_metrics(episode_rows):
                     "evaluation_episode_count": episode_count,
                 }
             )
-    cross_seed = aggregate_seed_metric_rows(
-        per_seed, ENVIRONMENT_SIZE_AGGREGATE_ROWS
+    aggregate_rows = (
+        ENVIRONMENT_SIZE_AGGREGATE_ROWS
+        if contract_version == ENVIRONMENT_SIZE_AGGREGATE_CONTRACT_VERSION
+        else LEGACY_ENVIRONMENT_SIZE_AGGREGATE_ROWS
     )
+    cross_seed = aggregate_seed_metric_rows(per_seed, aggregate_rows)
     return per_seed, cross_seed
 
 
@@ -301,6 +349,7 @@ def aggregate_paper_point_metrics(
     episode_rows,
     *,
     include_environment_size_metrics=None,
+    environment_size_contract_version=None,
 ):
     """Adapt the shared seed-ratio aggregation into paper plot rows."""
 
@@ -331,13 +380,28 @@ def aggregate_paper_point_metrics(
         "fov_coverage_snapshot_timing": "packet generation/capture time",
     }
     if include_environment_size_metrics:
+        environment_size_contract_version = (
+            environment_size_contract_version
+            or ENVIRONMENT_SIZE_AGGREGATE_CONTRACT_VERSION
+        )
         common.update(
             {
                 "environment_width_m": point.get("environment_width_m"),
                 "environment_height_m": point.get("environment_height_m"),
+                "environment_size_m": point.get("environment_width_m"),
+                "training_episode_horizon_s": point.get("training_episode_horizon_s"),
+                "evaluation_episode_horizon_s": point.get("evaluation_episode_horizon_s"),
+                "episode_horizon_s": point.get("episode_horizon_s"),
+                "movement_transition_count": point.get("movement_transition_count"),
+                "routing_slot_count": point.get("routing_slot_count"),
+                "packet_injection_cutoff_s": point.get("packet_injection_cutoff_s"),
+                "zero_shot_environment_shift": point.get("zero_shot_environment_shift"),
+                "zero_shot_horizon_shift": point.get("zero_shot_horizon_shift"),
+                "environment_shift_types": point.get("environment_shift_types"),
+                "evaluation_config_fingerprint": point.get("evaluation_config_fingerprint"),
                 "display_name": None,
                 "suite_aggregate_contract_version": (
-                    ENVIRONMENT_SIZE_AGGREGATE_CONTRACT_VERSION
+                    environment_size_contract_version
                 ),
             }
         )
@@ -395,7 +459,9 @@ def aggregate_paper_point_metrics(
         )
     if include_environment_size_metrics:
         environment_per_seed, environment_cross_seed = (
-            _environment_size_seed_metrics(rows)
+            _environment_size_seed_metrics(
+                rows, contract_version=environment_size_contract_version
+            )
         )
         for aggregate in environment_cross_seed:
             definition = ENVIRONMENT_SIZE_METRIC_DEFINITIONS[aggregate["metric"]]
@@ -535,20 +601,29 @@ def validate_canonical_aggregate_rows(
     if suite_contract_version not in (None, ""):
         advertised_contracts.add(suite_contract_version)
     unknown_contracts = advertised_contracts.difference(
-        {ENVIRONMENT_SIZE_AGGREGATE_CONTRACT_VERSION}
+        {
+            LEGACY_ENVIRONMENT_SIZE_AGGREGATE_CONTRACT_VERSION,
+            ENVIRONMENT_SIZE_AGGREGATE_CONTRACT_VERSION,
+        }
     )
     if unknown_contracts:
         raise ValueError(
             "unsupported suite aggregate contract version: "
             f"{sorted(unknown_contracts)}"
         )
-    environment_size = (
-        suite == "environment_size"
-        and ENVIRONMENT_SIZE_AGGREGATE_CONTRACT_VERSION
-        in advertised_contracts
+    environment_contract = (
+        next(iter(advertised_contracts))
+        if suite == "environment_size" and len(advertised_contracts) == 1
+        else None
+    )
+    environment_size = environment_contract is not None
+    environment_rows = (
+        ENVIRONMENT_SIZE_AGGREGATE_ROWS
+        if environment_contract == ENVIRONMENT_SIZE_AGGREGATE_CONTRACT_VERSION
+        else LEGACY_ENVIRONMENT_SIZE_AGGREGATE_ROWS
     )
     expected_rows = (
-        (*CANONICAL_AGGREGATE_ROWS, *ENVIRONMENT_SIZE_AGGREGATE_ROWS)
+        (*CANONICAL_AGGREGATE_ROWS, *environment_rows)
         if environment_size
         else CANONICAL_AGGREGATE_ROWS
     )
@@ -629,7 +704,7 @@ def validate_canonical_aggregate_rows(
         identity = _identity(method_id, point_id, metric, task_type)
         if environment_size:
             _require_value(
-                ENVIRONMENT_SIZE_AGGREGATE_CONTRACT_VERSION,
+                environment_contract,
                 row.get("suite_aggregate_contract_version"),
                 "suite_aggregate_contract_version",
                 identity,
@@ -719,12 +794,12 @@ def validate_canonical_aggregate_rows(
                 f"{identity}: violation probability outside [0,1]: actual={expected_value}"
             )
     if environment_size:
-        for metric, task_type in ENVIRONMENT_SIZE_AGGREGATE_ROWS:
+        for metric, task_type in environment_rows:
             row = seen[(metric, task_type)]
             identity = _identity(method_id, point_id, metric, task_type)
             definition = ENVIRONMENT_SIZE_METRIC_DEFINITIONS[metric]
             _require_value(
-                ENVIRONMENT_SIZE_AGGREGATE_CONTRACT_VERSION,
+                environment_contract,
                 row.get("suite_aggregate_contract_version"),
                 "suite_aggregate_contract_version",
                 identity,

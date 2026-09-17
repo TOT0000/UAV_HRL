@@ -5,10 +5,15 @@ import json
 
 from evaluation_selection import (
     resolve_checkpoint_episodes,
+    resolve_episode_horizons_s,
     resolve_environment_sizes_m,
     resolve_roi_counts,
 )
-from experiment_config import METHOD_REGISTRY, MethodSpec
+from experiment_config import (
+    FORMAL_EXPERIMENT_DEFAULTS,
+    METHOD_REGISTRY,
+    MethodSpec,
+)
 from paper_evaluation import PAPER_EVALUATION_SUITES, run_paper_evaluation
 
 
@@ -26,6 +31,9 @@ def build_parser():
     parser.add_argument("--manifest-seed", type=int)
     parser.add_argument("--episodes", type=int)
     parser.add_argument("--episode-seconds", type=int)
+    episode_horizon = parser.add_mutually_exclusive_group()
+    episode_horizon.add_argument("--episode-horizon-s", type=int)
+    episode_horizon.add_argument("--episode-horizons-s", type=int, nargs="+")
     parser.add_argument(
         "--deadline-seconds",
         type=float,
@@ -98,6 +106,26 @@ def main(argv=None):
         if args.suite == "environment_size"
         else None
     )
+    explicit_episode_horizon = (
+        args.episode_horizon_s is not None
+        or args.episode_horizons_s is not None
+    )
+    if explicit_episode_horizon and args.suite != "environment_size":
+        raise ValueError(
+            "episode-horizon selectors are available only for environment_size"
+        )
+    if explicit_episode_horizon and args.episode_seconds is not None:
+        raise ValueError(
+            "--episode-seconds cannot be combined with episode-horizon selectors"
+        )
+    episode_horizons_s = (
+        resolve_episode_horizons_s(
+            args.episode_horizon_s,
+            args.episode_horizons_s,
+        )
+        if args.suite == "environment_size" and args.episode_seconds is None
+        else None
+    )
     method = MethodSpec.parse(args.method)
     if explicit_checkpoint and not (
         method.learns_movement or method.learns_routing
@@ -129,6 +157,23 @@ def main(argv=None):
         result = execute_checkpoint_roi_sweep(plan)
         print(json.dumps(result, ensure_ascii=False))
         return 0
+    if args.suite == "environment_size":
+        summary_horizons = (
+            episode_horizons_s
+            if episode_horizons_s is not None
+            else (int(args.episode_seconds),)
+        )
+        episode_count = (
+            FORMAL_EXPERIMENT_DEFAULTS["evaluation_episodes_per_trained_seed"]
+            if args.episodes is None
+            else int(args.episodes)
+        )
+        print(
+            f"{len(environment_sizes_m)} environment sizes × "
+            f"{len(summary_horizons)} horizons × {episode_count} episodes = "
+            f"{len(environment_sizes_m) * len(summary_horizons) * episode_count} "
+            "episodes"
+        )
     result = run_paper_evaluation(
         args.method,
         run_directory=args.run_dir,
@@ -142,6 +187,7 @@ def main(argv=None):
         checkpoint_episode=checkpoint_episodes[0],
         roi_counts=roi_counts,
         environment_sizes_m=environment_sizes_m,
+        episode_horizons_s=episode_horizons_s,
         deadline_seconds=args.deadline_seconds,
         allow_registered_fixed_roi_method=bool(
             args.suite == "fixed_roi" and (explicit_checkpoint or explicit_roi)

@@ -11,6 +11,7 @@ import numpy as np
 from centralized_movement import MOVEMENT_STATE_DIM, aggregate_coverage_map
 from evaluation_selection import (
     DEFAULT_ENVIRONMENT_SIZES_M,
+    resolve_episode_horizons_s,
     resolve_environment_sizes_m,
 )
 from experiment_config import (
@@ -18,7 +19,7 @@ from experiment_config import (
     ENVIRONMENT_SIZE_REFERENCE_M,
     METHOD_REGISTRY,
 )
-from HRL_task_aware import _normalize_evaluation_overrides
+from HRL_task_aware import _normalize_evaluation_overrides, normalized_remaining_time
 from observation_strategy import ROUTING_STATE_DIM
 from paper_evaluation import (
     PAPER_EVALUATION_SUITES,
@@ -27,6 +28,7 @@ from paper_evaluation import (
 )
 from paper_metrics import (
     ENVIRONMENT_SIZE_AGGREGATE_CONTRACT_VERSION,
+    LEGACY_ENVIRONMENT_SIZE_AGGREGATE_CONTRACT_VERSION,
     aggregate_paper_point_metrics,
     validate_canonical_aggregate_rows,
 )
@@ -79,6 +81,41 @@ class EnvironmentSizeSelectionTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "exactly one"):
             evaluation_sweep_points("environment_size", roi_counts=(4, 8))
 
+    def test_horizon_selectors_are_strict_and_cartesian(self):
+        self.assertEqual(resolve_episode_horizons_s(), (60,))
+        self.assertEqual(
+            resolve_episode_horizons_s(episode_horizons_s=(120, 60, 120)),
+            (120, 60),
+        )
+        self.assertEqual(resolve_episode_horizons_s(episode_horizon_s=137), (137,))
+        with self.assertRaisesRegex(ValueError, "either"):
+            resolve_episode_horizons_s(60, (120,))
+        with self.assertRaisesRegex(ValueError, "at least one"):
+            resolve_episode_horizons_s(episode_horizons_s=())
+        for invalid in (-1, 0, 1, 2, 2.5, True, "120"):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                resolve_episode_horizons_s(episode_horizon_s=invalid)
+        points = evaluation_sweep_points(
+            "environment_size",
+            environment_sizes_m=(750, 1000),
+            episode_horizons_s=(60, 120, 600),
+        )
+        self.assertEqual(
+            [point["point_id"] for point in points],
+            [
+                "map_750m", "map_750m_t120s", "map_750m_t600s",
+                "map_1000m", "map_1000m_t120s", "map_1000m_t600s",
+            ],
+        )
+        self.assertEqual(
+            [point["packet_injection_cutoff_s"] for point in points],
+            [57.5, 117.5, 597.5, 57.5, 117.5, 597.5],
+        )
+        self.assertEqual(points[-1]["movement_transition_count"], 600)
+        self.assertEqual(points[-1]["routing_slot_count"], 2400)
+        self.assertEqual(len({point["point_id"] for point in points}), len(points))
+        self.assertEqual(normalized_remaining_time(240, 60), 0.75)
+
     def test_environment_size_point_shift_semantics(self):
         points = {
             point["x_value"]: point
@@ -124,6 +161,22 @@ class EnvironmentSizeSelectionTest(unittest.TestCase):
             )
         self.assertEqual(runner.call_args.kwargs["environment_sizes_m"], (2000, 750))
         self.assertEqual(runner.call_args.kwargs["roi_counts"], (6,))
+        self.assertEqual(runner.call_args.kwargs["episode_horizons_s"], (60,))
+        with mock.patch(
+            "run_paper_evaluation.run_paper_evaluation", return_value={}
+        ) as horizon_runner:
+            run_evaluation_main(
+                [
+                    "kkm_random_action_random_routing",
+                    "--suite", "environment_size",
+                    "--environment-size-m", "1000",
+                    "--episode-horizons-s", "60", "120",
+                    "--episodes", "2",
+                ]
+            )
+        self.assertEqual(
+            horizon_runner.call_args.kwargs["episode_horizons_s"], (60, 120)
+        )
         with self.assertRaisesRegex(ValueError, "not --roi-counts"):
             run_evaluation_main(
                 [
@@ -143,6 +196,14 @@ class EnvironmentSizeSelectionTest(unittest.TestCase):
                     "fixed_roi",
                     "--environment-size-m",
                     "750",
+                ]
+            )
+        with self.assertRaisesRegex(ValueError, "only for environment_size"):
+            run_evaluation_main(
+                [
+                    "kkm_random_action_random_routing",
+                    "--suite", "fixed_roi",
+                    "--episode-horizon-s", "120",
                 ]
             )
 
@@ -283,6 +344,7 @@ class EnvironmentSizeAggregateTest(unittest.TestCase):
             "total_mobility_energy_j": energy,
             "found_GT_ratio": discovery,
             "coverage": coverage,
+            "all_rois_discovered": discovery >= 0.9,
             "fov_delivered_packets": 2,
             "fov_delivered_e2e_delay_sum_seconds": 0.5,
             "fov_eligible_packets": 4,
@@ -305,7 +367,7 @@ class EnvironmentSizeAggregateTest(unittest.TestCase):
 
     def test_new_metrics_use_per_seed_ratios_then_equal_seed_weighting(self):
         rows = self._rows()
-        self.assertEqual(len(rows), 10)
+        self.assertEqual(len(rows), 11)
         validate_canonical_aggregate_rows(
             rows, "method", "map_750m", suite="environment_size"
         )
@@ -315,6 +377,7 @@ class EnvironmentSizeAggregateTest(unittest.TestCase):
             "mobility_energy_j_per_episode": ([200.0, 50.0], "J/episode"),
             "roi_discovery_ratio": ([0.3, 0.9], "ratio"),
             "terminal_coverage_ratio": ([0.5, 0.1], "ratio"),
+            "all_rois_discovered_probability": ([0.0, 1.0], "probability"),
         }
         for metric, (seed_values, unit) in expected.items():
             with self.subTest(metric=metric):
@@ -386,6 +449,24 @@ class EnvironmentSizeAggregateTest(unittest.TestCase):
             legacy_environment, "method", "roi_8", suite="environment_size"
         )
 
+    def test_environment_v1_ten_row_artifact_remains_readable(self):
+        rows = [
+            row
+            for row in self._rows()
+            if row["metric"] != "all_rois_discovered_probability"
+        ]
+        for row in rows:
+            row["suite_aggregate_contract_version"] = (
+                LEGACY_ENVIRONMENT_SIZE_AGGREGATE_CONTRACT_VERSION
+            )
+        validate_canonical_aggregate_rows(
+            rows,
+            "method",
+            "map_750m",
+            suite="environment_size",
+            suite_contract_version=LEGACY_ENVIRONMENT_SIZE_AGGREGATE_CONTRACT_VERSION,
+        )
+
 
 class EnvironmentSizeRuntimeContractTest(unittest.TestCase):
     def test_bitmap_and_observation_shape_follow_map_without_state_dim_change(self):
@@ -431,6 +512,101 @@ class EnvironmentSizeRuntimeContractTest(unittest.TestCase):
 
 
 class EnvironmentSizeSmokeTest(unittest.TestCase):
+    def test_horizon_points_share_scenarios_but_have_distinct_config_identity(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output = Path(temp_dir) / "evaluation"
+            result = run_paper_evaluation(
+                "kkm_random_action_random_routing",
+                suite="environment_size",
+                manifest_seed=47,
+                episodes=1,
+                episode_horizons_s=(3, 4),
+                roi_counts=(8,),
+                environment_sizes_m=(1000,),
+                output_directory=output,
+            )
+            self.assertEqual(result["environment_size_horizon_cartesian_point_count"], 2)
+            self.assertEqual(result["environment_size_horizon_total_episode_count"], 2)
+            self.assertIsNone(result["evaluation_horizon_seconds"])
+            self.assertEqual(result["evaluation_episode_horizons_s"], [3, 4])
+            first, second = result["points"]
+            self.assertEqual(first["scenario_manifest_hash"], second["scenario_manifest_hash"])
+            self.assertEqual(first["scenario_ids"], second["scenario_ids"])
+            self.assertNotEqual(
+                first["evaluation_config_fingerprint"],
+                second["evaluation_config_fingerprint"],
+            )
+
+    def test_discovery_diagnostics_use_canonical_found_state_and_first_time(self):
+        def discover_all(env):
+            for gt in env.gts:
+                gt.is_found = True
+            return ()
+
+        with tempfile.TemporaryDirectory() as temp_dir, mock.patch(
+            "HRL_task_aware._mark_search_observations", side_effect=discover_all
+        ):
+            output = Path(temp_dir) / "evaluation"
+            run_paper_evaluation(
+                "kkm_random_action_random_routing",
+                suite="environment_size",
+                manifest_seed=53,
+                episodes=1,
+                episode_horizons_s=(3,),
+                roi_counts=(8,),
+                environment_sizes_m=(1000,),
+                output_directory=output,
+                flatten_single_point=True,
+            )
+            row = json.loads(
+                (output / "per_episode.jsonl").read_text(encoding="utf-8").splitlines()[0]
+            )
+            self.assertEqual(row["discovered_roi_count"], 8)
+            self.assertEqual(row["roi_discovery_ratio"], 1.0)
+            self.assertTrue(row["all_rois_discovered"])
+            self.assertEqual(row["all_rois_discovered_time_s"], 1.0)
+            self.assertEqual(row["movement_transition_count"], 3)
+            self.assertEqual(row["routing_slot_count"], 12)
+            self.assertEqual(set(row["first_discovery_time_by_roi_s"]), {str(i) for i in range(8)})
+            self.assertEqual(set(row["first_discovery_time_by_roi_s"].values()), {1.0})
+
+    def test_incomplete_discovery_keeps_null_completion_and_first_time_once(self):
+        calls = {"count": 0}
+
+        def discover_incrementally(env):
+            calls["count"] += 1
+            env.gts[0].is_found = True
+            if calls["count"] >= 2:
+                env.gts[1].is_found = True
+            return ()
+
+        with tempfile.TemporaryDirectory() as temp_dir, mock.patch(
+            "HRL_task_aware._mark_search_observations",
+            side_effect=discover_incrementally,
+        ):
+            output = Path(temp_dir) / "evaluation"
+            run_paper_evaluation(
+                "kkm_random_action_random_routing",
+                suite="environment_size",
+                manifest_seed=59,
+                episodes=1,
+                episode_horizons_s=(3,),
+                roi_counts=(8,),
+                environment_sizes_m=(1500,),
+                output_directory=output,
+                flatten_single_point=True,
+            )
+            row = json.loads(
+                (output / "per_episode.jsonl").read_text(encoding="utf-8").splitlines()[0]
+            )
+            self.assertEqual(row["discovered_roi_count"], 2)
+            self.assertEqual(row["roi_discovery_ratio"], 0.25)
+            self.assertFalse(row["all_rois_discovered"])
+            self.assertIsNone(row["all_rois_discovered_time_s"])
+            self.assertEqual(
+                row["first_discovery_time_by_roi_s"], {"0": 1.0, "1": 2.0}
+            )
+
     def test_mixed_sweep_uses_point_authority_and_suite_summary(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             output = Path(temp_dir) / "evaluation"
@@ -439,7 +615,7 @@ class EnvironmentSizeSmokeTest(unittest.TestCase):
                 suite="environment_size",
                 manifest_seed=43,
                 episodes=1,
-                episode_seconds=1,
+                episode_horizons_s=(3,),
                 roi_counts=(8,),
                 environment_sizes_m=(750, 1000, 2000),
                 output_directory=output,
@@ -451,9 +627,14 @@ class EnvironmentSizeSmokeTest(unittest.TestCase):
             self.assertTrue(result["contains_zero_shot_environment_shift"])
             points = {point["x_value"]: point for point in result["points"]}
             self.assertFalse(points[1000]["zero_shot_environment_shift"])
-            self.assertIsNone(points[1000]["environment_shift_type"])
+            self.assertEqual(points[1000]["environment_shift_type"], "episode_horizon")
+            self.assertTrue(points[1000]["zero_shot_horizon_shift"])
             self.assertTrue(points[750]["zero_shot_environment_shift"])
             self.assertTrue(points[2000]["zero_shot_environment_shift"])
+            self.assertEqual(
+                points[750]["environment_shift_types"],
+                ["map_size", "episode_horizon"],
+            )
 
     def test_one_episode_random_smoke_at_smallest_and_largest_maps(self):
         for size in (750, 1000, 2000):
@@ -464,7 +645,7 @@ class EnvironmentSizeSmokeTest(unittest.TestCase):
                     suite="environment_size",
                     manifest_seed=41,
                     episodes=1,
-                    episode_seconds=1,
+                    episode_horizons_s=(3,),
                     roi_counts=(8,),
                     environment_sizes_m=(size,),
                     output_directory=output,
@@ -485,13 +666,11 @@ class EnvironmentSizeSmokeTest(unittest.TestCase):
                 )
                 self.assertEqual(
                     point["environment_shift_type"],
-                    "map_size" if size != 1000 else None,
+                    "map_size" if size != 1000 else "episode_horizon",
                 )
                 self.assertEqual(
                     point["point_evaluation_purpose"],
-                    "zero_shot_environment_shift_evaluation"
-                    if size != 1000
-                    else "in_distribution_environment_size_baseline",
+                    "zero_shot_environment_shift_evaluation",
                 )
                 metadata = json.loads(
                     (output / "paper_evaluation_metadata.json").read_text(
@@ -507,24 +686,39 @@ class EnvironmentSizeSmokeTest(unittest.TestCase):
                     metadata["contains_zero_shot_environment_shift"],
                     size != 1000,
                 )
+                self.assertTrue(metadata["contains_zero_shot_horizon_shift"])
                 self.assertEqual(metadata["points"][0]["roi_count"], 8)
+                self.assertEqual(metadata["points"][0]["environment_size_m"], size)
+                self.assertEqual(metadata["points"][0]["training_episode_horizon_s"], 60)
+                self.assertEqual(metadata["points"][0]["evaluation_episode_horizon_s"], 3)
+                self.assertEqual(
+                    metadata["points"][0]["remaining_time_normalization"],
+                    "current_evaluation_episode_horizon",
+                )
+                self.assertFalse(
+                    metadata["points"][0]["episode_horizon_seconds_observed_by_policy"]
+                )
                 persisted_episode = json.loads(
                     (output / "per_episode.jsonl")
                     .read_text(encoding="utf-8")
                     .splitlines()[0]
                 )
-                self.assertEqual(persisted_episode["episode_horizon_seconds"], 1.0)
+                self.assertEqual(persisted_episode["episode_horizon_seconds"], 3.0)
+                self.assertEqual(persisted_episode["movement_transition_count"], 3)
+                self.assertEqual(persisted_episode["routing_slot_count"], 12)
+                self.assertEqual(persisted_episode["packet_injection_cutoff_seconds"], 0.5)
                 aggregate_json = json.loads(
                     (output / "aggregated_plot_data.json").read_text(
                         encoding="utf-8"
                     )
                 )
-                self.assertEqual(len(aggregate_json), 10)
+                self.assertEqual(len(aggregate_json), 11)
                 expected_metrics = {
                     "timely_throughput_kbit_per_s",
                     "mobility_energy_j_per_episode",
                     "roi_discovery_ratio",
                     "terminal_coverage_ratio",
+                    "all_rois_discovered_probability",
                 }
                 self.assertTrue(
                     expected_metrics.issubset(

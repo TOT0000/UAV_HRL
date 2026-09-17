@@ -10,6 +10,8 @@ from com_capacity_calibration import load_com_capacity_reference
 from experiment_config import (
     ENVIRONMENT_SIZE_EVALUATION_VALUES_M,
     FORMAL_CHECKPOINT_EPISODE,
+    PRODUCTION_EPISODE_HORIZON_SECONDS,
+    PRODUCTION_TASK_DEADLINE_SECONDS,
     ROI_COUNT_MAX,
     ROI_COUNT_MIN,
     MethodSpec,
@@ -29,6 +31,8 @@ from training_checkpoint import (
 DEFAULT_FIXED_ROI_COUNTS = tuple(range(ROI_COUNT_MIN, ROI_COUNT_MAX + 1))
 SUPPORTED_ENVIRONMENT_SIZES_M = ENVIRONMENT_SIZE_EVALUATION_VALUES_M
 DEFAULT_ENVIRONMENT_SIZES_M = SUPPORTED_ENVIRONMENT_SIZES_M
+DEFAULT_EPISODE_HORIZONS_S = (int(PRODUCTION_EPISODE_HORIZON_SECONDS),)
+MINIMUM_EPISODE_HORIZON_S = int(max(PRODUCTION_TASK_DEADLINE_SECONDS.values())) + 1
 
 
 def _exclusive_values(single, multiple, *, label, default, multiple_label=None):
@@ -122,6 +126,47 @@ def resolve_environment_sizes_m(
             f"{list(SUPPORTED_ENVIRONMENT_SIZES_M)}: {invalid}"
         )
     return sizes
+
+
+def resolve_episode_horizons_s(
+    episode_horizon_s=None,
+    episode_horizons_s=None,
+):
+    """Resolve strict integer evaluation horizons in caller-provided order."""
+
+    if episode_horizon_s is not None and episode_horizons_s is not None:
+        raise ValueError(
+            "use either --episode-horizon-s or --episode-horizons-s, not both"
+        )
+    values = (
+        episode_horizons_s
+        if episode_horizons_s is not None
+        else (
+            (episode_horizon_s,)
+            if episode_horizon_s is not None
+            else DEFAULT_EPISODE_HORIZONS_S
+        )
+    )
+    if isinstance(values, (str, bytes)):
+        values = (values,)
+    values = tuple(values)
+    if not values:
+        raise ValueError("at least one episode horizon is required")
+    result = []
+    for value in values:
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError("episode horizons must be integer seconds")
+        if value < MINIMUM_EPISODE_HORIZON_S:
+            raise ValueError(
+                "episode horizons must be greater than the maximum packet "
+                f"deadline ({max(PRODUCTION_TASK_DEADLINE_SECONDS.values()):g} s): "
+                f"{value}"
+            )
+        if value not in result:
+            result.append(value)
+    if not result:
+        raise ValueError("at least one episode horizon is required")
+    return tuple(result)
 
 
 def _read_json_object(path, label):

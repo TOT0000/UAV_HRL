@@ -151,6 +151,16 @@ PRODUCTION_POLICY_DELAY = FORMAL_EXPERIMENT_DEFAULTS["movement_hyperparameters"]
 SMOKE_RANDOM_SEED = DEFAULT_TRAINING_SEED
 
 
+def normalized_remaining_time(episode_horizon_seconds, elapsed_seconds):
+    """Return the movement-state time fraction for the active episode horizon."""
+
+    horizon = float(episode_horizon_seconds)
+    elapsed = float(elapsed_seconds)
+    if horizon <= 0.0:
+        raise ValueError("episode horizon must be positive")
+    return min(1.0, max(0.0, (horizon - elapsed) / horizon))
+
+
 def _seed_training_rng(seed):
     """Return the local RNG registry; formal execution never seeds globals."""
 
@@ -1494,6 +1504,17 @@ def _evaluation_runtime_provenance(
         evaluation_width != int(ENVIRONMENT_WIDTH_M)
         or evaluation_height != int(ENVIRONMENT_HEIGHT_M)
     )
+    training_horizon = int(FORMAL_EXPERIMENT_DEFAULTS["episode_seconds"])
+    evaluation_horizon = int(config.episode_seconds)
+    zero_shot_horizon_shift = evaluation_horizon != training_horizon
+    environment_shift_types = [
+        name
+        for name, active in (
+            ("map_size", zero_shot_environment_shift),
+            ("episode_horizon", zero_shot_horizon_shift),
+        )
+        if active
+    ]
     return {
         "evaluation_episode_count": int(config.total_episodes),
         "evaluation_git_sha": str(evaluation_git_sha),
@@ -1517,6 +1538,18 @@ def _evaluation_runtime_provenance(
                 else None
             ),
             "episode_horizon_seconds": float(config.episode_seconds),
+            "training_episode_horizon_s": training_horizon,
+            "evaluation_episode_horizon_s": evaluation_horizon,
+            "zero_shot_horizon_shift": zero_shot_horizon_shift,
+            "environment_shift_types": environment_shift_types,
+            "remaining_time_normalization_horizon_s": evaluation_horizon,
+            "remaining_time_normalization": "current_evaluation_episode_horizon",
+            "episode_horizon_seconds_observed_by_policy": False,
+            "remaining_time_definition": (
+                "(evaluation_horizon_s - elapsed_s) / evaluation_horizon_s"
+            ),
+            "movement_transition_count": evaluation_horizon,
+            "routing_slot_count": evaluation_horizon * MOVEMENT_CONTROL_INTERVAL,
             "movement_interval_seconds": MOVEMENT_INTERVAL_SECONDS,
             "routing_slot_seconds": float(config.routing_slot_seconds),
             "evaluation_overrides": copy.deepcopy(resolved_evaluation),
@@ -1527,9 +1560,7 @@ def _evaluation_runtime_provenance(
             "evaluation_environment_height_m": evaluation_height,
             "zero_shot_environment_shift": zero_shot_environment_shift,
             "environment_shift_type": (
-                "map_size"
-                if zero_shot_environment_shift
-                else None
+                environment_shift_types[0] if environment_shift_types else None
             ),
             "new_training_started": False,
             "environment_size_observed_by_policy": False,
@@ -2471,6 +2502,7 @@ def train(
         ]
         pending_snapshot_times = list(requested_snapshot_times)
         episode_snapshots = []
+        first_discovery_time_by_roi_s = {}
         env.lambda_EE_global = float(lambda_ee)
         episode_lambda = float(lambda_ee)
         episode_delivered_mbits = 0.0
@@ -2512,8 +2544,9 @@ def train(
                     packet_engine,
                     backlog_before,
                     c_ref_com,
-                    remaining_time=(config.episode_seconds - interval)
-                    / config.episode_seconds,
+                    remaining_time=normalized_remaining_time(
+                        config.episode_seconds, interval
+                    ),
                 )
                 state = apply_observation_strategy(
                     physical_state,
@@ -2672,7 +2705,17 @@ def train(
             interval_energy = float(interval_energies.sum())
             # Search observation, RoI discovery, and task assignment remain
             # one-second boundary events and therefore execute exactly once.
+            found_before = {
+                int(gt.id) for gt in env.gts if bool(gt.is_found)
+            }
             fov_transitions = _mark_search_observations(env)
+            discovery_time_seconds = float(interval + 1)
+            for gt in env.gts:
+                gt_id = int(gt.id)
+                if bool(gt.is_found) and gt_id not in found_before:
+                    first_discovery_time_by_roi_s.setdefault(
+                        str(gt_id), discovery_time_seconds
+                    )
             if fov_transitions:
                 packet_engine.process_fov_transitions(
                     env,
@@ -2720,8 +2763,9 @@ def train(
                 packet_engine,
                 backlog_after,
                 c_ref_com,
-                remaining_time=(config.episode_seconds - (interval + 1))
-                / config.episode_seconds,
+                remaining_time=normalized_remaining_time(
+                    config.episode_seconds, interval + 1
+                ),
             )
             next_state = apply_observation_strategy(
                 physical_next_state,
@@ -2992,6 +3036,15 @@ def train(
             if int(env.num_GT) > 0
             else 0.0
         )
+        discovered_roi_count = int(env.count_found_targets())
+        all_rois_discovered = bool(
+            int(env.num_GT) > 0 and discovered_roi_count == int(env.num_GT)
+        )
+        all_rois_discovered_time_s = (
+            max(first_discovery_time_by_roi_s.values())
+            if all_rois_discovered and first_discovery_time_by_roi_s
+            else None
+        )
         episode_metrics.append(
             {
                 "method_id": method_spec.method_id,
@@ -3082,6 +3135,18 @@ def train(
                     resolved_evaluation["packet_injection_cutoff_seconds"]
                 ),
                 "episode_horizon_seconds": float(config.episode_seconds),
+                "movement_transition_count": int(config.episode_seconds),
+                "routing_slot_count": int(
+                    config.episode_seconds * MOVEMENT_CONTROL_INTERVAL
+                ),
+                "discovered_roi_count": discovered_roi_count,
+                "roi_discovery_ratio": found_gt_ratio,
+                "all_rois_discovered": all_rois_discovered,
+                "all_rois_discovered_time_s": all_rois_discovered_time_s,
+                "first_discovery_time_by_roi_s": dict(
+                    sorted(first_discovery_time_by_roi_s.items(), key=lambda item: int(item[0]))
+                ),
+                "terminal_coverage_ratio": coverage,
                 "routing_cost_sum": episode_routing_immediate_cost_sum,
                 "eligible_packet_count": episode_system_eligible_packet_count,
                 "delay_violation_probability": episode_violation_probability,
@@ -3670,6 +3735,21 @@ def train(
             "training_environment_height_m": int(ENVIRONMENT_HEIGHT_M),
             "evaluation_environment_width_m": int(env.env_width),
             "evaluation_environment_height_m": int(env.env_height),
+            "training_episode_horizon_s": int(
+                FORMAL_EXPERIMENT_DEFAULTS["episode_seconds"]
+            ),
+            "evaluation_episode_horizon_s": int(config.episode_seconds),
+            "zero_shot_horizon_shift": bool(
+                evaluation
+                and int(config.episode_seconds)
+                != int(FORMAL_EXPERIMENT_DEFAULTS["episode_seconds"])
+            ),
+            "remaining_time_normalization_horizon_s": int(config.episode_seconds),
+            "remaining_time_normalization": "current_evaluation_episode_horizon",
+            "episode_horizon_seconds_observed_by_policy": False,
+            "remaining_time_definition": (
+                "(evaluation_horizon_s - elapsed_s) / evaluation_horizon_s"
+            ),
             "zero_shot_environment_shift": bool(
                 evaluation
                 and (
@@ -3678,13 +3758,20 @@ def train(
                 )
             ),
             "environment_shift_type": (
-                "map_size"
-                if evaluation
-                and (
-                    env.env_width != int(ENVIRONMENT_WIDTH_M)
-                    or env.env_height != int(ENVIRONMENT_HEIGHT_M)
+                (
+                    evaluation_runtime["resolved_evaluation_config"][
+                        "environment_shift_type"
+                    ]
+                    if evaluation_runtime is not None
+                    else None
                 )
-                else None
+            ),
+            "environment_shift_types": (
+                evaluation_runtime["resolved_evaluation_config"][
+                    "environment_shift_types"
+                ]
+                if evaluation_runtime is not None
+                else []
             ),
             "new_training_started": False if evaluation else True,
             "environment_size_observed_by_policy": False,

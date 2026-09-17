@@ -605,6 +605,7 @@ class SyntheticFigureBuildTest(unittest.TestCase):
                             ),
                             "found_GT_ratio": 0.5 + episode_index / 10.0,
                             "coverage": 0.4 + episode_index / 10.0,
+                            "all_rois_discovered": False,
                         }
                     )
             per_episode_path = point_dir / "per_episode.jsonl"
@@ -689,6 +690,11 @@ class SyntheticFigureBuildTest(unittest.TestCase):
             "manifest_seed": TRAINING_SEED,
             "evaluation_episodes_per_point": EVALUATION_EPISODES,
             "evaluation_horizon_seconds": EVALUATION_HORIZON_SECONDS,
+            "evaluation_episode_horizons_s": (
+                [EVALUATION_HORIZON_SECONDS]
+                if suite == "environment_size"
+                else None
+            ),
             "target_uav_id": 0 if suite == "uav_trajectory_snapshots" else None,
             "points": metadata_points,
         }

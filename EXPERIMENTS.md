@@ -764,6 +764,7 @@ python -X utf8 run_paper_evaluation.py td3_dinkelbach `
 python -X utf8 run_paper_evaluation.py kkm_random_action_random_routing `
   --suite environment_size `
   --environment-sizes-m 750 1000 2000 `
+  --episode-horizons-s 60 120 240 `
   --roi-count 8
 ```
 
@@ -771,6 +772,23 @@ python -X utf8 run_paper_evaluation.py kkm_random_action_random_routing `
 duplicates in the plural form are removed while preserving order. The suite
 accepts `--roi-count` only. It rejects `--roi-counts`, so each run has exactly
 one RoI count across all selected map sizes.
+
+`--episode-horizon-s` and `--episode-horizons-s` are mutually exclusive and
+apply only to this suite. Values are integer seconds greater than the maximum
+2.5-second packet deadline. The runner evaluates the full map-size by horizon
+Cartesian product and prints the point and episode count before execution. A
+60-second point keeps the historical `map_<size>m` ID; other horizons append
+`_t<horizon>s`.
+
+The frozen checkpoint was trained with a 60-second horizon. Evaluating another
+horizon is recorded as a zero-shot `episode_horizon` shift and does not relax
+checkpoint architecture, method, or provenance validation. The movement loop,
+terminal finalization, trajectory bounds, and four routing slots per second use
+the point horizon. Packet injection ends at `horizon - 2.5 s`, and the
+movement-state remaining-time scalar is `(horizon - elapsed) / horizon`.
+Horizons for a common map reuse the same scenario manifest, scenario IDs, and
+initial conditions; their evaluation configuration fingerprints remain
+distinct.
 
 The checkpoint training domain remains 1000 m by 1000 m. Evaluation changes
 only the square map geometry: the GS remains at the origin, the canonical UAV
@@ -791,9 +809,9 @@ and height. The map size is not appended to the policy observation.
 Environment-size manifests use scenario schema `uav-hrl-scenario-v9`; existing
 fixed-RoI and training manifests remain byte-compatible v8 artifacts. Suite
 metadata uses `environment_size_sweep_evaluation` and reports whether it
-contains any zero-shot point. Each point is authoritative: 1000 m is the
-in-distribution baseline with a null shift type, while every other size is a
-`map_size` zero-shot shift. Metadata also records the 1000 m training
+contains any zero-shot point. Each point is authoritative: only 1000 m at 60 s
+is the in-distribution baseline. Other sizes record `map_size`, other horizons
+record `episode_horizon`, and a point can record both shift types. Metadata also records the 1000 m training
 environment, selected evaluation size, `new_training_started=false`, and
 `environment_size_observed_by_policy=false`. Checkpoint schema and training
 configuration are unchanged, so existing compatible 1000 m checkpoints load
@@ -888,7 +906,8 @@ scenario IDs, evaluation count/horizon/seed, 16-UAV count, and fully resolved
 traffic-rate/deadline/cutoff overrides. The deadline-violation (Fig. 6) sweep
 uses a scoped `57.0 s` packet-injection cutoff so its maximum `3.0 s` deadline
 can resolve within the 60-second horizon; other training and evaluation suites
-retain the production `57.5 s` cutoff.
+retain the production `57.5 s` cutoff, while environment-size points use their
+selected horizon minus the maximum 2.5-second deadline.
 Within each training seed, delay is total delivered E2E delay divided by total
 delivered packet count. FOV and COM violation rows remain diagnostics. The
 formal `ALL` seed row pools the two raw violation counts over the two raw
@@ -913,21 +932,26 @@ violation_probability       / ALL
 ```
 
 Environment-size points use the versioned
-`uav-hrl-environment-size-aggregate-v1` extension and append four rows, for ten
-rows total:
+`uav-hrl-environment-size-aggregate-v2` extension and append five rows, for
+eleven rows total. Readers continue to accept historical v1 ten-row artifacts:
 
 ```text
 timely_throughput_kbit_per_s / null  (kbit/s)
 mobility_energy_j_per_episode / null (J/episode)
 roi_discovery_ratio         / null   (ratio)
 terminal_coverage_ratio     / null   (ratio)
+all_rois_discovered_probability / null (probability)
 ```
 
 Within a seed, timely throughput is summed `total_timely_useful_bits` divided
 by 1000 and by summed actual episode horizon seconds. Mobility energy is summed
 `total_mobility_energy_j` divided by episode count. Discovery and coverage are
 the arithmetic means of the terminal `found_GT_ratio` and terminal global
-visited-bitmap `coverage`. The resulting seed values receive equal weight, the
+visited-bitmap `coverage`. The `all_rois_discovered_probability` row is the
+fraction of episodes in which all
+RoIs were found. Per-episode diagnostics also record the discovered count,
+final discovery ratio, all-discovered flag/time, and deterministic first
+discovery time by RoI. The resulting seed values receive equal weight, the
 same sample standard deviation, and the same Student-t 95% interval as the six
 canonical rows. Missing fields, non-finite values, non-positive horizons, and
 ratios outside `[0,1]` fail validation. Historical six-row artifacts and all

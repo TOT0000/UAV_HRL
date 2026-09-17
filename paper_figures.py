@@ -305,14 +305,27 @@ def _validate_manifest_point(point, metadata, suite):
     if int(metadata.get("evaluation_episodes_per_point", -1)) != manifest.episode_count:
         raise IncompatiblePaperRunError("top-level evaluation episode count is incompatible")
     horizon = int(point.get("evaluation_horizon_seconds", -1))
-    if horizon != int(metadata.get("evaluation_horizon_seconds", -2)):
-        raise IncompatiblePaperRunError(
-            f"evaluation horizon mismatch at {point.get('point_id')}"
-        )
-    if horizon != int(current_environment_config()["episode_seconds"]):
-        raise IncompatiblePaperRunError(
-            f"manifest horizon mismatch at {point.get('point_id')}"
-        )
+    if suite == "environment_size":
+        selected_horizons = metadata.get("evaluation_episode_horizons_s")
+        if selected_horizons is None:
+            selected_horizons = [metadata.get("evaluation_horizon_seconds")]
+        if (
+            not isinstance(selected_horizons, list)
+            or horizon not in [int(value) for value in selected_horizons]
+            or horizon != int(point.get("evaluation_episode_horizon_s", -2))
+        ):
+            raise IncompatiblePaperRunError(
+                f"evaluation horizon mismatch at {point.get('point_id')}"
+            )
+    else:
+        if horizon != int(metadata.get("evaluation_horizon_seconds", -2)):
+            raise IncompatiblePaperRunError(
+                f"evaluation horizon mismatch at {point.get('point_id')}"
+            )
+        if horizon != int(current_environment_config()["episode_seconds"]):
+            raise IncompatiblePaperRunError(
+                f"manifest horizon mismatch at {point.get('point_id')}"
+            )
     if int(point.get("evaluation_seed", -1)) != int(metadata.get("evaluation_seed", -2)):
         raise IncompatiblePaperRunError(
             f"evaluation seed mismatch at {point.get('point_id')}"
@@ -541,11 +554,15 @@ def _validate_aggregate_layers(evaluation_dir, metadata, top_rows):
                 point,
                 episode_rows,
                 include_environment_size_metrics=(
-                    metadata.get("suite_aggregate_contract_version")
-                    == ENVIRONMENT_SIZE_AGGREGATE_CONTRACT_VERSION
+                    bool(metadata.get("suite_aggregate_contract_version"))
                 )
                 if suite == "environment_size"
                 else None,
+                environment_size_contract_version=(
+                    metadata.get("suite_aggregate_contract_version")
+                    if suite == "environment_size"
+                    else None
+                ),
             )
             compare_aggregate_collections(
                 recomputed,

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import csv
 from datetime import datetime, timezone
+import hashlib
 import json
 import math
 from pathlib import Path
@@ -13,6 +14,7 @@ from evaluation_metrics import write_evaluation_outputs
 from evaluation_selection import (
     DEFAULT_ENVIRONMENT_SIZES_M,
     DEFAULT_FIXED_ROI_COUNTS,
+    resolve_episode_horizons_s,
     resolve_environment_sizes_m,
     resolve_checkpoint_episodes,
     resolve_roi_counts,
@@ -30,6 +32,7 @@ from experiment_config import (
     NUM_UAV,
     ROI_COUNT_MAX,
     PRODUCTION_PACKET_INJECTION_CUTOFF_SECONDS,
+    PRODUCTION_EPISODE_HORIZON_SECONDS,
     PRODUCTION_TASK_DEADLINE_SECONDS,
     comparison_method_configuration,
 )
@@ -184,6 +187,7 @@ def evaluation_sweep_points(
     deadline_seconds=None,
     episode_seconds=None,
     environment_sizes_m=None,
+    episode_horizons_s=None,
 ):
     suite = resolve_evaluation_suite(suite)
     kind = PAPER_EVALUATION_SUITES[suite]["kind"]
@@ -194,6 +198,10 @@ def evaluation_sweep_points(
     if environment_sizes_m is not None and kind != "environment_size":
         raise ValueError(
             "environment-size selectors are available only for the environment_size suite"
+        )
+    if episode_horizons_s is not None and kind != "environment_size":
+        raise ValueError(
+            "episode-horizon selectors are available only for the environment_size suite"
         )
     if deadline_seconds is not None and kind != "deadline":
         raise ValueError(
@@ -317,32 +325,71 @@ def evaluation_sweep_points(
                 "multi-RoI x multi-environment Cartesian sweeps are not supported"
             )
         fixed_num_gt = int(resolved_roi_counts[0])
+        if episode_horizons_s is not None:
+            resolved_horizons = resolve_episode_horizons_s(
+                episode_horizons_s=episode_horizons_s
+            )
+        else:
+            resolved_horizons = (
+                int(episode_seconds)
+                if episode_seconds is not None
+                else int(PRODUCTION_EPISODE_HORIZON_SECONDS),
+            )
+        max_deadline = float(max(PRODUCTION_TASK_DEADLINE_SECONDS.values()))
         points = []
         for size in resolved_sizes:
-            zero_shot_shift = int(size) != int(ENVIRONMENT_WIDTH_M)
-            points.append(
-                {
-                    "point_id": f"map_{size}m",
+            map_shift = int(size) != int(ENVIRONMENT_WIDTH_M)
+            for horizon in resolved_horizons:
+                horizon_shift = int(horizon) != int(PRODUCTION_EPISODE_HORIZON_SECONDS)
+                shift_types = [
+                    name
+                    for name, active in (
+                        ("map_size", map_shift),
+                        ("episode_horizon", horizon_shift),
+                    )
+                    if active
+                ]
+                point_id = f"map_{size}m"
+                if int(horizon) != int(PRODUCTION_EPISODE_HORIZON_SECONDS):
+                    point_id += f"_t{int(horizon)}s"
+                points.append({
+                    "point_id": point_id,
                     "overrides": {
                         "environment_width_m": int(size),
                         "environment_height_m": int(size),
+                        "packet_injection_cutoff_seconds": float(horizon) - max_deadline,
                     },
                     "fixed_num_gt": fixed_num_gt,
                     "x_value": int(size),
                     "x_unit": "m",
                     "environment_width_m": int(size),
                     "environment_height_m": int(size),
-                    "zero_shot_environment_shift": zero_shot_shift,
-                    "environment_shift_type": (
-                        "map_size" if zero_shot_shift else None
+                    "environment_size_m": int(size),
+                    "training_episode_horizon_s": int(
+                        PRODUCTION_EPISODE_HORIZON_SECONDS
                     ),
+                    "evaluation_episode_horizon_s": int(horizon),
+                    "episode_horizon_s": int(horizon),
+                    "movement_transition_count": int(horizon),
+                    "routing_slot_count": int(horizon) * 4,
+                    "packet_injection_cutoff_s": float(horizon) - max_deadline,
+                    "remaining_time_normalization_horizon_s": int(horizon),
+                    "remaining_time_normalization": "current_evaluation_episode_horizon",
+                    "episode_horizon_seconds_observed_by_policy": False,
+                    "remaining_time_definition": (
+                        "(evaluation_horizon_s - elapsed_s) / "
+                        "evaluation_horizon_s"
+                    ),
+                    "zero_shot_environment_shift": map_shift,
+                    "zero_shot_horizon_shift": horizon_shift,
+                    "environment_shift_types": shift_types,
+                    "environment_shift_type": shift_types[0] if shift_types else None,
                     "point_evaluation_purpose": (
                         "zero_shot_environment_shift_evaluation"
-                        if zero_shot_shift
+                        if shift_types
                         else "in_distribution_environment_size_baseline"
                     ),
-                }
-            )
+                })
         return tuple(points)
     raise RuntimeError(f"unsupported paper suite kind: {kind}")
 
@@ -465,6 +512,21 @@ def _write_csv(path, rows):
         writer.writerows(rows)
 
 
+def _evaluation_config_fingerprint(method_id, point, episodes, seed):
+    payload = {
+        "method_id": str(method_id),
+        "point_id": str(point["point_id"]),
+        "episodes": int(episodes),
+        "evaluation_seed": int(seed),
+        "environment_width_m": point.get("environment_width_m"),
+        "environment_height_m": point.get("environment_height_m"),
+        "evaluation_episode_horizon_s": point.get("evaluation_episode_horizon_s"),
+        "overrides": point.get("overrides", {}),
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=False)
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
 def _write_routing_q_score_outputs(output_directory, method, result):
     """Write independent Q-score artifacts only for safe-DDQN evaluation."""
 
@@ -493,6 +555,7 @@ def run_paper_evaluation(
     checkpoint_episode=None,
     roi_counts=None,
     environment_sizes_m=None,
+    episode_horizons_s=None,
     deadline_seconds=None,
     output_directory=None,
     fixed_roi_manifests=None,
@@ -551,6 +614,14 @@ def run_paper_evaluation(
     if environment_sizes_m is not None and suite != "environment_size":
         raise ValueError(
             "environment-size selectors are available only for environment_size"
+        )
+    if episode_horizons_s is not None and suite != "environment_size":
+        raise ValueError(
+            "episode-horizon selectors are available only for environment_size"
+        )
+    if episode_horizons_s is not None and episode_seconds is not None:
+        raise ValueError(
+            "episode_seconds cannot be combined with episode_horizons_s"
         )
     selected_environment_sizes = (
         resolve_environment_sizes_m(environment_sizes_m=environment_sizes_m)
@@ -654,6 +725,11 @@ def run_paper_evaluation(
         if episode_seconds is None
         else episode_seconds
     )
+    selected_episode_horizons = (
+        resolve_episode_horizons_s(episode_horizons_s=episode_horizons_s)
+        if suite == "environment_size" and episode_horizons_s is not None
+        else ((resolved_seconds,) if suite == "environment_size" else None)
+    )
     if definition["kind"] == "trajectory" and target_uav_id is None:
         raise ValueError("uav_trajectory_snapshots requires --target-uav-id")
 
@@ -663,6 +739,7 @@ def run_paper_evaluation(
         deadline_seconds=deadline_seconds,
         episode_seconds=resolved_seconds,
         environment_sizes_m=selected_environment_sizes,
+        episode_horizons_s=selected_episode_horizons,
     )
     if flatten_single_point and len(points) != 1:
         raise ValueError("flatten_single_point requires exactly one evaluation point")
@@ -686,18 +763,25 @@ def run_paper_evaluation(
         }
 
     resolved_point_manifests = []
+    generated_manifest_cache = {}
     for point in points:
         fixed_num_gt = point.get("fixed_num_gt")
-        manifest = (
-            shared_manifests[int(fixed_num_gt)]
-            if fixed_num_gt is not None and shared_manifests
-            else _manifest_for_point(
+        manifest_cache_key = (
+            int(point["environment_width_m"]), int(fixed_num_gt)
+        ) if "environment_width_m" in point else None
+        if fixed_num_gt is not None and shared_manifests:
+            manifest = shared_manifests[int(fixed_num_gt)]
+        elif manifest_cache_key in generated_manifest_cache:
+            manifest = generated_manifest_cache[manifest_cache_key]
+        else:
+            manifest = _manifest_for_point(
                 point,
                 base_manifest=base_manifest,
                 manifest_seed=requested_manifest_seed,
                 episodes=resolved_episodes,
             )
-        )
+        if manifest_cache_key is not None:
+            generated_manifest_cache.setdefault(manifest_cache_key, manifest)
         if fixed_num_gt is not None:
             validate_fixed_roi_manifest(
                 manifest,
@@ -726,6 +810,12 @@ def run_paper_evaluation(
     point_results = []
     all_aggregates = []
     for point, manifest in resolved_point_manifests:
+        point_seconds = int(
+            point.get("evaluation_episode_horizon_s", resolved_seconds)
+        )
+        evaluation_config_fingerprint = _evaluation_config_fingerprint(
+            method.method_id, point, resolved_episodes, context["training_seed"]
+        )
         fixed_num_gt = point.get("fixed_num_gt")
         point_dir = (
             output_dir
@@ -740,7 +830,7 @@ def run_paper_evaluation(
             result = train(
                 _evaluation_config(
                     resolved_episodes,
-                    resolved_seconds,
+                    point_seconds,
                     context["training_seed"],
                 ),
                 scenario_manifest=manifest,
@@ -807,7 +897,10 @@ def run_paper_evaluation(
                 int(fixed_num_gt) if fixed_num_gt is not None else None
             ),
             "evaluation_episode_count": resolved_episodes,
-            "episode_seconds": resolved_seconds,
+            "episode_seconds": point_seconds,
+            "training_episode_horizon_s": int(PRODUCTION_EPISODE_HORIZON_SECONDS),
+            "evaluation_episode_horizon_s": point_seconds,
+            "evaluation_config_fingerprint": evaluation_config_fingerprint,
             "manifest_seed": int(manifest.manifest_seed),
             "manifest_hash": manifest.content_hash,
             "scenario_ids": list(result["scenario_ids"]),
@@ -828,7 +921,18 @@ def run_paper_evaluation(
             result["episode_metrics"],
             run_metadata,
             episode_context_columns=(
-                ("episode_horizon_seconds",)
+                (
+                    "episode_horizon_seconds",
+                    "movement_transition_count",
+                    "routing_slot_count",
+                    "packet_injection_cutoff_seconds",
+                    "discovered_roi_count",
+                    "roi_discovery_ratio",
+                    "all_rois_discovered",
+                    "all_rois_discovered_time_s",
+                    "first_discovery_time_by_roi_s",
+                    "terminal_coverage_ratio",
+                )
                 if suite == "environment_size"
                 else ()
             ),
@@ -849,7 +953,13 @@ def run_paper_evaluation(
         if trajectories:
             _write_json(point_dir / "trajectory_artifacts.json", trajectories)
         aggregates = aggregate_paper_point_metrics(
-            method.method_id, suite, point, result["episode_metrics"]
+            method.method_id,
+            suite,
+            {
+                **point,
+                "evaluation_config_fingerprint": evaluation_config_fingerprint,
+            },
+            result["episode_metrics"],
         )
         validate_canonical_aggregate_rows(
             aggregates,
@@ -875,7 +985,10 @@ def run_paper_evaluation(
                 "manifest_hash": manifest.content_hash,
                 "scenario_ids": list(result["scenario_ids"]),
                 "evaluation_episode_count": resolved_episodes,
-                "evaluation_horizon_seconds": resolved_seconds,
+                "evaluation_horizon_seconds": point_seconds,
+                "evaluation_episode_horizon_s": point_seconds,
+                "training_episode_horizon_s": int(PRODUCTION_EPISODE_HORIZON_SECONDS),
+                "evaluation_config_fingerprint": evaluation_config_fingerprint,
                 "evaluation_seed": context["training_seed"],
                 "manifest_seed": manifest.manifest_seed,
                 "num_uav": NUM_UAV,
@@ -916,7 +1029,7 @@ def run_paper_evaluation(
                 "roi_count": (
                     int(fixed_num_gt) if fixed_num_gt is not None else None
                 ),
-                "episode_seconds": resolved_seconds,
+                "episode_seconds": point_seconds,
                 "formal_checkpoint_episode": FORMAL_CHECKPOINT_EPISODE,
                 "is_formal_checkpoint": is_formal_checkpoint,
                 "evaluation_purpose": evaluation_purpose,
@@ -1027,7 +1140,19 @@ def run_paper_evaluation(
         "evaluation_seed": context["training_seed"],
         "manifest_seed": requested_manifest_seed,
         "evaluation_episodes_per_point": resolved_episodes,
-        "evaluation_horizon_seconds": resolved_seconds,
+        "evaluation_horizon_seconds": (
+            selected_episode_horizons[0]
+            if selected_episode_horizons is not None and len(selected_episode_horizons) == 1
+            else None
+        ),
+        "evaluation_episode_horizons_s": (
+            list(selected_episode_horizons)
+            if selected_episode_horizons is not None
+            else None
+        ),
+        "training_episode_horizon_s": int(PRODUCTION_EPISODE_HORIZON_SECONDS),
+        "remaining_time_normalization": "current_evaluation_episode_horizon",
+        "episode_horizon_seconds_observed_by_policy": False,
         "collect_packet_outcomes": False,
         "packet_outcome_artifact_mode": PACKET_OUTCOME_MODE_STREAMING,
         "packet_outcome_artifact_schema_version": (
@@ -1066,7 +1191,19 @@ def run_paper_evaluation(
                 "contains_zero_shot_environment_shift": any(
                     int(size) != int(ENVIRONMENT_WIDTH_M)
                     for size in selected_environment_sizes
-                )
+                ),
+                "contains_zero_shot_horizon_shift": any(
+                    int(horizon) != int(PRODUCTION_EPISODE_HORIZON_SECONDS)
+                    for horizon in selected_episode_horizons
+                ),
+                "environment_size_horizon_cartesian_point_count": (
+                    len(selected_environment_sizes) * len(selected_episode_horizons)
+                ),
+                "environment_size_horizon_total_episode_count": (
+                    len(selected_environment_sizes)
+                    * len(selected_episode_horizons)
+                    * resolved_episodes
+                ),
             }
             if selected_environment_sizes is not None
             else {
