@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import csv
+from contextlib import ExitStack
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -65,6 +66,11 @@ from scenario_manifest import (
     ScenarioManifest,
     generate_manifest,
     validate_manifest_initial_topologies,
+)
+from search_diagnostics import (
+    SEARCH_DIAGNOSTICS_INDEXING,
+    SEARCH_DIAGNOSTICS_SCHEMA_VERSION,
+    SearchDiagnosticsJsonlWriter,
 )
 from training_checkpoint import (
     CHECKPOINT_HORIZON_COMPATIBILITY_FIELDS,
@@ -561,10 +567,16 @@ def run_paper_evaluation(
     fixed_roi_manifests=None,
     allow_registered_fixed_roi_method=False,
     flatten_single_point=False,
+    collect_search_diagnostics=False,
 ):
     validate_production_deadlines()
     suite = resolve_evaluation_suite(suite)
     definition = PAPER_EVALUATION_SUITES[suite]
+    collect_search_diagnostics = bool(collect_search_diagnostics)
+    if collect_search_diagnostics and suite != "environment_size":
+        raise ValueError(
+            "Search diagnostics are available only for environment_size"
+        )
     if deadline_seconds is not None and definition["kind"] != "deadline":
         raise ValueError(
             "deadline_seconds is available only for the "
@@ -826,7 +838,18 @@ def run_paper_evaluation(
             point_dir.mkdir()
         manifest.save(point_dir / "scenario_manifest.json")
         packet_outcomes_path = point_dir / "packet_outcomes.jsonl"
-        with PacketOutcomeJsonlWriter(packet_outcomes_path) as outcome_writer:
+        search_diagnostics_path = point_dir / "search_diagnostics.jsonl"
+        with ExitStack() as stack:
+            outcome_writer = stack.enter_context(
+                PacketOutcomeJsonlWriter(packet_outcomes_path)
+            )
+            search_writer = (
+                stack.enter_context(
+                    SearchDiagnosticsJsonlWriter(search_diagnostics_path)
+                )
+                if collect_search_diagnostics
+                else None
+            )
             result = train(
                 _evaluation_config(
                     resolved_episodes,
@@ -857,6 +880,9 @@ def run_paper_evaluation(
                 collect_routing_q_score_diagnostics=(
                     method.routing == "safe_ddqn"
                 ),
+                search_diagnostics_sink=(
+                    search_writer.write if search_writer is not None else None
+                ),
             )
         diagnostic_outputs = write_packet_routing_diagnostic_artifacts(
             point_dir,
@@ -877,6 +903,14 @@ def run_paper_evaluation(
                 "paper packet outcome stream episode count mismatch: "
                 f"written={outcome_writer.episode_count}, "
                 f"expected={resolved_episodes}"
+            )
+        if search_writer is not None and search_writer.row_count != (
+            resolved_episodes * point_seconds
+        ):
+            raise RuntimeError(
+                "Search diagnostic interval count mismatch: "
+                f"written={search_writer.row_count}, "
+                f"expected={resolved_episodes * point_seconds}"
             )
         run_metadata = {
             **result["run_metadata"],
@@ -901,6 +935,20 @@ def run_paper_evaluation(
             "training_episode_horizon_s": int(PRODUCTION_EPISODE_HORIZON_SECONDS),
             "evaluation_episode_horizon_s": point_seconds,
             "evaluation_config_fingerprint": evaluation_config_fingerprint,
+            **(
+                {
+                    "search_diagnostics_enabled": True,
+                    "search_diagnostics_schema_version": (
+                        SEARCH_DIAGNOSTICS_SCHEMA_VERSION
+                    ),
+                    "search_diagnostics_indexing": SEARCH_DIAGNOSTICS_INDEXING,
+                    "search_diagnostics_jsonl": str(
+                        search_diagnostics_path.resolve()
+                    ),
+                }
+                if collect_search_diagnostics
+                else {}
+            ),
             "manifest_seed": int(manifest.manifest_seed),
             "manifest_hash": manifest.content_hash,
             "scenario_ids": list(result["scenario_ids"]),
@@ -938,6 +986,8 @@ def run_paper_evaluation(
             ),
         )
         outputs["packet_outcomes_jsonl"] = packet_outcomes_path.resolve()
+        if collect_search_diagnostics:
+            outputs["search_diagnostics_jsonl"] = search_diagnostics_path.resolve()
         outputs.update(diagnostic_outputs)
         outputs.update(routing_q_score_outputs)
         trajectories = [
@@ -989,6 +1039,21 @@ def run_paper_evaluation(
                 "evaluation_episode_horizon_s": point_seconds,
                 "training_episode_horizon_s": int(PRODUCTION_EPISODE_HORIZON_SECONDS),
                 "evaluation_config_fingerprint": evaluation_config_fingerprint,
+                **(
+                    {
+                        "search_diagnostics_enabled": True,
+                        "search_diagnostics_schema_version": (
+                            SEARCH_DIAGNOSTICS_SCHEMA_VERSION
+                        ),
+                        "search_diagnostics_indexing": SEARCH_DIAGNOSTICS_INDEXING,
+                        "search_diagnostics_jsonl": str(
+                            search_diagnostics_path.resolve()
+                        ),
+                        "search_diagnostics_row_count": search_writer.row_count,
+                    }
+                    if collect_search_diagnostics
+                    else {}
+                ),
                 "evaluation_seed": context["training_seed"],
                 "manifest_seed": manifest.manifest_seed,
                 "num_uav": NUM_UAV,
@@ -1140,6 +1205,17 @@ def run_paper_evaluation(
         "evaluation_seed": context["training_seed"],
         "manifest_seed": requested_manifest_seed,
         "evaluation_episodes_per_point": resolved_episodes,
+        **(
+            {
+                "search_diagnostics_enabled": True,
+                "search_diagnostics_schema_version": (
+                    SEARCH_DIAGNOSTICS_SCHEMA_VERSION
+                ),
+                "search_diagnostics_indexing": SEARCH_DIAGNOSTICS_INDEXING,
+            }
+            if collect_search_diagnostics
+            else {}
+        ),
         "evaluation_horizon_seconds": (
             selected_episode_horizons[0]
             if selected_episode_horizons is not None and len(selected_episode_horizons) == 1

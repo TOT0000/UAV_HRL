@@ -31,6 +31,7 @@ def build_parser():
     parser.add_argument("--manifest-seed", type=int)
     parser.add_argument("--episodes", type=int)
     parser.add_argument("--episode-seconds", type=int)
+    parser.add_argument("--collect-search-diagnostics", action="store_true")
     episode_horizon = parser.add_mutually_exclusive_group()
     episode_horizon.add_argument("--episode-horizon-s", type=int)
     episode_horizon.add_argument("--episode-horizons-s", type=int, nargs="+")
@@ -114,6 +115,10 @@ def main(argv=None):
         raise ValueError(
             "episode-horizon selectors are available only for environment_size"
         )
+    if args.collect_search_diagnostics and args.suite != "environment_size":
+        raise ValueError(
+            "--collect-search-diagnostics is available only for environment_size"
+        )
     if explicit_episode_horizon and args.episode_seconds is not None:
         raise ValueError(
             "--episode-seconds cannot be combined with episode-horizon selectors"
@@ -188,6 +193,7 @@ def main(argv=None):
         roi_counts=roi_counts,
         environment_sizes_m=environment_sizes_m,
         episode_horizons_s=episode_horizons_s,
+        collect_search_diagnostics=args.collect_search_diagnostics,
         deadline_seconds=args.deadline_seconds,
         allow_registered_fixed_roi_method=bool(
             args.suite == "fixed_roi" and (explicit_checkpoint or explicit_roi)

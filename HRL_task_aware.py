@@ -129,6 +129,7 @@ from training_history import (
 import utils_update_v2
 from rng_contract import CHANNEL_RNG_STREAMS, NamedRNGStreams, RNG_CONTRACT_VERSION
 from scenario_manifest import validate_manifest_initial_topologies
+from search_diagnostics import build_search_diagnostics_record
 
 
 MOVEMENT_CONTROL_INTERVAL = int(round(MOVEMENT_INTERVAL_SECONDS / ROUTING_SLOT_SECONDS))
@@ -1030,8 +1031,48 @@ def _select_routing_actions(ddqn, states, routing_masks, epsilon):
     }
 
 
-def _mark_search_observations(env):
+def _mark_search_observations(
+    env,
+    *,
+    search_diagnostics_sink=None,
+    search_diagnostics_context=None,
+):
+    diagnostics_enabled = search_diagnostics_sink is not None
+    if diagnostics_enabled and not isinstance(search_diagnostics_context, dict):
+        raise ValueError("Search diagnostics require interval context")
+
+    def emit_diagnostics(visited_before, transitions, search_ids):
+        if not diagnostics_enabled:
+            return
+        final_positions = {
+            uav_id: env.uav_dict[uav_id].get_position()
+            for uav_id in search_ids
+        }
+        record = build_search_diagnostics_record(
+            method_id=search_diagnostics_context["method_id"],
+            scenario_id=search_diagnostics_context["scenario_id"],
+            episode_index=search_diagnostics_context["episode_index"],
+            interval_index=search_diagnostics_context["interval_index"],
+            time_seconds=search_diagnostics_context["time_seconds"],
+            visited_before=visited_before,
+            visited_after=env.visited_bitmap,
+            discovered_roi_ids_before=search_diagnostics_context[
+                "discovered_roi_ids_before"
+            ],
+            discovered_roi_ids_after=(
+                int(gt.id) for gt in env.gts if bool(gt.is_found)
+            ),
+            search_uav_ids=search_ids,
+            footprint_transitions=transitions,
+            interval_initial_positions=search_diagnostics_context[
+                "interval_initial_positions"
+            ],
+            interval_final_positions=final_positions,
+        )
+        search_diagnostics_sink(record)
+
     if getattr(env, "_search_phase_over", False):
+        emit_diagnostics(env.visited_bitmap, (), ())
         return ()
     search_uav_ids = [
         uav_id
@@ -1039,6 +1080,7 @@ def _mark_search_observations(env):
         if env.is_search_contributor(uav_id)
     ]
     if not search_uav_ids:
+        emit_diagnostics(env.visited_bitmap, (), ())
         return ()
     visited_precommit = env.visited_bitmap.copy()
     footprints = {uid: env.search_footprint(uid) for uid in search_uav_ids}
@@ -1068,6 +1110,7 @@ def _mark_search_observations(env):
         bx_min, bx_max, by_min, by_max = transition.current_footprint
         committed[bx_min : bx_max + 1, by_min : by_max + 1] = True
     env.visited_bitmap[:, :] = committed
+    emit_diagnostics(visited_precommit, transitions, search_uav_ids)
     return transitions
 
 
@@ -1846,6 +1889,7 @@ def train(
     trajectory_target_uav_id=None,
     packet_outcome_sink=None,
     collect_routing_q_score_diagnostics=False,
+    search_diagnostics_sink=None,
 ):
     if config is None:
         raise ValueError(
@@ -1871,6 +1915,12 @@ def train(
     elif packet_outcome_sink is not None:
         raise ValueError(
             "a packet outcome sink is valid only in stream_jsonl mode"
+        )
+    if search_diagnostics_sink is not None and (
+        not evaluation or not callable(search_diagnostics_sink)
+    ):
+        raise ValueError(
+            "Search diagnostics require an evaluation-only callable sink"
         )
     collect_routing_q_score_diagnostics = bool(
         collect_routing_q_score_diagnostics
@@ -2708,7 +2758,22 @@ def train(
             found_before = {
                 int(gt.id) for gt in env.gts if bool(gt.is_found)
             }
-            fov_transitions = _mark_search_observations(env)
+            if search_diagnostics_sink is None:
+                fov_transitions = _mark_search_observations(env)
+            else:
+                fov_transitions = _mark_search_observations(
+                    env,
+                    search_diagnostics_sink=search_diagnostics_sink,
+                    search_diagnostics_context={
+                        "method_id": method_spec.method_id,
+                        "scenario_id": scenario_id,
+                        "episode_index": episode,
+                        "interval_index": interval,
+                        "time_seconds": float(interval + 1),
+                        "discovered_roi_ids_before": found_before,
+                        "interval_initial_positions": interval_initial_positions,
+                    },
+                )
             discovery_time_seconds = float(interval + 1)
             for gt in env.gts:
                 gt_id = int(gt.id)

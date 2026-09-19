@@ -790,6 +790,35 @@ Horizons for a common map reuse the same scenario manifest, scenario IDs, and
 initial conditions; their evaluation configuration fingerprints remain
 distinct.
 
+Search timing diagnostics are an opt-in extension of this same suite:
+
+```powershell
+python -X utf8 run_paper_evaluation.py kkm_random_action_random_routing `
+  --suite environment_size `
+  --environment-size-m 1500 `
+  --episode-horizon-s 3 `
+  --episodes 1 `
+  --collect-search-diagnostics
+```
+
+Each point then streams one `uav-hrl-search-diagnostics-v1` JSON object per
+one-second movement interval to `search_diagnostics.jsonl`. Episode and
+interval indices are zero-based; `time_seconds` is the actual post-commit time,
+so the first row is 1.0 seconds. The row uses the canonical frozen pre-commit
+visited bitmap and the same clipped `FovCoverageTransition` footprints that are
+committed by the simulator. It records coverage and discovery before/after,
+actual Search contributors, their post-movement position and executed 3-D
+displacement, and per-UAV footprint/new-cell counts.
+
+For footprints `F_i` and the pre-commit visited set `V`, gross footprint cells
+are `sum(|F_i|)`, union cells are `|union(F_i)|`, and new union cells are
+`|union(F_i) - V|`. Simultaneous overlap is `(gross - union) / gross` while
+historical revisit is `(union - new_union) / union`; a zero denominator yields
+zero. The artifact does not contain bitmaps or heatmaps. Collection is
+evaluation-only and disabled by default. Enabling it adds only the streaming
+artifact and diagnostic metadata; canonical per-episode metrics and aggregates
+remain unchanged.
+
 The checkpoint training domain remains 1000 m by 1000 m. Evaluation changes
 only the square map geometry: the GS remains at the origin, the canonical UAV
 initial layout is unchanged, SR teams start at the selected map's boundary
