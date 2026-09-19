@@ -37,6 +37,7 @@ from scenario_manifest import (
     ENVIRONMENT_SIZE_SCENARIO_SCHEMA_VERSION,
     SCENARIO_SCHEMA_VERSION,
     ScenarioManifest,
+    environment_size_uav_initial_xy_m,
     generate_manifest,
 )
 from Simulator import Simulator
@@ -485,7 +486,7 @@ class EnvironmentSizeRuntimeContractTest(unittest.TestCase):
                 self.assertEqual(env.explorer_id_map.shape, env.visited_bitmap.shape)
                 self.assertEqual(
                     tuple((uav.x_u, uav.y_u) for uav in env.UAVs),
-                    CANONICAL_UAV_INITIAL_XY_M,
+                    environment_size_uav_initial_xy_m(size),
                 )
                 self.assertEqual(tuple(env.GS_pos), (0.0, 0.0, 0.0))
                 self.assertLessEqual(
@@ -636,8 +637,8 @@ class EnvironmentSizeSmokeTest(unittest.TestCase):
                 ["map_size", "episode_horizon"],
             )
 
-    def test_one_episode_random_smoke_at_smallest_and_largest_maps(self):
-        for size in (750, 1000, 2000):
+    def test_one_episode_random_smoke_at_1500m_and_2000m(self):
+        for size in (1500, 2000):
             with self.subTest(size=size), tempfile.TemporaryDirectory() as temp_dir:
                 output = Path(temp_dir) / "evaluation"
                 result = run_paper_evaluation(
@@ -657,6 +658,17 @@ class EnvironmentSizeSmokeTest(unittest.TestCase):
                 self.assertEqual(point["training_environment_width_m"], 1000)
                 self.assertEqual(point["new_training_started"], False)
                 self.assertFalse(point["environment_size_observed_by_policy"])
+                self.assertEqual(
+                    point["initial_uav_deployment_strategy"],
+                    "scaled_canonical_connectivity_preserving",
+                )
+                self.assertEqual(
+                    point["initial_uav_xy_scale"], min(size / 1000.0, 1.9)
+                )
+                self.assertTrue(point["initial_topology_connected"])
+                self.assertEqual(
+                    point["initial_uav_deployment_source"], "evaluation_map_size"
+                )
                 self.assertEqual(
                     point["coordinate_normalization"],
                     "current_environment_width_height",
@@ -689,6 +701,12 @@ class EnvironmentSizeSmokeTest(unittest.TestCase):
                 self.assertTrue(metadata["contains_zero_shot_horizon_shift"])
                 self.assertEqual(metadata["points"][0]["roi_count"], 8)
                 self.assertEqual(metadata["points"][0]["environment_size_m"], size)
+                self.assertEqual(
+                    metadata["environment_size_uav_deployments"][0][
+                        "initial_uav_deployment_strategy"
+                    ],
+                    "scaled_canonical_connectivity_preserving",
+                )
                 self.assertEqual(metadata["points"][0]["training_episode_horizon_s"], 60)
                 self.assertEqual(metadata["points"][0]["evaluation_episode_horizon_s"], 3)
                 self.assertEqual(

@@ -819,11 +819,17 @@ evaluation-only and disabled by default. Enabling it adds only the streaming
 artifact and diagnostic metadata; canonical per-episode metrics and aggregates
 remain unchanged.
 
-The checkpoint training domain remains 1000 m by 1000 m. Evaluation changes
-only the square map geometry: the GS remains at the origin, the canonical UAV
-initial layout is unchanged, SR teams start at the selected map's boundary
-midpoints, and radius-80 m RoIs use paired latent layouts. For each manifest
-seed, episode, RoI count, and RoI ID, schema v9 first generates the layout in
+The checkpoint training domain remains 1000 m by 1000 m. In the
+`environment_size` suite, the GS remains at the origin and the canonical UAV
+IDs, 4-by-4 grid structure, and sampled altitudes remain unchanged. Horizontal
+UAV coordinates use `min(map_size_m / 1000, 1.9)` times the canonical
+`{100, 300, 500, 700}` metre coordinates. The 1.9 cap gives a 380 m horizontal
+grid spacing at 2000 m, and each generated episode must pass the existing
+inclusive 400 m three-dimensional graph validation with all 16 UAVs connected
+to the GS component. SR teams start at the selected map's boundary midpoints,
+and radius-80 m RoIs use paired latent layouts. For each manifest seed,
+episode, RoI count, and RoI ID, schema v10 retains the v9 exogenous RNG stream
+and first generates the layout in
 the legal `[80, 670]` area of the canonical 750 m reference map. It maps each
 coordinate to a legal target-map coordinate with
 `80 + ((x_750 - 80) / (750 - 160)) * (L - 160)`. The latent RNG seed is
@@ -835,9 +841,13 @@ dimensions remain unchanged because the aggregate coverage grid keeps its
 fixed shape and coordinates are normalized by the current environment width
 and height. The map size is not appended to the policy observation.
 
-Environment-size manifests use scenario schema `uav-hrl-scenario-v9`; existing
-fixed-RoI and training manifests remain byte-compatible v8 artifacts. Suite
-metadata uses `environment_size_sweep_evaluation` and reports whether it
+Environment-size manifests use scenario schema `uav-hrl-scenario-v10` and
+reject the old v9 fixed-coordinate deployment instead of reinterpreting it.
+The deployment strategy, scale, episode positions, connectivity result, and
+gateway distance participate in manifest identity, fingerprint, hash, and
+evaluation provenance. Existing fixed-RoI and training manifests remain
+byte-compatible v8 artifacts. Suite metadata uses
+`environment_size_sweep_evaluation` and reports whether it
 contains any zero-shot point. Each point is authoritative: only 1000 m at 60 s
 is the in-distribution baseline. Other sizes record `map_size`, other horizons
 record `episode_horizon`, and a point can record both shift types. Metadata also records the 1000 m training

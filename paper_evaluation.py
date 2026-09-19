@@ -518,7 +518,33 @@ def _write_csv(path, rows):
         writer.writerows(rows)
 
 
-def _evaluation_config_fingerprint(method_id, point, episodes, seed):
+def _manifest_deployment_provenance(manifest):
+    if manifest.environment_size_m is None:
+        return {}
+    config = manifest.generator_config
+    return {
+        "initial_uav_deployment_strategy": config[
+            "initial_uav_deployment_strategy"
+        ],
+        "canonical_environment_size_m": int(
+            config["canonical_environment_size_m"]
+        ),
+        "initial_uav_xy_scale": float(config["initial_uav_xy_scale"]),
+        "initial_uav_positions_xyz_m": config[
+            "initial_uav_positions_xyz_m"
+        ],
+        "initial_topology_connected": bool(
+            config["initial_topology_connected"]
+        ),
+        "initial_gateway_distance_m": config[
+            "initial_gateway_distance_m"
+        ],
+        "initial_uav_deployment_source": "evaluation_map_size",
+    }
+
+
+def _evaluation_config_fingerprint(method_id, point, episodes, seed, manifest):
+    deployment = _manifest_deployment_provenance(manifest)
     payload = {
         "method_id": str(method_id),
         "point_id": str(point["point_id"]),
@@ -529,6 +555,16 @@ def _evaluation_config_fingerprint(method_id, point, episodes, seed):
         "evaluation_episode_horizon_s": point.get("evaluation_episode_horizon_s"),
         "overrides": point.get("overrides", {}),
     }
+    if deployment:
+        payload.update(
+            {
+                "scenario_manifest_config_fingerprint": (
+                    manifest.config_fingerprint
+                ),
+                "scenario_manifest_hash": manifest.content_hash,
+                **deployment,
+            }
+        )
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=False)
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
@@ -826,8 +862,13 @@ def run_paper_evaluation(
             point.get("evaluation_episode_horizon_s", resolved_seconds)
         )
         evaluation_config_fingerprint = _evaluation_config_fingerprint(
-            method.method_id, point, resolved_episodes, context["training_seed"]
+            method.method_id,
+            point,
+            resolved_episodes,
+            context["training_seed"],
+            manifest,
         )
+        deployment_provenance = _manifest_deployment_provenance(manifest)
         fixed_num_gt = point.get("fixed_num_gt")
         point_dir = (
             output_dir
@@ -935,6 +976,7 @@ def run_paper_evaluation(
             "training_episode_horizon_s": int(PRODUCTION_EPISODE_HORIZON_SECONDS),
             "evaluation_episode_horizon_s": point_seconds,
             "evaluation_config_fingerprint": evaluation_config_fingerprint,
+            **deployment_provenance,
             **(
                 {
                     "search_diagnostics_enabled": True,
@@ -1039,6 +1081,7 @@ def run_paper_evaluation(
                 "evaluation_episode_horizon_s": point_seconds,
                 "training_episode_horizon_s": int(PRODUCTION_EPISODE_HORIZON_SECONDS),
                 "evaluation_config_fingerprint": evaluation_config_fingerprint,
+                **deployment_provenance,
                 **(
                     {
                         "search_diagnostics_enabled": True,
@@ -1260,6 +1303,30 @@ def run_paper_evaluation(
         "evaluation_environment_sizes_m": (
             list(selected_environment_sizes)
             if selected_environment_sizes is not None
+            else None
+        ),
+        "environment_size_uav_deployments": (
+            [
+                {
+                    "environment_size_m": int(point["environment_size_m"]),
+                    **{
+                        key: value
+                        for key, value in point.items()
+                        if key
+                        in {
+                            "initial_uav_deployment_strategy",
+                            "canonical_environment_size_m",
+                            "initial_uav_xy_scale",
+                            "initial_uav_positions_xyz_m",
+                            "initial_topology_connected",
+                            "initial_gateway_distance_m",
+                            "initial_uav_deployment_source",
+                        }
+                    },
+                }
+                for point in point_results
+            ]
+            if suite == "environment_size"
             else None
         ),
         **(

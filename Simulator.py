@@ -1311,6 +1311,11 @@ class Simulator:
                 else "simulator-fallback"
             ),
             gs_position=self.GS_pos,
+            environment_size_m=(
+                scenario_entry.get("environment_size_m")
+                if scenario_entry is not None
+                else None
+            ),
         )
         validate_permanent_gateway_initial_position(
             uav_initial_data,
@@ -1320,6 +1325,11 @@ class Simulator:
                 else "simulator-fallback"
             ),
             gs_position=self.GS_pos,
+            environment_size_m=(
+                scenario_entry.get("environment_size_m")
+                if scenario_entry is not None
+                else None
+            ),
         )
         for initial in uav_initial_data:
             i = int(initial["uav_id"])

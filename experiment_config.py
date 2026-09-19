@@ -87,6 +87,11 @@ CANONICAL_UAV_INITIAL_XY_M = (
     (700.0, 700.0),
 )
 UAV_INITIAL_LAYOUT_VERSION = "original-fixed-4x4-grid-named-altitude-v3"
+ENVIRONMENT_SIZE_UAV_DEPLOYMENT_STRATEGY = (
+    "scaled_canonical_connectivity_preserving"
+)
+CANONICAL_ENVIRONMENT_SIZE_M = 1000
+ENVIRONMENT_SIZE_UAV_XY_SCALE_CAP = 1.9
 INITIAL_COMMUNICATION_TOPOLOGY_CONTRACT_VERSION = (
     "finite-3d-inclusive-unified-400m-connected-16-uav-grid-v3"
 )

@@ -17,6 +17,7 @@ import numpy as np
 from experiment_config import (
     A2A_COMMUNICATION_RANGE_M,
     A2G_COMMUNICATION_RANGE_M,
+    CANONICAL_ENVIRONMENT_SIZE_M,
     CANONICAL_UAV_INITIAL_XY_M,
     COMMUNICATION_RANGE_M,
     COMMUNICATION_RANGE_BOUNDARY_RULE,
@@ -24,6 +25,8 @@ from experiment_config import (
     ENVIRONMENT_HEIGHT_M,
     ENVIRONMENT_SIZE_EVALUATION_VALUES_M,
     ENVIRONMENT_SIZE_REFERENCE_M,
+    ENVIRONMENT_SIZE_UAV_DEPLOYMENT_STRATEGY,
+    ENVIRONMENT_SIZE_UAV_XY_SCALE_CAP,
     ENVIRONMENT_WIDTH_M,
     GROUND_STATION_POSITION_M,
     GS_GATEWAY_CONTRACT_VERSION,
@@ -46,7 +49,7 @@ from experiment_config import (
 
 
 SCENARIO_SCHEMA_VERSION = "uav-hrl-scenario-v8"
-ENVIRONMENT_SIZE_SCENARIO_SCHEMA_VERSION = "uav-hrl-scenario-v9"
+ENVIRONMENT_SIZE_SCENARIO_SCHEMA_VERSION = "uav-hrl-scenario-v10"
 OBSOLETE_SCHEMA_VERSIONS = frozenset(
     {
         "uav-hrl-scenario-v1",
@@ -56,6 +59,7 @@ OBSOLETE_SCHEMA_VERSIONS = frozenset(
         "uav-hrl-scenario-v5",
         "uav-hrl-scenario-v6",
         "uav-hrl-scenario-v7",
+        "uav-hrl-scenario-v9",
     }
 )
 # Singular compatibility name used by callers that construct an obsolete
@@ -99,6 +103,10 @@ def _topology_error(
     nearest_u2g_distance_m,
     u2g_range_m,
     gs_component_uav_ids,
+    environment_size_m=None,
+    unreachable_uav_ids=(),
+    gateway_distance_m=None,
+    relevant_uav_pair_distances_m=(),
 ):
     nearest = (
         f"{float(nearest_u2g_distance_m):.12g}"
@@ -108,10 +116,16 @@ def _topology_error(
     )
     return ValueError(
         "initial communication topology is invalid: "
-        f"scenario_id={scenario_id}; reason={reason}; "
+        f"scenario_id={scenario_id}; "
+        f"environment_size_m={environment_size_m}; reason={reason}; "
         f"nearest_u2g_3d_distance_m={nearest}; "
         f"u2g_range_m={float(u2g_range_m):.12g}; "
-        f"gs_component_uav_ids={list(gs_component_uav_ids)}"
+        f"gs_component_uav_ids={list(gs_component_uav_ids)}; "
+        f"unreachable_uav_ids={list(unreachable_uav_ids)}; "
+        f"gateway_gs_3d_distance_m="
+        f"{None if gateway_distance_m is None else float(gateway_distance_m):}; "
+        f"relevant_uav_pair_3d_distances_m="
+        f"{list(relevant_uav_pair_distances_m)}"
     )
 
 
@@ -122,6 +136,7 @@ def validate_initial_communication_topology(
     gs_position=GROUND_STATION_POSITION_M,
     u2g_range_m=COMMUNICATION_RANGE_M,
     u2u_range_m=COMMUNICATION_RANGE_M,
+    environment_size_m=None,
 ):
     """Validate the finite inclusive 3-D range graph at episode start."""
 
@@ -136,6 +151,7 @@ def validate_initial_communication_topology(
             nearest_u2g_distance_m=None,
             u2g_range_m=A2G_COMMUNICATION_RANGE_M,
             gs_component_uav_ids=(),
+            environment_size_m=environment_size_m,
         ) from exc
     if (
         len(gs) != 3
@@ -151,6 +167,7 @@ def validate_initial_communication_topology(
             nearest_u2g_distance_m=None,
             u2g_range_m=u2g_range_m,
             gs_component_uav_ids=(),
+            environment_size_m=environment_size_m,
         )
 
     positions = {}
@@ -172,6 +189,7 @@ def validate_initial_communication_topology(
             nearest_u2g_distance_m=None,
             u2g_range_m=u2g_range_m,
             gs_component_uav_ids=(),
+            environment_size_m=environment_size_m,
         ) from exc
     if not positions:
         raise _topology_error(
@@ -180,6 +198,7 @@ def validate_initial_communication_topology(
             nearest_u2g_distance_m=None,
             u2g_range_m=u2g_range_m,
             gs_component_uav_ids=(),
+            environment_size_m=environment_size_m,
         )
 
     u2g_distances = {
@@ -193,8 +212,10 @@ def validate_initial_communication_topology(
             nearest_u2g_distance_m=None,
             u2g_range_m=u2g_range_m,
             gs_component_uav_ids=(),
+            environment_size_m=environment_size_m,
         )
     nearest_u2g_distance_m = min(u2g_distances.values())
+    gateway_distance_m = u2g_distances.get(PERMANENT_GS_GATEWAY_UAV_ID)
     u2g_uav_ids = sorted(
         uav_id
         for uav_id, distance in u2g_distances.items()
@@ -213,6 +234,8 @@ def validate_initial_communication_topology(
                     nearest_u2g_distance_m=nearest_u2g_distance_m,
                     u2g_range_m=u2g_range_m,
                     gs_component_uav_ids=u2g_uav_ids,
+                    environment_size_m=environment_size_m,
+                    gateway_distance_m=gateway_distance_m,
                 )
             if distance <= u2u_range_m:
                 adjacency[sender].add(receiver)
@@ -228,6 +251,37 @@ def validate_initial_communication_topology(
                 component.add(receiver)
                 frontier.append(receiver)
     gs_component_uav_ids = sorted(component)
+    unreachable_uav_ids = sorted(set(ordered_ids).difference(component))
+    relevant_pair_distances = []
+    if unreachable_uav_ids and component:
+        for unreachable_id in unreachable_uav_ids:
+            connected_id, distance = min(
+                (
+                    (connected_id, math.dist(
+                        positions[unreachable_id], positions[connected_id]
+                    ))
+                    for connected_id in sorted(component)
+                ),
+                key=lambda item: (item[1], item[0]),
+            )
+            relevant_pair_distances.append(
+                {
+                    "uav_ids": [connected_id, unreachable_id],
+                    "distance_3d_m": distance,
+                }
+            )
+    elif len(ordered_ids) >= 2:
+        sender, receiver, distance = min(
+            (
+                (sender, receiver, math.dist(positions[sender], positions[receiver]))
+                for index, sender in enumerate(ordered_ids)
+                for receiver in ordered_ids[index + 1 :]
+            ),
+            key=lambda item: (item[2], item[0], item[1]),
+        )
+        relevant_pair_distances.append(
+            {"uav_ids": [sender, receiver], "distance_3d_m": distance}
+        )
     if not u2g_uav_ids:
         raise _topology_error(
             scenario_id,
@@ -235,14 +289,22 @@ def validate_initial_communication_topology(
             nearest_u2g_distance_m=nearest_u2g_distance_m,
             u2g_range_m=u2g_range_m,
             gs_component_uav_ids=gs_component_uav_ids,
+            environment_size_m=environment_size_m,
+            unreachable_uav_ids=unreachable_uav_ids,
+            gateway_distance_m=gateway_distance_m,
+            relevant_uav_pair_distances_m=relevant_pair_distances,
         )
-    if len(gs_component_uav_ids) < 2:
+    if unreachable_uav_ids:
         raise _topology_error(
             scenario_id,
-            "GS component must contain at least two UAVs",
+            "every UAV must have a multi-hop path to GS",
             nearest_u2g_distance_m=nearest_u2g_distance_m,
             u2g_range_m=u2g_range_m,
             gs_component_uav_ids=gs_component_uav_ids,
+            environment_size_m=environment_size_m,
+            unreachable_uav_ids=unreachable_uav_ids,
+            gateway_distance_m=gateway_distance_m,
+            relevant_uav_pair_distances_m=relevant_pair_distances,
         )
     return {
         "scenario_id": str(scenario_id),
@@ -255,6 +317,9 @@ def validate_initial_communication_topology(
         "u2g_uav_ids": u2g_uav_ids,
         "u2u_edges": [list(edge) for edge in u2u_edges],
         "gs_component_uav_ids": gs_component_uav_ids,
+        "unreachable_uav_ids": [],
+        "initial_topology_connected": True,
+        "gateway_gs_3d_distance_m": gateway_distance_m,
     }
 
 
@@ -263,6 +328,7 @@ def validate_permanent_gateway_initial_position(
     *,
     scenario_id,
     gs_position=GROUND_STATION_POSITION_M,
+    environment_size_m=None,
 ):
     """Fail before reset side effects if UAV 0 would require an initial teleport."""
 
@@ -270,7 +336,8 @@ def validate_permanent_gateway_initial_position(
     if PERMANENT_GS_GATEWAY_UAV_ID not in by_id:
         raise ValueError(
             "permanent GS gateway is absent from initial scenario: "
-            f"scenario_id={scenario_id}; uav_id={PERMANENT_GS_GATEWAY_UAV_ID}"
+            f"scenario_id={scenario_id}; environment_size_m={environment_size_m}; "
+            f"uav_id={PERMANENT_GS_GATEWAY_UAV_ID}"
         )
     try:
         position = tuple(
@@ -281,20 +348,21 @@ def validate_permanent_gateway_initial_position(
     except (KeyError, TypeError, ValueError) as exc:
         raise ValueError(
             "permanent GS gateway initial position is invalid: "
-            f"scenario_id={scenario_id}"
+            f"scenario_id={scenario_id}; environment_size_m={environment_size_m}"
         ) from exc
     if len(position) != 3 or len(station) != 3 or not all(
         math.isfinite(value) for value in (*position, *station)
     ):
         raise ValueError(
             "permanent GS gateway initial position must be finite 3-D: "
-            f"scenario_id={scenario_id}"
+            f"scenario_id={scenario_id}; environment_size_m={environment_size_m}"
         )
     distance = math.dist(position, station)
     if distance > GS_GATEWAY_HARD_RADIUS_M:
         raise ValueError(
             "permanent GS gateway initial position exceeds hard radius: "
-            f"scenario_id={scenario_id}; uav_id={PERMANENT_GS_GATEWAY_UAV_ID}; "
+            f"scenario_id={scenario_id}; environment_size_m={environment_size_m}; "
+            f"uav_id={PERMANENT_GS_GATEWAY_UAV_ID}; "
             f"distance_3d_m={distance:.12g}; "
             f"hard_radius_m={GS_GATEWAY_HARD_RADIUS_M:.12g}"
         )
@@ -307,13 +375,45 @@ def validate_permanent_gateway_initial_position(
     }
 
 
+def environment_size_uav_xy_scale(environment_size_m: int) -> float:
+    """Return the specified deterministic environment-size deployment scale."""
+
+    if isinstance(environment_size_m, bool):
+        raise ValueError("environment size must be a supported integer metre value")
+    size = int(environment_size_m)
+    if size != environment_size_m or size not in ENVIRONMENT_SIZE_EVALUATION_VALUES_M:
+        raise ValueError(
+            "environment size must be one of "
+            f"{list(ENVIRONMENT_SIZE_EVALUATION_VALUES_M)} metres"
+        )
+    return min(
+        float(size) / float(CANONICAL_ENVIRONMENT_SIZE_M),
+        float(ENVIRONMENT_SIZE_UAV_XY_SCALE_CAP),
+    )
+
+
+def environment_size_uav_initial_xy_m(
+    environment_size_m: int,
+) -> tuple[tuple[float, float], ...]:
+    """Scale the canonical 4x4 horizontal layout without reordering UAVs."""
+
+    scale = environment_size_uav_xy_scale(environment_size_m)
+    return tuple(
+        (float(x) * scale, float(y) * scale)
+        for x, y in CANONICAL_UAV_INITIAL_XY_M
+    )
+
+
 def current_environment_config(
     environment_width_m=None,
     environment_height_m=None,
+    *,
+    environment_size_m=None,
+    initial_uav_positions_xyz_m=None,
 ) -> dict[str, Any]:
     width = 1000 if environment_width_m is None else int(environment_width_m)
     height = 1000 if environment_height_m is None else int(environment_height_m)
-    return {
+    config = {
         "num_uav": NUM_UAV,
         "roi_count_min": ROI_COUNT_MIN,
         "roi_count_max": ROI_COUNT_MAX,
@@ -358,6 +458,19 @@ def current_environment_config(
         "sr_initial_layout": "four-boundary-midpoints-cyclic",
         "sr_motion_model": "policy-triggered-straight-line-v1",
     }
+    if environment_size_m is not None:
+        scale = environment_size_uav_xy_scale(environment_size_m)
+        config.update(
+            {
+                "initial_uav_deployment_strategy": (
+                    ENVIRONMENT_SIZE_UAV_DEPLOYMENT_STRATEGY
+                ),
+                "canonical_environment_size_m": CANONICAL_ENVIRONMENT_SIZE_M,
+                "initial_uav_xy_scale": scale,
+                "initial_uav_positions_xyz_m": initial_uav_positions_xyz_m,
+            }
+        )
+    return config
 
 
 def environment_config_fingerprint(config: dict[str, Any] | None = None) -> str:
@@ -417,14 +530,22 @@ def _split_seed(
     return int.from_bytes(hashlib.sha256(material).digest()[:8], "big")
 
 
-def _uav_initial_data(py_rng: random.Random) -> list[dict[str, Any]]:
+def _uav_initial_data(
+    py_rng: random.Random,
+    environment_size_m: int | None = None,
+) -> list[dict[str, Any]]:
+    xy_positions = (
+        CANONICAL_UAV_INITIAL_XY_M
+        if environment_size_m is None
+        else environment_size_uav_initial_xy_m(environment_size_m)
+    )
     return [
         {
             "uav_id": uav_id,
             "position": [x, y, py_rng.uniform(80.0, 120.0)],
             "energy_j": 10000.0,
         }
-        for uav_id, (x, y) in enumerate(CANONICAL_UAV_INITIAL_XY_M)
+        for uav_id, (x, y) in enumerate(xy_positions)
     ]
 
 
@@ -566,7 +687,13 @@ def generate_scenario_entry(
         manifest_seed,
         episode_index,
         generation_profile,
-        schema_version=schema_version,
+        # Preserve the paired v9 exogenous RNG stream. The v10 identity changes
+        # only because deployment is now explicitly scaled and fingerprinted.
+        schema_version=(
+            schema_version
+            if environment_size_m is None
+            else "uav-hrl-scenario-v9"
+        ),
         environment_size_m=environment_size_m,
     )
     np_rng = np.random.default_rng(scenario_seed)
@@ -576,31 +703,66 @@ def generate_scenario_entry(
         if generation_profile["num_gt_mode"] == "mixed"
         else int(generation_profile["fixed_num_gt"])
     )
+    ground_targets = (
+        _gt_initial_data(
+            py_rng,
+            episode_num_gt,
+            environment_width_m,
+            environment_height_m,
+        )
+        if environment_size_m is None
+        else _paired_environment_size_gt_initial_data(
+            py_rng,
+            episode_num_gt,
+            environment_size_m,
+        )
+    )
+    uavs = _uav_initial_data(py_rng, environment_size_m=environment_size_m)
+    deployment_metadata = {}
+    deployment_identity = ""
+    if environment_size_m is not None:
+        topology = validate_initial_communication_topology(
+            uavs,
+            scenario_id=f"pending-map-{environment_size_m}m",
+            environment_size_m=environment_size_m,
+        )
+        gateway = validate_permanent_gateway_initial_position(
+            uavs,
+            scenario_id=f"pending-map-{environment_size_m}m",
+            environment_size_m=environment_size_m,
+        )
+        positions = [
+            [float(value) for value in item["position"]]
+            for item in sorted(uavs, key=lambda item: int(item["uav_id"]))
+        ]
+        deployment_metadata = {
+            "initial_uav_deployment_strategy": (
+                ENVIRONMENT_SIZE_UAV_DEPLOYMENT_STRATEGY
+            ),
+            "canonical_environment_size_m": CANONICAL_ENVIRONMENT_SIZE_M,
+            "initial_uav_xy_scale": environment_size_uav_xy_scale(
+                environment_size_m
+            ),
+            "initial_uav_positions_xyz_m": positions,
+            "initial_topology_connected": bool(
+                topology["initial_topology_connected"]
+            ),
+            "initial_gateway_distance_m": float(gateway["distance_3d_m"]),
+        }
+        deployment_identity = sha256_json(deployment_metadata)[:16]
     entry = {
         "scenario_id": (
             f"{split}:{schema_version}:{profile_id}:"
             f"{'' if environment_size_m is None else f'map-{environment_size_m}m:'}"
+            f"{'' if environment_size_m is None else f'deployment-{deployment_identity}:'}"
             f"{int(manifest_seed)}:"
             f"{int(episode_index):06d}"
         ),
         "scenario_seed": scenario_seed,
         "generation_profile_id": profile_id,
         "num_GT": episode_num_gt,
-        "ground_targets": (
-            _gt_initial_data(
-                py_rng,
-                episode_num_gt,
-                environment_width_m,
-                environment_height_m,
-            )
-            if environment_size_m is None
-            else _paired_environment_size_gt_initial_data(
-                py_rng,
-                episode_num_gt,
-                environment_size_m,
-            )
-        ),
-        "uavs": _uav_initial_data(py_rng),
+        "ground_targets": ground_targets,
+        "uavs": uavs,
         "sr_teams": _sr_initial_data(
             episode_num_gt,
             environment_width_m,
@@ -638,6 +800,7 @@ def generate_scenario_entry(
                 ),
                 "latent_layout_rng_paired_across_environment_sizes": True,
                 "latent_layout_mapping": "radius-aware-normalized-legal-area",
+                **deployment_metadata,
             }
         )
         entry.update(
@@ -692,6 +855,9 @@ def validate_scenario_entry(entry: dict[str, Any]) -> dict[str, Any]:
         size = float(entry["environment_size_m"])
         if not math.isfinite(size) or size != width or size != height:
             raise ValueError("environment-size scenario must use one square map size")
+        environment_size_m = int(size)
+    else:
+        environment_size_m = None
     if int(entry["num_GT"]) != len(entry["ground_targets"]):
         raise ValueError("scenario num_GT does not match ground target data")
     if not ROI_COUNT_MIN <= int(entry["num_GT"]) <= ROI_COUNT_MAX:
@@ -701,10 +867,14 @@ def validate_scenario_entry(entry: dict[str, Any]) -> dict[str, Any]:
     if len(entry["uavs"]) != NUM_UAV:
         raise ValueError(f"scenario must contain exactly {NUM_UAV} UAVs")
     validate_permanent_gateway_initial_position(
-        entry["uavs"], scenario_id=entry["scenario_id"]
+        entry["uavs"],
+        scenario_id=entry["scenario_id"],
+        environment_size_m=environment_size_m,
     )
     topology = validate_initial_communication_topology(
-        entry["uavs"], scenario_id=entry["scenario_id"]
+        entry["uavs"],
+        scenario_id=entry["scenario_id"],
+        environment_size_m=environment_size_m,
     )
     metadata = dict(entry["exogenous_primitives"])
     if metadata.get("uav_xy_layout") != UAV_INITIAL_LAYOUT:
@@ -736,6 +906,60 @@ def validate_scenario_entry(entry: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("scenario permanent GS gateway UAV ID is incompatible")
     if metadata.get("gs_gateway_contract_version") != GS_GATEWAY_CONTRACT_VERSION:
         raise ValueError("scenario permanent GS gateway contract is incompatible")
+    if environment_size_m is not None:
+        expected_scale = environment_size_uav_xy_scale(environment_size_m)
+        expected_positions = [
+            [float(value) for value in item["position"]]
+            for item in entry["uavs"]
+        ]
+        expected_gateway_distance = math.dist(
+            expected_positions[PERMANENT_GS_GATEWAY_UAV_ID],
+            GROUND_STATION_POSITION_M,
+        )
+        if metadata.get("initial_uav_deployment_strategy") != (
+            ENVIRONMENT_SIZE_UAV_DEPLOYMENT_STRATEGY
+        ):
+            raise ValueError(
+                "environment-size deployment strategy is incompatible: "
+                f"scenario_id={entry['scenario_id']}"
+            )
+        if int(metadata.get("canonical_environment_size_m", -1)) != (
+            CANONICAL_ENVIRONMENT_SIZE_M
+        ):
+            raise ValueError("canonical environment-size deployment metadata is incompatible")
+        if float(metadata.get("initial_uav_xy_scale", math.nan)) != expected_scale:
+            raise ValueError("environment-size UAV scale metadata is incompatible")
+        if metadata.get("initial_uav_positions_xyz_m") != expected_positions:
+            raise ValueError(
+                "environment-size manifest deployment positions disagree with UAV data"
+            )
+        if metadata.get("initial_topology_connected") is not True:
+            raise ValueError("environment-size manifest topology metadata is incompatible")
+        if not math.isclose(
+            float(metadata.get("initial_gateway_distance_m", math.nan)),
+            expected_gateway_distance,
+            rel_tol=0.0,
+            abs_tol=1e-12,
+        ):
+            raise ValueError("environment-size gateway distance metadata is incompatible")
+        identity_payload = {
+            key: metadata[key]
+            for key in (
+                "initial_uav_deployment_strategy",
+                "canonical_environment_size_m",
+                "initial_uav_xy_scale",
+                "initial_uav_positions_xyz_m",
+                "initial_topology_connected",
+                "initial_gateway_distance_m",
+            )
+        }
+        expected_identity_fragment = (
+            f"deployment-{sha256_json(identity_payload)[:16]}"
+        )
+        if expected_identity_fragment not in str(entry["scenario_id"]):
+            raise ValueError(
+                "environment-size scenario identity disagrees with deployment"
+            )
     if entry["traffic_primitives"].get("generation_model") != (
         "assigned-fov-rate-accumulator-v2"
     ):
@@ -743,7 +967,12 @@ def validate_scenario_entry(entry: dict[str, Any]) -> dict[str, Any]:
     uav_ids = [int(item["uav_id"]) for item in entry["uavs"]]
     if uav_ids != list(range(NUM_UAV)):
         raise ValueError("scenario UAV IDs and order are incompatible")
-    for item, expected_xy in zip(entry["uavs"], CANONICAL_UAV_INITIAL_XY_M):
+    expected_xy_positions = (
+        CANONICAL_UAV_INITIAL_XY_M
+        if environment_size_m is None
+        else environment_size_uav_initial_xy_m(environment_size_m)
+    )
+    for item, expected_xy in zip(entry["uavs"], expected_xy_positions):
         x, y, z = map(float, item["position"])
         energy = float(item["energy_j"])
         if (x, y) != tuple(expected_xy):
@@ -754,7 +983,9 @@ def validate_scenario_entry(entry: dict[str, Any]) -> dict[str, Any]:
         if not 0.0 <= x <= width or not 0.0 <= y <= height:
             raise ValueError(
                 "scenario canonical UAV initial position is outside map bounds: "
-                f"scenario_id={entry['scenario_id']}; uav_id={item['uav_id']}"
+                f"scenario_id={entry['scenario_id']}; "
+                f"environment_size_m={environment_size_m}; "
+                f"uav_id={item['uav_id']}"
             )
         if not 80.0 <= z <= 120.0:
             raise ValueError("scenario UAV initial altitude must be in [80, 120] m")
@@ -915,6 +1146,11 @@ class ScenarioManifest:
                 "legacy 10-UAV scenario schema is incompatible; regenerate the "
                 "manifest with the 16-UAV v8 generator"
             )
+        if data.get("schema_version") == "uav-hrl-scenario-v9":
+            raise ValueError(
+                "legacy environment-size fixed-coordinate deployment is incompatible; "
+                "regenerate the manifest with the scaled canonical v10 generator"
+            )
         schema_version = data.get("schema_version")
         if schema_version not in {
             SCENARIO_SCHEMA_VERSION,
@@ -990,6 +1226,34 @@ class ScenarioManifest:
                     "mixed num_GT entry is outside "
                     f"[{ROI_COUNT_MIN}, {ROI_COUNT_MAX}]"
                 )
+        if schema_version == ENVIRONMENT_SIZE_SCENARIO_SCHEMA_VERSION:
+            generator_config = dict(data.get("generator_config") or {})
+            expected_positions = [
+                entry["exogenous_primitives"]["initial_uav_positions_xyz_m"]
+                for entry in episodes
+            ]
+            expected_gateway_distances = [
+                entry["exogenous_primitives"]["initial_gateway_distance_m"]
+                for entry in episodes
+            ]
+            expected_deployment_fields = {
+                "initial_uav_deployment_strategy": (
+                    ENVIRONMENT_SIZE_UAV_DEPLOYMENT_STRATEGY
+                ),
+                "canonical_environment_size_m": CANONICAL_ENVIRONMENT_SIZE_M,
+                "initial_uav_xy_scale": environment_size_uav_xy_scale(
+                    environment_size_m
+                ),
+                "initial_uav_positions_xyz_m": expected_positions,
+                "initial_topology_connected": True,
+                "initial_gateway_distance_m": expected_gateway_distances,
+            }
+            for field, expected in expected_deployment_fields.items():
+                if generator_config.get(field) != expected:
+                    raise ValueError(
+                        "environment-size manifest generator deployment metadata "
+                        f"is incompatible: field={field}"
+                    )
         unsigned = {key: value for key, value in data.items() if key != "content_hash"}
         expected_hash = sha256_json(unsigned)
         if data.get("content_hash") != expected_hash:
@@ -998,6 +1262,17 @@ class ScenarioManifest:
             current_environment_config(
                 environment_width_m,
                 environment_height_m,
+                environment_size_m=environment_size_m,
+                initial_uav_positions_xyz_m=(
+                    [
+                        entry["exogenous_primitives"][
+                            "initial_uav_positions_xyz_m"
+                        ]
+                        for entry in episodes
+                    ]
+                    if environment_size_m is not None
+                    else None
+                ),
             )
         )
         if data.get("config_fingerprint") != expected_config:
@@ -1046,23 +1321,32 @@ def generate_manifest(
     environment_height_m = int(
         ENVIRONMENT_HEIGHT_M if environment_size_m is None else environment_size_m
     )
+    episodes = [
+        generate_scenario_entry(split, manifest_seed, index)
+        if num_gt is None
+        else generate_scenario_entry(
+            split,
+            manifest_seed,
+            index,
+            num_gt=num_gt,
+            environment_size_m=environment_size_m,
+        )
+        for index in range(int(episode_count))
+    ]
+    initial_positions = (
+        [
+            entry["exogenous_primitives"]["initial_uav_positions_xyz_m"]
+            for entry in episodes
+        ]
+        if environment_size_m is not None
+        else None
+    )
     unsigned = {
         "schema_version": schema_version,
         "split": split,
         "manifest_seed": int(manifest_seed),
         "episode_count": int(episode_count),
-        "episodes": [
-            generate_scenario_entry(split, manifest_seed, index)
-            if num_gt is None
-            else generate_scenario_entry(
-                split,
-                manifest_seed,
-                index,
-                num_gt=num_gt,
-                environment_size_m=environment_size_m,
-            )
-            for index in range(int(episode_count))
-        ],
+        "episodes": episodes,
         "generation_profile": generation_profile,
         "generator_config": {
             "generator": "local-python-and-numpy-rng-v1",
@@ -1098,6 +1382,8 @@ def generate_manifest(
             current_environment_config(
                 environment_width_m,
                 environment_height_m,
+                environment_size_m=environment_size_m,
+                initial_uav_positions_xyz_m=initial_positions,
             )
         ),
     }
@@ -1112,6 +1398,22 @@ def generate_manifest(
                 ),
                 "latent_layout_rng_paired_across_environment_sizes": True,
                 "latent_layout_mapping": "radius-aware-normalized-legal-area",
+                "initial_uav_deployment_strategy": (
+                    ENVIRONMENT_SIZE_UAV_DEPLOYMENT_STRATEGY
+                ),
+                "canonical_environment_size_m": CANONICAL_ENVIRONMENT_SIZE_M,
+                "initial_uav_xy_scale": environment_size_uav_xy_scale(
+                    environment_size_m
+                ),
+                "initial_uav_positions_xyz_m": initial_positions,
+                "initial_topology_connected": all(
+                    entry["exogenous_primitives"]["initial_topology_connected"]
+                    for entry in episodes
+                ),
+                "initial_gateway_distance_m": [
+                    entry["exogenous_primitives"]["initial_gateway_distance_m"]
+                    for entry in episodes
+                ],
             }
         )
         unsigned.update(
@@ -1142,6 +1444,28 @@ def manifest_prefix(manifest: ScenarioManifest, episode_count: int) -> ScenarioM
     unsigned = manifest.unsigned_dict()
     unsigned["episode_count"] = episode_count
     unsigned["episodes"] = list(manifest.episodes[:episode_count])
+    if manifest.schema_version == ENVIRONMENT_SIZE_SCENARIO_SCHEMA_VERSION:
+        positions = [
+            entry["exogenous_primitives"]["initial_uav_positions_xyz_m"]
+            for entry in unsigned["episodes"]
+        ]
+        gateway_distances = [
+            entry["exogenous_primitives"]["initial_gateway_distance_m"]
+            for entry in unsigned["episodes"]
+        ]
+        unsigned["generator_config"] = {
+            **unsigned["generator_config"],
+            "initial_uav_positions_xyz_m": positions,
+            "initial_gateway_distance_m": gateway_distances,
+        }
+        unsigned["config_fingerprint"] = environment_config_fingerprint(
+            current_environment_config(
+                manifest.environment_width_m,
+                manifest.environment_height_m,
+                environment_size_m=manifest.environment_size_m,
+                initial_uav_positions_xyz_m=positions,
+            )
+        )
     return ScenarioManifest.from_dict(
         {**unsigned, "content_hash": sha256_json(unsigned)}
     )
