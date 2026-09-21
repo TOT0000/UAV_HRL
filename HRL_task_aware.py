@@ -1107,7 +1107,7 @@ def _mark_search_observations(
     for uav_id in search_uav_ids:
         env.update_visited_grid(uav_id, footprint=footprints[uav_id])
     search_uav_ids = frozenset(search_uav_ids)
-    # Non-Search participants carry an empty sample, never a camera footprint.
+    # Non-contributors (FOV and FOV+COM) carry an empty Search footprint sample.
     transitions = tuple(
         env.mark_search_coverage(
             uav_id,
@@ -1128,8 +1128,8 @@ def _mark_search_observations(
             visited_precommit,
             effective_visit_interval_index,
         )
-    # Atomically commit only the Search-UAV union after every participant's raw
-    # observation has been frozen.
+    # Atomically commit the Search coverage contributors' union after every
+    # participant's raw observation has been frozen.
     committed = env.visited_bitmap.copy()
     for transition in transitions:
         if not transition.coverage_contributor:

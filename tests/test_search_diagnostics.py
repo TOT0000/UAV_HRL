@@ -178,6 +178,60 @@ class SearchDiagnosticCalculationTest(unittest.TestCase):
         self.assertEqual(record["search_uavs"][0]["new_cell_count"], 1)
         self.assertEqual(record["search_uavs"][0]["new_cell_ratio"], 0.5)
 
+    def test_four_subslot_counts_preserve_interval_and_sample_semantics(self):
+        before = np.zeros((3, 3), dtype=bool)
+        before[0, 0] = True
+        after = before.copy()
+        for x_index, y_index in ((0, 1), (1, 1), (2, 2), (2, 0)):
+            after[x_index, y_index] = True
+        batches = (
+            (
+                self._transition(1, (0, 0, 0, 0)),
+                self._transition(2, (0, 0, 1, 1)),
+            ),
+            (
+                self._transition(1, (0, 0, 1, 1)),
+                self._transition(2, (0, 0, 1, 1)),
+            ),
+            (
+                self._transition(1, (1, 1, 1, 1)),
+                self._transition(2, (2, 2, 2, 2)),
+            ),
+            (
+                self._transition(1, (1, 1, 1, 1)),
+                self._transition(2, (2, 2, 0, 0)),
+            ),
+        )
+        record = build_search_diagnostics_record(
+            method_id="method",
+            scenario_id="scenario",
+            episode_index=0,
+            interval_index=0,
+            time_seconds=1.0,
+            visited_before=before,
+            visited_after=after,
+            discovered_roi_ids_before=(),
+            discovered_roi_ids_after=(),
+            search_uav_ids=(1, 2),
+            footprint_transition_batches=batches[:3],
+            footprint_transitions=batches[3],
+            interval_initial_positions={1: (0, 0, 0), 2: (0, 0, 0)},
+            interval_final_positions={1: (0, 0, 0), 2: (0, 0, 0)},
+        )
+        self.assertEqual(record["gross_footprint_cell_count"], 8)
+        self.assertEqual(record["union_footprint_cell_count"], 5)
+        self.assertEqual(record["new_union_cell_count"], 4)
+        self.assertEqual(record["historical_revisit_cell_count"], 1)
+        self.assertEqual(record["simultaneous_overlap_cell_count"], 1)
+        self.assertEqual(record["simultaneous_overlap_ratio"], 1.0 / 8.0)
+        per_uav = {item["uav_id"]: item for item in record["search_uavs"]}
+        self.assertEqual(per_uav[1]["footprint_cell_count"], 4)
+        self.assertEqual(per_uav[1]["new_cell_count"], 2)
+        self.assertEqual(per_uav[1]["new_cell_ratio"], 0.5)
+        self.assertEqual(per_uav[2]["footprint_cell_count"], 4)
+        self.assertEqual(per_uav[2]["new_cell_count"], 3)
+        self.assertEqual(per_uav[2]["new_cell_ratio"], 0.75)
+
     def test_subslot_contributor_set_and_schema_version_are_validated(self):
         bitmap = np.zeros((2, 2), dtype=bool)
         valid_batch = (

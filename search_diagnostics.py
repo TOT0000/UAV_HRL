@@ -122,13 +122,17 @@ def build_search_diagnostics_record(
             if footprint is None:
                 continue
             bx_min, bx_max, by_min, by_max = map(int, footprint)
-            footprint_mask = np.zeros(before.shape, dtype=bool)
-            footprint_mask[bx_min : bx_max + 1, by_min : by_max + 1] = True
-            footprint_count = int(np.count_nonzero(footprint_mask))
+            footprint_count = (
+                (bx_max - bx_min + 1) * (by_max - by_min + 1)
+            )
             footprint_samples_by_uav[uav_id] += footprint_count
             batch_gross_count += footprint_count
-            batch_union_mask |= footprint_mask
-            uav_masks[uav_id] |= footprint_mask
+            batch_union_mask[
+                bx_min : bx_max + 1, by_min : by_max + 1
+            ] = True
+            uav_masks[uav_id][
+                bx_min : bx_max + 1, by_min : by_max + 1
+            ] = True
         batch_union_count = int(np.count_nonzero(batch_union_mask))
         gross_count += batch_gross_count
         simultaneous_overlap_count += batch_gross_count - batch_union_count

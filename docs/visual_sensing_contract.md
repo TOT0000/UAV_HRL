@@ -195,8 +195,11 @@ Older schemas,
 missing visual metadata, or changed camera/coverage/packet/weight/validity
 metadata fail before loading weights. All affected methods must be retrained.
 Training/evaluation configs and metadata publish the canonical configuration.
-FOV EMA lifecycle v6 represents non-Search footprints as null while preserving
-complete per-UAV checkpoint records and the existing transition/EMA cadence.
+FOV EMA lifecycle v7, identified by
+`nadir-contributor-footprints-empty-fov-samples-v7`, records nadir footprints
+for Search, COM-only, and Hover coverage contributors. Non-contributors (FOV
+and FOV+COM) use an empty footprint sample while complete per-UAV checkpoint
+records and the existing transition/EMA cadence are preserved.
 
 Scenario generation, manifest schema/content rules, seeds, CRN, pairing,
 Dinkelbach/ratio objectives, VS/COM potential formulas, routing reward and
