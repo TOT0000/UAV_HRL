@@ -121,7 +121,9 @@ class MaskedTaskObservationTest(unittest.TestCase):
                 self.assertEqual(replay["current_movement_mask"].shape, (1, 16))
                 self.assertEqual(replay["next_movement_mask"].shape, (1, 16))
                 self.assertTrue(replay["movement_mask_valid"].all())
-                self.assertTrue(replay["current_movement_mask"].any())
+                # Before any RoI is discovered every UAV is externally Search-
+                # controlled, so the policy legitimately owns no action block.
+                self.assertFalse(replay["current_movement_mask"].any())
             with np.load(checkpoint / "routing_replay.npz", allow_pickle=False) as replay:
                 # A one-second episode may end before the random scenario admits
                 # any packet to the routing layer.  When routing transitions do
@@ -204,18 +206,7 @@ class MaskedTaskObservationTest(unittest.TestCase):
         self.assertEqual(result["actor_updates"], 1)
         self.assertEqual(len(environment_masks), 2)
         self.assertGreaterEqual(len(training_masks), 5)
-        self.assertTrue(
-            any(
-                not torch.equal(previous, current)
-                for previous, current in zip(actor_before, agent.actor.parameters())
-            )
-        )
-        gradient_total = sum(
-            float(parameter.grad.abs().sum())
-            for parameter in agent.actor.parameters()
-            if parameter.grad is not None
-        )
-        self.assertGreater(gradient_total, 0.0)
+        self.assertFalse(environment_masks[0].any())
         update = agent.last_joint_update
         np.testing.assert_array_equal(
             update["state"][:, list(MOVEMENT_TASK_ASSIGNMENT_INDICES)], 0.0
@@ -228,6 +219,17 @@ class MaskedTaskObservationTest(unittest.TestCase):
         self.assertTrue(
             any(np.array_equal(sampled_next, mask[0]) for mask in training_masks)
         )
+        actor_changed = any(
+            not torch.equal(previous, current)
+            for previous, current in zip(actor_before, agent.actor.parameters())
+        )
+        gradient_total = sum(
+            float(parameter.grad.abs().sum())
+            for parameter in agent.actor.parameters()
+            if parameter.grad is not None
+        )
+        self.assertEqual(actor_changed, bool(sampled_current.any()))
+        self.assertEqual(gradient_total > 0.0, bool(sampled_current.any()))
 
 class ControlledDQNTest(unittest.TestCase):
     def test_effective_mask_is_recomputed_in_every_routing_slot(self):

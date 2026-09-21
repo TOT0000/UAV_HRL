@@ -63,10 +63,12 @@ from experiment_config import (
     SAFE_DDQN_ETA_C,
     SAFE_DDQN_INITIAL_LAMBDA_COST,
     SAFE_DDQN_QOS_TARGET_PROBABILITY,
+    SEARCH_CONTROLLER_CONTRACT_VERSION,
     TASK_POTENTIAL_CONTRACT_VERSION,
     TIMELY_USEFUL_GOODPUT_CONTRACT_VERSION,
     UAV_INITIAL_LAYOUT_VERSION,
     task_potential_contract_metadata,
+    search_controller_contract_metadata,
 )
 from Packet_scheduler_v1 import (
     PACKET_ENGINE_CHECKPOINT_SCHEMA_VERSION,
@@ -94,7 +96,8 @@ from dinkelbach_blocks import (
     dinkelbach_config_metadata,
 )
 
-CHECKPOINT_SCHEMA_VERSION = 31
+CHECKPOINT_SCHEMA_VERSION = 32
+PRE_HYBRID_SEARCH_CHECKPOINT_SCHEMA_VERSION = 31
 PRE_SEARCH_OVERLAP_GATEWAY_RANDOM_CHECKPOINT_SCHEMA_VERSION = 30
 PRE_SERVICE_ONLY_CHECKPOINT_SCHEMA_VERSION = 29
 PRE_GS_PROGRESS_CHECKPOINT_SCHEMA_VERSION = 21
@@ -187,6 +190,21 @@ FORMAL_CORE_CONFIG_FIELDS = (
     "task_potential_shaping_coefficients",
     "effective_task_potential_shaping_coefficients",
     "movement_replay_contract_version",
+    "search_controller",
+    "search_controller_contract_version",
+    "search_target_altitude_m",
+    "search_region_target_size_m",
+    "search_region_completion_threshold",
+    "global_search_completion_threshold",
+    "roi_discovery_overlap_threshold",
+    "roi_discovery_temporal_accumulation",
+    "passive_search_coverage_roles",
+    "fov_roles_contribute_search_coverage",
+    "search_controlled_by_movement_policy",
+    "search_potential_coefficient",
+    "training_environment_width_m",
+    "training_environment_height_m",
+    "environment_size_observed_by_policy",
     "assignment_contract_version",
     "assignment_flow",
     "random_assignment_algorithm",
@@ -1151,6 +1169,7 @@ def _base_metadata(
         ),
         "movement_heading_contract": "periodic-wrap-to-[-1,1)",
         "movement_replay_contract_version": MOVEMENT_REPLAY_CONTRACT_VERSION,
+        **search_controller_contract_metadata(),
         "movement_warmup_contract_version": MOVEMENT_WARMUP_CONTRACT_VERSION,
         "capabilities": {
             "movement_learning": kind in {"td3", "ddpg"},
@@ -1442,6 +1461,14 @@ def _checkpoint_uses_dinkelbach(metadata):
 def _validate_checkpoint_schema(metadata):
     schema = metadata.get("checkpoint_schema_version")
     if schema != CHECKPOINT_SCHEMA_VERSION:
+        if schema == PRE_HYBRID_SEARCH_CHECKPOINT_SCHEMA_VERSION:
+            raise RuntimeError(
+                "checkpoint schema v31 used movement-policy Search control, "
+                "Search-only coverage, 25% footprint-denominator discovery, and "
+                "non-zero Search shaping; the deterministic region-frontier "
+                "hybrid Search contract requires retraining before weights or "
+                "replay can be loaded"
+            )
         if schema == PRE_SEARCH_OVERLAP_GATEWAY_RANDOM_CHECKPOINT_SCHEMA_VERSION:
             raise RuntimeError(
                 "checkpoint schema v30 used ROI-center Search discovery, excluded "
@@ -1464,7 +1491,7 @@ def _validate_checkpoint_schema(metadata):
             "checkpoint_schema_version is incompatible with the canonical 16-UAV "
             "boundary-aligned "
             "stochastic channel, routing-stage frozen-queue immediate cost, "
-            "fixed-reference Safe-DDQN dual update, Search-only footprints, "
+            "fixed-reference Safe-DDQN dual update, canonical nadir contributors, "
             "GS-reachable initial topology, canonical oblique VS quality/proximity and range-gap COM "
             "potentials, "
             "permanent GS gateway, capture-weighted timely useful goodput, "
@@ -1517,6 +1544,9 @@ def _validate_checkpoint_schema(metadata):
             ),
             "task_potential_contract_version": TASK_POTENTIAL_CONTRACT_VERSION,
             "assignment_contract_version": ASSIGNMENT_CONTRACT_VERSION,
+            "search_controller_contract_version": (
+                SEARCH_CONTROLLER_CONTRACT_VERSION
+            ),
             "com_session_lifecycle_version": COM_SESSION_LIFECYCLE_VERSION,
             "fov_packet_generation_contract_version": (
                 FOV_PACKET_GENERATION_CONTRACT_VERSION

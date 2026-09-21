@@ -62,6 +62,7 @@ def build_search_diagnostics_record(
     discovered_roi_ids_after,
     search_uav_ids,
     footprint_transitions,
+    footprint_transition_batches=(),
     interval_initial_positions,
     interval_final_positions,
 ):
@@ -81,21 +82,33 @@ def build_search_diagnostics_record(
     if set(transition_by_uav) != set(search_ids):
         raise ValueError("Search diagnostic contributors disagree with transitions")
 
+    batches = tuple(footprint_transition_batches) + (tuple(footprint_transitions),)
+    for batch in batches:
+        contributors = {
+            int(transition.uav_id)
+            for transition in batch
+            if bool(transition.coverage_contributor)
+        }
+        if contributors != set(search_ids):
+            raise ValueError("Search diagnostic contributor set changed within interval")
+
     union_mask = np.zeros(before.shape, dtype=bool) if search_ids else None
     gross_count = 0
     per_uav = []
     for uav_id in search_ids:
-        transition = transition_by_uav[uav_id]
-        footprint = transition.current_footprint
-        if footprint is None:
-            footprint_count = 0
-            new_count = 0
-        else:
+        uav_mask = np.zeros(before.shape, dtype=bool)
+        for batch in batches:
+            transition = next(
+                item for item in batch if int(item.uav_id) == uav_id
+            )
+            footprint = transition.current_footprint
+            if footprint is None:
+                continue
             bx_min, bx_max, by_min, by_max = map(int, footprint)
-            patch = before[bx_min : bx_max + 1, by_min : by_max + 1]
-            footprint_count = int(patch.size)
-            new_count = int(np.count_nonzero(~patch))
-            union_mask[bx_min : bx_max + 1, by_min : by_max + 1] = True
+            uav_mask[bx_min : bx_max + 1, by_min : by_max + 1] = True
+        footprint_count = int(np.count_nonzero(uav_mask))
+        new_count = int(np.count_nonzero(uav_mask & ~before))
+        union_mask |= uav_mask
         gross_count += footprint_count
         initial = _position(interval_initial_positions, uav_id)
         final = _position(interval_final_positions, uav_id)

@@ -31,6 +31,7 @@ from Packet_scheduler_v1 import (
 )
 from Simulator import Simulator
 from centralized_movement import (
+    HOVER_ACTION,
     JOINT_ACTION_DIM,
     MOVEMENT_STATE_DIM,
     apply_joint_movement_proposals,
@@ -55,6 +56,7 @@ from experiment_config import (
     ENVIRONMENT_SIZE_EVALUATION_VALUES_M,
     ENVIRONMENT_WIDTH_M,
     FOV_EMA_LIFECYCLE_VERSION,
+    GLOBAL_SEARCH_COMPLETION_THRESHOLD,
     FORMAL_CHECKPOINT_EPISODE,
     FORMAL_EXPERIMENT_DEFAULTS,
     MOVEMENT_EXPLORATION_DECAY_EPISODES,
@@ -249,7 +251,7 @@ class TrainingConfig:
     beta_search: float = TASK_POTENTIAL_BETA_SEARCH
     beta_vs: float = TASK_POTENTIAL_BETA_VS
     beta_com: float = TASK_POTENTIAL_BETA_COM
-    search_coverage_threshold: float = 0.99
+    search_coverage_threshold: float = GLOBAL_SEARCH_COMPLETION_THRESHOLD
     dinkelbach_initial_lambda: float = DINKELBACH_INITIAL_LAMBDA
     dinkelbach_update_interval_episodes: int = DINKELBACH_UPDATE_INTERVAL_EPISODES
     dinkelbach_update_rule: str = DINKELBACH_UPDATE_RULE
@@ -330,6 +332,17 @@ class TrainingConfig:
             raise ValueError("movement interval must contain exactly four routing slots")
         if self.episode_seconds <= 0 or self.total_episodes <= 0:
             raise ValueError("episode_seconds and total_episodes must be positive")
+        if not np.isclose(float(self.beta_search), 0.0, rtol=0.0, atol=0.0):
+            raise ValueError(
+                "beta_search is fixed at zero under the external Search controller"
+            )
+        if not np.isclose(
+            float(self.search_coverage_threshold),
+            GLOBAL_SEARCH_COMPLETION_THRESHOLD,
+            rtol=0.0,
+            atol=0.0,
+        ):
+            raise ValueError("global Search completion threshold is fixed at 0.99")
         if self.warmup_joint_transitions < 0 or self.batch_size <= 0:
             raise ValueError("warmup must be non-negative and batch_size positive")
         if int(self.replay_max_size) <= 0:
@@ -1036,6 +1049,9 @@ def _mark_search_observations(
     *,
     search_diagnostics_sink=None,
     search_diagnostics_context=None,
+    diagnostics_visited_before=None,
+    effective_visit_interval_index=None,
+    transition_visited_snapshot=None,
 ):
     diagnostics_enabled = search_diagnostics_sink is not None
     if diagnostics_enabled and not isinstance(search_diagnostics_context, dict):
@@ -1064,6 +1080,9 @@ def _mark_search_observations(
             ),
             search_uav_ids=search_ids,
             footprint_transitions=transitions,
+            footprint_transition_batches=search_diagnostics_context.get(
+                "footprint_transition_batches", ()
+            ),
             interval_initial_positions=search_diagnostics_context[
                 "interval_initial_positions"
             ],
@@ -1092,13 +1111,23 @@ def _mark_search_observations(
     transitions = tuple(
         env.mark_search_coverage(
             uav_id,
-            visited_snapshot=visited_precommit,
+            visited_snapshot=(
+                visited_precommit
+                if transition_visited_snapshot is None
+                else transition_visited_snapshot
+            ),
             commit=False,
             coverage_contributor=uav_id in search_uav_ids,
             footprint=footprints.get(uav_id),
         )
         for uav_id in range(env.num_UAV)
     )
+    if effective_visit_interval_index is not None:
+        env.search_path_manager.record_effective_visits(
+            transitions,
+            visited_precommit,
+            effective_visit_interval_index,
+        )
     # Atomically commit only the Search-UAV union after every participant's raw
     # observation has been frozen.
     committed = env.visited_bitmap.copy()
@@ -1110,7 +1139,12 @@ def _mark_search_observations(
         bx_min, bx_max, by_min, by_max = transition.current_footprint
         committed[bx_min : bx_max + 1, by_min : by_max + 1] = True
     env.visited_bitmap[:, :] = committed
-    emit_diagnostics(visited_precommit, transitions, search_uav_ids)
+    diagnostics_before = (
+        visited_precommit
+        if diagnostics_visited_before is None
+        else np.asarray(diagnostics_visited_before, dtype=bool)
+    )
+    emit_diagnostics(diagnostics_before, transitions, search_uav_ids)
     return transitions
 
 
@@ -2666,6 +2700,14 @@ def train(
             velocity_commands = decode_joint_velocity_commands(
                 movement_agent, projected_action
             )
+            search_uav_ids = set(env.search_path_manager.active_search_uavs())
+            if any(bool(current_movement_mask[uav_id]) for uav_id in search_uav_ids):
+                raise RuntimeError(
+                    "Search UAV is simultaneously controlled by the movement policy"
+                )
+            velocity_commands = env.search_path_manager.apply_control(
+                velocity_commands, interval
+            )
             interval_initial_positions = np.asarray(
                 [env.uav_dict[uav_id].get_position() for uav_id in range(env.num_UAV)],
                 dtype=np.float64,
@@ -2673,12 +2715,27 @@ def train(
             env.update_source_uavs()
             interval_energies = np.zeros(env.num_UAV, dtype=np.float64)
             interval_delivered_bits = 0.0
+            interval_visited_before = env.visited_bitmap.copy()
+            interval_transition_batches = []
+            found_before = {
+                int(gt.id) for gt in env.gts if bool(gt.is_found)
+            }
             for routing_slot in range(MOVEMENT_CONTROL_INTERVAL):
                 # All UAV proposals come from one substep snapshot. The same
                 # decoded command is held across all four 0.25-second slots.
                 proposals = build_velocity_substep_proposals(
                     env, velocity_commands, config.routing_slot_seconds
                 )
+                if (
+                    env.permanent_gs_gateway_uav_id in search_uav_ids
+                    and proposals[env.permanent_gs_gateway_uav_id].get(
+                        "gateway_projection_applied", False
+                    )
+                ):
+                    raise RuntimeError(
+                        "Search Path Manager produced an illegal UAV 0 waypoint; "
+                        "silent gateway clipping is forbidden"
+                    )
                 proposal_batches += 1
                 substep_energies = apply_joint_movement_proposals(
                     env, proposals, step_time=config.routing_slot_seconds
@@ -2689,6 +2746,43 @@ def train(
                 # displacement and before that substep's routing decision.
                 env.update_u2u_channels()
                 env.update_u2g_channels()
+                diagnostics_this_slot = (
+                    search_diagnostics_sink is not None
+                    and routing_slot == MOVEMENT_CONTROL_INTERVAL - 1
+                )
+                fov_transitions = _mark_search_observations(
+                    env,
+                    search_diagnostics_sink=(
+                        search_diagnostics_sink if diagnostics_this_slot else None
+                    ),
+                    search_diagnostics_context=(
+                        {
+                            "method_id": method_spec.method_id,
+                            "scenario_id": scenario_id,
+                            "episode_index": episode,
+                            "interval_index": interval,
+                            "time_seconds": float(interval + 1),
+                            "discovered_roi_ids_before": found_before,
+                            "interval_initial_positions": interval_initial_positions,
+                            "footprint_transition_batches": tuple(
+                                interval_transition_batches
+                            ),
+                        }
+                        if diagnostics_this_slot
+                        else None
+                    ),
+                    diagnostics_visited_before=(
+                        interval_visited_before if diagnostics_this_slot else None
+                    ),
+                    effective_visit_interval_index=interval,
+                    transition_visited_snapshot=(
+                        interval_visited_before
+                        if routing_slot == MOVEMENT_CONTROL_INTERVAL - 1
+                        else None
+                    ),
+                )
+                if fov_transitions:
+                    interval_transition_batches.append(fov_transitions)
                 slot_epsilon = (
                     0.0
                     if evaluation or not method_spec.learns_routing
@@ -2741,6 +2835,13 @@ def train(
                         ddqn, routing_replay, config.batch_size
                     )
 
+            if fov_transitions:
+                packet_engine.process_fov_transitions(
+                    env,
+                    transition_marker=f"episode={episode},interval={interval}",
+                    footprint_transitions=fov_transitions,
+                )
+
             executed_action = executed_joint_action_from_displacement(
                 interval_initial_positions,
                 np.asarray(
@@ -2752,28 +2853,12 @@ def train(
                 ),
                 MOVEMENT_INTERVAL_SECONDS,
             )
+            executed_action = env.search_path_manager.replay_action(
+                executed_action,
+                current_movement_mask,
+                HOVER_ACTION,
+            )
             interval_energy = float(interval_energies.sum())
-            # Search observation, RoI discovery, and task assignment remain
-            # one-second boundary events and therefore execute exactly once.
-            found_before = {
-                int(gt.id) for gt in env.gts if bool(gt.is_found)
-            }
-            if search_diagnostics_sink is None:
-                fov_transitions = _mark_search_observations(env)
-            else:
-                fov_transitions = _mark_search_observations(
-                    env,
-                    search_diagnostics_sink=search_diagnostics_sink,
-                    search_diagnostics_context={
-                        "method_id": method_spec.method_id,
-                        "scenario_id": scenario_id,
-                        "episode_index": episode,
-                        "interval_index": interval,
-                        "time_seconds": float(interval + 1),
-                        "discovered_roi_ids_before": found_before,
-                        "interval_initial_positions": interval_initial_positions,
-                    },
-                )
             discovery_time_seconds = float(interval + 1)
             for gt in env.gts:
                 gt_id = int(gt.id)
@@ -2781,12 +2866,6 @@ def train(
                     first_discovery_time_by_roi_s.setdefault(
                         str(gt_id), discovery_time_seconds
                     )
-            if fov_transitions:
-                packet_engine.process_fov_transitions(
-                    env,
-                    transition_marker=f"episode={episode},interval={interval}",
-                    footprint_transitions=fov_transitions,
-                )
             if (
                 not getattr(env, "_search_phase_over", False)
                 and float(env.visited_bitmap.mean())

@@ -27,7 +27,7 @@ from utils_update_v2 import ReplayBufferJoint
 def movement_state(movable_uavs):
     state = np.zeros(MOVEMENT_STATE_DIM, dtype=np.float32)
     for uav_id in movable_uavs:
-        state[uav_id * LOCAL_MOVEMENT_DIM] = 1.0
+        state[uav_id * LOCAL_MOVEMENT_DIM + 1] = 1.0
     return state
 
 
@@ -150,8 +150,8 @@ class JointReplayAndLearnerTest(unittest.TestCase):
         reward_lambda_4 = replay._reward_numpy(
             np.array([0, 1]), current_lambda=4.0, gamma=0.9
         ).ravel()
-        self.assertAlmostEqual(reward_lambda_3[0], 6.2, places=5)
-        self.assertAlmostEqual(reward_lambda_3[1], -10.0, places=5)
+        self.assertAlmostEqual(reward_lambda_3[0], 3.8, places=5)
+        self.assertAlmostEqual(reward_lambda_3[1], -7.0, places=5)
         np.testing.assert_allclose(reward_lambda_4, reward_lambda_3 - 2.0)
         self.assertEqual(replay.size, size_before)
         np.testing.assert_array_equal(replay.not_done[:2, 0], [1.0, 0.0])

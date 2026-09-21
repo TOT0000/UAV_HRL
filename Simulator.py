@@ -37,6 +37,7 @@ from collections import defaultdict
 from Energy_model import EnergyConsumptionModel
 from Task_assignment import UAVAssigner, Task
 from object import UAV, SRTeam, GroundTarget
+from search_path_manager import SearchPathManager
 from experiment_config import (
     ASSIGNMENT_CONTRACT_VERSION,
     ASSIGNMENT_FLOW_BY_STRATEGY,
@@ -462,14 +463,33 @@ class Simulator:
         #         self.multi_tasks[uid] = [t for t in self.multi_tasks[uid] if t["task_type"] != "Search"]
 
     # ===============判斷TG是否有被發現=====================
-    def is_search_contributor(self, uav_id):
-        return (
-            not self._search_phase_over
-            and any(
-                task.get("task_type") == "Search"
-                for task in self.multi_tasks.get(uav_id, ())
-            )
+    def search_coverage_role(self, uav_id):
+        """Return the canonical nadir-Search contributor role, or ``None``."""
+
+        roles = tuple(
+            task.get("task_type") for task in self.multi_tasks.get(uav_id, ())
         )
+        role_set = set(roles)
+        if "Search" in role_set and role_set & {"FOV", "COM"}:
+            raise RuntimeError(
+                f"UAV {uav_id} has illegal Search and FOV/COM role overlap"
+            )
+        if self._search_phase_over:
+            return None
+        if role_set == {"Search"}:
+            return "SEARCH"
+        if role_set == {"COM"}:
+            return "COM_ONLY"
+        if role_set == {"Hovering"}:
+            return "HOVER"
+        if "FOV" in role_set:
+            return None
+        return None
+
+    def is_search_contributor(self, uav_id):
+        """Compatibility alias for all legal nadir-Search contributors."""
+
+        return self.search_coverage_role(uav_id) is not None
 
     def search_footprint(self, uav_id):
         return search_footprint(self.uav_dict[uav_id].get_position())
@@ -1264,6 +1284,7 @@ class Simulator:
         )
         self.map_width, self.map_height = bitmap_shape
         self.visited_bitmap = np.zeros(bitmap_shape, dtype=bool)
+        self.search_path_manager = SearchPathManager(self)
         self.task_list = []
         # self.UAVs = []
         self.explorer_id_map = np.full(bitmap_shape, -1, dtype=int)

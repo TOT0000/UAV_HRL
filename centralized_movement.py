@@ -411,13 +411,14 @@ def get_global_movement_state(
 
 
 def movement_mask_from_state(state):
+    active_indices = tuple(TASK_TYPES.index(name) for name in ACTIVE_MOVEMENT_TASK_TYPES)
     if torch.is_tensor(state):
         if state.shape[-1] != MOVEMENT_STATE_DIM:
             raise ValueError(f"movement state must end in {MOVEMENT_STATE_DIM} features")
         local = state[..., : NUM_UAV * LOCAL_MOVEMENT_DIM].reshape(
             *state.shape[:-1], NUM_UAV, LOCAL_MOVEMENT_DIM
         )
-        return local[..., : len(ACTIVE_MOVEMENT_TASK_TYPES)].amax(dim=-1) > 0.5
+        return local[..., list(active_indices)].amax(dim=-1) > 0.5
 
     state_array = np.asarray(state)
     if state_array.shape[-1] != MOVEMENT_STATE_DIM:
@@ -425,7 +426,7 @@ def movement_mask_from_state(state):
     local = state_array[..., : NUM_UAV * LOCAL_MOVEMENT_DIM].reshape(
         *state_array.shape[:-1], NUM_UAV, LOCAL_MOVEMENT_DIM
     )
-    return np.max(local[..., : len(ACTIVE_MOVEMENT_TASK_TYPES)], axis=-1) > 0.5
+    return np.max(local[..., list(active_indices)], axis=-1) > 0.5
 
 
 def validate_movement_mask(movement_mask):

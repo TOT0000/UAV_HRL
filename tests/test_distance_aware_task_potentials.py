@@ -101,10 +101,10 @@ class DistanceProgressHelperTest(unittest.TestCase):
         )
         self.assertEqual(metadata["com"]["s2u_range_m"], S2U_COMMUNICATION_RANGE_M)
         self.assertEqual(metadata["com"]["s2u_range_m"], 400.0)
-        self.assertTrue(metadata["search"]["unchanged"])
+        self.assertFalse(metadata["search"]["unchanged"])
         self.assertFalse(metadata["lifecycle"]["delivery_or_connectivity_potential"])
         expected_betas = {
-            "beta_search": 3.0,
+            "beta_search": 0.0,
             "beta_vs": 3.0,
             "beta_com": 3.0,
         }
@@ -115,7 +115,7 @@ class DistanceProgressHelperTest(unittest.TestCase):
                 TASK_POTENTIAL_BETA_VS,
                 TASK_POTENTIAL_BETA_COM,
             ),
-            (3.0, 3.0, 3.0),
+            (0.0, 3.0, 3.0),
         )
 
         with mock.patch(
@@ -318,15 +318,15 @@ class DistanceAwarePotentialLifecycleTest(unittest.TestCase):
 
 
 class TaskPotentialMethodContractTest(unittest.TestCase):
-    def test_training_evaluation_agents_and_replay_share_beta3_defaults(self):
+    def test_training_evaluation_agents_and_replay_share_zero_search_defaults(self):
         names = ("beta_search", "beta_vs", "beta_com")
         training = formal_training_config(total_episodes=1500)
         evaluation = _evaluation_config(episodes=1, episode_seconds=60, seed=17)
         self.assertEqual(
-            tuple(getattr(training, name) for name in names), (3.0,) * 3
+            tuple(getattr(training, name) for name in names), (0.0, 3.0, 3.0)
         )
         self.assertEqual(
-            tuple(getattr(evaluation, name) for name in names), (3.0,) * 3
+            tuple(getattr(evaluation, name) for name in names), (0.0, 3.0, 3.0)
         )
         for callable_obj in (
             TD3.update_joint,
@@ -338,7 +338,7 @@ class TaskPotentialMethodContractTest(unittest.TestCase):
                 signature = inspect.signature(callable_obj)
                 self.assertEqual(
                     tuple(signature.parameters[name].default for name in names),
-                    (3.0,) * 3,
+                    (0.0, 3.0, 3.0),
                 )
 
     def test_all_methods_publish_one_contract_without_dimension_changes(self):
@@ -359,10 +359,14 @@ class TaskPotentialMethodContractTest(unittest.TestCase):
                 effective = config[
                     "effective_task_potential_shaping_coefficients"
                 ]
-                self.assertEqual(set(configured.values()), {3.0})
+                self.assertEqual(configured, {
+                    "beta_search": 0.0,
+                    "beta_vs": 3.0,
+                    "beta_com": 3.0,
+                })
                 self.assertEqual(
                     set(effective.values()),
-                    {3.0} if method.task_potential_enabled else {0.0},
+                    {0.0, 3.0} if method.task_potential_enabled else {0.0},
                 )
                 if shared is None:
                     shared = config["task_potential_configuration"]

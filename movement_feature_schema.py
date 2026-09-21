@@ -4,7 +4,9 @@
 MOVEMENT_FEATURE_SCHEMA_VERSION = 7
 
 TASK_TYPES = ("Search", "FOV", "COM", "Hovering")
-ACTIVE_MOVEMENT_TASK_TYPES = ("Search", "FOV", "COM")
+# Only service roles are owned by the learned/random movement policy. Search is
+# externally controlled and Hovering is canonical zero velocity.
+ACTIVE_MOVEMENT_TASK_TYPES = ("FOV", "COM")
 
 LOCAL_MOVEMENT_FEATURES = (
     ("task_search", "binary", 0.0, 1.0, "Search task is active"),

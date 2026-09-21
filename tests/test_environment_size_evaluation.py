@@ -539,7 +539,7 @@ class EnvironmentSizeSmokeTest(unittest.TestCase):
             )
 
     def test_discovery_diagnostics_use_canonical_found_state_and_first_time(self):
-        def discover_all(env):
+        def discover_all(env, **_kwargs):
             for gt in env.gts:
                 gt.is_found = True
             return ()
@@ -574,10 +574,10 @@ class EnvironmentSizeSmokeTest(unittest.TestCase):
     def test_incomplete_discovery_keeps_null_completion_and_first_time_once(self):
         calls = {"count": 0}
 
-        def discover_incrementally(env):
+        def discover_incrementally(env, **kwargs):
             calls["count"] += 1
             env.gts[0].is_found = True
-            if calls["count"] >= 2:
+            if kwargs["effective_visit_interval_index"] >= 1:
                 env.gts[1].is_found = True
             return ()
 

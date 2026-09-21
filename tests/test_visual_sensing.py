@@ -84,8 +84,8 @@ def test_visual_metadata_records_modes_and_no_resolution_thresholds():
         == metadata['vs_camera']['image_length_m']
     )
     assert 'nadir' in metadata['search_model']
-    assert 'effective Search footprint' in metadata['search_model']
-    assert metadata['search_detection']['threshold'] == pytest.approx(0.25)
+    assert 'complete circular ROI' in metadata['search_model']
+    assert metadata['search_detection']['threshold'] == pytest.approx(0.10)
     assert metadata['search_detection']['boundary_rule'] == 'inclusive_greater_than_or_equal'
     assert 'oblique' in metadata['vs_model']
     assert metadata['minimum_resolution_hard_constraint'] == {
@@ -120,9 +120,7 @@ def test_search_overlap_and_one_frozen_footprint():
     assert calculate_movement_potentials(env, 1)[0] == expected.mean()
 
 
-@pytest.mark.parametrize('roles', [
-    ['FOV'], ['FOV', 'COM'], ['COM'], ['Hovering'],
-])
+@pytest.mark.parametrize('roles', [['FOV'], ['FOV', 'COM']])
 def test_nonsearch_cannot_discover_or_contribute(roles):
     env, target, _, descriptor = environment()
     env.multi_tasks[1] = [{**descriptor, 'task_type': role} for role in roles]
@@ -137,6 +135,19 @@ def test_nonsearch_cannot_discover_or_contribute(roles):
     env.update_visited_grid(1, coverage_contributor=False)
     assert not target.is_found
     assert env.mark_search_coverage(1, coverage_contributor=False).current_footprint is None
+
+
+@pytest.mark.parametrize('role', ['COM', 'Hovering'])
+def test_passive_roles_discover_and_contribute_without_joining_search_allocation(role):
+    env, target, _, descriptor = environment()
+    env.multi_tasks[1] = [{**descriptor, 'task_type': role}]
+    env.visited_bitmap[:] = False
+    env.update_visited_grid(1)
+    transition = env.mark_search_coverage(1)
+    assert target.is_found
+    assert transition.coverage_contributor
+    assert env.visited_bitmap.any()
+    assert 1 not in env.search_path_manager.active_search_uavs()
 
 
 def test_permanent_gateway_contributes_search_sensing_while_searching():
@@ -177,38 +188,37 @@ def test_search_discovery_uses_inclusive_overlap_threshold_and_no_duplicates():
 
 
 def test_search_overlap_ratio_threshold_boundary_radius_and_map_clipping():
-    footprint = SearchFootprint(0.0, 4.0, 0.0, math.pi)
-    bounds = (0.0, 4.0, 0.0, math.pi)
-    centered = (2.0, math.pi / 2.0)
+    centered = (0.0, 0.0)
+    bounds = (-2.0, 2.0, -2.0, 2.0)
+    exact_side = math.sqrt(0.10 * math.pi)
+    below_side = math.sqrt(0.0999 * math.pi)
+    above_side = math.sqrt(0.1001 * math.pi)
+    footprint = SearchFootprint(-exact_side/2, exact_side/2, -exact_side/2, exact_side/2)
     exact = search_detection_overlap_ratio(
         footprint, centered, 1.0, map_bounds=bounds
     )
     below = search_detection_overlap_ratio(
-        footprint,
-        centered,
-        math.sqrt(1.0 - 4e-6),
-        map_bounds=bounds,
+        SearchFootprint(-below_side/2, below_side/2, -below_side/2, below_side/2),
+        centered, 1.0, map_bounds=bounds,
     )
     above = search_detection_overlap_ratio(
-        footprint, centered, 1.01, map_bounds=bounds
+        SearchFootprint(-above_side/2, above_side/2, -above_side/2, above_side/2),
+        centered, 1.0, map_bounds=bounds
     )
-    assert SEARCH_DETECTION_OVERLAP_THRESHOLD == pytest.approx(0.25)
-    assert exact == pytest.approx(0.25, abs=1e-12)
+    assert SEARCH_DETECTION_OVERLAP_THRESHOLD == pytest.approx(0.10)
+    assert exact == pytest.approx(0.10, abs=1e-12)
     assert below < SEARCH_DETECTION_OVERLAP_THRESHOLD
     assert above > SEARCH_DETECTION_OVERLAP_THRESHOLD
 
-    clipped = SearchFootprint(-2.0, 2.0, 0.0, math.pi)
+    clipped = SearchFootprint(-2.0, 0.0, -2.0, 2.0)
     clipped_ratio = search_detection_overlap_ratio(
-        clipped, (1.0, math.pi / 2.0), 1.0,
-        map_bounds=(0.0, 4.0, 0.0, math.pi),
+        clipped, centered, 1.0, map_bounds=bounds,
     )
     assert clipped_ratio == pytest.approx(0.5, abs=1e-12)
     assert search_detection_overlap_ratio(
         footprint, (20.0, 20.0), 1.0, map_bounds=bounds
     ) == 0.0
-    assert search_detection_overlap_ratio(
-        footprint, centered, 0.5, map_bounds=bounds
-    ) == pytest.approx(0.0625, abs=1e-12)
+    assert search_detection_overlap_ratio(footprint, centered, 0.5, map_bounds=bounds) > 0.10
     assert search_detection_overlap_ratio(
         None, centered, 1.0, map_bounds=bounds
     ) == 0.0
@@ -269,7 +279,7 @@ def test_evaluation_exports_active_camera_pose_and_actual_roi_radius():
         == visual_sensing_metadata()['vs_camera']
     )
     env.multi_tasks[1] = [{'task_type':'COM'}]
-    assert _sensing_coverage(env,1) == []
+    assert _sensing_coverage(env,1)[0]['model'] == visual_sensing_metadata()['search_camera']
 
 
 @pytest.mark.parametrize('angle', [math.pi/2, math.pi/3, -math.pi/4, math.pi])
@@ -395,7 +405,8 @@ def test_all_method_assignments_share_visual_model(method_id):
     assert calculate_movement_potentials(env,1)[1] == pytest.approx(g.pair_score)
     cfg = effective_training_config(TrainingConfig(total_episodes=1),method)
     assert cfg['visual_sensing_configuration'] == visual_sensing_metadata()
-    assert cfg['search_detection_overlap_threshold'] == pytest.approx(0.25)
+    assert cfg['search_detection_overlap_threshold'] == pytest.approx(0.10)
+    assert cfg['search_controller'] == 'deterministic_region_frontier_manager'
     assert cfg['permanent_gateway_search_contributor'] is True
     assert cfg['random_assignment_uses_utility'] is False
     env.source_uavs = {uid}
@@ -436,9 +447,8 @@ def test_checkpoint_rejects_old_missing_or_changed_visual_contract():
     with pytest.raises(RuntimeError) as rejected:
         _validate_checkpoint_schema({'checkpoint_schema_version': CHECKPOINT_SCHEMA_VERSION-1})
     message = str(rejected.value)
-    assert 'ROI-center Search discovery' in message
-    assert 'permanent gateway' in message
-    assert 'mixed Random assignment' in message
+    assert 'movement-policy Search control' in message
+    assert 'deterministic region-frontier' in message
     assert 'schema v31' in message
     current = {'checkpoint_schema_version': CHECKPOINT_SCHEMA_VERSION,
                'visual_sensing_contract_version': VISUAL_SENSING_CONTRACT_VERSION,

@@ -59,7 +59,7 @@ def test_service_only_observation_potential_and_checkpoint_contracts():
     assert MOVEMENT_STATE_DIM == 531
     assert len(names) == MOVEMENT_STATE_DIM
     assert not any("relay" in name.lower() for name in names)
-    assert CHECKPOINT_SCHEMA_VERSION == 31
+    assert CHECKPOINT_SCHEMA_VERSION == 32
     assert "service-only" in ASSIGNMENT_CONTRACT_VERSION
 
     env = Simulator(16)
@@ -82,10 +82,10 @@ def test_reward_is_the_previous_reward_minus_relay_shaping_only():
         done=False,
         config=config,
     )
-    unchanged_objective_and_three_potentials = 3.5 + 3.0 * 0.3 * 3
+    unchanged_objective_and_service_potentials = 3.5 + 3.0 * 0.3 * 2
     hypothetical_retired_relay_shaping = 3.0 * (0.8 - 0.1)
     previous_reward = (
-        unchanged_objective_and_three_potentials
+        unchanged_objective_and_service_potentials
         + hypothetical_retired_relay_shaping
     )
     assert reward == pytest.approx(

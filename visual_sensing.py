@@ -37,9 +37,9 @@ VS_PACKET_MAX_BITS = 31_600.0
 VS_QUALITY_WEIGHT = 0.8
 VS_PROXIMITY_WEIGHT = 0.2
 VISUAL_SENSING_CONTRACT_VERSION = (
-    "task-selected-search-effective-overlap25-gateway-v4"
+    "single-footprint-full-roi-overlap10-passive-contributors-v5"
 )
-SEARCH_DETECTION_OVERLAP_THRESHOLD = 0.25
+SEARCH_DETECTION_OVERLAP_THRESHOLD = 0.10
 DISTANCE_EPSILON_M = 1e-9
 SINGULAR_RAY_EPSILON = 1e-8
 
@@ -59,20 +59,19 @@ def visual_sensing_metadata():
         "roi_radius_source": "scenario target object",
         "search_model": (
             "nadir rectangle; undiscovered circular ROI detected when its "
-            "overlap with the map-clipped effective Search footprint is at "
-            "least 25%; permanent GS gateway contributes while assigned Search"
+            "overlap with the complete circular ROI is at least 10%; Search, "
+            "COM-only, and Hover roles contribute with their actual altitude"
         ),
         "vs_model": "oblique camera aimed at assigned ROI",
         "camera_mode_selection": (
-            "Search task -> Search camera; FOV or FOV+COM -> VS camera; "
-            "COM-only and Hovering -> no sensing; permanent GS gateway uses "
-            "Search camera while its task is Search"
+            "Search, COM-only, or Hovering -> nadir Search camera; FOV or "
+            "FOV+COM -> VS camera"
         ),
         "search_detection": {
-            "metric": "area(effective_search_footprint intersect circular_roi) / area(effective_search_footprint)",
+            "metric": "area(single_search_footprint intersect circular_roi) / area(complete_circular_roi)",
             "threshold": SEARCH_DETECTION_OVERLAP_THRESHOLD,
             "boundary_rule": "inclusive_greater_than_or_equal",
-            "effective_footprint": "Search footprint clipped to map bounds",
+            "effective_footprint": "single Search footprint clipped to map bounds",
             "roi_radius_source": "scenario target object gt.radius",
         },
         "camera_mode_state": (
@@ -141,7 +140,7 @@ def search_detection_overlap_ratio(
     *,
     map_bounds,
 ):
-    """Return circular-RoI overlap divided by map-clipped footprint area.
+    """Return one footprint's overlap divided by complete circular-RoI area.
 
     Invalid or empty effective geometry fails closed with a zero ratio.  The
     analytic circle/polygon routine keeps the result deterministic and avoids
@@ -181,8 +180,7 @@ def search_detection_overlap_ratio(
     ymin = max(float(footprint.ymin), map_ymin)
     ymax = min(float(footprint.ymax), map_ymax)
     width, height = xmax - xmin, ymax - ymin
-    effective_area = width * height
-    if not math.isfinite(effective_area) or effective_area <= 0.0:
+    if not math.isfinite(width * height) or width <= 0.0 or height <= 0.0:
         return 0.0
     center_x, center_y = map(float, center)
     if (
@@ -194,7 +192,7 @@ def search_detection_overlap_ratio(
         return 0.0
     polygon = ((xmin, ymin), (xmax, ymin), (xmax, ymax), (xmin, ymax))
     overlap = circle_polygon_intersection_area(polygon, center, radius)
-    ratio = overlap / effective_area
+    ratio = overlap / (math.pi * radius * radius)
     if not math.isfinite(ratio):
         return 0.0
     return float(min(max(ratio, 0.0), 1.0))

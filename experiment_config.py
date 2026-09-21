@@ -103,11 +103,23 @@ GROUND_ALTITUDE_M = 0.0
 UAV_MAX_ALTITUDE_M = 150.0
 TASK_POTENTIAL_NORMALIZATION_EPSILON = 1e-12
 TASK_POTENTIAL_CONTRACT_VERSION = (
-    "search-vs-com-uniform-beta3-potential-v13"
+    "external-search-manager-zero-search-potential-v14"
 )
-TASK_POTENTIAL_BETA_SEARCH = 3.0
+TASK_POTENTIAL_BETA_SEARCH = 0.0
 TASK_POTENTIAL_BETA_VS = 3.0
 TASK_POTENTIAL_BETA_COM = 3.0
+SEARCH_CONTROLLER = "deterministic_region_frontier_manager"
+SEARCH_CONTROLLER_CONTRACT_VERSION = "region-frontier-hybrid-search-v1"
+SEARCH_TARGET_ALTITUDE_M = 120.0
+SEARCH_REGION_TARGET_SIZE_M = 100.0
+SEARCH_REGION_COMPLETION_THRESHOLD = 0.99
+GLOBAL_SEARCH_COMPLETION_THRESHOLD = 0.99
+ROI_DISCOVERY_OVERLAP_THRESHOLD = 0.10
+ROI_DISCOVERY_TEMPORAL_ACCUMULATION = False
+PASSIVE_SEARCH_COVERAGE_ROLES = ("COM_ONLY", "HOVER")
+FOV_ROLES_CONTRIBUTE_SEARCH_COVERAGE = False
+SEARCH_CONTROLLED_BY_MOVEMENT_POLICY = False
+SEARCH_FRONTIER_EPSILON = 1e-12
 COM_CAPACITY_POTENTIAL_WEIGHT = 0.5
 COM_DISTANCE_POTENTIAL_WEIGHT = 0.5
 ASSIGNMENT_CONTRACT_VERSION = (
@@ -123,11 +135,11 @@ ASSIGNMENT_FLOW_BY_STRATEGY = MappingProxyType(
         ),
     }
 )
-METHOD_CONTRACT_VERSION = "centralized-16-uav-overlap-search-random-typed-v8"
+METHOD_CONTRACT_VERSION = "centralized-16-uav-deterministic-region-search-v9"
 DEFAULT_TRAINING_SEED = 20260817
 FORMAL_TRAINING_EPISODES = 1500
 FORMAL_CHECKPOINT_EPISODE = FORMAL_TRAINING_EPISODES
-SEARCH_COVERAGE_THRESHOLD = 0.99
+SEARCH_COVERAGE_THRESHOLD = GLOBAL_SEARCH_COMPLETION_THRESHOLD
 FOV_COM_PAIR_MAX_DISTANCE_M = None
 TOTAL_COMMUNICATION_BANDWIDTH_HZ = 10e6
 REFERENCE_COM_BANDWIDTH_HZ = TOTAL_COMMUNICATION_BANDWIDTH_HZ / (
@@ -193,7 +205,7 @@ ROUTING_LEARNING_RATE = 1e-3
 ROUTING_GAMMA = 0.99
 ROUTING_TAU = 0.005
 ROUTING_OPTIMIZER_UPDATE_SCOPE = "every_4_routing_slots"
-FOV_EMA_LIFECYCLE_VERSION = "search-only-footprints-empty-nonsearch-samples-v6"
+FOV_EMA_LIFECYCLE_VERSION = "nadir-contributor-footprints-empty-fov-samples-v7"
 SR_ROUTE_LIFECYCLE_VERSION = "assigned-and-arrived-derived-state-v2"
 PACKET_QOS_CONTRACT_VERSION = (
     "assigned-fov-and-activated-com-immediate-qos-v8"
@@ -231,10 +243,10 @@ MOVEMENT_CHANNEL_TIMING_VERSION = (
 )
 PROPULSION_MODEL_ID = "canonical-3d-quadrotor-v1"
 MOVEMENT_ACTION_PROJECTION_CONTRACT_VERSION = (
-    "fieldwise-clamp-heading-wrap-service-active-mask-uav0-hard400-v6"
+    "fieldwise-clamp-heading-wrap-service-owned-mask-external-search-uav0-hard400-v7"
 )
 MOVEMENT_REPLAY_CONTRACT_VERSION = (
-    "executed-action-boundary-aligned-next-state-three-potential-capacity-50000-v8"
+    "policy-owned-executed-action-external-search-hover-mask-capacity-50000-v9"
 )
 MOVEMENT_WARMUP_CONTRACT_VERSION = "global-joint-transition-boundary-10000-v1"
 PROPULSION_PARAMETERS = MappingProxyType(
@@ -322,9 +334,11 @@ def task_potential_contract_metadata():
         "pbrs": "beta_i * (gamma * phi_i_next - phi_i_current)",
         "no_task_potential": "all three shaping contributions are zero",
         "search": {
-            "unchanged": True,
+            "unchanged": False,
             "definition": "mean(visited_bitmap)",
             "target_distance_used": False,
+            "movement_reward_coefficient": 0.0,
+            "control_owner": SEARCH_CONTROLLER,
         },
         "vs": {
             "definition": "0.8 * coverage_ratio * q(image_quality) + 0.2 * G",
@@ -923,6 +937,26 @@ def effective_training_config(config, method_spec: MethodSpec) -> dict:
     return values
 
 
+def search_controller_contract_metadata():
+    """Return the formal hybrid Search ownership and sensing contract."""
+
+    return {
+        "search_controller": SEARCH_CONTROLLER,
+        "search_controller_contract_version": SEARCH_CONTROLLER_CONTRACT_VERSION,
+        "search_target_altitude_m": SEARCH_TARGET_ALTITUDE_M,
+        "search_region_target_size_m": SEARCH_REGION_TARGET_SIZE_M,
+        "search_region_completion_threshold": SEARCH_REGION_COMPLETION_THRESHOLD,
+        "global_search_completion_threshold": GLOBAL_SEARCH_COMPLETION_THRESHOLD,
+        "roi_discovery_overlap_threshold": ROI_DISCOVERY_OVERLAP_THRESHOLD,
+        "roi_discovery_temporal_accumulation": ROI_DISCOVERY_TEMPORAL_ACCUMULATION,
+        "passive_search_coverage_roles": list(PASSIVE_SEARCH_COVERAGE_ROLES),
+        "fov_roles_contribute_search_coverage": FOV_ROLES_CONTRIBUTE_SEARCH_COVERAGE,
+        "search_controlled_by_movement_policy": SEARCH_CONTROLLED_BY_MOVEMENT_POLICY,
+        "search_potential_coefficient": TASK_POTENTIAL_BETA_SEARCH,
+        "training_environment_width_m": int(ENVIRONMENT_WIDTH_M),
+        "training_environment_height_m": int(ENVIRONMENT_HEIGHT_M),
+        "environment_size_observed_by_policy": False,
+    }
 def comparison_method_configuration(method_spec: MethodSpec) -> dict:
     """Resolve orthogonal comparison strategies and shared assignment constants."""
 
@@ -948,6 +982,7 @@ def comparison_method_configuration(method_spec: MethodSpec) -> dict:
             for name, coefficient in configured_coefficients.items()
         },
         "movement_replay_contract_version": MOVEMENT_REPLAY_CONTRACT_VERSION,
+        **search_controller_contract_metadata(),
         "assignment_contract_version": ASSIGNMENT_CONTRACT_VERSION,
         "assignment_flow": ASSIGNMENT_FLOW_BY_STRATEGY[method_spec.assignment],
         "random_assignment_algorithm": (
