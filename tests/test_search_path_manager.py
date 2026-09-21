@@ -22,6 +22,7 @@ from search_path_manager import (
     SearchPathManager,
     build_search_regions,
     entropy_weights,
+    frontier_costs_and_weights,
 )
 from visual_sensing import SearchFootprint, search_detection_overlap_ratio
 
@@ -81,6 +82,67 @@ def test_entropy_weights_constant_columns_and_assignment_are_finite_deterministi
         if feasible:
             assert manager.owner_by_region[region.region_id] in feasible
     assert all(manager.owner_by_region[region_id] in (0, 1) for region_id in manager.owner_by_region)
+
+
+def test_frontier_weights_use_normalized_criterion_standard_deviations():
+    distances = np.asarray([10.0, 20.0, 40.0])
+    angles = np.asarray([0.0, 0.2, 1.0])
+    costs, weights = frontier_costs_and_weights(distances, angles)
+    normalized_distances = (distances - distances.min()) / np.ptp(distances)
+    normalized_angles = (angles - angles.min()) / np.ptp(angles)
+    q_distance = 1.0 / (np.std(normalized_distances) + 1e-12)
+    q_angle = 1.0 / (np.std(normalized_angles) + 1e-12)
+    expected_weights = np.asarray((q_distance, q_angle)) / (q_distance + q_angle)
+    np.testing.assert_allclose(weights, expected_weights, rtol=0.0, atol=1e-15)
+    np.testing.assert_allclose(
+        costs,
+        expected_weights[0] * normalized_distances
+        + expected_weights[1] * normalized_angles,
+        rtol=0.0,
+        atol=1e-15,
+    )
+
+
+def test_frontier_weights_and_ranking_are_invariant_to_distance_units():
+    distances = np.asarray([10.0, 24.0, 80.0])
+    angles = np.asarray([1.0, 0.0, 0.25])
+    costs_m, weights_m = frontier_costs_and_weights(distances, angles)
+    costs_scaled, weights_scaled = frontier_costs_and_weights(
+        distances * 1000.0, angles
+    )
+    np.testing.assert_allclose(weights_scaled, weights_m, rtol=0.0, atol=1e-15)
+    np.testing.assert_allclose(costs_scaled, costs_m, rtol=0.0, atol=1e-15)
+    np.testing.assert_array_equal(
+        np.argsort(costs_scaled, kind="stable"),
+        np.argsort(costs_m, kind="stable"),
+    )
+
+
+def test_frontier_distance_weight_is_not_suppressed_by_meter_scale():
+    costs, (weight_distance, weight_angle) = frontier_costs_and_weights(
+        [10.0, 100.0], [1.0, 0.0]
+    )
+    assert weight_distance == pytest.approx(0.5)
+    assert weight_angle == pytest.approx(0.5)
+    assert weight_distance > 0.1
+    np.testing.assert_allclose(costs, [0.5, 0.5], rtol=0.0, atol=1e-15)
+
+
+def test_frontier_constant_criteria_are_finite_and_deterministic():
+    first = frontier_costs_and_weights([5.0, 5.0, 5.0], [0.2, 0.2, 0.2])
+    second = frontier_costs_and_weights([5.0, 5.0, 5.0], [0.2, 0.2, 0.2])
+    np.testing.assert_array_equal(first[0], np.zeros(3))
+    assert first[1] == pytest.approx((0.5, 0.5))
+    np.testing.assert_array_equal(first[0], second[0])
+    assert first[1] == second[1]
+    assert np.isfinite(first[0]).all()
+    assert np.isfinite(first[1]).all()
+
+    one_constant = frontier_costs_and_weights(
+        [1.0, 1.0, 1.0], [0.0, 0.5, 1.0]
+    )
+    assert np.isfinite(one_constant[0]).all()
+    assert np.isfinite(one_constant[1]).all()
 
 
 def test_reallocation_only_on_events_and_preserves_active_region_lock():

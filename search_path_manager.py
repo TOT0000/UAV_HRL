@@ -133,6 +133,50 @@ def entropy_weights(*criteria):
     return weights
 
 
+def frontier_costs_and_weights(distances, angles):
+    """Return frontier costs using inverse dispersion on normalized criteria.
+
+    Min-max normalization maps a constant criterion to all zeros.  The shared
+    epsilon then keeps its inverse-standard-deviation weight finite; two
+    constant criteria deterministically receive equal weights and zero costs.
+    """
+
+    distances = np.asarray(distances, dtype=np.float64)
+    angles = np.asarray(angles, dtype=np.float64)
+    if distances.ndim != 1 or angles.ndim != 1 or distances.shape != angles.shape:
+        raise ValueError("frontier criteria must be matching one-dimensional arrays")
+    if distances.size == 0:
+        raise ValueError("frontier criteria must not be empty")
+    normalized_distances = _minmax(distances)
+    normalized_angles = _minmax(angles)
+    sigma_distance = float(np.std(normalized_distances))
+    sigma_angle = float(np.std(normalized_angles))
+    q_distance = 1.0 / (sigma_distance + SEARCH_FRONTIER_EPSILON)
+    q_angle = 1.0 / (sigma_angle + SEARCH_FRONTIER_EPSILON)
+    denominator = q_distance + q_angle
+    weight_distance = q_distance / denominator
+    weight_angle = q_angle / denominator
+    costs = (
+        weight_distance * normalized_distances
+        + weight_angle * normalized_angles
+    )
+    values = np.asarray(
+        (
+            sigma_distance,
+            sigma_angle,
+            q_distance,
+            q_angle,
+            weight_distance,
+            weight_angle,
+            *costs,
+        ),
+        dtype=np.float64,
+    )
+    if not np.isfinite(values).all():
+        raise FloatingPointError("Search frontier weights or costs are not finite")
+    return costs, (float(weight_distance), float(weight_angle))
+
+
 class SearchPathManager:
     """Own Search UAV movement while leaving service UAVs to policy control."""
 
@@ -389,16 +433,10 @@ class SearchPathManager:
                 else:
                     cosine = float(np.dot(delta, velocity) / (distance * np.linalg.norm(velocity)))
                     angles.append(math.acos(float(np.clip(cosine, -1.0, 1.0))) / math.pi)
-            normalized_angles = _minmax(angles)
-            sigma_distance = float(np.std(distances))
-            sigma_angle = float(np.std(angles))
-            q_distance = 1.0 / (sigma_distance + SEARCH_FRONTIER_EPSILON)
-            q_angle = 1.0 / (sigma_angle + SEARCH_FRONTIER_EPSILON)
-            weight_distance = q_distance / (q_distance + q_angle)
-            weight_angle = q_angle / (q_distance + q_angle)
+            costs, _weights = frontier_costs_and_weights(distances, angles)
             ranked = [
                 (
-                    float(weight_distance * normalized_distances[index] + weight_angle * normalized_angles[index]),
+                    float(costs[index]),
                     candidates[index][0],
                     candidates[index][1],
                 )

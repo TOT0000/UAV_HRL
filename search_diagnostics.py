@@ -1,4 +1,9 @@
-"""Streaming Search-coverage diagnostics for environment-size evaluation."""
+"""Streaming Search-coverage diagnostics for environment-size evaluation.
+
+``search_uav_ids`` is a legacy field name.  It contains every nadir Search
+coverage contributor (Search, COM-only, and Hover), not only UAVs whose task
+type is Search; FOV and FOV+COM UAVs are excluded.
+"""
 
 from __future__ import annotations
 
@@ -9,7 +14,7 @@ from pathlib import Path
 import numpy as np
 
 
-SEARCH_DIAGNOSTICS_SCHEMA_VERSION = "uav-hrl-search-diagnostics-v1"
+SEARCH_DIAGNOSTICS_SCHEMA_VERSION = "uav-hrl-search-diagnostics-v2"
 SEARCH_DIAGNOSTICS_INDEXING = {
     "episode_index": "zero_based",
     "interval_index": "zero_based",
@@ -66,7 +71,12 @@ def build_search_diagnostics_record(
     interval_initial_positions,
     interval_final_positions,
 ):
-    """Build one row from the canonical frozen bitmap and clipped footprints."""
+    """Build one row from frozen bitmap state and per-subslot footprints.
+
+    ``search_uav_ids`` retains its legacy name for reader compatibility but
+    means Search coverage contributor IDs.  Each transition batch is one
+    simultaneous 0.25-second subslot sample.
+    """
 
     before = np.asarray(visited_before, dtype=bool)
     after = np.asarray(visited_after, dtype=bool)
@@ -93,23 +103,43 @@ def build_search_diagnostics_record(
             raise ValueError("Search diagnostic contributor set changed within interval")
 
     union_mask = np.zeros(before.shape, dtype=bool) if search_ids else None
+    uav_masks = {
+        uav_id: np.zeros(before.shape, dtype=bool) for uav_id in search_ids
+    }
+    footprint_samples_by_uav = {uav_id: 0 for uav_id in search_ids}
     gross_count = 0
-    per_uav = []
-    for uav_id in search_ids:
-        uav_mask = np.zeros(before.shape, dtype=bool)
-        for batch in batches:
-            transition = next(
-                item for item in batch if int(item.uav_id) == uav_id
-            )
-            footprint = transition.current_footprint
+    simultaneous_overlap_count = 0
+    for batch in batches:
+        batch_union_mask = np.zeros(before.shape, dtype=bool)
+        batch_gross_count = 0
+        transition_by_uav = {
+            int(transition.uav_id): transition
+            for transition in batch
+            if bool(transition.coverage_contributor)
+        }
+        for uav_id in search_ids:
+            footprint = transition_by_uav[uav_id].current_footprint
             if footprint is None:
                 continue
             bx_min, bx_max, by_min, by_max = map(int, footprint)
-            uav_mask[bx_min : bx_max + 1, by_min : by_max + 1] = True
-        footprint_count = int(np.count_nonzero(uav_mask))
+            footprint_mask = np.zeros(before.shape, dtype=bool)
+            footprint_mask[bx_min : bx_max + 1, by_min : by_max + 1] = True
+            footprint_count = int(np.count_nonzero(footprint_mask))
+            footprint_samples_by_uav[uav_id] += footprint_count
+            batch_gross_count += footprint_count
+            batch_union_mask |= footprint_mask
+            uav_masks[uav_id] |= footprint_mask
+        batch_union_count = int(np.count_nonzero(batch_union_mask))
+        gross_count += batch_gross_count
+        simultaneous_overlap_count += batch_gross_count - batch_union_count
+        if union_mask is not None:
+            union_mask |= batch_union_mask
+
+    per_uav = []
+    for uav_id in search_ids:
+        uav_mask = uav_masks[uav_id]
+        footprint_count = footprint_samples_by_uav[uav_id]
         new_count = int(np.count_nonzero(uav_mask & ~before))
-        union_mask |= uav_mask
-        gross_count += footprint_count
         initial = _position(interval_initial_positions, uav_id)
         final = _position(interval_final_positions, uav_id)
         per_uav.append(
@@ -133,7 +163,6 @@ def build_search_diagnostics_record(
         if union_mask is not None
         else 0
     )
-    simultaneous_overlap_count = gross_count - union_count
     historical_revisit_count = union_count - new_union_count
     expected_after = before if union_mask is None else before | union_mask
     if not np.array_equal(after, expected_after):
@@ -197,11 +226,14 @@ def validate_search_diagnostics_record(record):
     new_union = record["new_union_cell_count"]
     if not gross >= union >= new_union >= 0:
         raise ValueError("Search footprint cell counts are inconsistent")
-    if record["simultaneous_overlap_cell_count"] != gross - union:
+    simultaneous_overlap = record["simultaneous_overlap_cell_count"]
+    if not gross >= simultaneous_overlap >= 0:
         raise ValueError("simultaneous Search overlap count is inconsistent")
     if record["historical_revisit_cell_count"] != union - new_union:
         raise ValueError("historical Search revisit count is inconsistent")
-    expected_overlap_ratio = float(gross - union) / float(gross) if gross else 0.0
+    expected_overlap_ratio = (
+        float(simultaneous_overlap) / float(gross) if gross else 0.0
+    )
     expected_revisit_ratio = (
         float(union - new_union) / float(union) if union else 0.0
     )

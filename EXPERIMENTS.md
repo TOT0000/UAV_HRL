@@ -165,11 +165,12 @@ Relay diagnostics artifact.
   `size_bits` remains the queue, service, partial-hop, and routing-reward load.
   Timely FOV useful bits are `size_bits * capture_coverage_ratio`; timely COM
   useful bits are the full `size_bits`; late packets contribute zero useful bits
-- At each one-second Search boundary each Search contributor freezes one nadir
-  footprint for both 25% effective-footprint overlap discovery and bitmap updates. Its
-  unvisited, frontier, overlap, and `map_changed` use the immutable pre-commit
-  bitmap. Non-Search UAVs contribute empty samples and have no Search footprint.
-  The frozen all-UAV samples update EMA after coverage commit and before
+- Search coverage is sampled and committed at every 0.25-second routing
+  subslot. Search, COM-only, and Hovering UAVs are nadir Search coverage
+  contributors; FOV and FOV+COM UAVs use the VS camera and contribute no Search
+  footprint. Each subslot's unvisited, frontier, overlap, and `map_changed` use
+  its immutable pre-commit bitmap. The frozen all-UAV samples update EMA once
+  per one-second movement interval after coverage commit and before
   Search-to-Hover conversion, assignment, or state construction. No post-commit
   bitmap fallback is permitted. Routing state
   getters are pure reads. Full checkpoints persist EMA values, initialization,
@@ -213,7 +214,7 @@ Relay diagnostics artifact.
 
 Movement shaping remains a potential difference with unit movement discount:
 `F_x = beta_x * (Phi_x(s_next) - Phi_x(s))`, where
-`beta_search = beta_vs = beta_com = 3.0` and `gamma = 1` in every
+`beta_search = 0`, `beta_vs = beta_com = 3.0`, and `gamma = 1` in every
 task-potential-enabled formal method. An unchanged potential
 therefore contributes zero, approaching a task target contributes positively,
 and retreating contributes negatively. Terminal transitions retain the existing
@@ -222,24 +223,26 @@ delivery or connectivity potential is present; routing reward is governed by
 the separate GS-progress routing contract above. The `no_task_potential`
 ablation makes all three effective coefficients zero.
 
-Search remains exactly the global `mean(visited_bitmap)`. It does not use the
-Search target position, a frontier target, or any target-distance term, and the
-pre-commit coverage lifecycle is unchanged.
+The Search potential remains the global `mean(visited_bitmap)`, but its shaping
+coefficient is zero. Search movement is owned by the shared deterministic
+region/frontier Search Path Manager, not TD3 or DDPG. It emits one command per
+one-second movement interval, holds it for all four routing slots, targets
+120 m altitude, and uses normalized distance/direction criteria for frontier
+ranking.
 
 The shared image plane is 0.0156 m wide by 0.0235 m long. Search and VS use
 explicit task-mode camera configurations. `SEARCH_CAMERA` has focal length
-0.0175 m and `search_footprint` produces an 89.142857 by 134.285714 m nadir
-rectangle at 100 m altitude. This doubles both dimensions and quadruples the
-area of the former 0.035 m Search footprint. Every UAV with a current Search
-task, including permanent gateway UAV 0, updates `visited_bitmap`. Discovery
-uses the analytic overlap between the circular ROI (with `gt.radius`) and the
-Search rectangle clipped to the map, divided by that clipped rectangle area;
-the inclusive threshold is 0.25. Empty or invalid effective geometry fails
-closed.
+0.0175 m and produces a nadir rectangle at the UAV's actual altitude. Search,
+COM-only, and Hovering UAVs update `visited_bitmap`. Discovery uses one current
+footprint only: the analytic intersection of that map-clipped footprint with
+the complete circular RoI, divided by the complete circular RoI area. The
+inclusive threshold is 10%; there is no temporal accumulation. Empty or
+invalid effective geometry fails closed.
 
 `VS_CAMERA` retains focal length 0.035 m. `vs_geometry` aims at the assigned ROI
 center and projects all four sensor rays onto its ground plane. FOV and FOV+COM
-use VS mode; COM-only and Hovering UAVs perform no Search sensing. UAV 0 uses
+use VS mode and perform no Search sensing; COM-only and Hovering UAVs use the
+nadir Search camera. UAV 0 uses
 Search sensing while its task is Search and remains excluded from FOV/COM
 assignment. Camera mode is derived from the current task types and has no
 independent per-step state transition. Sensor width follows the tilt plane and
@@ -282,7 +285,7 @@ and horizontal target geometry and is independent of the communication range.
 Both blends use weights `0.5/0.5` and are finite in `[0,1]`.
 
 The task-potential contract is
-`search-vs-com-uniform-beta3-potential-v13`. TD3 and DDPG
+`external-search-manager-zero-search-potential-v14`. TD3 and DDPG
 consume the same potential definitions, random-movement methods publish the
 same environment/reward contract, and `*_no_task_potential` methods disable all
 Search/VS/COM shaping. Existing observations already contain UAV and task
@@ -552,11 +555,12 @@ python -X utf8 comparison_experiment.py aggregate --input-dir runs/comparison/ev
 
 Exact-resume checkpoints validate the method fingerprint, training-manifest
 relationship, training seed, the complete Dinkelbach block state, and its configuration.
-Checkpoint schema v31 retains the service-only 531-D contract and adds the 25%
-effective-footprint Search discovery rule, gateway Search contribution, and
-typed feasibility-only Random rounds. Schema v30 used ROI-center discovery,
-excluded the gateway from Search, and used mixed Random rounds, so it is
-rejected before weights or replay are loaded. Schema v29 removed the explicit
+Checkpoint schema v32 retains the service-only 531-D contract and requires the
+deterministic external region/frontier Search controller, zero Search shaping,
+single-footprint complete-RoI inclusive-10% discovery, passive COM-only/Hover
+coverage contribution, and typed feasibility-only Random rounds. Schema v31
+and older encode earlier Search contracts and are rejected before weights or
+replay are loaded. Schema v29 removed the explicit
 Relay task, its movement observation fields, potential, replay fields,
 checkpoint metadata and diagnostics. The current schema requires
 valid-sensing VS generation and assignment-local
@@ -569,7 +573,7 @@ boundary-aligned current/next decision-state Search/VS/COM potentials plus soft-
 reward, GS-reachable initial topology, distance-aware VS/COM task potentials,
 hard-range/COM-session, atomic-FOV, seed-ratio
 aggregation, propulsion, and four-slot/fifty-block movement-channel contract.
-Schema v30 and every older schema is rejected before weights or replay state are
+Schema v31 and every older schema is rejected before weights or replay state are
 restored and must be retrained; v29 receives an explicit retired-Relay-schema
 error and no legacy checkpoint migration is attempted.
 Model-only evaluation checkpoints also validate the visual version and complete
@@ -801,20 +805,27 @@ python -X utf8 run_paper_evaluation.py kkm_random_action_random_routing `
   --collect-search-diagnostics
 ```
 
-Each point then streams one `uav-hrl-search-diagnostics-v1` JSON object per
+Each point then streams one `uav-hrl-search-diagnostics-v2` JSON object per
 one-second movement interval to `search_diagnostics.jsonl`. Episode and
 interval indices are zero-based; `time_seconds` is the actual post-commit time,
 so the first row is 1.0 seconds. The row uses the canonical frozen pre-commit
 visited bitmap and the same clipped `FovCoverageTransition` footprints that are
 committed by the simulator. It records coverage and discovery before/after,
-actual Search contributors, their post-movement position and executed 3-D
-displacement, and per-UAV footprint/new-cell counts.
+actual Search coverage contributors, their post-movement position and executed
+3-D displacement, and per-UAV footprint-sample/new-cell counts. The legacy
+field name `search_uav_ids` means all Search coverage contributor IDs (Search,
+COM-only, and Hover), never FOV or FOV+COM IDs.
 
-For footprints `F_i` and the pre-commit visited set `V`, gross footprint cells
-are `sum(|F_i|)`, union cells are `|union(F_i)|`, and new union cells are
-`|union(F_i) - V|`. Simultaneous overlap is `(gross - union) / gross` while
-historical revisit is `(union - new_union) / union`; a zero denominator yields
-zero. The artifact does not contain bitmaps or heatmaps. Collection is
+For subslot footprints `F_(u,k)` and the interval-start visited set `V`, each
+subslot has `gross_k = sum_u |F_(u,k)|` and
+`overlap_k = gross_k - |union_u F_(u,k)|`. Interval gross and simultaneous
+overlap are the sums across the four subslots, so cross-subslot revisits are not
+simultaneous multi-UAV overlap. Interval union is the unique union across every
+contributor and subslot; new union is its unique portion outside `V`, and
+historical revisit is `(union - new_union) / union`. Per-UAV
+`footprint_cell_count` is the four-subslot cell-sample total while
+`new_cell_count` is unique relative to `V`. A zero denominator yields zero. The
+artifact does not contain bitmaps or heatmaps. Collection is
 evaluation-only and disabled by default. Enabling it adds only the streaming
 artifact and diagnostic metadata; canonical per-episode metrics and aggregates
 remain unchanged.

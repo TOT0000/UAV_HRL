@@ -84,6 +84,167 @@ class SearchDiagnosticCalculationTest(unittest.TestCase):
         self.assertEqual(per_uav[2]["new_cell_ratio"], 1.0)
         self.assertEqual(per_uav[2]["displacement_m"], 1.0)
 
+    def test_same_subslot_multi_uav_overlap_is_simultaneous(self):
+        before = np.zeros((2, 2), dtype=bool)
+        after = before.copy()
+        after[0, 0] = True
+        record = build_search_diagnostics_record(
+            method_id="method",
+            scenario_id="scenario",
+            episode_index=0,
+            interval_index=0,
+            time_seconds=1.0,
+            visited_before=before,
+            visited_after=after,
+            discovered_roi_ids_before=(),
+            discovered_roi_ids_after=(),
+            search_uav_ids=(1, 2),
+            footprint_transitions=(
+                self._transition(1, (0, 0, 0, 0)),
+                self._transition(2, (0, 0, 0, 0)),
+            ),
+            interval_initial_positions={1: (0, 0, 0), 2: (0, 0, 0)},
+            interval_final_positions={1: (0, 0, 0), 2: (0, 0, 0)},
+        )
+        self.assertEqual(record["gross_footprint_cell_count"], 2)
+        self.assertEqual(record["union_footprint_cell_count"], 1)
+        self.assertEqual(record["simultaneous_overlap_cell_count"], 1)
+        self.assertEqual(record["simultaneous_overlap_ratio"], 0.5)
+
+    def test_cross_subslot_overlap_is_not_simultaneous(self):
+        before = np.zeros((3, 3), dtype=bool)
+        after = before.copy()
+        after[0, 0] = True
+        after[1, 1] = True
+        after[2, 2] = True
+        first = (
+            self._transition(1, (0, 0, 0, 0)),
+            self._transition(2, (2, 2, 2, 2)),
+        )
+        second = (
+            self._transition(1, (1, 1, 1, 1)),
+            self._transition(2, (0, 0, 0, 0)),
+        )
+        record = build_search_diagnostics_record(
+            method_id="method",
+            scenario_id="scenario",
+            episode_index=0,
+            interval_index=0,
+            time_seconds=1.0,
+            visited_before=before,
+            visited_after=after,
+            discovered_roi_ids_before=(),
+            discovered_roi_ids_after=(),
+            search_uav_ids=(1, 2),
+            footprint_transition_batches=(first,),
+            footprint_transitions=second,
+            interval_initial_positions={1: (0, 0, 0), 2: (0, 0, 0)},
+            interval_final_positions={1: (0, 0, 0), 2: (0, 0, 0)},
+        )
+        self.assertEqual(record["gross_footprint_cell_count"], 4)
+        self.assertEqual(record["union_footprint_cell_count"], 3)
+        self.assertEqual(record["new_union_cell_count"], 3)
+        self.assertEqual(record["historical_revisit_cell_count"], 0)
+        self.assertEqual(record["simultaneous_overlap_cell_count"], 0)
+        self.assertEqual(record["simultaneous_overlap_ratio"], 0.0)
+        self.assertTrue(
+            all(item["footprint_cell_count"] == 2 for item in record["search_uavs"])
+        )
+
+    def test_same_uav_cross_subslot_revisit_is_not_multi_uav_overlap(self):
+        before = np.zeros((1, 1), dtype=bool)
+        after = np.ones((1, 1), dtype=bool)
+        transition = (self._transition(1, (0, 0, 0, 0)),)
+        record = build_search_diagnostics_record(
+            method_id="method",
+            scenario_id="scenario",
+            episode_index=0,
+            interval_index=0,
+            time_seconds=1.0,
+            visited_before=before,
+            visited_after=after,
+            discovered_roi_ids_before=(),
+            discovered_roi_ids_after=(),
+            search_uav_ids=(1,),
+            footprint_transition_batches=(transition,),
+            footprint_transitions=transition,
+            interval_initial_positions={1: (0, 0, 0)},
+            interval_final_positions={1: (0, 0, 0)},
+        )
+        self.assertEqual(record["gross_footprint_cell_count"], 2)
+        self.assertEqual(record["union_footprint_cell_count"], 1)
+        self.assertEqual(record["simultaneous_overlap_cell_count"], 0)
+        self.assertEqual(record["search_uavs"][0]["footprint_cell_count"], 2)
+        self.assertEqual(record["search_uavs"][0]["new_cell_count"], 1)
+        self.assertEqual(record["search_uavs"][0]["new_cell_ratio"], 0.5)
+
+    def test_subslot_contributor_set_and_schema_version_are_validated(self):
+        bitmap = np.zeros((2, 2), dtype=bool)
+        valid_batch = (
+            self._transition(1, (0, 0, 0, 0)),
+            self._transition(2, (1, 1, 1, 1)),
+        )
+        invalid_batch = (self._transition(1, (0, 0, 0, 0)),)
+        with self.assertRaisesRegex(ValueError, "contributor set changed"):
+            build_search_diagnostics_record(
+                method_id="method",
+                scenario_id="scenario",
+                episode_index=0,
+                interval_index=0,
+                time_seconds=1.0,
+                visited_before=bitmap,
+                visited_after=np.ones((2, 2), dtype=bool),
+                discovered_roi_ids_before=(),
+                discovered_roi_ids_after=(),
+                search_uav_ids=(1, 2),
+                footprint_transition_batches=(
+                    valid_batch,
+                    invalid_batch,
+                    valid_batch,
+                ),
+                footprint_transitions=valid_batch,
+                interval_initial_positions={1: (0, 0, 0), 2: (0, 0, 0)},
+                interval_final_positions={1: (0, 0, 0), 2: (0, 0, 0)},
+            )
+
+        empty_record = build_search_diagnostics_record(
+            method_id="method",
+            scenario_id="scenario",
+            episode_index=0,
+            interval_index=0,
+            time_seconds=1.0,
+            visited_before=bitmap,
+            visited_after=bitmap,
+            discovered_roi_ids_before=(),
+            discovered_roi_ids_after=(),
+            search_uav_ids=(),
+            footprint_transitions=(),
+            interval_initial_positions={},
+            interval_final_positions={},
+        )
+        legacy_record = dict(empty_record)
+        legacy_record["schema_version"] = "uav-hrl-search-diagnostics-v1"
+        with self.assertRaisesRegex(ValueError, "schema version"):
+            validate_search_diagnostics_record(legacy_record)
+
+    def test_legacy_search_uav_ids_are_all_nadir_coverage_contributors(self):
+        env = Simulator(num_UAV=16, evaluation=True)
+        env.num_GT = 2
+        env.reset_environment()
+        env.multi_tasks[1] = [{"task_type": "Search"}]
+        env.multi_tasks[2] = [{"task_type": "COM", "target_obj_id": 0}]
+        env.multi_tasks[3] = [{"task_type": "Hovering"}]
+        env.multi_tasks[4] = [{"task_type": "FOV", "target_obj_id": 0}]
+        env.multi_tasks[5] = [
+            {"task_type": "FOV", "target_obj_id": 0},
+            {"task_type": "COM", "target_obj_id": 0},
+        ]
+        self.assertTrue(env.is_search_contributor(1))
+        self.assertTrue(env.is_search_contributor(2))
+        self.assertTrue(env.is_search_contributor(3))
+        self.assertFalse(env.is_search_contributor(4))
+        self.assertFalse(env.is_search_contributor(5))
+
     def test_no_search_uav_produces_finite_zero_diagnostics(self):
         bitmap = np.zeros((3, 3), dtype=bool)
         record = build_search_diagnostics_record(

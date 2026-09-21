@@ -1,23 +1,25 @@
 # Canonical visual sensing change record
 
-## Task-selected Search/VS camera follow-up
+## Active deterministic Search/VS contract
 
 The current visual contract is
-`task-selected-search-effective-overlap25-gateway-v4`. Both modes use the
+`single-footprint-full-roi-overlap10-passive-contributors-v5`. Both modes use the
 0.0156 m by 0.0235 m image plane. Search uses a 0.0175 m focal length and a
 fixed nadir footprint; VS keeps the 0.035 m focal length and the existing
-oblique camera aimed at the assigned ROI. At 100 m, the Search footprint is
-89.142857 m by 134.285714 m, twice the former length and width and four times
-its area.
+oblique camera aimed at the assigned ROI. The deterministic region/frontier
+Search Path Manager owns Search UAV motion instead of TD3/DDPG, targets 120 m,
+emits one command per second, and holds it across four 0.25-second routing
+slots. Search coverage itself is sampled in every subslot.
 
-Every UAV with a current Search task, including permanent gateway UAV 0,
-contributes a Search footprint and changes `visited_bitmap`. An undiscovered
-circular ROI is detected when its intersection with the Search rectangle is at
-least 25% of the Search rectangle after clipping that rectangle to the map.
-The comparison is inclusive and uses `gt.radius`; an empty or invalid effective
-footprint cannot detect. FOV and FOV+COM UAVs use VS mode. COM-only and
-Hovering UAVs do not perform Search sensing. The mode follows current task
-types; there is no separate camera action or camera-state transition.
+Search, COM-only, and Hovering UAVs contribute a nadir Search footprint and
+change `visited_bitmap`; FOV and FOV+COM UAVs use VS mode and do not contribute
+Search coverage. An undiscovered circular RoI is detected from a single
+current footprint when
+`area(footprint intersect complete circular RoI) / area(complete circular RoI)`
+is at least 10%. The comparison is inclusive and uses `gt.radius`; there is no
+temporal accumulation, and empty or invalid effective geometry fails closed.
+The mode follows current task types; there is no separate camera action or
+camera-state transition.
 
 FOV assignment utility, VS potential, coverage, image quantity, packet
 generation and packet size continue to use `VS_CAMERA` and retain the original
@@ -26,12 +28,20 @@ constraint. Resolution remains an input to the existing VS utility, potential
 and packet-size calculations.
 
 All task-potential-enabled formal methods now resolve
-`beta_search = beta_vs = beta_com = 3.0`. The potential formulas
+`beta_search = 0` and `beta_vs = beta_com = 3.0`. The VS/COM potential formulas
 and PBRS difference are unchanged; `no_task_potential` resolves all three
 effective shaping coefficients to zero. Training, evaluation and checkpoint
 validation use the same resolved configuration. A checkpoint containing the
 old visual contract or beta values is rejected before continuation. The
-current checkpoint schema is **31**.
+current checkpoint schema is **32**.
+
+Search diagnostics schema `uav-hrl-search-diagnostics-v2` retains the legacy
+field name `search_uav_ids`, whose actual meaning is all Search coverage
+contributor IDs. For each subslot, simultaneous overlap is the sum of footprint
+cell counts minus that subslot's multi-UAV union; interval overlap and gross are
+the four-subslot sums. Interval union/new/historical-revisit counts remain
+unique across the full interval, and per-UAV `footprint_cell_count` is the
+four-subslot cell-sample denominator.
 
 Original geometry change base: `feature/centralized-td3`, HEAD
 `84531f859ed6ab3291d14091e67ba0c8cce6398d`.
@@ -121,12 +131,13 @@ experiment result was changed, and no push was performed.
 ground altitude. `CAMERA` remains a compatibility alias for `VS_CAMERA` and is
 not used by Search production paths.
 
-- `search_footprint`: fixed nadir rectangle, 89.142857 by 134.285714 m at 100 m.
+- `search_footprint`: a fixed nadir rectangle derived from actual altitude.
   `HRL_task_aware._mark_search_observations` freezes one continuous footprint
-  per Search contributor and passes it to both discovery and bitmap sampling.
-  Discovery uses deterministic analytic circle/rectangle intersection divided
-  by the map-clipped effective rectangle area with an inclusive 0.25 threshold.
-  Non-Search transitions contain no footprint and zero raw Search samples.
+  per Search coverage contributor in each 0.25-second subslot and passes it to
+  both discovery and bitmap sampling. Discovery uses deterministic analytic
+  circle/rectangle intersection divided by the complete circular RoI area with
+  an inclusive 10% threshold and no temporal accumulation. Search, COM-only,
+  and Hover contribute; FOV and FOV+COM transitions contain no Search footprint.
 - `vs_geometry`: target-pointing camera rays project all four sensor corners
   onto the ROI ground plane. Sensor width follows the tilt plane, sensor height
   is cross-track, and nadir uses +x bearing. The resulting polygon rotates with
@@ -177,10 +188,10 @@ are unchanged. Each capture freezes physical size, coverage, raw image quantity
 and ROI/task identity; the VS QoS denominator excludes invalid intervals;
 timely useful VS bits equal timely physical bits times capture coverage.
 
-Checkpoint schema 31 requires the complete visual contract configuration and
-version for both full resume and model-only evaluation. Schema 30 is rejected
-because it used ROI-center discovery, excluded the permanent gateway from
-Search contribution and used the former mixed Random rounds. Older schemas,
+Checkpoint schema 32 requires the complete visual and deterministic external
+Search-controller contract for both full resume and model-only evaluation.
+Schema 31 and older are rejected because they encode earlier Search contracts.
+Older schemas,
 missing visual metadata, or changed camera/coverage/packet/weight/validity
 metadata fail before loading weights. All affected methods must be retrained.
 Training/evaluation configs and metadata publish the canonical configuration.
@@ -188,9 +199,9 @@ FOV EMA lifecycle v6 represents non-Search footprints as null while preserving
 complete per-UAV checkpoint records and the existing transition/EMA cadence.
 
 Scenario generation, manifest schema/content rules, seeds, CRN, pairing,
-Dinkelbach/ratio objectives, Search/COM potential formulas, routing reward
-and energy formulas are unchanged. The narrower Search footprint intentionally
-changes discovery timing; a short smoke episode can have no routing packets.
+Dinkelbach/ratio objectives, VS/COM potential formulas, routing reward and
+energy formulas are unchanged. A short smoke episode can have no routing
+packets.
 
 ## Legacy code audit
 
