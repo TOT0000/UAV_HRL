@@ -204,6 +204,29 @@ class ExperimentPreflightTest(unittest.TestCase):
                     comparison_main(self._train_args(manifest_path, output))
                 train_mock.assert_not_called()
 
+    def test_training_lifecycle_marks_keyboard_interrupt_and_reraises(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            output = root / "output"
+            manifest = generate_manifest("train", 7013, 1)
+            manifest_path = root / "train.json"
+            manifest.save(manifest_path)
+            run_dir = training_run_directory(output, self.method, manifest, 17)
+
+            with mock.patch(
+                "comparison_experiment.train", side_effect=KeyboardInterrupt()
+            ):
+                with self.assertRaises(KeyboardInterrupt):
+                    comparison_main(self._train_args(manifest_path, output))
+
+            status = read_run_status(run_dir)
+            self.assertEqual(status["state"], "INTERRUPTED")
+            self.assertEqual(status["exception"]["type"], "KeyboardInterrupt")
+            self.assertEqual(
+                [item["state"] for item in status["transitions"]],
+                ["PREPARING", "RUNNING", "INTERRUPTED"],
+            )
+
     def test_valid_fresh_training_writes_identity_and_completed_status(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -306,6 +329,43 @@ class ExperimentPreflightTest(unittest.TestCase):
                     return_value=None,
                 ),
                 mock.patch(
+                    "comparison_experiment.train",
+                    side_effect=KeyboardInterrupt(),
+                ),
+            ):
+                with self.assertRaises(KeyboardInterrupt):
+                    comparison_main(
+                        self._train_args(manifest_path, output, resume=resume)
+                    )
+
+            interrupted = read_run_status(run_dir)
+            self.assertEqual(interrupted["state"], "INTERRUPTED")
+            self.assertEqual(
+                [item["state"] for item in interrupted["transitions"]],
+                [
+                    "PREPARING",
+                    "RUNNING",
+                    "FAILED",
+                    "RESUMING",
+                    "RUNNING",
+                    "INTERRUPTED",
+                ],
+            )
+
+            with (
+                mock.patch(
+                    "comparison_experiment.plan_resume_reconciliation",
+                    return_value=plan,
+                ),
+                mock.patch(
+                    "comparison_experiment.preflight_resume_training_history",
+                    return_value=[{}],
+                ),
+                mock.patch(
+                    "comparison_experiment.execute_resume_reconciliation",
+                    return_value=None,
+                ),
+                mock.patch(
                     "comparison_experiment.train", return_value=resumed_result
                 ),
             ):
@@ -321,6 +381,9 @@ class ExperimentPreflightTest(unittest.TestCase):
                     "PREPARING",
                     "RUNNING",
                     "FAILED",
+                    "RESUMING",
+                    "RUNNING",
+                    "INTERRUPTED",
                     "RESUMING",
                     "RUNNING",
                     "COMPLETED",

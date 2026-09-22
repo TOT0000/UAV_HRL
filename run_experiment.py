@@ -30,6 +30,7 @@ from experiment_config import (
     movement_agent_configuration,
     routing_agent_configuration,
 )
+from experiment_paths import run_state_for_exception, write_run_status
 from HRL_task_aware import (
     ROUTING_STATE_DIM,
     TrainingConfig,
@@ -216,6 +217,37 @@ def _write_json_atomic(path, value):
             temporary.unlink()
 
 
+def _training_exception_metadata(exception):
+    status = run_state_for_exception(exception)
+    timestamp_field = (
+        "interrupted_at" if status == "INTERRUPTED" else "failed_at"
+    )
+    return {
+        "status": status,
+        timestamp_field: datetime.now(timezone.utc).isoformat(),
+        "error": {
+            "type": type(exception).__name__,
+            "message": str(exception),
+        },
+    }
+
+
+def _record_training_exception(run_dir, resolved, exception):
+    """Best-effort both lifecycle files without replacing the original error."""
+
+    resolved.update(_training_exception_metadata(exception))
+    try:
+        _write_json_atomic(run_dir / "resolved_config.json", resolved)
+    except BaseException:
+        pass
+    try:
+        write_run_status(
+            run_dir, run_state_for_exception(exception), exception=exception
+        )
+    except BaseException:
+        pass
+
+
 def _read_json(path):
     path = Path(path)
     if not path.is_file():
@@ -380,6 +412,7 @@ def run(args):
     run_dir = create_unique_run_directory(
         values["output_root"], method.method_key, values["seed"], git_sha
     )
+    write_run_status(run_dir, "PREPARING")
     checkpoints_enabled = not args.smoke
     config = formal_training_config(
         values["episodes"],
@@ -411,7 +444,8 @@ def run(args):
     )
     manifest.save(run_dir / "scenario_manifest.json")
     resolved = _base_resolved(run_dir, method, manifest, config, values, args, git_sha)
-    _write_json(run_dir / "resolved_config.json", resolved)
+    _write_json_atomic(run_dir / "resolved_config.json", resolved)
+    write_run_status(run_dir, "RUNNING")
     try:
         result = train(
             config,
@@ -429,14 +463,10 @@ def run(args):
             run_dir / "run_metadata.json",
             _merge_training_run_metadata(result["run_metadata"], resolved),
         )
-        _write_json(run_dir / "resolved_config.json", resolved)
+        _write_json_atomic(run_dir / "resolved_config.json", resolved)
+        write_run_status(run_dir, "COMPLETED")
     except BaseException as exc:
-        resolved.update(
-            status="FAILED",
-            completed_at=datetime.now(timezone.utc).isoformat(),
-            error={"type": type(exc).__name__, "message": str(exc)},
-        )
-        _write_json(run_dir / "resolved_config.json", resolved)
+        _record_training_exception(run_dir, resolved, exc)
         raise
     print(json.dumps({"run_directory": str(run_dir), "status": "COMPLETED"}))
     return 0
@@ -638,6 +668,7 @@ def run_resume(args):
             current_total_episodes=active_manifest.episode_count,
         )
     config.resume_dir = str(checkpoint)
+    write_run_status(run_dir, "RESUMING")
     resolved.update(
         status="RUNNING",
         resumed_at=datetime.now(timezone.utc).isoformat(),
@@ -671,6 +702,7 @@ def run_resume(args):
             horizon_extension_history=history,
         )
     _write_json_atomic(run_dir / "resolved_config.json", resolved)
+    write_run_status(run_dir, "RUNNING")
     try:
         result = train(
             config,
@@ -691,13 +723,9 @@ def run_resume(args):
             _merge_training_run_metadata(result["run_metadata"], resolved),
         )
         _write_json_atomic(run_dir / "resolved_config.json", resolved)
+        write_run_status(run_dir, "COMPLETED")
     except BaseException as exc:
-        resolved.update(
-            status="FAILED",
-            completed_at=datetime.now(timezone.utc).isoformat(),
-            error={"type": type(exc).__name__, "message": str(exc)},
-        )
-        _write_json_atomic(run_dir / "resolved_config.json", resolved)
+        _record_training_exception(run_dir, resolved, exc)
         raise
     print(json.dumps({"run_directory": str(run_dir), "status": "COMPLETED", "resumed_from": str(checkpoint)}))
     return 0

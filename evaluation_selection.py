@@ -16,6 +16,7 @@ from experiment_config import (
     ROI_COUNT_MIN,
     MethodSpec,
 )
+from experiment_paths import read_run_status
 from HRL_task_aware import ROUTING_STATE_DIM
 from scenario_manifest import (
     ScenarioManifest,
@@ -40,7 +41,6 @@ TRAINING_CHECKPOINT_EVALUATION_FIELDS = (
     "training_run_status_at_evaluation",
     "training_run_completed_at_evaluation",
     "interim_checkpoint_evaluation",
-    "checkpoint_episode",
 )
 
 
@@ -215,9 +215,13 @@ def resolve_training_run_checkpoint(
     checkpoint_episode,
     *,
     expected_method=None,
-    require_run_metadata=False,
+    require_completed_run_metadata=True,
 ):
-    """Validate one run/checkpoint without loading policy weights."""
+    """Validate one run/checkpoint without loading policy weights.
+
+    Completed runs require final run metadata by default. Interim runs may
+    omit it, but any metadata already present is still parsed and validated.
+    """
 
     if run_directory is None:
         raise ValueError("a learned checkpoint evaluation requires --run-dir")
@@ -226,12 +230,6 @@ def resolve_training_run_checkpoint(
         raise FileNotFoundError(f"training run directory is missing: {run_dir}")
     resolved = _read_json_object(
         run_dir / "resolved_config.json", "training resolved config"
-    )
-    run_metadata_path = run_dir / "run_metadata.json"
-    run_metadata = (
-        _read_json_object(run_metadata_path, "training run metadata")
-        if require_run_metadata or run_metadata_path.is_file()
-        else None
     )
     try:
         method = MethodSpec.parse(resolved["method"])
@@ -257,6 +255,26 @@ def resolve_training_run_checkpoint(
             "training run status is missing or invalid for evaluation: "
             f"{training_run_status!r}"
         )
+    lifecycle_status = read_run_status(run_dir)
+    if (
+        lifecycle_status is not None
+        and lifecycle_status["state"] != training_run_status
+    ):
+        raise RuntimeError(
+            "training run lifecycle status disagrees with resolved config: "
+            f"run_status={lifecycle_status['state']!r}, "
+            f"resolved_status={training_run_status!r}"
+        )
+    run_metadata_path = run_dir / "run_metadata.json"
+    run_metadata_required = bool(
+        require_completed_run_metadata
+        and training_run_status == "COMPLETED"
+    )
+    run_metadata = (
+        _read_json_object(run_metadata_path, "training run metadata")
+        if run_metadata_required or run_metadata_path.is_file()
+        else None
+    )
     if run_metadata is not None:
         metadata_method = run_metadata.get(
             "method_id", run_metadata.get("method")

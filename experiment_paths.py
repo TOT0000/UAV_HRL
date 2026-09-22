@@ -16,9 +16,22 @@ RUN_IDENTITY_FILENAME = "run_identity.json"
 RUN_STATUS_FILENAME = "run_status.json"
 RUN_STATUS_SCHEMA_VERSION = 1
 RUN_STATES = frozenset(
-    {"PREPARING", "RUNNING", "COMPLETED", "FAILED", "RESUMING"}
+    {
+        "PREPARING",
+        "RUNNING",
+        "INTERRUPTED",
+        "COMPLETED",
+        "FAILED",
+        "RESUMING",
+    }
 )
 SHORT_HASH_LENGTH = 8
+
+
+def run_state_for_exception(exception):
+    """Map a terminating exception to its persisted training-run state."""
+
+    return "INTERRUPTED" if isinstance(exception, KeyboardInterrupt) else "FAILED"
 
 
 def filesystem_slug(value: str) -> str:

@@ -12,11 +12,13 @@ from checkpoint_roi_sweep import (
 )
 from evaluation_selection import (
     DEFAULT_FIXED_ROI_COUNTS,
+    TRAINING_CHECKPOINT_EVALUATION_FIELDS,
     resolve_checkpoint_episodes,
     resolve_roi_counts,
     resolve_training_run_checkpoint,
 )
 from experiment_config import FORMAL_CHECKPOINT_EPISODE, MethodSpec
+from experiment_paths import write_run_status
 from paper_evaluation import (
     _load_training_run,
     evaluation_sweep_points,
@@ -36,6 +38,16 @@ PROVENANCE = {
 
 
 class CheckpointRoiSelectorTest(unittest.TestCase):
+    def test_status_metadata_fields_do_not_duplicate_checkpoint_episode(self):
+        self.assertEqual(
+            TRAINING_CHECKPOINT_EVALUATION_FIELDS,
+            (
+                "training_run_status_at_evaluation",
+                "training_run_completed_at_evaluation",
+                "interim_checkpoint_evaluation",
+            ),
+        )
+
     def test_defaults_and_explicit_singular_or_batch_values(self):
         self.assertEqual(
             resolve_checkpoint_episodes(), (FORMAL_CHECKPOINT_EPISODE,)
@@ -210,7 +222,7 @@ class TrainingRunCheckpointSelectorTest(unittest.TestCase):
                 ) as fingerprint,
             ):
                 context = resolve_training_run_checkpoint(
-                    run_dir, 50, require_run_metadata=True
+                    run_dir, 50, require_completed_run_metadata=True
                 )
 
         self.assertEqual(context["checkpoint_episode"], 50)
@@ -238,6 +250,7 @@ class TrainingRunCheckpointSelectorTest(unittest.TestCase):
                     run_dir = self._run(
                         root / status.lower(), status=status, checkpoints=(50,)
                     )
+                    (run_dir / "run_metadata.json").unlink()
                     with (
                         mock.patch(
                             "evaluation_selection.inspect_model_checkpoint",
@@ -263,7 +276,9 @@ class TrainingRunCheckpointSelectorTest(unittest.TestCase):
     def test_missing_or_invalid_training_status_is_rejected(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
-            for index, status in enumerate((None, "", "FAILED", 123)):
+            for index, status in enumerate(
+                (None, "", "PREPARING", "RESUMING", "FAILED", "UNKNOWN", 123)
+            ):
                 with self.subTest(status=status):
                     run_dir = self._run(root / f"run-{index}", checkpoints=(50,))
                     resolved_path = run_dir / "resolved_config.json"
@@ -275,6 +290,33 @@ class TrainingRunCheckpointSelectorTest(unittest.TestCase):
                     resolved_path.write_text(json.dumps(resolved), encoding="utf-8")
                     with self.assertRaisesRegex(RuntimeError, "status"):
                         resolve_training_run_checkpoint(run_dir, 50)
+
+    def test_completed_run_requires_metadata_but_interim_metadata_is_validated(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            completed = self._run(root / "completed", checkpoints=(50,))
+            (completed / "run_metadata.json").unlink()
+            with self.assertRaisesRegex(FileNotFoundError, "training run metadata"):
+                _load_training_run(completed, "td3_dinkelbach", 50)
+
+            running = self._run(
+                root / "running", status="RUNNING", checkpoints=(50,)
+            )
+            (running / "run_metadata.json").write_text(
+                json.dumps({"method_id": "ddpg_dinkelbach"}),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(RuntimeError, "metadata method"):
+                resolve_training_run_checkpoint(running, 50)
+
+    def test_run_status_marker_must_match_resolved_config(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            run_dir = self._run(
+                Path(temp_dir) / "run", status="RUNNING", checkpoints=(50,)
+            )
+            write_run_status(run_dir, "INTERRUPTED")
+            with self.assertRaisesRegex(RuntimeError, "lifecycle status"):
+                resolve_training_run_checkpoint(run_dir, 50)
 
     def test_running_run_still_rejects_incomplete_and_incompatible_checkpoints(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -535,6 +577,25 @@ class CheckpointRoiBatchPlanTest(unittest.TestCase):
             )
             self.assertFalse(point["training_run_completed_at_evaluation"])
             self.assertTrue(point["interim_checkpoint_evaluation"])
+
+    def test_completed_run_without_metadata_fails_batch_preflight(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            run_dir = self._run(root / "run", checkpoints=(50,))
+            (run_dir / "run_metadata.json").unlink()
+            with self.assertRaisesRegex(
+                SweepPreflightError, "training run metadata"
+            ):
+                build_checkpoint_roi_sweep_plan(
+                    (run_dir,),
+                    checkpoint_episodes=(50,),
+                    roi_counts=(2,),
+                    evaluation_episodes=1,
+                    episode_seconds=5,
+                    manifest_seed=701,
+                    output_root=root / "outputs",
+                    batch_id="batch",
+                )
 
     def _fake_evaluator(self, calls):
         def evaluate(method_id, **kwargs):

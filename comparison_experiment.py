@@ -21,6 +21,7 @@ from experiment_config import (
 )
 from experiment_paths import (
     prepare_run_directory,
+    run_state_for_exception,
     training_run_directory,
     training_run_identity,
     validate_run_directory_preflight,
@@ -185,7 +186,9 @@ def command_train(args):
         write_run_status(run_dir, "COMPLETED")
     except BaseException as exc:
         try:
-            write_run_status(run_dir, "FAILED", exception=exc)
+            write_run_status(
+                run_dir, run_state_for_exception(exc), exception=exc
+            )
         except BaseException:
             pass
         raise

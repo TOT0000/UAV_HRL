@@ -694,7 +694,7 @@ def run_paper_evaluation(
         if checkpoint_required
         else _no_checkpoint_context(method, requested_manifest_seed, run_directory)
     )
-    checkpoint_evaluation_metadata = {
+    training_run_status_metadata = {
         field: context.get(field)
         for field in TRAINING_CHECKPOINT_EVALUATION_FIELDS
     }
@@ -739,7 +739,7 @@ def run_paper_evaluation(
             "training_history": str(history_path.resolve()),
             "checkpoint_required": True,
             "checkpoint_episode": context["checkpoint_episode"],
-            **checkpoint_evaluation_metadata,
+            **training_run_status_metadata,
             "checkpoint_path": str(context["checkpoint"]),
             "training_run_id": context["training_run_id"],
             "training_total_episodes": context["training_total_episodes"],
@@ -964,7 +964,7 @@ def run_paper_evaluation(
             )
         run_metadata = {
             **result["run_metadata"],
-            **checkpoint_evaluation_metadata,
+            **training_run_status_metadata,
             "evaluation_runtime_provenance": {
                 **(
                     result["run_metadata"].get(
@@ -972,7 +972,8 @@ def run_paper_evaluation(
                     )
                     or {}
                 ),
-                **checkpoint_evaluation_metadata,
+                **training_run_status_metadata,
+                "checkpoint_episode": context["checkpoint_episode"],
             },
             "semantic_suite": suite,
             "paper_sweep_point": point,
@@ -1150,7 +1151,7 @@ def run_paper_evaluation(
                     "training_total_episodes"
                 ],
                 "checkpoint_episode": context["checkpoint_episode"],
-                **checkpoint_evaluation_metadata,
+                **training_run_status_metadata,
                 "checkpoint_path": (
                     str(context["checkpoint"]) if checkpoint_required else None
                 ),
@@ -1244,7 +1245,7 @@ def run_paper_evaluation(
         "checkpoint_required": checkpoint_required,
         "checkpoint_path": str(context["checkpoint"]) if context["checkpoint"] else None,
         "checkpoint_episode": context["checkpoint_episode"],
-        **checkpoint_evaluation_metadata,
+        **training_run_status_metadata,
         "formal_checkpoint_episode": FORMAL_CHECKPOINT_EPISODE,
         "is_formal_checkpoint": is_formal_checkpoint,
         "evaluation_purpose": evaluation_purpose,

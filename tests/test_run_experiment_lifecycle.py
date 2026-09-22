@@ -9,12 +9,89 @@ import torch
 
 from observation_strategy import MOVEMENT_TASK_ASSIGNMENT_INDICES
 from evaluation_selection import resolve_training_run_checkpoint
+from experiment_paths import read_run_status
 from run_experiment import main
 from scenario_manifest import ScenarioManifest, manifest_prefix
 from Simulator import Simulator
 
 
 class SimpleRunnerLifecycleIntegrationTest(unittest.TestCase):
+    def test_keyboard_interrupt_marks_new_and_resumed_run_interrupted(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output = Path(temp_dir) / "results"
+            command = [
+                "td3_ratio",
+                "--episodes", "2",
+                "--episode-seconds", "1",
+                "--checkpoint-interval", "1",
+                "--roi-count", "2",
+                "--output-root", str(output),
+            ]
+            original_apply = Simulator.apply_scenario_entry
+            calls = []
+
+            def interrupt_second_episode(simulator, scenario_entry):
+                calls.append(str(scenario_entry["scenario_id"]))
+                if len(calls) == 2:
+                    raise KeyboardInterrupt()
+                return original_apply(simulator, scenario_entry)
+
+            with mock.patch.object(
+                Simulator,
+                "apply_scenario_entry",
+                new=interrupt_second_episode,
+            ):
+                with self.assertRaises(KeyboardInterrupt):
+                    main(command)
+
+            run_dir = next((output / "td3_ratio").iterdir())
+            resolved_path = run_dir / "resolved_config.json"
+            interrupted = json.loads(
+                resolved_path.read_text(encoding="utf-8")
+            )
+            self.assertEqual(interrupted["status"], "INTERRUPTED")
+            self.assertIn("interrupted_at", interrupted)
+            self.assertNotIn("completed_at", interrupted)
+            self.assertEqual(read_run_status(run_dir)["state"], "INTERRUPTED")
+            self.assertEqual(
+                [
+                    transition["state"]
+                    for transition in read_run_status(run_dir)["transitions"]
+                ],
+                ["PREPARING", "RUNNING", "INTERRUPTED"],
+            )
+
+            def interrupt_resume(_simulator, _scenario_entry):
+                raise KeyboardInterrupt()
+
+            with mock.patch.object(
+                Simulator, "apply_scenario_entry", new=interrupt_resume
+            ):
+                with self.assertRaises(KeyboardInterrupt):
+                    main(["resume", str(run_dir)])
+
+            interrupted = json.loads(
+                resolved_path.read_text(encoding="utf-8")
+            )
+            self.assertEqual(interrupted["status"], "INTERRUPTED")
+            self.assertIn("interrupted_at", interrupted)
+            self.assertNotIn("completed_at", interrupted)
+            self.assertEqual(read_run_status(run_dir)["state"], "INTERRUPTED")
+            self.assertEqual(
+                [
+                    transition["state"]
+                    for transition in read_run_status(run_dir)["transitions"]
+                ],
+                [
+                    "PREPARING",
+                    "RUNNING",
+                    "INTERRUPTED",
+                    "RESUMING",
+                    "RUNNING",
+                    "INTERRUPTED",
+                ],
+            )
+
     def test_train_resume_and_evaluation_emit_no_task_role_diagnostics(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             output = Path(temp_dir) / "results"
@@ -24,11 +101,13 @@ class SimpleRunnerLifecycleIntegrationTest(unittest.TestCase):
                 "--output-root", str(output),
             ]), 0)
             run_dir = next((output / "td3_ratio").iterdir())
+            self.assertEqual(read_run_status(run_dir)["state"], "COMPLETED")
             metadata = json.loads((run_dir / "run_metadata.json").read_text(encoding="utf-8"))
             self.assertFalse((run_dir / "relay_diagnostics.json").exists())
             self.assertNotIn("relay_diagnostics_filename", metadata)
 
             self.assertEqual(main(["resume", str(run_dir), "--target-episodes", "2"]), 0)
+            self.assertEqual(read_run_status(run_dir)["state"], "COMPLETED")
             self.assertFalse((run_dir / "relay_diagnostics.json").exists())
 
             self.assertEqual(main([
@@ -430,6 +509,7 @@ class SimpleRunnerLifecycleIntegrationTest(unittest.TestCase):
                 )["status"],
                 "FAILED",
             )
+            self.assertEqual(read_run_status(run_dir)["state"], "FAILED")
 
             resumed_scenarios = []
 
