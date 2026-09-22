@@ -33,6 +33,15 @@ SUPPORTED_ENVIRONMENT_SIZES_M = ENVIRONMENT_SIZE_EVALUATION_VALUES_M
 DEFAULT_ENVIRONMENT_SIZES_M = SUPPORTED_ENVIRONMENT_SIZES_M
 DEFAULT_EPISODE_HORIZONS_S = (int(PRODUCTION_EPISODE_HORIZON_SECONDS),)
 MINIMUM_EPISODE_HORIZON_S = int(max(PRODUCTION_TASK_DEADLINE_SECONDS.values())) + 1
+EVALUATABLE_TRAINING_RUN_STATUSES = frozenset(
+    {"RUNNING", "INTERRUPTED", "COMPLETED"}
+)
+TRAINING_CHECKPOINT_EVALUATION_FIELDS = (
+    "training_run_status_at_evaluation",
+    "training_run_completed_at_evaluation",
+    "interim_checkpoint_evaluation",
+    "checkpoint_episode",
+)
 
 
 def _exclusive_values(single, multiple, *, label, default, multiple_label=None):
@@ -239,8 +248,15 @@ def resolve_training_run_checkpoint(
             )
     if resolved.get("method_spec") != method.to_dict():
         raise RuntimeError("training run method metadata is incompatible")
-    if resolved.get("status") != "COMPLETED":
-        raise RuntimeError("evaluation requires a completed training run")
+    training_run_status = resolved.get("status")
+    if (
+        not isinstance(training_run_status, str)
+        or training_run_status not in EVALUATABLE_TRAINING_RUN_STATUSES
+    ):
+        raise RuntimeError(
+            "training run status is missing or invalid for evaluation: "
+            f"{training_run_status!r}"
+        )
     if run_metadata is not None:
         metadata_method = run_metadata.get(
             "method_id", run_metadata.get("method")
@@ -281,6 +297,9 @@ def resolve_training_run_checkpoint(
         raise FileNotFoundError(
             f"checkpoint ep_{checkpoint_episode:04d} is missing: {checkpoint}"
         )
+    # Published ep_NNNN directories are atomically renamed into place only
+    # after metadata.json and models.pt are written. Keep full inspection and
+    # artifact validation even when the training run is still active.
     _, calibration = load_com_capacity_reference()
     inspected = inspect_model_checkpoint(
         checkpoint,
@@ -320,6 +339,13 @@ def resolve_training_run_checkpoint(
         "training_seed": int(resolved["seed"]),
         "training_total_episodes": training_total,
         "checkpoint_episode": checkpoint_episode,
+        "training_run_status_at_evaluation": training_run_status,
+        "training_run_completed_at_evaluation": (
+            training_run_status == "COMPLETED"
+        ),
+        "interim_checkpoint_evaluation": (
+            training_run_status != "COMPLETED"
+        ),
         "checkpoint": checkpoint.resolve(),
         "checkpoint_metadata": inspected["metadata"],
         "checkpoint_artifact_provenance": artifact_provenance,

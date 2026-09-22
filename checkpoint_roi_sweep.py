@@ -10,6 +10,7 @@ import subprocess
 import uuid
 
 from evaluation_selection import (
+    TRAINING_CHECKPOINT_EVALUATION_FIELDS,
     resolve_checkpoint_episodes,
     resolve_roi_counts,
     resolve_training_run_checkpoint,
@@ -31,6 +32,9 @@ SUMMARY_FIELDS = (
     "method_id",
     "training_run_id",
     "checkpoint_episode",
+    "training_run_status_at_evaluation",
+    "training_run_completed_at_evaluation",
+    "interim_checkpoint_evaluation",
     "checkpoint_planned_total_episodes",
     "current_training_run_total_episodes",
     "horizon_extension_compatible",
@@ -227,7 +231,6 @@ def build_checkpoint_roi_sweep_plan(
                 context = resolve_training_run_checkpoint(
                     run_dir,
                     selected_checkpoint,
-                    require_run_metadata=True,
                 )
                 contexts[(run_dir, selected_checkpoint)] = context
             except Exception as exc:
@@ -266,6 +269,10 @@ def build_checkpoint_roi_sweep_plan(
                             "training_total_episodes"
                         ],
                         "checkpoint_episode": selected_checkpoint,
+                        **{
+                            field: context.get(field)
+                            for field in TRAINING_CHECKPOINT_EVALUATION_FIELDS
+                        },
                         "checkpoint_path": str(context["checkpoint"]),
                         **{
                             field: context.get(field)
@@ -355,6 +362,10 @@ def _summary_identity(point, *, status, result_directory=None):
         "checkpoint_episode": point["checkpoint_episode"],
         **{
             field: point.get(field)
+            for field in TRAINING_CHECKPOINT_EVALUATION_FIELDS
+        },
+        **{
+            field: point.get(field)
             for field in CHECKPOINT_HORIZON_COMPATIBILITY_FIELDS
         },
         "training_total_episodes": point["training_total_episodes"],
@@ -416,6 +427,10 @@ def _completed_summary(point, result):
             status="COMPLETED",
             result_directory=evaluated["output_directory"],
         ),
+        **{
+            field: evaluated.get(field)
+            for field in TRAINING_CHECKPOINT_EVALUATION_FIELDS
+        },
         "energy_efficiency_bit_per_joule": float(energy["value"]) * 1e6,
         "timely_useful_bits": timely_bits,
         "timely_useful_goodput_bps": timely_bits / horizon_seconds,

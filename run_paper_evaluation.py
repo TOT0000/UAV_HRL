@@ -24,7 +24,10 @@ def build_parser():
     parser.add_argument("method", choices=tuple(METHOD_REGISTRY))
     parser.add_argument(
         "--run-dir",
-        help="completed training run (omit only for the pure-random baseline)",
+        help=(
+            "training run containing the selected complete checkpoint "
+            "(omit only for the pure-random baseline)"
+        ),
     )
     parser.add_argument("--suite", required=True, choices=tuple(PAPER_EVALUATION_SUITES))
     parser.add_argument("--manifest")

@@ -15,6 +15,7 @@ from evaluation_metrics import write_evaluation_outputs
 from evaluation_selection import (
     DEFAULT_ENVIRONMENT_SIZES_M,
     DEFAULT_FIXED_ROI_COUNTS,
+    TRAINING_CHECKPOINT_EVALUATION_FIELDS,
     resolve_episode_horizons_s,
     resolve_environment_sizes_m,
     resolve_checkpoint_episodes,
@@ -455,6 +456,9 @@ def _no_checkpoint_context(method, evaluation_seed, run_directory):
         "training_seed": int(evaluation_seed),
         "checkpoint": None,
         "checkpoint_episode": None,
+        "training_run_status_at_evaluation": None,
+        "training_run_completed_at_evaluation": None,
+        "interim_checkpoint_evaluation": None,
         "training_run_id": None,
         "training_total_episodes": None,
         "expected_training_config": None,
@@ -690,6 +694,10 @@ def run_paper_evaluation(
         if checkpoint_required
         else _no_checkpoint_context(method, requested_manifest_seed, run_directory)
     )
+    checkpoint_evaluation_metadata = {
+        field: context.get(field)
+        for field in TRAINING_CHECKPOINT_EVALUATION_FIELDS
+    }
     is_formal_checkpoint = bool(
         checkpoint_required
         and context["checkpoint_episode"] == FORMAL_CHECKPOINT_EPISODE
@@ -731,6 +739,7 @@ def run_paper_evaluation(
             "training_history": str(history_path.resolve()),
             "checkpoint_required": True,
             "checkpoint_episode": context["checkpoint_episode"],
+            **checkpoint_evaluation_metadata,
             "checkpoint_path": str(context["checkpoint"]),
             "training_run_id": context["training_run_id"],
             "training_total_episodes": context["training_total_episodes"],
@@ -955,6 +964,16 @@ def run_paper_evaluation(
             )
         run_metadata = {
             **result["run_metadata"],
+            **checkpoint_evaluation_metadata,
+            "evaluation_runtime_provenance": {
+                **(
+                    result["run_metadata"].get(
+                        "evaluation_runtime_provenance"
+                    )
+                    or {}
+                ),
+                **checkpoint_evaluation_metadata,
+            },
             "semantic_suite": suite,
             "paper_sweep_point": point,
             "git_sha": git_sha,
@@ -1131,6 +1150,7 @@ def run_paper_evaluation(
                     "training_total_episodes"
                 ],
                 "checkpoint_episode": context["checkpoint_episode"],
+                **checkpoint_evaluation_metadata,
                 "checkpoint_path": (
                     str(context["checkpoint"]) if checkpoint_required else None
                 ),
@@ -1172,7 +1192,7 @@ def run_paper_evaluation(
                     for field in CHECKPOINT_HORIZON_COMPATIBILITY_FIELDS
                 },
                 **{
-                    field: result["run_metadata"].get(field)
+                    field: run_metadata.get(field)
                     for field in (
                         *CHECKPOINT_PROVENANCE_FIELDS,
                         *EVALUATION_PROVENANCE_FIELDS,
@@ -1224,6 +1244,7 @@ def run_paper_evaluation(
         "checkpoint_required": checkpoint_required,
         "checkpoint_path": str(context["checkpoint"]) if context["checkpoint"] else None,
         "checkpoint_episode": context["checkpoint_episode"],
+        **checkpoint_evaluation_metadata,
         "formal_checkpoint_episode": FORMAL_CHECKPOINT_EPISODE,
         "is_formal_checkpoint": is_formal_checkpoint,
         "evaluation_purpose": evaluation_purpose,
