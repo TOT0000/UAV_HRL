@@ -13,7 +13,7 @@ from visual_sensing import (
     SEARCH_DETECTION_OVERLAP_THRESHOLD, SearchFootprint,
     VS_PACKET_MAX_BITS,
     circle_polygon_intersection_area, search_detection_overlap_ratio,
-    search_footprint, vs_geometry,
+    search_footprint, vs_c10_edge_distances, vs_geometry,
     visual_sensing_metadata,
 )
 from centralized_movement import (
@@ -98,6 +98,39 @@ def test_visual_metadata_records_modes_and_no_resolution_thresholds():
         'vs': False,
     }
     assert 'FOV or FOV+COM -> VS camera' in metadata['camera_mode_selection']
+    assert metadata['b1'] == pytest.approx(
+        2.0 * VS_CAMERA.f_m / VS_CAMERA.image_width_m
+    )
+    assert metadata['b2'] == pytest.approx(
+        2.0 * VS_CAMERA.f_m / VS_CAMERA.image_length_m
+    )
+    assert 'b1*h+d' in metadata['c10_edge_distances']['d_left']
+    assert 'b2^2*h^2' in metadata['c10_edge_distances']['d_right']
+
+
+def test_c10_edge_distances_follow_independent_off_axis_formula():
+    h = 100.0
+    distance = 200.0
+    geometry = vs_geometry((distance, 0.0, h), (0.0, 0.0, 0.0))
+
+    f = VS_CAMERA.f_m
+    image_width = VS_CAMERA.image_width_m
+    image_length = VS_CAMERA.image_length_m
+    b1 = 2.0 * f / image_width
+    b2 = 2.0 * f / image_length
+    numerator = h * h + distance * distance
+    expected_left = numerator / (b1 * h + distance)
+    expected_right = numerator / math.sqrt(
+        b2 * b2 * h * h
+        + (1.0 + b2 * b2) * distance * distance
+    )
+
+    assert geometry.model_range_valid
+    assert geometry.b1 == pytest.approx(b1)
+    assert geometry.b2 == pytest.approx(b2)
+    assert vs_c10_edge_distances(geometry) == pytest.approx(
+        (expected_left, expected_right)
+    )
 
 
 def test_search_overlap_and_one_frozen_footprint():

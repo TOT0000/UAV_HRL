@@ -4,14 +4,14 @@ import numpy as np
 
 from HRL_task_aware import _interval_reward
 from Simulator import Simulator
-from centralized_movement import movement_constraint_penalties
+from centralized_movement import fov_task_geometry, movement_constraint_penalties
 from experiment_config import (
     METHOD_REGISTRY,
     S2U_COMMUNICATION_RANGE_M,
     MethodSpec,
     comparison_method_configuration,
 )
-from visual_sensing import VS_CAMERA
+from visual_sensing import VS_CAMERA, vs_c10_edge_distances
 
 
 class MovementConstraintPenaltyTest(unittest.TestCase):
@@ -60,6 +60,21 @@ class MovementConstraintPenaltyTest(unittest.TestCase):
             result["c10_penalty_mean"], 1.0 - expected_factor
         )
         self.assertEqual(result["c10_violated_pair_count"], 1)
+
+    def test_c9_boundary_has_finite_c10_geometry_and_is_sampled(self):
+        self.env.multi_tasks[1] = [self.fov_task]
+        limit = VS_CAMERA.b1 * 100.0
+        self._uav_position(1, 500.0 + limit, 500.0, 100.0)
+
+        geometry = fov_task_geometry(self.env, 1, self.fov_task)
+        edge_distances = vs_c10_edge_distances(geometry)
+        result = movement_constraint_penalties(self.env)
+
+        self.assertTrue(geometry.model_range_valid)
+        self.assertFalse(geometry.sensing_valid_now)
+        self.assertIsNotNone(edge_distances)
+        self.assertTrue(np.isfinite(edge_distances).all())
+        self.assertEqual(result["c10_sample_count"], 1)
 
     def test_com_range_boundaries_and_mean_aggregation(self):
         for sr_id, distance, uav_id in ((0, 200.0, 1), (1, 800.0, 2)):

@@ -3,7 +3,7 @@
 ## Active deterministic Search/VS contract
 
 The current visual contract is
-`single-footprint-full-roi-overlap10-passive-contributors-v5`. Both modes use the
+`single-footprint-full-roi-overlap10-passive-contributors-c10-b2-v6`. Both modes use the
 0.0156 m by 0.0235 m image plane. Search uses a 0.0175 m focal length and a
 fixed nadir footprint; VS keeps the 0.035 m focal length and the existing
 oblique camera aimed at the assigned ROI. The deterministic region/frontier
@@ -143,7 +143,7 @@ not used by Search production paths.
   is cross-track, and nadir uses +x bearing. The resulting polygon rotates with
   bearing. Circle/polygon overlap uses deterministic analytical triangle/sector
   edge integration, with no bitmap, Monte Carlo, or added dependency.
-- The returned result contains horizontal distance, relative altitude, b1,
+- The returned result contains horizontal distance, relative altitude, b1, b2,
   model-range validity, sensing validity, polygon, area, raw I, coverage, G,
   Q, pair score, and geometry diagnostics. Invalid poses return I=c=Q=0.
   The exact inclusive `d=b1*z_relative` boundary has a horizontal corner ray;
@@ -152,7 +152,10 @@ not used by Search production paths.
 - `I=ROI_area/footprint_area` uses the same polygon as coverage and remains
   unsaturated. `Q=c*min(I,1)` and `G=min(1,b1*z_relative/(d+1e-12))` determine
   `pair_score=0.8*Q+0.2*G`. Assignment keeps this raw score. Movement C9 uses
-  `1-G`; C10 uses the finite along-tilt margins only after C9 is satisfied.
+  `1-G`; C10 uses the finite edge distances
+  `d_L=(h^2+d^2)/(b1*h+d)` and
+  `d_R=(h^2+d^2)/sqrt(b2^2*h^2+(1+b2^2)*d^2)` only after C9 is satisfied,
+  where `b1=2*f/image_width` and `b2=2*f/image_length`.
 
 `run_experiment.py`, `comparison_experiment.py`, `paper_evaluation.py` and their
 CLI/thin training wrappers all enter `HRL_task_aware.train`. All 16 registered

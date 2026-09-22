@@ -14,6 +14,10 @@ class CameraConfiguration:
     def b1(self):
         return 2 * self.f_m / self.image_width_m
 
+    @property
+    def b2(self):
+        return 2 * self.f_m / self.image_length_m
+
 
 IMAGE_PLANE_WIDTH_M = 0.0156
 IMAGE_PLANE_LENGTH_M = 0.0235
@@ -37,7 +41,7 @@ VS_PACKET_MAX_BITS = 31_600.0
 VS_QUALITY_WEIGHT = 0.8
 VS_PROXIMITY_WEIGHT = 0.2
 VISUAL_SENSING_CONTRACT_VERSION = (
-    "single-footprint-full-roi-overlap10-passive-contributors-v5"
+    "single-footprint-full-roi-overlap10-passive-contributors-c10-b2-v6"
 )
 SEARCH_DETECTION_OVERLAP_THRESHOLD = 0.10
 DISTANCE_EPSILON_M = 1e-9
@@ -90,11 +94,17 @@ def visual_sensing_metadata():
         "pair_score": "0.8 * coverage * min(I,1) + 0.2 * G",
         "proximity": "min(1,b1*relative_altitude/(horizontal_distance+1e-12))",
         "geometry_validity": "d2D <= b1*relative_altitude; positive altitude; all corner rays downward",
-        "c10_edge_distances": (
-            "visual_sensing.vs_c10_edge_distances from the same b1, relative "
-            "altitude, and horizontal distance"
-        ),
+        "c10_edge_distances": {
+            "source": "visual_sensing.vs_c10_edge_distances",
+            "d_left": "(h^2+d^2)/(b1*h+d)",
+            "d_right": (
+                "(h^2+d^2)/sqrt(b2^2*h^2+(1+b2^2)*d^2)"
+            ),
+            "h": "relative_altitude",
+            "d": "horizontal_distance",
+        },
         "b1": VS_CAMERA.b1,
+        "b2": VS_CAMERA.b2,
         "distance_epsilon_m": DISTANCE_EPSILON_M,
         "singular_ray_epsilon": SINGULAR_RAY_EPSILON,
         "assignment_eligibility": "independent of sensing_valid_now; existing target/role/energy constraints",
@@ -246,6 +256,7 @@ class VSGeometry:
     horizontal_distance: float
     relative_altitude: float
     b1: float
+    b2: float
     model_range_valid: bool
     sensing_valid_now: bool
     polygon: tuple
@@ -277,17 +288,36 @@ def vs_c10_edge_distances(geometry, epsilon=1e-12):
     h = float(geometry.relative_altitude)
     distance = float(geometry.horizontal_distance)
     b1 = float(geometry.b1)
+    b2 = float(geometry.b2)
     epsilon = float(epsilon)
     numerator = h * h + distance * distance
-    denominators = (b1 * h + distance, b1 * h - distance)
+    left_denominator = b1 * h + distance
+    right_radicand = (
+        b2 * b2 * h * h
+        + (1.0 + b2 * b2) * distance * distance
+    )
     if (
-        not np.isfinite((numerator, *denominators, epsilon)).all()
+        not np.isfinite(
+            (h, distance, b1, b2, numerator, left_denominator,
+             right_radicand, epsilon)
+        ).all()
+        or h <= 0.0
+        or distance < 0.0
+        or b1 <= 0.0
+        or b2 <= 0.0
         or numerator < 0.0
         or epsilon <= 0.0
-        or any(value <= epsilon for value in denominators)
+        or left_denominator <= epsilon
+        or right_radicand <= 0.0
     ):
         return None
-    distances = tuple(numerator / value for value in denominators)
+    right_denominator = math.sqrt(right_radicand)
+    if not math.isfinite(right_denominator) or right_denominator <= epsilon:
+        return None
+    distances = (
+        numerator / left_denominator,
+        numerator / right_denominator,
+    )
     if not np.isfinite(distances).all() or any(value < 0.0 for value in distances):
         return None
     return distances
@@ -311,7 +341,8 @@ def vs_geometry(
     range_valid = False
 
     def invalid(reason):
-        return VSGeometry(distance, altitude, camera.b1, range_valid, False,
+        return VSGeometry(distance, altitude, camera.b1, camera.b2,
+                          range_valid, False,
                           (), 0.0, 0.0, 0.0, proximity, {"reason": reason})
 
     if uav.shape != (3,) or roi.shape != (3,) or not np.isfinite((uav, roi)).all():
@@ -359,7 +390,8 @@ def vs_geometry(
     polygon = tuple(tuple(map(float, point+roi[:2])) for point in vertices)
     if not np.isfinite(polygon).all() or not math.isfinite(quantity):
         return invalid("non_finite_geometry")
-    return VSGeometry(distance, altitude, camera.b1, True, True, polygon, area,
-                      quantity, min(max(coverage,0.0),1.0), proximity,
+    return VSGeometry(distance, altitude, camera.b1, camera.b2, True, True,
+                      polygon, area, quantity,
+                      min(max(coverage,0.0),1.0), proximity,
                       {"reason": "valid", "minimum_downward_ray": min(margins),
                        "bearing_radians": math.atan2(bearing[1],bearing[0])})

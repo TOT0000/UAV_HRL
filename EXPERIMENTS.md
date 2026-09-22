@@ -261,7 +261,10 @@ Outside `d_horizontal <= b1*z_relative`, or with invalid/singular rays,
 ray, so it is model-range-valid but sensing-invalid; G remains one. There is
 no coverage threshold. The C9 penalty is `mean(1-G)` over assigned FOV pairs.
 C10 is evaluated only for C9-valid pairs with finite `d_L,d_R`, as
-`mean(1-clip(min(d_L,d_R)/(r_ROI+epsilon),0,1))`; it remains a soft movement
+`mean(1-clip(min(d_L,d_R)/(r_ROI+epsilon),0,1))`, where
+`d_L=(h^2+d^2)/(b1*h+d)`,
+`d_R=(h^2+d^2)/sqrt(b2^2*h^2+(1+b2^2)*d^2)`, and
+`b2=2*f/image_length`; it remains a soft movement
 constraint and does not change partial-coverage packet generation.
 
 The independent traffic-model maximum is exactly 31,600 bits. Assigned VS uses

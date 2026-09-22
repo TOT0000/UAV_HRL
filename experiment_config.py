@@ -328,6 +328,9 @@ def task_potential_contract_metadata():
         },
         "c10": {
             "definition": "mean(1 - clip(min(d_L,d_R)/(roi_radius+epsilon),0,1))",
+            "edge_distances": visual_sensing_metadata()["c10_edge_distances"],
+            "b1": visual_sensing_metadata()["b1"],
+            "b2": visual_sensing_metadata()["b2"],
             "population": "currently assigned C9-valid FOV pairs with finite geometry",
             "soft_constraint": True,
         },
