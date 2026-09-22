@@ -1,4 +1,4 @@
-"""Routing-agent factory for safe-DDQN, controlled DQN, and random routing."""
+"""Routing-agent factory for safe-DDQN, controlled DQN/DDQN, and random routing."""
 
 from __future__ import annotations
 
@@ -28,6 +28,7 @@ class ControlledDQN:
         lr=ROUTING_LEARNING_RATE,
         rng_streams=None,
         master_seed=0,
+        double_dqn=False,
     ):
         self.rng_streams = rng_streams or NamedRNGStreams(master_seed)
         self.exploration_rng = self.rng_streams.numpy("standard_dqn_exploration")
@@ -43,6 +44,7 @@ class ControlledDQN:
         self.tau = float(tau)
         self.learning_rate = float(lr)
         self.action_dim = int(action_dim)
+        self.double_dqn = bool(double_dqn)
         self.loss_log = []
         self.num_training = 0
         self.target_update_count = 0
@@ -87,10 +89,17 @@ class ControlledDQN:
     @torch.no_grad()
     def _standard_targets(self, next_state, reward, not_done):
         legal = self._routing_action_mask(next_state)
-        target_values = self.target_q_network(next_state).masked_fill(
-            ~legal, float("-inf")
-        )
-        next_values = target_values.max(dim=1).values
+        target_values = self.target_q_network(next_state)
+        if getattr(self, "double_dqn", False):
+            online_values = self.q_network(next_state).masked_fill(
+                ~legal, float("-inf")
+            )
+            next_actions = online_values.argmax(dim=1, keepdim=True)
+            next_values = target_values.gather(1, next_actions).squeeze(1)
+        else:
+            next_values = target_values.masked_fill(
+                ~legal, float("-inf")
+            ).max(dim=1).values
         return reward.squeeze(1) + not_done.squeeze(1) * self.gamma * next_values
 
     def train(self, replay_buffer, batch_size=64):
@@ -117,6 +126,17 @@ class ControlledDQN:
             )
         self.target_update_count += 1
         self.reward_target_update_count += 1
+
+
+class ControlledDDQN(ControlledDQN):
+    """Vanilla masked Double DQN without safe-DDQN cost machinery."""
+
+    routing_agent_kind = "ddqn"
+
+    def __init__(self, *args, **kwargs):
+        if "double_dqn" in kwargs:
+            raise TypeError("ControlledDDQN fixes double_dqn=True")
+        super().__init__(*args, double_dqn=True, **kwargs)
 
 
 class RandomRoutingController:
@@ -165,6 +185,10 @@ def create_routing_agent(
         )
     if method_spec.routing == "dqn":
         return ControlledDQN(
+            state_dim, action_dim, rng_streams=rng_streams, master_seed=master_seed
+        )
+    if method_spec.routing == "ddqn":
+        return ControlledDDQN(
             state_dim, action_dim, rng_streams=rng_streams, master_seed=master_seed
         )
     if method_spec.routing == "random":

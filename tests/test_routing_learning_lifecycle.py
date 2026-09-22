@@ -11,7 +11,12 @@ from experiment_config import (
     routing_agent_configuration,
 )
 from HRL_task_aware import _select_routing_actions, formal_training_config
-from routing_agents import ControlledDQN, RandomRoutingController, create_routing_agent
+from routing_agents import (
+    ControlledDDQN,
+    ControlledDQN,
+    RandomRoutingController,
+    create_routing_agent,
+)
 from routing_lifecycle import RoutingLearnerLifecycle
 from utils_update_v2 import ReplayBufferDiscrete
 
@@ -167,7 +172,7 @@ class RoutingCadenceTest(unittest.TestCase):
 class StrategyScopeTest(unittest.TestCase):
     def test_every_registry_method_uses_strategy_driven_scope(self):
         config = formal_training_config(1500)
-        self.assertEqual(len(METHOD_REGISTRY), 16)
+        self.assertEqual(len(METHOD_REGISTRY), 17)
         for method_key in METHOD_REGISTRY:
             with self.subTest(method=method_key):
                 method = MethodSpec.parse(method_key)
@@ -180,11 +185,11 @@ class StrategyScopeTest(unittest.TestCase):
                 )
                 self.assertEqual(
                     routing["routing_learner_enabled"],
-                    method.routing in {"safe_ddqn", "dqn"},
+                    method.routing in {"safe_ddqn", "dqn", "ddqn"},
                 )
                 self.assertEqual(
                     exploration["routing_epsilon_enabled"],
-                    method.routing in {"safe_ddqn", "dqn"},
+                    method.routing in {"safe_ddqn", "dqn", "ddqn"},
                 )
                 if method.routing == "random":
                     agent = create_routing_agent(method, 42, 3)
@@ -194,6 +199,11 @@ class StrategyScopeTest(unittest.TestCase):
                 elif method.routing == "dqn":
                     agent = create_routing_agent(method, 42, 3)
                     self.assertIsInstance(agent, ControlledDQN)
+                    self.assertFalse(hasattr(agent, "cost_network"))
+                elif method.routing == "ddqn":
+                    agent = create_routing_agent(method, 42, 3)
+                    self.assertIsInstance(agent, ControlledDDQN)
+                    self.assertTrue(agent.double_dqn)
                     self.assertFalse(hasattr(agent, "cost_network"))
                 else:
                     self.assertEqual(method.routing, "safe_ddqn")

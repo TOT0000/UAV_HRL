@@ -18,6 +18,7 @@ NEW_PAPER_METHODS = (
     "ddpg_dinkelbach_wo_ta",
     "td3_dinkelbach_random_routing",
     "td3_dinkelbach_dqn_wo_ta",
+    "td3_dinkelbach_ddqn",
 )
 
 
@@ -40,7 +41,7 @@ class PaperMethodSmokeTest(unittest.TestCase):
             random_seed=20260817,
         )
 
-    def test_four_methods_train_and_model_checkpoint_round_trip(self):
+    def test_methods_train_and_model_checkpoint_round_trip(self):
         for method_id in NEW_PAPER_METHODS:
             with self.subTest(method=method_id), tempfile.TemporaryDirectory() as temp_dir:
                 root = Path(temp_dir) / "checkpoints"
@@ -86,8 +87,11 @@ class PaperMethodSmokeTest(unittest.TestCase):
                     self.assertEqual(networks["routing_agent"], {"kind": "random"})
                     self.assertFalse((full / "routing_replay.npz").exists())
                     self.assertEqual(training["routing_replay_size"], 0)
-                elif method.routing == "dqn":
+                elif method.routing in {"dqn", "ddqn"}:
                     self.assertNotIn("cost_network", networks["routing_agent"])
+                    self.assertEqual(
+                        networks["routing_agent"]["kind"], method.routing
+                    )
 
                 evaluation_manifest = generate_manifest(
                     "validation", 8123, 1, num_gt=2

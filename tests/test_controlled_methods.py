@@ -58,6 +58,7 @@ EXISTING_METHODS = (
 NEW_METHODS = (
     "td3_dinkelbach_wo_ta",
     "td3_dinkelbach_dqn",
+    "td3_dinkelbach_ddqn",
     "kkm_random_action_random_routing",
     "km_td3_dinkelbach",
     "random_assignment_td3_dinkelbach",
@@ -70,7 +71,7 @@ EXPECTED_METHODS = EXISTING_METHODS + NEW_METHODS
 
 
 class ControlledMethodRegistryTest(unittest.TestCase):
-    def test_registry_contains_and_parses_all_sixteen_methods(self):
+    def test_registry_contains_and_parses_all_methods(self):
         self.assertEqual(tuple(METHOD_REGISTRY), EXPECTED_METHODS)
         self.assertEqual(
             [MethodSpec.parse(key).method_key for key in EXPECTED_METHODS],
@@ -212,6 +213,9 @@ class ControlledMethodRegistryTest(unittest.TestCase):
             ),
             "td3_dinkelbach_dqn": (
                 "k_km", "td3", "dinkelbach", "full", "dqn", 2
+            ),
+            "td3_dinkelbach_ddqn": (
+                "k_km", "td3", "dinkelbach", "full", "ddqn", 2
             ),
             "kkm_random_action_random_routing": (
                 "k_km", "random", "ratio", "full", "random", 2

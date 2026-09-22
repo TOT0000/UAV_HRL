@@ -564,6 +564,7 @@ class FovOverlapEmaLifecycleTest(unittest.TestCase):
             "td3_dinkelbach": ("safe_ddqn", "full"),
             "td3_dinkelbach_wo_ta": ("safe_ddqn", "masked"),
             "td3_dinkelbach_dqn": ("dqn", "full"),
+            "td3_dinkelbach_ddqn": ("ddqn", "full"),
             "td3_dinkelbach_dqn_wo_ta": ("dqn", "masked"),
         }
         ema_indices = [

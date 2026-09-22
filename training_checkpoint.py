@@ -840,7 +840,7 @@ def _routing_agent_configuration(agent, resolved_configuration=None):
         "learning_rate": getattr(agent, "learning_rate", None),
         "target_update_scope": (
             "after_each_optimizer_event"
-            if kind in {"safe_ddqn", "dqn"}
+            if kind in {"safe_ddqn", "dqn", "ddqn"}
             else None
         ),
         "routing_optimizer_update_count": int(agent.num_training),
@@ -993,9 +993,9 @@ def _network_states(td3, ddqn):
             "target_cost_network": ddqn.target_cost_network.state_dict(),
             "constraint_state": ddqn.constraint_state(),
         }
-    elif routing_kind == "dqn":
+    elif routing_kind in {"dqn", "ddqn"}:
         states["routing_agent"] = {
-            "kind": "dqn",
+            "kind": routing_kind,
             "q_network": ddqn.q_network.state_dict(),
             "target_q_network": ddqn.target_q_network.state_dict(),
         }
@@ -1043,9 +1043,9 @@ def _load_network_states(payload, td3, ddqn):
                 "legacy safe-DDQN checkpoint lacks adaptive constraint state"
             )
         ddqn.load_constraint_state(ddqn_state["constraint_state"])
-    elif routing_kind == "dqn":
+    elif routing_kind in {"dqn", "ddqn"}:
         state = payload.get("routing_agent") or {}
-        if state.get("kind") != "dqn" or "cost_network" in state:
+        if state.get("kind") != routing_kind or "cost_network" in state:
             raise RuntimeError("checkpoint routing agent kind is incompatible")
         ddqn.q_network.load_state_dict(state["q_network"])
         ddqn.target_q_network.load_state_dict(state["target_q_network"])
@@ -1175,8 +1175,10 @@ def _base_metadata(
             "movement_learning": kind in {"td3", "ddpg"},
             "movement_replay": kind in {"td3", "ddpg"},
             "target_policy_smoothing": kind == "td3",
-            "routing_learning": _routing_agent_kind(ddqn) in {"safe_ddqn", "dqn"},
-            "routing_replay": _routing_agent_kind(ddqn) in {"safe_ddqn", "dqn"},
+            "routing_learning": _routing_agent_kind(ddqn)
+            in {"safe_ddqn", "dqn", "ddqn"},
+            "routing_replay": _routing_agent_kind(ddqn)
+            in {"safe_ddqn", "dqn", "ddqn"},
         },
     }
     reward_mode = (
@@ -2155,7 +2157,7 @@ def _restore_movement_training_payload(agent, payload):
 
 def _routing_training_payload(agent):
     kind = _routing_agent_kind(agent)
-    if kind in {"safe_ddqn", "dqn"}:
+    if kind in {"safe_ddqn", "dqn", "ddqn"}:
         expected = int(agent.num_training)
         counters = {
             "target": int(agent.target_update_count),
@@ -2202,7 +2204,7 @@ def _routing_training_payload(agent):
                 "cost_target_update_count": int(agent.cost_target_update_count),
             },
         }
-    if kind == "dqn":
+    if kind in {"dqn", "ddqn"}:
         return {
             "routing_agent_optimizer": agent.optimizer.state_dict(),
             "routing_agent_state": state,
@@ -2230,9 +2232,9 @@ def _restore_routing_training_payload(agent, payload):
             state["cost_optimizer_update_count"]
         )
         agent.cost_target_update_count = int(state["cost_target_update_count"])
-    elif kind == "dqn":
+    elif kind in {"dqn", "ddqn"}:
         state = payload.get("routing_agent_state") or {}
-        if state.get("kind") != "dqn":
+        if state.get("kind") != kind:
             raise RuntimeError("checkpoint routing agent kind is incompatible")
         agent.optimizer.load_state_dict(payload["routing_agent_optimizer"])
     elif kind == "random":
@@ -2251,7 +2253,7 @@ def _restore_routing_training_payload(agent, payload):
         state["reward_optimizer_update_count"]
     )
     agent.reward_target_update_count = int(state["reward_target_update_count"])
-    if kind in {"safe_ddqn", "dqn"}:
+    if kind in {"safe_ddqn", "dqn", "ddqn"}:
         expected = int(agent.num_training)
         counters = {
             "target": int(agent.target_update_count),

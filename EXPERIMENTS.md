@@ -5,17 +5,20 @@ process. The registry keys are `td3_dinkelbach`, `ddpg_dinkelbach`,
 `td3_ratio`, `ddpg_ratio`, `random_action`,
 `td3_dinkelbach_no_task_potential`,
 `ddpg_dinkelbach_no_task_potential`, `td3_dinkelbach_wo_ta`,
-`td3_dinkelbach_dqn`, `kkm_random_action_random_routing`,
+`td3_dinkelbach_dqn`, `td3_dinkelbach_ddqn`,
+`kkm_random_action_random_routing`,
 `km_td3_dinkelbach`, `random_assignment_td3_dinkelbach`,
 `km_ddpg_dinkelbach`, `ddpg_dinkelbach_wo_ta`,
-`td3_dinkelbach_random_routing`, and `td3_dinkelbach_dqn_wo_ta`. All sixteen methods share
+`td3_dinkelbach_random_routing`, and `td3_dinkelbach_dqn_wo_ta`. All seventeen methods share
 16 UAVs, the common Simulator and synchronous movement flow,
 energy/delivery accounting, evaluation, and logging.
 
 The added baselines are orthogonal configurations of that shared flow. The
 `wo_ta` method keeps the 531-D/143-D layouts but zeros named task-assignment
 observation fields. The controlled DQN method replaces safe-DDQN with a masked
-standard DQN. The combined random baseline uses K-KM, the common projected
+standard DQN. `td3_dinkelbach_ddqn` keeps that method's full configuration but
+uses masked online-network action selection with target-network evaluation for
+its routing TD target. The combined random baseline uses K-KM, the common projected
 continuous movement domain, and uniform random routing over each slot's current
 effective mask. The assignment baselines use one FOV/COM KM round and two seeded
 random FOV/COM rounds, respectively.
@@ -57,6 +60,7 @@ python -X utf8 run_experiment.py td3_dinkelbach
 python -X utf8 run_experiment.py ddpg_ratio --smoke
 python -X utf8 run_experiment.py td3_dinkelbach_wo_ta --smoke
 python -X utf8 run_experiment.py td3_dinkelbach_dqn --smoke
+python -X utf8 run_experiment.py td3_dinkelbach_ddqn --smoke
 python -X utf8 run_experiment.py kkm_random_action_random_routing --smoke
 python -X utf8 run_experiment.py km_td3_dinkelbach --smoke
 python -X utf8 run_experiment.py random_assignment_td3_dinkelbach --smoke
@@ -109,7 +113,7 @@ The environment creates only Search, FOV, COM and Hovering task roles. It does
 not reserve UAVs for connectivity, create virtual communication targets, or
 alter assignment to repair a predicted topology. Packet forwarding remains a
 generic multi-hop routing function available to every UAV under the unchanged
-safe-DDQN, standard-DQN and random-routing contracts.
+safe-DDQN, standard-DQN, vanilla-DDQN and random-routing contracts.
 
 K-KM solves exactly two service stages at each existing new-RoI assignment
 boundary: one FOV matching followed by one COM matching. Both stages receive the
@@ -132,7 +136,7 @@ Relay diagnostics artifact.
   movement/channel/routing substeps per one-second movement interval; each
   routing slot contains exactly fifty 5 ms fading blocks
 - physical and effective routing masks recomputed in every routing slot for
-  safe-DDQN, controlled DQN, and random routing
+  safe-DDQN, controlled DQN, controlled DDQN, and random routing
 - safe-DDQN target violation probability `0.1`, initial `lambda_cost=0`, and
   `eta_c=0.01`; every episode uses one frozen multiplier for both executed and
   target actions, then updates it once with
@@ -317,7 +321,7 @@ mask, preserving policy-independent RNG draw counts. No `C_min`, outage/PER,
 HARQ, shadowing, or retransmission model is added.
 
 The range decision is frozen at the start of each 0.25 s routing slot and is
-shared by all fifty 5 ms service blocks in that slot. All sixteen registered
+shared by all fifty 5 ms service blocks in that slot. All seventeen registered
 methods use this same channel, range mask, COM activation, packet-service, and
 evaluation contract. `FOV_COM_PAIR_MAX_DISTANCE_M = 200 m` remains unchanged:
 it is a horizontal task-target compatibility rule for pairing FOV and COM, not

@@ -50,9 +50,10 @@ EXPECTED_SEMANTIC_FIGURES = (
 
 
 class PaperMethodRegistryTest(unittest.TestCase):
-    def test_registry_contains_the_exact_sixteen_methods(self):
-        self.assertEqual(len(METHOD_REGISTRY), 16)
+    def test_registry_contains_the_exact_methods(self):
+        self.assertEqual(len(METHOD_REGISTRY), 17)
         self.assertIn("kkm_random_action_random_routing", METHOD_REGISTRY)
+        self.assertIn("td3_dinkelbach_ddqn", METHOD_REGISTRY)
 
     def test_comparison_methods_are_orthogonal_combinations(self):
         km_ddpg = MethodSpec.parse("km_ddpg_dinkelbach")

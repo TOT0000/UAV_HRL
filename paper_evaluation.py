@@ -133,6 +133,24 @@ PAPER_EVALUATION_SUITES = {
     },
 }
 
+# A DDQN run is eligible everywhere the otherwise-identical DQN routing
+# baseline is eligible, without changing any suite's default method list.
+_EVALUATION_METHOD_BASELINES = {
+    "td3_dinkelbach_ddqn": "td3_dinkelbach_dqn",
+}
+
+
+def evaluation_method_supported(method_id, suite):
+    """Return suite eligibility without adding a method to suite defaults."""
+
+    suite = resolve_evaluation_suite(suite)
+    methods = PAPER_EVALUATION_SUITES[suite]["methods"]
+    method_id = str(method_id)
+    return (
+        method_id in methods
+        or _EVALUATION_METHOD_BASELINES.get(method_id) in methods
+    )
+
 DEPRECATED_SUITE_ALIASES = {
     "fig2_convergence": "training_ee_vs_episode",
     "fig3_trajectory": "uav_trajectory_snapshots",
@@ -639,7 +657,8 @@ def run_paper_evaluation(
         and allow_registered_fixed_roi_method
         and (method.learns_movement or method.learns_routing)
     )
-    if method.method_id not in definition["methods"] and not registry_fixed_roi:
+    method_supported = evaluation_method_supported(method.method_id, suite)
+    if not method_supported and not registry_fixed_roi:
         raise ValueError(f"{method.method_id} is not part of {suite}: {definition['methods']}")
 
     selected_checkpoint_episode = resolve_checkpoint_episodes(

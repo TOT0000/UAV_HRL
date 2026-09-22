@@ -108,9 +108,9 @@ class CheckpointEvaluationProvenanceTest(unittest.TestCase):
         }
         return metadata
 
-    def test_all_16_registry_methods_have_strategy_typed_lifecycle(self):
-        counts = {"safe_ddqn": 0, "dqn": 0, "random": 0}
-        self.assertEqual(len(METHOD_REGISTRY), 16)
+    def test_all_registry_methods_have_strategy_typed_lifecycle(self):
+        counts = {"safe_ddqn": 0, "dqn": 0, "ddqn": 0, "random": 0}
+        self.assertEqual(len(METHOD_REGISTRY), 17)
         for method_id in METHOD_REGISTRY:
             with self.subTest(method=method_id):
                 metadata = self._metadata(method_id)
@@ -132,7 +132,10 @@ class CheckpointEvaluationProvenanceTest(unittest.TestCase):
                     )
                 else:
                     self.assertIsNone(provenance["routing_lifecycle"])
-        self.assertEqual(counts, {"safe_ddqn": 12, "dqn": 2, "random": 2})
+        self.assertEqual(
+            counts,
+            {"safe_ddqn": 12, "dqn": 2, "ddqn": 1, "random": 2},
+        )
 
     def test_schema6_learned_model_requires_explicit_incomplete_opt_in(self):
         metadata = self._metadata("td3_dinkelbach")

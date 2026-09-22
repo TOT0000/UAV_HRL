@@ -339,6 +339,7 @@ class DesignDatasetIntegrationTest(unittest.TestCase):
             "ddpg_dinkelbach_no_task_potential",
             "td3_dinkelbach_wo_ta",
             "td3_dinkelbach_dqn",
+            "td3_dinkelbach_ddqn",
             "kkm_random_action_random_routing",
             "km_td3_dinkelbach",
             "random_assignment_td3_dinkelbach",

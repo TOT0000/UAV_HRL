@@ -142,6 +142,7 @@ METHOD_DISPLAY_NAMES = MappingProxyType(
         "kkm_random_action_random_routing": "K-KM+Rand+Rand",
         "td3_dinkelbach_random_routing": "Random",
         "td3_dinkelbach_dqn": "DQN",
+        "td3_dinkelbach_ddqn": "K-KM + TD3 + DDQN",
         "td3_dinkelbach_dqn_wo_ta": "DQN w/o task-aware",
     }
 )
@@ -190,26 +191,31 @@ PLOT_STYLES = MappingProxyType(
         "task_type_delay_vs_arrival_rate": {
             "td3_dinkelbach_random_routing": {"color": "#187600"},
             "td3_dinkelbach_dqn": {"color": "#F39C00"},
+            "td3_dinkelbach_ddqn": {"color": "#D35400"},
             "td3_dinkelbach": {"color": "red"},
         },
         "com_task_delay_vs_arrival_rate": {
             "td3_dinkelbach_random_routing": {"color": "#187600"},
             "td3_dinkelbach_dqn": {"color": "#F39C00"},
+            "td3_dinkelbach_ddqn": {"color": "#D35400"},
             "td3_dinkelbach": {"color": "red"},
         },
         "vs_task_delay_vs_arrival_rate": {
             "td3_dinkelbach_random_routing": {"color": "#187600"},
             "td3_dinkelbach_dqn": {"color": "#F39C00"},
+            "td3_dinkelbach_ddqn": {"color": "#D35400"},
             "td3_dinkelbach": {"color": "red"},
         },
         "task_type_delay_violation_vs_target_delay": {
             "td3_dinkelbach_random_routing": {"label": "Random", "color": "#187600", "marker": "*"},
             "td3_dinkelbach_dqn": {"label": "DQN", "color": "#F39C00", "marker": "s"},
+            "td3_dinkelbach_ddqn": {"label": "K-KM + TD3 + DDQN", "color": "#D35400", "marker": "D"},
             "td3_dinkelbach_wo_ta": {"label": "Our w/o task-aware", "color": "#243BFF", "marker": "^"},
             "td3_dinkelbach": {"label": "Our method", "color": "red", "marker": "8"},
         },
         "task_type_delay_vs_number_of_rois": {
             "td3_dinkelbach_random_routing": {"label": "Rand", "color": "#187600", "marker": "^"},
+            "td3_dinkelbach_ddqn": {"label": "K-KM + TD3 + DDQN", "color": "#D35400", "marker": "D"},
             "td3_dinkelbach_dqn_wo_ta": {"label": "DQN w/o task-aware", "color": "#C000C0", "marker": "s"},
             "td3_dinkelbach_wo_ta": {"label": "Our method w/o task-aware", "color": "#243BFF", "marker": "v"},
             "td3_dinkelbach": {"label": "Our method w/ task-aware", "color": "red", "marker": "*"},

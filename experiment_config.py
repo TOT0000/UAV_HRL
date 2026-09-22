@@ -450,6 +450,14 @@ _METHOD_DEFINITIONS = {
         "routing": "dqn",
         "label": "TD3 + Dinkelbach + controlled DQN routing",
     },
+    "td3_dinkelbach_ddqn": {
+        **_COMMON_METHOD,
+        "agent": "td3",
+        "movement": "centralized_td3",
+        "reward_mode": "dinkelbach",
+        "routing": "ddqn",
+        "label": "K-KM + TD3 + DDQN",
+    },
     "kkm_random_action_random_routing": {
         **_COMMON_METHOD,
         "agent": "random",
@@ -580,7 +588,7 @@ class MethodSpec:
 
     @property
     def learns_routing(self) -> bool:
-        return self.routing in {"safe_ddqn", "dqn"}
+        return self.routing in {"safe_ddqn", "dqn", "ddqn"}
 
     @property
     def fingerprint(self) -> str:

@@ -183,7 +183,7 @@ class InitialTopologyGeometryTest(unittest.TestCase):
         entry = generate_manifest("train", 20260817, 1, num_gt=4).episodes[0]
         expected_geometry = None
         expected_topology = None
-        self.assertEqual(len(METHOD_REGISTRY), 16)
+        self.assertEqual(len(METHOD_REGISTRY), 17)
         for method_id in METHOD_REGISTRY:
             with self.subTest(method=method_id):
                 env = Simulator(16, rng_streams=NamedRNGStreams(88))
