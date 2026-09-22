@@ -119,7 +119,7 @@ class PacketQosFlowTest(unittest.TestCase):
         )
         self.assertTrue(expired["done"])
         self.assertEqual(expired["reason"], "deadline")
-        self.assertEqual(missed["cost_by_sender"][0], 1.0)
+        self.assertEqual(missed["cost_by_sender"][0], 0.0)
         self.assertEqual(missed["timely_goodput_bits"], 0.0)
         self.assertEqual(missed["raw_final_hop_bits"], 50.0)
         self.assertEqual(expired_engine.deadline_drops, 1)
@@ -216,7 +216,7 @@ class PacketQosFlowTest(unittest.TestCase):
         self.assertEqual(packet["current"], 2)
         self.assertFalse(packet["done"])
 
-    def test_relay_that_cannot_wait_until_next_slot_is_charged_to_sender(self):
+    def test_relay_that_cannot_wait_until_next_slot_emits_one_packet_outcome(self):
         env = routing_env()
         engine = PacketEngine(num_uav=3, step_time=0.25)
         packet = engine.create_packet(0, "COM", 100.0, 0.0)
@@ -231,7 +231,7 @@ class PacketQosFlowTest(unittest.TestCase):
         self.assertIsNone(engine.get_hol_packet(2))
         self.assertTrue(packet["done"])
         self.assertEqual(packet["reason"], "deadline")
-        self.assertEqual(result["cost_by_sender"][0], 1.0)
+        self.assertEqual(result["cost_by_sender"][0], 0.0)
         self.assertEqual(result["cost_by_sender"][2], 0.0)
         self.assertEqual(engine.total_violated, 1)
         self.assertEqual(engine.com_violated, 1)
@@ -240,7 +240,7 @@ class PacketQosFlowTest(unittest.TestCase):
         self.assertEqual(result["outcomes"][0]["attributed_sender"], 0)
         self.assertEqual(result["outcomes"][0]["packet_id"], packet["id"])
 
-    def test_relay_violation_is_not_charged_to_receivers_own_action(self):
+    def test_relay_violation_does_not_use_sender_local_cost(self):
         env = routing_env()
         engine = PacketEngine(num_uav=3, step_time=0.25)
         incoming = engine.create_packet(0, "COM", 100.0, 0.0)
@@ -255,10 +255,10 @@ class PacketQosFlowTest(unittest.TestCase):
 
         self.assertTrue(incoming["done"])
         self.assertIs(engine.get_hol_packet(2), resident)
-        self.assertEqual(result["cost_by_sender"][0], 1.0)
+        self.assertEqual(result["cost_by_sender"][0], 0.0)
         self.assertEqual(result["cost_by_sender"][2], 0.0)
 
-    def test_resident_packet_expiration_is_charged_to_its_sender_action(self):
+    def test_resident_packet_expiration_is_reported_as_packet_outcome(self):
         env = routing_env()
         engine = PacketEngine(num_uav=3, step_time=0.25)
         resident = engine.create_packet(2, "COM", 100.0, 0.0)
@@ -269,7 +269,7 @@ class PacketQosFlowTest(unittest.TestCase):
 
         self.assertTrue(resident["done"])
         self.assertEqual(resident["reason"], "deadline")
-        self.assertEqual(result["cost_by_sender"][2], 1.0)
+        self.assertEqual(result["cost_by_sender"][2], 0.0)
         self.assertEqual(result["outcomes"][0]["attributed_sender"], 2)
 
     def test_timely_relay_arrival_enters_receiver_queue(self):

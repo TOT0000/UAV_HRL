@@ -43,14 +43,14 @@ class AssignmentUtilityTest(unittest.TestCase):
             ),
             mock.patch.object(
                 self.env,
-                "get_sr_uav_normalized_utility",
-                side_effect=[0.5, 1.0],
+                "get_sr_uav_capacity_mbps",
+                side_effect=[5.0, 10.0],
             ),
         ):
             problem = assigner.build_problem([0, 1], tasks)
 
         self.assertEqual([task.task_type for task in problem.tasks], ["FOV", "COM"])
-        np.testing.assert_allclose(problem.utility_matrix[:, 0], [0.0, 1.0])
+        np.testing.assert_allclose(problem.utility_matrix[:, 0], [0.4, 1.0])
         np.testing.assert_allclose(problem.utility_matrix[:, 1], [0.5, 1.0])
         self.assertTrue(problem.feasible_mask.all())
         np.testing.assert_allclose(problem.raw_fov_utility[:, 0], [0.4, 1.0])
@@ -86,14 +86,26 @@ class AssignmentUtilityTest(unittest.TestCase):
             problem = UAVAssigner(self.env).build_problem([0], [task])
         self.assertAlmostEqual(problem.raw_fov_utility[0, 0], 0.52)
         self.assertTrue(problem.feasible_mask[0, 0])
-        self.assertAlmostEqual(problem.utility_matrix[0, 0], 0.5)
+        self.assertAlmostEqual(problem.utility_matrix[0, 0], 1.0)
 
-    def test_normalization_uses_only_feasible_values_and_equal_values_are_neutral(self):
+    def test_normalization_uses_only_feasible_values_and_preserves_equal_maxima(self):
         raw = np.asarray([[5.0, -999.0], [5.0, 999.0]])
         feasible = np.asarray([[True, False], [True, False]])
         normalized = normalize_feasible_values(raw, feasible)
-        np.testing.assert_array_equal(normalized[:, 0], [0.5, 0.5])
+        np.testing.assert_array_equal(normalized[:, 0], [1.0, 1.0])
         np.testing.assert_array_equal(normalized[:, 1], [0.0, 0.0])
+
+    def test_maximum_normalization_preserves_small_positive_ordering(self):
+        normalized = normalize_feasible_values(
+            np.asarray([[0.01], [0.02]]),
+            np.asarray([[True], [True]]),
+        )
+        np.testing.assert_allclose(normalized[:, 0], [0.5, 1.0])
+        zeros = normalize_feasible_values(
+            np.zeros((2, 2)), np.asarray([[True, False], [True, False]])
+        )
+        self.assertTrue(np.isfinite(zeros).all())
+        np.testing.assert_array_equal(zeros, 0.0)
 
     def test_dummy_prevents_an_infeasible_task_from_being_written(self):
         selected = solve_assignment_with_dummies(

@@ -189,9 +189,9 @@ class DesignDatasetIntegrationTest(unittest.TestCase):
 
     def test_two_episodes_produce_120_ordered_joint_transitions(self):
         arrays = self.arrays_one
-        self.assertEqual(DESIGN_DATASET_SCHEMA_VERSION, 8)
-        self.assertEqual(self.metadata_one["schema_version"], 8)
-        self.assertEqual(self.metadata_one["checkpoint_schema_version"], 31)
+        self.assertEqual(DESIGN_DATASET_SCHEMA_VERSION, 9)
+        self.assertEqual(self.metadata_one["schema_version"], 9)
+        self.assertEqual(self.metadata_one["checkpoint_schema_version"], 33)
         self.assertEqual(self.metadata_one["scenario_schema_version"], "uav-hrl-scenario-v8")
         self.assertEqual(self.metadata_one["num_uav"], 16)
         self.assertEqual(
@@ -237,10 +237,12 @@ class DesignDatasetIntegrationTest(unittest.TestCase):
             rtol=0.0,
             atol=1e-12,
         )
-        for terminal in (59, 119):
-            self.assertEqual(self.arrays_one["phi_search_t1"][terminal], 0.0)
-            self.assertEqual(self.arrays_one["phi_vs_t1"][terminal], 0.0)
-            self.assertEqual(self.arrays_one["phi_com_t1"][terminal], 0.0)
+        for name in (
+            "c9_penalty_mean",
+            "c10_penalty_mean",
+            "com_range_penalty_mean",
+        ):
+            self.assertTrue(np.isfinite(self.arrays_one[name]).all(), name)
 
     def test_repeated_collection_is_bitwise_deterministic(self):
         for name in ARRAY_NAMES:

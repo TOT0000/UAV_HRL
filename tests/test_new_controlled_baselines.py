@@ -361,9 +361,9 @@ class ControlledDQNTest(unittest.TestCase):
             np.ones(MOVEMENT_STATE_DIM),
             True,
             delivered_mbits=1.0, total_mobility_energy=2.0,
-            phi_search_t=0.0, phi_search_t1=0.0,
-            phi_vs_t=0.0, phi_vs_t1=0.0,
-            phi_com_t=0.0, phi_com_t1=0.0,
+            c9_penalty=0.0,
+            c10_penalty=0.0,
+            com_range_penalty=0.0,
         )
         routing_replay = ReplayBufferDiscrete(
             ROUTING_STATE_DIM, ROUTING_ACTION_DIM, max_size=8, n_step=1

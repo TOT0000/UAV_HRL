@@ -392,6 +392,7 @@ class SimpleRunnerLifecycleIntegrationTest(unittest.TestCase):
             with np.load(first / "joint_replay.npz", allow_pickle=False) as replay:
                 self.assertEqual(replay["current_movement_mask"].shape, (1, 16))
                 self.assertTrue(replay["movement_mask_valid"].all())
+                first_current_mask = replay["current_movement_mask"].copy()
                 np.testing.assert_array_equal(
                     replay["state"][:, list(MOVEMENT_TASK_ASSIGNMENT_INDICES)],
                     0.0,
@@ -403,7 +404,9 @@ class SimpleRunnerLifecycleIntegrationTest(unittest.TestCase):
                 self.assertEqual(replay["current_movement_mask"].shape, (2, 16))
                 self.assertEqual(replay["next_movement_mask"].shape, (2, 16))
                 self.assertTrue(replay["movement_mask_valid"].all())
-                self.assertTrue(replay["current_movement_mask"].any())
+                np.testing.assert_array_equal(
+                    replay["current_movement_mask"][:1], first_current_mask
+                )
                 np.testing.assert_array_equal(
                     replay["state"][:, list(MOVEMENT_TASK_ASSIGNMENT_INDICES)],
                     0.0,
@@ -602,13 +605,10 @@ class SimpleRunnerLifecycleIntegrationTest(unittest.TestCase):
                 objectives = replay["ratio_objective_reward"][:, 0]
                 delivered = replay["delivered_mbits"][:, 0]
                 energy = replay["total_mobility_energy"][:, 0]
-                shaping = (
-                    not_done * replay["phi_search_t1"][:, 0]
-                    - replay["phi_search_t"][:, 0]
-                    + not_done * replay["phi_vs_t1"][:, 0]
-                    - replay["phi_vs_t"][:, 0]
-                    + not_done * replay["phi_com_t1"][:, 0]
-                    - replay["phi_com_t"][:, 0]
+                constraint_reward = -(
+                    replay["c9_penalty"][:, 0]
+                    + replay["c10_penalty"][:, 0]
+                    + replay["com_range_penalty"][:, 0]
                 )
             np.testing.assert_array_equal(not_done, [1.0, 0.0] * 3)
             np.testing.assert_array_equal(objectives[::2], np.zeros(3))
@@ -624,7 +624,9 @@ class SimpleRunnerLifecycleIntegrationTest(unittest.TestCase):
                     places=6,
                 )
                 self.assertAlmostEqual(
-                    float((objectives[start:stop] + shaping[start:stop]).sum()),
+                    float(
+                        (objectives[start:stop] + constraint_reward[start:stop]).sum()
+                    ),
                     row["reward"],
                     places=5,
                 )

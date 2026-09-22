@@ -87,6 +87,27 @@ METRIC_COLUMNS = (
     "routing_stage_violation_probability",
     "routing_immediate_cost_sum",
     "pre_routing_violation_count",
+    "packet_path_decision_count",
+    "packet_path_cost_transition_count",
+    "packet_path_terminal_cost_sum",
+    "pre_routing_terminal_without_decision_count",
+    "movement_base_reward_sum",
+    "movement_final_reward_sum",
+    "c9_penalty_sum",
+    "c9_penalty_mean",
+    "c9_penalty_sample_count",
+    "c10_penalty_sum",
+    "c10_penalty_mean",
+    "c10_penalty_sample_count",
+    "com_range_penalty_sum",
+    "com_range_penalty_mean",
+    "com_range_penalty_sample_count",
+    "c9_satisfied_pair_count",
+    "c9_violated_pair_count",
+    "c10_satisfied_pair_count",
+    "c10_violated_pair_count",
+    "com_in_range_assigned_pair_count",
+    "com_out_of_range_assigned_pair_count",
 )
 
 OPTIONAL_METRIC_COLUMNS = {
@@ -141,6 +162,27 @@ DESCRIPTIVE_EPISODE_METRIC_COLUMNS = (
     "routing_stage_violation_probability",
     "routing_immediate_cost_sum",
     "pre_routing_violation_count",
+    "packet_path_decision_count",
+    "packet_path_cost_transition_count",
+    "packet_path_terminal_cost_sum",
+    "pre_routing_terminal_without_decision_count",
+    "movement_base_reward_sum",
+    "movement_final_reward_sum",
+    "c9_penalty_sum",
+    "c9_penalty_mean",
+    "c9_penalty_sample_count",
+    "c10_penalty_sum",
+    "c10_penalty_mean",
+    "c10_penalty_sample_count",
+    "com_range_penalty_sum",
+    "com_range_penalty_mean",
+    "com_range_penalty_sample_count",
+    "c9_satisfied_pair_count",
+    "c9_violated_pair_count",
+    "c10_satisfied_pair_count",
+    "c10_violated_pair_count",
+    "com_in_range_assigned_pair_count",
+    "com_out_of_range_assigned_pair_count",
 )
 
 METRIC_AGGREGATION_REGISTRY = {
@@ -679,7 +721,7 @@ def validate_formal_aggregation_rows(
 
     for row in episode_rows:
         for metric in METRIC_COLUMNS:
-            if row[metric] is None or row[metric] == "":
+            if row.get(metric) is None or row.get(metric) == "":
                 continue
             try:
                 value = float(row[metric])

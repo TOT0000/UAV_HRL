@@ -32,7 +32,7 @@ import numpy as np
 
 
 PACKET_ENGINE_CHECKPOINT_SCHEMA_VERSION = (
-    "episode-boundary-routing-stage-immediate-cost-v4"
+    "episode-boundary-unique-system-outcomes-packet-path-cost-v5"
 )
 
 
@@ -1768,11 +1768,10 @@ class PacketEngine:
         s2u_block_capacity_profiles=None,
         resolved_s2u_links=None,
     ):
-        """Serve frozen sender FIFOs and emit queue-snapshot immediate costs.
+        """Serve frozen sender FIFOs and emit unique packet outcomes.
 
-        The cost population is exactly the full UAV queue present when each
-        action was selected. Later S2U/relay arrivals and future violations
-        cannot mutate the returned cost.
+        Safe-DDQN cost attribution is linked separately by packet ID to the
+        packet's actual routing-decision chain.
         """
 
         current_time = float(current_time)
@@ -1827,14 +1826,15 @@ class PacketEngine:
                     "frozen backlog snapshots must match frozen HOL senders"
                 )
         del routing_transition_ids_by_sender
-        snapshot_owner_by_packet_id = {}
-        for sender, packet_ids in frozen_queue_packet_ids.items():
-            for packet_id in packet_ids:
-                if packet_id in snapshot_owner_by_packet_id:
-                    raise AssertionError(
-                        "a packet appears in multiple frozen UAV queue snapshots"
-                    )
-                snapshot_owner_by_packet_id[packet_id] = sender
+        frozen_packet_ids = [
+            packet_id
+            for packet_ids in frozen_queue_packet_ids.values()
+            for packet_id in packet_ids
+        ]
+        if len(frozen_packet_ids) != len(set(frozen_packet_ids)):
+            raise AssertionError(
+                "a packet appears in multiple frozen UAV queue snapshots"
+            )
         effective_masks = {}
         if self.enable_packet_diagnostic_artifacts:
             effective_masks = {
@@ -2086,7 +2086,6 @@ class PacketEngine:
                                 reason="late_delivered",
                             )
                             if violation is not None:
-                                result["cost_by_sender"][sender] += 1.0
                                 result["outcomes"].append(
                                     {
                                         "attributed_sender": sender,
@@ -2111,7 +2110,6 @@ class PacketEngine:
                                 reason="max_hops",
                             )
                             if violation is not None:
-                                result["cost_by_sender"][sender] += 1.0
                                 result["outcomes"].append(
                                     {
                                         "attributed_sender": sender,
@@ -2131,7 +2129,6 @@ class PacketEngine:
                             pkt, completion_time, sender=sender
                         )
                         if violation is not None:
-                            result["cost_by_sender"][sender] += 1.0
                             result["outcomes"].append(
                                 {
                                     "attributed_sender": sender,
@@ -2176,28 +2173,13 @@ class PacketEngine:
                     "packet": violation["packet"],
                 }
             )
-        # The learning cost is a sender-local, slot-immediate raw count over
-        # the full frozen UAV queue. Packets arriving through S2U or relay
-        # after the snapshot cannot affect any transition in this slot.
+        # Reward transitions retain sender-time causality.  The packet-path
+        # cost ledger consumes the outcomes below and never charges a queue
+        # owner merely because a packet happened to expire in this slot.
         result["cost_by_sender"] = defaultdict(float)
-        charged_packet_ids = set()
-        for outcome in result["outcomes"]:
-            if not bool(outcome["violated"]):
-                continue
-            packet_id = int(outcome["packet_id"])
-            sender = snapshot_owner_by_packet_id.get(packet_id)
-            if sender is None or packet_id in charged_packet_ids:
-                continue
-            result["cost_by_sender"][sender] += 1.0
-            charged_packet_ids.add(packet_id)
         for sender in frozen_hol:
             result["cost_by_sender"][sender] += 0.0
-        result["charged_snapshot_packet_ids"] = tuple(
-            sorted(charged_packet_ids)
-        )
-        self.routing_immediate_cost_sum += float(
-            sum(result["cost_by_sender"].values())
-        )
+        result["charged_snapshot_packet_ids"] = ()
         return result
 
     def inject_packets(

@@ -16,7 +16,12 @@ from visual_sensing import (
     search_footprint, vs_geometry,
     visual_sensing_metadata,
 )
-from centralized_movement import calculate_movement_potentials, fov_task_geometry, fov_task_metrics
+from centralized_movement import (
+    calculate_movement_potentials,
+    fov_task_geometry,
+    fov_task_metrics,
+    movement_constraint_penalties,
+)
 from experiment_config import METHOD_REGISTRY, MethodSpec, effective_training_config
 from HRL_task_aware import TrainingConfig, _mark_search_observations, _sensing_coverage
 from Packet_scheduler_v1 import PacketEngine, fov_physical_packet_size_bits
@@ -347,7 +352,6 @@ def test_assignment_outside_range_and_shared_quality_proximity_potential():
         g = fov_task_geometry(env,uid,descriptor)
         assert (g.image_quantity,g.coverage_ratio,g.quality) == (0,0,0)
         assert 0 < g.proximity < 1
-    assert calculate_movement_potentials(env,1)[1] == pytest.approx(problem.raw_fov_utility.mean())
     for uid, distance in ((1,0),(2,180)):
         env.uav_dict[uid].x_u = target.x+distance
         g = fov_task_geometry(env,uid,descriptor)
@@ -402,7 +406,8 @@ def test_all_method_assignments_share_visual_model(method_id):
     env.multi_tasks[uid] = [descriptor]
     g = fov_task_geometry(env,uid,descriptor)
     assert fov_task_metrics(env,uid,descriptor) == (g.coverage_ratio,g.image_quantity,g.sensing_valid_now)
-    assert calculate_movement_potentials(env,1)[1] == pytest.approx(g.pair_score)
+    penalties = movement_constraint_penalties(env)
+    assert penalties["c9_penalty_mean"] == pytest.approx(1.0 - g.proximity)
     cfg = effective_training_config(TrainingConfig(total_episodes=1),method)
     assert cfg['visual_sensing_configuration'] == visual_sensing_metadata()
     assert cfg['search_detection_overlap_threshold'] == pytest.approx(0.10)
@@ -447,9 +452,7 @@ def test_checkpoint_rejects_old_missing_or_changed_visual_contract():
     with pytest.raises(RuntimeError) as rejected:
         _validate_checkpoint_schema({'checkpoint_schema_version': CHECKPOINT_SCHEMA_VERSION-1})
     message = str(rejected.value)
-    assert 'movement-policy Search control' in message
-    assert 'deterministic region-frontier' in message
-    assert 'schema v31' in message
+    assert 'packet-path cost' in message
     current = {'checkpoint_schema_version': CHECKPOINT_SCHEMA_VERSION,
                'visual_sensing_contract_version': VISUAL_SENSING_CONTRACT_VERSION,
                'visual_sensing_configuration': visual_sensing_metadata()}

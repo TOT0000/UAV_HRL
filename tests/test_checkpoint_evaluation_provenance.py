@@ -49,10 +49,11 @@ class CheckpointEvaluationProvenanceTest(unittest.TestCase):
                 lambda_cost=2.75,
                 initial_lambda_cost=0.0,
                 normalized_eta_c=0.01,
-                dual_normalization_reference_packets=10_000,
-                qos_target_probability=0.05,
+                qos_target_probability=0.01,
+                system_dvp_target=0.01,
                 lambda_update_scope="episode_end",
-                cost_denominator="fixed_reference_packets",
+                lambda_update_mode="direct_episode_system_dvp",
+                cost_denominator="episode_system_eligible_packets",
                 mid_episode_checkpoint_supported=False,
             )
         experiment = {

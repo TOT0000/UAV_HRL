@@ -105,7 +105,7 @@ class Uav16ConfigurationContractTest(unittest.TestCase):
         data["schema_version"] = "uav-hrl-scenario-v2"
         with self.assertRaisesRegex(ValueError, "16-UAV.*incompatible"):
             ScenarioManifest.from_dict(data)
-        self.assertEqual(CHECKPOINT_SCHEMA_VERSION, 32)
+        self.assertEqual(CHECKPOINT_SCHEMA_VERSION, 33)
         with self.assertRaisesRegex(RuntimeError, "must be retrained"):
             _validate_checkpoint_schema({"checkpoint_schema_version": 24})
 
@@ -304,11 +304,11 @@ class StateAndAssignmentContractTest(unittest.TestCase):
                 delivered_mbits=0.25,
                 energy=100.0,
                 current_lambda=0.001,
-                gamma=1.0,
-                potentials_t=potentials,
-                potentials_t1=potentials,
-                done=False,
-                config=TrainingConfig(total_episodes=1),
+                constraint_penalties={
+                    "c9_penalty_mean": 0.0,
+                    "c10_penalty_mean": 0.0,
+                    "com_range_penalty_mean": 0.0,
+                },
             )
             observations.append(
                 (

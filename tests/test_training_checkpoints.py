@@ -757,12 +757,9 @@ class FullResumeCheckpointTest(unittest.TestCase):
                 done=done,
                 delivered_mbits=1.0 + index,
                 total_mobility_energy=2.0,
-                phi_search_t=0.1,
-                phi_search_t1=0.2,
-                phi_vs_t=0.3,
-                phi_vs_t1=0.4,
-                phi_com_t=0.5,
-                phi_com_t1=0.6,
+                c9_penalty=0.1,
+                c10_penalty=0.3,
+                com_range_penalty=0.5,
             )
         td3.update_joint(joint, current_lambda=0.1, batch_size=1)
         td3.update_joint(joint, current_lambda=0.1, batch_size=1)
@@ -790,6 +787,12 @@ class FullResumeCheckpointTest(unittest.TestCase):
             done=True,
             tag_gt=4,
             transition_id=101,
+        )
+        self.assertTrue(
+            routing.attach_cost_transition(100, routing_state, cost=0.25, done=False)
+        )
+        self.assertTrue(
+            routing.attach_cost_transition(101, routing_state, cost=0.5, done=True)
         )
         ddqn.train(routing, batch_size=1)
         ddqn.update_target()
@@ -1457,7 +1460,7 @@ class TrainingCliTest(unittest.TestCase):
         )
 
     def test_checkpoint_schema_is_explicit(self):
-        self.assertEqual(CHECKPOINT_SCHEMA_VERSION, 32)
+        self.assertEqual(CHECKPOINT_SCHEMA_VERSION, 33)
 
 
 if __name__ == "__main__":

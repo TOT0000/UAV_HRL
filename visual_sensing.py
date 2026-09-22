@@ -90,6 +90,10 @@ def visual_sensing_metadata():
         "pair_score": "0.8 * coverage * min(I,1) + 0.2 * G",
         "proximity": "min(1,b1*relative_altitude/(horizontal_distance+1e-12))",
         "geometry_validity": "d2D <= b1*relative_altitude; positive altitude; all corner rays downward",
+        "c10_edge_distances": (
+            "visual_sensing.vs_c10_edge_distances from the same b1, relative "
+            "altitude, and horizontal distance"
+        ),
         "b1": VS_CAMERA.b1,
         "distance_epsilon_m": DISTANCE_EPSILON_M,
         "singular_ray_epsilon": SINGULAR_RAY_EPSILON,
@@ -258,6 +262,35 @@ class VSGeometry:
     @property
     def pair_score(self):
         return VS_QUALITY_WEIGHT*self.quality + VS_PROXIMITY_WEIGHT*self.proximity
+
+
+def vs_c10_edge_distances(geometry, epsilon=1e-12):
+    """Return authoritative along-tilt C10 edge distances, or ``None``.
+
+    This derives the paper's ``d_L`` and ``d_R`` from the same canonical VS
+    geometry used for sensing and assignment, so reward code cannot drift to
+    a separate camera model.
+    """
+
+    if not isinstance(geometry, VSGeometry) or not geometry.model_range_valid:
+        return None
+    h = float(geometry.relative_altitude)
+    distance = float(geometry.horizontal_distance)
+    b1 = float(geometry.b1)
+    epsilon = float(epsilon)
+    numerator = h * h + distance * distance
+    denominators = (b1 * h + distance, b1 * h - distance)
+    if (
+        not np.isfinite((numerator, *denominators, epsilon)).all()
+        or numerator < 0.0
+        or epsilon <= 0.0
+        or any(value <= epsilon for value in denominators)
+    ):
+        return None
+    distances = tuple(numerator / value for value in denominators)
+    if not np.isfinite(distances).all() or any(value < 0.0 for value in distances):
+        return None
+    return distances
 
 
 def vs_geometry(

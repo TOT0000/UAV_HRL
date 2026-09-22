@@ -36,11 +36,11 @@ from centralized_movement import (
     MOVEMENT_STATE_DIM,
     apply_joint_movement_proposals,
     build_velocity_substep_proposals,
-    calculate_movement_potentials,
     decode_joint_velocity_commands,
     executed_joint_action_from_displacement,
     get_global_movement_state,
     movement_mask_from_state,
+    movement_constraint_penalties,
     movement_state_feature_schema,
     project_joint_action,
 )
@@ -678,19 +678,6 @@ def _routing_transition_done(episode_done, next_hol):
     return bool(episode_done or next_hol is None)
 
 
-def _attribute_routing_transition_cost(
-    routing_buffer, pending_transitions, sender, cost
-):
-    """Attribute cleanup cost before a pending transition enters replay."""
-
-    sender = int(sender)
-    value = float(cost)
-    if pending_transitions is not None and sender in pending_transitions:
-        pending_transitions[sender]["cost"] += value
-        return True
-    return routing_buffer.attribute_latest_cost(sender, value)
-
-
 def _finalize_pending_routing_transitions(
     routing_buffer,
     pending_transitions,
@@ -746,6 +733,10 @@ def _run_routing_slot(
     routing_q_score_context=None,
 ):
     del routing_masks
+    packet_cost_attribution = (
+        routing_transition_ledger is not None
+        and getattr(ddqn, "routing_agent_kind", None) == "safe_ddqn"
+    )
     if write_replay and int(getattr(routing_buffer, "n_step", -1)) != 1:
         raise ValueError("formal routing replay requires n_step=1")
     step_time = float(packet_engine.step_time)
@@ -771,6 +762,10 @@ def _run_routing_slot(
         task_type = violation["task_type"]
         if task_type in violation_stats:
             violation_stats[task_type]["deadline_violated_packets"] += 1
+        if write_replay and packet_cost_attribution:
+            routing_transition_ledger.finalize_packet(
+                violation["packet_id"], violated=True
+            )
     backlog_before = _active_backlog(packet_engine)
     start_of_slot_hol_by_sender = {
         int(uid): packet_engine.get_hol_packet(uid)
@@ -887,6 +882,11 @@ def _run_routing_slot(
                 state=states[uid],
                 action=int(next_hops.get(uid, uid)),
                 tag_gt=int(env.num_GT),
+                packet_id=(
+                    int(start_of_slot_hol_by_sender[uid]["id"])
+                    if packet_cost_attribution
+                    else None
+                ),
             )
     slot_result = packet_engine.serve_active_links(
         env,
@@ -906,40 +906,6 @@ def _run_routing_slot(
         s2u_block_capacity_profiles=env.active_s2u_capacity_profiles_mbps,
         resolved_s2u_links=resolved_s2u_links,
     )
-    frozen_owner_by_packet_id = {
-        packet_id: sender
-        for sender, packet_ids in frozen_queue_packet_ids_by_sender.items()
-        for packet_id in packet_ids
-    }
-    charged_packet_ids = set(slot_result["charged_snapshot_packet_ids"])
-    if not charged_packet_ids.issubset(frozen_owner_by_packet_id):
-        raise AssertionError("routing cost includes a packet outside the frozen queue")
-    if done:
-        # Horizon settlement happens after this transition is committed. Charge
-        # only still-active packets that belonged to this final action's frozen
-        # sender queue; finalize_episode will record their system/routing-stage
-        # outcomes without retroactively touching replay.
-        active_packet_ids = {
-            int(pkt["id"])
-            for pkt in packet_engine.get_active_packets()
-            if bool(pkt.get("routing_eligible", False))
-        }
-        terminal_snapshot_packet_ids = (
-            active_packet_ids.intersection(frozen_owner_by_packet_id)
-            - charged_packet_ids
-        )
-        for packet_id in terminal_snapshot_packet_ids:
-            slot_result["cost_by_sender"][
-                frozen_owner_by_packet_id[packet_id]
-            ] += 1.0
-        slot_result["terminal_snapshot_packet_ids"] = tuple(
-            sorted(terminal_snapshot_packet_ids)
-        )
-        packet_engine.routing_immediate_cost_sum += float(
-            len(terminal_snapshot_packet_ids)
-        )
-    else:
-        slot_result["terminal_snapshot_packet_ids"] = ()
     env.current_time = float(current_time) + step_time
     for outcome in slot_result["outcomes"]:
         task_type = outcome["task_type"]
@@ -949,13 +915,14 @@ def _run_routing_slot(
             violation_stats[task_type]["deadline_violated_packets"] += 1
         else:
             violation_stats[task_type]["timely_delivered_packets"] += 1
+        if write_replay and packet_cost_attribution:
+            routing_transition_ledger.finalize_packet(
+                outcome["packet_id"], violated=outcome["violated"]
+            )
 
     if write_replay:
         if routing_transition_ledger is not None:
             for uid, transition_id in routing_transition_ids.items():
-                routing_transition_ledger.set_cost(
-                    transition_id, slot_result["cost_by_sender"][uid]
-                )
                 routing_transition_ledger.set_reward(
                     transition_id, slot_result["reward_by_sender"][uid]
                 )
@@ -1186,21 +1153,11 @@ def _interval_reward(
     delivered_mbits,
     energy,
     current_lambda,
-    gamma,
-    potentials_t,
-    potentials_t1,
-    done,
-    config,
+    constraint_penalties,
     reward_mode="dinkelbach",
     task_potential_enabled=True,
     ratio_objective_reward=0.0,
 ):
-    next_values = (0.0, 0.0, 0.0) if done else potentials_t1
-    shaping = float(bool(task_potential_enabled)) * (
-        config.beta_search * (gamma * next_values[0] - potentials_t[0])
-        + config.beta_vs * (gamma * next_values[1] - potentials_t[1])
-        + config.beta_com * (gamma * next_values[2] - potentials_t[2])
-    )
     if reward_mode == "dinkelbach":
         objective = float(delivered_mbits) - float(current_lambda) * float(energy)
     elif reward_mode == "ratio":
@@ -1209,7 +1166,15 @@ def _interval_reward(
             objective = 0.0
     else:
         raise ValueError(f"unsupported reward mode: {reward_mode}")
-    return float(objective + shaping)
+    penalty = float(bool(task_potential_enabled)) * sum(
+        float(constraint_penalties[name])
+        for name in (
+            "c9_penalty_mean",
+            "c10_penalty_mean",
+            "com_range_penalty_mean",
+        )
+    )
+    return float(objective - penalty)
 
 
 def _is_checkpoint_episode(completed_episode, total_episodes, every):
@@ -1783,17 +1748,18 @@ def _evaluation_state_snapshot(
                     "not_done",
                     "delivered_mbits",
                     "total_mobility_energy",
-                    "phi_search_t",
-                    "phi_search_t1",
-                    "phi_vs_t",
-                    "phi_vs_t1",
-                    "phi_com_t",
-                    "phi_com_t1",
+                    "c9_penalty",
+                    "c10_penalty",
+                    "com_range_penalty",
                 ),
             ),
             "routing": replay_snapshot(
                 routing_replay,
-                ("state", "action", "next_state", "reward", "cost", "not_done", "tag_gt"),
+                (
+                    "state", "action", "next_state", "reward", "cost",
+                    "not_done", "cost_next_state", "cost_not_done",
+                    "cost_ready", "tag_gt",
+                ),
             ),
         },
         "update_counters": {
@@ -2547,6 +2513,8 @@ def train(
         executed_scenario_ids.append(scenario_id)
         env.prepare_initial_movement_interval()
         packet_engine.reset_packet_state()
+        if routing_transition_ledger is not None:
+            routing_transition_ledger.begin_episode()
         packet_engine.update_fov_ema(
             env, transition_marker=f"episode={episode},map_reset"
         )
@@ -2593,6 +2561,20 @@ def train(
         episode_energy = 0.0
         episode_reward = 0.0
         episode_routing_reward = 0.0
+        episode_c9_penalty_sum = 0.0
+        episode_c9_penalty_samples = 0
+        episode_c10_penalty_sum = 0.0
+        episode_c10_penalty_samples = 0
+        episode_com_range_penalty_sum = 0.0
+        episode_com_range_penalty_samples = 0
+        episode_c9_satisfied_pairs = 0
+        episode_c9_violated_pairs = 0
+        episode_c10_satisfied_pairs = 0
+        episode_c10_violated_pairs = 0
+        episode_com_in_range_pairs = 0
+        episode_com_out_of_range_pairs = 0
+        episode_base_movement_reward = 0.0
+        episode_final_movement_reward = 0.0
         episode_lambda_cost = (
             float(ddqn.lambda_cost)
             if method_spec.routing == "safe_ddqn"
@@ -2613,7 +2595,6 @@ def train(
         )
         expected_next_movement_state = None
         expected_next_movement_mask = None
-        expected_next_movement_potentials = None
 
         for interval in range(config.episode_seconds):
             if env.channel.movement_interval_index != interval:
@@ -2637,9 +2618,6 @@ def train(
                     method_spec.task_observation,
                     "movement",
                 )
-                potentials_t = calculate_movement_potentials(
-                    env, c_ref_com, backlog_bits=backlog_before
-                )
                 current_movement_mask = movement_mask_from_state(physical_state)
             except ValueError as exc:
                 if "duplicate" in str(exc):
@@ -2656,13 +2634,8 @@ def train(
                     raise AssertionError(
                         "movement replay next mask differs from the next policy mask"
                     )
-                if tuple(potentials_t) != tuple(expected_next_movement_potentials):
-                    raise AssertionError(
-                        "movement replay next potentials differ from the next transition"
-                    )
                 expected_next_movement_state = None
                 expected_next_movement_mask = None
-                expected_next_movement_potentials = None
 
             if method_spec.agent == "random":
                 raw_joint_action = sample_random_joint_action(
@@ -2899,9 +2872,7 @@ def train(
                         **copy.deepcopy(trajectory_history[-1]),
                     }
                 )
-            potentials_t1 = calculate_movement_potentials(
-                env, c_ref_com, backlog_bits=backlog_after
-            )
+            constraint_penalties = movement_constraint_penalties(env)
             physical_next_state = get_global_movement_state(
                 env,
                 packet_engine,
@@ -2917,13 +2888,9 @@ def train(
                 "movement",
             )
             next_movement_mask = movement_mask_from_state(physical_next_state)
-            effective_potentials_t1 = (
-                (0.0, 0.0, 0.0) if done else potentials_t1
-            )
             if not done:
                 expected_next_movement_state = next_state.copy()
                 expected_next_movement_mask = next_movement_mask.copy()
-                expected_next_movement_potentials = tuple(potentials_t1)
             terminal_joint_transitions += int(done)
             episode_delivered_mbits += interval_delivered_mbits
             episode_energy += interval_energy
@@ -2942,12 +2909,11 @@ def train(
                     delivered_mbits=interval_delivered_mbits,
                     total_mobility_energy=interval_energy,
                     ratio_objective_reward=ratio_objective_reward,
-                    phi_search_t=potentials_t[0],
-                    phi_search_t1=effective_potentials_t1[0],
-                    phi_vs_t=potentials_t[1],
-                    phi_vs_t1=effective_potentials_t1[1],
-                    phi_com_t=potentials_t[2],
-                    phi_com_t1=effective_potentials_t1[2],
+                    c9_penalty=constraint_penalties["c9_penalty_mean"],
+                    c10_penalty=constraint_penalties["c10_penalty_mean"],
+                    com_range_penalty=constraint_penalties[
+                        "com_range_penalty_mean"
+                    ],
                     current_movement_mask=current_movement_mask,
                     next_movement_mask=next_movement_mask,
                 )
@@ -2964,16 +2930,51 @@ def train(
                 interval_delivered_mbits,
                 interval_energy,
                 episode_lambda,
-                movement_agent.gamma,
-                potentials_t,
-                effective_potentials_t1,
-                done,
-                config,
+                constraint_penalties,
                 reward_mode=method_spec.reward_mode,
                 task_potential_enabled=method_spec.task_potential_enabled,
                 ratio_objective_reward=ratio_objective_reward,
             )
+            applied_penalty = float(method_spec.task_potential_enabled) * sum(
+                constraint_penalties[name]
+                for name in (
+                    "c9_penalty_mean",
+                    "c10_penalty_mean",
+                    "com_range_penalty_mean",
+                )
+            )
+            base_movement_reward = interval_reward + applied_penalty
             episode_reward += interval_reward
+            episode_base_movement_reward += base_movement_reward
+            episode_final_movement_reward += interval_reward
+            episode_c9_penalty_sum += constraint_penalties["c9_penalty_sum"]
+            episode_c9_penalty_samples += constraint_penalties["c9_sample_count"]
+            episode_c10_penalty_sum += constraint_penalties["c10_penalty_sum"]
+            episode_c10_penalty_samples += constraint_penalties["c10_sample_count"]
+            episode_com_range_penalty_sum += constraint_penalties[
+                "com_range_penalty_sum"
+            ]
+            episode_com_range_penalty_samples += constraint_penalties[
+                "com_range_sample_count"
+            ]
+            episode_c9_satisfied_pairs += constraint_penalties[
+                "c9_satisfied_pair_count"
+            ]
+            episode_c9_violated_pairs += constraint_penalties[
+                "c9_violated_pair_count"
+            ]
+            episode_c10_satisfied_pairs += constraint_penalties[
+                "c10_satisfied_pair_count"
+            ]
+            episode_c10_violated_pairs += constraint_penalties[
+                "c10_violated_pair_count"
+            ]
+            episode_com_in_range_pairs += constraint_penalties[
+                "com_in_range_pair_count"
+            ]
+            episode_com_out_of_range_pairs += constraint_penalties[
+                "com_out_of_range_pair_count"
+            ]
             if transition_observer is not None:
                 transition_observer(
                     {
@@ -2985,12 +2986,10 @@ def train(
                         "delivered_mbits": interval_delivered_mbits,
                         "total_mobility_energy_j": interval_energy,
                         "ratio_objective_reward": ratio_objective_reward,
-                        "phi_search_t": potentials_t[0],
-                        "phi_search_t1": effective_potentials_t1[0],
-                        "phi_vs_t": potentials_t[1],
-                        "phi_vs_t1": effective_potentials_t1[1],
-                        "phi_com_t": potentials_t[2],
-                        "phi_com_t1": effective_potentials_t1[2],
+                        **constraint_penalties,
+                        "base_movement_reward": base_movement_reward,
+                        "applied_constraint_penalty": applied_penalty,
+                        "final_movement_reward": interval_reward,
                         "movement_gamma": float(movement_agent.gamma),
                         "reward_at_checkpoint_lambda": interval_reward,
                         "checkpoint_lambda": (
@@ -3023,15 +3022,35 @@ def train(
 
         if pending_routing_transitions:
             raise AssertionError("terminal routing transitions remained pending")
+        terminal_outcome_start = len(packet_engine.packet_outcomes)
         packet_metrics = packet_engine.finalize_episode(
             float(config.episode_seconds)
         )
         if not evaluation and method_spec.learns_routing:
+            if method_spec.routing == "safe_ddqn":
+                for outcome in packet_engine.packet_outcomes[terminal_outcome_start:]:
+                    if bool(outcome.get("qos_eligible", False)):
+                        routing_transition_ledger.finalize_packet(
+                            outcome["packet_id"],
+                            violated=outcome["outcome"]
+                            in {"late_delivered", "expired_dropped"},
+                        )
             routing_transition_ledger.finalize_causality(
                 {}, {}, terminal=True
             )
             routing_transition_ledger.commit_ready(routing_replay)
             routing_transition_ledger.assert_drained()
+            packet_path_diagnostics = routing_transition_ledger.episode_diagnostics()
+            packet_engine.routing_immediate_cost_sum = float(
+                packet_path_diagnostics["packet_path_terminal_cost_sum"]
+            )
+        else:
+            packet_path_diagnostics = {
+                "packet_path_decision_count": 0,
+                "packet_path_cost_transition_count": 0,
+                "packet_path_terminal_cost_sum": 0.0,
+                "pre_routing_terminal_without_decision_count": 0,
+            }
         (
             episode_system_violation_count,
             episode_system_eligible_packet_count,
@@ -3063,9 +3082,14 @@ def train(
         if method_spec.routing == "safe_ddqn":
             if not evaluation:
                 lambda_cost_after_episode = ddqn.update_cost_multiplier(
-                    episode_routing_stage_violation_count,
-                    episode_routing_eligible_packet_count,
+                    episode_system_violation_count,
+                    episode_system_eligible_packet_count,
                 )
+                if episode_system_eligible_packet_count == 0:
+                    print(
+                        f"[Episode {episode + 1}] Safe-DDQN lambda update "
+                        "skipped: no system-QoS-eligible packets"
+                    )
             else:
                 lambda_cost_after_episode = float(ddqn.lambda_cost)
             lambda_cost_used_log.append(float(episode_lambda_cost))
@@ -3324,11 +3348,55 @@ def train(
                 "routing_immediate_cost_sum": (
                     episode_routing_immediate_cost_sum
                 ),
+                **packet_path_diagnostics,
                 "pre_routing_violation_count": int(
                     packet_engine.pre_routing_violation_count
                 ),
                 "lambda_cost_used": episode_lambda_cost,
                 "lambda_cost_after_episode": lambda_cost_after_episode,
+                "lambda_cost_update_status": (
+                    getattr(ddqn, "last_lambda_update_status", None)
+                    if method_spec.routing == "safe_ddqn" and not evaluation
+                    else "checkpoint_frozen" if method_spec.routing == "safe_ddqn"
+                    else None
+                ),
+                "movement_base_reward_sum": float(
+                    episode_base_movement_reward
+                ),
+                "movement_final_reward_sum": float(
+                    episode_final_movement_reward
+                ),
+                "c9_penalty_sum": float(episode_c9_penalty_sum),
+                "c9_penalty_mean": (
+                    episode_c9_penalty_sum / episode_c9_penalty_samples
+                    if episode_c9_penalty_samples else 0.0
+                ),
+                "c9_penalty_sample_count": int(episode_c9_penalty_samples),
+                "c10_penalty_sum": float(episode_c10_penalty_sum),
+                "c10_penalty_mean": (
+                    episode_c10_penalty_sum / episode_c10_penalty_samples
+                    if episode_c10_penalty_samples else 0.0
+                ),
+                "c10_penalty_sample_count": int(episode_c10_penalty_samples),
+                "com_range_penalty_sum": float(episode_com_range_penalty_sum),
+                "com_range_penalty_mean": (
+                    episode_com_range_penalty_sum
+                    / episode_com_range_penalty_samples
+                    if episode_com_range_penalty_samples else 0.0
+                ),
+                "com_range_penalty_sample_count": int(
+                    episode_com_range_penalty_samples
+                ),
+                "c9_satisfied_pair_count": int(episode_c9_satisfied_pairs),
+                "c9_violated_pair_count": int(episode_c9_violated_pairs),
+                "c10_satisfied_pair_count": int(episode_c10_satisfied_pairs),
+                "c10_violated_pair_count": int(episode_c10_violated_pairs),
+                "com_in_range_assigned_pair_count": int(
+                    episode_com_in_range_pairs
+                ),
+                "com_out_of_range_assigned_pair_count": int(
+                    episode_com_out_of_range_pairs
+                ),
                 "coverage": coverage,
                 "found_GT_ratio": found_gt_ratio,
                 "routing_wait_count": int(packet_engine.wait_actions),

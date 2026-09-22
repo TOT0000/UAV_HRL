@@ -21,19 +21,19 @@ temporal accumulation, and empty or invalid effective geometry fails closed.
 The mode follows current task types; there is no separate camera action or
 camera-state transition.
 
-FOV assignment utility, VS potential, coverage, image quantity, packet
+FOV assignment utility, movement constraints, coverage, image quantity, packet
 generation and packet size continue to use `VS_CAMERA` and retain the original
 35 mm numerical geometry. Search and VS have no minimum-resolution hard
-constraint. Resolution remains an input to the existing VS utility, potential
-and packet-size calculations.
+constraint. Resolution remains an input to the existing VS utility and
+packet-size calculations.
 
-All task-potential-enabled formal methods now resolve
-`beta_search = 0` and `beta_vs = beta_com = 3.0`. The VS/COM potential formulas
-and PBRS difference are unchanged; `no_task_potential` resolves all three
-effective shaping coefficients to zero. Training, evaluation and checkpoint
-validation use the same resolved configuration. A checkpoint containing the
-old visual contract or beta values is rejected before continuation. The
-current checkpoint schema is **32**.
+All methods whose existing task-potential flag is enabled now use post-action
+C9, C10, and assigned COM-range penalties with unit weights. Each task type is
+averaged over its assigned pairs and is not normalized by episode length.
+`no_task_potential` applies none of these penalties. Training, evaluation and
+checkpoint validation use the same resolved configuration. The current
+checkpoint schema is **33**; schema 32 uses incompatible reward, assignment,
+Safe-DDQN cost, and dual-update semantics and requires retraining.
 
 Search diagnostics schema `uav-hrl-search-diagnostics-v2` retains the legacy
 field name `search_uav_ids`, whose actual meaning is all Search coverage
@@ -151,7 +151,8 @@ not used by Search production paths.
   guards the singularity; the distance boundary tolerance is 1e-9 m.
 - `I=ROI_area/footprint_area` uses the same polygon as coverage and remains
   unsaturated. `Q=c*min(I,1)` and `G=min(1,b1*z_relative/(d+1e-12))` determine
-  `pair_score=0.8*Q+0.2*G`. VS potential averages every assigned pair.
+  `pair_score=0.8*Q+0.2*G`. Assignment keeps this raw score. Movement C9 uses
+  `1-G`; C10 uses the finite along-tilt margins only after C9 is satisfied.
 
 `run_experiment.py`, `comparison_experiment.py`, `paper_evaluation.py` and their
 CLI/thin training wrappers all enter `HRL_task_aware.train`. All 16 registered
@@ -166,9 +167,10 @@ the canonical geometry result directly.
 Assignment uses the same geometry result. Eligibility retains valid positions,
 altitude and target checks, plus existing orchestration/role/task-count rules;
 it never masks a pair merely because `sensing_valid_now` is false. Outside the
-sensing range, candidates remain ranked by G. Global min/max normalization and
-the equal-value result of 0.5 are preserved. Random assignment bypasses ranking
-but shares sensing, potential and packet generation after selection.
+sensing range, candidates remain ranked by G. Each task type divides its raw
+feasible utilities by that call's feasible maximum; equal positive values map
+to one. Random assignment bypasses ranking but shares sensing, movement
+constraints, and packet generation after selection.
 
 Evaluation trajectory artifacts export the actual active Search rectangle or
 VS polygon. `paper_figures` draws oblique polygons at the ROI ground altitude.
@@ -188,9 +190,10 @@ are unchanged. Each capture freezes physical size, coverage, raw image quantity
 and ROI/task identity; the VS QoS denominator excludes invalid intervals;
 timely useful VS bits equal timely physical bits times capture coverage.
 
-Checkpoint schema 32 requires the complete visual and deterministic external
+Checkpoint schema 33 requires the complete visual and deterministic external
 Search-controller contract for both full resume and model-only evaluation.
-Schema 31 and older are rejected because they encode earlier Search contracts.
+Schema 32 and older are rejected because they encode incompatible learning
+contracts (and earlier schemas also encode earlier Search contracts).
 Older schemas,
 missing visual metadata, or changed camera/coverage/packet/weight/validity
 metadata fail before loading weights. All affected methods must be retrained.
@@ -202,7 +205,7 @@ and FOV+COM) use an empty footprint sample while complete per-UAV checkpoint
 records and the existing transition/EMA cadence are preserved.
 
 Scenario generation, manifest schema/content rules, seeds, CRN, pairing,
-Dinkelbach/ratio objectives, VS/COM potential formulas, routing reward and
+Dinkelbach/ratio objectives, routing reward and
 energy formulas are unchanged. A short smoke episode can have no routing
 packets.
 

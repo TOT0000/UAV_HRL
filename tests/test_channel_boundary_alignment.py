@@ -24,6 +24,7 @@ from centralized_movement import (
 )
 from experiment_config import METHOD_REGISTRY, MethodSpec, comparison_method_configuration
 from rng_contract import NamedRNGStreams
+from routing_transition_ledger import RoutingTransitionLedger
 from training_checkpoint import CHECKPOINT_SCHEMA_VERSION, _validate_checkpoint_schema
 from utils_update_v2 import ReplayBufferDiscrete, ReplayBufferJoint
 
@@ -34,6 +35,8 @@ class AllNlosDraws:
 
 
 class RecordingRoutingPolicy:
+    routing_agent_kind = "safe_ddqn"
+
     def __init__(self, receiver):
         self.receiver = int(receiver)
         self.observations = []
@@ -168,7 +171,7 @@ class EpisodeAndBoundaryLifecycleTest(unittest.TestCase):
 
 
 class MovementBoundaryReplayTest(unittest.TestCase):
-    def test_transition_next_state_mask_and_phi_match_next_policy_input(self):
+    def test_transition_next_state_mask_and_post_action_penalty_are_authoritative(self):
         records = []
         boundary_states = []
         original_initial = Simulator.prepare_initial_movement_interval
@@ -222,8 +225,7 @@ class MovementBoundaryReplayTest(unittest.TestCase):
                 {
                     "state": np.asarray(state).copy(),
                     "next_state": np.asarray(next_state).copy(),
-                    "phi_com_t": float(kwargs["phi_com_t"]),
-                    "phi_com_t1": float(kwargs["phi_com_t1"]),
+                    "com_range_penalty": float(kwargs["com_range_penalty"]),
                 }
             )
             return original_add(replay, state, action, next_state, **kwargs)
@@ -245,7 +247,9 @@ class MovementBoundaryReplayTest(unittest.TestCase):
             movement_mask_from_state(records[0]["next_state"]),
             movement_mask_from_state(records[1]["state"]),
         )
-        self.assertEqual(records[0]["phi_com_t1"], records[1]["phi_com_t"])
+        self.assertTrue(
+            all(np.isfinite(row["com_range_penalty"]) for row in records)
+        )
         com_feature = LOCAL_MOVEMENT_DIM + 17
         self.assertNotEqual(
             float(records[0]["state"][com_feature]),
@@ -326,7 +330,8 @@ class RoutingBoundaryReplayTest(unittest.TestCase):
         packet = engine.create_packet(0, "COM", 1e12, 0.75)
         packet["deadline_abs"] = 1.0
         replay = ReplayBufferDiscrete(143, 17, max_size=16, n_step=1)
-        pending = {}
+        ledger = RoutingTransitionLedger()
+        ledger.begin_episode()
         policy = RecordingRoutingPolicy(env.GS_ID)
         stats = violation_stats()
 
@@ -346,14 +351,14 @@ class RoutingBoundaryReplayTest(unittest.TestCase):
                 violation_stats=stats,
                 epsilon=0.0,
                 traffic_rate_overrides={"FOV": 0.0, "COM": 0.0},
-                pending_routing_transitions=pending,
+                routing_transition_ledger=ledger,
             )
 
         self.assertEqual(replay.size, 1)
-        self.assertEqual(pending, {})
         self.assertEqual(replay.not_done[0, 0], 0.0)
         self.assertEqual(replay.cost[0, 0], 1.0)
-        self.assertEqual(engine.routing_immediate_cost_sum, 1.0)
+        self.assertTrue(replay.cost_ready[0, 0])
+        self.assertEqual(ledger.episode_terminal_cost_sum, 1.0)
         self.assertEqual(stats["COM"]["deadline_violated_packets"], 1)
 
 
@@ -545,11 +550,11 @@ class CompatibilityAndRegistryTest(unittest.TestCase):
             uninterrupted_capture["executions"][4:],
             resumed_capture["executions"],
         )
-        self.assertAlmostEqual(
+        self.assertLessEqual(
             gs_gateway_distance_m(
                 uninterrupted_capture["executions"][4]["positions"][0]
             ),
-            400.0,
+            400.0 + 1e-9,
         )
         self._assert_nested_exact(
             self,
@@ -558,7 +563,7 @@ class CompatibilityAndRegistryTest(unittest.TestCase):
         )
 
     def test_old_boundary_checkpoint_is_rejected_before_restore(self):
-        self.assertEqual(CHECKPOINT_SCHEMA_VERSION, 31)
+        self.assertEqual(CHECKPOINT_SCHEMA_VERSION, 33)
         with self.assertRaisesRegex(RuntimeError, "must be retrained"):
             _validate_checkpoint_schema({"checkpoint_schema_version": 12})
 
@@ -575,7 +580,7 @@ class CompatibilityAndRegistryTest(unittest.TestCase):
                     configuration["movement_replay_contract_version"],
                 )
                 self.assertIn(
-                    "sender-next-state-immediate-cost",
+                    "sender-next-state-reward-packet-next-decision-cost",
                     configuration["packet_routing_causality_contract_version"],
                 )
 

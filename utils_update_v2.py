@@ -196,12 +196,9 @@ class ReplayBufferJoint:
         self.ratio_objective_reward = np.zeros(
             (self.max_size, 1), dtype=np.float32
         )
-        self.phi_search_t = np.zeros((self.max_size, 1), dtype=np.float32)
-        self.phi_search_t1 = np.zeros((self.max_size, 1), dtype=np.float32)
-        self.phi_vs_t = np.zeros((self.max_size, 1), dtype=np.float32)
-        self.phi_vs_t1 = np.zeros((self.max_size, 1), dtype=np.float32)
-        self.phi_com_t = np.zeros((self.max_size, 1), dtype=np.float32)
-        self.phi_com_t1 = np.zeros((self.max_size, 1), dtype=np.float32)
+        self.c9_penalty = np.zeros((self.max_size, 1), dtype=np.float32)
+        self.c10_penalty = np.zeros((self.max_size, 1), dtype=np.float32)
+        self.com_range_penalty = np.zeros((self.max_size, 1), dtype=np.float32)
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     @torch.no_grad()
@@ -213,12 +210,9 @@ class ReplayBufferJoint:
         done,
         delivered_mbits,
         total_mobility_energy,
-        phi_search_t,
-        phi_search_t1,
-        phi_vs_t,
-        phi_vs_t1,
-        phi_com_t,
-        phi_com_t1,
+        c9_penalty,
+        c10_penalty,
+        com_range_penalty,
         ratio_objective_reward=0.0,
         current_movement_mask=None,
         next_movement_mask=None,
@@ -255,12 +249,9 @@ class ReplayBufferJoint:
         self.delivered_mbits[index, 0] = float(delivered_mbits)
         self.total_mobility_energy[index, 0] = float(total_mobility_energy)
         self.ratio_objective_reward[index, 0] = float(ratio_objective_reward)
-        self.phi_search_t[index, 0] = float(phi_search_t)
-        self.phi_search_t1[index, 0] = float(phi_search_t1)
-        self.phi_vs_t[index, 0] = float(phi_vs_t)
-        self.phi_vs_t1[index, 0] = float(phi_vs_t1)
-        self.phi_com_t[index, 0] = float(phi_com_t)
-        self.phi_com_t1[index, 0] = float(phi_com_t1)
+        self.c9_penalty[index, 0] = float(c9_penalty)
+        self.c10_penalty[index, 0] = float(c10_penalty)
+        self.com_range_penalty[index, 0] = float(com_range_penalty)
         self.ptr = (self.ptr + 1) % self.max_size
         self.size = min(self.size + 1, self.max_size)
         self.total_added += 1
@@ -305,14 +296,12 @@ class ReplayBufferJoint:
             objective[~np.isfinite(objective)] = 0.0
         else:
             raise ValueError(f"unsupported reward mode: {reward_mode}")
-        shaping_scale = 1.0 if task_potential_enabled else 0.0
-        reward = objective + shaping_scale * (
-            float(beta_search)
-            * (float(gamma) * not_done * self.phi_search_t1[indices] - self.phi_search_t[indices])
-            + float(beta_vs)
-            * (float(gamma) * not_done * self.phi_vs_t1[indices] - self.phi_vs_t[indices])
-            + float(beta_com)
-            * (float(gamma) * not_done * self.phi_com_t1[indices] - self.phi_com_t[indices])
+        del not_done, gamma, beta_search, beta_vs, beta_com
+        penalty_scale = 1.0 if task_potential_enabled else 0.0
+        reward = objective - penalty_scale * (
+            self.c9_penalty[indices]
+            + self.c10_penalty[indices]
+            + self.com_range_penalty[indices]
         )
         return reward.astype(np.float32, copy=False)
 
@@ -376,6 +365,11 @@ class ReplayBufferDiscrete:
         self.reward     = np.zeros((self.max_size, 1), dtype=np.float32)
         self.cost       = np.zeros((self.max_size, 1), dtype=np.float32)
         self.not_done   = np.zeros((self.max_size, 1), dtype=np.float32)
+        self.cost_next_state = np.zeros(
+            (self.max_size, state_dim), dtype=np.float32
+        )
+        self.cost_not_done = np.zeros((self.max_size, 1), dtype=np.float32)
+        self.cost_ready = np.zeros((self.max_size, 1), dtype=bool)
 
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -383,6 +377,7 @@ class ReplayBufferDiscrete:
         self.gamma = float(gamma)
         self.n_step_buffer = []
         self.latest_index_by_agent = {}
+        self.index_by_transition_id = {}
 
     @torch.no_grad()
     def add(
@@ -417,6 +412,9 @@ class ReplayBufferDiscrete:
         s0, a0, _, _, _, _, tg0, tid0 = self.n_step_buffer[0]
 
         i = self.ptr
+        previous_transition_id = int(self.transition_id[i])
+        if previous_transition_id >= 0:
+            self.index_by_transition_id.pop(previous_transition_id, None)
         self.state[i]       = s0
         self.action[i]      = a0
         self.next_state[i]  = next_s
@@ -425,6 +423,13 @@ class ReplayBufferDiscrete:
         self.not_done[i, 0] = 1.0 - float(done_flag)
         self.tag_gt[i, 0]   = tg0  # ★ 寫入場景標籤
         self.transition_id[i] = tid0
+        self.cost_next_state[i] = next_s if tid0 < 0 else 0.0
+        self.cost_not_done[i, 0] = (
+            1.0 - float(done_flag) if tid0 < 0 else 0.0
+        )
+        self.cost_ready[i, 0] = tid0 < 0
+        if tid0 >= 0:
+            self.index_by_transition_id[tid0] = i
         if agent_id is not None:
             self.latest_index_by_agent[int(agent_id)] = i
 
@@ -437,22 +442,56 @@ class ReplayBufferDiscrete:
         else:
             self.n_step_buffer.pop(0)
 
-    def attribute_latest_cost(self, agent_id, cost=1.0):
-        """Attach a boundary-cleanup violation to the latest agent transition."""
+    @property
+    def cost_ready_size(self):
+        return int(np.count_nonzero(self.cost_ready[: self.size, 0]))
 
-        index = self.latest_index_by_agent.get(int(agent_id))
+    def attach_cost_transition(self, transition_id, next_state, cost, done):
+        """Attach packet-chain cost causality to an existing reward row."""
+
+        transition_id = int(transition_id)
+        index = self.index_by_transition_id.get(transition_id)
         if index is None:
+            matches = np.flatnonzero(
+                self.transition_id[: self.size] == transition_id
+            )
+            if matches.size != 1:
+                return False
+            index = int(matches[0])
+            self.index_by_transition_id[transition_id] = index
+        if int(self.transition_id[index]) != transition_id:
+            self.index_by_transition_id.pop(transition_id, None)
             return False
+        if bool(self.cost_ready[index, 0]):
+            raise AssertionError("packet-chain cost transition was attached twice")
+        next_state_array = _to_np_float32(next_state)
+        if next_state_array.shape != self.cost_next_state[index].shape:
+            raise ValueError("cost next-state shape is incompatible with replay")
         value = float(cost)
         if not np.isfinite(value) or value < 0.0:
-            raise ValueError("attributed replay cost must be finite and non-negative")
-        self.cost[index, 0] += value
+            raise ValueError("packet-chain cost must be finite and non-negative")
+        self.cost_next_state[index] = next_state_array
+        self.cost[index, 0] = value
+        self.cost_not_done[index, 0] = 1.0 - float(bool(done))
+        self.cost_ready[index, 0] = True
         return True
-
 
     def sample(self, batch_size, include_cost=False):
         ind = self.rng.integers(0, self.size, size=batch_size)
         return self._gather(ind, include_cost=include_cost)
+
+    def sample_cost(self, batch_size):
+        ready = np.flatnonzero(self.cost_ready[: self.size, 0])
+        if ready.size == 0:
+            raise ValueError("routing replay has no packet-chain cost transitions")
+        indices = self.rng.choice(ready, size=int(batch_size), replace=True)
+        return (
+            torch.from_numpy(self.state[indices]).to(self.device),
+            torch.from_numpy(self.action[indices]).to(self.device),
+            torch.from_numpy(self.cost_next_state[indices]).to(self.device),
+            torch.from_numpy(self.cost[indices]).to(self.device),
+            torch.from_numpy(self.cost_not_done[indices]).to(self.device),
+        )
 
     def sample_by_tag(self, batch_size, curr_tag, neighbor_step=2,
                       p_same=0.6, p_neighbor=0.2, include_cost=False):

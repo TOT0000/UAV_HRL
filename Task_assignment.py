@@ -60,7 +60,7 @@ def assignment_fov_pair_metrics(env, uav_id, task):
 
 
 def normalize_feasible_values(raw_values, feasible_mask):
-    """Globally min-max normalize one task type using feasible pairs only."""
+    """Normalize one task type by its maximum feasible candidate utility."""
 
     raw = np.asarray(raw_values, dtype=float)
     feasible = np.asarray(feasible_mask, dtype=bool)
@@ -72,12 +72,10 @@ def normalize_feasible_values(raw_values, feasible_mask):
         return normalized
     if not np.isfinite(values).all():
         raise ValueError("feasible raw utility contains NaN or Inf")
-    minimum = float(values.min())
     maximum = float(values.max())
-    if np.isclose(minimum, maximum):
-        normalized[feasible] = 0.5
-    else:
-        normalized[feasible] = (values - minimum) / (maximum - minimum)
+    if maximum <= np.finfo(float).eps:
+        return normalized
+    normalized[feasible] = np.clip(values / maximum, 0.0, 1.0)
     return normalized
 
 
@@ -293,7 +291,7 @@ class UAVAssigner:
                     sr = self.env.SR_teams[int(task.target_obj_id)]
                     if sr.assigned_gt_id is None:
                         continue
-                    raw = self.env.get_sr_uav_normalized_utility(
+                    raw = self.env.get_sr_uav_capacity_mbps(
                         uav_id, int(task.target_obj_id)
                     )
                     if math.isfinite(raw):
@@ -301,9 +299,10 @@ class UAVAssigner:
                         com_feasible[row, column] = True
 
         normalized_fov = normalize_feasible_values(raw_fov, fov_feasible)
+        normalized_com = normalize_feasible_values(raw_com, com_feasible)
         utility = np.zeros(shape, dtype=float)
         utility[fov_feasible] = normalized_fov[fov_feasible]
-        utility[com_feasible] = raw_com[com_feasible]
+        utility[com_feasible] = normalized_com[com_feasible]
         feasible = fov_feasible | com_feasible
         if not np.isfinite(utility).all():
             raise AssertionError("production assignment utility contains NaN or Inf")
@@ -347,6 +346,27 @@ class UAVAssigner:
                 )
         return feasible
 
+    @staticmethod
+    def _round_utility(problem, feasible_mask):
+        """Normalize each task type over this round's actual candidates."""
+
+        feasible = np.asarray(feasible_mask, dtype=bool)
+        if feasible.shape != problem.feasible_mask.shape:
+            raise ValueError("round feasibility mask shape is invalid")
+        fov_columns = np.asarray(
+            [task.task_type == "FOV" for task in problem.tasks], dtype=bool
+        )[None, :]
+        com_columns = np.asarray(
+            [task.task_type == "COM" for task in problem.tasks], dtype=bool
+        )[None, :]
+        fov_mask = feasible & fov_columns
+        com_mask = feasible & com_columns
+        utility = normalize_feasible_values(problem.raw_fov_utility, fov_mask)
+        utility += normalize_feasible_values(problem.raw_com_utility, com_mask)
+        if not np.isfinite(utility).all() or np.any(utility < 0.0) or np.any(utility > 1.0):
+            raise AssertionError("round utility escaped the [0,1] contract")
+        return utility
+
     def assign_uav_tasks_k_times(
         self,
         uav_list,
@@ -386,9 +406,10 @@ class UAVAssigner:
                 available,
                 round_index,
             )
-            self.last_round_problems.append((problem.utility_matrix.copy(), feasible.copy()))
+            round_utility = self._round_utility(problem, feasible)
+            self.last_round_problems.append((round_utility.copy(), feasible.copy()))
             for row, column in solve_assignment_with_dummies(
-                problem.utility_matrix,
+                round_utility,
                 feasible,
             ):
                 original_index = problem.original_task_indices[column]
@@ -399,7 +420,7 @@ class UAVAssigner:
                     (
                         original_index,
                         task.task_type,
-                        float(problem.utility_matrix[row, column]),
+                        float(round_utility[row, column]),
                     )
                 )
                 available.remove(original_index)

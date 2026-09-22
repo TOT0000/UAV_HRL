@@ -148,45 +148,47 @@ class SafeDDQNTargetTest(unittest.TestCase):
 
     def test_constraint_defaults_and_episode_end_update_formula(self):
         model = DDQN(state_dim=42, action_dim=3, hidden_dim=8)
-        self.assertEqual(model.qos_target_probability, 0.05)
+        self.assertEqual(model.qos_target_probability, 0.01)
         self.assertEqual(model.lambda_cost, 0.0)
         self.assertEqual(model.eta_c, 0.01)
-        self.assertEqual(model.dual_normalization_reference_packets, 10_000)
 
-        increased = model.update_cost_multiplier(
-            episode_violation_count=1000,
-            episode_eligible_packet_count=10_000,
-        )
-        self.assertAlmostEqual(increased, 0.0005)
-        self.assertEqual(model.cost_multiplier_update_count, 1)
         unchanged = model.update_cost_multiplier(
-            episode_violation_count=500,
-            episode_eligible_packet_count=10_000,
+            episode_violation_count=1,
+            episode_eligible_packet_count=100,
         )
-        self.assertAlmostEqual(unchanged, 0.0005)
+        self.assertAlmostEqual(unchanged, 0.0)
+        self.assertEqual(model.cost_multiplier_update_count, 1)
+        increased = model.update_cost_multiplier(
+            episode_violation_count=2,
+            episode_eligible_packet_count=100,
+        )
+        self.assertAlmostEqual(increased, 0.0001)
         self.assertEqual(model.cost_multiplier_update_count, 2)
         decreased = model.update_cost_multiplier(
-            episode_violation_count=200,
-            episode_eligible_packet_count=10_000,
+            episode_violation_count=0,
+            episode_eligible_packet_count=100,
         )
-        self.assertAlmostEqual(decreased, 0.0002)
+        self.assertAlmostEqual(decreased, 0.0)
         self.assertEqual(model.cost_multiplier_update_count, 3)
         zero_eligible = model.update_cost_multiplier(
             episode_violation_count=0,
             episode_eligible_packet_count=0,
         )
-        self.assertAlmostEqual(zero_eligible, 0.0002)
-        self.assertEqual(model.cost_multiplier_update_count, 4)
+        self.assertAlmostEqual(zero_eligible, 0.0)
+        self.assertEqual(model.cost_multiplier_update_count, 3)
+        self.assertEqual(model.cost_multiplier_skipped_episode_count, 1)
         state = model.constraint_state()
         self.assertEqual(state["lambda_update_scope"], "episode_end")
-        self.assertEqual(state["cost_denominator"], "fixed_reference_packets")
+        self.assertEqual(state["cost_denominator"], "episode_system_eligible_packets")
+        self.assertEqual(state["lambda_update_mode"], "direct_episode_system_dvp")
+        self.assertEqual(state["system_dvp_target"], 0.01)
+        self.assertIsNone(state["reference_packet_count"])
         self.assertEqual(state["normalized_eta_c"], 0.01)
-        self.assertEqual(state["dual_normalization_reference_packets"], 10_000)
         self.assertEqual(state["last_episode_eligible_packet_count"], 0)
         self.assertIsNone(state["last_episode_violation_probability"])
         self.assertFalse(state["mid_episode_checkpoint_supported"])
 
-    def test_system_paper_row_remains_distinct_from_routing_dual_inputs(self):
+    def test_system_paper_row_matches_direct_system_dual_inputs(self):
         episode = {
             "timely_goodput_mbits": 1.0,
             "total_mobility_energy_j": 2.0,
@@ -224,14 +226,12 @@ class SafeDDQNTargetTest(unittest.TestCase):
 
         model = DDQN(state_dim=42, action_dim=3, hidden_dim=8)
         model.update_cost_multiplier(
-            episode["routing_stage_violated_packets"],
-            episode["routing_stage_eligible_packets"],
+            episode["total_deadline_violations"],
+            episode["eligible_packet_count"],
         )
         state = model.constraint_state()
-        self.assertEqual(
-            state["last_episode_violation_probability"], 0.05
-        )
-        self.assertNotEqual(combined["value"], state["last_episode_violation_probability"])
+        self.assertEqual(state["last_episode_violation_probability"], 0.3)
+        self.assertEqual(combined["value"], state["last_episode_violation_probability"])
 
 
 if __name__ == "__main__":

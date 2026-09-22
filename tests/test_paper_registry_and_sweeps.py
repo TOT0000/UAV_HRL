@@ -74,10 +74,10 @@ class PaperMethodRegistryTest(unittest.TestCase):
             self.assertEqual(resolved["resolved_com_deadline_seconds"], 2.0)
             if spec.routing == "safe_ddqn":
                 safe_method_count += 1
-                self.assertEqual(resolved["safe_ddqn_qos_target_probability"], 0.05)
+                self.assertEqual(resolved["safe_ddqn_qos_target_probability"], 0.01)
                 self.assertEqual(
-                    resolved["safe_ddqn_dual_normalization_reference_packets"],
-                    10_000,
+                    resolved["safe_ddqn_lambda_update_mode"],
+                    "direct_episode_system_dvp",
                 )
                 self.assertEqual(resolved["safe_ddqn_initial_lambda_cost"], 0.0)
                 self.assertEqual(resolved["safe_ddqn_eta_c"], 0.01)

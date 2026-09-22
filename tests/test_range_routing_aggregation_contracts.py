@@ -362,9 +362,10 @@ class RoutingCreditAndRewardContractTest(unittest.TestCase):
             state=np.array([1.0, 0.0], dtype=np.float32),
             action=0,
             tag_gt=2,
+            packet_id=pkt["id"],
         )
         ledger.set_reward(transition_id, 0.25)
-        ledger.set_cost(transition_id, 0.0)
+        self.assertTrue(ledger.finalize_packet(pkt["id"], violated=False))
         ledger.finalize_causality(
             {0: np.array([0.0, 1.0], dtype=np.float32)}, {0: pkt}
         )
@@ -382,17 +383,17 @@ class RoutingCreditAndRewardContractTest(unittest.TestCase):
         self.assertEqual(replay.transition_id[0], transition_id)
         self.assertEqual(replay.cost[0, 0], 0.0)
 
-    def test_immediate_raw_cost_can_exceed_one(self):
+    def test_packet_terminal_violation_cost_is_one(self):
         replay = ReplayBufferDiscrete(2, 2, max_size=8, n_step=1)
         ledger = RoutingTransitionLedger()
         transition_id = ledger.create(
-            agent_id=0, state=[1.0, 0.0], action=0, tag_gt=2
+            agent_id=0, state=[1.0, 0.0], action=0, tag_gt=2, packet_id=9
         )
         ledger.set_reward(transition_id, 0.0)
-        ledger.set_cost(transition_id, 3.0)
+        self.assertTrue(ledger.finalize_packet(9, violated=True))
         ledger.finalize_causality({}, {}, terminal=True)
         self.assertEqual(ledger.commit_ready(replay), [transition_id])
-        self.assertEqual(replay.cost[0, 0], 3.0)
+        self.assertEqual(replay.cost[0, 0], 1.0)
 
     def test_max_hop_violation_is_a_routing_stage_outcome_without_transition_credit(self):
         engine = PacketEngine(num_uav=1)

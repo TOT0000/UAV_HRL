@@ -87,6 +87,11 @@ class RoutingLearnerLifecycle:
         cadence_boundary = self.update_phase == 0
         if not cadence_boundary or int(replay.size) < int(self.warmup_transitions):
             return False
+        if (
+            getattr(agent, "routing_agent_kind", None) == "safe_ddqn"
+            and int(getattr(replay, "cost_ready_size", 0)) == 0
+        ):
+            return False
 
         before_training = int(agent.num_training)
         before_target = int(agent.target_update_count)

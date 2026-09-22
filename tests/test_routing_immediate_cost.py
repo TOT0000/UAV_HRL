@@ -92,13 +92,13 @@ class RoutingImmediateCostContractTest(unittest.TestCase):
         replay = self.run_slot({0: receiver}, capacities)
         return replay
 
-    def test_b_wait_counts_behind_hol_expiry(self):
+    def test_b_non_hol_expiry_does_not_create_sender_local_cost(self):
         replay = self._behind_hol_expiry(0, {})
-        self.assertEqual(replay.cost[0, 0], 2.0)
+        self.assertEqual(replay.cost[0, 0], 0.0)
 
-    def test_c_forward_counts_same_behind_hol_population(self):
+    def test_c_forward_non_hol_expiry_does_not_create_sender_local_cost(self):
         replay = self._behind_hol_expiry(1, {(0, 1): 1e-9})
-        self.assertEqual(replay.cost[0, 0], 2.0)
+        self.assertEqual(replay.cost[0, 0], 0.0)
 
     def test_d_and_e_post_action_relay_arrival_has_no_current_or_retroactive_cost(self):
         relayed = self.engine.create_packet(0, "FOV", 100.0, 0.0)
@@ -123,7 +123,7 @@ class RoutingImmediateCostContractTest(unittest.TestCase):
         self.assertEqual(replay.cost[2, 0], 0.0)
         self.assertEqual(self.engine.routing_constraint_counts(), (1, 2))
 
-    def test_f_three_frozen_packets_store_raw_cost_three(self):
+    def test_f_non_hol_frozen_packets_do_not_create_routing_decisions(self):
         for _ in range(3):
             packet = self.engine.create_packet(0, "FOV", 100.0, 0.0)
             packet["deadline_abs"] = 0.25
@@ -131,8 +131,8 @@ class RoutingImmediateCostContractTest(unittest.TestCase):
         replay = self.run_slot({0: 0})
 
         self.assertEqual(replay.size, 1)
-        self.assertEqual(replay.cost[0, 0], 3.0)
-        self.assertEqual(self.engine.routing_immediate_cost_sum, 3.0)
+        self.assertEqual(replay.cost[0, 0], 0.0)
+        self.assertEqual(self.engine.routing_immediate_cost_sum, 0.0)
 
     def test_g_com_pre_s2u_violation_is_system_only(self):
         packet = self.engine.create_sr_packet(0, 100.0, 0.0)
@@ -256,13 +256,13 @@ class RoutingImmediateCostContractTest(unittest.TestCase):
 
         self.assertEqual(self.engine.routing_constraint_counts(), (1, 2))
 
-    def test_terminal_cost_only_uses_final_frozen_snapshot(self):
+    def test_episode_finalization_requires_packet_chain_attribution(self):
         frozen = self.engine.create_packet(0, "FOV", 100.0, 0.0)
         frozen["deadline_abs"] = 10.0
 
         replay = self.run_slot({0: 0}, done=True)
 
-        self.assertEqual(replay.cost[0, 0], 1.0)
+        self.assertEqual(replay.cost[0, 0], 0.0)
         self.assertEqual(self.engine.system_qos_counts(), (0, 1))
         self.engine.finalize_episode(0.25)
         self.assertEqual(self.engine.system_qos_counts(), (1, 1))

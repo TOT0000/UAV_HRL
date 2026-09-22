@@ -245,49 +245,38 @@ class ControlledMethodRegistryTest(unittest.TestCase):
 class ControlledRewardTest(unittest.TestCase):
     def setUp(self):
         self.config = formal_training_config(1)
-        self.potential_t = (0.2, 0.3, 0.4)
-        self.potential_t1 = (0.5, 0.6, 0.7)
+        self.penalties = {
+            "c9_penalty_mean": 0.2,
+            "c10_penalty_mean": 0.3,
+            "com_range_penalty_mean": 0.4,
+        }
 
     def test_task_potential_flag_changes_only_shaping_term(self):
         shaped = _interval_reward(
-            4.0, 2.0, 0.25, 1.0, self.potential_t,
-            self.potential_t1, False, self.config,
+            4.0, 2.0, 0.25, self.penalties,
             reward_mode="dinkelbach", task_potential_enabled=True,
         )
         unshaped = _interval_reward(
-            4.0, 2.0, 0.25, 1.0, self.potential_t,
-            self.potential_t1, False, self.config,
+            4.0, 2.0, 0.25, self.penalties,
             reward_mode="dinkelbach", task_potential_enabled=False,
         )
-        expected_shaping = sum(
-            beta * (b - a)
-            for beta, a, b in zip(
-                (
-                    self.config.beta_search,
-                    self.config.beta_vs,
-                    self.config.beta_com,
-                ),
-                self.potential_t,
-                self.potential_t1,
-            )
-        )
-        self.assertAlmostEqual(shaped - unshaped, expected_shaping)
+        self.assertAlmostEqual(shaped - unshaped, -0.9)
         self.assertAlmostEqual(unshaped, 3.5)
 
     def test_ratio_reward_is_safe_and_does_not_use_lambda(self):
         first = _interval_reward(
-            4.0, 2.0, 0.0, 1.0, self.potential_t, self.potential_t1,
-            False, self.config, reward_mode="ratio", task_potential_enabled=False,
+            4.0, 2.0, 0.0, self.penalties,
+            reward_mode="ratio", task_potential_enabled=False,
             ratio_objective_reward=0.0,
         )
         second = _interval_reward(
-            4.0, 2.0, 999.0, 1.0, self.potential_t, self.potential_t1,
-            True, self.config, reward_mode="ratio", task_potential_enabled=False,
+            4.0, 2.0, 999.0, self.penalties,
+            reward_mode="ratio", task_potential_enabled=False,
             ratio_objective_reward=2.5,
         )
         zero_energy = _interval_reward(
-            4.0, 0.0, 999.0, 1.0, self.potential_t, self.potential_t1,
-            True, self.config, reward_mode="ratio", task_potential_enabled=False,
+            4.0, 0.0, 999.0, self.penalties,
+            reward_mode="ratio", task_potential_enabled=False,
             ratio_objective_reward=0.0,
         )
         self.assertEqual((first, second, zero_energy), (0.0, 2.5, 0.0))
@@ -317,21 +306,20 @@ class ControlledRewardTest(unittest.TestCase):
                 delivered_mbits=delivered,
                 total_mobility_energy=energy,
                 ratio_objective_reward=objective,
-                phi_search_t=phi_t,
-                phi_search_t1=phi_t1,
-                phi_vs_t=0.0, phi_vs_t1=0.0,
-                phi_com_t=0.0, phi_com_t1=0.0,
+                c9_penalty=abs(phi_t),
+                c10_penalty=0.0,
+                com_range_penalty=0.0,
             )
             online_rewards.append(
                 _interval_reward(
                     delivered,
                     energy,
                     current_lambda=999.0,
-                    gamma=1.0,
-                    potentials_t=(phi_t, 0.0, 0.0),
-                    potentials_t1=(phi_t1, 0.0, 0.0),
-                    done=done,
-                    config=self.config,
+                    constraint_penalties={
+                        "c9_penalty_mean": abs(phi_t),
+                        "c10_penalty_mean": 0.0,
+                        "com_range_penalty_mean": 0.0,
+                    },
                     reward_mode="ratio",
                     task_potential_enabled=True,
                     ratio_objective_reward=objective,
@@ -354,15 +342,12 @@ class ControlledRewardTest(unittest.TestCase):
             np.asarray([0, 1]), current_lambda=999.0, gamma=1.0,
             reward_mode="ratio", task_potential_enabled=True,
         ).ravel()
-        expected_shaped = np.asarray([
-            -self.config.beta_search * 1.25,
-            2_500_000.0 + self.config.beta_search * 0.75,
-        ])
+        expected_shaped = np.asarray([-1.25, 2_500_000.0 - 0.75])
         self.assertTrue(np.allclose(shaped, expected_shaped))
         self.assertTrue(np.allclose(online_rewards, shaped))
         self.assertAlmostEqual(
             sum(online_rewards),
-            objectives[-1] + self.config.beta_search * (-1.25 + 0.75),
+            objectives[-1] - 1.25 - 0.75,
         )
         same_ratio = replay._reward_numpy(
             np.asarray([0, 1]), current_lambda=-123.0, gamma=1.0,
@@ -437,9 +422,9 @@ class ControlledDDPGCheckpointTest(unittest.TestCase):
             done=True,
             delivered_mbits=10.0,
             total_mobility_energy=4.0,
-            phi_search_t=0.0, phi_search_t1=0.0,
-            phi_vs_t=0.0, phi_vs_t1=0.0,
-            phi_com_t=0.0, phi_com_t1=0.0,
+            c9_penalty=0.0,
+            c10_penalty=0.0,
+            com_range_penalty=0.0,
             ratio_objective_reward=2.5,
         )
         routing = ReplayBufferDiscrete(

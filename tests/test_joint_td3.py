@@ -131,12 +131,9 @@ class JointReplayAndLearnerTest(unittest.TestCase):
             done=done,
             delivered_mbits=5.0,
             total_mobility_energy=2.0,
-            phi_search_t=1.0,
-            phi_search_t1=2.0,
-            phi_vs_t=1.0,
-            phi_vs_t1=2.0,
-            phi_com_t=1.0,
-            phi_com_t1=2.0,
+            c9_penalty=0.2,
+            c10_penalty=0.3,
+            com_range_penalty=0.4,
         )
 
     def test_current_lambda_reward_terminal_potential_and_replay_size(self):
@@ -150,8 +147,8 @@ class JointReplayAndLearnerTest(unittest.TestCase):
         reward_lambda_4 = replay._reward_numpy(
             np.array([0, 1]), current_lambda=4.0, gamma=0.9
         ).ravel()
-        self.assertAlmostEqual(reward_lambda_3[0], 3.8, places=5)
-        self.assertAlmostEqual(reward_lambda_3[1], -7.0, places=5)
+        self.assertAlmostEqual(reward_lambda_3[0], -1.9, places=5)
+        self.assertAlmostEqual(reward_lambda_3[1], -1.9, places=5)
         np.testing.assert_allclose(reward_lambda_4, reward_lambda_3 - 2.0)
         self.assertEqual(replay.size, size_before)
         np.testing.assert_array_equal(replay.not_done[:2, 0], [1.0, 0.0])
@@ -203,12 +200,9 @@ class JointReplayAndLearnerTest(unittest.TestCase):
             done=False,
             delivered_mbits=1.0,
             total_mobility_energy=2.0,
-            phi_search_t=0.0,
-            phi_search_t1=0.0,
-            phi_vs_t=0.0,
-            phi_vs_t1=0.0,
-            phi_com_t=0.0,
-            phi_com_t1=0.0,
+            c9_penalty=0.0,
+            c10_penalty=0.0,
+            com_range_penalty=0.0,
             current_movement_mask=current_mask,
             next_movement_mask=next_mask,
         )
@@ -247,12 +241,9 @@ class JointReplayAndLearnerTest(unittest.TestCase):
                 done=False,
                 delivered_mbits=delivered,
                 total_mobility_energy=0.5,
-                phi_search_t=0.0,
-                phi_search_t1=0.0,
-                phi_vs_t=0.0,
-                phi_vs_t1=0.0,
-                phi_com_t=0.0,
-                phi_com_t1=0.0,
+                c9_penalty=0.0,
+                c10_penalty=0.0,
+                com_range_penalty=0.0,
                 current_movement_mask=current_mask,
                 next_movement_mask=next_mask,
             )

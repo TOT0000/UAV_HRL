@@ -144,11 +144,11 @@ class CentralizedTrainingFlowTest(unittest.TestCase):
                     delivered_mbits=2.0,
                     energy=4.0,
                     current_lambda=lambda_used,
-                    gamma=1.0,
-                    potentials_t=(0.0, 0.0, 0.0),
-                    potentials_t1=(0.0, 0.0, 0.0),
-                    done=False,
-                    config=config,
+                    constraint_penalties={
+                        "c9_penalty_mean": 0.0,
+                        "c10_penalty_mean": 0.0,
+                        "com_range_penalty_mean": 0.0,
+                    },
                 )
             )
             event = state.record_episode(2.0, 4.0)
@@ -203,19 +203,18 @@ class CentralizedTrainingFlowTest(unittest.TestCase):
             canonical["dinkelbach_lambda_after_episode"],
         )
 
-    def test_finite_horizon_potential_shaping_uses_zero_search_and_beta3_service(self):
-        config = TrainingConfig(total_episodes=1)
+    def test_immediate_constraint_penalties_are_not_horizon_normalized(self):
         reward = _interval_reward(
             delivered_mbits=0.0,
             energy=0.0,
             current_lambda=0.0,
-            gamma=1.0,
-            potentials_t=(0.1, 0.2, 0.3),
-            potentials_t1=(0.4, 0.5, 0.6),
-            done=False,
-            config=config,
+            constraint_penalties={
+                "c9_penalty_mean": 0.1,
+                "c10_penalty_mean": 0.2,
+                "com_range_penalty_mean": 0.3,
+            },
         )
-        self.assertAlmostEqual(reward, 1.8)
+        self.assertAlmostEqual(reward, -0.6)
 
     def test_normal_training_end_writes_episode_boundary_full_checkpoint(self):
         with tempfile.TemporaryDirectory() as temp_dir:

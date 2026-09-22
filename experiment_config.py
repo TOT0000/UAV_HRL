@@ -103,11 +103,14 @@ GROUND_ALTITUDE_M = 0.0
 UAV_MAX_ALTITUDE_M = 150.0
 TASK_POTENTIAL_NORMALIZATION_EPSILON = 1e-12
 TASK_POTENTIAL_CONTRACT_VERSION = (
-    "external-search-manager-zero-search-potential-v14"
+    "post-action-vs-com-mean-constraint-penalties-v15"
 )
 TASK_POTENTIAL_BETA_SEARCH = 0.0
-TASK_POTENTIAL_BETA_VS = 3.0
-TASK_POTENTIAL_BETA_COM = 3.0
+TASK_POTENTIAL_BETA_VS = 1.0
+TASK_POTENTIAL_BETA_COM = 1.0
+MOVEMENT_CONSTRAINT_WEIGHT_C9 = 1.0
+MOVEMENT_CONSTRAINT_WEIGHT_C10 = 1.0
+MOVEMENT_CONSTRAINT_WEIGHT_COM = 1.0
 SEARCH_CONTROLLER = "deterministic_region_frontier_manager"
 SEARCH_CONTROLLER_CONTRACT_VERSION = "region-frontier-hybrid-search-v1"
 SEARCH_TARGET_ALTITUDE_M = 120.0
@@ -123,7 +126,7 @@ SEARCH_FRONTIER_EPSILON = 1e-12
 COM_CAPACITY_POTENTIAL_WEIGHT = 0.5
 COM_DISTANCE_POTENTIAL_WEIGHT = 0.5
 ASSIGNMENT_CONTRACT_VERSION = (
-    "service-only-k-km-two-stage-km-single-random-typed-rounds-v2"
+    "service-only-k-km-two-stage-km-single-random-typed-max-normalization-v3"
 )
 ASSIGNMENT_FLOW_BY_STRATEGY = MappingProxyType(
     {
@@ -168,8 +171,8 @@ validate_communication_range_aliases(
     U2U_COMMUNICATION_RANGE_M,
 )
 ASSIGNMENT_DUMMY_UTILITY = -1e-9
-UTILITY_NORMALIZATION_MODE = "fov-global-minmax-com-fading-aware-reference-v3"
-COM_UTILITY_CONTRACT_VERSION = "fixed-s2u-los-rician-expected-maximum-v2"
+UTILITY_NORMALIZATION_MODE = "task-type-feasible-maximum-v4"
+COM_UTILITY_CONTRACT_VERSION = "fading-aware-raw-capacity-maximum-v3"
 TASK_COMPATIBILITY_POLICY = "fov_com_type_only_no_distance_limit"
 FOV_ASSIGNMENT_UTILITY_VERSION = "oblique-quality-proximity-v3"
 FOV_QUALITY_TRANSFORM = (
@@ -179,11 +182,11 @@ FOV_COVERAGE_SOURCE = (
     "visual_sensing.vs_geometry circle-ROI/oblique-polygon "
     "intersection ratio [0,1]"
 )
-SAFE_DDQN_QOS_TARGET_PROBABILITY = 0.05
+SAFE_DDQN_QOS_TARGET_PROBABILITY = 0.01
 SAFE_DDQN_INITIAL_LAMBDA_COST = 0.0
 SAFE_DDQN_ETA_C = 0.01
-SAFE_DDQN_DUAL_NORMALIZATION_REFERENCE_PACKETS = 10_000
 SAFE_DDQN_LAMBDA_UPDATE_SCOPE = "episode_end"
+SAFE_DDQN_LAMBDA_UPDATE_MODE = "direct_episode_system_dvp"
 SAFE_DDQN_EVALUATION_LAMBDA_MODE = "checkpoint_frozen"
 ROUTING_MASK_SCOPE = "every_slot"
 MOVEMENT_INTERVAL_SECONDS = 1.0
@@ -217,10 +220,10 @@ TIMELY_USEFUL_GOODPUT_CONTRACT_VERSION = (
     "fov-capture-coverage-weighted-com-full-timely-bits-v1"
 )
 PACKET_ROUTING_CAUSALITY_CONTRACT_VERSION = (
-    "sender-next-state-immediate-cost-one-step-v4"
+    "sender-next-state-reward-packet-next-decision-cost-v5"
 )
 ROUTING_COST_ATTRIBUTION_CONTRACT_VERSION = (
-    "routing-stage-frozen-full-queue-sender-immediate-count-v3"
+    "packet-path-terminal-outcome-bellman-chain-v4"
 )
 PACKET_SERVICE_CONTRACT_VERSION = (
     "unified-400m-slot-start-fifty-5ms-block-cumulative-service-v2"
@@ -246,7 +249,7 @@ MOVEMENT_ACTION_PROJECTION_CONTRACT_VERSION = (
     "fieldwise-clamp-heading-wrap-service-owned-mask-external-search-uav0-hard400-v7"
 )
 MOVEMENT_REPLAY_CONTRACT_VERSION = (
-    "policy-owned-executed-action-external-search-hover-mask-capacity-50000-v9"
+    "boundary-aligned-next-state-post-action-constraint-penalties-executed-action-hover-mask-capacity-50000-v10"
 )
 MOVEMENT_WARMUP_CONTRACT_VERSION = "global-joint-transition-boundary-10000-v1"
 PROPULSION_PARAMETERS = MappingProxyType(
@@ -283,92 +286,59 @@ CURRENT_METHOD_ID = "td3_dinkelbach"
 
 
 def validate_task_potential_weights():
-    """Fail fast unless the authoritative COM blend is convex."""
+    """Fail fast unless the authoritative immediate-penalty weights are valid."""
 
-    groups = {
-        "COM": (COM_CAPACITY_POTENTIAL_WEIGHT, COM_DISTANCE_POTENTIAL_WEIGHT),
-    }
-    for name, weights in groups.items():
-        numeric = tuple(float(weight) for weight in weights)
-        if not all(math.isfinite(weight) and weight >= 0.0 for weight in numeric):
-            raise ValueError(
-                f"{name} task-potential weights must be finite and non-negative"
-            )
-        if not math.isclose(sum(numeric), 1.0, rel_tol=0.0, abs_tol=1e-12):
-            raise ValueError(f"{name} task-potential weights must sum to 1")
-    shaping_coefficients = (
-        TASK_POTENTIAL_BETA_SEARCH,
-        TASK_POTENTIAL_BETA_VS,
-        TASK_POTENTIAL_BETA_COM,
+    penalty_weights = (
+        MOVEMENT_CONSTRAINT_WEIGHT_C9,
+        MOVEMENT_CONSTRAINT_WEIGHT_C10,
+        MOVEMENT_CONSTRAINT_WEIGHT_COM,
     )
     if not all(
-        math.isfinite(float(coefficient)) and float(coefficient) >= 0.0
-        for coefficient in shaping_coefficients
+        math.isfinite(float(weight)) and float(weight) == 1.0
+        for weight in penalty_weights
     ):
-        raise ValueError(
-            "task-potential shaping coefficients must be finite and non-negative"
-        )
-    return groups
+        raise ValueError("movement constraint penalty weights must all equal one")
+    return {"C9": (1.0,), "C10": (1.0,), "COM": (1.0,)}
 
 
 def task_potential_contract_metadata():
-    """Return the shared reward/config/checkpoint task-potential contract."""
+    """Return the shared reward/config/checkpoint auxiliary-reward contract."""
 
     validate_task_potential_weights()
-    distance_3d_reference = math.sqrt(
-        ENVIRONMENT_WIDTH_M**2
-        + ENVIRONMENT_HEIGHT_M**2
-        + (UAV_MAX_ALTITUDE_M - GROUND_ALTITUDE_M) ** 2
-    )
-    range_gap_reference = max(
-        distance_3d_reference - S2U_COMMUNICATION_RANGE_M,
-        TASK_POTENTIAL_NORMALIZATION_EPSILON,
-    )
     return {
         "contract_version": TASK_POTENTIAL_CONTRACT_VERSION,
-        "shaping_coefficients": {
-            "beta_search": TASK_POTENTIAL_BETA_SEARCH,
-            "beta_vs": TASK_POTENTIAL_BETA_VS,
-            "beta_com": TASK_POTENTIAL_BETA_COM,
+        "constraint_penalty_weights": {
+            "c9": MOVEMENT_CONSTRAINT_WEIGHT_C9,
+            "c10": MOVEMENT_CONSTRAINT_WEIGHT_C10,
+            "com_range": MOVEMENT_CONSTRAINT_WEIGHT_COM,
         },
-        "pbrs": "beta_i * (gamma * phi_i_next - phi_i_current)",
-        "no_task_potential": "all three shaping contributions are zero",
+        "reward_form": "base_reward - P_C9 - P_C10 - P_COM",
+        "aggregation": "mean over currently assigned pairs of each task type",
+        "normalization_by_episode_steps": False,
+        "no_task_potential": "all three constraint-penalty reward weights are zero",
         "search": {
-            "unchanged": False,
-            "definition": "mean(visited_bitmap)",
-            "target_distance_used": False,
-            "movement_reward_coefficient": 0.0,
+            "unchanged": True,
+            "movement_reward_coefficient": TASK_POTENTIAL_BETA_SEARCH,
             "control_owner": SEARCH_CONTROLLER,
         },
-        "vs": {
-            "definition": "0.8 * coverage_ratio * q(image_quality) + 0.2 * G",
+        "c9": {
+            "definition": "mean(1 - clip(b1*h/(d2D+epsilon),0,1))",
             "visual_sensing": visual_sensing_metadata(),
-            "quality_transform": FOV_QUALITY_TRANSFORM,
-            "target_distance_used": True,
-            "aggregation": "mean over assigned FOV tasks",
+            "population": "currently assigned FOV pairs",
         },
-        "com": {
-            "capacity_weight": COM_CAPACITY_POTENTIAL_WEIGHT,
-            "distance_weight": COM_DISTANCE_POTENTIAL_WEIGHT,
+        "c10": {
+            "definition": "mean(1 - clip(min(d_L,d_R)/(roi_radius+epsilon),0,1))",
+            "population": "currently assigned C9-valid FOV pairs with finite geometry",
+            "soft_constraint": True,
+        },
+        "com_range": {
+            "definition": "mean(1 - clip(R_com/(distance_3d+epsilon),0,1))",
+            "population": "all currently assigned COM UAV-SR pairs",
             "distance_dimensionality": "three_dimensional_3d",
             "s2u_range_m": S2U_COMMUNICATION_RANGE_M,
-            "normalization": "positive_range_gap_over_maximum_environment_gap",
-            "environment_width_m": ENVIRONMENT_WIDTH_M,
-            "environment_height_m": ENVIRONMENT_HEIGHT_M,
-            "uav_max_altitude_m": UAV_MAX_ALTITUDE_M,
-            "ground_altitude_m": GROUND_ALTITUDE_M,
-            "maximum_3d_distance_reference_m": distance_3d_reference,
-            "range_gap_normalization_reference_m": range_gap_reference,
             "normalization_epsilon": TASK_POTENTIAL_NORMALIZATION_EPSILON,
         },
-        "lifecycle": {
-            "form": "beta * (gamma * phi_next - phi_current)",
-            "nonterminal_boundary_continuity": (
-                "all three phi_next values equal the next transition phi_current"
-            ),
-            "terminal_next_potential": 0.0,
-            "delivery_or_connectivity_potential": False,
-        },
+        "evaluation_uses_training_path": True,
     }
 
 
@@ -931,14 +901,12 @@ def effective_training_config(config, method_spec: MethodSpec) -> dict:
     )
     values.update(comparison_method_configuration(method_spec))
     configured_coefficients = {
-        "beta_search": float(values.get(
-            "beta_search", TASK_POTENTIAL_BETA_SEARCH
-        )),
-        "beta_vs": float(values.get("beta_vs", TASK_POTENTIAL_BETA_VS)),
-        "beta_com": float(values.get("beta_com", TASK_POTENTIAL_BETA_COM)),
+        "c9": MOVEMENT_CONSTRAINT_WEIGHT_C9,
+        "c10": MOVEMENT_CONSTRAINT_WEIGHT_C10,
+        "com_range": MOVEMENT_CONSTRAINT_WEIGHT_COM,
     }
-    values["task_potential_shaping_coefficients"] = configured_coefficients
-    values["effective_task_potential_shaping_coefficients"] = {
+    values["movement_constraint_penalty_weights"] = configured_coefficients
+    values["effective_movement_constraint_penalty_weights"] = {
         name: coefficient if method_spec.task_potential_enabled else 0.0
         for name, coefficient in configured_coefficients.items()
     }
@@ -970,9 +938,9 @@ def comparison_method_configuration(method_spec: MethodSpec) -> dict:
 
     method_spec = MethodSpec.parse(method_spec.method_id)
     configured_coefficients = {
-        "beta_search": TASK_POTENTIAL_BETA_SEARCH,
-        "beta_vs": TASK_POTENTIAL_BETA_VS,
-        "beta_com": TASK_POTENTIAL_BETA_COM,
+        "c9": MOVEMENT_CONSTRAINT_WEIGHT_C9,
+        "c10": MOVEMENT_CONSTRAINT_WEIGHT_C10,
+        "com_range": MOVEMENT_CONSTRAINT_WEIGHT_COM,
     }
     return {
         "assignment_strategy": method_spec.assignment,
@@ -984,8 +952,8 @@ def comparison_method_configuration(method_spec: MethodSpec) -> dict:
         "task_potential_enabled": bool(method_spec.task_potential_enabled),
         "task_potential_contract_version": TASK_POTENTIAL_CONTRACT_VERSION,
         "task_potential_configuration": task_potential_contract_metadata(),
-        "task_potential_shaping_coefficients": configured_coefficients,
-        "effective_task_potential_shaping_coefficients": {
+        "movement_constraint_penalty_weights": configured_coefficients,
+        "effective_movement_constraint_penalty_weights": {
             name: coefficient if method_spec.task_potential_enabled else 0.0
             for name, coefficient in configured_coefficients.items()
         },
@@ -1043,8 +1011,22 @@ def comparison_method_configuration(method_spec: MethodSpec) -> dict:
         "safe_ddqn_eta_c": (
             SAFE_DDQN_ETA_C if method_spec.routing == "safe_ddqn" else None
         ),
-        "safe_ddqn_dual_normalization_reference_packets": (
-            SAFE_DDQN_DUAL_NORMALIZATION_REFERENCE_PACKETS
+        "safe_ddqn_system_dvp_target": (
+            SAFE_DDQN_QOS_TARGET_PROBABILITY
+            if method_spec.routing == "safe_ddqn"
+            else None
+        ),
+        "safe_ddqn_lambda_update_mode": (
+            SAFE_DDQN_LAMBDA_UPDATE_MODE
+            if method_spec.routing == "safe_ddqn"
+            else None
+        ),
+        "safe_ddqn_reference_packet_count": None,
+        "safe_ddqn_cost_discount_source": (
+            "routing_gamma" if method_spec.routing == "safe_ddqn" else None
+        ),
+        "safe_ddqn_pre_routing_cost_transition": (
+            "none_without_routing_decision"
             if method_spec.routing == "safe_ddqn"
             else None
         ),

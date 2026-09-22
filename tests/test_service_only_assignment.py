@@ -59,7 +59,7 @@ def test_service_only_observation_potential_and_checkpoint_contracts():
     assert MOVEMENT_STATE_DIM == 531
     assert len(names) == MOVEMENT_STATE_DIM
     assert not any("relay" in name.lower() for name in names)
-    assert CHECKPOINT_SCHEMA_VERSION == 32
+    assert CHECKPOINT_SCHEMA_VERSION == 33
     assert "service-only" in ASSIGNMENT_CONTRACT_VERSION
 
     env = Simulator(16)
@@ -68,29 +68,18 @@ def test_service_only_observation_potential_and_checkpoint_contracts():
     assert len(calculate_movement_potentials(env, 1.0)) == 3
 
 
-def test_reward_is_the_previous_reward_minus_relay_shaping_only():
-    config = TrainingConfig(total_episodes=1)
-    current = (0.2, 0.3, 0.4)
-    following = (0.5, 0.6, 0.7)
+def test_reward_contains_only_base_and_current_constraints():
     reward = _interval_reward(
         delivered_mbits=4.0,
         energy=2.0,
         current_lambda=0.25,
-        gamma=1.0,
-        potentials_t=current,
-        potentials_t1=following,
-        done=False,
-        config=config,
+        constraint_penalties={
+            "c9_penalty_mean": 0.1,
+            "c10_penalty_mean": 0.2,
+            "com_range_penalty_mean": 0.3,
+        },
     )
-    unchanged_objective_and_service_potentials = 3.5 + 3.0 * 0.3 * 2
-    hypothetical_retired_relay_shaping = 3.0 * (0.8 - 0.1)
-    previous_reward = (
-        unchanged_objective_and_service_potentials
-        + hypothetical_retired_relay_shaping
-    )
-    assert reward == pytest.approx(
-        previous_reward - hypothetical_retired_relay_shaping
-    )
+    assert reward == pytest.approx(2.9)
     assert "beta_relay" not in inspect.signature(
         ReplayBufferJoint._reward_numpy
     ).parameters

@@ -59,7 +59,6 @@ from experiment_config import (
     ROUTING_REWARD_CONTRACT_VERSION,
     ROUTING_STATE_DIM,
     ROUTING_STATE_SCHEMA_VERSION,
-    SAFE_DDQN_DUAL_NORMALIZATION_REFERENCE_PACKETS,
     SAFE_DDQN_ETA_C,
     SAFE_DDQN_INITIAL_LAMBDA_COST,
     SAFE_DDQN_QOS_TARGET_PROBABILITY,
@@ -96,7 +95,8 @@ from dinkelbach_blocks import (
     dinkelbach_config_metadata,
 )
 
-CHECKPOINT_SCHEMA_VERSION = 32
+CHECKPOINT_SCHEMA_VERSION = 33
+PRE_PACKET_PATH_COST_CHECKPOINT_SCHEMA_VERSION = 32
 PRE_HYBRID_SEARCH_CHECKPOINT_SCHEMA_VERSION = 31
 PRE_SEARCH_OVERLAP_GATEWAY_RANDOM_CHECKPOINT_SCHEMA_VERSION = 30
 PRE_SERVICE_ONLY_CHECKPOINT_SCHEMA_VERSION = 29
@@ -132,12 +132,9 @@ JOINT_REPLAY_FIELDS = (
     "not_done",
     "delivered_mbits",
     "total_mobility_energy",
-    "phi_search_t",
-    "phi_search_t1",
-    "phi_vs_t",
-    "phi_vs_t1",
-    "phi_com_t",
-    "phi_com_t1",
+    "c9_penalty",
+    "c10_penalty",
+    "com_range_penalty",
     "ratio_objective_reward",
     "current_movement_mask",
     "next_movement_mask",
@@ -152,6 +149,9 @@ ROUTING_REPLAY_FIELDS = (
     "not_done",
     "tag_gt",
     "transition_id",
+    "cost_next_state",
+    "cost_not_done",
+    "cost_ready",
 )
 
 FORMAL_CORE_CONFIG_FIELDS = (
@@ -187,8 +187,8 @@ FORMAL_CORE_CONFIG_FIELDS = (
     "task_potential_enabled",
     "task_potential_contract_version",
     "task_potential_configuration",
-    "task_potential_shaping_coefficients",
-    "effective_task_potential_shaping_coefficients",
+    "movement_constraint_penalty_weights",
+    "effective_movement_constraint_penalty_weights",
     "movement_replay_contract_version",
     "search_controller",
     "search_controller_contract_version",
@@ -235,7 +235,11 @@ FORMAL_CORE_CONFIG_FIELDS = (
     "reference_s2u_max_capacity_mbps",
     "safe_ddqn_initial_lambda_cost",
     "safe_ddqn_eta_c",
-    "safe_ddqn_dual_normalization_reference_packets",
+    "safe_ddqn_system_dvp_target",
+    "safe_ddqn_lambda_update_mode",
+    "safe_ddqn_reference_packet_count",
+    "safe_ddqn_cost_discount_source",
+    "safe_ddqn_pre_routing_cost_transition",
     "safe_ddqn_lambda_update_scope",
     "safe_ddqn_evaluation_lambda_mode",
     "routing_mask_scope",
@@ -875,12 +879,12 @@ def _validate_safe_ddqn_constraint_metadata(metadata):
     expected = {
         "initial_lambda_cost": SAFE_DDQN_INITIAL_LAMBDA_COST,
         "normalized_eta_c": SAFE_DDQN_ETA_C,
-        "dual_normalization_reference_packets": (
-            SAFE_DDQN_DUAL_NORMALIZATION_REFERENCE_PACKETS
-        ),
         "qos_target_probability": SAFE_DDQN_QOS_TARGET_PROBABILITY,
+        "system_dvp_target": SAFE_DDQN_QOS_TARGET_PROBABILITY,
         "lambda_update_scope": "episode_end",
-        "cost_denominator": "fixed_reference_packets",
+        "lambda_update_mode": "direct_episode_system_dvp",
+        "cost_denominator": "episode_system_eligible_packets",
+        "reference_packet_count": None,
         "mid_episode_checkpoint_supported": False,
     }
     mismatches = {
@@ -1463,6 +1467,14 @@ def _checkpoint_uses_dinkelbach(metadata):
 def _validate_checkpoint_schema(metadata):
     schema = metadata.get("checkpoint_schema_version")
     if schema != CHECKPOINT_SCHEMA_VERSION:
+        if schema == PRE_PACKET_PATH_COST_CHECKPOINT_SCHEMA_VERSION:
+            raise RuntimeError(
+                "checkpoint schema v32 stores sender-local immediate costs, the "
+                "5% fixed-reference Safe-DDQN dual contract, VS/COM potential "
+                "differences, and the previous assignment normalization. The "
+                "packet-path cost and direct 1% system-DVP contract is "
+                "incompatible; retraining is required"
+            )
         if schema == PRE_HYBRID_SEARCH_CHECKPOINT_SCHEMA_VERSION:
             raise RuntimeError(
                 "checkpoint schema v31 used movement-policy Search control, "
@@ -1492,10 +1504,9 @@ def _validate_checkpoint_schema(metadata):
         raise RuntimeError(
             "checkpoint_schema_version is incompatible with the canonical 16-UAV "
             "boundary-aligned "
-            "stochastic channel, routing-stage frozen-queue immediate cost, "
-            "fixed-reference Safe-DDQN dual update, canonical nadir contributors, "
-            "GS-reachable initial topology, canonical oblique VS quality/proximity and range-gap COM "
-            "potentials, "
+            "stochastic channel, packet-path routing cost, direct system-DVP "
+            "Safe-DDQN dual update, canonical nadir contributors, "
+            "GS-reachable initial topology, immediate VS/COM constraints, "
             "permanent GS gateway, capture-weighted timely useful goodput, "
             "continuous hard-only 400 m UAV 0 gateway projection, "
             "unified inclusive 400 m S2U/U2G/U2U communication range, "

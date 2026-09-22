@@ -88,7 +88,7 @@ class RoutingTransitionTerminalTest(unittest.TestCase):
             {0: 1}, {(0, 1): 0.001}
         )
 
-        self.assertEqual(replay.cost[0, 0], 1.0)
+        self.assertEqual(replay.cost[0, 0], 0.0)
         self.assertEqual(self.stats["COM"]["timely_delivered_packets"], 0)
         self.assertEqual(self.stats["COM"]["deadline_violated_packets"], 1)
 

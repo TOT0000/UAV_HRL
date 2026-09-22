@@ -29,12 +29,13 @@ and COM service tasks; unassigned UAVs fall back to Search. UAV 0 is permanently
 excluded from service assignment: it is Search plus GS gateway below the release
 threshold and Hovering plus GS gateway after release. UAV 15 keeps the ordinary
 reserved-Search lifecycle and may enter service matching at a subsequent new-RoI boundary after release. FOV raw utility
-uses global feasible-pair min/max normalization (equal values map to 0.5), while
-COM uses canonical S2U capacity at the candidate's actual 3-D geometry,
+and COM raw capacity are each divided by the maximum feasible candidate of
+their own task type in that matching call. Masked, dummy, completed, inactive,
+and infeasible pairs do not enter either maximum. COM uses canonical S2U capacity at the candidate's actual 3-D geometry,
 computed with `10 MHz / 24` from the sampled one-second A2G LoS/NLoS state and
-the corresponding deterministic Rician/Rayleigh expected capacity. It is
-divided by the fixed 50 m AGL LoS-Rician expected-capacity reference. This
-denominator is independent of candidates and traffic rate. A separate feasibility mask and
+the corresponding deterministic Rician/Rayleigh expected capacity. The fixed
+reference remains available to non-assignment observation/channel paths but is
+not used for assignment. A separate feasibility mask and
 explicit dummy choices keep rows unmatched when no service task is available;
 solver-only infinities never enter the domain utility matrix. K-KM runs one
 FOV-only round followed by one COM-only round over all eligible UAVs, so a UAV
@@ -48,7 +49,7 @@ FOV assignment uses `visual_sensing.vs_geometry` through
 `G = min(1, b1 * relative_altitude / (horizontal_distance + epsilon))`.
 Assignment eligibility is independent of current sensing validity: UAVs outside
 the oblique range can accept a task and approach it. Existing target, altitude,
-role and task-count checks still apply. Equal normalized values remain 0.5.
+role and task-count checks still apply. Equal positive maxima normalize to 1.
 The seeded random-assignment baseline uses `env.assignment_rng` and runs a
 feasibility-only FOV round followed, when requested, by a COM round. It does not
 build FOV/COM utility matrices; a first-round FOV UAV remains eligible for one
@@ -137,14 +138,14 @@ Relay diagnostics artifact.
   routing slot contains exactly fifty 5 ms fading blocks
 - physical and effective routing masks recomputed in every routing slot for
   safe-DDQN, controlled DQN, controlled DDQN, and random routing
-- safe-DDQN target violation probability `0.1`, initial `lambda_cost=0`, and
+- safe-DDQN system-DVP target probability `0.01`, initial `lambda_cost=0`, and
   `eta_c=0.01`; every episode uses one frozen multiplier for both executed and
   target actions, then updates it once with
-  `max(0, lambda_cost + eta_c * (violations / eligible_packets - 0.1))`.
-  This multiplier uses only packets that received a stable routing transition
-  ID and their routing-attributable violations. Pre-routing S2U failures remain
-  formal system QoS violations but cannot update the multiplier or replay cost;
-  an episode with no routing-credit-eligible packets does not update it
+  `max(0, lambda_cost + eta_c * (system_violations / system_eligible_packets - 0.01))`.
+  Both counts are unique packet counts and include pre-routing and routing-stage
+  outcomes. If the system denominator is zero, the update is skipped and
+  diagnosed. A pre-routing failure with no routing decision creates no cost
+  transition but still affects system DVP and the multiplier
 - learned routing uses the common local reward
   `capacity_norm - 0.5 * (transmission_delay_norm + queue_delay_norm) + 2 * gs_progress_norm`
   with fixed canonical U2U/U2G reference capacities. The soft GS progress is
@@ -201,7 +202,7 @@ Relay diagnostics artifact.
 - direct-ratio methods store zero objective reward on every non-terminal
   movement transition and the single episode value
   `sum(timely useful Mbit) / sum(all-UAV mobility energy J)` on the terminal
-  transition; task-potential shaping remains transition-local
+  transition; movement constraint penalties remain transition-local
 - Dinkelbach lambda starts at `0.0` and is fixed within each non-overlapping
   50-episode outer block
 - after every complete block, lambda becomes
@@ -214,18 +215,14 @@ Relay diagnostics artifact.
 - model-only checkpoint every 50 episodes, including exactly one final checkpoint
 - full-resume checkpoint every 50 episodes, retaining only the latest two
 
-## Movement task-potential contract
+## Movement constraint-reward contract
 
-Movement shaping remains a potential difference with unit movement discount:
-`F_x = beta_x * (Phi_x(s_next) - Phi_x(s))`, where
-`beta_search = 0`, `beta_vs = beta_com = 3.0`, and `gamma = 1` in every
-task-potential-enabled formal method. An unchanged potential
-therefore contributes zero, approaching a task target contributes positively,
-and retreating contributes negatively. Terminal transitions retain the existing
-terminal-zero potential lifecycle. No absolute per-step proximity bonus and no
-delivery or connectivity potential is present; routing reward is governed by
-the separate GS-progress routing contract above. The `no_task_potential`
-ablation makes all three effective coefficients zero.
+Every method whose existing `task_potential_enabled` flag is true uses the
+post-action immediate reward `r_base - P_C9 - P_C10 - P_COM`. Each penalty has
+weight one, is averaged over the currently assigned pairs of its own task type,
+and is not divided by 60 or by a dynamic movement-step count. The
+`no_task_potential` methods apply none of these penalties. Dinkelbach and ratio
+methods retain their distinct base objectives.
 
 The Search potential remains the global `mean(visited_bitmap)`, but its shaping
 coefficient is zero. Search movement is owned by the shared deterministic
@@ -257,13 +254,15 @@ ROI radius comes from the target object, defaulting to 80 m. Raw `I` is ROI
 area divided by this same polygon area and can exceed one. Neither camera mode
 has a minimum-resolution feasibility threshold.
 
-VS potential and assignment share `0.8 * coverage * min(I,1) + 0.2 * G`.
+VS assignment retains `0.8 * coverage * min(I,1) + 0.2 * G`.
 `G = min(1, b1*z_relative/(d_horizontal+epsilon))`, where `b1=2*f/width`.
 Outside `d_horizontal <= b1*z_relative`, or with invalid/singular rays,
 `I=coverage=Q=0`. The exact inclusive range boundary has a horizontal corner
 ray, so it is model-range-valid but sensing-invalid; G remains one. There is
-no coverage threshold. `Phi_VS` averages all assigned FOV pairs, including
-invalid current poses, or is zero when no pair is assigned.
+no coverage threshold. The C9 penalty is `mean(1-G)` over assigned FOV pairs.
+C10 is evaluated only for C9-valid pairs with finite `d_L,d_R`, as
+`mean(1-clip(min(d_L,d_R)/(r_ROI+epsilon),0,1))`; it remains a soft movement
+constraint and does not change partial-coverage packet generation.
 
 The independent traffic-model maximum is exactly 31,600 bits. Assigned VS uses
 the existing 5 packets/s rate accumulator only during valid sensing, retaining
@@ -275,24 +274,16 @@ inconsistent geometry raises an error before credit or counters change. Timely
 useful VS bits are physical bits times frozen coverage. COM is unchanged;
 the VS QoS denominator now includes only captures generated during valid sensing.
 
-For every assigned COM task, progress is an equal blend of the existing
-deterministic expected S2U capacity normalization and 3-D S2U range-gap
-proximity. With inclusive `R_S2U = 400 m`, the gap is
-`max(d_3D - R_S2U, 0)` and is normalized by
-`max(sqrt(W^2 + H^2 + (z_max - z_ground)^2) - R_S2U, epsilon)`. The distance
-term is exactly one throughout the legal S2U range and decreases continuously
-only outside it. The prospective fading-aware capacity component deliberately
-does not apply the hard service cutoff, so it continues to provide continuous
-channel-quality information outside 400 m. VS remains based only on FOV sensing
-and horizontal target geometry and is independent of the communication range.
-`Phi_COM` is the arithmetic mean over COM tasks, or zero when none exist.
-Both blends use weights `0.5/0.5` and are finite in `[0,1]`.
+For every assigned COM UAV-SR pair, including sessions not yet activated, the
+range penalty is `1-clip(R_S2U/(d_3D+epsilon),0,1)` with the shared inclusive
+`R_S2U = 400 m`. It is averaged across assigned COM pairs. No duplicate C8
+penalty is applied to routing links already governed by their action masks.
 
-The task-potential contract is
-`external-search-manager-zero-search-potential-v14`. TD3 and DDPG
-consume the same potential definitions, random-movement methods publish the
-same environment/reward contract, and `*_no_task_potential` methods disable all
-Search/VS/COM shaping. Existing observations already contain UAV and task
+The movement auxiliary-reward contract is
+`post-action-vs-com-mean-constraint-penalties-v15`. TD3 and DDPG
+consume the same constraint definitions, random-movement methods publish the
+same environment/reward contract, and `*_no_task_potential` methods set all
+C9/C10/COM penalty weights to zero. Existing observations already contain UAV and task
 positions plus COM capacity. Movement state and joint action dimensions remain
 531 and 48; routing state is 143-D after adding the 17 action-wise GS-progress
 features in UAV-0-through-UAV-15-then-GS order.
@@ -358,28 +349,24 @@ canonical slot-0 SR movement then completes before interval-0 A2G state is
 sampled exactly once and initial task assignment runs. At a later boundary, the
 fourth routing slot and packet service finish, boundary UAV/SR geometry is made
 current, and the next interval's complete A2G state is sampled once. The expired
-slot profile is cleared by that state transition. Boundary task assignment,
-movement potentials, and movement `next_state` are then built from the new
-geometry/state. The next loop iteration reuses this prepared state, so every
-non-terminal movement replay `next_state`, projection mask, and `phi_*_t1`
-exactly equal the next policy observation, mask, and `phi_*_t`.
+slot profile is cleared by that state transition. Boundary task assignment and
+movement `next_state` are then built from the new geometry/state. Constraint
+penalties use the post-action geometry at that boundary. The next loop
+iteration reuses the prepared state and projection mask.
 
-Every routing decision, including Wait, receives a global monotonic transition
-ID. Packets retain the exact ID of their last routing action. Routing
-transitions first remain causality-pending instead of recording an end-of-slot
-observation. At the next slot, packet injection,
+Every actual HOL routing decision, including Wait, receives a global monotonic
+transition ID and is appended to that packet's decision chain. Reward
+transitions retain sender-next-observation causality. Cost transitions instead
+link to the same packet's next routing decision, even after a UAV handoff or a
+loop back to the same UAV. At the next slot, packet injection,
 expiration/cleanup, start-of-slot HOL eligibility, effective masks, and routing
-observations are resolved in their canonical order. Boundary expiration cost is
-attached by packet transition ID, never by the sender's latest replay index.
-After the actual next observation is fixed, a transition remains credit-pending
-while any active packet still references it and is not sampleable. Delivery,
-expiration, or replacement by a newer action releases that reference. Packets
-with no routing transition still contribute to system QoS and increment an
-explicit missing-ID diagnostic without receiving fabricated replay credit.
-System violations therefore equal routing-attributable violations plus
-unattributed pre-routing violations. System evaluation uses every activated
-COM sample, while the safe-DDQN constraint uses only stable-ID credit-eligible
-samples.
+observations are resolved in their canonical order. Earlier decisions have
+immediate cost zero. Timely delivery closes the final decision with terminal
+cost zero; violation closes it once with terminal cost one. The existing cost
+critic discount and masked Double-DQN backup propagate that terminal cost
+through the chain. Non-HOL waiting creates no decision. Packets with no routing
+decision still contribute to system QoS and the dual update without receiving
+fabricated replay credit.
 Formal routing replay is one-step. Episode-terminal packet outcomes and costs
 are settled before the ledger is drained.
 
@@ -559,12 +546,13 @@ python -X utf8 comparison_experiment.py aggregate --input-dir runs/comparison/ev
 
 Exact-resume checkpoints validate the method fingerprint, training-manifest
 relationship, training seed, the complete Dinkelbach block state, and its configuration.
-Checkpoint schema v32 retains the service-only 531-D contract and requires the
+Checkpoint schema v33 retains the service-only 531-D contract and requires the
 deterministic external region/frontier Search controller, zero Search shaping,
 single-footprint complete-RoI inclusive-10% discovery, passive COM-only/Hover
-coverage contribution, and typed feasibility-only Random rounds. Schema v31
-and older encode earlier Search contracts and are rejected before weights or
-replay are loaded. Schema v29 removed the explicit
+coverage contribution, typed feasibility-only Random rounds, packet-path cost
+linkage, direct 1% system-DVP dual updates, post-action movement constraints,
+and task-type maximum-normalized assignment. Schema v32 and older are rejected
+before weights or replay are loaded. Schema v29 removed the explicit
 Relay task, its movement observation fields, potential, replay fields,
 checkpoint metadata and diagnostics. The current schema requires
 valid-sensing VS generation and assignment-local
@@ -573,11 +561,11 @@ continuous-hard-only-gateway,
 unified-400-m communication, permanent-gateway, coverage-weighted useful
 goodput, boundary-aligned stochastic-channel,
 movement/routing replay, utility/QoS, routing-ID causality/credit,
-boundary-aligned current/next decision-state Search/VS/COM potentials plus soft-GS-progress
-reward, GS-reachable initial topology, distance-aware VS/COM task potentials,
+post-action VS/COM constraints plus soft-GS-progress
+reward, GS-reachable initial topology, immediate VS/COM constraint penalties,
 hard-range/COM-session, atomic-FOV, seed-ratio
 aggregation, propulsion, and four-slot/fifty-block movement-channel contract.
-Schema v31 and every older schema is rejected before weights or replay state are
+Schema v32 and every older schema is rejected before weights or replay state are
 restored and must be retrained; v29 receives an explicit retired-Relay-schema
 error and no legacy checkpoint migration is attempted.
 Model-only evaluation checkpoints also validate the visual version and complete

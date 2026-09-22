@@ -53,7 +53,7 @@ from training_checkpoint import (
 )
 
 
-DESIGN_DATASET_SCHEMA_VERSION = 8
+DESIGN_DATASET_SCHEMA_VERSION = 9
 DESIGN_TRANSITIONS_FILENAME = "design_transitions.npz"
 DESIGN_METADATA_FILENAME = "design_dataset_metadata.json"
 DESIGN_EPISODES_CSV = "per_episode.csv"
@@ -67,12 +67,12 @@ ARRAY_NAMES = (
     "not_done",
     "delivered_mbits",
     "total_mobility_energy_j",
-    "phi_search_t",
-    "phi_search_t1",
-    "phi_vs_t",
-    "phi_vs_t1",
-    "phi_com_t",
-    "phi_com_t1",
+    "c9_penalty_mean",
+    "c10_penalty_mean",
+    "com_range_penalty_mean",
+    "base_movement_reward",
+    "applied_constraint_penalty",
+    "final_movement_reward",
     "movement_gamma",
     "reward_at_checkpoint_lambda",
     "checkpoint_lambda",
@@ -86,12 +86,12 @@ ARRAY_NAMES = (
 FLOAT_COMPONENTS = (
     "delivered_mbits",
     "total_mobility_energy_j",
-    "phi_search_t",
-    "phi_search_t1",
-    "phi_vs_t",
-    "phi_vs_t1",
-    "phi_com_t",
-    "phi_com_t1",
+    "c9_penalty_mean",
+    "c10_penalty_mean",
+    "com_range_penalty_mean",
+    "base_movement_reward",
+    "applied_constraint_penalty",
+    "final_movement_reward",
     "movement_gamma",
     "reward_at_checkpoint_lambda",
     "checkpoint_lambda",
@@ -111,6 +111,18 @@ INTEGER_EPISODE_COLUMNS = {
     "routing_wait_count",
     "partial_transmission_count",
     "slot_budget_violation_count",
+    "packet_path_decision_count",
+    "packet_path_cost_transition_count",
+    "pre_routing_terminal_without_decision_count",
+    "c9_penalty_sample_count",
+    "c10_penalty_sample_count",
+    "com_range_penalty_sample_count",
+    "c9_satisfied_pair_count",
+    "c9_violated_pair_count",
+    "c10_satisfied_pair_count",
+    "c10_violated_pair_count",
+    "com_in_range_assigned_pair_count",
+    "com_out_of_range_assigned_pair_count",
 }
 PACKET_INTEGER_COLUMNS = {
     column for column in PACKET_METRIC_COLUMNS if column.endswith("_packets")
@@ -171,18 +183,8 @@ class DesignTransitionCollector:
 
 
 def reconstruct_reward(arrays, *, beta_search, beta_vs, beta_com):
-    gamma = arrays["movement_gamma"]
-    return (
-        arrays["delivered_mbits"]
-        - arrays["checkpoint_lambda"]
-        * arrays["total_mobility_energy_j"]
-        + float(beta_search)
-        * (gamma * arrays["phi_search_t1"] - arrays["phi_search_t"])
-        + float(beta_vs)
-        * (gamma * arrays["phi_vs_t1"] - arrays["phi_vs_t"])
-        + float(beta_com)
-        * (gamma * arrays["phi_com_t1"] - arrays["phi_com_t"])
-    )
+    del beta_search, beta_vs, beta_com
+    return arrays["base_movement_reward"] - arrays["applied_constraint_penalty"]
 
 
 def validate_design_arrays(
@@ -491,11 +493,9 @@ def _build_metadata(preflight, arrays, result, run_dir, reference_rows):
             "ddqn_logits_noise": 0.0,
         },
         "action_perturbation": "disabled",
-        "potential_weights": {
-            "beta_search": float(formal_config["beta_search"]),
-            "beta_vs": float(formal_config["beta_vs"]),
-            "beta_com": float(formal_config["beta_com"]),
-        },
+        "constraint_penalty_weights": formal_config[
+            "movement_constraint_penalty_weights"
+        ],
         "task_potential_contract_version": TASK_POTENTIAL_CONTRACT_VERSION,
         "movement_replay_contract_version": MOVEMENT_REPLAY_CONTRACT_VERSION,
         "assignment_contract_version": formal_config["assignment_contract_version"],
@@ -509,21 +509,17 @@ def _build_metadata(preflight, arrays, result, run_dir, reference_rows):
         "search_detection_overlap_threshold": float(
             formal_config["search_detection_overlap_threshold"]
         ),
-        "potential_boundary_semantics": (
-            "phi_current uses current decision-state backlog; phi_next uses next "
-            "decision-state backlog; terminal phi_next is zero"
-        ),
+        "constraint_timing": "post-action geometry at each movement boundary",
         "reward_components": {
             "definition": (
-                "delivered_mbits - lambda * total_mobility_energy_j + "
-                "sum(beta_d * (phi_d_t1 - phi_d_t)); terminal phi_d_t1 is zero"
+                "base_movement_reward - P_C9 - P_C10 - P_COM"
             ),
             "delivered_mbits_unit": "Mbit delivered to ground station within deadline",
             "total_mobility_energy_j_unit": "joule across all UAVs in one second",
-            "potentials_unit": "dimensionless",
+            "constraint_penalties_unit": "dimensionless",
             "checkpoint_lambda_unit": "Mbit per joule",
             "reward_unit": "Mbit-equivalent shaped reward",
-            "terminal_next_potential": 0.0,
+            "episode_step_normalization": False,
         },
         "state_feature_schema": state_schema,
         "continuous_state_indices": state_schema["continuous_indices"],
@@ -531,8 +527,8 @@ def _build_metadata(preflight, arrays, result, run_dir, reference_rows):
         "next_state_schema": "identical to state_feature_schema",
         "projected_joint_action_schema": action_schema,
         "terminal_semantics": (
-            "done is true only at movement_step 59; not_done=0 and all "
-            "effective next potentials are zero; episodes never link"
+            "done is true only at the final movement step; not_done=0; "
+            "episodes never link"
         ),
         "transition_definition": (
             "movement-boundary state -> one deterministic actor call -> projected "

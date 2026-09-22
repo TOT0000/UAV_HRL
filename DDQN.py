@@ -10,7 +10,6 @@ from torch.optim.lr_scheduler import StepLR
 import matplotlib.pyplot as plt
 
 from experiment_config import (
-    SAFE_DDQN_DUAL_NORMALIZATION_REFERENCE_PACKETS,
     SAFE_DDQN_ETA_C,
     SAFE_DDQN_INITIAL_LAMBDA_COST,
     SAFE_DDQN_QOS_TARGET_PROBABILITY,
@@ -116,9 +115,6 @@ class DDQN:
         lr=ROUTING_LEARNING_RATE,
         lambda_cost=SAFE_DDQN_INITIAL_LAMBDA_COST,
         eta_c=SAFE_DDQN_ETA_C,
-        dual_normalization_reference_packets=(
-            SAFE_DDQN_DUAL_NORMALIZATION_REFERENCE_PACKETS
-        ),
         qos_target_probability=SAFE_DDQN_QOS_TARGET_PROBABILITY,
         rng_streams=None,
         master_seed=0,
@@ -152,16 +148,12 @@ class DDQN:
         self.lambda_cost = float(lambda_cost)
         self.initial_lambda_cost = float(SAFE_DDQN_INITIAL_LAMBDA_COST)
         self.eta_c = float(eta_c)
-        self.dual_normalization_reference_packets = int(
-            dual_normalization_reference_packets
-        )
         self.qos_target_probability = float(qos_target_probability)
         if (
             not np.isfinite(self.lambda_cost)
             or self.lambda_cost < 0.0
             or not np.isfinite(self.eta_c)
             or self.eta_c <= 0.0
-            or self.dual_normalization_reference_packets <= 0
             or not np.isfinite(self.qos_target_probability)
             or not 0.0 <= self.qos_target_probability <= 1.0
         ):
@@ -172,6 +164,8 @@ class DDQN:
         self.last_episode_violation_probability = None
         self.last_lambda_cost_used = None
         self.last_lambda_cost_after = None
+        self.last_lambda_update_status = None
+        self.cost_multiplier_skipped_episode_count = 0
 
         self.loss_log = []
         self.cost_loss_log = []
@@ -337,19 +331,20 @@ class DDQN:
             if eligible_count
             else None
         )
-        residual_count = (
-            violation_count
-            - self.qos_target_probability * float(eligible_count)
-        )
-        updated = max(
-            0.0,
-            used
-            + self.eta_c
-            * residual_count
-            / float(self.dual_normalization_reference_packets),
-        )
+        if eligible_count == 0:
+            updated = used
+            self.cost_multiplier_skipped_episode_count += 1
+            self.last_lambda_update_status = "skipped_no_eligible_packets"
+        else:
+            updated = max(
+                0.0,
+                used
+                + self.eta_c
+                * (violation_probability - self.qos_target_probability),
+            )
+            self.cost_multiplier_update_count += 1
+            self.last_lambda_update_status = "updated_from_system_dvp"
         self.lambda_cost = float(updated)
-        self.cost_multiplier_update_count += 1
         self.last_episode_violation_probability = violation_probability
         self.last_lambda_cost_used = used
         self.last_lambda_cost_after = float(updated)
@@ -360,12 +355,12 @@ class DDQN:
             "lambda_cost": float(self.lambda_cost),
             "initial_lambda_cost": float(self.initial_lambda_cost),
             "normalized_eta_c": float(self.eta_c),
-            "dual_normalization_reference_packets": int(
-                self.dual_normalization_reference_packets
-            ),
             "qos_target_probability": float(self.qos_target_probability),
+            "system_dvp_target": float(self.qos_target_probability),
             "lambda_update_scope": "episode_end",
-            "cost_denominator": "fixed_reference_packets",
+            "lambda_update_mode": "direct_episode_system_dvp",
+            "cost_denominator": "episode_system_eligible_packets",
+            "reference_packet_count": None,
             "cost_multiplier_update_count": int(
                 self.cost_multiplier_update_count
             ),
@@ -381,6 +376,10 @@ class DDQN:
             ),
             "last_lambda_cost_used": self.last_lambda_cost_used,
             "last_lambda_cost_after": self.last_lambda_cost_after,
+            "last_lambda_update_status": self.last_lambda_update_status,
+            "cost_multiplier_skipped_episode_count": int(
+                self.cost_multiplier_skipped_episode_count
+            ),
         }
 
     def load_constraint_state(self, state):
@@ -388,10 +387,12 @@ class DDQN:
             "lambda_cost",
             "initial_lambda_cost",
             "normalized_eta_c",
-            "dual_normalization_reference_packets",
             "qos_target_probability",
+            "system_dvp_target",
             "lambda_update_scope",
+            "lambda_update_mode",
             "cost_denominator",
+            "reference_packet_count",
             "cost_multiplier_update_count",
             "episode_violation_accumulator",
             "episode_eligible_packet_accumulator",
@@ -406,12 +407,14 @@ class DDQN:
             float(state["initial_lambda_cost"])
             != SAFE_DDQN_INITIAL_LAMBDA_COST
             or float(state["normalized_eta_c"]) != SAFE_DDQN_ETA_C
-            or int(state["dual_normalization_reference_packets"])
-            != SAFE_DDQN_DUAL_NORMALIZATION_REFERENCE_PACKETS
             or float(state["qos_target_probability"])
             != SAFE_DDQN_QOS_TARGET_PROBABILITY
+            or float(state["system_dvp_target"])
+            != SAFE_DDQN_QOS_TARGET_PROBABILITY
             or state["lambda_update_scope"] != "episode_end"
-            or state["cost_denominator"] != "fixed_reference_packets"
+            or state["lambda_update_mode"] != "direct_episode_system_dvp"
+            or state["cost_denominator"] != "episode_system_eligible_packets"
+            or state["reference_packet_count"] is not None
             or float(state["episode_violation_accumulator"]) != 0.0
             or int(state["episode_eligible_packet_accumulator"]) != 0
             or bool(state["mid_episode_checkpoint_supported"])
@@ -424,9 +427,6 @@ class DDQN:
             raise RuntimeError("safe-DDQN checkpoint lambda_cost is invalid")
         self.initial_lambda_cost = SAFE_DDQN_INITIAL_LAMBDA_COST
         self.eta_c = SAFE_DDQN_ETA_C
-        self.dual_normalization_reference_packets = (
-            SAFE_DDQN_DUAL_NORMALIZATION_REFERENCE_PACKETS
-        )
         self.qos_target_probability = SAFE_DDQN_QOS_TARGET_PROBABILITY
         self.cost_multiplier_update_count = int(
             state["cost_multiplier_update_count"]
@@ -437,18 +437,25 @@ class DDQN:
             "last_episode_violation_probability",
             "last_lambda_cost_used",
             "last_lambda_cost_after",
+            "last_lambda_update_status",
         ):
             setattr(self, field, state.get(field))
+        self.cost_multiplier_skipped_episode_count = int(
+            state.get("cost_multiplier_skipped_episode_count", 0)
+        )
 
     def train(self, replay_buffer, batch_size=64):
 
-        state, action, next_state, reward, cost, not_done = replay_buffer.sample(batch_size)
+        state, action, next_state, reward, _unused_cost, not_done = replay_buffer.sample(batch_size)
+        cost_state, cost_action, cost_next_state, cost, cost_not_done = (
+            replay_buffer.sample_cost(batch_size)
+        )
 
         q_values = self.q_network(state)
         q_values = q_values.gather(1, action.unsqueeze(1)).squeeze(1)
 
-        target_q, target_c, _ = self._safe_targets(
-            next_state, reward, cost, not_done
+        target_q, _, _ = self._safe_targets(
+            next_state, reward, torch.zeros_like(reward), not_done
         )
         
         loss = F.mse_loss(q_values, target_q)
@@ -459,8 +466,15 @@ class DDQN:
         self.reward_optimizer_update_count += 1
 
         # === cost critic 訓練 ===
-        c_values = self.cost_network(state)
-        c_values = c_values.gather(1, action.unsqueeze(1)).squeeze(1)
+        c_values = self.cost_network(cost_state)
+        c_values = c_values.gather(1, cost_action.unsqueeze(1)).squeeze(1)
+
+        _, target_c, _ = self._safe_targets(
+            cost_next_state,
+            torch.zeros_like(cost),
+            cost,
+            cost_not_done,
+        )
 
         cost_loss = F.mse_loss(c_values, target_c)
         self.cost_optimizer.zero_grad()

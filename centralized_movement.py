@@ -17,7 +17,11 @@ from experiment_config import (
     TASK_POTENTIAL_NORMALIZATION_EPSILON,
     UAV_MAX_ALTITUDE_M,
 )
-from visual_sensing import DEFAULT_ROI_RADIUS_M, vs_geometry
+from visual_sensing import (
+    DEFAULT_ROI_RADIUS_M,
+    vs_c10_edge_distances,
+    vs_geometry,
+)
 from movement_feature_schema import (
     ACTIVE_MOVEMENT_TASK_TYPES,
     LOCAL_MOVEMENT_DIM,
@@ -219,7 +223,7 @@ def fov_quality_transform(image_quality):
 
 
 def fov_sensing_progress(coverage_ratio, image_quality):
-    """Return canonical FOV progress shared by assignment and VS potential."""
+    """Return the legacy canonical FOV quality product for observations."""
 
     try:
         coverage = float(coverage_ratio)
@@ -589,29 +593,115 @@ def fov_task_metrics(env, uav_id, task):
 
 
 def calculate_movement_potentials(env, c_ref_com, backlog_bits=None):
+    """Compatibility view: Search is external and VS/COM shaping was removed."""
+
+    del c_ref_com, backlog_bits
     phi_search = float(np.asarray(env.visited_bitmap, dtype=bool).mean())
-    vs_progress = []
-    com_progress = []
+    return phi_search, 0.0, 0.0
+
+
+def movement_constraint_penalties(env):
+    """Compute post-action C9, C10, and assigned COM range penalties.
+
+    Each task type is averaged independently over its authoritative assigned
+    pair population.  C10 is evaluated only after C9 is satisfied and its two
+    along-tilt footprint margins are finite.
+    """
+
+    c9_values = []
+    c10_values = []
+    com_values = []
+    c9_satisfied = c9_violated = 0
+    c10_satisfied = c10_violated = 0
+    com_in_range = com_out_of_range = 0
+
     for uav_id in range(env.num_UAV):
         grouped = _tasks_by_type(env, uav_id)
         _assert_unique_target_tasks(uav_id, grouped)
         for task in grouped["FOV"]:
-            vs_progress.append(fov_task_geometry(env, uav_id, task).pair_score)
+            geometry = fov_task_geometry(env, uav_id, task)
+            proximity = float(np.clip(geometry.proximity, 0.0, 1.0))
+            c9_values.append(1.0 - proximity)
+            if geometry.model_range_valid:
+                c9_satisfied += 1
+                edge_distances = vs_c10_edge_distances(
+                    geometry, epsilon=TASK_POTENTIAL_NORMALIZATION_EPSILON
+                )
+                if edge_distances is not None:
+                    d_left, d_right = edge_distances
+                    target = env.gts[_target_object_id(task, "FOV")]
+                    radius = float(getattr(target, "radius", DEFAULT_ROI_RADIUS_M))
+                    if (
+                        math.isfinite(d_left)
+                        and math.isfinite(d_right)
+                        and math.isfinite(radius)
+                        and radius > 0.0
+                    ):
+                        coverage_factor = float(
+                            np.clip(
+                                min(d_left, d_right)
+                                / (radius + TASK_POTENTIAL_NORMALIZATION_EPSILON),
+                                0.0,
+                                1.0,
+                            )
+                        )
+                        c10_values.append(1.0 - coverage_factor)
+                        if coverage_factor >= 1.0 - 1e-12:
+                            c10_satisfied += 1
+                        else:
+                            c10_violated += 1
+            else:
+                c9_violated += 1
         for task in grouped["COM"]:
             sr_id = _target_object_id(task, "COM")
-            capacity_progress = normalized_com_link_quality(env, uav_id, task)
-            distance_progress = normalized_s2u_range_gap_proximity(
-                env.uav_dict[uav_id].get_position(),
-                env.SR_teams[sr_id].get_position(),
-                env.env_width,
-                env.env_height,
+            uav_position = np.asarray(
+                env.uav_dict[uav_id].get_position(), dtype=np.float64
             )
-            com_progress.append(
-                blended_com_progress(capacity_progress, distance_progress)
+            sr_position = np.asarray(
+                env.SR_teams[sr_id].get_position(), dtype=np.float64
             )
-    phi_vs = float(np.mean(vs_progress)) if vs_progress else 0.0
-    phi_com = float(np.mean(com_progress)) if com_progress else 0.0
-    return phi_search, phi_vs, phi_com
+            distance = float(np.linalg.norm(uav_position - sr_position))
+            if not math.isfinite(distance):
+                raise ValueError("assigned COM pair has non-finite 3-D distance")
+            range_factor = float(
+                np.clip(
+                    S2U_COMMUNICATION_RANGE_M
+                    / (distance + TASK_POTENTIAL_NORMALIZATION_EPSILON),
+                    0.0,
+                    1.0,
+                )
+            )
+            com_values.append(1.0 - range_factor)
+            if distance <= S2U_COMMUNICATION_RANGE_M + 1e-9:
+                com_in_range += 1
+            else:
+                com_out_of_range += 1
+
+    def summarize(values):
+        total = float(math.fsum(values)) if values else 0.0
+        count = len(values)
+        return total, total / count if count else 0.0, count
+
+    c9_sum, c9_mean, c9_count = summarize(c9_values)
+    c10_sum, c10_mean, c10_count = summarize(c10_values)
+    com_sum, com_mean, com_count = summarize(com_values)
+    return {
+        "c9_penalty_sum": c9_sum,
+        "c9_penalty_mean": c9_mean,
+        "c9_sample_count": c9_count,
+        "c10_penalty_sum": c10_sum,
+        "c10_penalty_mean": c10_mean,
+        "c10_sample_count": c10_count,
+        "com_range_penalty_sum": com_sum,
+        "com_range_penalty_mean": com_mean,
+        "com_range_sample_count": com_count,
+        "c9_satisfied_pair_count": c9_satisfied,
+        "c9_violated_pair_count": c9_violated,
+        "c10_satisfied_pair_count": c10_satisfied,
+        "c10_violated_pair_count": c10_violated,
+        "com_in_range_pair_count": com_in_range,
+        "com_out_of_range_pair_count": com_out_of_range,
+    }
 
 
 def decode_joint_velocity_commands(model, projected_joint_action):

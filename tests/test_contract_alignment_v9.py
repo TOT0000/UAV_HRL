@@ -49,7 +49,7 @@ class FormalContractTest(unittest.TestCase):
         self.assertEqual(FORMAL_CHECKPOINT_EPISODE, 1500)
         self.assertEqual(FORMAL_EXPERIMENT_DEFAULTS["training_episodes_per_seed"], 1500)
         self.assertEqual(checkpoint_episode_schedule(1500, 50), list(range(50, 1501, 50)))
-        self.assertEqual(CHECKPOINT_SCHEMA_VERSION, 31)
+        self.assertEqual(CHECKPOINT_SCHEMA_VERSION, 33)
 
     def test_all_methods_publish_the_same_physical_contracts(self):
         shared_fields = (
@@ -216,17 +216,19 @@ class PropulsionContractTest(unittest.TestCase):
 
 
 class QoSAndRoutingRewardContractTest(unittest.TestCase):
-    def test_multiplier_uses_fixed_reference_count_residual(self):
+    def test_multiplier_uses_direct_episode_system_dvp_residual(self):
         agent = DDQN(4, 2)
         initial = agent.lambda_cost
         self.assertEqual(agent.qos_target_probability, SAFE_DDQN_QOS_TARGET_PROBABILITY)
-        self.assertAlmostEqual(agent.update_cost_multiplier(1, 20), initial)
+        first = agent.update_cost_multiplier(1, 20)
+        self.assertAlmostEqual(first, initial + 0.01 * (0.05 - 0.01))
         increased = agent.update_cost_multiplier(2, 20)
-        self.assertAlmostEqual(increased, initial + 0.01 / 10_000)
+        self.assertAlmostEqual(increased, first + 0.01 * (0.10 - 0.01))
         agent.lambda_cost = 0.0
         self.assertEqual(agent.update_cost_multiplier(0, 20), 0.0)
         self.assertEqual(agent.update_cost_multiplier(0, 0), 0.0)
-        self.assertEqual(agent.cost_multiplier_update_count, 4)
+        self.assertEqual(agent.cost_multiplier_update_count, 3)
+        self.assertEqual(agent.cost_multiplier_skipped_episode_count, 1)
 
     def test_activated_sr_packet_is_immediately_qos_eligible_and_terminal_violation(self):
         engine = PacketEngine(2)

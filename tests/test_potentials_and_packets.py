@@ -19,6 +19,7 @@ from centralized_movement import (
     normalized_s2u_range_gap_proximity,
     project_joint_action,
     fov_task_metrics,
+    movement_constraint_penalties,
 )
 from com_capacity_calibration import calibrate_com_capacity
 
@@ -80,10 +81,11 @@ class VisualSensingPacketGenerationTest(unittest.TestCase):
         self.assertTrue(old_packet["done"])
         self.assertEqual(old_packet["current"], self.env.GS_ID)
 
-    def test_vs_potential_is_continuous_and_positive_for_full_coverage(self):
-        _, phi_vs, _ = calculate_movement_potentials(self.env, c_ref_com=1.0)
-        self.assertGreater(phi_vs, 0.0)
-        self.assertLessEqual(phi_vs, 1.0)
+    def test_vs_constraints_are_finite_for_valid_geometry(self):
+        penalties = movement_constraint_penalties(self.env)
+        self.assertEqual(penalties["c9_penalty_mean"], 0.0)
+        self.assertEqual(penalties["c10_sample_count"], 1)
+        self.assertTrue(np.isfinite(penalties["c10_penalty_mean"]))
 
     def test_image_score_outside_old_validity_gate_still_injects(self):
         with patch(
@@ -142,7 +144,7 @@ class ComStateCalibrationAndDeliveryTest(unittest.TestCase):
         second = calibrate_com_capacity(self.env, seed=1234, sample_count=1000)
         self.assertEqual(first, second)
         self.assertEqual(
-            first["schema"], "fixed-s2u-los-rician-expected-maximum-v2"
+            first["schema"], "fading-aware-raw-capacity-maximum-v3"
         )
         self.assertEqual(first["reference_bandwidth_denominator"], 24)
         self.assertAlmostEqual(first["reference_bandwidth_hz"], 10e6 / 24)
@@ -205,9 +207,14 @@ class ComStateCalibrationAndDeliveryTest(unittest.TestCase):
         self.env.multi_tasks = {uid: [] for uid in range(16)}
         self.env.multi_tasks[0] = [task_dict]
         packet_engine = PacketEngine(num_uav=16, step_time=0.25)
-        with patch.object(
-            self.env, "get_sr_uav_normalized_utility", return_value=0.5
-        ) as utility_helper:
+        with (
+            patch.object(
+                self.env, "get_sr_uav_normalized_utility", return_value=0.5
+            ) as state_utility_helper,
+            patch.object(
+                self.env, "get_sr_uav_capacity_mbps", return_value=12.0
+            ) as assignment_utility_helper,
+        ):
             state = get_global_movement_state(
                 self.env,
                 packet_engine,
@@ -215,9 +222,7 @@ class ComStateCalibrationAndDeliveryTest(unittest.TestCase):
                 c_ref_com=24.0,
                 remaining_time=1.0,
             )
-            _, _, phi_com = calculate_movement_potentials(
-                self.env, c_ref_com=24.0
-            )
+            penalties = movement_constraint_penalties(self.env)
             assigner = UAVAssigner(self.env)
             problem = assigner.build_problem(
                 [0],
@@ -249,16 +254,11 @@ class ComStateCalibrationAndDeliveryTest(unittest.TestCase):
             if feature["name"] == "uav_0.com_capacity"
         )
         self.assertEqual(state[com_capacity_index], 0.5)
-        expected_distance = normalized_s2u_range_gap_proximity(
-            self.env.uav_dict[0].get_position(),
-            sr.get_position(),
-            self.env.env_width,
-            self.env.env_height,
-        )
-        self.assertEqual(phi_com, blended_com_progress(0.5, expected_distance))
-        self.assertEqual(problem.raw_com_utility[0, 0], 0.5)
-        self.assertEqual(assignment[0][0][2], 0.5)
-        self.assertGreaterEqual(utility_helper.call_count, 3)
+        self.assertGreaterEqual(penalties["com_range_penalty_mean"], 0.0)
+        self.assertEqual(problem.raw_com_utility[0, 0], 12.0)
+        self.assertEqual(assignment[0][0][2], 1.0)
+        self.assertGreaterEqual(state_utility_helper.call_count, 1)
+        self.assertGreaterEqual(assignment_utility_helper.call_count, 2)
         source = inspect.getsource(UAVAssigner.assign_uav_tasks_k_times)
         self.assertNotIn("capacity / 1e6", source)
 
