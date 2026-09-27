@@ -33,9 +33,12 @@ The complete field/shape/dtype/unit/mask dictionary is emitted under
   snapshot times, and the Dinkelbach lambda used by the transition.
 
 Missing auxiliary fields in an older full-resume replay remain invalid after
-load; zero-filled values are never marked as observations. New samples written
-after resume use the active schema. Model-only checkpoints do not need replay
-fields, so otherwise-compatible older models remain valid sampling sources.
+load; reusing an already allocated buffer first resets every auxiliary value to
+its defined missing state, including `-1` IDs and false validity masks.
+Zero-filled values are never marked as observations. New samples written after
+resume use the active schema. Model-only checkpoints do not need replay fields,
+so otherwise-compatible older models remain valid sampling sources. Snapshot
+capture reads absent SR queues without inserting keys into the queue mapping.
 
 At 50,000 transitions, the auxiliary fields require approximately 557 MiB of
 uncompressed RAM (11,679 bytes per transition). The fixed-shape fields use
@@ -60,6 +63,10 @@ python run_llm_sampling.py --checkpoint <CHECKPOINT_DIR> --episodes 37 --noise-s
 
 To reuse exactly the same scenarios for multiple checkpoints, first save the
 generated manifest, then pass it to later runs with the same episode count:
+
+Generated balanced manifests encode both the balanced generation mode and each
+forced RoI count in every scenario ID. Reusing the saved manifest preserves
+those IDs exactly; legacy manifests remain loadable and are never rewritten.
 
 ```powershell
 python run_llm_sampling.py --checkpoint <CHECKPOINT_250> --episodes 100 --manifest-output shared_sampling_manifest.json

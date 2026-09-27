@@ -147,6 +147,91 @@ class ScenarioManifestTest(unittest.TestCase):
         self.assertEqual(manifest.generation_profile["num_gt_mode"], "mixed")
         self.assertEqual(values, set(range(2, 9)))
 
+    def test_balanced_scenarios_have_distinct_reproducible_identities(self):
+        random_manifest = generate_manifest("test", 20260927, 3)
+        balanced = generate_manifest(
+            "test", 20260927, 3, balanced_num_gt=True
+        )
+        repeated = generate_manifest(
+            "test", 20260927, 3, balanced_num_gt=True
+        )
+
+        self.assertEqual(
+            [
+                (entry["scenario_id"], entry["scenario_seed"], entry["num_GT"])
+                for entry in random_manifest.episodes
+            ],
+            [
+                (
+                    "test:uav-hrl-scenario-v8:mixed-2-8:20260927:000000",
+                    13365926783996891901,
+                    4,
+                ),
+                (
+                    "test:uav-hrl-scenario-v8:mixed-2-8:20260927:000001",
+                    12912678206454183004,
+                    4,
+                ),
+                (
+                    "test:uav-hrl-scenario-v8:mixed-2-8:20260927:000002",
+                    8448027389647038549,
+                    3,
+                ),
+            ],
+        )
+        self.assertEqual(
+            random_manifest.content_hash,
+            "265ae8cc8dd6bce5ffc1efb02b8447ecc4608e59f9db0c62b9abb53e3a80bb7c",
+        )
+        self.assertEqual(balanced.to_dict(), repeated.to_dict())
+        self.assertEqual(
+            [entry["scenario_seed"] for entry in balanced.episodes],
+            [entry["scenario_seed"] for entry in random_manifest.episodes],
+        )
+        self.assertTrue(
+            {
+                entry["scenario_id"] for entry in random_manifest.episodes
+            }.isdisjoint(
+                {entry["scenario_id"] for entry in balanced.episodes}
+            )
+        )
+        for expected_num_gt, entry in zip((2, 3, 4), balanced.episodes):
+            self.assertEqual(entry["num_GT"], expected_num_gt)
+            self.assertIn(
+                f"balanced-numgt-{expected_num_gt}", entry["scenario_id"]
+            )
+            self.assertEqual(
+                entry["generation_variant"]["forced_num_GT"], expected_num_gt
+            )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = balanced.save(Path(tmp) / "balanced.json")
+            loaded = ScenarioManifest.load(path)
+        self.assertEqual(loaded.to_dict(), balanced.to_dict())
+
+    def test_legacy_balanced_manifest_without_identity_metadata_remains_readable(self):
+        data = generate_manifest(
+            "test", 20260927, 3, balanced_num_gt=True
+        ).to_dict()
+        data["generator_config"].pop("balanced_scenario_identity_version")
+        for entry in data["episodes"]:
+            forced = int(entry["num_GT"])
+            entry["scenario_id"] = entry["scenario_id"].replace(
+                f":balanced-numgt-{forced}:", ":"
+            )
+            entry.pop("generation_variant")
+        unsigned = {
+            key: value for key, value in data.items() if key != "content_hash"
+        }
+        data["content_hash"] = sha256_json(unsigned)
+
+        loaded = ScenarioManifest.from_dict(data)
+
+        self.assertTrue(loaded.generator_config["balanced_mixed_roi_counts"])
+        self.assertNotIn(
+            "generation_variant", loaded.episodes[0]
+        )
+
     def test_fixed_num_gt_profile_applies_to_every_episode_and_environment(self):
         manifest = generate_manifest("test", 910, 5, num_gt=4)
 

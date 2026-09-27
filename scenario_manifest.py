@@ -731,6 +731,17 @@ def generate_scenario_entry(
     uavs = _uav_initial_data(py_rng, environment_size_m=environment_size_m)
     deployment_metadata = {}
     deployment_identity = ""
+    generation_variant = None
+    generation_identity = ""
+    if forced_mixed_num_gt is not None:
+        generation_variant = {
+            "mode": "balanced_mixed_num_gt",
+            "forced_num_GT": int(forced_mixed_num_gt),
+            "identity_version": "forced-num-gt-v1",
+        }
+        generation_identity = (
+            f"balanced-numgt-{int(forced_mixed_num_gt)}:"
+        )
     if environment_size_m is not None:
         topology = validate_initial_communication_topology(
             uavs,
@@ -766,6 +777,7 @@ def generate_scenario_entry(
             f"{split}:{schema_version}:{profile_id}:"
             f"{'' if environment_size_m is None else f'map-{environment_size_m}m:'}"
             f"{'' if environment_size_m is None else f'deployment-{deployment_identity}:'}"
+            f"{generation_identity}"
             f"{int(manifest_seed)}:"
             f"{int(episode_index):06d}"
         ),
@@ -803,6 +815,8 @@ def generate_scenario_entry(
             "gs_gateway_contract_version": GS_GATEWAY_CONTRACT_VERSION,
         },
     }
+    if generation_variant is not None:
+        entry["generation_variant"] = generation_variant
     if environment_size_m is not None:
         entry["exogenous_primitives"].update(
             {
@@ -875,6 +889,24 @@ def validate_scenario_entry(entry: dict[str, Any]) -> dict[str, Any]:
         raise ValueError(
             f"scenario num_GT must be in [{ROI_COUNT_MIN}, {ROI_COUNT_MAX}]"
         )
+    generation_variant = entry.get("generation_variant")
+    if generation_variant is not None:
+        expected_variant = {
+            "mode": "balanced_mixed_num_gt",
+            "forced_num_GT": int(entry["num_GT"]),
+            "identity_version": "forced-num-gt-v1",
+        }
+        if generation_variant != expected_variant:
+            raise ValueError("scenario balanced generation variant is invalid")
+        if entry["generation_profile_id"] != _profile_id(
+            build_generation_profile(None)
+        ):
+            raise ValueError("balanced scenario must use the mixed RoI profile")
+        identity_fragment = f":balanced-numgt-{int(entry['num_GT'])}:"
+        if identity_fragment not in str(entry["scenario_id"]):
+            raise ValueError(
+                "scenario identity disagrees with its balanced RoI count"
+            )
     if len(entry["uavs"]) != NUM_UAV:
         raise ValueError(f"scenario must contain exactly {NUM_UAV} UAVs")
     validate_permanent_gateway_initial_position(
@@ -1216,7 +1248,18 @@ class ScenarioManifest:
             environment_size_m = None
             fixed_num_gt = generation_profile.get("fixed_num_gt")
         profile_id = _profile_id(generation_profile)
-        for entry in episodes:
+        generator_config = dict(data.get("generator_config") or {})
+        balanced_identity_version = generator_config.get(
+            "balanced_scenario_identity_version"
+        )
+        if balanced_identity_version not in {None, "forced-num-gt-v1"}:
+            raise ValueError("manifest balanced scenario identity is incompatible")
+        if (
+            balanced_identity_version is not None
+            and generator_config.get("balanced_mixed_roi_counts") is not True
+        ):
+            raise ValueError("manifest balanced generation metadata is inconsistent")
+        for episode_index, entry in enumerate(episodes):
             validate_scenario_entry(entry)
             if schema_version == ENVIRONMENT_SIZE_SCENARIO_SCHEMA_VERSION and (
                 int(entry.get("environment_width_m", -1)) != environment_width_m
@@ -1237,6 +1280,22 @@ class ScenarioManifest:
                     "mixed num_GT entry is outside "
                     f"[{ROI_COUNT_MIN}, {ROI_COUNT_MAX}]"
                 )
+            if balanced_identity_version == "forced-num-gt-v1":
+                expected_num_gt = ROI_COUNT_MIN + (
+                    episode_index % (ROI_COUNT_MAX - ROI_COUNT_MIN + 1)
+                )
+                if int(entry["num_GT"]) != expected_num_gt:
+                    raise ValueError(
+                        "balanced manifest RoI sequence is incompatible"
+                    )
+                if entry.get("generation_variant") != {
+                    "mode": "balanced_mixed_num_gt",
+                    "forced_num_GT": expected_num_gt,
+                    "identity_version": "forced-num-gt-v1",
+                }:
+                    raise ValueError(
+                        "balanced manifest scenario identity metadata is incomplete"
+                    )
         if schema_version == ENVIRONMENT_SIZE_SCENARIO_SCHEMA_VERSION:
             generator_config = dict(data.get("generator_config") or {})
             expected_positions = [
@@ -1402,7 +1461,10 @@ def generate_manifest(
             "num_uav": NUM_UAV,
             "reserved_search_uav_ids": list(RESERVED_SEARCH_UAV_IDS),
             **(
-                {"balanced_mixed_roi_counts": True}
+                {
+                    "balanced_mixed_roi_counts": True,
+                    "balanced_scenario_identity_version": "forced-num-gt-v1",
+                }
                 if balanced_num_gt
                 else {}
             ),

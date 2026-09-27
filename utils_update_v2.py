@@ -17,6 +17,7 @@ from replay_auxiliary import (
     REPLAY_AUXILIARY_FIELDS,
     REPLAY_AUXILIARY_SCHEMA_VERSION,
     allocate_auxiliary_arrays,
+    reset_auxiliary_arrays,
     write_auxiliary_transition,
 )
 
@@ -225,6 +226,9 @@ class ReplayBufferJoint:
         for field, array in allocate_auxiliary_arrays(self.max_size).items():
             setattr(self, field, array)
         self.record_auxiliary = True
+
+    def _reset_auxiliary_storage(self):
+        return reset_auxiliary_arrays(self)
 
     @torch.no_grad()
     def add(

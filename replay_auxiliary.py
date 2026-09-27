@@ -196,7 +196,7 @@ def capture_replay_snapshot(env, packet_engine, snapshot_time_s):
         result["sr_position_m"][row] = np.asarray(sr.get_position(), dtype=np.float32)
         result["sr_roi_id"][row] = int(roi_id)
         result["sr_roi_mapping_valid"][row] = True
-        packets = _active_packets(packet_engine.sr_queues[sr_id])
+        packets = _active_packets(packet_engine.sr_queues.get(sr_id, ()))
         result["sr_queue_valid"][row] = True
         result["sr_queue_empty"][row] = not packets
         result["sr_backlog_bits"][row] = math.fsum(
@@ -420,6 +420,35 @@ def allocate_auxiliary_arrays(max_size):
     arrays["scenario_index"].fill(-1)
     arrays["scenario_id_hash"].fill(-1)
     return arrays
+
+
+def reset_auxiliary_arrays(replay):
+    """Restore already-allocated auxiliary storage to the missing-data state."""
+
+    if not hasattr(replay, "auxiliary_valid"):
+        return False
+    for name in REPLAY_AUXILIARY_FIELDS:
+        target = getattr(replay, name)
+        target.fill(False if target.dtype == np.bool_ else 0)
+    for prefix in ("current_", "next_"):
+        for name in (
+            "sr_id",
+            "sr_roi_id",
+            "roi_id",
+            "task_target_id",
+            "vs_uav_id",
+            "vs_roi_id",
+        ):
+            getattr(replay, prefix + name).fill(-1)
+    for name in (
+        "episode_id",
+        "td3_step",
+        "global_transition_id",
+        "scenario_index",
+        "scenario_id_hash",
+    ):
+        getattr(replay, name).fill(-1)
+    return True
 
 
 def write_auxiliary_transition(

@@ -2054,10 +2054,13 @@ def _load_replay(path, replay, fields, metadata):
     size = int(metadata["size"])
     ptr = int(metadata["ptr"])
     with np.load(path, allow_pickle=False) as arrays:
-        if set(getattr(replay, "auxiliary_fields", ())).intersection(
-            arrays.files
-        ) and not getattr(replay, "record_auxiliary", False):
+        present_auxiliary = set(
+            getattr(replay, "auxiliary_fields", ())
+        ).intersection(arrays.files)
+        if present_auxiliary and not getattr(replay, "record_auxiliary", False):
             replay._allocate_auxiliary_storage()
+        if hasattr(replay, "auxiliary_valid"):
+            replay._reset_auxiliary_storage()
         for field in fields:
             if field not in arrays and field in getattr(
                 replay, "auxiliary_fields", ()
@@ -2065,9 +2068,6 @@ def _load_replay(path, replay, fields, metadata):
                 continue
             target = getattr(replay, field)
             target[:size] = arrays[field]
-        present_auxiliary = set(getattr(replay, "auxiliary_fields", ())).intersection(
-            arrays.files
-        )
         if present_auxiliary and present_auxiliary != set(
             getattr(replay, "auxiliary_fields", ())
         ):

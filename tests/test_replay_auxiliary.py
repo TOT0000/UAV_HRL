@@ -1,10 +1,13 @@
 import copy
 
 import numpy as np
+import pytest
 
 from Packet_scheduler_v1 import PacketEngine, TASK_DEADLINE_SECONDS
 from Simulator import Simulator
 from replay_auxiliary import (
+    REPLAY_AUXILIARY_FIELDS,
+    allocate_auxiliary_arrays,
     capture_replay_snapshot,
     empty_snapshot,
     replay_auxiliary_metadata,
@@ -184,9 +187,145 @@ def test_ring_alignment_npz_no_pickle_and_legacy_missing_auxiliary(tmp_path):
     legacy_path = tmp_path / "legacy.npz"
     metadata = _save_replay(legacy_path, legacy, JOINT_REPLAY_FIELDS)
     restored = ReplayBufferJoint(2, 3, max_size=2, record_auxiliary=True)
+    stale = empty_snapshot()
+    stale["snapshot_valid"][0] = True
+    stale["sr_observable"][0] = True
+    stale["sr_id"][0] = 7
+    restored.add(
+        [9, 9],
+        [1, 1, 1],
+        [8, 8],
+        False,
+        9,
+        9,
+        9,
+        9,
+        9,
+        current_auxiliary_snapshot=stale,
+        next_auxiliary_snapshot=stale,
+        episode_id=9,
+        scenario_id="stale",
+    )
+    assert restored.auxiliary_valid[0, 0]
     _load_replay(legacy_path, restored, JOINT_REPLAY_FIELDS, metadata)
     assert restored.size == 1
-    assert not restored.auxiliary_valid[0, 0]
+    assert restored.ptr == legacy.ptr
+    assert restored.total_added == legacy.total_added
+    np.testing.assert_array_equal(restored.state[:1], legacy.state[:1])
+    expected_missing = allocate_auxiliary_arrays(restored.max_size)
+    for field in REPLAY_AUXILIARY_FIELDS:
+        np.testing.assert_array_equal(
+            getattr(restored, field), expected_missing[field]
+        )
+    unallocated = ReplayBufferJoint(2, 3, max_size=2)
+    _load_replay(legacy_path, unallocated, JOINT_REPLAY_FIELDS, metadata)
+    assert not unallocated.record_auxiliary
+    assert not hasattr(unallocated, "auxiliary_valid")
+
+
+def test_complete_auxiliary_replay_restores_and_partial_schema_is_rejected(tmp_path):
+    source = ReplayBufferJoint(2, 3, max_size=2, record_auxiliary=True)
+    current = empty_snapshot()
+    next_snapshot = empty_snapshot()
+    current["snapshot_valid"][0] = True
+    next_snapshot["snapshot_valid"][0] = True
+    current["snapshot_time_s"][0] = 4.0
+    next_snapshot["snapshot_time_s"][0] = 5.0
+    current["sr_observable"][0] = True
+    current["sr_id"][0] = 0
+    source.add(
+        [1, 2],
+        [0, 0, 0],
+        [3, 4],
+        True,
+        1,
+        2,
+        3,
+        4,
+        5,
+        current_auxiliary_snapshot=current,
+        next_auxiliary_snapshot=next_snapshot,
+        episode_id=6,
+        scenario_id="complete",
+    )
+    complete_path = tmp_path / "complete.npz"
+    metadata = _save_replay(complete_path, source, JOINT_REPLAY_FIELDS)
+    restored = ReplayBufferJoint(2, 3, max_size=2, record_auxiliary=True)
+
+    _load_replay(complete_path, restored, JOINT_REPLAY_FIELDS, metadata)
+
+    for field in JOINT_REPLAY_FIELDS:
+        np.testing.assert_array_equal(
+            getattr(restored, field)[: source.size],
+            getattr(source, field)[: source.size],
+        )
+
+    with np.load(complete_path, allow_pickle=False) as archive:
+        missing_field = REPLAY_AUXILIARY_FIELDS[-1]
+        partial_payload = {
+            name: archive[name]
+            for name in archive.files
+            if name != missing_field
+        }
+    partial_path = tmp_path / "partial.npz"
+    np.savez_compressed(partial_path, **partial_payload)
+    partial_metadata = copy.deepcopy(metadata)
+    partial_metadata["auxiliary_fields"].remove(missing_field)
+    with pytest.raises(RuntimeError, match="partial auxiliary schema"):
+        _load_replay(
+            partial_path,
+            ReplayBufferJoint(2, 3, max_size=2, record_auxiliary=True),
+            JOINT_REPLAY_FIELDS,
+            partial_metadata,
+        )
+
+
+def test_observable_sr_without_queue_is_captured_without_mutating_defaultdict():
+    env = Simulator(num_UAV=16)
+    env.num_GT = 2
+    env.reset_environment()
+    target = env.gts[0]
+    target.mark_found(1)
+    sr = env.SR_team_gogo(target)
+    engine = PacketEngine(num_uav=16)
+    engine.sr_queues[7].extend(
+        [
+            {"id": 90, "rem_bits": 3.0, "done": False},
+            {"id": 91, "rem_bits": 2.0, "done": False},
+        ]
+    )
+    queue_before = {
+        key: copy.deepcopy(list(queue))
+        for key, queue in engine.sr_queues.items()
+    }
+    channel_before = copy.deepcopy(env.channel_state_dict())
+    rngs = (
+        env.environment_rng,
+        env.assignment_rng,
+        env.channel_large_scale_rng,
+        env.channel_small_scale_rng,
+    )
+    rng_before = [copy.deepcopy(rng.bit_generator.state) for rng in rngs]
+    assert int(sr.id) not in engine.sr_queues
+
+    snapshot = capture_replay_snapshot(env, engine, 0.0)
+
+    assert snapshot["sr_observable"][sr.id]
+    assert snapshot["sr_queue_valid"][sr.id]
+    assert snapshot["sr_queue_empty"][sr.id]
+    assert snapshot["sr_backlog_bits"][sr.id] == 0.0
+    assert snapshot["sr_packet_count"][sr.id] == 0
+    assert not snapshot["sr_hol_deadline_valid"][sr.id]
+    assert {
+        key: list(queue) for key, queue in engine.sr_queues.items()
+    } == queue_before
+    assert [rng.bit_generator.state for rng in rngs] == rng_before
+    for key, before in channel_before.items():
+        after = env.channel_state_dict()[key]
+        if isinstance(before, np.ndarray):
+            np.testing.assert_array_equal(after, before)
+        else:
+            assert after == before
 
 
 def test_auxiliary_cost_estimate_is_explicit_and_fixed_shape():
