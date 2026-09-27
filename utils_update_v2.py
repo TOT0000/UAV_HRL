@@ -13,6 +13,12 @@ from experiment_config import (
     TASK_POTENTIAL_BETA_SEARCH,
     TASK_POTENTIAL_BETA_VS,
 )
+from replay_auxiliary import (
+    REPLAY_AUXILIARY_FIELDS,
+    REPLAY_AUXILIARY_SCHEMA_VERSION,
+    allocate_auxiliary_arrays,
+    write_auxiliary_transition,
+)
 
 
 def _to_np_float32(x):
@@ -172,7 +178,14 @@ class ReplayBufferContinuous:
 class ReplayBufferJoint:
     """One-step joint replay supporting Dinkelbach reward reconstruction and stored terminal ratio objectives."""
 
-    def __init__(self, state_dim, action_dim, max_size=50_000, rng=None):
+    def __init__(
+        self,
+        state_dim,
+        action_dim,
+        max_size=50_000,
+        rng=None,
+        record_auxiliary=False,
+    ):
         self.state_dim = int(state_dim)
         self.max_size = int(max_size)
         self.ptr = 0
@@ -199,7 +212,19 @@ class ReplayBufferJoint:
         self.c9_penalty = np.zeros((self.max_size, 1), dtype=np.float32)
         self.c10_penalty = np.zeros((self.max_size, 1), dtype=np.float32)
         self.com_range_penalty = np.zeros((self.max_size, 1), dtype=np.float32)
+        self.auxiliary_fields = REPLAY_AUXILIARY_FIELDS
+        self.auxiliary_schema_version = REPLAY_AUXILIARY_SCHEMA_VERSION
+        self.record_auxiliary = bool(record_auxiliary)
+        if self.record_auxiliary:
+            self._allocate_auxiliary_storage()
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    def _allocate_auxiliary_storage(self):
+        if hasattr(self, "auxiliary_valid"):
+            return
+        for field, array in allocate_auxiliary_arrays(self.max_size).items():
+            setattr(self, field, array)
+        self.record_auxiliary = True
 
     @torch.no_grad()
     def add(
@@ -216,6 +241,14 @@ class ReplayBufferJoint:
         ratio_objective_reward=0.0,
         current_movement_mask=None,
         next_movement_mask=None,
+        current_auxiliary_snapshot=None,
+        next_auxiliary_snapshot=None,
+        episode_id=-1,
+        td3_step=-1,
+        global_transition_id=-1,
+        scenario_index=-1,
+        scenario_id=None,
+        dinkelbach_lambda=0.0,
     ):
         index = self.ptr
         state_array = _to_np_float32(state)
@@ -252,6 +285,24 @@ class ReplayBufferJoint:
         self.c9_penalty[index, 0] = float(c9_penalty)
         self.c10_penalty[index, 0] = float(c10_penalty)
         self.com_range_penalty[index, 0] = float(com_range_penalty)
+        if (
+            self.record_auxiliary
+            or current_auxiliary_snapshot is not None
+            or next_auxiliary_snapshot is not None
+        ):
+            self._allocate_auxiliary_storage()
+            write_auxiliary_transition(
+                self,
+                index,
+                current_auxiliary_snapshot,
+                next_auxiliary_snapshot,
+                episode_id=episode_id,
+                td3_step=td3_step,
+                global_transition_id=global_transition_id,
+                scenario_index=scenario_index,
+                scenario_id=scenario_id,
+                dinkelbach_lambda=dinkelbach_lambda,
+            )
         self.ptr = (self.ptr + 1) % self.max_size
         self.size = min(self.size + 1, self.max_size)
         self.total_added += 1
@@ -263,7 +314,7 @@ class ReplayBufferJoint:
             oldest, newest = 0, self.size - 1
         else:
             oldest, newest = self.ptr, (self.ptr - 1) % self.max_size
-        return {
+        diagnostics = {
             "capacity": int(self.max_size),
             "size": int(self.size),
             "write_pointer": int(self.ptr),
@@ -274,6 +325,16 @@ class ReplayBufferJoint:
             "oldest_age": self.size - 1 if self.size else None,
             "newest_age": 0 if self.size else None,
         }
+        if self.record_auxiliary:
+            valid_count = int(np.count_nonzero(self.auxiliary_valid[: self.size]))
+            diagnostics.update(
+                {
+                    "auxiliary_schema_version": self.auxiliary_schema_version,
+                    "auxiliary_valid_count": valid_count,
+                    "auxiliary_missing_count": int(self.size - valid_count),
+                }
+            )
+        return diagnostics
 
     def _reward_numpy(
         self,
@@ -347,6 +408,34 @@ class ReplayBufferJoint:
             torch.from_numpy(self.current_movement_mask[indices]).to(self.device),
             torch.from_numpy(self.next_movement_mask[indices]).to(self.device),
         )
+
+    @property
+    def all_fields(self):
+        fields = (
+            "state",
+            "action",
+            "next_state",
+            "not_done",
+            "delivered_mbits",
+            "total_mobility_energy",
+            "c9_penalty",
+            "c10_penalty",
+            "com_range_penalty",
+            "ratio_objective_reward",
+            "current_movement_mask",
+            "next_movement_mask",
+            "movement_mask_valid",
+        )
+        return fields + (
+            tuple(self.auxiliary_fields) if self.record_auxiliary else ()
+        )
+
+    def save_npz(self, path):
+        arrays = {
+            field: np.asarray(getattr(self, field)[: self.size])
+            for field in self.all_fields
+        }
+        np.savez_compressed(path, **arrays)
 
 
 class ReplayBufferDiscrete:

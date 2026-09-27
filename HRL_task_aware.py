@@ -132,6 +132,7 @@ import utils_update_v2
 from rng_contract import CHANNEL_RNG_STREAMS, NamedRNGStreams, RNG_CONTRACT_VERSION
 from scenario_manifest import validate_manifest_initial_topologies
 from search_diagnostics import build_search_diagnostics_record
+from replay_auxiliary import capture_replay_snapshot, replay_auxiliary_metadata
 
 
 MOVEMENT_CONTROL_INTERVAL = int(round(MOVEMENT_INTERVAL_SECONDS / ROUTING_SLOT_SECONDS))
@@ -1836,7 +1837,14 @@ def _nested_state_equal(left, right):
     return left == right
 
 
-def _evaluation_invariants(before, after, routing_epsilon_log, td3_noise_log):
+def _evaluation_invariants(
+    before,
+    after,
+    routing_epsilon_log,
+    td3_noise_log,
+    *,
+    sampling_noise_std=None,
+):
     checks = {
         "online_networks_unchanged": _nested_state_equal(
             before["online_networks"], after["online_networks"]
@@ -1859,11 +1867,21 @@ def _evaluation_invariants(before, after, routing_epsilon_log, td3_noise_log):
         "schedule_counters_unchanged": _nested_state_equal(
             before["schedule_counters"], after["schedule_counters"]
         ),
-        "exploration_disabled": (
+    }
+    if sampling_noise_std is None:
+        checks["exploration_disabled"] = (
             not td3_noise_log
             and all(float(epsilon) == 0.0 for epsilon in routing_epsilon_log)
-        ),
-    }
+        )
+    else:
+        checks["sampling_exploration_fixed"] = (
+            bool(td3_noise_log)
+            and all(
+                np.isclose(float(value), float(sampling_noise_std))
+                for value in td3_noise_log
+            )
+            and all(float(epsilon) == 0.0 for epsilon in routing_epsilon_log)
+        )
     if not all(checks.values()):
         failed = sorted(name for name, passed in checks.items() if not passed)
         raise AssertionError(f"evaluation mutated learning state: {failed}")
@@ -1890,6 +1908,9 @@ def train(
     packet_outcome_sink=None,
     collect_routing_q_score_diagnostics=False,
     search_diagnostics_sink=None,
+    sampling_mode=False,
+    sampling_noise_std=None,
+    sampling_seed=None,
 ):
     if config is None:
         raise ValueError(
@@ -1956,6 +1977,24 @@ def train(
         raise ValueError("evaluation cannot load a full-resume training state")
     if transition_observer is not None and not evaluation:
         raise ValueError("transition collection is available only in evaluation")
+    sampling_mode = bool(sampling_mode)
+    if sampling_mode:
+        if not evaluation or transition_observer is None:
+            raise ValueError(
+                "sampling mode requires evaluation=True and a transition observer"
+            )
+        if method_spec.agent != "td3" or method_spec.routing != "safe_ddqn":
+            raise ValueError(
+                "independent sampling supports TD3 with safe-DDQN checkpoints only"
+            )
+        if sampling_noise_std is None or not np.isfinite(sampling_noise_std):
+            raise ValueError("sampling noise standard deviation must be finite")
+        if float(sampling_noise_std) < 0.0:
+            raise ValueError("sampling noise standard deviation must be non-negative")
+        if sampling_seed is None:
+            raise ValueError("sampling mode requires an explicit sampling seed")
+    elif sampling_noise_std is not None or sampling_seed is not None:
+        raise ValueError("sampling-only parameters require sampling_mode=True")
     if not evaluation and (
         evaluation_overrides
         or trajectory_snapshot_times
@@ -1981,7 +2020,9 @@ def train(
         0 <= int(trajectory_target_uav_id) < NUM_UAV
     ):
         raise ValueError(f"target_uav_id must be in [0, {NUM_UAV - 1}]")
-    rng_streams = _seed_training_rng(config.random_seed)
+    rng_streams = _seed_training_rng(
+        sampling_seed if sampling_mode else config.random_seed
+    )
 
     c_ref_com, calibration = load_com_capacity_reference()
     env = Simulator(
@@ -2027,6 +2068,7 @@ def train(
             JOINT_ACTION_DIM,
             max_size=config.replay_max_size,
             rng=rng_streams.numpy("movement_replay_sampling"),
+            record_auxiliary=not evaluation,
         )
         if method_spec.learns_movement
         else None
@@ -2619,6 +2661,12 @@ def train(
                     "movement",
                 )
                 current_movement_mask = movement_mask_from_state(physical_state)
+                current_auxiliary_snapshot = (
+                    capture_replay_snapshot(env, packet_engine, float(interval))
+                    if (not evaluation and method_spec.learns_movement)
+                    or transition_observer is not None
+                    else None
+                )
             except ValueError as exc:
                 if "duplicate" in str(exc):
                     duplicate_target_assertions += 1
@@ -2648,8 +2696,12 @@ def train(
                 )
             elif evaluation:
                 raw_joint_action = movement_agent.select_action(
-                    state, add_noise=False, noise_std=0.0
+                    state,
+                    add_noise=sampling_mode,
+                    noise_std=(float(sampling_noise_std) if sampling_mode else 0.0),
                 )
+                if sampling_mode:
+                    td3_noise_log.append(float(sampling_noise_std))
                 environment_actor_calls += 1
             elif _uses_warmup_random_action(
                 total_joint_transitions, config.warmup_joint_transitions
@@ -2888,6 +2940,12 @@ def train(
                 "movement",
             )
             next_movement_mask = movement_mask_from_state(physical_next_state)
+            next_auxiliary_snapshot = (
+                capture_replay_snapshot(env, packet_engine, actual_time_seconds)
+                if (not evaluation and method_spec.learns_movement)
+                or transition_observer is not None
+                else None
+            )
             if not done:
                 expected_next_movement_state = next_state.copy()
                 expected_next_movement_mask = next_movement_mask.copy()
@@ -2916,6 +2974,14 @@ def train(
                     ],
                     current_movement_mask=current_movement_mask,
                     next_movement_mask=next_movement_mask,
+                    current_auxiliary_snapshot=current_auxiliary_snapshot,
+                    next_auxiliary_snapshot=next_auxiliary_snapshot,
+                    episode_id=episode,
+                    td3_step=interval,
+                    global_transition_id=total_joint_transitions,
+                    scenario_index=episode,
+                    scenario_id=scenario_id,
+                    dinkelbach_lambda=episode_lambda,
                 )
             global_transition_index = (
                 evaluation_observation_transition_index
@@ -2980,6 +3046,9 @@ def train(
                     {
                         "state": state.copy(),
                         "projected_joint_action": projected_action.copy(),
+                        "executed_action": executed_action.copy(),
+                        "current_movement_mask": current_movement_mask.copy(),
+                        "next_movement_mask": next_movement_mask.copy(),
                         "next_state": next_state.copy(),
                         "done": done,
                         "not_done": 1.0 - float(done),
@@ -3000,6 +3069,9 @@ def train(
                         "global_transition_index": global_transition_index,
                         "scenario_index": episode,
                         "scenario_id": scenario_id,
+                        "current_auxiliary_snapshot": current_auxiliary_snapshot,
+                        "next_auxiliary_snapshot": next_auxiliary_snapshot,
+                        "dinkelbach_lambda": episode_lambda,
                     }
                 )
 
@@ -3692,6 +3764,9 @@ def train(
             evaluation_state_after,
             routing_epsilon_log,
             td3_noise_log,
+            sampling_noise_std=(
+                float(sampling_noise_std) if sampling_mode else None
+            ),
         )
         evaluation_state_fingerprints = {
             "before": _learning_state_fingerprint(evaluation_state_before),
@@ -3883,6 +3958,12 @@ def train(
         "backlog_invariant_passed": backlog_invariant_passed,
         "deadline_counter_consistent": deadline_counter_consistent,
         "evaluation": bool(evaluation),
+        "sampling_mode": sampling_mode,
+        "sampling_noise_std": (
+            float(sampling_noise_std) if sampling_mode else None
+        ),
+        "sampling_seed": int(sampling_seed) if sampling_mode else None,
+        "replay_auxiliary_schema": replay_auxiliary_metadata(),
         "evaluation_invariants": evaluation_invariants,
         "evaluation_state_fingerprints": evaluation_state_fingerprints,
         "scenario_ids": executed_scenario_ids,

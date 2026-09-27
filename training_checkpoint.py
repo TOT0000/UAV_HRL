@@ -82,6 +82,10 @@ from rng_contract import (
     RNG_STREAM_IDS,
 )
 from fov_ema_lifecycle import validate_fov_ema_state
+from replay_auxiliary import (
+    REPLAY_AUXILIARY_FIELDS,
+    REPLAY_AUXILIARY_SCHEMA_VERSION,
+)
 from scenario_manifest import (
     ScenarioManifest,
     manifest_prefix,
@@ -139,6 +143,7 @@ JOINT_REPLAY_FIELDS = (
     "current_movement_mask",
     "next_movement_mask",
     "movement_mask_valid",
+    *REPLAY_AUXILIARY_FIELDS,
 )
 ROUTING_REPLAY_FIELDS = (
     "state",
@@ -1931,9 +1936,13 @@ def load_model_checkpoint(
 
 def _save_replay(path, replay, fields):
     size = int(replay.size)
-    arrays = {field: np.asarray(getattr(replay, field)[:size]) for field in fields}
+    arrays = {
+        field: np.asarray(getattr(replay, field)[:size])
+        for field in fields
+        if hasattr(replay, field)
+    }
     np.savez_compressed(path, **arrays)
-    return {
+    metadata = {
         "ptr": int(replay.ptr),
         "size": size,
         "max_size": int(replay.max_size),
@@ -1942,6 +1951,21 @@ def _save_replay(path, replay, fields):
         "total_added": int(getattr(replay, "total_added", size)),
         "n_step_buffer": list(getattr(replay, "n_step_buffer", [])),
     }
+    if hasattr(replay, "auxiliary_schema_version"):
+        saved_auxiliary = [
+            field
+            for field in getattr(replay, "auxiliary_fields", ())
+            if field in arrays
+        ]
+        metadata.update(
+            auxiliary_schema_version=(
+                str(replay.auxiliary_schema_version)
+                if saved_auxiliary
+                else None
+            ),
+            auxiliary_fields=saved_auxiliary,
+        )
+    return metadata
 
 
 def _validate_replay_payload(path, replay, fields, metadata):
@@ -1977,14 +2001,50 @@ def _validate_replay_payload(path, replay, fields, metadata):
     with np.load(path, allow_pickle=False) as arrays:
         for field in fields:
             if field not in arrays:
+                if field in getattr(replay, "auxiliary_fields", ()):
+                    continue
                 raise RuntimeError(f"replay field is missing from checkpoint: {field}")
             saved = arrays[field]
+            if not hasattr(replay, field):
+                if field in getattr(replay, "auxiliary_fields", ()):
+                    replay._allocate_auxiliary_storage()
+                else:
+                    raise RuntimeError(f"replay object lacks field: {field}")
             target = getattr(replay, field)
             if saved.shape != target[:size].shape:
                 raise RuntimeError(
                     f"replay field {field} shape mismatch: "
                     f"checkpoint={saved.shape}, current={target[:size].shape}"
                 )
+        auxiliary_fields = set(getattr(replay, "auxiliary_fields", ()))
+        present_auxiliary = auxiliary_fields.intersection(arrays.files)
+        declared_auxiliary_raw = metadata.get("auxiliary_fields", [])
+        if not isinstance(declared_auxiliary_raw, (list, tuple)):
+            raise RuntimeError("checkpoint replay auxiliary field metadata is invalid")
+        declared_auxiliary = set(declared_auxiliary_raw)
+        if declared_auxiliary != present_auxiliary:
+            raise RuntimeError(
+                "checkpoint replay auxiliary metadata disagrees with its archive: "
+                f"declared={sorted(declared_auxiliary)}, "
+                f"present={sorted(present_auxiliary)}"
+            )
+        if present_auxiliary and present_auxiliary != auxiliary_fields:
+            raise RuntimeError(
+                "checkpoint joint replay has a partial auxiliary schema: "
+                f"{sorted(auxiliary_fields - present_auxiliary)}"
+            )
+        if present_auxiliary and metadata.get(
+            "auxiliary_schema_version"
+        ) != REPLAY_AUXILIARY_SCHEMA_VERSION:
+            raise RuntimeError(
+                "checkpoint replay auxiliary schema is incompatible: "
+                f"checkpoint={metadata.get('auxiliary_schema_version')}, "
+                f"current={REPLAY_AUXILIARY_SCHEMA_VERSION}"
+            )
+        if not present_auxiliary and metadata.get("auxiliary_schema_version") is not None:
+            raise RuntimeError(
+                "checkpoint replay declares an auxiliary schema without auxiliary fields"
+            )
     if not isinstance(metadata.get("n_step_buffer"), (list, tuple)):
         raise RuntimeError("checkpoint replay n-step buffer is invalid")
 
@@ -1994,9 +2054,37 @@ def _load_replay(path, replay, fields, metadata):
     size = int(metadata["size"])
     ptr = int(metadata["ptr"])
     with np.load(path, allow_pickle=False) as arrays:
+        if set(getattr(replay, "auxiliary_fields", ())).intersection(
+            arrays.files
+        ) and not getattr(replay, "record_auxiliary", False):
+            replay._allocate_auxiliary_storage()
         for field in fields:
+            if field not in arrays and field in getattr(
+                replay, "auxiliary_fields", ()
+            ):
+                continue
             target = getattr(replay, field)
             target[:size] = arrays[field]
+        present_auxiliary = set(getattr(replay, "auxiliary_fields", ())).intersection(
+            arrays.files
+        )
+        if present_auxiliary and present_auxiliary != set(
+            getattr(replay, "auxiliary_fields", ())
+        ):
+            missing = sorted(
+                set(getattr(replay, "auxiliary_fields", ())) - present_auxiliary
+            )
+            raise RuntimeError(
+                "checkpoint joint replay has a partial auxiliary schema: "
+                f"{missing}"
+            )
+        if present_auxiliary:
+            schema = metadata.get("auxiliary_schema_version")
+            if schema != REPLAY_AUXILIARY_SCHEMA_VERSION:
+                raise RuntimeError(
+                    "checkpoint replay auxiliary schema is incompatible: "
+                    f"checkpoint={schema}, current={REPLAY_AUXILIARY_SCHEMA_VERSION}"
+                )
     replay.size = size
     replay.ptr = ptr
     replay.total_added = int(metadata.get("total_added", size))

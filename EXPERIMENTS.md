@@ -277,6 +277,11 @@ inconsistent geometry raises an error before credit or counters change. Timely
 useful VS bits are physical bits times frozen coverage. COM is unchanged;
 the VS QoS denominator now includes only captures generated during valid sensing.
 
+Enriched movement replay fields and the checkpoint-driven, no-training sampling
+mode are specified in `docs/replay_sampling_contract.md`. They are auxiliary
+data only and do not change movement observations, actions, rewards, batches, or
+formal evaluation exploration.
+
 For every assigned COM UAV-SR pair, including sessions not yet activated, the
 range penalty is `1-clip(R_S2U/(d_3D+epsilon),0,1)` with the shared inclusive
 `R_S2U = 400 m`. It is averaged across assigned COM pairs. No duplicate C8

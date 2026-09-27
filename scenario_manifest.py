@@ -658,6 +658,7 @@ def generate_scenario_entry(
     episode_index: int,
     num_gt: int | None = None,
     environment_size_m: int | None = None,
+    forced_mixed_num_gt: int | None = None,
 ) -> dict[str, Any]:
     if split not in SUPPORTED_SPLITS:
         raise ValueError(f"unsupported scenario split: {split}")
@@ -670,6 +671,12 @@ def generate_scenario_entry(
             f"{list(ENVIRONMENT_SIZE_EVALUATION_VALUES_M)} metres"
         )
     generation_profile = build_generation_profile(num_gt)
+    if forced_mixed_num_gt is not None:
+        forced_mixed_num_gt = int(forced_mixed_num_gt)
+        if num_gt is not None or not ROI_COUNT_MIN <= forced_mixed_num_gt <= ROI_COUNT_MAX:
+            raise ValueError(
+                "forced mixed num_GT requires mixed mode and a supported RoI count"
+            )
     profile_id = _profile_id(generation_profile)
     schema_version = (
         SCENARIO_SCHEMA_VERSION
@@ -699,7 +706,11 @@ def generate_scenario_entry(
     np_rng = np.random.default_rng(scenario_seed)
     py_rng = random.Random(scenario_seed)
     episode_num_gt = (
-        int(np_rng.integers(ROI_COUNT_MIN, ROI_COUNT_MAX + 1))
+        (
+            int(np_rng.integers(ROI_COUNT_MIN, ROI_COUNT_MAX + 1))
+            if forced_mixed_num_gt is None
+            else forced_mixed_num_gt
+        )
         if generation_profile["num_gt_mode"] == "mixed"
         else int(generation_profile["fixed_num_gt"])
     )
@@ -1304,12 +1315,15 @@ def generate_manifest(
     episode_count: int,
     num_gt: int | None = None,
     environment_size_m: int | None = None,
+    balanced_num_gt: bool = False,
 ) -> ScenarioManifest:
     if int(episode_count) <= 0:
         raise ValueError("episode_count must be positive")
     generation_profile = build_generation_profile(num_gt)
     if environment_size_m is not None and num_gt is None:
         raise ValueError("environment-size manifests require one fixed num_GT")
+    if balanced_num_gt and num_gt is not None:
+        raise ValueError("balanced_num_gt is available only for mixed manifests")
     schema_version = (
         SCENARIO_SCHEMA_VERSION
         if environment_size_m is None
@@ -1321,8 +1335,18 @@ def generate_manifest(
     environment_height_m = int(
         ENVIRONMENT_HEIGHT_M if environment_size_m is None else environment_size_m
     )
+    balanced_counts = tuple(range(ROI_COUNT_MIN, ROI_COUNT_MAX + 1))
     episodes = [
-        generate_scenario_entry(split, manifest_seed, index)
+        generate_scenario_entry(
+            split,
+            manifest_seed,
+            index,
+            forced_mixed_num_gt=(
+                balanced_counts[index % len(balanced_counts)]
+                if balanced_num_gt
+                else None
+            ),
+        )
         if num_gt is None
         else generate_scenario_entry(
             split,
@@ -1377,6 +1401,11 @@ def generate_manifest(
             "u2u_communication_range_m": COMMUNICATION_RANGE_M,
             "num_uav": NUM_UAV,
             "reserved_search_uav_ids": list(RESERVED_SEARCH_UAV_IDS),
+            **(
+                {"balanced_mixed_roi_counts": True}
+                if balanced_num_gt
+                else {}
+            ),
         },
         "config_fingerprint": environment_config_fingerprint(
             current_environment_config(
