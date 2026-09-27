@@ -145,3 +145,6 @@ may change because it does not change pair identity or numerical definitions:
 & 'C:\Users\user\anaconda3\envs\LLM_HRL\python.exe' run_llm_baseline.py `
   --fixed-sample results/llm_baselines/<RUN_NAME> --batch-size 64
 ```
+
+The downstream current-only LM Studio design and approved-artifact contract is
+documented in `docs/llm_design_contract.md`.

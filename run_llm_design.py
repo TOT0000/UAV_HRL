@@ -1,0 +1,85 @@
+"""CLI for offline LM Studio state/reward design against fixed samples."""
+
+from __future__ import annotations
+
+import argparse
+import sys
+
+from llm_design import (
+    DEFAULT_ABSOLUTE_TOLERANCE,
+    DEFAULT_BASE_URL,
+    DEFAULT_BATCH_SIZE,
+    DEFAULT_BETA,
+    DEFAULT_CONTEXT_LENGTH,
+    DEFAULT_MAX_ATTEMPTS,
+    DEFAULT_MAX_OUTPUT_TOKENS,
+    DEFAULT_OUTPUT_ROOT,
+    DEFAULT_RELATIVE_TOLERANCE,
+    DEFAULT_SEED,
+    DEFAULT_TEMPERATURE,
+    DEFAULT_TIMEOUT_SECONDS,
+    run_design,
+)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Generate and validate a current-only LLM state/reward design using "
+            "one fixed offline baseline artifact."
+        )
+    )
+    parser.add_argument("--fixed-sample", required=True)
+    parser.add_argument("--base-url", default=DEFAULT_BASE_URL)
+    parser.add_argument("--model", required=True, help="exact LM Studio API identifier")
+    parser.add_argument("--context-length", type=int, default=DEFAULT_CONTEXT_LENGTH)
+    parser.add_argument(
+        "--max-output-tokens", type=int, default=DEFAULT_MAX_OUTPUT_TOKENS
+    )
+    parser.add_argument("--temperature", type=float, default=DEFAULT_TEMPERATURE)
+    parser.add_argument("--seed", type=int, default=DEFAULT_SEED)
+    parser.add_argument("--max-attempts", type=int, default=DEFAULT_MAX_ATTEMPTS)
+    parser.add_argument("--beta", type=float, default=DEFAULT_BETA)
+    parser.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_SIZE)
+    parser.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT_SECONDS)
+    parser.add_argument("--absolute-tolerance", type=float, default=DEFAULT_ABSOLUTE_TOLERANCE)
+    parser.add_argument("--relative-tolerance", type=float, default=DEFAULT_RELATIVE_TOLERANCE)
+    parser.add_argument("--output-root", default=str(DEFAULT_OUTPUT_ROOT))
+    parser.add_argument("--output-dir")
+    parser.add_argument("--dry-run", action="store_true")
+    return parser
+
+
+def main(argv=None) -> int:
+    args = build_parser().parse_args(argv)
+    try:
+        result = run_design(
+            fixed_sample=args.fixed_sample,
+            model=args.model,
+            base_url=args.base_url,
+            context_length=args.context_length,
+            max_output_tokens=args.max_output_tokens,
+            temperature=args.temperature,
+            seed=args.seed,
+            max_attempts=args.max_attempts,
+            beta=args.beta,
+            batch_size=args.batch_size,
+            timeout=args.timeout,
+            absolute_tolerance=args.absolute_tolerance,
+            relative_tolerance=args.relative_tolerance,
+            output_root=args.output_root,
+            output_dir=args.output_dir,
+            dry_run=args.dry_run,
+        )
+    except (OSError, RuntimeError, ValueError) as exc:
+        print(f"LLM design failed: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return 2
+    print(f"LLM design status: {result['status']}")
+    print(f"Output: {result['output_directory']}")
+    if result.get("approved_artifact"):
+        print(f"Approved artifact: {result['approved_artifact']}")
+    return 0 if result["status"] in {"approved", "dry_run_complete"} else 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
