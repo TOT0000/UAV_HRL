@@ -144,7 +144,12 @@ def command_smoke(args):
         total_episodes=args.episodes,
         random_seed=args.training_seed,
     )
-    result = train(config, scenario_manifest=manifest, method_spec=method)
+    result = train(
+        config,
+        scenario_manifest=manifest,
+        method_spec=method,
+        llm_artifact_dir=getattr(args, "llm_artifact", None),
+    )
     _write_run_metadata(args.output_dir, result)
     print(json.dumps(result["run_metadata"], ensure_ascii=False))
     return 0
@@ -199,6 +204,11 @@ def _training_preflight(args):
     """Validate every formal training input before canonical run creation."""
 
     method = args.method
+    if method.llm_enabled:
+        raise ValueError(
+            "td3_dinkelbach_llm training uses run_experiment.py so its approved "
+            "artifact is copied into the isolated run"
+        )
     MethodSpec(**{
         key: value
         for key, value in method.to_dict().items()
@@ -358,6 +368,7 @@ def build_parser():
     smoke.add_argument("--checkpoint")
     smoke.add_argument("--output-dir", default=str(DEFAULT_OUTPUT_DIR / "smoke"))
     smoke.add_argument("--resume")
+    smoke.add_argument("--llm-artifact")
     smoke.set_defaults(handler=command_smoke)
 
     train_parser = subparsers.add_parser("train")
@@ -384,6 +395,7 @@ def build_parser():
     evaluate.add_argument("--checkpoint", required=True)
     evaluate.add_argument("--output-dir", default=str(DEFAULT_OUTPUT_DIR))
     evaluate.add_argument("--resume")
+    evaluate.add_argument("--llm-artifact")
     evaluate.set_defaults(handler=command_evaluate)
 
     design = subparsers.add_parser("collect-design-dataset")

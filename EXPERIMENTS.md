@@ -5,11 +5,11 @@ process. The registry keys are `td3_dinkelbach`, `ddpg_dinkelbach`,
 `td3_ratio`, `ddpg_ratio`, `random_action`,
 `td3_dinkelbach_no_task_potential`,
 `ddpg_dinkelbach_no_task_potential`, `td3_dinkelbach_wo_ta`,
-`td3_dinkelbach_dqn`, `td3_dinkelbach_ddqn`,
+`td3_dinkelbach_dqn`, `td3_dinkelbach_ddqn`, `td3_dinkelbach_llm`,
 `kkm_random_action_random_routing`,
 `km_td3_dinkelbach`, `random_assignment_td3_dinkelbach`,
 `km_ddpg_dinkelbach`, `ddpg_dinkelbach_wo_ta`,
-`td3_dinkelbach_random_routing`, and `td3_dinkelbach_dqn_wo_ta`. All seventeen methods share
+`td3_dinkelbach_random_routing`, and `td3_dinkelbach_dqn_wo_ta`. All eighteen methods share
 16 UAVs, the common Simulator and synchronous movement flow,
 energy/delivery accounting, evaluation, and logging.
 
@@ -104,6 +104,34 @@ Evaluation defaults to the formal `ep_1500` checkpoint. Each invocation creates
 manifest, and plots never overwrite a prior evaluation. `--smoke` explicitly
 marks a non-formal evaluation and may be combined with
 `--checkpoint-episode N` for lifecycle checks.
+
+## Approved LLM state/reward comparison
+
+`td3_dinkelbach_llm` is an independent method and requires an explicit approved
+artifact produced by `run_llm_design.py`. It copies the complete artifact into
+the new run, records its content hash and beta, appends the artifact-defined
+features to the unchanged 531-dimensional state, and stores the current-only
+extra reward separately in replay. The existing reward is reconstructed at the
+current Dinkelbach lambda and `beta * r_extra` is added exactly once for TD3
+learning. Task metrics and the Dinkelbach update do not include this extra
+reward. Baseline methods neither load an artifact nor start the candidate
+worker.
+
+```powershell
+python -X utf8 run_experiment.py td3_dinkelbach_llm --llm-artifact <approved-artifact-directory>
+python -X utf8 run_experiment.py resume results/td3_dinkelbach_llm/<run-id>
+python -X utf8 run_experiment.py evaluate results/td3_dinkelbach_llm/<run-id> --checkpoint-episode 1500
+python -X utf8 run_paper_evaluation.py td3_dinkelbach_llm --run-dir results/td3_dinkelbach_llm/<run-id> --suite fixed_roi --roi-counts 2 4 8
+python -X utf8 run_paper_evaluation.py td3_dinkelbach_llm --run-dir results/td3_dinkelbach_llm/<run-id> --suite environment_size --environment-sizes-m 750 1000 1500 --roi-count 8
+```
+
+Resume and evaluation use the validated copy under `<run>/llm_artifact`, so the
+original offline-design directory may be moved after training starts. Every
+model-only and full-resume checkpoint also embeds the artifact. A changed hash,
+different design (even with the same feature count), incompatible interface, or
+missing approved status is rejected. The worker is persistent for the run; a
+runtime candidate error writes the current input and error metadata under
+`llm_runtime_failures/` and stops instead of clipping or falling back.
 
 `comparison_experiment.py` remains available for manifest-driven evaluation,
 design-dataset collection, aggregation, and exact-resume workflows.
@@ -320,7 +348,7 @@ mask, preserving policy-independent RNG draw counts. No `C_min`, outage/PER,
 HARQ, shadowing, or retransmission model is added.
 
 The range decision is frozen at the start of each 0.25 s routing slot and is
-shared by all fifty 5 ms service blocks in that slot. All seventeen registered
+shared by all fifty 5 ms service blocks in that slot. All eighteen registered
 methods use this same channel, range mask, COM activation, packet-service, and
 evaluation contract. `FOV_COM_PAIR_MAX_DISTANCE_M = 200 m` remains unchanged:
 it is a horizontal task-target compatibility rule for pairing FOV and COM, not

@@ -186,6 +186,7 @@ class ReplayBufferJoint:
         max_size=50_000,
         rng=None,
         record_auxiliary=False,
+        record_llm_reward=False,
     ):
         self.state_dim = int(state_dim)
         self.max_size = int(max_size)
@@ -216,6 +217,9 @@ class ReplayBufferJoint:
         self.auxiliary_fields = REPLAY_AUXILIARY_FIELDS
         self.auxiliary_schema_version = REPLAY_AUXILIARY_SCHEMA_VERSION
         self.record_auxiliary = bool(record_auxiliary)
+        self.record_llm_reward = bool(record_llm_reward)
+        if self.record_llm_reward:
+            self.llm_extra_reward = np.zeros((self.max_size, 1), dtype=np.float32)
         if self.record_auxiliary:
             self._allocate_auxiliary_storage()
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -253,6 +257,7 @@ class ReplayBufferJoint:
         scenario_index=-1,
         scenario_id=None,
         dinkelbach_lambda=0.0,
+        llm_extra_reward=None,
     ):
         index = self.ptr
         state_array = _to_np_float32(state)
@@ -289,6 +294,12 @@ class ReplayBufferJoint:
         self.c9_penalty[index, 0] = float(c9_penalty)
         self.c10_penalty[index, 0] = float(c10_penalty)
         self.com_range_penalty[index, 0] = float(com_range_penalty)
+        if self.record_llm_reward:
+            if llm_extra_reward is None or not np.isfinite(llm_extra_reward):
+                raise ValueError("LLM replay requires a finite extra reward")
+            self.llm_extra_reward[index, 0] = float(llm_extra_reward)
+        elif llm_extra_reward is not None:
+            raise ValueError("baseline replay must not receive an LLM extra reward")
         if (
             self.record_auxiliary
             or current_auxiliary_snapshot is not None
@@ -338,6 +349,7 @@ class ReplayBufferJoint:
                     "auxiliary_missing_count": int(self.size - valid_count),
                 }
             )
+        diagnostics["llm_extra_reward_enabled"] = self.record_llm_reward
         return diagnostics
 
     def _reward_numpy(
@@ -350,6 +362,7 @@ class ReplayBufferJoint:
         beta_com=TASK_POTENTIAL_BETA_COM,
         reward_mode="dinkelbach",
         task_potential_enabled=True,
+        llm_reward_beta=0.0,
     ):
         not_done = self.not_done[indices]
         delivered = self.delivered_mbits[indices]
@@ -368,6 +381,11 @@ class ReplayBufferJoint:
             + self.c10_penalty[indices]
             + self.com_range_penalty[indices]
         )
+        beta = float(llm_reward_beta)
+        if beta != 0.0:
+            if not self.record_llm_reward:
+                raise RuntimeError("LLM reward requested from a baseline replay")
+            reward = reward + beta * self.llm_extra_reward[indices]
         return reward.astype(np.float32, copy=False)
 
     def sample(
@@ -381,6 +399,7 @@ class ReplayBufferJoint:
         reward_mode="dinkelbach",
         task_potential_enabled=True,
         include_movement_masks=False,
+        llm_reward_beta=0.0,
     ):
         if self.size <= 0:
             raise ValueError("Replay buffer is empty")
@@ -394,6 +413,7 @@ class ReplayBufferJoint:
             beta_com=beta_com,
             reward_mode=reward_mode,
             task_potential_enabled=task_potential_enabled,
+            llm_reward_beta=llm_reward_beta,
         )
         batch = (
             torch.from_numpy(self.state[indices]).to(self.device),
@@ -430,6 +450,8 @@ class ReplayBufferJoint:
             "next_movement_mask",
             "movement_mask_valid",
         )
+        if self.record_llm_reward:
+            fields = fields + ("llm_extra_reward",)
         return fields + (
             tuple(self.auxiliary_fields) if self.record_auxiliary else ()
         )

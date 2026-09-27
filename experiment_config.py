@@ -363,6 +363,14 @@ _METHOD_DEFINITIONS = {
         "reward_mode": "dinkelbach",
         "label": "TD3 + Dinkelbach",
     },
+    "td3_dinkelbach_llm": {
+        **_COMMON_METHOD,
+        "agent": "td3",
+        "movement": "centralized_td3",
+        "reward_mode": "dinkelbach",
+        "llm_enabled": True,
+        "label": "TD3 + Dinkelbach + LLM state/reward",
+    },
     "ddpg_dinkelbach": {
         **_COMMON_METHOD,
         "agent": "ddpg",
@@ -493,7 +501,17 @@ _METHOD_DEFINITIONS = {
     },
 }
 METHOD_REGISTRY = MappingProxyType(_METHOD_DEFINITIONS)
-_LEGACY_METHOD_IDS = frozenset(tuple(_METHOD_DEFINITIONS)[:7])
+_LEGACY_METHOD_IDS = frozenset(
+    {
+        "td3_dinkelbach",
+        "ddpg_dinkelbach",
+        "td3_ratio",
+        "ddpg_ratio",
+        "random_action",
+        "td3_dinkelbach_no_task_potential",
+        "ddpg_dinkelbach_no_task_potential",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -529,7 +547,7 @@ class MethodSpec:
             "task_observation": definition["task_observation"],
             "assignment_rounds": definition["assignment_rounds"],
             "lambda_mode": definition["reward_mode"],
-            "llm_enabled": False,
+            "llm_enabled": bool(definition.get("llm_enabled", False)),
             "agent": definition["agent"],
             "reward_mode": definition["reward_mode"],
             "task_potential_enabled": definition["task_potential_enabled"],
@@ -617,6 +635,7 @@ class MethodSpec:
             task_observation=definition["task_observation"],
             assignment_rounds=definition["assignment_rounds"],
             lambda_mode=definition["reward_mode"],
+            llm_enabled=bool(definition.get("llm_enabled", False)),
             agent=definition["agent"],
             reward_mode=definition["reward_mode"],
             task_potential_enabled=definition["task_potential_enabled"],

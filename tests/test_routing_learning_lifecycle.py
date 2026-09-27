@@ -172,7 +172,7 @@ class RoutingCadenceTest(unittest.TestCase):
 class StrategyScopeTest(unittest.TestCase):
     def test_every_registry_method_uses_strategy_driven_scope(self):
         config = formal_training_config(1500)
-        self.assertEqual(len(METHOD_REGISTRY), 17)
+        self.assertEqual(len(METHOD_REGISTRY), 18)
         for method_key in METHOD_REGISTRY:
             with self.subTest(method=method_key):
                 method = MethodSpec.parse(method_key)

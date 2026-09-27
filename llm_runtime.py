@@ -1,0 +1,284 @@
+"""Approved LLM design loading and persistent current-only execution."""
+
+from __future__ import annotations
+
+import copy
+from dataclasses import dataclass
+import json
+import math
+import multiprocessing as mp
+from pathlib import Path
+import shutil
+from typing import Any
+
+import numpy as np
+
+from llm_candidate import ApprovedDesign, load_approved_design
+from llm_candidate_worker import (
+    SAFE_BUILTINS,
+    _run_function,
+    _validate_output_ranges,
+)
+from llm_design_contract import OBS_KEYS, runtime_constants
+from replay_auxiliary import SNAPSHOT_FIELD_SPECS
+
+
+LLM_RUNTIME_CONTRACT_VERSION = "uav-hrl-llm-runtime-v1"
+RUN_ARTIFACT_DIRECTORY_NAME = "llm_artifact"
+
+
+class LLMRuntimeError(RuntimeError):
+    pass
+
+
+def artifact_identity(design: ApprovedDesign) -> dict[str, Any]:
+    provenance = design.artifact.get("provenance") or {}
+    try:
+        beta = float(provenance["beta"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise LLMRuntimeError("approved artifact has no finite beta") from exc
+    if not math.isfinite(beta):
+        raise LLMRuntimeError("approved artifact beta must be finite")
+    return {
+        "runtime_contract_version": LLM_RUNTIME_CONTRACT_VERSION,
+        "artifact_content_sha256": str(design.artifact["content_sha256"]),
+        "candidate_name": str(design.artifact["candidate_name"]),
+        "feature_count": int(design.artifact["feature_count"]),
+        "reward_term_count": int(design.artifact["reward_term_count"]),
+        "beta": beta,
+        "observation_interface_version": str(
+            design.artifact["observation_interface_version"]
+        ),
+        "source_model_requested": provenance.get("model_requested"),
+        "source_model_actual": provenance.get("model_actual"),
+    }
+
+
+def copy_approved_artifact(source: str | Path, run_directory: str | Path):
+    """Validate, copy, and revalidate an immutable design inside a run."""
+
+    source_design = load_approved_design(source)
+    destination = Path(run_directory).resolve() / RUN_ARTIFACT_DIRECTORY_NAME
+    if destination.exists():
+        raise FileExistsError(f"run LLM artifact already exists: {destination}")
+    shutil.copytree(source_design.directory, destination)
+    copied_design = load_approved_design(destination)
+    if artifact_identity(copied_design) != artifact_identity(source_design):
+        raise LLMRuntimeError("copied approved artifact identity changed")
+    return copied_design
+
+
+def load_run_artifact(
+    run_directory: str | Path, expected_identity: dict[str, Any] | None = None
+):
+    design = load_approved_design(
+        Path(run_directory).resolve() / RUN_ARTIFACT_DIRECTORY_NAME
+    )
+    identity = artifact_identity(design)
+    if expected_identity is not None and identity != expected_identity:
+        raise LLMRuntimeError(
+            "run LLM artifact differs from the recorded approved design"
+        )
+    return design
+
+
+def runtime_constants_metadata(
+    design: ApprovedDesign,
+    *,
+    environment_width_m: float,
+    environment_height_m: float,
+    episode_seconds: float,
+    task_deadlines_seconds: dict[str, float],
+) -> dict[str, Any]:
+    """Overlay only environment-varying values on the approved interface."""
+
+    metadata = copy.deepcopy(design.constants_metadata)
+    updates = {
+        "environment_width_m": float(environment_width_m),
+        "environment_height_m": float(environment_height_m),
+        "episode_seconds": float(episode_seconds),
+        "vs_deadline_seconds": float(task_deadlines_seconds["FOV"]),
+        "com_deadline_seconds": float(task_deadlines_seconds["COM"]),
+    }
+    missing = sorted(set(updates).difference(metadata))
+    if missing:
+        raise LLMRuntimeError(
+            f"approved artifact lacks dynamic environment constants: {missing}"
+        )
+    for name, value in updates.items():
+        if not math.isfinite(value) or value <= 0.0:
+            raise LLMRuntimeError(f"runtime constant {name} must be finite positive")
+        metadata[name]["value"] = value
+        metadata[name]["runtime_source"] = "current training/evaluation environment"
+    return metadata
+
+
+def build_online_obs(state, movement_mask, snapshot) -> dict[str, np.ndarray]:
+    if set(snapshot) != set(SNAPSHOT_FIELD_SPECS):
+        raise LLMRuntimeError("online snapshot field set is incompatible")
+    obs = {
+        "state": np.asarray(state, dtype=np.float32).copy(),
+        "movement_mask": np.asarray(movement_mask, dtype=bool).copy(),
+    }
+    if obs["state"].ndim != 1 or obs["movement_mask"].ndim != 1:
+        raise LLMRuntimeError("online state and movement mask must be one-dimensional")
+    for name, spec in SNAPSHOT_FIELD_SPECS.items():
+        value = np.asarray(snapshot[name])
+        if value.shape != tuple(spec["shape"]) or value.dtype != spec["dtype"]:
+            raise LLMRuntimeError(
+                f"online snapshot {name} has incompatible shape or dtype"
+            )
+        obs[name] = value.copy()
+    if set(obs) != set(OBS_KEYS):
+        raise LLMRuntimeError("online observation field set is incompatible")
+    return obs
+
+
+def _worker_main(connection, candidate, constants):
+    try:
+        namespace = {"__builtins__": SAFE_BUILTINS, "np": np}
+        exec(
+            compile(candidate["code"], "<approved-candidate-runtime>", "exec"),
+            namespace,
+            namespace,
+        )
+        extra_function = namespace["compute_extra_state"]
+        reward_function = namespace["compute_reward_terms"]
+        feature_count = len(candidate["features"])
+        term_count = len(candidate["reward_terms"])
+        weights = np.asarray(
+            [item["weight"] for item in candidate["reward_terms"]],
+            dtype=np.float64,
+        )
+        connection.send({"status": "ready"})
+        while True:
+            request = connection.recv()
+            if request is None:
+                return
+            obs = request["obs"]
+            if set(obs) != set(OBS_KEYS):
+                raise ValueError("runtime exposes an unexpected observation field set")
+            for value in obs.values():
+                value.setflags(write=False)
+            extra = _run_function(
+                extra_function, obs, constants, feature_count, "compute_extra_state"
+            )
+            if request.get("mode") == "state":
+                # Reuse the common range checker with a known-valid zero reward
+                # vector; reward terms are intentionally not evaluated at the
+                # next-state boundary.
+                zero_terms = np.zeros((term_count,), dtype=np.float32)
+                _validate_output_ranges(
+                    extra, zero_terms, candidate, "online next observation"
+                )
+                connection.send({"status": "ok", "extra": extra})
+                continue
+            terms = _run_function(
+                reward_function, obs, constants, term_count, "compute_reward_terms"
+            )
+            _validate_output_ranges(extra, terms, candidate, "online observation")
+            reward = float(np.asarray(terms, dtype=np.float64) @ weights)
+            connection.send(
+                {"status": "ok", "extra": extra, "terms": terms, "reward": reward}
+            )
+    except EOFError:
+        return
+    except BaseException as exc:
+        try:
+            connection.send(
+                {"status": "error", "type": type(exc).__name__, "message": str(exc)}
+            )
+        except BaseException:
+            pass
+    finally:
+        connection.close()
+
+
+@dataclass
+class ApprovedDesignRuntime:
+    design: ApprovedDesign
+    constants_metadata: dict[str, Any]
+    timeout: float = 60.0
+
+    def __post_init__(self):
+        if not math.isfinite(float(self.timeout)) or float(self.timeout) <= 0.0:
+            raise ValueError("LLM worker timeout must be finite positive")
+        self.identity = artifact_identity(self.design)
+        self.beta = float(self.identity["beta"])
+        self.constants = runtime_constants(self.constants_metadata)
+        context = mp.get_context("spawn")
+        parent, child = context.Pipe()
+        self._connection = parent
+        self._process = context.Process(
+            target=_worker_main,
+            args=(child, self.design.candidate, self.constants),
+            daemon=True,
+        )
+        self._process.start()
+        child.close()
+        response = self._receive("initialization")
+        if response.get("status") != "ready":
+            self.close()
+            raise LLMRuntimeError(f"LLM runtime initialization failed: {response}")
+
+    @property
+    def feature_count(self):
+        return int(self.identity["feature_count"])
+
+    def _receive(self, phase):
+        if not self._connection.poll(float(self.timeout)):
+            self.close()
+            raise LLMRuntimeError(f"LLM candidate worker timed out during {phase}")
+        try:
+            response = self._connection.recv()
+        except EOFError as exc:
+            self.close()
+            raise LLMRuntimeError(
+                f"LLM candidate worker exited during {phase}"
+            ) from exc
+        return response
+
+    def evaluate(self, obs):
+        if not self._process.is_alive():
+            raise LLMRuntimeError("LLM candidate worker is not running")
+        self._connection.send({"obs": obs, "mode": "all"})
+        response = self._receive("online evaluation")
+        if response.get("status") != "ok":
+            raise LLMRuntimeError(
+                "LLM candidate evaluation failed: "
+                f"{response.get('type')}: {response.get('message')}"
+            )
+        return (
+            np.asarray(response["extra"], dtype=np.float32),
+            np.asarray(response["terms"], dtype=np.float32),
+            float(response["reward"]),
+        )
+
+    def evaluate_state(self, obs):
+        if not self._process.is_alive():
+            raise LLMRuntimeError("LLM candidate worker is not running")
+        self._connection.send({"obs": obs, "mode": "state"})
+        response = self._receive("online next-state evaluation")
+        if response.get("status") != "ok":
+            raise LLMRuntimeError(
+                "LLM candidate state evaluation failed: "
+                f"{response.get('type')}: {response.get('message')}"
+            )
+        return np.asarray(response["extra"], dtype=np.float32)
+
+    def close(self):
+        process = getattr(self, "_process", None)
+        connection = getattr(self, "_connection", None)
+        if connection is not None:
+            try:
+                if process is not None and process.is_alive():
+                    connection.send(None)
+            except (BrokenPipeError, EOFError, OSError):
+                pass
+        if process is not None:
+            process.join(timeout=1.0)
+            if process.is_alive():
+                process.terminate()
+                process.join(timeout=1.0)
+        if connection is not None:
+            connection.close()

@@ -128,7 +128,11 @@ PAPER_EVALUATION_SUITES = {
     },
     "fixed_roi": {"methods": _FIXED_ROI_METHODS, "kind": "fixed_roi"},
     "environment_size": {
-        "methods": tuple(METHOD_REGISTRY),
+        "methods": tuple(
+            method_id
+            for method_id in METHOD_REGISTRY
+            if method_id != "td3_dinkelbach_llm"
+        ),
         "kind": "environment_size",
     },
 }
@@ -137,6 +141,7 @@ PAPER_EVALUATION_SUITES = {
 # baseline is eligible, without changing any suite's default method list.
 _EVALUATION_METHOD_BASELINES = {
     "td3_dinkelbach_ddqn": "td3_dinkelbach_dqn",
+    "td3_dinkelbach_llm": "td3_dinkelbach",
 }
 
 
@@ -952,6 +957,16 @@ def run_paper_evaluation(
                 search_diagnostics_sink=(
                     search_writer.write if search_writer is not None else None
                 ),
+                llm_artifact_dir=(
+                    context["run_dir"] / "llm_artifact"
+                    if method.llm_enabled
+                    else None
+                ),
+                llm_worker_timeout=float(
+                    (context.get("resolved") or {}).get(
+                        "llm_worker_timeout_seconds", 60.0
+                    )
+                ),
             )
         diagnostic_outputs = write_packet_routing_diagnostic_artifacts(
             point_dir,
@@ -1103,6 +1118,14 @@ def run_paper_evaluation(
                 else None
             ),
         )
+        llm_artifact_id = (
+            result["llm_artifact_identity"]["artifact_content_sha256"]
+            if method.llm_enabled
+            else None
+        )
+        if llm_artifact_id is not None:
+            for aggregate in aggregates:
+                aggregate["llm_artifact_id"] = llm_artifact_id
         _write_json(point_dir / "aggregated_plot_data.json", aggregates)
         _write_csv(point_dir / "aggregated_plot_data.csv", aggregates)
         all_aggregates.extend(aggregates)
@@ -1120,6 +1143,11 @@ def run_paper_evaluation(
                 "evaluation_episode_horizon_s": point_seconds,
                 "training_episode_horizon_s": int(PRODUCTION_EPISODE_HORIZON_SECONDS),
                 "evaluation_config_fingerprint": evaluation_config_fingerprint,
+                **(
+                    {"llm_artifact_id": llm_artifact_id}
+                    if llm_artifact_id is not None
+                    else {}
+                ),
                 **deployment_provenance,
                 **(
                     {

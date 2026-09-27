@@ -3,7 +3,9 @@ from collections import defaultdict
 import copy
 from dataclasses import dataclass
 import hashlib
+import json
 import os
+from pathlib import Path
 import random
 import subprocess
 
@@ -133,6 +135,14 @@ from rng_contract import CHANNEL_RNG_STREAMS, NamedRNGStreams, RNG_CONTRACT_VERS
 from scenario_manifest import validate_manifest_initial_topologies
 from search_diagnostics import build_search_diagnostics_record
 from replay_auxiliary import capture_replay_snapshot, replay_auxiliary_metadata
+from llm_runtime import (
+    ApprovedDesignRuntime,
+    LLMRuntimeError,
+    artifact_identity,
+    build_online_obs,
+    load_approved_design,
+    runtime_constants_metadata,
+)
 
 
 MOVEMENT_CONTROL_INTERVAL = int(round(MOVEMENT_INTERVAL_SECONDS / ROUTING_SLOT_SECONDS))
@@ -1587,7 +1597,9 @@ def _evaluation_runtime_provenance(
             "environment_shift_types": environment_shift_types,
             "remaining_time_normalization_horizon_s": evaluation_horizon,
             "remaining_time_normalization": "current_evaluation_episode_horizon",
-            "episode_horizon_seconds_observed_by_policy": False,
+            "episode_horizon_seconds_observed_by_policy": bool(
+                method_spec.llm_enabled
+            ),
             "remaining_time_definition": (
                 "(evaluation_horizon_s - elapsed_s) / evaluation_horizon_s"
             ),
@@ -1606,7 +1618,7 @@ def _evaluation_runtime_provenance(
                 environment_shift_types[0] if environment_shift_types else None
             ),
             "new_training_started": False,
-            "environment_size_observed_by_policy": False,
+            "environment_size_observed_by_policy": bool(method_spec.llm_enabled),
             "coordinate_normalization": "current_environment_width_height",
         },
         "routing_lifecycle": (
@@ -1888,6 +1900,37 @@ def _evaluation_invariants(
     return checks
 
 
+def _evaluate_llm_observation(runtime, obs, config, episode, step, phase, *, state_only=False):
+    try:
+        return runtime.evaluate_state(obs) if state_only else runtime.evaluate(obs)
+    except BaseException as exc:
+        root = Path(config.run_directory or ".") / "llm_runtime_failures"
+        root.mkdir(parents=True, exist_ok=True)
+        stem = f"episode_{int(episode):04d}_step_{int(step):04d}_{phase}"
+        np.savez_compressed(root / f"{stem}.npz", **obs)
+        (root / f"{stem}.json").write_text(
+            json.dumps(
+                {
+                    "artifact_identity": runtime.identity,
+                    "episode": int(episode),
+                    "step": int(step),
+                    "phase": str(phase),
+                    "error_type": type(exc).__name__,
+                    "error": str(exc),
+                },
+                indent=2,
+                allow_nan=False,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        runtime.close()
+        raise LLMRuntimeError(
+            f"LLM candidate failed at episode {episode}, step {step}, {phase}; "
+            f"diagnostic saved to {root}"
+        ) from exc
+
+
 def train(
     config=None,
     *,
@@ -1911,6 +1954,8 @@ def train(
     sampling_mode=False,
     sampling_noise_std=None,
     sampling_seed=None,
+    llm_artifact_dir=None,
+    llm_worker_timeout=60.0,
 ):
     if config is None:
         raise ValueError(
@@ -1925,6 +1970,28 @@ def train(
         if key != "method_id"
     })
     formal_config = effective_training_config(config, method_spec)
+    if method_spec.llm_enabled and llm_artifact_dir is None:
+        raise ValueError("td3_dinkelbach_llm requires an explicit approved artifact")
+    if not method_spec.llm_enabled and llm_artifact_dir is not None:
+        raise ValueError("only td3_dinkelbach_llm may load an approved artifact")
+    llm_design = (
+        load_approved_design(llm_artifact_dir)
+        if method_spec.llm_enabled
+        else None
+    )
+    llm_identity = artifact_identity(llm_design) if llm_design is not None else None
+    movement_state_dim = MOVEMENT_STATE_DIM + (
+        int(llm_identity["feature_count"]) if llm_identity is not None else 0
+    )
+    llm_checkpoint_artifact = None
+    if llm_identity is not None and evaluation and checkpoint_dir is not None:
+        llm_checkpoint_artifact = Path(checkpoint_dir) / "llm_artifact"
+    elif llm_identity is not None and config.resume_dir is not None:
+        llm_checkpoint_artifact = Path(config.resume_dir) / "llm_artifact"
+    if llm_checkpoint_artifact is not None:
+        embedded_design = load_approved_design(llm_checkpoint_artifact)
+        if artifact_identity(embedded_design) != llm_identity:
+            raise RuntimeError("checkpoint LLM artifact identity is incompatible")
     resolved_exploration = exploration_schedule_configuration(config, method_spec)
     resolved_routing = routing_agent_configuration(method_spec, config)
     packet_outcome_mode = config.packet_outcome_artifact_mode
@@ -2048,9 +2115,21 @@ def train(
             packet_outcome_mode != PACKET_OUTCOME_MODE_DISABLED
         ),
     )
+    llm_runtime = None
+    if llm_design is not None:
+        constants_metadata = runtime_constants_metadata(
+            llm_design,
+            environment_width_m=env.env_width,
+            environment_height_m=env.env_height,
+            episode_seconds=config.episode_seconds,
+            task_deadlines_seconds=resolved_evaluation["task_deadlines_seconds"],
+        )
+        llm_runtime = ApprovedDesignRuntime(
+            llm_design, constants_metadata, timeout=llm_worker_timeout
+        )
     movement_agent = create_movement_agent(
         method_spec,
-        MOVEMENT_STATE_DIM,
+        movement_state_dim,
         JOINT_ACTION_DIM,
         config,
         rng_streams=rng_streams,
@@ -2064,11 +2143,12 @@ def train(
     )
     joint_replay = (
         utils_update_v2.ReplayBufferJoint(
-            MOVEMENT_STATE_DIM,
+            movement_state_dim,
             JOINT_ACTION_DIM,
             max_size=config.replay_max_size,
             rng=rng_streams.numpy("movement_replay_sampling"),
             record_auxiliary=not evaluation,
+            record_llm_reward=method_spec.llm_enabled,
         )
         if method_spec.learns_movement
         else None
@@ -2115,6 +2195,13 @@ def train(
         evaluation=evaluation,
         rng_contract_metadata=rng_streams.metadata(),
     )
+    if llm_identity is not None:
+        experiment_identity["llm_artifact_identity"] = copy.deepcopy(llm_identity)
+        experiment_identity["movement_state_dimensions"] = {
+            "original": MOVEMENT_STATE_DIM,
+            "extra": int(llm_identity["feature_count"]),
+            "total": movement_state_dim,
+        }
     if training_run_provenance is not None:
         if evaluation:
             raise ValueError(
@@ -2175,13 +2262,18 @@ def train(
             checkpoint_dir,
             movement_agent,
             ddqn,
-            movement_state_dim=MOVEMENT_STATE_DIM,
+            movement_state_dim=movement_state_dim,
             joint_action_dim=JOINT_ACTION_DIM,
             routing_state_dim=ROUTING_STATE_DIM,
             calibration=calibration,
             expected_experiment_metadata={
                 "method_spec_fingerprint": method_spec.compatible_fingerprints,
                 "training_seed": int(config.random_seed),
+                **(
+                    {"llm_artifact_identity": llm_identity}
+                    if llm_identity is not None
+                    else {}
+                ),
             },
             expected_completed_episodes=expected_checkpoint_episodes,
             expected_formal_config=expected_checkpoint_formal_config,
@@ -2324,7 +2416,7 @@ def train(
             ddqn=ddqn,
             joint_replay=joint_replay,
             routing_replay=routing_replay,
-            movement_state_dim=MOVEMENT_STATE_DIM,
+            movement_state_dim=movement_state_dim,
             joint_action_dim=JOINT_ACTION_DIM,
             routing_state_dim=ROUTING_STATE_DIM,
             calibration=calibration,
@@ -2338,6 +2430,11 @@ def train(
                 **(
                     {"manifest_hash": scenario_manifest.content_hash}
                     if scenario_manifest is not None
+                    else {}
+                ),
+                **(
+                    {"llm_artifact_identity": llm_identity}
+                    if llm_identity is not None
                     else {}
                 ),
             },
@@ -2602,6 +2699,8 @@ def train(
         episode_delivered_mbits = 0.0
         episode_energy = 0.0
         episode_reward = 0.0
+        episode_existing_movement_reward = 0.0
+        episode_llm_extra_reward = 0.0
         episode_routing_reward = 0.0
         episode_c9_penalty_sum = 0.0
         episode_c9_penalty_samples = 0
@@ -2655,7 +2754,7 @@ def train(
                         config.episode_seconds, interval
                     ),
                 )
-                state = apply_observation_strategy(
+                original_state = apply_observation_strategy(
                     physical_state,
                     method_spec.task_observation,
                     "movement",
@@ -2665,8 +2764,32 @@ def train(
                     capture_replay_snapshot(env, packet_engine, float(interval))
                     if (not evaluation and method_spec.learns_movement)
                     or transition_observer is not None
+                    or method_spec.llm_enabled
                     else None
                 )
+                llm_extra_reward = 0.0
+                llm_reward_terms = None
+                if llm_runtime is not None:
+                    current_obs = build_online_obs(
+                        original_state,
+                        current_movement_mask,
+                        current_auxiliary_snapshot,
+                    )
+                    current_extra, llm_reward_terms, llm_extra_reward = (
+                        _evaluate_llm_observation(
+                            llm_runtime,
+                            current_obs,
+                            config,
+                            episode,
+                            interval,
+                            "current",
+                        )
+                    )
+                    state = np.concatenate(
+                        (original_state, current_extra), dtype=np.float32
+                    )
+                else:
+                    state = original_state
             except ValueError as exc:
                 if "duplicate" in str(exc):
                     duplicate_target_assertions += 1
@@ -2934,7 +3057,7 @@ def train(
                     config.episode_seconds, interval + 1
                 ),
             )
-            next_state = apply_observation_strategy(
+            original_next_state = apply_observation_strategy(
                 physical_next_state,
                 method_spec.task_observation,
                 "movement",
@@ -2944,8 +3067,29 @@ def train(
                 capture_replay_snapshot(env, packet_engine, actual_time_seconds)
                 if (not evaluation and method_spec.learns_movement)
                 or transition_observer is not None
+                or method_spec.llm_enabled
                 else None
             )
+            if llm_runtime is not None:
+                next_obs = build_online_obs(
+                    original_next_state,
+                    next_movement_mask,
+                    next_auxiliary_snapshot,
+                )
+                next_extra = _evaluate_llm_observation(
+                    llm_runtime,
+                    next_obs,
+                    config,
+                    episode,
+                    interval,
+                    "next",
+                    state_only=True,
+                )
+                next_state = np.concatenate(
+                    (original_next_state, next_extra), dtype=np.float32
+                )
+            else:
+                next_state = original_next_state
             if not done:
                 expected_next_movement_state = next_state.copy()
                 expected_next_movement_mask = next_movement_mask.copy()
@@ -2982,6 +3126,9 @@ def train(
                     scenario_index=episode,
                     scenario_id=scenario_id,
                     dinkelbach_lambda=episode_lambda,
+                    llm_extra_reward=(
+                        llm_extra_reward if method_spec.llm_enabled else None
+                    ),
                 )
             global_transition_index = (
                 evaluation_observation_transition_index
@@ -3001,6 +3148,11 @@ def train(
                 task_potential_enabled=method_spec.task_potential_enabled,
                 ratio_objective_reward=ratio_objective_reward,
             )
+            combined_movement_reward = interval_reward + (
+                llm_runtime.beta * llm_extra_reward
+                if llm_runtime is not None
+                else 0.0
+            )
             applied_penalty = float(method_spec.task_potential_enabled) * sum(
                 constraint_penalties[name]
                 for name in (
@@ -3010,9 +3162,11 @@ def train(
                 )
             )
             base_movement_reward = interval_reward + applied_penalty
-            episode_reward += interval_reward
+            episode_reward += combined_movement_reward
+            episode_existing_movement_reward += interval_reward
+            episode_llm_extra_reward += llm_extra_reward
             episode_base_movement_reward += base_movement_reward
-            episode_final_movement_reward += interval_reward
+            episode_final_movement_reward += combined_movement_reward
             episode_c9_penalty_sum += constraint_penalties["c9_penalty_sum"]
             episode_c9_penalty_samples += constraint_penalties["c9_sample_count"]
             episode_c10_penalty_sum += constraint_penalties["c10_penalty_sum"]
@@ -3058,9 +3212,22 @@ def train(
                         **constraint_penalties,
                         "base_movement_reward": base_movement_reward,
                         "applied_constraint_penalty": applied_penalty,
-                        "final_movement_reward": interval_reward,
+                        "final_movement_reward": combined_movement_reward,
                         "movement_gamma": float(movement_agent.gamma),
                         "reward_at_checkpoint_lambda": interval_reward,
+                        "existing_movement_reward": interval_reward,
+                        "llm_reward_terms": (
+                            None
+                            if llm_reward_terms is None
+                            else llm_reward_terms.copy()
+                        ),
+                        "llm_extra_reward": float(llm_extra_reward),
+                        "llm_reward_beta": (
+                            float(llm_runtime.beta)
+                            if llm_runtime is not None
+                            else 0.0
+                        ),
+                        "combined_movement_reward": combined_movement_reward,
                         "checkpoint_lambda": (
                             episode_lambda if method_spec.uses_dinkelbach else None
                         ),
@@ -3081,6 +3248,9 @@ def train(
                 and total_joint_transitions >= config.warmup_joint_transitions
                 and joint_replay.size >= config.batch_size
             ):
+                update_kwargs = {}
+                if method_spec.llm_enabled:
+                    update_kwargs["llm_reward_beta"] = llm_runtime.beta
                 movement_agent.update_joint(
                     joint_replay,
                     current_lambda=episode_lambda,
@@ -3090,6 +3260,7 @@ def train(
                     beta_com=config.beta_com,
                     reward_mode=method_spec.reward_mode,
                     task_potential_enabled=method_spec.task_potential_enabled,
+                    **update_kwargs,
                 )
 
         if pending_routing_transitions:
@@ -3288,6 +3459,19 @@ def train(
         episode_metrics.append(
             {
                 "method_id": method_spec.method_id,
+                "llm_artifact_id": (
+                    llm_identity["artifact_content_sha256"]
+                    if llm_identity is not None
+                    else None
+                ),
+                "existing_movement_reward": float(
+                    episode_existing_movement_reward
+                ),
+                "llm_extra_reward": float(episode_llm_extra_reward),
+                "llm_reward_beta": (
+                    float(llm_runtime.beta) if llm_runtime is not None else None
+                ),
+                "combined_movement_reward": float(episode_reward),
                 "training_seed": (
                     int(config.random_seed)
                     if config.random_seed is not None
@@ -3598,7 +3782,7 @@ def train(
                 episode=episode,
                 td3=movement_agent,
                 ddqn=ddqn,
-                movement_state_dim=MOVEMENT_STATE_DIM,
+                movement_state_dim=movement_state_dim,
                 joint_action_dim=JOINT_ACTION_DIM,
                 routing_state_dim=ROUTING_STATE_DIM,
                 calibration=calibration,
@@ -3618,6 +3802,9 @@ def train(
                     routing_lifecycle.state_dict()
                     if routing_lifecycle is not None
                     else None
+                ),
+                llm_artifact_dir=(
+                    llm_design.directory if llm_design is not None else None
                 ),
             )
         if (
@@ -3691,7 +3878,7 @@ def train(
                     packet_engine_state=packet_engine.checkpoint_state(),
                 ),
                 formal_config=formal_config,
-                movement_state_dim=MOVEMENT_STATE_DIM,
+                movement_state_dim=movement_state_dim,
                 joint_action_dim=JOINT_ACTION_DIM,
                 routing_state_dim=ROUTING_STATE_DIM,
                 calibration=calibration,
@@ -3708,6 +3895,9 @@ def train(
                     "formal_config": formal_config,
                 },
                 keep_last=config.full_resume_keep_last,
+                llm_artifact_dir=(
+                    llm_design.directory if llm_design is not None else None
+                ),
             )
 
     if config.enable_csv:
@@ -3825,6 +4015,9 @@ def train(
         else None
     )
 
+    if llm_runtime is not None:
+        llm_runtime.close()
+
     return {
         "episodes": len(reward_log),
         "episodes_run": len(reward_log) - initial_log_length,
@@ -3832,7 +4025,9 @@ def train(
         "critic_updates": movement_agent.num_critic_update_iteration,
         "actor_updates": movement_agent.num_actor_update_iteration,
         "routing_state_dim": ROUTING_STATE_DIM,
-        "movement_state_dim": MOVEMENT_STATE_DIM,
+        "movement_state_dim": movement_state_dim,
+        "original_movement_state_dim": MOVEMENT_STATE_DIM,
+        "llm_artifact_identity": copy.deepcopy(llm_identity),
         "joint_action_dim": JOINT_ACTION_DIM,
         "num_uav": NUM_UAV,
         "reserved_search_uav_ids": list(env.reserved_search_uav_ids),
@@ -4039,7 +4234,9 @@ def train(
             ),
             "remaining_time_normalization_horizon_s": int(config.episode_seconds),
             "remaining_time_normalization": "current_evaluation_episode_horizon",
-            "episode_horizon_seconds_observed_by_policy": False,
+            "episode_horizon_seconds_observed_by_policy": bool(
+                method_spec.llm_enabled
+            ),
             "remaining_time_definition": (
                 "(evaluation_horizon_s - elapsed_s) / evaluation_horizon_s"
             ),
@@ -4067,7 +4264,7 @@ def train(
                 else []
             ),
             "new_training_started": False if evaluation else True,
-            "environment_size_observed_by_policy": False,
+            "environment_size_observed_by_policy": bool(method_spec.llm_enabled),
             "coordinate_normalization": "current_environment_width_height",
             **(
                 evaluation_aliases

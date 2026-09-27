@@ -27,6 +27,7 @@ from training_checkpoint import (
     checkpoint_artifact_provenance,
     inspect_model_checkpoint,
 )
+from llm_runtime import artifact_identity, load_run_artifact
 
 
 DEFAULT_FIXED_ROI_COUNTS = tuple(range(ROI_COUNT_MIN, ROI_COUNT_MAX + 1))
@@ -319,9 +320,18 @@ def resolve_training_run_checkpoint(
     # after metadata.json and models.pt are written. Keep full inspection and
     # artifact validation even when the training run is still active.
     _, calibration = load_com_capacity_reference()
+    llm_identity = None
+    movement_state_dim = MOVEMENT_STATE_DIM
+    if method.llm_enabled:
+        expected_llm_identity = resolved.get("llm_artifact_identity")
+        if not isinstance(expected_llm_identity, dict):
+            raise RuntimeError("LLM run metadata lacks its approved artifact identity")
+        design = load_run_artifact(run_dir, expected_llm_identity)
+        llm_identity = artifact_identity(design)
+        movement_state_dim += int(llm_identity["feature_count"])
     inspected = inspect_model_checkpoint(
         checkpoint,
-        movement_state_dim=MOVEMENT_STATE_DIM,
+        movement_state_dim=movement_state_dim,
         joint_action_dim=JOINT_ACTION_DIM,
         routing_state_dim=ROUTING_STATE_DIM,
         td3_gamma=1.0,
@@ -330,6 +340,11 @@ def resolve_training_run_checkpoint(
         expected_experiment_metadata={
             "method_spec_fingerprint": method.compatible_fingerprints,
             "training_seed": int(resolved["seed"]),
+            **(
+                {"llm_artifact_identity": llm_identity}
+                if llm_identity is not None
+                else {}
+            ),
         },
         expected_completed_episodes=checkpoint_episode,
         expected_formal_config=expected_training_config,
@@ -339,6 +354,8 @@ def resolve_training_run_checkpoint(
         require_episode_directory=True,
         movement_agent_kind=method.agent,
     )
+    if llm_identity is not None:
+        load_run_artifact(checkpoint, llm_identity)
     if int(inspected["completed_episode"]) != checkpoint_episode:
         raise RuntimeError(
             "checkpoint completed episode disagrees with selector: "

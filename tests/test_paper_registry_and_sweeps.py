@@ -51,7 +51,8 @@ EXPECTED_SEMANTIC_FIGURES = (
 
 class PaperMethodRegistryTest(unittest.TestCase):
     def test_registry_contains_the_exact_methods(self):
-        self.assertEqual(len(METHOD_REGISTRY), 17)
+        self.assertEqual(len(METHOD_REGISTRY), 18)
+        self.assertIn("td3_dinkelbach_llm", METHOD_REGISTRY)
         self.assertIn("kkm_random_action_random_routing", METHOD_REGISTRY)
         self.assertIn("td3_dinkelbach_ddqn", METHOD_REGISTRY)
 
@@ -84,7 +85,7 @@ class PaperMethodRegistryTest(unittest.TestCase):
             else:
                 self.assertIsNone(resolved["safe_ddqn_qos_target_probability"])
                 self.assertIsNone(resolved["safe_ddqn_eta_c"])
-        self.assertEqual(safe_method_count, 12)
+        self.assertEqual(safe_method_count, 13)
 
     def test_td3_and_ddpg_hyperparameters_are_explicit_and_unchanged(self):
         td3 = movement_agent_configuration(MethodSpec.parse("td3_dinkelbach"))

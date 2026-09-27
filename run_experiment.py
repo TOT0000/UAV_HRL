@@ -62,6 +62,11 @@ from training_history import (
     preflight_resume_training_history,
     training_history_identity,
 )
+from llm_runtime import (
+    artifact_identity,
+    copy_approved_artifact,
+    load_run_artifact,
+)
 
 
 TRAINING_HISTORY_MANIFEST_HASH_SEMANTICS = (
@@ -136,7 +141,20 @@ def build_parser():
     for key in METHOD_REGISTRY:
         method_parser = commands.add_parser(key, help=MethodSpec.parse(key).label)
         _add_training_options(method_parser)
-        method_parser.set_defaults(command="train", method=MethodSpec.parse(key))
+        method = MethodSpec.parse(key)
+        if method.llm_enabled:
+            method_parser.add_argument(
+                "--llm-artifact",
+                required=True,
+                help="explicit approved artifact directory from run_llm_design.py",
+            )
+            method_parser.add_argument(
+                "--llm-worker-timeout",
+                type=float,
+                default=60.0,
+                help="seconds allowed for each isolated candidate computation",
+            )
+        method_parser.set_defaults(command="train", method=method)
 
     resume = commands.add_parser("resume", help="exactly resume one run directory")
     resume.add_argument("run_directory")
@@ -268,6 +286,17 @@ def _load_run_context(run_directory):
     if int(resolved["seed"]) != int(manifest.manifest_seed):
         raise RuntimeError("run seed is incompatible with its scenario manifest")
     return run_dir, resolved, method, manifest
+
+
+def _llm_run_artifact(run_dir, resolved, method):
+    if not method.llm_enabled:
+        return None, None, MOVEMENT_STATE_DIM
+    expected = resolved.get("llm_artifact_identity")
+    if not isinstance(expected, dict):
+        raise RuntimeError("LLM run metadata lacks its approved artifact identity")
+    design = load_run_artifact(run_dir, expected)
+    identity = artifact_identity(design)
+    return design.directory, identity, MOVEMENT_STATE_DIM + int(identity["feature_count"])
 
 
 def _training_manifest_segments_from_resolved(
@@ -413,6 +442,11 @@ def run(args):
         values["output_root"], method.method_key, values["seed"], git_sha
     )
     write_run_status(run_dir, "PREPARING")
+    llm_design = (
+        copy_approved_artifact(args.llm_artifact, run_dir)
+        if method.llm_enabled
+        else None
+    )
     checkpoints_enabled = not args.smoke
     config = formal_training_config(
         values["episodes"],
@@ -444,6 +478,10 @@ def run(args):
     )
     manifest.save(run_dir / "scenario_manifest.json")
     resolved = _base_resolved(run_dir, method, manifest, config, values, args, git_sha)
+    if llm_design is not None:
+        resolved["llm_artifact_identity"] = artifact_identity(llm_design)
+        resolved["llm_artifact_path"] = "llm_artifact"
+        resolved["llm_worker_timeout_seconds"] = float(args.llm_worker_timeout)
     _write_json_atomic(run_dir / "resolved_config.json", resolved)
     write_run_status(run_dir, "RUNNING")
     try:
@@ -452,6 +490,8 @@ def run(args):
             scenario_manifest=manifest,
             method_spec=method,
             training_run_provenance=_training_run_provenance(resolved),
+            llm_artifact_dir=(llm_design.directory if llm_design is not None else None),
+            llm_worker_timeout=getattr(args, "llm_worker_timeout", 60.0),
         )
         resolved.update(
             status="COMPLETED",
@@ -485,6 +525,9 @@ def _episode_directories(root):
 
 def run_resume(args):
     run_dir, resolved, method, manifest = _load_run_context(args.run_directory)
+    llm_artifact_dir, llm_identity, movement_state_dim = _llm_run_artifact(
+        run_dir, resolved, method
+    )
     invocation_git_sha = _git_short_sha()
     try:
         previous_total = int(resolved["training_config"]["total_episodes"])
@@ -579,13 +622,20 @@ def run_resume(args):
     }
     inspect_full = partial(
         inspect_full_resume_checkpoint,
-        movement_state_dim=MOVEMENT_STATE_DIM,
+        movement_state_dim=movement_state_dim,
         joint_action_dim=JOINT_ACTION_DIM,
         routing_state_dim=ROUTING_STATE_DIM,
         td3_gamma=1.0,
         ddqn_gamma=0.99,
         calibration=calibration,
-        expected_experiment_metadata=expected_experiment,
+        expected_experiment_metadata={
+            **expected_experiment,
+            **(
+                {"llm_artifact_identity": llm_identity}
+                if llm_identity is not None
+                else {}
+            ),
+        },
         expected_formal_config=formal_config,
         current_training_manifest=active_manifest,
         training_run_directory=run_dir,
@@ -594,13 +644,20 @@ def run_resume(args):
     )
     inspect_model = partial(
         inspect_model_checkpoint,
-        movement_state_dim=MOVEMENT_STATE_DIM,
+        movement_state_dim=movement_state_dim,
         joint_action_dim=JOINT_ACTION_DIM,
         routing_state_dim=ROUTING_STATE_DIM,
         td3_gamma=1.0,
         ddqn_gamma=0.99,
         calibration=calibration,
-        expected_experiment_metadata=expected_experiment,
+        expected_experiment_metadata={
+            **expected_experiment,
+            **(
+                {"llm_artifact_identity": llm_identity}
+                if llm_identity is not None
+                else {}
+            ),
+        },
         expected_formal_config=formal_config,
         current_training_manifest=active_manifest,
         training_run_directory=run_dir,
@@ -613,6 +670,8 @@ def run_resume(args):
     for _, candidate in _episode_directories(run_dir / "checkpoints" / "full"):
         try:
             checkpoint_inspection = inspect_full(candidate)
+            if llm_identity is not None:
+                load_run_artifact(candidate, llm_identity)
             checkpoint = candidate
             break
         except RuntimeError as exc:
@@ -710,6 +769,10 @@ def run_resume(args):
             method_spec=method,
             training_history_manifest_hash=history_identity_manifest_hash,
             training_run_provenance=_training_run_provenance(resolved),
+            llm_artifact_dir=llm_artifact_dir,
+            llm_worker_timeout=float(
+                resolved.get("llm_worker_timeout_seconds", 60.0)
+            ),
         )
         resolved.update(
             status="COMPLETED",
@@ -761,6 +824,9 @@ def _write_evaluation_plots(output_dir, rows):
 
 def run_evaluate(args):
     run_dir, resolved, method, training_manifest = _load_run_context(args.run_directory)
+    llm_artifact_dir, llm_identity, movement_state_dim = _llm_run_artifact(
+        run_dir, resolved, method
+    )
     training_manifest_path, _ = resolve_training_manifest(run_dir, resolved)
     training_manifest_segments = _training_manifest_segments_from_resolved(
         run_dir,
@@ -803,7 +869,7 @@ def run_evaluate(args):
     _, calibration = load_com_capacity_reference()
     inspected = inspect_model_checkpoint(
         checkpoint,
-        movement_state_dim=MOVEMENT_STATE_DIM,
+        movement_state_dim=movement_state_dim,
         joint_action_dim=JOINT_ACTION_DIM,
         routing_state_dim=ROUTING_STATE_DIM,
         td3_gamma=1.0,
@@ -812,6 +878,11 @@ def run_evaluate(args):
         expected_experiment_metadata={
             "method_spec_fingerprint": method.compatible_fingerprints,
             "training_seed": int(resolved["seed"]),
+            **(
+                {"llm_artifact_identity": llm_identity}
+                if llm_identity is not None
+                else {}
+            ),
         },
         expected_completed_episodes=checkpoint_episode,
         expected_formal_config=expected_training_config,
@@ -821,6 +892,8 @@ def run_evaluate(args):
         require_episode_directory=True,
         movement_agent_kind=method.agent,
     )
+    if llm_identity is not None:
+        load_run_artifact(checkpoint, llm_identity)
     output_dir = _create_unique_leaf(
         run_dir / "evaluation" / f"ep_{checkpoint_episode}", "eval"
     )
@@ -847,6 +920,10 @@ def run_evaluate(args):
         expected_checkpoint_episodes=checkpoint_episode,
         expected_checkpoint_formal_config=expected_training_config,
         expected_checkpoint_training_manifest=training_manifest,
+        llm_artifact_dir=llm_artifact_dir,
+        llm_worker_timeout=float(
+            resolved.get("llm_worker_timeout_seconds", 60.0)
+        ),
     )
     formal_evaluation = bool(
         not args.smoke

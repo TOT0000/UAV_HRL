@@ -371,11 +371,35 @@ def _returned_feature_expressions(function: ast.FunctionDef) -> list[ast.AST] | 
             bindings[statement.target.id] = _resolved_expression(
                 statement.value, bindings
             )
+        elif isinstance(statement, ast.AugAssign) and isinstance(
+            statement.target, ast.Name
+        ):
+            # AugAssign reads the previous value and then replaces the binding.
+            # Resolve both operands against the pre-update environment so aliases
+            # such as ``y = x; x *= x`` retain their actual, distinct meanings.
+            previous = bindings.get(statement.target.id)
+            if previous is None:
+                return None
+            bindings[statement.target.id] = ast.BinOp(
+                left=_resolved_expression(previous, bindings),
+                op=copy.deepcopy(statement.op),
+                right=_resolved_expression(statement.value, bindings),
+            )
         elif isinstance(statement, ast.Return):
             if statement.value is None:
                 return None
             returned = _resolved_expression(statement.value, bindings)
             break
+        elif isinstance(
+            statement,
+            (ast.If, ast.For, ast.While, ast.Try, ast.With, ast.Match),
+        ):
+            # This intentionally is not a general data-flow engine.  A binding
+            # modified through control flow is path-dependent, so retaining any
+            # pre-branch alias can create a false duplicate verdict.  Report the
+            # function as unresolved instead of pretending those expressions are
+            # known.
+            return None
     if returned is None:
         return None
     if isinstance(returned, ast.Call) and _dotted_name(returned.func) in {

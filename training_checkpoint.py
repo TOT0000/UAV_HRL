@@ -145,6 +145,14 @@ JOINT_REPLAY_FIELDS = (
     "movement_mask_valid",
     *REPLAY_AUXILIARY_FIELDS,
 )
+LLM_EXTRA_REWARD_FIELD = "llm_extra_reward"
+
+
+def _joint_replay_fields(replay):
+    fields = list(JOINT_REPLAY_FIELDS)
+    if bool(getattr(replay, "record_llm_reward", False)):
+        fields.append(LLM_EXTRA_REWARD_FIELD)
+    return tuple(fields)
 ROUTING_REPLAY_FIELDS = (
     "state",
     "action",
@@ -504,7 +512,7 @@ def _atomic_checkpoint_write(checkpoint_dir, writer):
     if checkpoint_dir.exists():
         raise FileExistsError(f"checkpoint already exists: {checkpoint_dir}")
     temporary = checkpoint_dir.parent / (
-        f".{checkpoint_dir.name}.tmp-{uuid.uuid4().hex}"
+        f".{checkpoint_dir.name}.tmp-{uuid.uuid4().hex[:8]}"
     )
     temporary.mkdir()
     try:
@@ -1220,6 +1228,7 @@ def save_model_checkpoint(
     calibration,
     experiment_metadata=None,
     routing_lifecycle_state=None,
+    llm_artifact_dir=None,
 ):
     checkpoint_dir = Path(checkpoint_dir)
     metadata = _base_metadata(
@@ -1243,6 +1252,8 @@ def save_model_checkpoint(
     )
     def write(temporary):
         torch.save(_network_states(td3, ddqn), temporary / "models.pt")
+        if llm_artifact_dir is not None:
+            shutil.copytree(Path(llm_artifact_dir), temporary / "llm_artifact")
         (temporary / "metadata.json").write_text(
             json.dumps(metadata, indent=2) + "\n", encoding="utf-8"
         )
@@ -2452,6 +2463,7 @@ def save_full_resume_checkpoint(
     calibration,
     experiment_metadata=None,
     keep_last=None,
+    llm_artifact_dir=None,
 ):
     checkpoint_dir = Path(checkpoint_dir)
     if not isinstance(training_state, dict):
@@ -2523,7 +2535,9 @@ def save_full_resume_checkpoint(
             if joint_replay is None:
                 raise ValueError(f"{movement_kind} movement requires a joint replay")
             replay_metadata["joint"] = _save_replay(
-                temporary / "joint_replay.npz", joint_replay, JOINT_REPLAY_FIELDS
+                temporary / "joint_replay.npz",
+                joint_replay,
+                _joint_replay_fields(joint_replay),
             )
         routing_kind = _routing_agent_kind(ddqn)
         if routing_kind == "random":
@@ -2547,6 +2561,8 @@ def save_full_resume_checkpoint(
             "rng_state": _rng_state(),
         }
         torch.save(payload, temporary / "training_state.pt")
+        if llm_artifact_dir is not None:
+            shutil.copytree(Path(llm_artifact_dir), temporary / "llm_artifact")
         (temporary / "metadata.json").write_text(
             json.dumps(metadata, indent=2) + "\n", encoding="utf-8"
         )
@@ -3454,7 +3470,11 @@ def load_full_resume_checkpoint(
     if not isinstance(payload.get("networks"), dict):
         raise RuntimeError("checkpoint network payload is invalid")
     _validate_rng_state_payload(payload.get("rng_state"))
-    joint_fields = JOINT_REPLAY_FIELDS
+    joint_fields = (
+        _joint_replay_fields(joint_replay)
+        if joint_replay is not None
+        else JOINT_REPLAY_FIELDS
+    )
     if movement_replay_enabled:
         if joint_replay is None:
             raise RuntimeError("learned movement requires a joint replay")

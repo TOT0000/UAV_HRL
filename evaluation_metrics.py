@@ -888,6 +888,7 @@ def run_evaluation_command(args):
             expected_checkpoint_formal_config=preflight[
                 "expected_training_config"
             ],
+            llm_artifact_dir=preflight.get("llm_artifact_dir"),
         )
         metadata = {
             **result["run_metadata"],
@@ -978,9 +979,25 @@ def _evaluation_preflight(args):
         method,
     )
     _, calibration = load_com_capacity_reference()
+    llm_artifact_dir = None
+    llm_identity = None
+    movement_state_dim = MOVEMENT_STATE_DIM
+    if method.llm_enabled:
+        from llm_runtime import artifact_identity
+        from llm_candidate import load_approved_design
+
+        embedded = Path(args.checkpoint) / "llm_artifact"
+        requested = getattr(args, "llm_artifact", None)
+        llm_artifact_dir = Path(requested).resolve() if requested else embedded
+        design = load_approved_design(llm_artifact_dir)
+        llm_identity = artifact_identity(design)
+        embedded_design = load_approved_design(embedded)
+        if artifact_identity(embedded_design) != llm_identity:
+            raise RuntimeError("evaluation LLM artifact differs from checkpoint design")
+        movement_state_dim += int(llm_identity["feature_count"])
     inspect_model_checkpoint(
         args.checkpoint,
-        movement_state_dim=MOVEMENT_STATE_DIM,
+        movement_state_dim=movement_state_dim,
         joint_action_dim=JOINT_ACTION_DIM,
         routing_state_dim=ROUTING_STATE_DIM,
         td3_gamma=1.0,
@@ -989,6 +1006,11 @@ def _evaluation_preflight(args):
         expected_experiment_metadata={
             "method_spec_fingerprint": method.compatible_fingerprints,
             "training_seed": int(args.training_seed),
+            **(
+                {"llm_artifact_identity": llm_identity}
+                if llm_identity is not None
+                else {}
+            ),
         },
         expected_completed_episodes=FORMAL_EXPERIMENT_DEFAULTS[
             "training_episodes_per_seed"
@@ -1006,6 +1028,7 @@ def _evaluation_preflight(args):
         "config": config,
         "expected_training_config": expected_training_config,
         "train": train,
+        "llm_artifact_dir": llm_artifact_dir,
     }
 
 

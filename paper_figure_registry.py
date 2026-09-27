@@ -128,6 +128,7 @@ PAPER_METHOD_MAPPINGS = MappingProxyType(
 METHOD_DISPLAY_NAMES = MappingProxyType(
     {
         "td3_dinkelbach": "Our method w/ task-aware",
+        "td3_dinkelbach_llm": "TD3-Dinkelbach + LLM",
         "td3_dinkelbach_wo_ta": "Our method w/o task-aware",
         "ddpg_dinkelbach": "DDPG with Dinkelbach",
         "km_td3_dinkelbach": "KM+TD3-Dinkelbach",
@@ -163,6 +164,7 @@ PLOT_STYLES = MappingProxyType(
         },
         "training_ee_vs_episode": {
             "td3_dinkelbach": {"label": "Our method w/ task-aware", "color": "#E74C3C", "raw_color": "#FFC4B2", "raw_alpha": 0.4},
+            "td3_dinkelbach_llm": {"label": "TD3-Dinkelbach + LLM", "color": "#008C95", "raw_color": "#9ADDE0", "raw_alpha": 0.4},
             "td3_dinkelbach_wo_ta": {"label": "Our method w/o task-aware", "color": "#27AE60", "raw_color": "#B6E388", "raw_alpha": 0.5},
             "ddpg_dinkelbach": {"label": "K-KM+DDPG-Dinkelbach", "color": "#E67E22", "raw_color": "#FFD1A4", "raw_alpha": 0.5},
             "km_td3_dinkelbach": {"label": "KM+TD3-Dinkelbach", "color": "#2471A3", "raw_color": "#AED6F1", "raw_alpha": 0.5},
@@ -170,11 +172,13 @@ PLOT_STYLES = MappingProxyType(
         },
         "task_assignment_ee_vs_number_of_rois": {
             "td3_dinkelbach": {"color": "red", "marker": "*", "markersize": 10},
+            "td3_dinkelbach_llm": {"label": "TD3-Dinkelbach + LLM", "color": "#008C95", "marker": "P", "markersize": 9},
             "km_td3_dinkelbach": {"color": "blue", "marker": "^", "markersize": 9},
             "random_assignment_td3_dinkelbach": {"color": "#187600", "marker": "o", "markersize": 8},
         },
         "trajectory_design_ee_vs_number_of_rois": {
             "td3_dinkelbach": {"label": "TD3 with Dinkelbach", "color": "#243BFF", "marker": "s"},
+            "td3_dinkelbach_llm": {"label": "TD3-Dinkelbach + LLM", "color": "#008C95", "marker": "P"},
             "ddpg_dinkelbach": {"label": "DDPG with Dinkelbach", "color": "#A52A2A", "marker": "D"},
             "td3_ratio": {"label": "TD3", "color": "#C000C0", "marker": "^"},
             "ddpg_ratio": {"label": "DDPG", "color": "#F39C00", "marker": "v"},
@@ -184,6 +188,7 @@ PLOT_STYLES = MappingProxyType(
         },
         "hierarchical_architecture_ee_vs_number_of_rois": {
             "td3_dinkelbach": {"label": "Our w/ TA", "color": "red", "marker": "*", "markersize": 10},
+            "td3_dinkelbach_llm": {"label": "TD3-Dinkelbach + LLM", "color": "#008C95", "marker": "P", "markersize": 9},
             "td3_dinkelbach_wo_ta": {"label": "Our w/o TA", "color": "#243BFF", "marker": "s"},
             "ddpg_dinkelbach_wo_ta": {"label": "DDPG-Dink. w/o TA", "color": "#A52A2A", "marker": "D"},
             "kkm_random_action_random_routing": {"label": "K-KM+Rand+Rand", "color": "#187600", "marker": "o"},
@@ -193,18 +198,21 @@ PLOT_STYLES = MappingProxyType(
             "td3_dinkelbach_dqn": {"color": "#F39C00"},
             "td3_dinkelbach_ddqn": {"color": "#D35400"},
             "td3_dinkelbach": {"color": "red"},
+            "td3_dinkelbach_llm": {"color": "#008C95"},
         },
         "com_task_delay_vs_arrival_rate": {
             "td3_dinkelbach_random_routing": {"color": "#187600"},
             "td3_dinkelbach_dqn": {"color": "#F39C00"},
             "td3_dinkelbach_ddqn": {"color": "#D35400"},
             "td3_dinkelbach": {"color": "red"},
+            "td3_dinkelbach_llm": {"color": "#008C95"},
         },
         "vs_task_delay_vs_arrival_rate": {
             "td3_dinkelbach_random_routing": {"color": "#187600"},
             "td3_dinkelbach_dqn": {"color": "#F39C00"},
             "td3_dinkelbach_ddqn": {"color": "#D35400"},
             "td3_dinkelbach": {"color": "red"},
+            "td3_dinkelbach_llm": {"color": "#008C95"},
         },
         "task_type_delay_violation_vs_target_delay": {
             "td3_dinkelbach_random_routing": {"label": "Random", "color": "#187600", "marker": "*"},
@@ -212,6 +220,7 @@ PLOT_STYLES = MappingProxyType(
             "td3_dinkelbach_ddqn": {"label": "K-KM + TD3 + DDQN", "color": "#D35400", "marker": "D"},
             "td3_dinkelbach_wo_ta": {"label": "Our w/o task-aware", "color": "#243BFF", "marker": "^"},
             "td3_dinkelbach": {"label": "Our method", "color": "red", "marker": "8"},
+            "td3_dinkelbach_llm": {"label": "TD3-Dinkelbach + LLM", "color": "#008C95", "marker": "P"},
         },
         "task_type_delay_vs_number_of_rois": {
             "td3_dinkelbach_random_routing": {"label": "Rand", "color": "#187600", "marker": "^"},
@@ -219,6 +228,7 @@ PLOT_STYLES = MappingProxyType(
             "td3_dinkelbach_dqn_wo_ta": {"label": "DQN w/o task-aware", "color": "#C000C0", "marker": "s"},
             "td3_dinkelbach_wo_ta": {"label": "Our method w/o task-aware", "color": "#243BFF", "marker": "v"},
             "td3_dinkelbach": {"label": "Our method w/ task-aware", "color": "red", "marker": "*"},
+            "td3_dinkelbach_llm": {"label": "TD3-Dinkelbach + LLM", "color": "#008C95", "marker": "P"},
         },
     }
 )

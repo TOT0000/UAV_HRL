@@ -469,6 +469,47 @@ def test_duplicate_statically_normalized_feature_expressions_are_rejected(design
         validate_candidate(candidate, constants)
 
 
+def test_augassign_updates_binding_instead_of_reusing_stale_alias(design_fixture):
+    _, _, _, _, constants = design_fixture
+    candidate = _candidate(
+        code=(
+            "def compute_extra_state(obs, constants):\n"
+            '    x = np.clip(obs["state"][0], -1.0, 1.0)\n'
+            "    y = x\n"
+            "    x *= x\n"
+            "    return np.asarray([x, y], dtype=np.float32)\n\n"
+            "def compute_reward_terms(obs, constants):\n"
+            "    return np.asarray([0.0], dtype=np.float32)\n"
+        )
+    )
+    second = dict(candidate["features"][0])
+    second.update(index=1, name="pre_square_value", formula="bounded pre-square value")
+    candidate["features"].append(second)
+    report = validate_candidate(candidate, constants)
+    assert report["explicit_feature_redundancy_check"]["status"].endswith("passed")
+
+
+def test_control_flow_is_reported_unresolved_not_as_confirmed_duplicate(design_fixture):
+    _, _, _, _, constants = design_fixture
+    candidate = _candidate(
+        code=(
+            "def compute_extra_state(obs, constants):\n"
+            '    x = np.clip(obs["state"][0], -1.0, 1.0)\n'
+            "    y = x\n"
+            "    if x > 0.0:\n"
+            "        x = x * x\n"
+            "    return np.asarray([x, y], dtype=np.float32)\n\n"
+            "def compute_reward_terms(obs, constants):\n"
+            "    return np.asarray([0.0], dtype=np.float32)\n"
+        )
+    )
+    second = dict(candidate["features"][0])
+    second.update(index=1, name="branch_independent", formula="pre-branch value")
+    candidate["features"].append(second)
+    report = validate_candidate(candidate, constants)
+    assert report["explicit_feature_redundancy_check"]["status"] == "not_statically_resolved"
+
+
 def test_derived_feature_is_allowed_and_numeric_coincidence_remains_warning(design_fixture):
     _, arrays, _, _, constants = design_fixture
     derived = _candidate()

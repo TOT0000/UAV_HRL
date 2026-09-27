@@ -296,6 +296,7 @@ class TD3():
         beta_com=TASK_POTENTIAL_BETA_COM,
         reward_mode="dinkelbach",
         task_potential_enabled=True,
+        llm_reward_beta=0.0,
     ):
         (
             state,
@@ -315,6 +316,7 @@ class TD3():
             reward_mode=reward_mode,
             task_potential_enabled=task_potential_enabled,
             include_movement_masks=True,
+            llm_reward_beta=llm_reward_beta,
         )
         state = state.to(device)
         action = action.to(device)

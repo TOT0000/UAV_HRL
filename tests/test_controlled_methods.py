@@ -55,6 +55,7 @@ EXISTING_METHODS = (
     "td3_dinkelbach_no_task_potential",
     "ddpg_dinkelbach_no_task_potential",
 )
+LLM_METHODS = ("td3_dinkelbach_llm",)
 NEW_METHODS = (
     "td3_dinkelbach_wo_ta",
     "td3_dinkelbach_dqn",
@@ -67,7 +68,7 @@ NEW_METHODS = (
     "td3_dinkelbach_random_routing",
     "td3_dinkelbach_dqn_wo_ta",
 )
-EXPECTED_METHODS = EXISTING_METHODS + NEW_METHODS
+EXPECTED_METHODS = (EXISTING_METHODS[0],) + LLM_METHODS + EXISTING_METHODS[1:] + NEW_METHODS
 
 
 class ControlledMethodRegistryTest(unittest.TestCase):
@@ -113,7 +114,7 @@ class ControlledMethodRegistryTest(unittest.TestCase):
 
     def test_one_transition_smoke_uses_shared_flow_for_all_methods(self):
         manifest = generate_manifest("train", 20260817, 1, num_gt=2)
-        for key in EXPECTED_METHODS:
+        for key in tuple(key for key in EXPECTED_METHODS if key not in LLM_METHODS):
             with self.subTest(method=key):
                 spec = MethodSpec.parse(key)
                 result = train(

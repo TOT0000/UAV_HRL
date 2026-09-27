@@ -111,7 +111,7 @@ class CheckpointEvaluationProvenanceTest(unittest.TestCase):
 
     def test_all_registry_methods_have_strategy_typed_lifecycle(self):
         counts = {"safe_ddqn": 0, "dqn": 0, "ddqn": 0, "random": 0}
-        self.assertEqual(len(METHOD_REGISTRY), 17)
+        self.assertEqual(len(METHOD_REGISTRY), 18)
         for method_id in METHOD_REGISTRY:
             with self.subTest(method=method_id):
                 metadata = self._metadata(method_id)
@@ -135,7 +135,7 @@ class CheckpointEvaluationProvenanceTest(unittest.TestCase):
                     self.assertIsNone(provenance["routing_lifecycle"])
         self.assertEqual(
             counts,
-            {"safe_ddqn": 12, "dqn": 2, "ddqn": 1, "random": 2},
+            {"safe_ddqn": 13, "dqn": 2, "ddqn": 1, "random": 2},
         )
 
     def test_schema6_learned_model_requires_explicit_incomplete_opt_in(self):
