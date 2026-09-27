@@ -3,6 +3,7 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+import run_llm_design
 
 from centralized_movement import JOINT_ACTION_DIM, MOVEMENT_STATE_DIM, movement_state_feature_schema
 from llm_baseline import run_baseline
@@ -294,6 +295,45 @@ def test_reward_term_schema_declares_weight_without_conflicting_inheritance():
     assert "weight" in reward_schema["required"]
     assert reward_schema["properties"]["weight"] == {"type": "number"}
     assert "allOf" not in reward_schema
+
+
+def test_dry_run_cli_prints_model_parameters_and_token_budget(monkeypatch, capsys):
+    monkeypatch.setattr(
+        run_llm_design,
+        "run_design",
+        lambda **kwargs: {
+            "status": "dry_run_complete",
+            "output_directory": "out",
+            "metadata": {
+                "model": {"requested_api_identifier": kwargs["model"]},
+                "generation": {
+                    "temperature": kwargs["temperature"],
+                    "max_output_tokens": kwargs["max_output_tokens"],
+                    "seed_requested": kwargs["seed"],
+                    "max_attempts": kwargs["max_attempts"],
+                },
+                "context": {"effective_budget": kwargs["context_length"]},
+                "first_prompt_token_budget": {
+                    "estimated_prompt_tokens_lower": 100,
+                    "estimated_prompt_tokens_upper": 120,
+                    "reserved_output_tokens": kwargs["max_output_tokens"],
+                    "estimated_total_upper": 248,
+                    "fits_client_budget": True,
+                },
+            },
+        },
+    )
+    assert (
+        run_llm_design.main(
+            ["--fixed-sample", "fixture", "--model", "qwen/qwen3.5-9b", "--dry-run"]
+        )
+        == 0
+    )
+    output = capsys.readouterr().out
+    assert "Model: qwen/qwen3.5-9b" in output
+    assert "temperature=0.3" in output
+    assert "prompt_estimate=100..120" in output
+    assert "fits=True" in output
 
 
 def test_lm_studio_structured_and_seed_fallbacks_are_explicit():

@@ -76,6 +76,28 @@ def main(argv=None) -> int:
         return 2
     print(f"LLM design status: {result['status']}")
     print(f"Output: {result['output_directory']}")
+    metadata = result.get("metadata", {})
+    generation = metadata.get("generation", {})
+    context = metadata.get("context", {})
+    budget = metadata.get("first_prompt_token_budget", {})
+    model_metadata = metadata.get("model", {})
+    print(f"Model: {model_metadata.get('requested_api_identifier', args.model)}")
+    print(
+        "Generation: "
+        f"temperature={generation.get('temperature', args.temperature)}, "
+        f"max_output_tokens={generation.get('max_output_tokens', args.max_output_tokens)}, "
+        f"seed={generation.get('seed_requested', args.seed)}, "
+        f"max_attempts={generation.get('max_attempts', args.max_attempts)}"
+    )
+    print(
+        "Context budget: "
+        f"effective={context.get('effective_budget', args.context_length)}, "
+        f"prompt_estimate={budget.get('estimated_prompt_tokens_lower')}.."
+        f"{budget.get('estimated_prompt_tokens_upper')}, "
+        f"reserved_output={budget.get('reserved_output_tokens', args.max_output_tokens)}, "
+        f"estimated_total_upper={budget.get('estimated_total_upper')}, "
+        f"fits={budget.get('fits_client_budget')}"
+    )
     if result.get("approved_artifact"):
         print(f"Approved artifact: {result['approved_artifact']}")
     return 0 if result["status"] in {"approved", "dry_run_complete"} else 2
