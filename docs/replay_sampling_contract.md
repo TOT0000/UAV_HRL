@@ -75,3 +75,73 @@ python run_llm_sampling.py --checkpoint <CHECKPOINT_1500> --episodes 100 --manif
 ```
 
 The episode counts and checkpoint episodes are not fixed by the program.
+
+## Fixed offline baseline and empirical Lipschitz estimate
+
+`run_llm_baseline.py` reads completed independent-sampling directories. It
+validates the replay/auxiliary schemas, 531-D movement-state contract,
+environment contract, manifest identities, monotonic replay order, finite
+numeric fields, and current-snapshot validity before selecting any row. Legal
+empty queues, undiscovered RoIs, and an all-false movement mask remain valid.
+
+The fixed sampler selects the same number of rows from every source. Within a
+source it uses seeded stable water-filling over the scenario's actual total RoI
+count, then the current-time early/middle/late segment, then episode. Rows are
+drawn without replacement. Any capacity-driven quota redistribution and all
+excluded incomplete records are recorded in `fixed_samples.json`. Source order
+on the command line does not affect the fixed result because sources are sorted
+by their content-derived identifier.
+
+This command uses the three current 250/750/1500 sampling outputs, selects the
+default 1000 transitions from each, tests the documented five lambdas, and uses
+128-row distance blocks:
+
+```powershell
+& 'C:\Users\user\anaconda3\envs\LLM_HRL\python.exe' run_llm_baseline.py `
+  --source results/llm_samples/td3d-ep250-20260927T105459Z-83c75c4c `
+  --source results/llm_samples/td3d-ep750-20260927T113004Z-4386d2df `
+  --source results/llm_samples/td3d-ep1500-20260927T120552Z-2a10fddc
+```
+
+Sampling and numeric settings can be overridden without embedding checkpoint
+numbers or source counts in the program:
+
+```powershell
+& 'C:\Users\user\anaconda3\envs\LLM_HRL\python.exe' run_llm_baseline.py `
+  --source <SAMPLE_DIR_A> --source <SAMPLE_DIR_B> `
+  --samples-per-source 750 --seed 17 --batch-size 64 `
+  --lambdas 0 0.0001 0.0002 `
+  --output-dir C:\absolute\new\baseline-output
+```
+
+An explicit `--output-dir` must not exist. Without it, every invocation creates
+a collision-safe directory below `results/llm_baselines/` (or
+`--output-root`). A new run contains:
+
+- `fixed_samples.npz`: fixed original states, current auxiliary snapshots,
+  reward components, masks, and trace identifiers;
+- `fixed_samples.json`: source/file hashes, ordered row trace, sampling and
+  stratum distributions, compatibility contract, bundle hash, and fixed pair
+  contract;
+- `baseline_report.json`: reward formula/units, numeric settings, empirical
+  Lipschitz estimates, maximum-ratio pair diagnostics, distance/reward
+  distributions, and zero/near-zero-distance diagnostics.
+
+For every lambda, the float64 reward is reconstructed as
+`B_timely_Mbit - lambda_Mbit_per_J * E_movement_J - P_C9 - P_C10 - P_COM`.
+The sampled checkpoint's stored lambda is trace-only. Distances are direct
+float64 Euclidean differences over the original current state. All unique
+`i < j` pairs are used; only pairs with original-state distance greater than
+`1e-8` enter the primary maximum. This is explicitly a finite-sample empirical
+estimate, not a global Lipschitz constant.
+
+Reloading verifies the saved NPZ SHA-256 and canonical array-content hash and
+does not resample. It also reuses the saved lambda list, distance threshold, and
+reward tolerance. Optional repeated `--source` arguments additionally verify
+that every original source still has exactly the saved hashes. `--batch-size`
+may change because it does not change pair identity or numerical definitions:
+
+```powershell
+& 'C:\Users\user\anaconda3\envs\LLM_HRL\python.exe' run_llm_baseline.py `
+  --fixed-sample results/llm_baselines/<RUN_NAME> --batch-size 64
+```
