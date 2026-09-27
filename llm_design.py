@@ -48,10 +48,14 @@ DEFAULT_SEED = 20260927
 DEFAULT_MAX_ATTEMPTS = 5
 DEFAULT_BETA = 1.0
 DEFAULT_BATCH_SIZE = 128
-DEFAULT_TIMEOUT_SECONDS = 120.0
+DEFAULT_API_TIMEOUT_SECONDS = 600.0
+DEFAULT_WORKER_TIMEOUT_SECONDS = 120.0
+# Backward-compatible module name; CLI --timeout is the API timeout.
+DEFAULT_TIMEOUT_SECONDS = DEFAULT_API_TIMEOUT_SECONDS
 DEFAULT_ABSOLUTE_TOLERANCE = 1e-12
 DEFAULT_RELATIVE_TOLERANCE = 1e-6
 DEFAULT_OUTPUT_ROOT = Path("results") / "llm_designs"
+DEFAULT_FAILED_CONTENT_LIMIT = 12_000
 
 
 class APIError(RuntimeError):
@@ -119,7 +123,7 @@ def _native_models_url(base_url: str) -> str:
 class LMStudioClient:
     """Small stdlib client for the documented LM Studio HTTP interfaces."""
 
-    def __init__(self, base_url=DEFAULT_BASE_URL, *, timeout=DEFAULT_TIMEOUT_SECONDS, retries=2):
+    def __init__(self, base_url=DEFAULT_BASE_URL, *, timeout=DEFAULT_API_TIMEOUT_SECONDS, retries=2):
         self.base_url = str(base_url).rstrip("/")
         self.timeout = float(timeout)
         self.retries = max(0, int(retries))
@@ -672,17 +676,65 @@ def evaluate_candidate(
 def _round_request(
     attempt: int,
     max_attempts: int,
-    previous_candidate: dict[str, Any] | None,
-    feedback: dict[str, Any] | None,
+    previous_attempt: dict[str, Any] | None,
+    *,
+    failed_content_limit: int | None = None,
 ) -> str:
     if attempt == 1:
         return "Generate the first candidate."
+    if previous_attempt is None:
+        raise ValueError("revision round requires the immediately preceding attempt")
+    parsed = previous_attempt.get("parsed_candidate")
+    raw_content = previous_attempt.get("raw_final_content")
+    feedback = previous_attempt.get("feedback")
+    if parsed is not None:
+        previous = (
+            "Previous complete parsed candidate:\n"
+            + json.dumps(parsed, indent=2, ensure_ascii=False, allow_nan=False)
+        )
+    elif isinstance(raw_content, str) and raw_content:
+        previous = (
+            "Previous failed raw final content (not a valid candidate JSON):\n"
+            + _failed_content_excerpt(raw_content, feedback, failed_content_limit)
+        )
+    else:
+        prior_kind = (
+            "The previous response contained reasoning, but no final JSON content. "
+            "Reasoning is intentionally omitted from this revision request."
+            if previous_attempt.get("reasoning_present")
+            else "The previous response had no final content."
+        )
+        previous = "Previous failed raw final content: <missing>\n" + prior_kind
     return (
         f"Revision round {attempt} of {max_attempts}. Return a complete replacement JSON object, not a patch.\n\n"
-        "Previous complete candidate:\n"
-        + json.dumps(previous_candidate, indent=2, ensure_ascii=False, allow_nan=False)
-        + "\n\nLatest validation/evaluation feedback:\n"
+        + previous
+        + "\n\nLatest validation/evaluation feedback for that same output:\n"
         + json.dumps(feedback, indent=2, ensure_ascii=False, allow_nan=False)
+    )
+
+
+def _failed_content_excerpt(
+    content: str,
+    feedback: dict[str, Any] | None,
+    limit: int | None,
+) -> str:
+    if limit is None or len(content) <= int(limit):
+        return content
+    limit = max(0, int(limit))
+    error = "" if feedback is None else str(feedback.get("error", ""))
+    match = re.search(r"(?:char|position)\s+(\d+)", error, flags=re.IGNORECASE)
+    center = int(match.group(1)) if match else len(content) // 2
+    center = min(max(center, 0), len(content))
+    if limit == 0:
+        return f"[TRUNCATED: omitted all {len(content)} raw characters to fit the context budget]"
+    start = max(0, center - limit // 2)
+    stop = min(len(content), start + limit)
+    start = max(0, stop - limit)
+    location = f" near parser character {center}" if match else ""
+    return (
+        f"[TRUNCATED: showing raw characters {start}:{stop} of {len(content)}{location}]\n"
+        + content[start:stop]
+        + "\n[END TRUNCATED RAW CONTENT]"
     )
 
 
@@ -742,7 +794,8 @@ def run_design(
     max_attempts: int = DEFAULT_MAX_ATTEMPTS,
     beta: float = DEFAULT_BETA,
     batch_size: int = DEFAULT_BATCH_SIZE,
-    timeout: float = DEFAULT_TIMEOUT_SECONDS,
+    timeout: float = DEFAULT_API_TIMEOUT_SECONDS,
+    worker_timeout: float = DEFAULT_WORKER_TIMEOUT_SECONDS,
     output_root: str | Path = DEFAULT_OUTPUT_ROOT,
     output_dir: str | Path | None = None,
     dry_run: bool = False,
@@ -760,6 +813,7 @@ def run_design(
         ("temperature", temperature),
         ("beta", beta),
         ("timeout", timeout),
+        ("worker_timeout", worker_timeout),
         ("absolute_tolerance", absolute_tolerance),
         ("relative_tolerance", relative_tolerance),
     ):
@@ -804,7 +858,10 @@ def run_design(
             "seed_requested": int(seed),
             "seed_support": "requested when generation runs; deterministic reproduction is not guaranteed by this client",
             "max_attempts": int(max_attempts),
-            "timeout_seconds": float(timeout),
+            "api_timeout_seconds_per_request": float(timeout),
+            "api_retry_count": int(getattr(api_client, "retries", 0)),
+            "api_total_wait_note": "timeout applies per request; retries can make total waiting time longer",
+            "worker_timeout_seconds": float(worker_timeout),
             "structured_output": "requested first; explicit recorded fallback to strict text parsing only when rejected by API",
         },
         "context": context_info,
@@ -892,7 +949,7 @@ def run_design(
     ]:
         raise ValueError("recomputed primary pair hash differs from fixed artifact")
     obs_arrays = build_obs_arrays(arrays)
-    previous_candidate = None
+    previous_attempt = None
     feedback = None
     history = []
     approved = None
@@ -902,23 +959,53 @@ def run_design(
     for attempt in range(1, int(max_attempts) + 1):
         round_directory = output / f"attempt_{attempt:02d}"
         round_directory.mkdir()
-        request_text = _round_request(
-            attempt, int(max_attempts), previous_candidate, feedback
+        raw_failure = (
+            previous_attempt is not None
+            and previous_attempt.get("parsed_candidate") is None
+            and isinstance(previous_attempt.get("raw_final_content"), str)
+            and bool(previous_attempt.get("raw_final_content"))
         )
-        prompt = render_prompt(
-            fixed_metadata=fixed_metadata,
-            baseline_report=baseline,
-            constants_metadata=constants_metadata,
-            beta=beta,
-            absolute_tolerance=absolute_tolerance,
-            relative_tolerance=relative_tolerance,
-            round_request=request_text,
+        content_limits = (
+            [
+                None,
+                DEFAULT_FAILED_CONTENT_LIMIT,
+                8_000,
+                4_000,
+                2_000,
+                1_000,
+                500,
+                0,
+            ]
+            if raw_failure
+            else [None]
         )
-        budget = estimate_token_budget(
-            prompt,
-            context_length=effective_context,
-            max_output_tokens=max_output_tokens,
-        )
+        prompt = None
+        budget = None
+        for content_limit in content_limits:
+            request_text = _round_request(
+                attempt,
+                int(max_attempts),
+                previous_attempt,
+                failed_content_limit=content_limit,
+            )
+            candidate_prompt = render_prompt(
+                fixed_metadata=fixed_metadata,
+                baseline_report=baseline,
+                constants_metadata=constants_metadata,
+                beta=beta,
+                absolute_tolerance=absolute_tolerance,
+                relative_tolerance=relative_tolerance,
+                round_request=request_text,
+            )
+            candidate_budget = estimate_token_budget(
+                candidate_prompt,
+                context_length=effective_context,
+                max_output_tokens=max_output_tokens,
+            )
+            prompt, budget = candidate_prompt, candidate_budget
+            if candidate_budget["fits_client_budget"]:
+                break
+        assert prompt is not None and budget is not None
         (round_directory / "prompt.txt").write_text(prompt, encoding="utf-8")
         _write_json(round_directory / "token_budget.json", budget)
         _write_json(
@@ -948,6 +1035,12 @@ def run_design(
             }
             history.append({"attempt": attempt, "status": "context_budget_exceeded"})
             break
+        attempt_output = {
+            "raw_final_content": None,
+            "parsed_candidate": None,
+            "reasoning_present": False,
+            "feedback": None,
+        }
         try:
             response = api_client.chat(
                 model=model,
@@ -988,6 +1081,10 @@ def run_design(
                     str(response["reasoning"]), encoding="utf-8"
                 )
             content = response.get("content")
+            attempt_output["raw_final_content"] = (
+                None if content is None else str(content)
+            )
+            attempt_output["reasoning_present"] = bool(response.get("reasoning"))
             (round_directory / "response_content.txt").write_text(
                 "" if content is None else str(content), encoding="utf-8"
             )
@@ -997,7 +1094,7 @@ def run_design(
                 reason = "model returned reasoning but no final JSON" if response.get("reasoning") else "model returned no final content"
                 raise CandidateError(reason)
             candidate = parse_candidate_json(str(content))
-            previous_candidate = candidate
+            attempt_output["parsed_candidate"] = candidate
             static = validate_candidate(candidate, constants_metadata)
             _write_json(round_directory / "candidate.json", candidate)
             (round_directory / "candidate.py").write_text(
@@ -1007,7 +1104,7 @@ def run_design(
                 candidate,
                 obs_arrays,
                 constants_metadata,
-                timeout=timeout,
+                timeout=worker_timeout,
             )
             validation_report = {
                 "status": "passed",
@@ -1053,6 +1150,8 @@ def run_design(
                 history.append({"attempt": attempt, "status": "approved"})
                 break
             feedback = _feedback_from_evaluation(evaluation)
+            attempt_output["feedback"] = feedback
+            previous_attempt = attempt_output
             _write_json(round_directory / "feedback.json", feedback)
             history.append({"attempt": attempt, "status": evaluation["status"]})
         except APIError as exc:
@@ -1062,10 +1161,14 @@ def run_design(
             break
         except CandidateExecutionError as exc:
             feedback = _summarize_error("candidate_execution_failure", exc)
+            attempt_output["feedback"] = feedback
+            previous_attempt = attempt_output
             _write_json(round_directory / "failure.json", feedback)
             history.append({"attempt": attempt, "status": "candidate_execution_failure"})
         except CandidateError as exc:
             feedback = _summarize_error("candidate_format_or_validation_failure", exc)
+            attempt_output["feedback"] = feedback
+            previous_attempt = attempt_output
             _write_json(round_directory / "failure.json", feedback)
             history.append({"attempt": attempt, "status": "candidate_format_or_validation_failure"})
         if feedback is not None:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import copy
 from dataclasses import dataclass
 import hashlib
 import json
@@ -325,6 +326,127 @@ class _CandidateVisitor(ast.NodeVisitor):
         self.generic_visit(node)
 
 
+class _LocalNameResolver(ast.NodeTransformer):
+    """Resolve straight-line local aliases without attempting general data flow."""
+
+    def __init__(self, bindings: dict[str, ast.AST], resolving: set[str] | None = None):
+        self.bindings = bindings
+        self.resolving = set() if resolving is None else set(resolving)
+
+    def visit_Name(self, node):
+        if (
+            isinstance(node.ctx, ast.Load)
+            and node.id in self.bindings
+            and node.id not in self.resolving
+        ):
+            return _LocalNameResolver(
+                self.bindings, self.resolving | {node.id}
+            ).visit(copy.deepcopy(self.bindings[node.id]))
+        return node
+
+
+def _resolved_expression(node: ast.AST, bindings: dict[str, ast.AST]) -> ast.AST:
+    return ast.fix_missing_locations(
+        _LocalNameResolver(bindings).visit(copy.deepcopy(node))
+    )
+
+
+def _returned_feature_expressions(function: ast.FunctionDef) -> list[ast.AST] | None:
+    """Extract common list/tuple outputs with simple straight-line alias tracking."""
+
+    bindings: dict[str, ast.AST] = {}
+    returned = None
+    for statement in function.body:
+        if (
+            isinstance(statement, ast.Assign)
+            and len(statement.targets) == 1
+            and isinstance(statement.targets[0], ast.Name)
+        ):
+            bindings[statement.targets[0].id] = _resolved_expression(
+                statement.value, bindings
+            )
+        elif isinstance(statement, ast.AnnAssign) and isinstance(
+            statement.target, ast.Name
+        ) and statement.value is not None:
+            bindings[statement.target.id] = _resolved_expression(
+                statement.value, bindings
+            )
+        elif isinstance(statement, ast.Return):
+            if statement.value is None:
+                return None
+            returned = _resolved_expression(statement.value, bindings)
+            break
+    if returned is None:
+        return None
+    if isinstance(returned, ast.Call) and _dotted_name(returned.func) in {
+        "np.asarray",
+        "np.array",
+        "np.stack",
+    }:
+        if not returned.args:
+            return None
+        returned = _resolved_expression(returned.args[0], bindings)
+    if isinstance(returned, (ast.List, ast.Tuple)):
+        return [_resolved_expression(value, bindings) for value in returned.elts]
+    return None
+
+
+def _direct_original_state_index(node: ast.AST) -> int | None:
+    """Recognize a direct scalar state copy, optionally through identity casts."""
+
+    while isinstance(node, ast.Call) and _dotted_name(node.func) in {
+        "float",
+        "np.float32",
+        "np.float64",
+        "np.asarray",
+    } and len(node.args) == 1:
+        node = node.args[0]
+    if not isinstance(node, ast.Subscript):
+        return None
+    index = node.slice.value if isinstance(node.slice, ast.Constant) else None
+    source = node.value
+    if (
+        isinstance(index, int)
+        and not isinstance(index, bool)
+        and isinstance(source, ast.Subscript)
+        and isinstance(source.value, ast.Name)
+        and source.value.id == "obs"
+        and isinstance(source.slice, ast.Constant)
+        and source.slice.value == "state"
+    ):
+        return int(index)
+    return None
+
+
+def _validate_explicit_feature_redundancy(
+    function: ast.FunctionDef, expected_count: int
+) -> dict[str, Any]:
+    expressions = _returned_feature_expressions(function)
+    result = {
+        "status": "limited_static_check_passed",
+        "coverage": "common list/tuple returns with straight-line local aliases",
+        "analyzed_feature_indices": [],
+    }
+    if expressions is None or len(expressions) != expected_count:
+        result["status"] = "not_statically_resolved"
+        return result
+    result["analyzed_feature_indices"] = list(range(len(expressions)))
+    normalized: dict[str, int] = {}
+    for index, expression in enumerate(expressions):
+        state_index = _direct_original_state_index(expression)
+        if state_index is not None:
+            raise CandidateError(
+                f"feature[{index}] is an explicit direct copy of obs['state'][{state_index}]"
+            )
+        key = ast.dump(expression, annotate_fields=True, include_attributes=False)
+        if key in normalized:
+            raise CandidateError(
+                f"features[{normalized[key]}] and [{index}] use the same statically normalized output expression"
+            )
+        normalized[key] = index
+    return result
+
+
 def validate_candidate_code(
     candidate: dict[str, Any], constants_metadata: dict[str, Any]
 ) -> dict[str, Any]:
@@ -367,10 +489,17 @@ def validate_candidate_code(
     undeclared = sorted(visitor.accessed_fields.difference(declared))
     if undeclared:
         raise CandidateError(f"code uses source fields absent from metadata: {undeclared}")
+    extra_function = next(
+        function for function in top_functions if function.name == "compute_extra_state"
+    )
+    redundancy = _validate_explicit_feature_redundancy(
+        extra_function, len(candidate["features"])
+    )
     return {
         "accessed_source_fields": sorted(visitor.accessed_fields),
         "declared_source_fields": sorted(declared),
         "ast_status": "passed",
+        "explicit_feature_redundancy_check": redundancy,
     }
 
 

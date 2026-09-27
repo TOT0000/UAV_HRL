@@ -382,6 +382,7 @@ SUPPORTED_OPERATIONS = """Supported code subset:
 - Literal arithmetic, comparisons, Boolean expressions, indexing with literal obs/constants keys, local variables, if/for constructs, and returns.
 - Safe built-ins: abs, bool, enumerate, float, int, len, list, max, min, range, sum, tuple, zip.
 - NumPy: abs, all, any, arange, array, asarray, bool_, clip, concatenate, count_nonzero, exp, float32, float64, int32, int64, isfinite, log, log1p, maximum, mean, minimum, ones, sqrt, stack, sum, where, zeros, and linalg.norm.
+- A feature that directly copies one original-state scalar, or two features with the same statically resolved output expression, is rejected. Derived quantities such as relative distances, normalized deadlines, and queue loads remain allowed.
 - Do not use array/object methods, imports, file/network/process access, eval/exec, reflection, globals, mutation of obs/constants, randomness, or time."""
 
 

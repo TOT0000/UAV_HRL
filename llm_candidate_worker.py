@@ -77,6 +77,49 @@ def _run_function(function, obs, constants, expected_size, label):
     return first
 
 
+def _validate_output_ranges(extra, terms, candidate, label):
+    tolerance = 1e-6
+    extra = np.asarray(extra)
+    terms = np.asarray(terms)
+    if extra.ndim == 1:
+        extra = extra[None, :]
+    if terms.ndim == 1:
+        terms = terms[None, :]
+    for index, definition in enumerate(candidate["features"]):
+        minimum = float(definition["range"]["minimum"])
+        maximum = float(definition["range"]["maximum"])
+        observed_minimum = float(np.min(extra[:, index]))
+        observed_maximum = float(np.max(extra[:, index]))
+        if observed_minimum < -1.0 - tolerance or observed_maximum > 1.0 + tolerance:
+            raise ValueError(
+                f"compute_extra_state({label}) feature[{index}] is outside [-1,1]: "
+                f"observed [{observed_minimum},{observed_maximum}]"
+            )
+        if observed_minimum < minimum - tolerance or observed_maximum > maximum + tolerance:
+            raise ValueError(
+                f"compute_extra_state({label}) feature[{index}] violates its declared "
+                f"range [{minimum},{maximum}]: observed "
+                f"[{observed_minimum},{observed_maximum}]"
+            )
+    for index in range(terms.shape[1]):
+        observed_minimum = float(np.min(terms[:, index]))
+        observed_maximum = float(np.max(terms[:, index]))
+        if observed_minimum < -tolerance or observed_maximum > 1.0 + tolerance:
+            raise ValueError(
+                f"compute_reward_terms({label}) reward_terms[{index}] is outside [0,1]: "
+                f"observed [{observed_minimum},{observed_maximum}]"
+            )
+    weights = np.asarray(
+        [item["weight"] for item in candidate["reward_terms"]], dtype=np.float64
+    )
+    weighted = np.asarray(terms, dtype=np.float64) @ weights
+    if np.any(weighted < -1.0 - tolerance) or np.any(weighted > 1.0 + tolerance):
+        raise ValueError(
+            f"weighted extra reward({label}) is outside [-1,1]: observed "
+            f"[{float(np.min(weighted))},{float(np.max(weighted))}]"
+        )
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser()
     parser.add_argument("--candidate", required=True)
@@ -119,21 +162,22 @@ def main(argv=None):
                 reward_function, obs, constants, term_count, "compute_reward_terms"
             )
         probe = _empty_probe({name: array[0] for name, array in arrays.items()})
-        _run_function(extra_function, probe, constants, feature_count, "compute_extra_state(empty probe)")
-        _run_function(reward_function, probe, constants, term_count, "compute_reward_terms(empty probe)")
-        if np.any(extra < -1.0 - 1e-6) or np.any(extra > 1.0 + 1e-6):
-            raise ValueError("extra-state output is outside [-1,1]")
-        if np.any(terms < -1e-6) or np.any(terms > 1.0 + 1e-6):
-            raise ValueError("reward-term output is outside [0,1]")
-        for index, definition in enumerate(candidate["features"]):
-            minimum = float(definition["range"]["minimum"])
-            maximum = float(definition["range"]["maximum"])
-            if np.any(extra[:, index] < minimum - 1e-6) or np.any(
-                extra[:, index] > maximum + 1e-6
-            ):
-                raise ValueError(
-                    f"feature[{index}] output violates its declared range [{minimum},{maximum}]"
-                )
+        probe_extra = _run_function(
+            extra_function,
+            probe,
+            constants,
+            feature_count,
+            "compute_extra_state(empty probe)",
+        )
+        probe_terms = _run_function(
+            reward_function,
+            probe,
+            constants,
+            term_count,
+            "compute_reward_terms(empty probe)",
+        )
+        _validate_output_ranges(extra, terms, candidate, "fixed samples")
+        _validate_output_ranges(probe_extra, probe_terms, candidate, "empty probe")
         np.savez_compressed(args.output, extra_state=extra, reward_terms=terms)
         _write_json(
             args.report,

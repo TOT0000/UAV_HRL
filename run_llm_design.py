@@ -7,6 +7,7 @@ import sys
 
 from llm_design import (
     DEFAULT_ABSOLUTE_TOLERANCE,
+    DEFAULT_API_TIMEOUT_SECONDS,
     DEFAULT_BASE_URL,
     DEFAULT_BATCH_SIZE,
     DEFAULT_BETA,
@@ -17,7 +18,7 @@ from llm_design import (
     DEFAULT_RELATIVE_TOLERANCE,
     DEFAULT_SEED,
     DEFAULT_TEMPERATURE,
-    DEFAULT_TIMEOUT_SECONDS,
+    DEFAULT_WORKER_TIMEOUT_SECONDS,
     run_design,
 )
 
@@ -41,7 +42,21 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-attempts", type=int, default=DEFAULT_MAX_ATTEMPTS)
     parser.add_argument("--beta", type=float, default=DEFAULT_BETA)
     parser.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_SIZE)
-    parser.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT_SECONDS)
+    parser.add_argument(
+        "--timeout",
+        type=float,
+        default=DEFAULT_API_TIMEOUT_SECONDS,
+        help=(
+            "LM Studio timeout in seconds for each HTTP request (default: 600); "
+            "retries can make total waiting time longer"
+        ),
+    )
+    parser.add_argument(
+        "--worker-timeout",
+        type=float,
+        default=DEFAULT_WORKER_TIMEOUT_SECONDS,
+        help="isolated candidate worker timeout in seconds (default: 120)",
+    )
     parser.add_argument("--absolute-tolerance", type=float, default=DEFAULT_ABSOLUTE_TOLERANCE)
     parser.add_argument("--relative-tolerance", type=float, default=DEFAULT_RELATIVE_TOLERANCE)
     parser.add_argument("--output-root", default=str(DEFAULT_OUTPUT_ROOT))
@@ -65,6 +80,7 @@ def main(argv=None) -> int:
             beta=args.beta,
             batch_size=args.batch_size,
             timeout=args.timeout,
+            worker_timeout=args.worker_timeout,
             absolute_tolerance=args.absolute_tolerance,
             relative_tolerance=args.relative_tolerance,
             output_root=args.output_root,
@@ -97,6 +113,12 @@ def main(argv=None) -> int:
         f"reserved_output={budget.get('reserved_output_tokens', args.max_output_tokens)}, "
         f"estimated_total_upper={budget.get('estimated_total_upper')}, "
         f"fits={budget.get('fits_client_budget')}"
+    )
+    print(
+        "Timeouts: "
+        f"api_per_request={generation.get('api_timeout_seconds_per_request', args.timeout)}, "
+        f"worker={generation.get('worker_timeout_seconds', args.worker_timeout)}; "
+        "API retries can increase total wait"
     )
     if result.get("approved_artifact"):
         print(f"Approved artifact: {result['approved_artifact']}")

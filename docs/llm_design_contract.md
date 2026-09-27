@@ -23,7 +23,10 @@ loaded instance context, quantization, and reasoning metadata when available.
 The effective budget is the minimum known bound. When no matching tokenizer is
 installed, prompt size is reported as an explicitly inexact character-based
 interval with chat-template and output reservations; an upper-bound overflow
-stops before generation rather than truncating the prompt.
+stops before generation. On a revision after invalid JSON, only the failed raw
+final-content excerpt may be explicitly shortened, with truncation markers and
+preference for the parser-error location. The environment interface, schema,
+evaluation rules, and output reservation are never silently removed.
 
 ## Current-only candidate interface
 
@@ -63,7 +66,17 @@ The worker statically excludes imports, arbitrary attributes/calls, reflection,
 I/O, dynamic execution, randomness, and mutation. It exposes only the listed
 NumPy subset and safe built-ins, runs in a terminable subprocess, checks every
 fixed sample twice for determinism, compares inputs before/after, and exercises
-an empty/missing-data probe.
+an empty/missing-data probe. Fixed samples and the empty probe share the same
+dtype, shape, finite-value, declared-range, global-range, determinism, mutation,
+and weighted-extra-reward checks.
+
+A limited AST redundancy check rejects direct scalar copies such as
+`obs["state"][i]`, including simple straight-line local aliases, and rejects
+multiple returned features whose statically resolved output expressions are
+identical. It intentionally does not claim general algebraic equivalence or
+full control-flow data-flow analysis. Numeric equality found only on the fixed
+samples remains a diagnostic warning rather than an automatic rejection;
+derived features may still use the original state.
 
 ## Fixed-pair acceptance
 
@@ -109,7 +122,8 @@ Qwen:
   --model qwen/qwen3.5-9b `
   --context-length 20000 --max-output-tokens 4096 `
   --temperature 0.3 --seed 20260927 --max-attempts 5 `
-  --beta 1.0 --batch-size 128 --timeout 120
+  --beta 1.0 --batch-size 128 `
+  --timeout 600 --worker-timeout 120
 ```
 
 Gemma uses the same task, schema, evaluation, and thresholds:
@@ -121,14 +135,24 @@ Gemma uses the same task, schema, evaluation, and thresholds:
   --model google/gemma-4-e4b `
   --context-length 20000 --max-output-tokens 4096 `
   --temperature 0.3 --seed 20260927 --max-attempts 5 `
-  --beta 1.0 --batch-size 128 --timeout 120
+  --beta 1.0 --batch-size 128 `
+  --timeout 600 --worker-timeout 120
 ```
+
+`--timeout` is the timeout for each LM Studio HTTP request and defaults to 600
+seconds. A request retry gets its own timeout, so total waiting can be longer.
+`--worker-timeout` independently limits untrusted candidate execution and
+defaults to the previous 120-second design-run limit.
 
 The default root is
 `results/llm_designs/<model-slug>/<unique-run-name>/`. Every attempt keeps its
 full prompt, request, raw response, finish reason/usage, extracted reasoning,
 candidate/code, validation, evaluation, and feedback. A failed run keeps
-history and `run_metadata.json` but has no `approved/` directory. The first
+history and `run_metadata.json` but has no `approved/` directory. A revision
+uses only the immediately preceding output: a successfully parsed full
+candidate plus its validation/evaluation feedback, or the failed raw final
+content plus its parse error. Reasoning-only text is stored locally but is not
+replayed as candidate code. The first
 passing attempt creates:
 
 ```text

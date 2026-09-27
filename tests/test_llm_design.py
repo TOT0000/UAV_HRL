@@ -3,6 +3,7 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+import llm_design
 import run_llm_design
 
 from centralized_movement import JOINT_ACTION_DIM, MOVEMENT_STATE_DIM, movement_state_feature_schema
@@ -10,6 +11,7 @@ from llm_baseline import run_baseline
 from llm_candidate import (
     CandidateError,
     CandidateExecutionError,
+    candidate_numeric_diagnostics,
     execute_candidate_isolated,
     load_approved_design,
     parse_candidate_json,
@@ -143,7 +145,11 @@ def _fixed_artifact(tmp_path, *, duplicate_first_state=False):
 
 def _candidate(*, passing=True, code=None, name="candidate"):
     if code is None:
-        feature = "obs[\"state\"][0]" if passing else "0.0"
+        feature = (
+            "np.clip(obs[\"state\"][0] * obs[\"state\"][0], 0.0, 1.0)"
+            if passing
+            else "0.0"
+        )
         code = (
             "def compute_extra_state(obs, constants):\n"
             f"    return np.asarray([{feature}], dtype=np.float32)\n\n"
@@ -162,7 +168,7 @@ def _candidate(*, passing=True, code=None, name="candidate"):
                 "description": "A bounded current-state feature.",
                 "range": {"minimum": -1.0, "maximum": 1.0},
                 "source_fields": ["obs.state"],
-                "formula": feature if code is None else "candidate formula",
+                "formula": "bounded square of original state index 0",
                 "missing_data_rule": "The original state is always present.",
             }
         ],
@@ -298,10 +304,11 @@ def test_reward_term_schema_declares_weight_without_conflicting_inheritance():
 
 
 def test_dry_run_cli_prints_model_parameters_and_token_budget(monkeypatch, capsys):
-    monkeypatch.setattr(
-        run_llm_design,
-        "run_design",
-        lambda **kwargs: {
+    received = {}
+
+    def fake_run_design(**kwargs):
+        received.update(kwargs)
+        return {
             "status": "dry_run_complete",
             "output_directory": "out",
             "metadata": {
@@ -311,6 +318,8 @@ def test_dry_run_cli_prints_model_parameters_and_token_budget(monkeypatch, capsy
                     "max_output_tokens": kwargs["max_output_tokens"],
                     "seed_requested": kwargs["seed"],
                     "max_attempts": kwargs["max_attempts"],
+                    "api_timeout_seconds_per_request": kwargs["timeout"],
+                    "worker_timeout_seconds": kwargs["worker_timeout"],
                 },
                 "context": {"effective_budget": kwargs["context_length"]},
                 "first_prompt_token_budget": {
@@ -321,11 +330,26 @@ def test_dry_run_cli_prints_model_parameters_and_token_budget(monkeypatch, capsy
                     "fits_client_budget": True,
                 },
             },
-        },
+        }
+
+    monkeypatch.setattr(
+        run_llm_design,
+        "run_design",
+        fake_run_design,
     )
     assert (
         run_llm_design.main(
-            ["--fixed-sample", "fixture", "--model", "qwen/qwen3.5-9b", "--dry-run"]
+            [
+                "--fixed-sample",
+                "fixture",
+                "--model",
+                "qwen/qwen3.5-9b",
+                "--timeout",
+                "601",
+                "--worker-timeout",
+                "7",
+                "--dry-run",
+            ]
         )
         == 0
     )
@@ -334,6 +358,9 @@ def test_dry_run_cli_prints_model_parameters_and_token_budget(monkeypatch, capsy
     assert "temperature=0.3" in output
     assert "prompt_estimate=100..120" in output
     assert "fits=True" in output
+    assert "api_per_request=601.0, worker=7.0" in output
+    assert received["timeout"] == 601.0
+    assert received["worker_timeout"] == 7.0
 
 
 def test_lm_studio_structured_and_seed_fallbacks_are_explicit():
@@ -400,6 +427,93 @@ def test_forbidden_json_and_code_are_rejected(design_fixture):
 
 
 @pytest.mark.parametrize(
+    "feature_lines",
+    [
+        '    return np.asarray([obs["state"][0]], dtype=np.float32)',
+        (
+            '    copied = obs["state"][0]\n'
+            "    forwarded = copied\n"
+            "    return np.asarray([forwarded], dtype=np.float32)"
+        ),
+    ],
+)
+def test_direct_original_state_copy_is_statically_rejected(design_fixture, feature_lines):
+    _, _, _, _, constants = design_fixture
+    candidate = _candidate(
+        code=(
+            "def compute_extra_state(obs, constants):\n"
+            f"{feature_lines}\n\n"
+            "def compute_reward_terms(obs, constants):\n"
+            "    return np.asarray([0.0], dtype=np.float32)\n"
+        )
+    )
+    with pytest.raises(CandidateError, match=r"feature\[0\].*direct copy.*state.*\[0\]"):
+        validate_candidate(candidate, constants)
+
+
+def test_duplicate_statically_normalized_feature_expressions_are_rejected(design_fixture):
+    _, _, _, _, constants = design_fixture
+    candidate = _candidate(
+        code=(
+            "def compute_extra_state(obs, constants):\n"
+            '    derived = np.clip(obs["state"][0] * obs["state"][0], 0.0, 1.0)\n'
+            "    return np.asarray([derived, derived], dtype=np.float32)\n\n"
+            "def compute_reward_terms(obs, constants):\n"
+            "    return np.asarray([0.0], dtype=np.float32)\n"
+        )
+    )
+    second = dict(candidate["features"][0])
+    second.update(index=1, name="second", formula="intentionally different metadata")
+    candidate["features"].append(second)
+    with pytest.raises(CandidateError, match=r"features\[0\] and \[1\].*same"):
+        validate_candidate(candidate, constants)
+
+
+def test_derived_feature_is_allowed_and_numeric_coincidence_remains_warning(design_fixture):
+    _, arrays, _, _, constants = design_fixture
+    derived = _candidate()
+    validation = validate_candidate(derived, constants)
+    assert validation["explicit_feature_redundancy_check"]["status"].endswith("passed")
+
+    coincident = _candidate(
+        code=(
+            "def compute_extra_state(obs, constants):\n"
+            '    return np.asarray([abs(obs["state"][0])], dtype=np.float32)\n\n'
+            "def compute_reward_terms(obs, constants):\n"
+            "    return np.asarray([0.0], dtype=np.float32)\n"
+        )
+    )
+    validate_candidate(coincident, constants)
+    extra, terms, _ = execute_candidate_isolated(
+        coincident, build_obs_arrays(arrays), constants, timeout=10
+    )
+    diagnostics = candidate_numeric_diagnostics(arrays["state"], extra, terms, coincident)
+    assert any("numerically duplicates original state" in item for item in diagnostics["warnings"])
+
+
+def test_direct_state_copy_cannot_create_approved_artifact(tmp_path):
+    fixed = _fixed_artifact(tmp_path)
+    direct = _candidate(
+        code=(
+            "def compute_extra_state(obs, constants):\n"
+            '    return np.asarray([obs["state"][0]], dtype=np.float32)\n\n'
+            "def compute_reward_terms(obs, constants):\n"
+            "    return np.asarray([0.0], dtype=np.float32)\n"
+        )
+    )
+    result = run_design(
+        fixed_sample=fixed,
+        model="qwen/qwen3.5-9b",
+        client=MockClient([_response(direct)]),
+        max_attempts=1,
+        output_dir=tmp_path / "direct-copy",
+        worker_timeout=10,
+    )
+    assert result["status"] == "failed_no_approved_candidate"
+    assert not (tmp_path / "direct-copy" / "approved").exists()
+
+
+@pytest.mark.parametrize(
     "code, message",
     [
         (
@@ -456,6 +570,45 @@ def test_worker_timeout_is_terminable(design_fixture):
         )
 
 
+@pytest.mark.parametrize("invalid_output", ["state", "reward"])
+def test_empty_probe_uses_full_output_range_validation(design_fixture, invalid_output):
+    _, arrays, _, _, constants = design_fixture
+    obs_arrays = {
+        name: np.asarray(value).copy()
+        for name, value in build_obs_arrays(arrays).items()
+    }
+    obs_arrays["state"][:, 0] = 0.5
+    feature_value = "bad" if invalid_output == "state" else "0.0"
+    reward_value = "bad" if invalid_output == "reward" else "0.0"
+    candidate = _candidate(
+        code=(
+            "def compute_extra_state(obs, constants):\n"
+            '    bad = 2.0 if np.count_nonzero(obs["state"]) == 0 else 0.0\n'
+            f"    return np.asarray([{feature_value}], dtype=np.float32)\n\n"
+            "def compute_reward_terms(obs, constants):\n"
+            '    bad = 2.0 if np.count_nonzero(obs["state"]) == 0 else 0.0\n'
+            f"    return np.asarray([{reward_value}], dtype=np.float32)\n"
+        )
+    )
+    expected = (
+        r"compute_extra_state\(empty probe\).*feature\[0\]"
+        if invalid_output == "state"
+        else r"compute_reward_terms\(empty probe\).*reward_terms\[0\]"
+    )
+    with pytest.raises(CandidateExecutionError, match=expected):
+        execute_candidate_isolated(candidate, obs_arrays, constants, timeout=10)
+
+
+def test_legal_empty_probe_still_passes(design_fixture):
+    _, arrays, _, _, constants = design_fixture
+    extra, terms, report = execute_candidate_isolated(
+        _candidate(), build_obs_arrays(arrays), constants, timeout=10
+    )
+    assert extra.shape == (6, 1)
+    assert terms.shape == (6, 1)
+    assert report["empty_probe_check"] == "passed"
+
+
 @pytest.mark.parametrize("model", ["qwen/qwen3.5-9b", "google/gemma-4-e4b"])
 def test_mock_api_first_candidate_passes_for_qwen_and_gemma(tmp_path, model):
     fixed = _fixed_artifact(tmp_path)
@@ -476,6 +629,32 @@ def test_mock_api_first_candidate_passes_for_qwen_and_gemma(tmp_path, model):
     assert (Path(result["approved_artifact"]) / "artifact.json").is_file()
 
 
+def test_api_and_worker_timeouts_are_independent(tmp_path, monkeypatch):
+    fixed = _fixed_artifact(tmp_path)
+    observed = []
+    original = llm_design.execute_candidate_isolated
+
+    def capture_worker_timeout(*args, **kwargs):
+        observed.append(kwargs["timeout"])
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(llm_design, "execute_candidate_isolated", capture_worker_timeout)
+    client = MockClient([_response(_candidate())])
+    result = run_design(
+        fixed_sample=fixed,
+        model=client.model,
+        client=client,
+        output_dir=tmp_path / "separate-timeouts",
+        timeout=601,
+        worker_timeout=9,
+    )
+    assert result["status"] == "approved"
+    assert observed == [9]
+    generation = result["metadata"]["generation"]
+    assert generation["api_timeout_seconds_per_request"] == 601
+    assert generation["worker_timeout_seconds"] == 9
+
+
 def test_revision_then_pass_and_max_attempt_exhaustion(tmp_path):
     fixed = _fixed_artifact(tmp_path)
     failing = _response(_candidate(passing=False, name="first"))
@@ -492,7 +671,7 @@ def test_revision_then_pass_and_max_attempt_exhaustion(tmp_path):
     assert result["status"] == "approved"
     second_prompt = (tmp_path / "revision" / "attempt_02" / "prompt.txt").read_text()
     assert '"candidate_name": "first"' in second_prompt
-    assert "Latest validation/evaluation feedback" in second_prompt
+    assert "Latest validation/evaluation feedback for that same output" in second_prompt
 
     exhausted_client = MockClient([failing, failing])
     exhausted = run_design(
@@ -505,6 +684,95 @@ def test_revision_then_pass_and_max_attempt_exhaustion(tmp_path):
     )
     assert exhausted["status"] == "failed_no_approved_candidate"
     assert not (tmp_path / "exhausted" / "approved").exists()
+
+
+def test_parse_failure_revision_includes_latest_raw_content_and_error(tmp_path):
+    fixed = _fixed_artifact(tmp_path)
+    invalid_text = '{"candidate_name":"broken", invalid-json-here}'
+    invalid = {**_response(_candidate()), "content": invalid_text}
+    client = MockClient([invalid, _response(_candidate(name="fixed"))])
+    result = run_design(
+        fixed_sample=fixed,
+        model=client.model,
+        client=client,
+        max_attempts=2,
+        output_dir=tmp_path / "parse-revision",
+        worker_timeout=10,
+    )
+    assert result["status"] == "approved"
+    prompt = (tmp_path / "parse-revision" / "attempt_02" / "prompt.txt").read_text()
+    assert invalid_text in prompt
+    assert "invalid JSON" in prompt
+    assert "Previous failed raw final content" in prompt
+
+
+def test_latest_invalid_json_does_not_reuse_older_parsed_candidate(tmp_path):
+    fixed = _fixed_artifact(tmp_path)
+    old = _response(_candidate(passing=False, name="older-parsed-candidate"))
+    newest_text = "LATEST-BROKEN-JSON"
+    newest = {**_response(_candidate()), "content": newest_text}
+    client = MockClient([old, newest, _response(_candidate(name="fixed"))])
+    result = run_design(
+        fixed_sample=fixed,
+        model=client.model,
+        client=client,
+        max_attempts=3,
+        output_dir=tmp_path / "latest-output",
+        worker_timeout=10,
+    )
+    assert result["status"] == "approved"
+    prompt = (tmp_path / "latest-output" / "attempt_03" / "prompt.txt").read_text()
+    assert newest_text in prompt
+    assert '"candidate_name": "older-parsed-candidate"' not in prompt
+
+
+def test_long_failed_output_is_marked_and_reasoning_only_is_not_replayed(tmp_path):
+    fixed = _fixed_artifact(tmp_path)
+    long_invalid = '{"candidate_name":"' + ("x" * 60_000) + '", invalid-json-here}'
+    long_client = MockClient(
+        [{**_response(_candidate()), "content": long_invalid}, _response(_candidate())]
+    )
+    result = run_design(
+        fixed_sample=fixed,
+        model=long_client.model,
+        client=long_client,
+        max_attempts=2,
+        context_length=16_000,
+        output_dir=tmp_path / "long-output",
+        worker_timeout=10,
+    )
+    assert result["status"] == "approved"
+    prompt = (tmp_path / "long-output" / "attempt_02" / "prompt.txt").read_text()
+    assert "[TRUNCATED:" in prompt
+    assert long_invalid not in prompt
+    assert "invalid-json-here" in prompt
+    budget = json.loads(
+        (tmp_path / "long-output" / "attempt_02" / "token_budget.json").read_text()
+    )
+    assert budget["fits_client_budget"] is True
+
+    reasoning_client = MockClient(
+        [
+            {
+                **_response(_candidate()),
+                "content": None,
+                "reasoning": "PRIVATE-REASONING-MUST-NOT-BE-REPLAYED",
+            },
+            _response(_candidate()),
+        ]
+    )
+    result = run_design(
+        fixed_sample=fixed,
+        model=reasoning_client.model,
+        client=reasoning_client,
+        max_attempts=2,
+        output_dir=tmp_path / "reasoning-output",
+        worker_timeout=10,
+    )
+    assert result["status"] == "approved"
+    prompt = (tmp_path / "reasoning-output" / "attempt_02" / "prompt.txt").read_text()
+    assert "reasoning, but no final JSON" in prompt
+    assert "PRIVATE-REASONING-MUST-NOT-BE-REPLAYED" not in prompt
 
 
 @pytest.mark.parametrize(
