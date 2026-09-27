@@ -287,6 +287,15 @@ def test_prompt_is_complete_current_only_and_example_parses(design_fixture):
     validate_candidate(example, constants)
 
 
+def test_reward_term_schema_declares_weight_without_conflicting_inheritance():
+    schema = candidate_schema()
+    reward_schema = schema["$defs"]["reward_term"]
+    assert reward_schema["additionalProperties"] is False
+    assert "weight" in reward_schema["required"]
+    assert reward_schema["properties"]["weight"] == {"type": "number"}
+    assert "allOf" not in reward_schema
+
+
 def test_lm_studio_structured_and_seed_fallbacks_are_explicit():
     schema = {"type": "object", "properties": {"ok": {"type": "boolean"}}}
     structured = FallbackHTTPClient("response_format json_schema unsupported")
