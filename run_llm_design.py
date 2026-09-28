@@ -58,7 +58,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--connect-timeout",
         type=float,
         default=DEFAULT_API_CONNECT_TIMEOUT_SECONDS,
-        help="maximum seconds to establish the LM Studio connection (default: 30)",
+        help=(
+            "maximum seconds for TCP/TLS connection establishment only (default: 30); "
+            "response headers and SSE reads use --timeout and --total-timeout"
+        ),
     )
     parser.add_argument(
         "--total-timeout",

@@ -5,7 +5,9 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
+import re
 import sys
+import traceback
 
 import numpy as np
 
@@ -125,8 +127,35 @@ class _IssueAccumulator:
         self.example_limit = int(example_limit)
         self._items = {}
 
-    def add(self, code, location, problem, requirement, sample):
-        key = (str(code), str(location), str(requirement))
+    def add(
+        self,
+        code,
+        location,
+        problem,
+        requirement,
+        sample,
+        *,
+        exception_type=None,
+        candidate_function=None,
+        candidate_line=None,
+        problem_signature=None,
+    ):
+        key = (
+            str(code),
+            str(location),
+            str(requirement),
+            "" if exception_type is None else str(exception_type),
+            "" if candidate_function is None else str(candidate_function),
+            "" if candidate_line is None else str(candidate_line),
+            "" if problem_signature is None else str(problem_signature),
+        )
+        details = {}
+        if exception_type is not None:
+            details["exception_type"] = str(exception_type)
+        if candidate_function is not None:
+            details["candidate_function"] = str(candidate_function)
+        if candidate_line is not None:
+            details["candidate_line"] = int(candidate_line)
         item = self._items.setdefault(
             key,
             {
@@ -137,6 +166,7 @@ class _IssueAccumulator:
                 "requirement": str(requirement),
                 "occurrence_count": 0,
                 "representative_samples": [],
+                **details,
             },
         )
         item["occurrence_count"] += 1
@@ -163,16 +193,51 @@ def _runtime_error_code(message):
     return "RUNTIME_FUNCTION_ERROR"
 
 
+def _candidate_exception_details(exc):
+    candidate_frame = None
+    for frame in traceback.extract_tb(exc.__traceback__):
+        if frame.filename == "<approved-candidate>":
+            candidate_frame = frame
+    exception_type = type(exc).__name__
+    if candidate_frame is None:
+        function = None
+        line = None
+    else:
+        function = candidate_frame.name
+        line = int(candidate_frame.lineno)
+    # Numeric values and object addresses frequently differ by sample without
+    # changing the faulty operation.  Field names and operation text remain,
+    # so distinct accesses on the same source line can still stay separate.
+    signature = re.sub(r"0x[0-9a-fA-F]+", "<address>", str(exc))
+    signature = re.sub(
+        r"(?<![A-Za-z_])-?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?",
+        "<number>",
+        signature,
+    )
+    return exception_type, function, line, signature
+
+
 def _check_function(function, obs, constants, expected_size, label, sample, issues):
     try:
         return _run_function(function, obs, constants, expected_size, label)
     except BaseException as exc:
+        exception_type, candidate_function, candidate_line, signature = (
+            _candidate_exception_details(exc)
+        )
+        location = label
+        if candidate_function is not None and candidate_line is not None:
+            location = f"{candidate_function} at candidate line {candidate_line}"
         issues.add(
             _runtime_error_code(str(exc)),
-            label,
-            f"{type(exc).__name__}: {exc}",
-            "Return a deterministic, side-effect-free one-dimensional float32 array of the declared length with finite values.",
+            location,
+            f"{exception_type}: {exc}",
+            "Return a deterministic, side-effect-free one-dimensional float32 "
+            "array of the declared length with finite values.",
             sample,
+            exception_type=exception_type,
+            candidate_function=candidate_function,
+            candidate_line=candidate_line,
+            problem_signature=signature,
         )
         return None
 

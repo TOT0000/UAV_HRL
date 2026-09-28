@@ -39,7 +39,12 @@ from llm_design_contract import (
     load_design_inputs,
     render_prompt,
 )
-from llm_streaming import StreamTransportError, capture_chat_stream
+from llm_streaming import (
+    StreamTransportError,
+    capture_chat_stream,
+    open_http_stream,
+    read_response_body_bounded,
+)
 
 
 DEFAULT_BASE_URL = "http://127.0.0.1:1234/v1"
@@ -190,8 +195,20 @@ class LMStudioClient:
             native_error = str(exc)
         return {"openai": openai, "native": native, "native_error": native_error}
 
-    def _open_stream(self, request, *, timeout):
-        return urllib.request.urlopen(request, timeout=timeout)
+    def _open_stream(
+        self,
+        request,
+        *,
+        connect_timeout,
+        header_timeout,
+        total_timeout,
+    ):
+        return open_http_stream(
+            request,
+            connect_timeout=connect_timeout,
+            header_timeout=header_timeout,
+            total_timeout=total_timeout,
+        )
 
     def chat(
         self,
@@ -232,17 +249,10 @@ class LMStudioClient:
         try:
             response = self._open_stream(
                 request,
-                timeout=min(self.connect_timeout, self.total_timeout),
+                connect_timeout=min(self.connect_timeout, self.total_timeout),
+                header_timeout=min(self.timeout, self.total_timeout),
+                total_timeout=self.total_timeout,
             )
-        except urllib.error.HTTPError as exc:
-            body = exc.read().decode("utf-8", errors="replace")
-            _write_json(
-                attempt_directory / "stream_status.json",
-                {"status": "http_error", "http_status": exc.code, "body": body},
-            )
-            raise APIError(
-                f"LM Studio HTTP {exc.code}: {body}", category="http_error"
-            ) from exc
         except KeyboardInterrupt as exc:
             _write_json(
                 attempt_directory / "stream_status.json",
@@ -255,25 +265,46 @@ class LMStudioClient:
                 "request cancelled by user during connection establishment",
                 category="stream_cancelled",
             ) from exc
-        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        except StreamTransportError as exc:
             _write_json(
                 attempt_directory / "stream_status.json",
                 {
-                    "status": "connection_failure",
+                    "status": exc.category,
                     "error_type": type(exc).__name__,
                     "error": str(exc),
                 },
             )
+            raise APIError(str(exc), category=exc.category) from exc
+        if getattr(response, "status", 200) >= 400:
+            remaining_total = max(
+                0.0, self.total_timeout - (time.monotonic() - request_started)
+            )
+            body_bytes, body_status = read_response_body_bounded(
+                response,
+                idle_timeout=self.timeout,
+                total_timeout=remaining_total,
+            )
+            body = body_bytes.decode("utf-8", errors="replace")
+            status = {
+                **body_status,
+                "http_status": int(response.status),
+                "http_reason": getattr(response, "reason", ""),
+                "body": body,
+            }
+            _write_json(attempt_directory / "stream_status.json", status)
+            if body_status["status"] != "complete":
+                raise APIError(
+                    body_status["failure"] or "HTTP error body read failed",
+                    category=body_status["status"],
+                )
             raise APIError(
-                f"LM Studio connection failed: {type(exc).__name__}: {exc}",
-                category="connection_failure",
-            ) from exc
+                f"LM Studio HTTP {response.status}: {body}", category="http_error"
+            )
         remaining_total = self.total_timeout - (time.monotonic() - request_started)
         if remaining_total <= 0.0:
-            try:
-                response.close()
-            except BaseException:
-                pass
+            abort = getattr(response, "abort", None)
+            if callable(abort):
+                abort()
             raise APIError(
                 f"request exceeded total timeout of {self.total_timeout:g} seconds during connection establishment",
                 category="stream_total_timeout",
@@ -770,6 +801,7 @@ def _round_request(
     previous_attempt: dict[str, Any] | None,
     *,
     failed_content_limit: int | None = None,
+    feedback_override: dict[str, Any] | None = None,
 ) -> str:
     if attempt == 1:
         return "Generate the first candidate."
@@ -777,7 +809,11 @@ def _round_request(
         raise ValueError("revision round requires the immediately preceding attempt")
     parsed = previous_attempt.get("parsed_candidate")
     raw_content = previous_attempt.get("raw_final_content")
-    feedback = previous_attempt.get("feedback")
+    feedback = (
+        previous_attempt.get("feedback")
+        if feedback_override is None
+        else feedback_override
+    )
     if parsed is not None:
         previous = (
             "Previous complete parsed candidate:\n"
@@ -936,6 +972,125 @@ def _feedback_from_validation(report: dict[str, Any], category: str) -> dict[str
             "candidate JSON object using the unchanged interface and evaluation rules."
         ),
     }
+
+
+def _shorten_feedback_text(value: Any, limit: int = 600) -> Any:
+    if not isinstance(value, str) or len(value) <= int(limit):
+        return value
+    kept = max(0, int(limit) - 56)
+    return value[:kept] + f"...[omitted {len(value) - kept} characters]"
+
+
+def _feedback_root_key(issue: dict[str, Any]) -> tuple[str, ...]:
+    """Stable, value-insensitive key for one independently actionable problem."""
+
+    return (
+        str(issue.get("code", "UNKNOWN")),
+        str(issue.get("exception_type", "")),
+        str(issue.get("candidate_function", "")),
+        str(issue.get("candidate_line", issue.get("location", ""))),
+    )
+
+
+def _compact_feedback_issue(issue: dict[str, Any]) -> dict[str, Any]:
+    retained = (
+        "code",
+        "stage",
+        "location",
+        "exception_type",
+        "candidate_function",
+        "candidate_line",
+        "problem",
+        "requirement",
+        "occurrence_count",
+        "line",
+        "column",
+        "character",
+    )
+    result = {
+        key: _shorten_feedback_text(issue[key])
+        for key in retained
+        if key in issue and issue[key] is not None
+    }
+    examples = issue.get("representative_samples")
+    if isinstance(examples, list) and examples:
+        result["representative_samples"] = examples[:1]
+        if len(examples) > 1:
+            result["representative_samples_omitted"] = len(examples) - 1
+    return result
+
+
+def _select_feedback_representatives(
+    errors: list[dict[str, Any]], maximum: int | None
+) -> tuple[list[dict[str, Any]], int]:
+    # First collapse exact root keys while preserving first-seen order.  Then
+    # select one representative from each broad code before taking additional
+    # roots.  This prevents a flood of one error class from hiding another.
+    unique: list[dict[str, Any]] = []
+    seen_roots: set[tuple[str, ...]] = set()
+    for issue in errors:
+        key = _feedback_root_key(issue)
+        if key not in seen_roots:
+            seen_roots.add(key)
+            unique.append(issue)
+    if maximum is None or len(unique) <= int(maximum):
+        return unique, len(errors) - len(unique)
+    maximum = max(1, int(maximum))
+    chosen: list[dict[str, Any]] = []
+    deferred: list[dict[str, Any]] = []
+    seen_codes: set[str] = set()
+    for issue in unique:
+        code = str(issue.get("code", "UNKNOWN"))
+        if code not in seen_codes and len(chosen) < maximum:
+            chosen.append(issue)
+            seen_codes.add(code)
+        else:
+            deferred.append(issue)
+    for issue in deferred:
+        if len(chosen) >= maximum:
+            break
+        chosen.append(issue)
+    return chosen, len(errors) - len(chosen)
+
+
+def _feedback_prompt_variants(
+    feedback: dict[str, Any] | None,
+) -> list[tuple[str, dict[str, Any] | None]]:
+    """Return deterministic full-to-minimal prompt feedback alternatives."""
+
+    if not isinstance(feedback, dict):
+        return [("full", feedback)]
+    errors = feedback.get("confirmed_errors")
+    if not isinstance(errors, list) or not errors:
+        return [("full", feedback)]
+    variants: list[tuple[str, dict[str, Any]]] = [("full", feedback)]
+    original_count = len(errors)
+    for maximum in (None, 64, 32, 16, 8, 4, 2, 1):
+        selected, omitted = _select_feedback_representatives(errors, maximum)
+        compact = {
+            key: value
+            for key, value in feedback.items()
+            if key not in {"confirmed_errors", "confirmed_error_count"}
+        }
+        compact["confirmed_errors"] = [
+            _compact_feedback_issue(issue) for issue in selected
+        ]
+        compact["confirmed_error_count"] = original_count
+        compact["prompt_feedback_summary"] = {
+            "summary_applied": True,
+            "original_error_count": original_count,
+            "included_error_count": len(selected),
+            "omitted_error_count": omitted,
+            "selection_rule": (
+                "stable first root per error code, then additional distinct roots; "
+                "long prose and repeated sample cases are shortened"
+            ),
+            "full_report_location": "the preceding attempt's validation_report.json",
+        }
+        label = "compact_all_roots" if maximum is None else f"representatives_{maximum}"
+        if variants[-1][1] != compact:
+            variants.append((label, compact))
+    return variants
 
 
 def _effective_context_budget(
@@ -1178,35 +1333,59 @@ def run_design(
             if raw_failure
             else [None]
         )
+        feedback_variants = (
+            _feedback_prompt_variants(previous_attempt.get("feedback"))
+            if previous_attempt is not None
+            and previous_attempt.get("parsed_candidate") is not None
+            else [("full", None)]
+        )
         prompt = None
         budget = None
-        for content_limit in content_limits:
-            request_text = _round_request(
-                attempt,
-                int(max_attempts),
-                previous_attempt,
-                failed_content_limit=content_limit,
-            )
-            candidate_prompt = render_prompt(
-                fixed_metadata=fixed_metadata,
-                baseline_report=baseline,
-                constants_metadata=constants_metadata,
-                beta=beta,
-                absolute_tolerance=absolute_tolerance,
-                relative_tolerance=relative_tolerance,
-                round_request=request_text,
-            )
-            candidate_budget = estimate_token_budget(
-                candidate_prompt,
-                context_length=effective_context,
-                max_output_tokens=max_output_tokens,
-            )
-            prompt, budget = candidate_prompt, candidate_budget
-            if candidate_budget["fits_client_budget"]:
+        selected_feedback = None
+        selected_feedback_strategy = "full"
+        selected_content_limit = None
+        for feedback_strategy, prompt_feedback in feedback_variants:
+            for content_limit in content_limits:
+                request_text = _round_request(
+                    attempt,
+                    int(max_attempts),
+                    previous_attempt,
+                    failed_content_limit=content_limit,
+                    feedback_override=prompt_feedback,
+                )
+                candidate_prompt = render_prompt(
+                    fixed_metadata=fixed_metadata,
+                    baseline_report=baseline,
+                    constants_metadata=constants_metadata,
+                    beta=beta,
+                    absolute_tolerance=absolute_tolerance,
+                    relative_tolerance=relative_tolerance,
+                    round_request=request_text,
+                )
+                candidate_budget = estimate_token_budget(
+                    candidate_prompt,
+                    context_length=effective_context,
+                    max_output_tokens=max_output_tokens,
+                )
+                prompt, budget = candidate_prompt, candidate_budget
+                selected_feedback = prompt_feedback
+                selected_feedback_strategy = feedback_strategy
+                selected_content_limit = content_limit
+                if candidate_budget["fits_client_budget"]:
+                    break
+            if budget is not None and budget["fits_client_budget"]:
                 break
         assert prompt is not None and budget is not None
         (round_directory / "prompt.txt").write_text(prompt, encoding="utf-8")
         _write_json(round_directory / "token_budget.json", budget)
+        _write_json(
+            round_directory / "prompt_feedback.json",
+            {
+                "strategy": selected_feedback_strategy,
+                "failed_raw_content_limit": selected_content_limit,
+                "feedback": selected_feedback,
+            },
+        )
         _write_json(
             round_directory / "request_planned.json",
             {
@@ -1224,6 +1403,12 @@ def run_design(
             feedback = {
                 "category": "context_budget_exceeded",
                 "token_budget": budget,
+                "prompt_feedback_strategy": selected_feedback_strategy,
+                "reason": (
+                    "The complete previous candidate plus the common interface, schema, "
+                    "output reservation, and minimum representative feedback do not fit. "
+                    "The candidate was not truncated or rewritten."
+                ),
             }
             history.append({"attempt": attempt, "status": "context_budget_exceeded"})
             break

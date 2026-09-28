@@ -121,10 +121,12 @@ The offline design command uses an unstructured OpenAI-compatible streaming
 request (`stream=true`) for both Qwen and Gemma. It never sends
 `response_format`; the prompt still contains the complete JSON contract and all
 responses pass strict local parsing, staged validation, isolated execution and
-fixed-pair scoring. `--connect-timeout` limits connection establishment
-(default 30 s), the backward-compatible `--timeout` limits inactivity while
-reading the SSE stream (default 600 s), and `--total-timeout` limits the whole
-request including connection time (default 1800 s). `--worker-timeout` remains
+fixed-pair scoring. `--connect-timeout` limits TCP/TLS establishment only
+(default 30 s). After that succeeds, sending the request and waiting for
+response headers use the backward-compatible `--timeout` inactivity limit;
+the same limit applies between SSE bytes (default 600 s). `--total-timeout`
+limits the entire request across connection, headers and stream receipt
+(default 1800 s). `--worker-timeout` remains
 an independent candidate-code limit. Generation transport failures are saved
 and stop the run rather than being presented to the model as design feedback.
 
@@ -138,6 +140,11 @@ produce an approved artifact. Parsed candidates receive a machine-readable
 staged report. Independent schema/static or runtime findings are deduplicated
 and returned together in the next prompt with only the immediately preceding
 candidate; checks whose prerequisites failed are explicitly marked not run.
+The complete report stays on disk. If full feedback exceeds the context
+budget, deterministic summaries retain distinct error codes, exception types,
+candidate locations and representative cases, and record included/omitted
+counts. Candidate JSON/code is never truncated; if it cannot fit with minimum
+feedback, the run stops with `context_budget_exceeded`.
 
 ```powershell
 python -X utf8 run_llm_design.py --fixed-sample results/llm_baselines/baseline-20260927T130708Z-ba4bf287 --base-url http://127.0.0.1:1234/v1 --model qwen/qwen3.5-9b --context-length 20000 --max-output-tokens 4096 --temperature 0.3 --seed 20260927 --max-attempts 5 --beta 1 --batch-size 128 --connect-timeout 30 --timeout 600 --total-timeout 1800 --worker-timeout 120

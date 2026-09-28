@@ -1,9 +1,10 @@
 import json
-import io
+from contextlib import contextmanager
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 import threading
 import time
-import urllib.error
+import urllib.request
 
 import numpy as np
 import pytest
@@ -30,7 +31,12 @@ from llm_design import (
     model_inventory_summary,
     run_design,
 )
-from llm_streaming import SSEDecoder, StreamTransportError, capture_chat_stream
+from llm_streaming import (
+    SSEDecoder,
+    StreamTransportError,
+    capture_chat_stream,
+    open_http_stream,
+)
 from llm_design_contract import (
     build_constants,
     build_obs_arrays,
@@ -277,10 +283,70 @@ class StreamingHTTPClient(LMStudioClient):
         self.response = ChunkedResponse(chunks)
         self.sent_request = None
 
-    def _open_stream(self, request, *, timeout):
+    def _open_stream(
+        self, request, *, connect_timeout, header_timeout, total_timeout
+    ):
         self.sent_request = request
-        self.connect_timeout_used = timeout
+        self.connect_timeout_used = connect_timeout
+        self.header_timeout_used = header_timeout
+        self.total_timeout_used = total_timeout
         return self.response
+
+
+@contextmanager
+def _local_stream_server(behavior):
+    class Handler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def log_message(self, _format, *_args):
+            return
+
+        def do_POST(self):
+            length = int(self.headers.get("Content-Length", "0"))
+            self.rfile.read(length)
+            try:
+                behavior(self)
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    server.daemon_threads = True
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield f"http://127.0.0.1:{server.server_address[1]}/v1"
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(2)
+
+
+def _send_stream_headers(handler):
+    handler.send_response(200)
+    handler.send_header("Content-Type", "text/event-stream")
+    handler.send_header("Connection", "close")
+    handler.end_headers()
+    handler.wfile.flush()
+
+
+def _send_sse(handler, data):
+    handler.wfile.write((f"data: {data}\n\n").encode("utf-8"))
+    handler.wfile.flush()
+
+
+def _complete_sse(handler, *, content="ok", model="qwen/qwen3.5-9b"):
+    _send_sse(
+        handler,
+        json.dumps(
+            {
+                "model": model,
+                "choices": [
+                    {"delta": {"content": content}, "finish_reason": "stop"}
+                ],
+            },
+        ),
+    )
+    _send_sse(handler, "[DONE]")
 
 
 @pytest.fixture
@@ -585,16 +651,296 @@ def test_stream_total_timeout_and_cancel_are_persisted(tmp_path, monkeypatch):
     monkeypatch.setattr(llm_streaming.queue.Queue, "get", original_get)
 
 
-def test_http_error_is_classified_and_request_is_saved(tmp_path):
-    class HTTPErrorClient(LMStudioClient):
-        def _open_stream(self, request, *, timeout):
-            raise urllib.error.HTTPError(
-                request.full_url,
-                400,
-                "bad request",
-                {},
-                io.BytesIO(b'{"error":"invalid"}'),
+@pytest.mark.parametrize("model", ["qwen/qwen3.5-9b", "google/gemma-4-e4b"])
+def test_real_http_delayed_first_sse_outlives_connect_timeout(tmp_path, model):
+    def behavior(handler):
+        _send_stream_headers(handler)
+        time.sleep(0.35)
+        _complete_sse(handler, model=model)
+
+    with _local_stream_server(behavior) as base_url:
+        directory = tmp_path / model.split("/")[0]
+        directory.mkdir()
+        client = LMStudioClient(
+            base_url,
+            connect_timeout=0.05,
+            timeout=1.0,
+            total_timeout=2.0,
+            retries=0,
+            progress_interval=60,
+        )
+        started = time.monotonic()
+        result = client.chat(
+            model=model,
+            prompt="return json",
+            temperature=0.3,
+            max_output_tokens=10,
+            seed=7,
+            attempt_directory=directory,
+        )
+        elapsed = time.monotonic() - started
+    assert result["content"] == "ok"
+    assert elapsed >= 0.30
+    assert elapsed < 1.5
+
+
+def test_real_http_header_wait_uses_idle_not_connect_timeout(tmp_path):
+    def behavior(handler):
+        time.sleep(0.30)
+        _send_stream_headers(handler)
+        _complete_sse(handler)
+
+    with _local_stream_server(behavior) as base_url:
+        client = LMStudioClient(
+            base_url,
+            connect_timeout=0.05,
+            timeout=0.8,
+            total_timeout=2.0,
+            retries=0,
+            progress_interval=60,
+        )
+        result = client.chat(
+            model="qwen/qwen3.5-9b",
+            prompt="return json",
+            temperature=0.3,
+            max_output_tokens=10,
+            seed=7,
+            attempt_directory=tmp_path,
+        )
+    assert result["content"] == "ok"
+
+
+def test_real_http_header_wait_respects_post_connect_idle_limit(tmp_path):
+    def behavior(handler):
+        time.sleep(0.8)
+        _send_stream_headers(handler)
+
+    with _local_stream_server(behavior) as base_url:
+        client = LMStudioClient(
+            base_url,
+            connect_timeout=0.05,
+            timeout=0.20,
+            total_timeout=2.0,
+            retries=0,
+            progress_interval=60,
+        )
+        started = time.monotonic()
+        with pytest.raises(APIError) as captured:
+            client.chat(
+                model="qwen/qwen3.5-9b",
+                prompt="return json",
+                temperature=0.3,
+                max_output_tokens=10,
+                seed=7,
+                attempt_directory=tmp_path,
             )
+        elapsed = time.monotonic() - started
+    assert captured.value.category == "response_header_timeout"
+    assert elapsed < 0.70
+    status = json.loads((tmp_path / "stream_status.json").read_text())
+    assert status["status"] == "response_header_timeout"
+
+
+def test_real_http_idle_timeout_aborts_blocked_reader_with_bounded_cleanup(tmp_path):
+    def behavior(handler):
+        _send_stream_headers(handler)
+        time.sleep(1.0)
+
+    with _local_stream_server(behavior) as base_url:
+        client = LMStudioClient(
+            base_url,
+            connect_timeout=0.1,
+            timeout=0.20,
+            total_timeout=2.0,
+            retries=0,
+            progress_interval=60,
+        )
+        started = time.monotonic()
+        with pytest.raises(APIError) as captured:
+            client.chat(
+                model="qwen/qwen3.5-9b",
+                prompt="return json",
+                temperature=0.3,
+                max_output_tokens=10,
+                seed=7,
+                attempt_directory=tmp_path,
+            )
+        elapsed = time.monotonic() - started
+    assert captured.value.category == "stream_idle_timeout"
+    assert elapsed < 0.75
+    status = json.loads((tmp_path / "stream_status.json").read_text())
+    assert status["status"] == "stream_idle_timeout"
+    assert status["reader_terminated"] is True
+
+
+def test_real_http_total_timeout_preserves_partial_stream_and_stops_reader(tmp_path):
+    def behavior(handler):
+        _send_stream_headers(handler)
+        for _ in range(30):
+            _send_sse(
+                handler,
+                '{"choices":[{"delta":{"content":"x"}}]}',
+            )
+            time.sleep(0.04)
+
+    with _local_stream_server(behavior) as base_url:
+        client = LMStudioClient(
+            base_url,
+            connect_timeout=0.1,
+            timeout=0.5,
+            total_timeout=0.24,
+            retries=0,
+            progress_interval=60,
+        )
+        started = time.monotonic()
+        with pytest.raises(APIError) as captured:
+            client.chat(
+                model="qwen/qwen3.5-9b",
+                prompt="return json",
+                temperature=0.3,
+                max_output_tokens=10,
+                seed=7,
+                attempt_directory=tmp_path,
+            )
+        elapsed = time.monotonic() - started
+    assert captured.value.category == "stream_total_timeout"
+    assert elapsed < 0.80
+    assert (tmp_path / "response_content.partial.txt").read_text()
+    status = json.loads((tmp_path / "stream_status.json").read_text())
+    assert status["content_characters"] > 0
+    assert status["reader_terminated"] is True
+
+
+def test_real_http_cancellation_aborts_blocked_reader(tmp_path):
+    def behavior(handler):
+        _send_stream_headers(handler)
+        _send_sse(
+            handler,
+            '{"choices":[{"delta":{"reasoning_content":"partial-thought"}}]}',
+        )
+        time.sleep(1.0)
+
+    with _local_stream_server(behavior) as base_url:
+        request = urllib.request.Request(
+            base_url + "/chat/completions",
+            data=b"{}",
+            method="POST",
+            headers={"Content-Type": "application/json"},
+        )
+        response = open_http_stream(
+            request,
+            connect_timeout=0.1,
+            header_timeout=0.5,
+            total_timeout=2.0,
+        )
+        cancelled = threading.Event()
+        timer = threading.Timer(0.15, cancelled.set)
+        timer.start()
+        started = time.monotonic()
+        with pytest.raises(StreamTransportError) as captured:
+            capture_chat_stream(
+                response,
+                directory=tmp_path,
+                idle_timeout=0.8,
+                total_timeout=2.0,
+                progress_interval=60,
+                cancel_event=cancelled,
+            )
+        elapsed = time.monotonic() - started
+        timer.cancel()
+    assert captured.value.category == "stream_cancelled"
+    assert elapsed < 0.70
+    assert (tmp_path / "reasoning.partial.txt").read_text() == "partial-thought"
+    status = json.loads((tmp_path / "stream_status.json").read_text())
+    assert status["status"] == "stream_cancelled"
+    assert status["reader_terminated"] is True
+
+
+def test_real_http_interrupted_stream_cannot_approve_candidate(tmp_path):
+    fixed = _fixed_artifact(tmp_path)
+
+    def behavior(handler):
+        _send_stream_headers(handler)
+        _send_sse(
+            handler,
+            '{"choices":[{"delta":{"content":"{\\"partial\\":true}"}}]}',
+        )
+
+    class LocalClient(LMStudioClient):
+        def list_models(self):
+            return MockClient([], model="qwen/qwen3.5-9b").list_models()
+
+    with _local_stream_server(behavior) as base_url:
+        client = LocalClient(
+            base_url,
+            connect_timeout=0.1,
+            timeout=0.5,
+            total_timeout=2.0,
+            retries=0,
+            progress_interval=60,
+        )
+        result = run_design(
+            fixed_sample=fixed,
+            model="qwen/qwen3.5-9b",
+            client=client,
+            max_attempts=1,
+            output_dir=tmp_path / "interrupted-design",
+            worker_timeout=10,
+        )
+    assert result["status"] == "failed_no_approved_candidate"
+    assert result["metadata"]["attempt_history"][0]["status"] == "stream_incomplete"
+    assert not (tmp_path / "interrupted-design" / "approved").exists()
+
+
+def test_real_http_error_body_read_obeys_idle_timeout(tmp_path):
+    def behavior(handler):
+        handler.send_response(400)
+        handler.send_header("Content-Type", "application/json")
+        handler.send_header("Connection", "close")
+        handler.end_headers()
+        handler.wfile.flush()
+        time.sleep(1.0)
+
+    with _local_stream_server(behavior) as base_url:
+        client = LMStudioClient(
+            base_url,
+            connect_timeout=0.1,
+            timeout=0.20,
+            total_timeout=2.0,
+            retries=0,
+            progress_interval=60,
+        )
+        started = time.monotonic()
+        with pytest.raises(APIError) as captured:
+            client.chat(
+                model="qwen/qwen3.5-9b",
+                prompt="return json",
+                temperature=0.3,
+                max_output_tokens=10,
+                seed=7,
+                attempt_directory=tmp_path,
+            )
+        elapsed = time.monotonic() - started
+    assert captured.value.category == "stream_idle_timeout"
+    assert elapsed < 0.70
+    status = json.loads((tmp_path / "stream_status.json").read_text())
+    assert status["http_status"] == 400
+    assert status["reader_terminated"] is True
+
+
+def test_http_error_is_classified_and_request_is_saved(tmp_path):
+    class ErrorResponse(ChunkedResponse):
+        status = 400
+        reason = "bad request"
+
+        def abort(self):
+            self.closed = True
+
+    class HTTPErrorClient(LMStudioClient):
+        def _open_stream(
+            self, request, *, connect_timeout, header_timeout, total_timeout
+        ):
+            return ErrorResponse([b'{"error":"invalid"}'])
 
     client = HTTPErrorClient(timeout=1, total_timeout=2, retries=0)
     with pytest.raises(APIError) as captured:
@@ -728,6 +1074,130 @@ def test_static_failures_are_not_executed_and_all_reach_revision_prompt(
     assert "STATIC_FUNCTION_CALL" in prompt
 
 
+@pytest.mark.parametrize("model", ["qwen/qwen3.5-9b", "google/gemma-4-e4b"])
+def test_over_budget_validation_feedback_is_summarized_before_next_request(
+    tmp_path, monkeypatch, model
+):
+    fixed = _fixed_artifact(tmp_path)
+    invalid = _candidate(name="many-independent-errors")
+    errors = []
+    for index in range(120):
+        code = ("STATIC_FIELD", "STATIC_CALL", "SCHEMA_RANGE")[index % 3]
+        errors.append(
+            {
+                "code": code,
+                "stage": "static" if code.startswith("STATIC") else "schema",
+                "location": f"candidate line {index + 1}",
+                "problem": f"root problem {index}: " + ("detail " * 180),
+                "requirement": f"requirement for {code}: " + ("rule " * 120),
+            }
+        )
+    original_validate = llm_design.validate_candidate_staged
+
+    def staged(candidate, constants):
+        if candidate.get("candidate_name") == "many-independent-errors":
+            return {
+                "status": "failed",
+                "can_execute": False,
+                "errors": errors,
+                "checks": {"static": {"status": "failed", "completed": True}},
+            }
+        return original_validate(candidate, constants)
+
+    monkeypatch.setattr(llm_design, "validate_candidate_staged", staged)
+    client = MockClient(
+        [
+            _response(invalid, model=model),
+            _response(_candidate(name="corrected"), model=model),
+        ],
+        model=model,
+    )
+    result = run_design(
+        fixed_sample=fixed,
+        model=model,
+        client=client,
+        max_attempts=2,
+        context_length=20_000,
+        output_dir=tmp_path / "feedback-summary",
+        worker_timeout=10,
+    )
+    assert result["status"] == "approved"
+    assert len(client.calls) == 2
+    full_report = json.loads(
+        (tmp_path / "feedback-summary" / "attempt_01" / "validation_report.json").read_text()
+    )
+    assert len(full_report["errors"]) == 120
+    prompt_info = json.loads(
+        (tmp_path / "feedback-summary" / "attempt_02" / "prompt_feedback.json").read_text()
+    )
+    summary = prompt_info["feedback"]["prompt_feedback_summary"]
+    assert prompt_info["strategy"] != "full"
+    assert summary["original_error_count"] == 120
+    assert summary["included_error_count"] < 120
+    assert summary["omitted_error_count"] > 0
+    prompt = (tmp_path / "feedback-summary" / "attempt_02" / "prompt.txt").read_text()
+    assert '"candidate_name": "many-independent-errors"' in prompt
+    assert all(code in prompt for code in ("STATIC_FIELD", "STATIC_CALL", "SCHEMA_RANGE"))
+    assert "omitted_error_count" in prompt
+    assert result["metadata"]["context"]["effective_budget"] == 20_000
+    assert result["metadata"]["generation"]["max_output_tokens"] == 4096
+
+
+def test_complete_candidate_is_not_truncated_when_minimum_feedback_cannot_fit(
+    tmp_path, monkeypatch
+):
+    fixed = _fixed_artifact(tmp_path)
+    marker = "COMPLETE-CANDIDATE-END-MARKER"
+    huge = _candidate(
+        name="candidate-too-large-for-revision",
+        code=(
+            "# " + ("x" * 60_000) + f" {marker}\n"
+            "def compute_extra_state(obs, constants):\n"
+            "    return np.asarray([0.0], dtype=np.float32)\n\n"
+            "def compute_reward_terms(obs, constants):\n"
+            "    return np.asarray([0.0], dtype=np.float32)\n"
+        ),
+    )
+    original_validate = llm_design.validate_candidate_staged
+
+    def staged(candidate, constants):
+        if candidate.get("candidate_name") == "candidate-too-large-for-revision":
+            return {
+                "status": "failed",
+                "can_execute": False,
+                "errors": [
+                    {
+                        "code": "STATIC_TEST_FAILURE",
+                        "stage": "static",
+                        "location": "candidate line 1",
+                        "problem": "fixture failure",
+                        "requirement": "fix the candidate",
+                    }
+                ],
+                "checks": {"static": {"status": "failed", "completed": True}},
+            }
+        return original_validate(candidate, constants)
+
+    monkeypatch.setattr(llm_design, "validate_candidate_staged", staged)
+    client = MockClient([_response(huge)])
+    result = run_design(
+        fixed_sample=fixed,
+        model=client.model,
+        client=client,
+        max_attempts=2,
+        context_length=20_000,
+        output_dir=tmp_path / "candidate-overflow",
+        worker_timeout=10,
+    )
+    assert result["status"] == "failed_no_approved_candidate"
+    assert len(client.calls) == 1
+    assert result["metadata"]["attempt_history"][-1]["status"] == "context_budget_exceeded"
+    prompt = (tmp_path / "candidate-overflow" / "attempt_02" / "prompt.txt").read_text()
+    assert marker in prompt
+    assert "[TRUNCATED:" not in prompt
+    assert result["metadata"]["final_feedback"]["category"] == "context_budget_exceeded"
+
+
 def test_runtime_errors_are_deduplicated_with_representative_samples(design_fixture):
     _, arrays, _, _, constants = design_fixture
     candidate = _candidate(
@@ -750,6 +1220,108 @@ def test_runtime_errors_are_deduplicated_with_representative_samples(design_fixt
     assert all(
         len(item["representative_samples"]) <= 3 for item in report["errors"]
     )
+
+
+def test_runtime_grouping_keeps_distinct_exception_types_and_candidate_lines(
+    design_fixture,
+):
+    _, arrays, _, _, constants = design_fixture
+    candidate = _candidate(
+        name="distinct-runtime-roots",
+        code=(
+            "def compute_extra_state(obs, constants):\n"
+            '    value = float(obs["state"][0])\n'
+            "    if value < 0.15:\n"
+            '        output = obs["state"][9999]\n'
+            "    else:\n"
+            "        output = 1.0 / (value - value)\n"
+            "    return np.asarray([output], dtype=np.float32)\n\n"
+            "def compute_reward_terms(obs, constants):\n"
+            "    return np.asarray([0.0], dtype=np.float32)\n"
+        ),
+    )
+    with pytest.raises(CandidateExecutionError) as captured:
+        execute_candidate_isolated(
+            candidate, build_obs_arrays(arrays), constants, timeout=10
+        )
+    runtime = [
+        item
+        for item in captured.value.report["errors"]
+        if item["code"] == "RUNTIME_FUNCTION_ERROR"
+    ]
+    assert {item["exception_type"] for item in runtime} == {
+        "IndexError",
+        "ZeroDivisionError",
+    }
+    assert {item["candidate_function"] for item in runtime} == {
+        "compute_extra_state"
+    }
+    assert len({item["candidate_line"] for item in runtime}) == 2
+    assert all(item["occurrence_count"] >= 2 for item in runtime)
+    assert all(len(item["representative_samples"]) <= 3 for item in runtime)
+
+
+def test_same_exception_type_at_different_candidate_lines_is_not_merged(
+    design_fixture,
+):
+    _, arrays, _, _, constants = design_fixture
+    candidate = _candidate(
+        name="same-type-different-lines",
+        code=(
+            "def compute_extra_state(obs, constants):\n"
+            '    value = float(obs["state"][0])\n'
+            "    if value < 0.15:\n"
+            "        output = 1.0 / (value - value)\n"
+            "    else:\n"
+            "        output = 2.0 / (value - value)\n"
+            "    return np.asarray([output], dtype=np.float32)\n\n"
+            "def compute_reward_terms(obs, constants):\n"
+            "    return np.asarray([0.0], dtype=np.float32)\n"
+        ),
+    )
+    with pytest.raises(CandidateExecutionError) as captured:
+        execute_candidate_isolated(
+            candidate, build_obs_arrays(arrays), constants, timeout=10
+        )
+    runtime = [
+        item
+        for item in captured.value.report["errors"]
+        if item.get("exception_type") == "ZeroDivisionError"
+    ]
+    assert len(runtime) == 2
+    assert len({item["candidate_line"] for item in runtime}) == 2
+
+
+def test_distinct_runtime_roots_are_visible_in_revision_prompt(tmp_path):
+    fixed = _fixed_artifact(tmp_path)
+    invalid = _candidate(
+        name="runtime-root-feedback",
+        code=(
+            "def compute_extra_state(obs, constants):\n"
+            '    value = float(obs["state"][0])\n'
+            "    if value < 0.15:\n"
+            '        output = obs["state"][9999]\n'
+            "    else:\n"
+            "        output = 1.0 / (value - value)\n"
+            "    return np.asarray([output], dtype=np.float32)\n\n"
+            "def compute_reward_terms(obs, constants):\n"
+            "    return np.asarray([0.0], dtype=np.float32)\n"
+        ),
+    )
+    client = MockClient([_response(invalid), _response(_candidate(name="fixed"))])
+    result = run_design(
+        fixed_sample=fixed,
+        model=client.model,
+        client=client,
+        max_attempts=2,
+        output_dir=tmp_path / "runtime-feedback",
+        worker_timeout=10,
+    )
+    assert result["status"] == "approved"
+    prompt = (tmp_path / "runtime-feedback" / "attempt_02" / "prompt.txt").read_text()
+    assert "IndexError" in prompt
+    assert "ZeroDivisionError" in prompt
+    assert "candidate_line" in prompt
 
 
 @pytest.mark.parametrize(

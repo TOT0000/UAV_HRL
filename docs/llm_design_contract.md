@@ -139,10 +139,14 @@ Gemma uses the same task, schema, evaluation, and thresholds:
   --timeout 600 --worker-timeout 120
 ```
 
-`--timeout` is the timeout for each LM Studio HTTP request and defaults to 600
-seconds. A request retry gets its own timeout, so total waiting can be longer.
-`--worker-timeout` independently limits untrusted candidate execution and
-defaults to the previous 120-second design-run limit.
+`--connect-timeout` applies only to TCP/TLS establishment (default 30 seconds).
+After a connection exists, `--timeout` limits inactivity while sending the
+request, waiting for response headers, the first SSE bytes, and subsequent SSE
+bytes (default 600 seconds). `--total-timeout` is an absolute per-generation
+limit covering all those phases (default 1800 seconds). Timeout/cancellation
+forcibly shuts down the transport and uses bounded cleanup; it does not enter a
+candidate revision round. `--worker-timeout` independently limits untrusted
+candidate execution and defaults to 120 seconds.
 
 The default root is
 `results/llm_designs/<model-slug>/<unique-run-name>/`. Every attempt keeps its
@@ -152,7 +156,12 @@ history and `run_metadata.json` but has no `approved/` directory. A revision
 uses only the immediately preceding output: a successfully parsed full
 candidate plus its validation/evaluation feedback, or the failed raw final
 content plus its parse error. Reasoning-only text is stored locally but is not
-replayed as candidate code. The first
+replayed as candidate code. Full validation reports remain on disk. If parsed
+candidate feedback is too large for the fixed context budget, a stable summary
+keeps representative distinct error types/root locations and records original,
+included, and omitted counts in `prompt_feedback.json`. The candidate itself
+is never truncated or rewritten; if even minimum feedback cannot fit, the run
+stops with `context_budget_exceeded`. The first
 passing attempt creates:
 
 ```text
