@@ -7,6 +7,9 @@ import sys
 
 from llm_design import (
     DEFAULT_ABSOLUTE_TOLERANCE,
+    DEFAULT_API_CONNECT_TIMEOUT_SECONDS,
+    DEFAULT_API_PROGRESS_INTERVAL_SECONDS,
+    DEFAULT_API_TOTAL_TIMEOUT_SECONDS,
     DEFAULT_API_TIMEOUT_SECONDS,
     DEFAULT_BASE_URL,
     DEFAULT_BATCH_SIZE,
@@ -47,9 +50,27 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=DEFAULT_API_TIMEOUT_SECONDS,
         help=(
-            "LM Studio timeout in seconds for each HTTP request (default: 600); "
-            "retries can make total waiting time longer"
+            "maximum idle seconds while reading one LM Studio stream "
+            "(default: 600); retained as the backward-compatible API timeout option"
         ),
+    )
+    parser.add_argument(
+        "--connect-timeout",
+        type=float,
+        default=DEFAULT_API_CONNECT_TIMEOUT_SECONDS,
+        help="maximum seconds to establish the LM Studio connection (default: 30)",
+    )
+    parser.add_argument(
+        "--total-timeout",
+        type=float,
+        default=DEFAULT_API_TOTAL_TIMEOUT_SECONDS,
+        help="maximum total seconds for one generation request (default: 1800)",
+    )
+    parser.add_argument(
+        "--progress-interval",
+        type=float,
+        default=DEFAULT_API_PROGRESS_INTERVAL_SECONDS,
+        help="seconds between concise streaming progress messages (default: 10)",
     )
     parser.add_argument(
         "--worker-timeout",
@@ -80,6 +101,9 @@ def main(argv=None) -> int:
             beta=args.beta,
             batch_size=args.batch_size,
             timeout=args.timeout,
+            connect_timeout=args.connect_timeout,
+            total_timeout=args.total_timeout,
+            progress_interval=args.progress_interval,
             worker_timeout=args.worker_timeout,
             absolute_tolerance=args.absolute_tolerance,
             relative_tolerance=args.relative_tolerance,
@@ -116,9 +140,11 @@ def main(argv=None) -> int:
     )
     print(
         "Timeouts: "
-        f"api_per_request={generation.get('api_timeout_seconds_per_request', args.timeout)}, "
+        f"connect={generation.get('api_connect_timeout_seconds', args.connect_timeout)}, "
+        f"stream_idle={generation.get('api_stream_idle_timeout_seconds', args.timeout)}, "
+        f"request_total={generation.get('api_total_timeout_seconds_per_request', args.total_timeout)}, "
         f"worker={generation.get('worker_timeout_seconds', args.worker_timeout)}; "
-        "API retries can increase total wait"
+        "limits apply independently per request"
     )
     if result.get("approved_artifact"):
         print(f"Approved artifact: {result['approved_artifact']}")

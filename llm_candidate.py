@@ -124,7 +124,9 @@ class CandidateError(ValueError):
 
 
 class CandidateExecutionError(RuntimeError):
-    pass
+    def __init__(self, message: str, *, report: dict[str, Any] | None = None):
+        super().__init__(message)
+        self.report = report
 
 
 def _reject_duplicate_key(pairs):
@@ -534,6 +536,544 @@ def validate_candidate(
     return validate_candidate_code(candidate, constants_metadata)
 
 
+def _validation_issue(
+    code: str,
+    stage: str,
+    location: str,
+    problem: str,
+    requirement: str,
+) -> dict[str, Any]:
+    return {
+        "code": str(code),
+        "stage": str(stage),
+        "location": str(location),
+        "problem": str(problem),
+        "requirement": str(requirement),
+    }
+
+
+def _schema_validation_issues(
+    candidate: Any, constants_metadata: dict[str, Any]
+) -> list[dict[str, Any]]:
+    issues: list[dict[str, Any]] = []
+
+    def add(code, location, problem, requirement):
+        issues.append(
+            _validation_issue(code, "schema", location, problem, requirement)
+        )
+
+    if not isinstance(candidate, dict):
+        add(
+            "SCHEMA_TOP_LEVEL_TYPE",
+            "$",
+            f"top-level value has type {type(candidate).__name__}",
+            "Return one JSON object.",
+        )
+        return issues
+    missing = sorted(TOP_FIELDS.difference(candidate))
+    extra = sorted(set(candidate).difference(TOP_FIELDS))
+    for name in missing:
+        add(
+            "SCHEMA_MISSING_FIELD",
+            f"$.{name}",
+            "required field is missing",
+            f"Include the required top-level field {name!r}.",
+        )
+    for name in extra:
+        add(
+            "SCHEMA_EXTRA_FIELD",
+            f"$.{name}",
+            "additional top-level field is not allowed",
+            "Return only the fields defined by the candidate schema.",
+        )
+    if candidate.get("schema_version") != CANDIDATE_SCHEMA_VERSION:
+        add(
+            "SCHEMA_VERSION",
+            "$.schema_version",
+            f"received {candidate.get('schema_version')!r}",
+            f"Use {CANDIDATE_SCHEMA_VERSION!r}.",
+        )
+    if candidate.get("reward_input_mode") != "current_only":
+        add(
+            "SCHEMA_REWARD_INPUT_MODE",
+            "$.reward_input_mode",
+            f"received {candidate.get('reward_input_mode')!r}",
+            "Use exactly 'current_only'.",
+        )
+    for name in ("candidate_name", "code"):
+        value = candidate.get(name)
+        if not isinstance(value, str) or not value.strip():
+            add(
+                "SCHEMA_NONEMPTY_TEXT",
+                f"$.{name}",
+                "value is not non-empty text",
+                f"Provide a non-empty string for {name}.",
+            )
+
+    allowed = allowed_source_fields(constants_metadata)
+    all_weights: list[float] = []
+    for group_name, reward in (("features", False), ("reward_terms", True)):
+        items = candidate.get(group_name)
+        if not isinstance(items, list) or not items:
+            add(
+                "SCHEMA_NONEMPTY_ARRAY",
+                f"$.{group_name}",
+                "value is not a non-empty array",
+                f"Provide at least one {group_name} item.",
+            )
+            continue
+        names: list[str] = []
+        formulas: list[str] = []
+        exact = REWARD_ITEM_FIELDS if reward else ITEM_FIELDS
+        for index, item in enumerate(items):
+            location = f"$.{group_name}[{index}]"
+            if not isinstance(item, dict):
+                add(
+                    "SCHEMA_ITEM_TYPE",
+                    location,
+                    f"item has type {type(item).__name__}",
+                    "Each item must be an object.",
+                )
+                continue
+            for name in sorted(exact.difference(item)):
+                add(
+                    "SCHEMA_MISSING_FIELD",
+                    f"{location}.{name}",
+                    "required field is missing",
+                    f"Include {name!r} for every {group_name} item.",
+                )
+            for name in sorted(set(item).difference(exact)):
+                add(
+                    "SCHEMA_EXTRA_FIELD",
+                    f"{location}.{name}",
+                    "additional item field is not allowed",
+                    "Use only fields defined by the candidate schema.",
+                )
+            if item.get("index") != index or isinstance(item.get("index"), bool):
+                add(
+                    "SCHEMA_INDEX",
+                    f"{location}.index",
+                    f"received {item.get('index')!r}",
+                    "Indices must be consecutive integers starting at zero.",
+                )
+            name = item.get("name")
+            if not isinstance(name, str) or not name.strip():
+                add(
+                    "SCHEMA_NONEMPTY_TEXT",
+                    f"{location}.name",
+                    "name is not non-empty text",
+                    "Provide a unique non-empty name.",
+                )
+            else:
+                names.append(name)
+            if item.get("dtype") != "float32":
+                add(
+                    "SCHEMA_DTYPE",
+                    f"{location}.dtype",
+                    f"received {item.get('dtype')!r}",
+                    "Declare dtype as exactly 'float32'.",
+                )
+            for field in ("description", "formula", "missing_data_rule"):
+                value = item.get(field)
+                if not isinstance(value, str) or not value.strip():
+                    add(
+                        "SCHEMA_NONEMPTY_TEXT",
+                        f"{location}.{field}",
+                        "value is not non-empty text",
+                        f"Provide a non-empty {field}.",
+                    )
+            formula = item.get("formula")
+            if isinstance(formula, str) and formula.strip():
+                formulas.append("".join(formula.split()).lower())
+            declared_range = item.get("range")
+            if not isinstance(declared_range, dict) or set(declared_range) != {
+                "minimum",
+                "maximum",
+            }:
+                add(
+                    "SCHEMA_RANGE",
+                    f"{location}.range",
+                    "range must contain exactly minimum and maximum",
+                    "Declare a finite output range using minimum and maximum.",
+                )
+            else:
+                numeric: list[float] = []
+                for bound in ("minimum", "maximum"):
+                    value = declared_range.get(bound)
+                    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)):
+                        add(
+                            "SCHEMA_RANGE",
+                            f"{location}.range.{bound}",
+                            f"received non-finite/non-numeric value {value!r}",
+                            "Range bounds must be finite numbers.",
+                        )
+                    else:
+                        numeric.append(float(value))
+                if len(numeric) == 2:
+                    minimum, maximum = numeric
+                    if minimum > maximum:
+                        add(
+                            "SCHEMA_RANGE_REVERSED",
+                            f"{location}.range",
+                            f"minimum {minimum} exceeds maximum {maximum}",
+                            "Use minimum <= maximum.",
+                        )
+                    if reward and (minimum != 0.0 or maximum != 1.0):
+                        add(
+                            "SCHEMA_REWARD_RANGE",
+                            f"{location}.range",
+                            f"declared [{minimum}, {maximum}]",
+                            "Every reward term must declare [0,1].",
+                        )
+                    if not reward and (minimum < -1.0 or maximum > 1.0):
+                        add(
+                            "SCHEMA_FEATURE_RANGE",
+                            f"{location}.range",
+                            f"declared [{minimum}, {maximum}]",
+                            "Feature ranges must lie within [-1,1].",
+                        )
+            sources = item.get("source_fields")
+            if not isinstance(sources, list) or not sources or any(
+                not isinstance(value, str) for value in sources
+            ) or len(set(sources)) != len(sources):
+                add(
+                    "SCHEMA_SOURCE_FIELDS",
+                    f"{location}.source_fields",
+                    "source_fields is not a unique non-empty string array",
+                    "List the actual allowed obs/constants fields used by this item.",
+                )
+            else:
+                unknown = sorted(set(sources).difference(allowed))
+                if unknown:
+                    add(
+                        "SCHEMA_FORBIDDEN_SOURCE_FIELD",
+                        f"{location}.source_fields",
+                        f"unknown fields: {unknown}",
+                        "Use only fields from the supplied current-only interface.",
+                    )
+            if reward:
+                weight = item.get("weight")
+                if isinstance(weight, bool) or not isinstance(weight, (int, float)) or not math.isfinite(float(weight)):
+                    add(
+                        "SCHEMA_WEIGHT",
+                        f"{location}.weight",
+                        f"received {weight!r}",
+                        "Each weight must be a finite signed number.",
+                    )
+                else:
+                    all_weights.append(float(weight))
+        duplicate_names = sorted({value for value in names if names.count(value) > 1})
+        for value in duplicate_names:
+            add(
+                "SCHEMA_DUPLICATE_NAME",
+                f"$.{group_name}",
+                f"name {value!r} is repeated",
+                "Names must be unique within the group.",
+            )
+        duplicate_formulas = sorted(
+            {value for value in formulas if formulas.count(value) > 1}
+        )
+        for value in duplicate_formulas:
+            add(
+                "SCHEMA_DUPLICATE_FORMULA",
+                f"$.{group_name}",
+                f"normalized formula {value!r} is repeated",
+                "Do not declare duplicate formulas.",
+            )
+    if math.fsum(abs(value) for value in all_weights) > 1.0 + 1e-12:
+        add(
+            "SCHEMA_WEIGHT_L1",
+            "$.reward_terms",
+            f"sum(abs(weight)) is {math.fsum(abs(value) for value in all_weights):.17g}",
+            "Keep sum(abs(weight)) <= 1.",
+        )
+    return issues
+
+
+class _CollectingCandidateVisitor(ast.NodeVisitor):
+    def __init__(self):
+        self.accessed_fields: set[str] = set()
+        self.issues: list[dict[str, Any]] = []
+        self._seen: set[tuple[str, int, int, str]] = set()
+
+    def add(self, code: str, node: ast.AST, problem: str, requirement: str):
+        line = int(getattr(node, "lineno", 0))
+        column = int(getattr(node, "col_offset", 0))
+        key = (code, line, column, problem)
+        if key not in self._seen:
+            self._seen.add(key)
+            self.issues.append(
+                _validation_issue(
+                    code,
+                    "static",
+                    f"code:{line}:{column}",
+                    problem,
+                    requirement,
+                )
+            )
+
+    def generic_visit(self, node):
+        if isinstance(node, DISALLOWED_NODES):
+            self.add(
+                "STATIC_DISALLOWED_SYNTAX",
+                node,
+                f"{type(node).__name__} is not allowed",
+                "Use only the documented deterministic expression subset; imports are not allowed and np is pre-provided.",
+            )
+            return
+        return super().generic_visit(node)
+
+    def visit_Attribute(self, node):
+        dotted = _dotted_name(node)
+        if dotted not in SAFE_NUMPY_CALLS and dotted not in SAFE_NUMPY_ATTRIBUTES and dotted != "np.linalg":
+            self.add(
+                "STATIC_ATTRIBUTE",
+                node,
+                f"attribute access {dotted or ast.dump(node)} is not allowed",
+                "Use only documented np operations.",
+            )
+        self.generic_visit(node)
+
+    def visit_Call(self, node):
+        if isinstance(node.func, ast.Name):
+            if node.func.id not in SAFE_BUILTIN_CALLS:
+                self.add(
+                    "STATIC_FUNCTION_CALL",
+                    node,
+                    f"function call {node.func.id!r} is not allowed",
+                    "Use only documented builtins and np operations.",
+                )
+        else:
+            dotted = _dotted_name(node.func)
+            if dotted not in SAFE_NUMPY_CALLS:
+                self.add(
+                    "STATIC_NUMPY_CALL",
+                    node,
+                    f"function call {dotted!r} is not allowed",
+                    "Use only documented np operations.",
+                )
+        for keyword in node.keywords:
+            if keyword.arg in {"out", "like"}:
+                self.add(
+                    "STATIC_NUMPY_KEYWORD",
+                    keyword,
+                    f"NumPy keyword {keyword.arg!r} is not allowed",
+                    "Do not use output-buffer or like= mutation hooks.",
+                )
+        # The callable attribute is already classified above. Visit only its
+        # arguments so one unsupported np call does not become a second,
+        # derivative attribute error.
+        for argument in node.args:
+            self.visit(argument)
+        for keyword in node.keywords:
+            self.visit(keyword.value)
+
+    def visit_Subscript(self, node):
+        if isinstance(node.value, ast.Name) and node.value.id in {"obs", "constants"}:
+            key = node.slice.value if isinstance(node.slice, ast.Constant) else None
+            if not isinstance(key, str):
+                self.add(
+                    "STATIC_DYNAMIC_FIELD",
+                    node,
+                    f"{node.value.id} key is not a literal string",
+                    "Use literal field names from the supplied interface.",
+                )
+            else:
+                self.accessed_fields.add(f"{node.value.id}.{key}")
+        self.generic_visit(node)
+
+    def visit_Assign(self, node):
+        for target in node.targets:
+            if _root_name(target) in {"obs", "constants"} or isinstance(
+                target, (ast.Subscript, ast.Attribute)
+            ):
+                self.add(
+                    "STATIC_INPUT_MUTATION",
+                    target,
+                    "assignment may modify an input or non-local target",
+                    "Assign only to local variable names; functions must be side-effect free.",
+                )
+        self.generic_visit(node)
+
+    def visit_AugAssign(self, node):
+        if _root_name(node.target) in {"obs", "constants"} or isinstance(
+            node.target, (ast.Subscript, ast.Attribute)
+        ):
+            self.add(
+                "STATIC_INPUT_MUTATION",
+                node.target,
+                "augmented assignment may modify an input or non-local target",
+                "Apply augmented assignment only to local variable names.",
+            )
+        self.generic_visit(node)
+
+
+def _static_validation_issues(
+    candidate: dict[str, Any], constants_metadata: dict[str, Any]
+) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
+    code = candidate.get("code")
+    if not isinstance(code, str) or not code.strip():
+        return [], None
+    try:
+        tree = ast.parse(code, mode="exec")
+    except SyntaxError as exc:
+        return [
+            _validation_issue(
+                "STATIC_PYTHON_SYNTAX",
+                "static",
+                f"code:{exc.lineno or 0}:{exc.offset or 0}",
+                exc.msg,
+                "Return syntactically valid Python defining the two required functions.",
+            )
+        ], None
+    issues: list[dict[str, Any]] = []
+    top_functions = [node for node in tree.body if isinstance(node, ast.FunctionDef)]
+    other_top = [node for node in tree.body if not isinstance(node, ast.FunctionDef)]
+    if len(top_functions) != 2 or other_top:
+        issues.append(
+            _validation_issue(
+                "STATIC_TOP_LEVEL",
+                "static",
+                "$.code",
+                "code does not contain exactly two top-level function definitions",
+                "Define only compute_extra_state and compute_reward_terms at top level.",
+            )
+        )
+    expected = {"compute_extra_state", "compute_reward_terms"}
+    names = {node.name for node in top_functions}
+    if names != expected:
+        issues.append(
+            _validation_issue(
+                "STATIC_FUNCTION_SET",
+                "static",
+                "$.code",
+                f"found function names {sorted(names)}",
+                f"Define exactly {sorted(expected)}.",
+            )
+        )
+    for function in top_functions:
+        args = function.args
+        if (
+            [argument.arg for argument in args.args] != ["obs", "constants"]
+            or args.vararg is not None
+            or args.kwarg is not None
+            or args.defaults
+            or args.kwonlyargs
+        ):
+            issues.append(
+                _validation_issue(
+                    "STATIC_FUNCTION_SIGNATURE",
+                    "static",
+                    f"code:{function.lineno}:0 {function.name}",
+                    "function signature is incompatible",
+                    f"Define {function.name}(obs, constants) with no other parameters.",
+                )
+            )
+    visitor = _CollectingCandidateVisitor()
+    visitor.visit(tree)
+    issues.extend(visitor.issues)
+    allowed = allowed_source_fields(constants_metadata)
+    for field in sorted(visitor.accessed_fields.difference(allowed)):
+        issues.append(
+            _validation_issue(
+                "STATIC_FORBIDDEN_FIELD",
+                "static",
+                f"$.code field {field}",
+                "code accesses a field outside the supplied interface",
+                "Use only current-only obs/constants fields listed in the prompt.",
+            )
+        )
+    declared: set[str] = set()
+    for group in (candidate.get("features"), candidate.get("reward_terms")):
+        if isinstance(group, list):
+            for item in group:
+                if isinstance(item, dict) and isinstance(item.get("source_fields"), list):
+                    declared.update(
+                        value for value in item["source_fields"] if isinstance(value, str)
+                    )
+    for field in sorted(visitor.accessed_fields.difference(declared)):
+        issues.append(
+            _validation_issue(
+                "STATIC_UNDECLARED_FIELD",
+                "static",
+                f"$.code field {field}",
+                "code uses a source field absent from feature/reward metadata",
+                "Declare every actually used field in the corresponding source_fields.",
+            )
+        )
+    redundancy = None
+    extra_function = next(
+        (node for node in top_functions if node.name == "compute_extra_state"), None
+    )
+    features = candidate.get("features")
+    if extra_function is not None and isinstance(features, list) and features:
+        try:
+            redundancy = _validate_explicit_feature_redundancy(
+                extra_function, len(features)
+            )
+        except CandidateError as exc:
+            issues.append(
+                _validation_issue(
+                    "STATIC_EXPLICIT_FEATURE_REDUNDANCY",
+                    "static",
+                    "compute_extra_state return",
+                    str(exc),
+                    "Do not directly copy an original state dimension or return the same statically confirmed expression twice.",
+                )
+            )
+    return issues, redundancy
+
+
+def validate_candidate_staged(
+    candidate: Any, constants_metadata: dict[str, Any]
+) -> dict[str, Any]:
+    """Collect independent schema/static findings without executing code."""
+
+    schema_issues = _schema_validation_issues(candidate, constants_metadata)
+    static_issues: list[dict[str, Any]] = []
+    redundancy = None
+    static_completed = False
+    if isinstance(candidate, dict) and isinstance(candidate.get("code"), str):
+        static_issues, redundancy = _static_validation_issues(
+            candidate, constants_metadata
+        )
+        static_completed = True
+    issues = schema_issues + static_issues
+    return {
+        "status": "passed" if not issues else "failed",
+        "can_execute": not issues,
+        "errors": issues,
+        "checks": {
+            "json": {"status": "passed", "completed": True},
+            "schema": {
+                "status": "passed" if not schema_issues else "failed",
+                "completed": True,
+                "error_count": len(schema_issues),
+            },
+            "static": {
+                "status": (
+                    "passed"
+                    if static_completed and not static_issues
+                    else "failed" if static_completed else "not_run"
+                ),
+                "completed": static_completed,
+                "error_count": len(static_issues),
+                "skipped_reason": (
+                    None if static_completed else "code is unavailable or not text"
+                ),
+                "explicit_feature_redundancy_check": redundancy,
+            },
+            "execution": {
+                "status": "not_run",
+                "completed": False,
+                "skipped_reason": (
+                    None if not issues else "schema/static prerequisites failed"
+                ),
+            },
+        },
+    }
+
+
 def _write_json(path: Path, value: Any) -> None:
     path.write_text(
         json.dumps(value, indent=2, ensure_ascii=False, allow_nan=False) + "\n",
@@ -591,9 +1131,20 @@ def execute_candidate_isolated(
             else {}
         )
         if completed.returncode != 0:
-            message = report.get("error") or completed.stderr.strip() or completed.stdout.strip()
+            errors = report.get("errors") or []
+            message = (
+                report.get("error")
+                or (
+                    f"{errors[0].get('location')}: {errors[0].get('problem')}"
+                    if errors
+                    else None
+                )
+                or completed.stderr.strip()
+                or completed.stdout.strip()
+            )
             raise CandidateExecutionError(
-                f"candidate worker failed with exit code {completed.returncode}: {message}"
+                f"candidate worker failed with exit code {completed.returncode}: {message}",
+                report=report,
             )
         with np.load(output_path, allow_pickle=False) as archive:
             extra = np.asarray(archive["extra_state"])

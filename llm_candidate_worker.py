@@ -120,6 +120,110 @@ def _validate_output_ranges(extra, terms, candidate, label):
         )
 
 
+class _IssueAccumulator:
+    def __init__(self, example_limit=3):
+        self.example_limit = int(example_limit)
+        self._items = {}
+
+    def add(self, code, location, problem, requirement, sample):
+        key = (str(code), str(location), str(requirement))
+        item = self._items.setdefault(
+            key,
+            {
+                "code": str(code),
+                "stage": "execution",
+                "location": str(location),
+                "problem": str(problem),
+                "requirement": str(requirement),
+                "occurrence_count": 0,
+                "representative_samples": [],
+            },
+        )
+        item["occurrence_count"] += 1
+        if len(item["representative_samples"]) < self.example_limit:
+            item["representative_samples"].append(sample)
+
+    @property
+    def errors(self):
+        return list(self._items.values())
+
+
+def _runtime_error_code(message):
+    lowered = str(message).lower()
+    if "shape" in lowered or "one-dimensional" in lowered:
+        return "RUNTIME_SHAPE"
+    if "dtype" in lowered:
+        return "RUNTIME_DTYPE"
+    if "nan" in lowered or "infinity" in lowered or "finite" in lowered:
+        return "RUNTIME_NONFINITE"
+    if "deterministic" in lowered:
+        return "RUNTIME_NONDETERMINISTIC"
+    if "modified" in lowered or "read-only" in lowered:
+        return "RUNTIME_INPUT_MUTATION"
+    return "RUNTIME_FUNCTION_ERROR"
+
+
+def _check_function(function, obs, constants, expected_size, label, sample, issues):
+    try:
+        return _run_function(function, obs, constants, expected_size, label)
+    except BaseException as exc:
+        issues.add(
+            _runtime_error_code(str(exc)),
+            label,
+            f"{type(exc).__name__}: {exc}",
+            "Return a deterministic, side-effect-free one-dimensional float32 array of the declared length with finite values.",
+            sample,
+        )
+        return None
+
+
+def _check_ranges(extra, terms, candidate, label, sample, issues):
+    tolerance = 1e-6
+    if extra is not None:
+        for index, definition in enumerate(candidate["features"]):
+            value = float(extra[index])
+            minimum = float(definition["range"]["minimum"])
+            maximum = float(definition["range"]["maximum"])
+            if value < -1.0 - tolerance or value > 1.0 + tolerance:
+                issues.add(
+                    "RUNTIME_FEATURE_BOUNDS",
+                    f"compute_extra_state({label}) feature[{index}]",
+                    f"observed {value} outside [-1,1]",
+                    "Every extra-state value must remain within [-1,1].",
+                    sample,
+                )
+            if value < minimum - tolerance or value > maximum + tolerance:
+                issues.add(
+                    "RUNTIME_DECLARED_FEATURE_RANGE",
+                    f"compute_extra_state({label}) feature[{index}]",
+                    f"observed {value} outside declared [{minimum},{maximum}]",
+                    "Make the implementation respect the feature's declared fixed range.",
+                    sample,
+                )
+    if terms is not None:
+        for index, value in enumerate(np.asarray(terms, dtype=np.float64)):
+            if value < -tolerance or value > 1.0 + tolerance:
+                issues.add(
+                    "RUNTIME_REWARD_TERM_BOUNDS",
+                    f"compute_reward_terms({label}) reward_terms[{index}]",
+                    f"observed {float(value)} outside [0,1]",
+                    "Every unweighted reward term must remain within [0,1].",
+                    sample,
+                )
+        weights = np.asarray(
+            [item["weight"] for item in candidate["reward_terms"]], dtype=np.float64
+        )
+        weighted = float(np.asarray(terms, dtype=np.float64) @ weights)
+        if weighted < -1.0 - tolerance or weighted > 1.0 + tolerance:
+            issues.add(
+                "RUNTIME_WEIGHTED_REWARD_BOUNDS",
+                "weighted extra reward",
+                f"observed {weighted} outside [-1,1]",
+                "Keep term values and weights within the declared constraints so the weighted sum lies in [-1,1].",
+                sample,
+            )
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser()
     parser.add_argument("--candidate", required=True)
@@ -153,31 +257,84 @@ def main(argv=None):
         term_count = len(candidate["reward_terms"])
         extra = np.empty((rows, feature_count), dtype=np.float32)
         terms = np.empty((rows, term_count), dtype=np.float32)
+        issues = _IssueAccumulator()
         for row in range(rows):
             obs = {name: array[row] for name, array in arrays.items()}
-            extra[row] = _run_function(
-                extra_function, obs, constants, feature_count, "compute_extra_state"
+            row_extra = _check_function(
+                extra_function,
+                obs,
+                constants,
+                feature_count,
+                "compute_extra_state",
+                {"fixed_sample_index": row},
+                issues,
             )
-            terms[row] = _run_function(
-                reward_function, obs, constants, term_count, "compute_reward_terms"
+            row_terms = _check_function(
+                reward_function,
+                obs,
+                constants,
+                term_count,
+                "compute_reward_terms",
+                {"fixed_sample_index": row},
+                issues,
             )
+            _check_ranges(
+                row_extra,
+                row_terms,
+                candidate,
+                "fixed sample",
+                {"fixed_sample_index": row},
+                issues,
+            )
+            if row_extra is not None:
+                extra[row] = row_extra
+            if row_terms is not None:
+                terms[row] = row_terms
         probe = _empty_probe({name: array[0] for name, array in arrays.items()})
-        probe_extra = _run_function(
+        probe_extra = _check_function(
             extra_function,
             probe,
             constants,
             feature_count,
             "compute_extra_state(empty probe)",
+            {"probe": "empty"},
+            issues,
         )
-        probe_terms = _run_function(
+        probe_terms = _check_function(
             reward_function,
             probe,
             constants,
             term_count,
             "compute_reward_terms(empty probe)",
+            {"probe": "empty"},
+            issues,
         )
-        _validate_output_ranges(extra, terms, candidate, "fixed samples")
-        _validate_output_ranges(probe_extra, probe_terms, candidate, "empty probe")
+        _check_ranges(
+            probe_extra,
+            probe_terms,
+            candidate,
+            "empty probe",
+            {"probe": "empty"},
+            issues,
+        )
+        if issues.errors:
+            _write_json(
+                args.report,
+                {
+                    "status": "failed",
+                    "errors": issues.errors,
+                    "error_count": len(issues.errors),
+                    "checks": {
+                        "execution": {
+                            "status": "failed",
+                            "completed": True,
+                            "sample_count_attempted": rows,
+                            "empty_probe_attempted": True,
+                        }
+                    },
+                },
+            )
+            return 1
         np.savez_compressed(args.output, extra_state=extra, reward_terms=terms)
         _write_json(
             args.report,

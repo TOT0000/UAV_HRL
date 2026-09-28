@@ -117,6 +117,33 @@ learning. Task metrics and the Dinkelbach update do not include this extra
 reward. Baseline methods neither load an artifact nor start the candidate
 worker.
 
+The offline design command uses an unstructured OpenAI-compatible streaming
+request (`stream=true`) for both Qwen and Gemma. It never sends
+`response_format`; the prompt still contains the complete JSON contract and all
+responses pass strict local parsing, staged validation, isolated execution and
+fixed-pair scoring. `--connect-timeout` limits connection establishment
+(default 30 s), the backward-compatible `--timeout` limits inactivity while
+reading the SSE stream (default 600 s), and `--total-timeout` limits the whole
+request including connection time (default 1800 s). `--worker-timeout` remains
+an independent candidate-code limit. Generation transport failures are saved
+and stop the run rather than being presented to the model as design feedback.
+
+Each attempt writes the exact request before connecting, appends completed SSE
+events to `stream_events.jsonl`, and flushes accumulated content and reasoning
+to separate partial files. `stream_status.json` records completion signals,
+finish reason, elapsed time, counts, cancellation or transport failure. A
+stream is eligible for parsing only after a terminal `finish_reason` and
+`[DONE]`; `length`, tool calls, blank content, interruption and timeout cannot
+produce an approved artifact. Parsed candidates receive a machine-readable
+staged report. Independent schema/static or runtime findings are deduplicated
+and returned together in the next prompt with only the immediately preceding
+candidate; checks whose prerequisites failed are explicitly marked not run.
+
+```powershell
+python -X utf8 run_llm_design.py --fixed-sample results/llm_baselines/baseline-20260927T130708Z-ba4bf287 --base-url http://127.0.0.1:1234/v1 --model qwen/qwen3.5-9b --context-length 20000 --max-output-tokens 4096 --temperature 0.3 --seed 20260927 --max-attempts 5 --beta 1 --batch-size 128 --connect-timeout 30 --timeout 600 --total-timeout 1800 --worker-timeout 120
+python -X utf8 run_llm_design.py --fixed-sample results/llm_baselines/baseline-20260927T130708Z-ba4bf287 --base-url http://127.0.0.1:1234/v1 --model google/gemma-4-e4b --context-length 20000 --max-output-tokens 4096 --temperature 0.3 --seed 20260927 --max-attempts 5 --beta 1 --batch-size 128 --connect-timeout 30 --timeout 600 --total-timeout 1800 --worker-timeout 120
+```
+
 ```powershell
 python -X utf8 run_experiment.py td3_dinkelbach_llm --llm-artifact <approved-artifact-directory>
 python -X utf8 run_experiment.py resume results/td3_dinkelbach_llm/<run-id>

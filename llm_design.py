@@ -28,6 +28,7 @@ from llm_candidate import (
     parse_candidate_json,
     save_approved_artifact,
     validate_candidate,
+    validate_candidate_staged,
 )
 from llm_design_contract import (
     DESIGN_RUN_SCHEMA_VERSION,
@@ -38,6 +39,7 @@ from llm_design_contract import (
     load_design_inputs,
     render_prompt,
 )
+from llm_streaming import StreamTransportError, capture_chat_stream
 
 
 DEFAULT_BASE_URL = "http://127.0.0.1:1234/v1"
@@ -49,8 +51,11 @@ DEFAULT_MAX_ATTEMPTS = 5
 DEFAULT_BETA = 1.0
 DEFAULT_BATCH_SIZE = 128
 DEFAULT_API_TIMEOUT_SECONDS = 600.0
+DEFAULT_API_CONNECT_TIMEOUT_SECONDS = 30.0
+DEFAULT_API_TOTAL_TIMEOUT_SECONDS = 1800.0
+DEFAULT_API_PROGRESS_INTERVAL_SECONDS = 10.0
 DEFAULT_WORKER_TIMEOUT_SECONDS = 120.0
-# Backward-compatible module name; CLI --timeout is the API timeout.
+# Backward-compatible module name; CLI --timeout is the stream idle timeout.
 DEFAULT_TIMEOUT_SECONDS = DEFAULT_API_TIMEOUT_SECONDS
 DEFAULT_ABSOLUTE_TOLERANCE = 1e-12
 DEFAULT_RELATIVE_TOLERANCE = 1e-6
@@ -59,7 +64,9 @@ DEFAULT_FAILED_CONTENT_LIMIT = 12_000
 
 
 class APIError(RuntimeError):
-    pass
+    def __init__(self, message: str, *, category: str = "api_failure"):
+        super().__init__(message)
+        self.category = str(category)
 
 
 class ContextBudgetError(ValueError):
@@ -123,9 +130,21 @@ def _native_models_url(base_url: str) -> str:
 class LMStudioClient:
     """Small stdlib client for the documented LM Studio HTTP interfaces."""
 
-    def __init__(self, base_url=DEFAULT_BASE_URL, *, timeout=DEFAULT_API_TIMEOUT_SECONDS, retries=2):
+    def __init__(
+        self,
+        base_url=DEFAULT_BASE_URL,
+        *,
+        timeout=DEFAULT_API_TIMEOUT_SECONDS,
+        connect_timeout=DEFAULT_API_CONNECT_TIMEOUT_SECONDS,
+        total_timeout=DEFAULT_API_TOTAL_TIMEOUT_SECONDS,
+        progress_interval=DEFAULT_API_PROGRESS_INTERVAL_SECONDS,
+        retries=2,
+    ):
         self.base_url = str(base_url).rstrip("/")
         self.timeout = float(timeout)
+        self.connect_timeout = float(connect_timeout)
+        self.total_timeout = float(total_timeout)
+        self.progress_interval = float(progress_interval)
         self.retries = max(0, int(retries))
         self.token = os.environ.get("LM_STUDIO_API_TOKEN")
 
@@ -141,7 +160,9 @@ class LMStudioClient:
         for attempt in range(self.retries + 1):
             request = urllib.request.Request(url, data=data, method=method, headers=headers)
             try:
-                with urllib.request.urlopen(request, timeout=self.timeout) as response:
+                with urllib.request.urlopen(
+                    request, timeout=self.connect_timeout
+                ) as response:
                     raw = response.read().decode("utf-8")
                 value = json.loads(raw)
                 if not isinstance(value, dict):
@@ -169,6 +190,9 @@ class LMStudioClient:
             native_error = str(exc)
         return {"openai": openai, "native": native, "native_error": native_error}
 
+    def _open_stream(self, request, *, timeout):
+        return urllib.request.urlopen(request, timeout=timeout)
+
     def chat(
         self,
         *,
@@ -177,63 +201,130 @@ class LMStudioClient:
         temperature: float,
         max_output_tokens: int,
         seed: int,
-        schema: dict[str, Any],
+        attempt_directory: str | Path,
     ) -> dict[str, Any]:
-        base_payload = {
+        payload = {
             "model": model,
             "messages": [{"role": "user", "content": prompt}],
             "temperature": float(temperature),
             "max_tokens": int(max_output_tokens),
             "seed": int(seed),
-            "stream": False,
-            "response_format": {
-                "type": "json_schema",
-                "json_schema": {
-                    "name": "uav_hrl_llm_candidate",
-                    "strict": True,
-                    "schema": schema,
-                },
-            },
+            "stream": True,
+            "stream_options": {"include_usage": True},
         }
-        payload = dict(base_payload)
+        attempt_directory = Path(attempt_directory)
+        _write_json(attempt_directory / "request.json", payload)
+        data = json.dumps(payload, allow_nan=False).encode("utf-8")
+        headers = {
+            "Accept": "text/event-stream",
+            "Content-Type": "application/json",
+        }
+        if self.token:
+            headers["Authorization"] = f"Bearer {self.token}"
+        request = urllib.request.Request(
+            self.base_url + "/chat/completions",
+            data=data,
+            method="POST",
+            headers=headers,
+        )
         fallbacks = []
+        request_started = time.monotonic()
         try:
-            raw = self._request("POST", self.base_url + "/chat/completions", payload)
-        except APIError as first:
-            message = str(first).lower()
-            if "response_format" in message or "json_schema" in message or "structured" in message:
-                payload.pop("response_format", None)
-                fallbacks.append("structured_output_not_supported; retried with strict text parsing")
-                raw = self._request("POST", self.base_url + "/chat/completions", payload)
-            elif "seed" in message:
-                payload.pop("seed", None)
-                fallbacks.append("seed_not_supported; retried without seed")
-                raw = self._request("POST", self.base_url + "/chat/completions", payload)
-            else:
-                raise
-        choices = raw.get("choices")
-        if not isinstance(choices, list) or not choices:
-            raise APIError("chat completion has no choices")
-        choice = choices[0]
-        message = choice.get("message") or {}
-        content = message.get("content")
-        reasoning = message.get("reasoning_content", message.get("reasoning"))
+            response = self._open_stream(
+                request,
+                timeout=min(self.connect_timeout, self.total_timeout),
+            )
+        except urllib.error.HTTPError as exc:
+            body = exc.read().decode("utf-8", errors="replace")
+            _write_json(
+                attempt_directory / "stream_status.json",
+                {"status": "http_error", "http_status": exc.code, "body": body},
+            )
+            raise APIError(
+                f"LM Studio HTTP {exc.code}: {body}", category="http_error"
+            ) from exc
+        except KeyboardInterrupt as exc:
+            _write_json(
+                attempt_directory / "stream_status.json",
+                {
+                    "status": "cancelled",
+                    "failure": "request cancelled by user during connection establishment",
+                },
+            )
+            raise APIError(
+                "request cancelled by user during connection establishment",
+                category="stream_cancelled",
+            ) from exc
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            _write_json(
+                attempt_directory / "stream_status.json",
+                {
+                    "status": "connection_failure",
+                    "error_type": type(exc).__name__,
+                    "error": str(exc),
+                },
+            )
+            raise APIError(
+                f"LM Studio connection failed: {type(exc).__name__}: {exc}",
+                category="connection_failure",
+            ) from exc
+        remaining_total = self.total_timeout - (time.monotonic() - request_started)
+        if remaining_total <= 0.0:
+            try:
+                response.close()
+            except BaseException:
+                pass
+            raise APIError(
+                f"request exceeded total timeout of {self.total_timeout:g} seconds during connection establishment",
+                category="stream_total_timeout",
+            )
+        try:
+            streamed = capture_chat_stream(
+                response,
+                directory=attempt_directory,
+                idle_timeout=self.timeout,
+                total_timeout=remaining_total,
+                progress_interval=self.progress_interval,
+            )
+        except StreamTransportError as exc:
+            raise APIError(str(exc), category=exc.category) from exc
+        content = streamed["content"]
+        reasoning = streamed["reasoning"]
         adapter = model_adapter(model)
         content, inline_reasoning = adapter_separate_reasoning(adapter, content)
         if inline_reasoning:
-            reasoning = inline_reasoning if reasoning is None else f"{reasoning}\n{inline_reasoning}"
+            reasoning = inline_reasoning if not reasoning else f"{reasoning}\n{inline_reasoning}"
+        raw = {
+            "reconstructed_from_stream": True,
+            "model": streamed.get("actual_model"),
+            "choices": [
+                {
+                    "finish_reason": streamed.get("finish_reason"),
+                    "message": {"content": content, "reasoning_content": reasoning},
+                }
+            ],
+            "usage": streamed.get("usage"),
+        }
         return {
             "request": payload,
             "raw": raw,
             "content": content,
             "reasoning": reasoning,
-            "finish_reason": choice.get("finish_reason"),
-            "actual_model": raw.get("model"),
-            "usage": raw.get("usage"),
+            "finish_reason": streamed.get("finish_reason"),
+            "actual_model": streamed.get("actual_model"),
+            "usage": streamed.get("usage"),
             "adapter": adapter,
             "fallbacks": fallbacks,
-            "seed_sent": "seed" in payload,
-            "structured_output_sent": "response_format" in payload,
+            "seed_sent": True,
+            "structured_output_sent": False,
+            "transport_completed": streamed["transport_completed"],
+            "done_received": streamed["done_received"],
+            "terminal_chunk_received": streamed["terminal_chunk_received"],
+            "tool_calls_seen": streamed["tool_calls_seen"],
+            "stream_elapsed_seconds": streamed["elapsed_seconds"],
+            "request_elapsed_seconds": time.monotonic() - request_started,
+            "stream_event_count": streamed["event_count"],
+            "stream_received_bytes": streamed["received_bytes"],
         }
 
 
@@ -723,14 +814,33 @@ def _failed_content_excerpt(
     limit = max(0, int(limit))
     error = "" if feedback is None else str(feedback.get("error", ""))
     match = re.search(r"(?:char|position)\s+(\d+)", error, flags=re.IGNORECASE)
-    center = int(match.group(1)) if match else len(content) // 2
+    confirmed = [] if feedback is None else feedback.get("confirmed_errors") or []
+    reported_character = next(
+        (
+            item.get("character")
+            for item in confirmed
+            if isinstance(item, dict) and isinstance(item.get("character"), int)
+        ),
+        None,
+    )
+    center = (
+        int(match.group(1))
+        if match
+        else int(reported_character)
+        if reported_character is not None
+        else len(content) // 2
+    )
     center = min(max(center, 0), len(content))
     if limit == 0:
         return f"[TRUNCATED: omitted all {len(content)} raw characters to fit the context budget]"
     start = max(0, center - limit // 2)
     stop = min(len(content), start + limit)
     start = max(0, stop - limit)
-    location = f" near parser character {center}" if match else ""
+    location = (
+        f" near parser character {center}"
+        if match or reported_character is not None
+        else ""
+    )
     return (
         f"[TRUNCATED: showing raw characters {start}:{stop} of {len(content)}{location}]\n"
         + content[start:stop]
@@ -757,6 +867,74 @@ def _summarize_error(category: str, exc: BaseException) -> dict[str, Any]:
         "error_type": type(exc).__name__,
         "error": str(exc),
         "instruction": "Return a complete corrected candidate JSON using the unchanged interface and evaluation rules.",
+    }
+
+
+def _json_failure_report(exc: CandidateError) -> dict[str, Any]:
+    cause = exc.__cause__
+    location = "$"
+    details: dict[str, Any] = {}
+    if isinstance(cause, json.JSONDecodeError):
+        location = f"line {cause.lineno}, column {cause.colno}"
+        details = {
+            "line": int(cause.lineno),
+            "column": int(cause.colno),
+            "character": int(cause.pos),
+        }
+    issue = {
+        "code": "JSON_PARSE_ERROR",
+        "stage": "json",
+        "location": location,
+        "problem": str(exc),
+        "requirement": "Return one complete valid JSON object with no Markdown or surrounding text.",
+        **details,
+    }
+    return {
+        "status": "failed",
+        "can_execute": False,
+        "errors": [issue],
+        "checks": {
+            "json": {"status": "failed", "completed": True, "error_count": 1},
+            "schema": {
+                "status": "not_run",
+                "completed": False,
+                "skipped_reason": "JSON could not be parsed",
+            },
+            "static": {
+                "status": "not_run",
+                "completed": False,
+                "skipped_reason": "JSON/code could not be parsed",
+            },
+            "execution": {
+                "status": "not_run",
+                "completed": False,
+                "skipped_reason": "JSON/schema/static prerequisites failed",
+            },
+        },
+    }
+
+
+def _feedback_from_validation(report: dict[str, Any], category: str) -> dict[str, Any]:
+    errors = list(report.get("errors") or [])
+    compact_checks = {
+        name: {
+            key: value
+            for key, value in check.items()
+            if key in {"status", "skipped_reason"} and value is not None
+        }
+        for name, check in (report.get("checks") or {}).items()
+        if isinstance(check, dict)
+    }
+    return {
+        "category": category,
+        "status": report.get("status", "failed"),
+        "confirmed_errors": errors,
+        "confirmed_error_count": len(errors),
+        "checks": compact_checks,
+        "instruction": (
+            "Correct every confirmed error above and return one complete replacement "
+            "candidate JSON object using the unchanged interface and evaluation rules."
+        ),
     }
 
 
@@ -795,6 +973,9 @@ def run_design(
     beta: float = DEFAULT_BETA,
     batch_size: int = DEFAULT_BATCH_SIZE,
     timeout: float = DEFAULT_API_TIMEOUT_SECONDS,
+    connect_timeout: float = DEFAULT_API_CONNECT_TIMEOUT_SECONDS,
+    total_timeout: float = DEFAULT_API_TOTAL_TIMEOUT_SECONDS,
+    progress_interval: float = DEFAULT_API_PROGRESS_INTERVAL_SECONDS,
     worker_timeout: float = DEFAULT_WORKER_TIMEOUT_SECONDS,
     output_root: str | Path = DEFAULT_OUTPUT_ROOT,
     output_dir: str | Path | None = None,
@@ -812,13 +993,20 @@ def run_design(
     for label, value in (
         ("temperature", temperature),
         ("beta", beta),
-        ("timeout", timeout),
-        ("worker_timeout", worker_timeout),
         ("absolute_tolerance", absolute_tolerance),
         ("relative_tolerance", relative_tolerance),
     ):
         if not math.isfinite(float(value)) or float(value) < 0.0:
             raise ValueError(f"{label} must be finite and non-negative")
+    for label, value in (
+        ("timeout", timeout),
+        ("connect_timeout", connect_timeout),
+        ("total_timeout", total_timeout),
+        ("progress_interval", progress_interval),
+        ("worker_timeout", worker_timeout),
+    ):
+        if not math.isfinite(float(value)) or float(value) <= 0.0:
+            raise ValueError(f"{label} must be finite and positive")
 
     arrays, fixed_metadata, baseline, constants_metadata = load_design_inputs(
         fixed_sample
@@ -827,7 +1015,13 @@ def run_design(
         model, output_root=output_root, output_dir=output_dir
     )
     model_info = None
-    api_client = client or LMStudioClient(base_url, timeout=timeout)
+    api_client = client or LMStudioClient(
+        base_url,
+        timeout=timeout,
+        connect_timeout=connect_timeout,
+        total_timeout=total_timeout,
+        progress_interval=progress_interval,
+    )
     if not dry_run:
         inventory = api_client.list_models()
         model_info = model_inventory_summary(inventory, model)
@@ -858,11 +1052,21 @@ def run_design(
             "seed_requested": int(seed),
             "seed_support": "requested when generation runs; deterministic reproduction is not guaranteed by this client",
             "max_attempts": int(max_attempts),
+            "api_connect_timeout_seconds": float(connect_timeout),
+            "api_stream_idle_timeout_seconds": float(timeout),
+            "api_total_timeout_seconds_per_request": float(total_timeout),
+            # Kept for readers of design metadata written before streaming v1.
             "api_timeout_seconds_per_request": float(timeout),
             "api_retry_count": int(getattr(api_client, "retries", 0)),
-            "api_total_wait_note": "timeout applies per request; retries can make total waiting time longer",
+            "api_stream_generation_retry_count": 0,
+            "api_progress_interval_seconds": float(progress_interval),
+            "api_total_wait_note": (
+                "connect, stream-idle, and total limits apply independently to each "
+                "request; generation transport failures are not retried"
+            ),
             "worker_timeout_seconds": float(worker_timeout),
-            "structured_output": "requested first; explicit recorded fallback to strict text parsing only when rejected by API",
+            "structured_output": "disabled; strict JSON parsing and local validation remain mandatory",
+            "streaming": True,
         },
         "context": context_info,
         "fixed_sample": {
@@ -911,15 +1115,8 @@ def run_design(
             "temperature": float(temperature),
             "max_tokens": int(max_output_tokens),
             "seed": int(seed),
-            "stream": False,
-            "response_format": {
-                "type": "json_schema",
-                "json_schema": {
-                    "name": "uav_hrl_llm_candidate",
-                    "strict": True,
-                    "schema": candidate_schema(),
-                },
-            },
+            "stream": True,
+            "stream_options": {"include_usage": True},
             "context_length_note": "client budget only; not sent to alter LM Studio load configuration",
         },
     )
@@ -974,6 +1171,8 @@ def run_design(
                 2_000,
                 1_000,
                 500,
+                250,
+                100,
                 0,
             ]
             if raw_failure
@@ -1016,15 +1215,8 @@ def run_design(
                 "temperature": float(temperature),
                 "max_tokens": int(max_output_tokens),
                 "seed": int(seed),
-                "stream": False,
-                "response_format": {
-                    "type": "json_schema",
-                    "json_schema": {
-                        "name": "uav_hrl_llm_candidate",
-                        "strict": True,
-                        "schema": candidate_schema(),
-                    },
-                },
+                "stream": True,
+                "stream_options": {"include_usage": True},
                 "context_length_note": "budget only; not a server load-setting request",
             },
         )
@@ -1041,6 +1233,7 @@ def run_design(
             "reasoning_present": False,
             "feedback": None,
         }
+        staged = None
         try:
             response = api_client.chat(
                 model=model,
@@ -1048,9 +1241,12 @@ def run_design(
                 temperature=temperature,
                 max_output_tokens=max_output_tokens,
                 seed=seed,
-                schema=candidate_schema(),
+                attempt_directory=round_directory,
             )
-            _write_json(round_directory / "request.json", response["request"])
+            # Real clients save this before opening the connection.  This write
+            # also keeps injected test clients and older adapters auditable.
+            if not (round_directory / "request.json").is_file():
+                _write_json(round_directory / "request.json", response["request"])
             _write_json(round_directory / "raw_response.json", response["raw"])
             _write_json(
                 round_directory / "response_metadata.json",
@@ -1064,6 +1260,14 @@ def run_design(
                         "fallbacks",
                         "seed_sent",
                         "structured_output_sent",
+                        "transport_completed",
+                        "done_received",
+                        "terminal_chunk_received",
+                        "tool_calls_seen",
+                        "stream_elapsed_seconds",
+                        "request_elapsed_seconds",
+                        "stream_event_count",
+                        "stream_received_bytes",
                     )
                 },
             )
@@ -1071,6 +1275,11 @@ def run_design(
                 actual_models.append(str(response["actual_model"]))
             adapter_fallbacks.extend(str(value) for value in response.get("fallbacks", []))
             seed_sent_values.append(bool(response.get("seed_sent")))
+            if not response.get("transport_completed", False):
+                raise APIError(
+                    "generation response was not confirmed as a complete stream",
+                    category="stream_incomplete",
+                )
             if response.get("actual_model") not in {None, model}:
                 raise APIError(
                     "LM Studio returned a different model identifier: "
@@ -1090,16 +1299,55 @@ def run_design(
             )
             if response.get("finish_reason") == "length":
                 raise CandidateError("model output was truncated (finish_reason=length)")
+            if response.get("finish_reason") != "stop":
+                raise CandidateError(
+                    "model output did not finish normally "
+                    f"(finish_reason={response.get('finish_reason')!r})"
+                )
+            if response.get("tool_calls_seen"):
+                raise CandidateError(
+                    "model returned tool calls; one plain candidate JSON object is required"
+                )
             if content is None or not str(content).strip():
                 reason = "model returned reasoning but no final JSON" if response.get("reasoning") else "model returned no final content"
                 raise CandidateError(reason)
-            candidate = parse_candidate_json(str(content))
+            try:
+                candidate = parse_candidate_json(str(content))
+            except CandidateError as exc:
+                validation_report = _json_failure_report(exc)
+                _write_json(
+                    round_directory / "validation_report.json", validation_report
+                )
+                feedback = _feedback_from_validation(
+                    validation_report, "candidate_json_failure"
+                )
+                attempt_output["feedback"] = feedback
+                previous_attempt = attempt_output
+                _write_json(round_directory / "failure.json", feedback)
+                _write_json(round_directory / "feedback.json", feedback)
+                history.append({"attempt": attempt, "status": "candidate_json_failure"})
+                continue
             attempt_output["parsed_candidate"] = candidate
-            static = validate_candidate(candidate, constants_metadata)
             _write_json(round_directory / "candidate.json", candidate)
-            (round_directory / "candidate.py").write_text(
-                candidate["code"], encoding="utf-8"
-            )
+            staged = validate_candidate_staged(candidate, constants_metadata)
+            if isinstance(candidate.get("code"), str):
+                (round_directory / "candidate.py").write_text(
+                    candidate["code"], encoding="utf-8"
+                )
+            if not staged["can_execute"]:
+                _write_json(round_directory / "validation_report.json", staged)
+                feedback = _feedback_from_validation(
+                    staged, "candidate_schema_or_static_failure"
+                )
+                attempt_output["feedback"] = feedback
+                previous_attempt = attempt_output
+                _write_json(round_directory / "failure.json", feedback)
+                _write_json(round_directory / "feedback.json", feedback)
+                history.append(
+                    {"attempt": attempt, "status": "candidate_schema_or_static_failure"}
+                )
+                continue
+            static = validate_candidate(candidate, constants_metadata)
             extra, terms, execution = execute_candidate_isolated(
                 candidate,
                 obs_arrays,
@@ -1108,6 +1356,11 @@ def run_design(
             )
             validation_report = {
                 "status": "passed",
+                "errors": [],
+                "checks": {
+                    **staged["checks"],
+                    "execution": {"status": "passed", "completed": True},
+                },
                 "static": static,
                 "execution": execution,
                 "numeric_tolerance": 1e-6,
@@ -1155,12 +1408,45 @@ def run_design(
             _write_json(round_directory / "feedback.json", feedback)
             history.append({"attempt": attempt, "status": evaluation["status"]})
         except APIError as exc:
-            feedback = _summarize_error("api_failure", exc)
+            category = getattr(exc, "category", "api_failure")
+            feedback = _summarize_error(category, exc)
+            feedback["retry_as_candidate_revision"] = False
             _write_json(round_directory / "failure.json", feedback)
-            history.append({"attempt": attempt, "status": "api_failure"})
+            history.append({"attempt": attempt, "status": category})
             break
         except CandidateExecutionError as exc:
-            feedback = _summarize_error("candidate_execution_failure", exc)
+            worker_report = exc.report or {
+                "status": "failed",
+                "errors": [
+                    {
+                        "code": "RUNTIME_WORKER_FAILURE",
+                        "stage": "execution",
+                        "location": "candidate worker",
+                        "problem": str(exc),
+                        "requirement": "Return functions that pass all isolated execution checks.",
+                    }
+                ],
+                "checks": {"execution": {"status": "failed", "completed": False}},
+            }
+            execution_report = {
+                "status": "failed",
+                "can_execute": False,
+                "errors": list(worker_report.get("errors") or []),
+                "checks": {
+                    **(
+                        staged.get("checks", {})
+                        if isinstance(staged, dict)
+                        else {}
+                    ),
+                    **(worker_report.get("checks") or {}),
+                },
+            }
+            _write_json(
+                round_directory / "validation_report.json", execution_report
+            )
+            feedback = _feedback_from_validation(
+                execution_report, "candidate_execution_failure"
+            )
             attempt_output["feedback"] = feedback
             previous_attempt = attempt_output
             _write_json(round_directory / "failure.json", feedback)

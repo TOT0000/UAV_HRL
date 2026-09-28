@@ -1,9 +1,14 @@
 import json
+import io
 from pathlib import Path
+import threading
+import time
+import urllib.error
 
 import numpy as np
 import pytest
 import llm_design
+import llm_streaming
 import run_llm_design
 
 from centralized_movement import JOINT_ACTION_DIM, MOVEMENT_STATE_DIM, movement_state_feature_schema
@@ -25,6 +30,7 @@ from llm_design import (
     model_inventory_summary,
     run_design,
 )
+from llm_streaming import SSEDecoder, StreamTransportError, capture_chat_stream
 from llm_design_contract import (
     build_constants,
     build_obs_arrays,
@@ -196,6 +202,7 @@ def _response(candidate, *, finish_reason="stop", model="qwen/qwen3.5-9b"):
             "temperature": 0.3,
             "max_tokens": 4096,
             "seed": 20260927,
+            "stream": True,
         },
         "raw": {"model": model, "choices": []},
         "content": json.dumps(candidate),
@@ -206,7 +213,11 @@ def _response(candidate, *, finish_reason="stop", model="qwen/qwen3.5-9b"):
         "adapter": "qwen" if "qwen" in model else "gemma",
         "fallbacks": [],
         "seed_sent": True,
-        "structured_output_sent": True,
+        "structured_output_sent": False,
+        "transport_completed": True,
+        "done_received": True,
+        "terminal_chunk_received": True,
+        "tool_calls_seen": False,
     }
 
 
@@ -243,26 +254,33 @@ class MockClient:
         return value
 
 
-class FallbackHTTPClient(LMStudioClient):
-    def __init__(self, first_error):
-        super().__init__(timeout=1, retries=0)
-        self.first_error = first_error
-        self.payloads = []
+class ChunkedResponse:
+    def __init__(self, chunks):
+        self.chunks = list(chunks)
+        self.closed = False
 
-    def _request(self, method, url, payload=None):
-        self.payloads.append(json.loads(json.dumps(payload)))
-        if len(self.payloads) == 1:
-            raise APIError(self.first_error)
-        return {
-            "model": "qwen/qwen3.5-9b",
-            "choices": [
-                {
-                    "finish_reason": "stop",
-                    "message": {"content": '{"ok":true}'},
-                }
-            ],
-            "usage": {"total_tokens": 2},
-        }
+    def read1(self, _size):
+        if not self.chunks:
+            return b""
+        value = self.chunks.pop(0)
+        if isinstance(value, BaseException):
+            raise value
+        return value
+
+    def close(self):
+        self.closed = True
+
+
+class StreamingHTTPClient(LMStudioClient):
+    def __init__(self, chunks, **kwargs):
+        super().__init__(retries=0, progress_interval=60, **kwargs)
+        self.response = ChunkedResponse(chunks)
+        self.sent_request = None
+
+    def _open_stream(self, request, *, timeout):
+        self.sent_request = request
+        self.connect_timeout_used = timeout
+        return self.response
 
 
 @pytest.fixture
@@ -346,6 +364,12 @@ def test_dry_run_cli_prints_model_parameters_and_token_budget(monkeypatch, capsy
                 "qwen/qwen3.5-9b",
                 "--timeout",
                 "601",
+                "--connect-timeout",
+                "31",
+                "--total-timeout",
+                "1801",
+                "--progress-interval",
+                "11",
                 "--worker-timeout",
                 "7",
                 "--dry-run",
@@ -358,39 +382,234 @@ def test_dry_run_cli_prints_model_parameters_and_token_budget(monkeypatch, capsy
     assert "temperature=0.3" in output
     assert "prompt_estimate=100..120" in output
     assert "fits=True" in output
-    assert "api_per_request=601.0, worker=7.0" in output
+    assert "connect=31.0, stream_idle=601.0, request_total=1801.0, worker=7.0" in output
     assert received["timeout"] == 601.0
+    assert received["connect_timeout"] == 31.0
+    assert received["total_timeout"] == 1801.0
+    assert received["progress_interval"] == 11.0
     assert received["worker_timeout"] == 7.0
 
 
-def test_lm_studio_structured_and_seed_fallbacks_are_explicit():
-    schema = {"type": "object", "properties": {"ok": {"type": "boolean"}}}
-    structured = FallbackHTTPClient("response_format json_schema unsupported")
-    result = structured.chat(
-        model="qwen/qwen3.5-9b",
-        prompt="return json",
-        temperature=0.3,
-        max_output_tokens=10,
-        seed=7,
-        schema=schema,
+@pytest.mark.parametrize("model", ["qwen/qwen3.5-9b", "google/gemma-4-e4b"])
+def test_dry_run_saves_streaming_unstructured_request(tmp_path, model):
+    fixed = _fixed_artifact(tmp_path)
+    result = run_design(
+        fixed_sample=fixed,
+        model=model,
+        output_dir=tmp_path / "dry-run",
+        dry_run=True,
     )
-    assert "response_format" in structured.payloads[0]
-    assert "response_format" not in structured.payloads[1]
-    assert result["structured_output_sent"] is False
-    assert result["fallbacks"]
+    assert result["status"] == "dry_run_complete"
+    request = json.loads(
+        (tmp_path / "dry-run" / "request_attempt_01.json").read_text()
+    )
+    assert request["model"] == model
+    assert request["stream"] is True
+    assert "response_format" not in request
+    assert result["metadata"]["generation_requests_sent"] == 0
 
-    seed = FallbackHTTPClient("seed is unsupported")
-    result = seed.chat(
-        model="qwen/qwen3.5-9b",
+
+@pytest.mark.parametrize("model", ["qwen/qwen3.5-9b", "google/gemma-4-e4b"])
+def test_lm_studio_request_streams_without_response_format(tmp_path, model):
+    chunks = [
+        (
+            'data: {"model":"%s","choices":[{"delta":{"content":"{\\"ok\\":true}"},'
+            '"finish_reason":"stop"}]}\n\n' % model
+        ).encode(),
+        b"data: [DONE]\n\n",
+    ]
+    client = StreamingHTTPClient(chunks, timeout=1, total_timeout=2)
+    result = client.chat(
+        model=model,
         prompt="return json",
         temperature=0.3,
         max_output_tokens=10,
         seed=7,
-        schema=schema,
+        attempt_directory=tmp_path,
     )
-    assert "seed" in seed.payloads[0]
-    assert "seed" not in seed.payloads[1]
-    assert result["seed_sent"] is False
+    saved = json.loads((tmp_path / "request.json").read_text())
+    sent = json.loads(client.sent_request.data.decode("utf-8"))
+    assert saved == sent == result["request"]
+    assert saved["stream"] is True
+    assert "response_format" not in saved
+    assert result["structured_output_sent"] is False
+    assert result["transport_completed"] is True
+
+
+def test_sse_decoder_handles_utf8_and_event_boundaries():
+    decoder = SSEDecoder()
+    raw = (
+        ': keepalive\r\n\r\n'
+        'data: {"choices":[{"delta":{"role":"assistant"}}]}\n\n'
+        'data: {"choices":[{"delta":{"content":"候選"}}]}\n\n'
+        'data: [DONE]\n\n'
+    ).encode("utf-8")
+    marker = raw.index("候".encode("utf-8")) + 1
+    chunks = [raw[:7], raw[7:marker], raw[marker:marker + 1], raw[marker + 1:]]
+    events = []
+    for chunk in chunks:
+        events.extend(decoder.feed(chunk))
+    events.extend(decoder.feed(b"", final=True))
+    assert len(events) == 3
+    assert json.loads(events[0])["choices"][0]["delta"]["role"] == "assistant"
+    assert json.loads(events[1])["choices"][0]["delta"]["content"] == "候選"
+    assert events[2] == "[DONE]"
+
+
+def test_stream_accumulates_content_reasoning_and_optional_usage(tmp_path):
+    response = ChunkedResponse(
+        [
+            b'data: {"model":"fixture","choices":[{"delta":{"role":"assistant"}}]}\n\n',
+            b'data: {"choices":[{"delta":{"reasoning_content":"think"}}]}\n\n',
+            b'data: {"choices":[{"delta":{"content":"answer"},"finish_reason":"stop"}]}\n\n',
+            b'data: [DONE]\n\n',
+        ]
+    )
+    result = capture_chat_stream(
+        response,
+        directory=tmp_path,
+        idle_timeout=1,
+        total_timeout=2,
+        progress_interval=60,
+    )
+    assert result["content"] == "answer"
+    assert result["reasoning"] == "think"
+    assert result["usage"] is None
+    assert result["done_received"] is True
+    assert (tmp_path / "response_content.partial.txt").read_text() == "answer"
+    assert (tmp_path / "reasoning.partial.txt").read_text() == "think"
+
+    with_usage = capture_chat_stream(
+        ChunkedResponse(
+            [
+                b'data: {"choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}]}\n\n',
+                b'data: {"choices":[],"usage":{"prompt_tokens":2,"completion_tokens":1}}\n\n',
+                b"data: [DONE]\n\n",
+            ]
+        ),
+        directory=tmp_path / "with-usage",
+        idle_timeout=1,
+        total_timeout=2,
+        progress_interval=60,
+    )
+    assert with_usage["usage"] == {"prompt_tokens": 2, "completion_tokens": 1}
+
+
+def test_partial_stream_is_flushed_before_connection_failure(tmp_path):
+    response = ChunkedResponse(
+        [
+            b'data: {"choices":[{"delta":{"content":"partial"}}]}\n\n',
+            OSError("connection reset"),
+        ]
+    )
+    with pytest.raises(StreamTransportError) as captured:
+        capture_chat_stream(
+            response,
+            directory=tmp_path,
+            idle_timeout=1,
+            total_timeout=2,
+            progress_interval=60,
+        )
+    assert captured.value.category == "stream_connection_error"
+    assert (tmp_path / "response_content.partial.txt").read_text() == "partial"
+    assert (tmp_path / "stream_events.jsonl").read_text().strip()
+    status = json.loads((tmp_path / "stream_status.json").read_text())
+    assert status["status"] == "stream_connection_error"
+
+
+@pytest.mark.parametrize(
+    "chunks, category",
+    [
+        (
+            [b'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n'],
+            "stream_incomplete",
+        ),
+        ([b'data: {"error":{"message":"bad stream"}}\n\n'], "stream_server_error"),
+        ([b"data: not-json\n\n"], "stream_protocol_error"),
+    ],
+)
+def test_stream_incomplete_server_and_protocol_errors_are_classified(
+    tmp_path, chunks, category
+):
+    with pytest.raises(StreamTransportError) as captured:
+        capture_chat_stream(
+            ChunkedResponse(chunks),
+            directory=tmp_path,
+            idle_timeout=1,
+            total_timeout=2,
+            progress_interval=60,
+        )
+    assert captured.value.category == category
+    assert json.loads((tmp_path / "stream_status.json").read_text())["status"] == category
+
+
+def test_stream_total_timeout_and_cancel_are_persisted(tmp_path, monkeypatch):
+    release = threading.Event()
+
+    class BlockingResponse:
+        def read1(self, _size):
+            release.wait(5)
+            return b""
+
+        def close(self):
+            release.set()
+
+    with pytest.raises(StreamTransportError) as timeout_error:
+        capture_chat_stream(
+            BlockingResponse(),
+            directory=tmp_path / "timeout",
+            idle_timeout=1,
+            total_timeout=0.05,
+            progress_interval=60,
+        )
+    assert timeout_error.value.category == "stream_total_timeout"
+
+    original_get = llm_streaming.queue.Queue.get
+
+    def cancel_get(self, *args, **kwargs):
+        raise KeyboardInterrupt()
+
+    monkeypatch.setattr(llm_streaming.queue.Queue, "get", cancel_get)
+    with pytest.raises(StreamTransportError) as cancelled:
+        capture_chat_stream(
+            ChunkedResponse([]),
+            directory=tmp_path / "cancel",
+            idle_timeout=1,
+            total_timeout=2,
+            progress_interval=60,
+        )
+    assert cancelled.value.category == "stream_cancelled"
+    assert json.loads(
+        (tmp_path / "cancel" / "stream_status.json").read_text()
+    )["status"] == "cancelled"
+    monkeypatch.setattr(llm_streaming.queue.Queue, "get", original_get)
+
+
+def test_http_error_is_classified_and_request_is_saved(tmp_path):
+    class HTTPErrorClient(LMStudioClient):
+        def _open_stream(self, request, *, timeout):
+            raise urllib.error.HTTPError(
+                request.full_url,
+                400,
+                "bad request",
+                {},
+                io.BytesIO(b'{"error":"invalid"}'),
+            )
+
+    client = HTTPErrorClient(timeout=1, total_timeout=2, retries=0)
+    with pytest.raises(APIError) as captured:
+        client.chat(
+            model="qwen/qwen3.5-9b",
+            prompt="return json",
+            temperature=0.3,
+            max_output_tokens=10,
+            seed=7,
+            attempt_directory=tmp_path,
+        )
+    assert captured.value.category == "http_error"
+    request = json.loads((tmp_path / "request.json").read_text())
+    assert request["stream"] is True
+    assert "response_format" not in request
 
 
 def test_missing_model_lists_visible_api_identifiers():
@@ -424,6 +643,113 @@ def test_forbidden_json_and_code_are_rejected(design_fixture):
     )
     with pytest.raises(CandidateError, match="two top-level functions|disallowed"):
         validate_candidate(forbidden, constants)
+
+
+def test_staged_validation_collects_independent_static_errors(design_fixture):
+    _, _, _, _, constants = design_fixture
+    candidate = _candidate(
+        code=(
+            "import os\n"
+            "def compute_extra_state(bad, signature):\n"
+            '    return np.asarray([np.sin(obs["not_a_field"])], dtype=np.float32)\n\n'
+            "def compute_reward_terms(obs, constants):\n"
+            "    return np.asarray([open('x')], dtype=np.float32)\n"
+        )
+    )
+    report = llm_design.validate_candidate_staged(candidate, constants)
+    codes = {item["code"] for item in report["errors"]}
+    assert "STATIC_TOP_LEVEL" in codes
+    assert "STATIC_FUNCTION_SIGNATURE" in codes
+    assert "STATIC_DISALLOWED_SYNTAX" in codes
+    assert "STATIC_NUMPY_CALL" in codes
+    assert "STATIC_FUNCTION_CALL" in codes
+    assert "STATIC_FORBIDDEN_FIELD" in codes
+    assert report["checks"]["execution"]["status"] == "not_run"
+
+
+def test_staged_validation_collects_independent_schema_errors(design_fixture):
+    _, _, _, _, constants = design_fixture
+    candidate = _candidate()
+    candidate["unexpected"] = True
+    candidate["features"][0]["dtype"] = "float64"
+    candidate["features"][0]["range"] = {"minimum": -2.0, "maximum": 2.0}
+    candidate["reward_terms"][0]["weight"] = float("inf")
+    report = llm_design.validate_candidate_staged(candidate, constants)
+    codes = {item["code"] for item in report["errors"]}
+    assert {
+        "SCHEMA_EXTRA_FIELD",
+        "SCHEMA_DTYPE",
+        "SCHEMA_FEATURE_RANGE",
+        "SCHEMA_WEIGHT",
+    }.issubset(codes)
+    assert report["can_execute"] is False
+
+
+def test_static_failures_are_not_executed_and_all_reach_revision_prompt(
+    tmp_path, monkeypatch
+):
+    fixed = _fixed_artifact(tmp_path)
+    invalid = _candidate(
+        name="multi-static-error",
+        code=(
+            "import os\n"
+            "def compute_extra_state(obs, constants):\n"
+            '    return np.asarray([np.sin(obs["missing"])], dtype=np.float32)\n\n'
+            "def compute_reward_terms(obs, constants):\n"
+            "    return np.asarray([open('x')], dtype=np.float32)\n"
+        ),
+    )
+    calls = []
+    original = llm_design.execute_candidate_isolated
+
+    def guarded(candidate, *args, **kwargs):
+        calls.append(candidate["candidate_name"])
+        assert candidate["candidate_name"] != "multi-static-error"
+        return original(candidate, *args, **kwargs)
+
+    monkeypatch.setattr(llm_design, "execute_candidate_isolated", guarded)
+    result = run_design(
+        fixed_sample=fixed,
+        model="qwen/qwen3.5-9b",
+        client=MockClient([_response(invalid), _response(_candidate(name="fixed"))]),
+        max_attempts=2,
+        output_dir=tmp_path / "multi-static",
+        worker_timeout=10,
+    )
+    assert result["status"] == "approved"
+    assert calls == ["fixed"]
+    report = json.loads(
+        (tmp_path / "multi-static" / "attempt_01" / "validation_report.json").read_text()
+    )
+    assert len(report["errors"]) >= 3
+    prompt = (tmp_path / "multi-static" / "attempt_02" / "prompt.txt").read_text()
+    assert "multi-static-error" in prompt
+    assert "STATIC_DISALLOWED_SYNTAX" in prompt
+    assert "STATIC_FUNCTION_CALL" in prompt
+
+
+def test_runtime_errors_are_deduplicated_with_representative_samples(design_fixture):
+    _, arrays, _, _, constants = design_fixture
+    candidate = _candidate(
+        code=(
+            "def compute_extra_state(obs, constants):\n"
+            "    return np.asarray([[0.0]], dtype=np.float32)\n\n"
+            "def compute_reward_terms(obs, constants):\n"
+            "    return np.asarray([np.log(-1.0)], dtype=np.float32)\n"
+        )
+    )
+    with pytest.raises(CandidateExecutionError) as captured:
+        execute_candidate_isolated(
+            candidate, build_obs_arrays(arrays), constants, timeout=10
+        )
+    report = captured.value.report
+    codes = {item["code"] for item in report["errors"]}
+    assert "RUNTIME_SHAPE" in codes
+    assert "RUNTIME_NONFINITE" in codes
+    assert all(item["occurrence_count"] >= 1 for item in report["errors"])
+    assert all(
+        len(item["representative_samples"]) <= 3 for item in report["errors"]
+    )
 
 
 @pytest.mark.parametrize(
@@ -821,13 +1147,21 @@ def test_long_failed_output_is_marked_and_reasoning_only_is_not_replayed(tmp_pat
     [
         (APIError("timeout"), "api_failure"),
         (
+            {**_response(_candidate()), "transport_completed": False},
+            "stream_incomplete",
+        ),
+        (
             {
                 **_response(_candidate()),
                 "finish_reason": "length",
             },
             "candidate_format_or_validation_failure",
         ),
-        ({**_response(_candidate()), "content": "not json"}, "candidate_format_or_validation_failure"),
+        (
+            {**_response(_candidate()), "tool_calls_seen": True},
+            "candidate_format_or_validation_failure",
+        ),
+        ({**_response(_candidate()), "content": "not json"}, "candidate_json_failure"),
         (
             {**_response(_candidate()), "content": None, "reasoning": "analysis only"},
             "candidate_format_or_validation_failure",
