@@ -9,7 +9,9 @@ import hashlib
 import io
 import json
 import math
+import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 import tempfile
@@ -139,23 +141,79 @@ def _reject_duplicate_key(pairs):
     return result
 
 
-def parse_candidate_json(text: str) -> dict[str, Any]:
+def parse_candidate_json_envelope(text: str) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Parse a strict object, optionally inside one whole-response JSON fence."""
+
     if not isinstance(text, str) or not text.strip():
         raise CandidateError("candidate response is empty")
-    try:
-        value = json.loads(
-            text,
+    stripped = text.strip()
+    candidate_text = stripped
+    envelope_removed = False
+
+    def strict_loads(source: str) -> Any:
+        return json.loads(
+            source,
             object_pairs_hook=_reject_duplicate_key,
             parse_constant=lambda token: (_ for _ in ()).throw(
                 CandidateError(f"non-finite JSON number: {token}")
             ),
         )
+
+    try:
+        value = strict_loads(stripped)
     except CandidateError:
         raise
-    except json.JSONDecodeError as exc:
-        raise CandidateError(f"invalid JSON: {exc}") from exc
+    except json.JSONDecodeError as plain_error:
+        if "```" not in stripped:
+            raise CandidateError(f"invalid JSON: {plain_error}") from plain_error
+        match = re.fullmatch(
+            r"```(?P<label>json)?[ \t]*\r?\n(?P<body>[\s\S]*?)\r?\n```",
+            stripped,
+        )
+        if match is None:
+            fence_count = stripped.count("```")
+            opening = re.match(r"```([^\r\n]*)", stripped)
+            if fence_count > 2:
+                reason = "candidate response contains multiple Markdown code fences"
+            elif stripped.startswith("```") and fence_count < 2:
+                reason = "candidate response contains an incomplete Markdown code fence"
+            elif opening is not None and opening.group(1).strip() not in {"", "json"}:
+                reason = (
+                    "candidate response uses unsupported Markdown code-fence label "
+                    f"{opening.group(1).strip()!r}; only 'json' or no label is allowed"
+                )
+            elif not stripped.startswith("```") or not stripped.endswith("```"):
+                reason = (
+                    "candidate response contains explanatory text outside the single "
+                    "JSON Markdown code fence"
+                )
+            else:
+                reason = "candidate response has an invalid Markdown code-fence envelope"
+            raise CandidateError(reason)
+        candidate_text = match.group("body").strip()
+        envelope_removed = True
+        if not candidate_text:
+            raise CandidateError("candidate Markdown code fence is empty")
+        if "```" in candidate_text:
+            raise CandidateError("candidate response contains multiple Markdown code fences")
+        try:
+            value = strict_loads(candidate_text)
+        except CandidateError:
+            raise
+        except json.JSONDecodeError as exc:
+            raise CandidateError(f"invalid JSON inside Markdown code fence: {exc}") from exc
     if not isinstance(value, dict):
         raise CandidateError("candidate response must be one JSON object")
+    return value, {
+        "markdown_envelope_removed": bool(envelope_removed),
+        "accepted_envelope": "single_json_fence" if envelope_removed else "plain_json",
+        "raw_character_count": len(text),
+        "parsed_character_count": len(candidate_text),
+    }
+
+
+def parse_candidate_json(text: str) -> dict[str, Any]:
+    value, _ = parse_candidate_json_envelope(text)
     return value
 
 
@@ -1221,12 +1279,16 @@ def execute_candidate_isolated(
             str(report_path),
         ]
         try:
+            worker_environment = dict(os.environ)
+            for name in ("OPENAI_API_KEY", "LM_STUDIO_API_TOKEN"):
+                worker_environment.pop(name, None)
             completed = subprocess.run(
                 command,
                 capture_output=True,
                 text=True,
                 timeout=float(timeout),
                 check=False,
+                env=worker_environment,
             )
         except subprocess.TimeoutExpired as exc:
             raise CandidateExecutionError(

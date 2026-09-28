@@ -2,21 +2,30 @@
 
 `run_llm_design.py` is an offline design tool. It loads an existing
 `fixed_samples.json`/`fixed_samples.npz`/`baseline_report.json` set, asks one
-explicit LM Studio model for a current-only state/reward candidate, validates
+explicit LM Studio or OpenAI model for a current-only state/reward candidate, validates
 the candidate in an isolated worker, evaluates it on the baseline-defined
 fixed pair set, and either requests a complete revision or saves the first
 approved design. It never imports a candidate as a trusted project module and
 never invokes training.
 
-The client uses LM Studio's OpenAI-compatible `GET /v1/models` and
-`POST /v1/chat/completions` endpoints with streaming enabled and without a
+The default `--provider lmstudio` client uses LM Studio's OpenAI-compatible
+`GET /v1/models` and `POST /v1/chat/completions` endpoints. The
+`--provider openai` client uses the official
+`https://api.openai.com/v1/chat/completions` endpoint and reads
+`OPENAI_API_KEY` only from the process environment; dry-run does not require a
+key. OpenAI generation never calls LM Studio's native inventory endpoint and
+does not automatically retry a paid request. Both providers stream and omit a
 `response_format` override. Responses remain subject to duplicate-key-aware
 strict JSON, schema, AST, worker, and numeric validation. The requested model must exactly
-match a model identifier visible through `/v1/models`; no model substitution is
-performed. `LM_STUDIO_API_TOKEN` is used when present and is never saved.
+match a model identifier visible through LM Studio's `/v1/models`; no model
+substitution is performed. For OpenAI, `gpt-4o` may report one of the explicitly
+documented GPT-4o snapshots, while an explicitly requested snapshot must match
+exactly. This does not admit `gpt-4o-mini` or arbitrary prefixes.
+`LM_STUDIO_API_TOKEN`, `OPENAI_API_KEY`, and Authorization headers are never
+saved and are removed from the isolated candidate worker environment.
 
-`--context-length` is a client-side budget. The OpenAI-compatible chat endpoint
-does not use it to modify the model load configuration. During a real run the
+`--context-length` is a client-side budget. Neither provider uses it to modify
+server-side model capacity. During a real LM Studio run the
 tool separately queries `/api/v1/models` for the model-supported maximum,
 loaded instance context, quantization, and reasoning metadata when available.
 The effective budget is the minimum known bound. When no matching tokenizer is
@@ -26,6 +35,14 @@ stops before generation. On a revision after invalid JSON, only the failed raw
 final-content excerpt may be explicitly shortened, with truncation markers and
 preference for the parser-error location. The environment interface, schema,
 evaluation rules, and output reservation are never silently removed.
+
+Candidate parsing accepts either a plain JSON object or a whole response made
+of exactly one `json`/unlabelled Markdown code fence containing one JSON object.
+It removes only that outer fence and records the action in
+`candidate_parse_metadata.json`. Explanatory text, multiple/incomplete fences,
+other language labels, invalid JSON, duplicate keys, and non-finite JSON values
+remain errors; no punctuation, field, number, weight, formula, or Python code is
+repaired.
 
 ## Current-only candidate interface
 
@@ -136,6 +153,29 @@ Qwen:
   --timeout 600 --worker-timeout 120
 ```
 
+OpenAI GPT-4o dry-run (no API key or network request required):
+
+```powershell
+& 'C:\Users\user\anaconda3\envs\LLM_HRL\python.exe' run_llm_design.py `
+  --provider openai --model gpt-4o `
+  --fixed-sample results/llm_baselines/baseline-20260927T130708Z-ba4bf287 `
+  --context-length 40000 --max-output-tokens 4096 --dry-run
+```
+
+One GPT-4o generation attempt (the key remains in `OPENAI_API_KEY`, not the
+command line):
+
+```powershell
+& 'C:\Users\user\anaconda3\envs\LLM_HRL\python.exe' run_llm_design.py `
+  --provider openai --model gpt-4o `
+  --fixed-sample results/llm_baselines/baseline-20260927T130708Z-ba4bf287 `
+  --context-length 40000 --max-output-tokens 4096 `
+  --temperature 0.3 --seed 20260927 --max-attempts 1 `
+  --beta 1 --batch-size 128 `
+  --connect-timeout 30 --timeout 600 --total-timeout 1800 `
+  --worker-timeout 120
+```
+
 Gemma uses the same task, schema, evaluation, and thresholds:
 
 ```powershell
@@ -166,7 +206,12 @@ history and `run_metadata.json` but has no `approved/` directory. A revision
 uses only the immediately preceding output: a successfully parsed full
 candidate plus its validation/evaluation feedback, or the failed raw final
 content plus its parse error. Reasoning-only text is stored locally but is not
-replayed as candidate code. Full validation reports remain on disk. If parsed
+replayed as candidate code. Each attempt's `prompt_feedback.json` is explicitly
+the incoming feedback used for that request and records its source attempt;
+attempt 1 therefore correctly has `feedback: null`. Feedback generated after
+checking the response is saved separately in that attempt's `feedback.json`
+with its source and intended next-attempt provenance. Full validation reports
+remain on disk. If parsed
 candidate feedback is too large for the fixed context budget, a stable summary
 keeps independently actionable roots and records original, included, omitted,
 and repeated-occurrence counts in `prompt_feedback.json`. Structured source
@@ -214,3 +259,8 @@ LM Studio interface references used by this implementation:
 - [OpenAI-compatible model listing](https://lmstudio.ai/docs/developer/openai-compat/models)
 - [OpenAI-compatible chat completions and supported parameters](https://beta.lmstudio.ai/docs/developer/openai-compat/chat-completions)
 - [Native model/load inventory and context metadata](https://lmstudio.ai/docs/developer/rest/list)
+
+OpenAI references used by the OpenAI provider:
+
+- [Chat Completions API](https://developers.openai.com/api/reference/resources/chat)
+- [GPT-4o model and documented snapshots](https://developers.openai.com/api/docs/models/gpt-4o)

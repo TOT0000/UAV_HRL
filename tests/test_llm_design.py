@@ -8,6 +8,7 @@ import urllib.request
 
 import numpy as np
 import pytest
+import llm_candidate
 import llm_design
 import llm_streaming
 import run_llm_design
@@ -23,14 +24,17 @@ from llm_candidate import (
     feature_reward,
     load_approved_design,
     parse_candidate_json,
+    parse_candidate_json_envelope,
     validate_candidate,
 )
 from llm_design import (
     APIError,
     EvaluationContext,
     LMStudioClient,
+    OpenAIClient,
     evaluate_candidate,
     model_inventory_summary,
+    response_model_matches,
     run_design,
 )
 from llm_streaming import (
@@ -285,6 +289,19 @@ class StreamingHTTPClient(LMStudioClient):
         return self.response
 
 
+class OpenAIStreamingClient(OpenAIClient):
+    def __init__(self, chunks, **kwargs):
+        super().__init__(retries=0, progress_interval=60, **kwargs)
+        self.response = ChunkedResponse(chunks)
+        self.sent_request = None
+
+    def _open_stream(
+        self, request, *, connect_timeout, header_timeout, total_timeout
+    ):
+        self.sent_request = request
+        return self.response
+
+
 @contextmanager
 def _local_stream_server(behavior):
     class Handler(BaseHTTPRequestHandler):
@@ -520,6 +537,31 @@ def test_dry_run_cli_prints_model_parameters_and_token_budget(monkeypatch, capsy
     assert received["total_timeout"] == 1801.0
     assert received["progress_interval"] == 11.0
     assert received["worker_timeout"] == 7.0
+    assert received["provider"] == "lmstudio"
+    assert received["base_url"] is None
+
+
+def test_cli_redacts_provider_credentials_from_errors(monkeypatch, capsys):
+    secret = "fixture-cli-secret"
+    monkeypatch.setenv("OPENAI_API_KEY", secret)
+
+    def fail(**_kwargs):
+        raise RuntimeError(f"unexpected Authorization: Bearer {secret}")
+
+    monkeypatch.setattr(run_llm_design, "run_design", fail)
+    assert run_llm_design.main(
+        [
+            "--provider",
+            "openai",
+            "--fixed-sample",
+            "fixture",
+            "--model",
+            "gpt-4o",
+        ]
+    ) == 2
+    error = capsys.readouterr().err
+    assert secret not in error
+    assert "[REDACTED]" in error
 
 
 @pytest.mark.parametrize("model", ["qwen/qwen3.5-9b", "google/gemma-4-e4b"])
@@ -566,6 +608,146 @@ def test_lm_studio_request_streams_without_response_format(tmp_path, model):
     assert "response_format" not in saved
     assert result["structured_output_sent"] is False
     assert result["transport_completed"] is True
+
+
+def test_openai_request_uses_official_chat_parameters_and_redacts_key(
+    tmp_path, monkeypatch
+):
+    secret = "fixture-openai-secret-must-not-be-saved"
+    monkeypatch.setenv("OPENAI_API_KEY", secret)
+    chunks = [
+        b'data: {"model":"gpt-4o-2024-11-20","choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}]}\n\n',
+        b'data: {"model":"gpt-4o-2024-11-20","choices":[],"usage":{"prompt_tokens":2,"completion_tokens":1,"total_tokens":3}}\n\n',
+        b"data: [DONE]\n\n",
+    ]
+    client = OpenAIStreamingClient(chunks, timeout=1, total_timeout=2)
+    assert client.retries == 0
+    result = client.chat(
+        model="gpt-4o",
+        prompt="return json",
+        temperature=0.3,
+        max_output_tokens=4096,
+        seed=20260927,
+        attempt_directory=tmp_path,
+    )
+    payload = json.loads(client.sent_request.data.decode("utf-8"))
+    assert client.sent_request.full_url == "https://api.openai.com/v1/chat/completions"
+    assert client.sent_request.get_header("Authorization") == f"Bearer {secret}"
+    assert payload["max_completion_tokens"] == 4096
+    assert "max_tokens" not in payload
+    assert payload["temperature"] == 0.3
+    assert payload["seed"] == 20260927
+    assert payload["stream"] is True
+    assert payload["stream_options"] == {"include_usage": True}
+    assert "response_format" not in payload
+    assert result["actual_model"] == "gpt-4o-2024-11-20"
+    assert result["usage"]["total_tokens"] == 3
+    assert result["raw"]["reconstructed_from_stream"] is True
+    assert (tmp_path / "stream_events.jsonl").is_file()
+    saved_text = "\n".join(
+        path.read_text(encoding="utf-8", errors="replace")
+        for path in tmp_path.iterdir()
+        if path.is_file()
+    )
+    assert secret not in saved_text
+
+
+def test_openai_key_is_not_sent_to_lmstudio(tmp_path, monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "fixture-openai-only-secret")
+    monkeypatch.delenv("LM_STUDIO_API_TOKEN", raising=False)
+    client = StreamingHTTPClient(
+        [
+            b'data: {"model":"qwen/qwen3.5-9b","choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}]}\n\n',
+            b"data: [DONE]\n\n",
+        ],
+        timeout=1,
+        total_timeout=2,
+    )
+    client.chat(
+        model="qwen/qwen3.5-9b",
+        prompt="return json",
+        temperature=0.3,
+        max_output_tokens=10,
+        seed=7,
+        attempt_directory=tmp_path,
+    )
+    assert client.sent_request.get_header("Authorization") is None
+
+
+def test_openai_missing_key_fails_but_dry_run_needs_no_key(tmp_path, monkeypatch):
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    client = OpenAIClient(timeout=1, total_timeout=2)
+    with pytest.raises(APIError, match="OPENAI_API_KEY") as captured:
+        client.chat(
+            model="gpt-4o",
+            prompt="return json",
+            temperature=0.3,
+            max_output_tokens=10,
+            seed=7,
+            attempt_directory=tmp_path / "missing-key",
+        )
+    assert captured.value.category == "authentication_error"
+
+    fixed = _fixed_artifact(tmp_path)
+    result = run_design(
+        fixed_sample=fixed,
+        provider="openai",
+        model="gpt-4o",
+        output_dir=tmp_path / "openai-dry-run",
+        dry_run=True,
+    )
+    assert result["status"] == "dry_run_complete"
+    assert result["metadata"]["generation_requests_sent"] == 0
+    assert result["metadata"]["model"]["inventory"] is None
+    request = json.loads(
+        (tmp_path / "openai-dry-run" / "request_attempt_01.json").read_text()
+    )
+    assert request["max_completion_tokens"] == 4096
+    assert "max_tokens" not in request
+
+
+def test_openai_model_alias_accepts_only_documented_gpt4o_snapshots():
+    assert response_model_matches("openai", "gpt-4o", "gpt-4o")
+    assert response_model_matches("openai", "gpt-4o", "gpt-4o-2024-08-06")
+    assert not response_model_matches("openai", "gpt-4o", "gpt-4o-mini")
+    assert not response_model_matches("openai", "gpt-4o", "gpt-4o-made-up")
+    assert response_model_matches(
+        "openai", "gpt-4o-2024-11-20", "gpt-4o-2024-11-20"
+    )
+    assert not response_model_matches(
+        "openai", "gpt-4o-2024-11-20", "gpt-4o"
+    )
+    with pytest.raises(ValueError, match="official base URL"):
+        OpenAIClient("https://example.invalid/v1")
+
+
+def test_openai_provider_skips_lmstudio_inventory_and_accepts_snapshot(
+    tmp_path,
+):
+    fixed = _fixed_artifact(tmp_path)
+
+    class NoInventoryClient(MockClient):
+        def list_models(self):
+            raise AssertionError("OpenAI provider must not call LM Studio model APIs")
+
+    response = _response(_candidate(), model="gpt-4o")
+    response["actual_model"] = "gpt-4o-2024-11-20"
+    response["raw"]["model"] = "gpt-4o-2024-11-20"
+    client = NoInventoryClient([response], model="gpt-4o")
+    result = run_design(
+        fixed_sample=fixed,
+        provider="openai",
+        model="gpt-4o",
+        client=client,
+        max_attempts=1,
+        output_dir=tmp_path / "openai-mock-run",
+        worker_timeout=10,
+    )
+    assert result["status"] == "approved"
+    assert result["metadata"]["model"]["provider"] == "openai"
+    assert result["metadata"]["model"]["actual_api_identifiers_reported"] == [
+        "gpt-4o-2024-11-20"
+    ]
 
 
 def test_sse_decoder_handles_utf8_and_event_boundaries():
@@ -625,6 +807,21 @@ def test_stream_accumulates_content_reasoning_and_optional_usage(tmp_path):
         progress_interval=60,
     )
     assert with_usage["usage"] == {"prompt_tokens": 2, "completion_tokens": 1}
+
+    refused = capture_chat_stream(
+        ChunkedResponse(
+            [
+                b'data: {"choices":[{"delta":{"refusal":"not allowed"},"finish_reason":"stop"}]}\n\n',
+                b"data: [DONE]\n\n",
+            ]
+        ),
+        directory=tmp_path / "refusal",
+        idle_timeout=1,
+        total_timeout=2,
+        progress_interval=60,
+    )
+    assert refused["refusal"] == "not allowed"
+    assert refused["content"] == ""
 
 
 def test_partial_stream_is_flushed_before_connection_failure(tmp_path):
@@ -1024,6 +1221,39 @@ def test_http_error_is_classified_and_request_is_saved(tmp_path):
     assert "response_format" not in request
 
 
+def test_openai_http_error_is_classified_and_secret_is_redacted(
+    tmp_path, monkeypatch
+):
+    secret = "fixture-sensitive-error-secret"
+    monkeypatch.setenv("OPENAI_API_KEY", secret)
+
+    class ErrorResponse(ChunkedResponse):
+        status = 401
+        reason = "unauthorized"
+
+        def abort(self):
+            self.closed = True
+
+    client = OpenAIStreamingClient([], timeout=1, total_timeout=2)
+    client.response = ErrorResponse(
+        [json.dumps({"error": {"message": f"bad Authorization: Bearer {secret}"}}).encode()]
+    )
+    with pytest.raises(APIError) as captured:
+        client.chat(
+            model="gpt-4o",
+            prompt="return json",
+            temperature=0.3,
+            max_output_tokens=10,
+            seed=7,
+            attempt_directory=tmp_path,
+        )
+    assert captured.value.category == "authentication_error"
+    assert secret not in str(captured.value)
+    status = (tmp_path / "stream_status.json").read_text()
+    assert secret not in status
+    assert "[REDACTED]" in status
+
+
 def test_missing_model_lists_visible_api_identifiers():
     with pytest.raises(APIError, match="available model IDs.*visible/model"):
         model_inventory_summary(
@@ -1055,6 +1285,60 @@ def test_forbidden_json_and_code_are_rejected(design_fixture):
     )
     with pytest.raises(CandidateError, match="one top-level function|disallowed"):
         validate_candidate(forbidden, constants)
+
+
+def test_candidate_parser_accepts_only_plain_or_single_json_fence():
+    candidate = _candidate()
+    raw = json.dumps(candidate)
+    plain, plain_meta = parse_candidate_json_envelope(f"  {raw}\n")
+    fenced, fenced_meta = parse_candidate_json_envelope(f"```json\n{raw}\n```")
+    unlabelled, unlabelled_meta = parse_candidate_json_envelope(f"```\n{raw}\n```")
+    assert plain == fenced == unlabelled == candidate
+    assert plain_meta["markdown_envelope_removed"] is False
+    assert fenced_meta["markdown_envelope_removed"] is True
+    assert unlabelled_meta["markdown_envelope_removed"] is True
+    assert fenced["code"] == candidate["code"]
+    assert fenced["features"][0]["reward_weight"] == candidate["features"][0][
+        "reward_weight"
+    ]
+
+
+@pytest.mark.parametrize(
+    "text, message",
+    [
+        ("before\n```json\n{}\n```", "outside"),
+        ("```json\n{}\n```\n```json\n{}\n```", "multiple"),
+        ("```json\n{}", "incomplete"),
+        ("```python\n{}\n```", "unsupported"),
+        ("```json\n{bad}\n```", "invalid JSON inside"),
+    ],
+)
+def test_candidate_parser_rejects_ambiguous_or_invalid_fences(text, message):
+    with pytest.raises(CandidateError, match=message):
+        parse_candidate_json(text)
+
+
+def test_candidate_worker_does_not_inherit_provider_credentials(
+    design_fixture, monkeypatch
+):
+    _, arrays, _, _, constants = design_fixture
+    monkeypatch.setenv("OPENAI_API_KEY", "worker-must-not-see-openai")
+    monkeypatch.setenv("LM_STUDIO_API_TOKEN", "worker-must-not-see-lmstudio")
+    original_run = llm_candidate.subprocess.run
+    observed = {}
+
+    def checked_run(*args, **kwargs):
+        observed.update(kwargs.get("env") or {})
+        return original_run(*args, **kwargs)
+
+    monkeypatch.setattr(llm_candidate.subprocess, "run", checked_run)
+    extra, reward, _ = execute_candidate_isolated(
+        _candidate(), build_obs_arrays(arrays), constants, timeout=10
+    )
+    assert extra.shape[0] == arrays["state"].shape[0]
+    assert reward.shape[0] == arrays["state"].shape[0]
+    assert "OPENAI_API_KEY" not in observed
+    assert "LM_STUDIO_API_TOKEN" not in observed
 
 
 def test_staged_validation_collects_independent_static_errors(design_fixture):
@@ -2020,6 +2304,111 @@ def test_parse_failure_revision_includes_latest_raw_content_and_error(tmp_path):
     assert invalid_text in prompt
     assert "invalid JSON" in prompt
     assert "Previous failed raw final content" in prompt
+    first_incoming = json.loads(
+        (tmp_path / "parse-revision" / "attempt_01" / "prompt_feedback.json").read_text()
+    )
+    assert first_incoming["record_role"] == "incoming_feedback_used_to_build_request"
+    assert first_incoming["target_attempt"] == 1
+    assert first_incoming["source_attempt"] is None
+    assert first_incoming["feedback"] is None
+    generated = json.loads(
+        (tmp_path / "parse-revision" / "attempt_01" / "feedback.json").read_text()
+    )
+    assert generated["feedback_provenance"] == {
+        "record_role": "validation_feedback_generated_from_response",
+        "source_attempt": 1,
+        "intended_next_attempt": 2,
+    }
+    second_incoming = json.loads(
+        (tmp_path / "parse-revision" / "attempt_02" / "prompt_feedback.json").read_text()
+    )
+    assert second_incoming["source_attempt"] == 1
+    assert second_incoming["feedback"]["confirmed_errors"][0]["code"] == "JSON_PARSE_ERROR"
+
+
+def test_single_json_fence_is_recorded_then_fully_validated(tmp_path):
+    fixed = _fixed_artifact(tmp_path)
+    candidate = _candidate(name="fenced-candidate")
+    response = _response(candidate)
+    response["content"] = "```json\n" + json.dumps(candidate) + "\n```"
+    result = run_design(
+        fixed_sample=fixed,
+        model="qwen/qwen3.5-9b",
+        client=MockClient([response]),
+        max_attempts=1,
+        output_dir=tmp_path / "fenced-run",
+        worker_timeout=10,
+    )
+    assert result["status"] == "approved"
+    metadata = json.loads(
+        (tmp_path / "fenced-run" / "attempt_01" / "candidate_parse_metadata.json").read_text()
+    )
+    assert metadata["markdown_envelope_removed"] is True
+    assert metadata["accepted_envelope"] == "single_json_fence"
+    assert (tmp_path / "fenced-run" / "attempt_01" / "response_content.txt").read_text().startswith(
+        "```json"
+    )
+
+    invalid = _candidate(name="fenced-but-invalid")
+    invalid["unexpected"] = True
+    invalid_response = _response(invalid)
+    invalid_response["content"] = "```\n" + json.dumps(invalid) + "\n```"
+    failed = run_design(
+        fixed_sample=fixed,
+        model="qwen/qwen3.5-9b",
+        client=MockClient([invalid_response]),
+        max_attempts=1,
+        output_dir=tmp_path / "fenced-invalid-run",
+        worker_timeout=10,
+    )
+    assert failed["status"] == "failed_no_approved_candidate"
+    assert not (tmp_path / "fenced-invalid-run" / "approved").exists()
+
+
+def test_ambiguous_fence_feedback_is_specific_and_reaches_next_prompt(tmp_path):
+    fixed = _fixed_artifact(tmp_path)
+    invalid_text = "Explanation\n```json\n{}\n```"
+    client = MockClient(
+        [
+            {**_response(_candidate()), "content": invalid_text},
+            _response(_candidate(name="fixed")),
+        ]
+    )
+    result = run_design(
+        fixed_sample=fixed,
+        model=client.model,
+        client=client,
+        max_attempts=2,
+        output_dir=tmp_path / "outer-text-revision",
+        worker_timeout=10,
+    )
+    assert result["status"] == "approved"
+    prompt = (tmp_path / "outer-text-revision" / "attempt_02" / "prompt.txt").read_text()
+    assert invalid_text in prompt
+    assert "explanatory text outside" in prompt
+    assert "one `json`/unlabelled Markdown fence" in prompt
+
+
+def test_openai_refusal_stops_without_revision_or_approved_artifact(tmp_path):
+    fixed = _fixed_artifact(tmp_path)
+    response = _response(_candidate(), model="gpt-4o")
+    response["refusal"] = "I cannot provide this output."
+    client = MockClient([response], model="gpt-4o")
+    result = run_design(
+        fixed_sample=fixed,
+        provider="openai",
+        model="gpt-4o",
+        client=client,
+        max_attempts=2,
+        output_dir=tmp_path / "openai-refusal",
+        worker_timeout=10,
+    )
+    assert result["status"] == "failed_no_approved_candidate"
+    assert len(client.calls) == 1
+    assert result["metadata"]["attempt_history"] == [
+        {"attempt": 1, "status": "model_refusal"}
+    ]
+    assert not (tmp_path / "openai-refusal" / "approved").exists()
 
 
 def test_latest_invalid_json_does_not_reuse_older_parsed_candidate(tmp_path):

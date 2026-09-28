@@ -1,4 +1,4 @@
-"""Offline LM Studio candidate generation, validation, and fixed-pair scoring."""
+"""Offline provider candidate generation, validation, and fixed-pair scoring."""
 
 from __future__ import annotations
 
@@ -27,7 +27,7 @@ from llm_candidate import (
     candidate_numeric_diagnostics,
     execute_candidate_isolated,
     feature_reward,
-    parse_candidate_json,
+    parse_candidate_json_envelope,
     save_approved_artifact,
     validate_candidate,
     validate_candidate_staged,
@@ -49,7 +49,16 @@ from llm_streaming import (
 )
 
 
-DEFAULT_BASE_URL = "http://127.0.0.1:1234/v1"
+DEFAULT_LMSTUDIO_BASE_URL = "http://127.0.0.1:1234/v1"
+DEFAULT_OPENAI_BASE_URL = "https://api.openai.com/v1"
+# Backward-compatible public name used by existing LM Studio callers.
+DEFAULT_BASE_URL = DEFAULT_LMSTUDIO_BASE_URL
+SUPPORTED_PROVIDERS = {"lmstudio", "openai"}
+GPT4O_SNAPSHOTS = {
+    "gpt-4o-2024-05-13",
+    "gpt-4o-2024-08-06",
+    "gpt-4o-2024-11-20",
+}
 DEFAULT_CONTEXT_LENGTH = 40_000
 DEFAULT_MAX_OUTPUT_TOKENS = 4096
 DEFAULT_TEMPERATURE = 0.3
@@ -78,6 +87,32 @@ class APIError(RuntimeError):
 
 class ContextBudgetError(ValueError):
     pass
+
+
+def _redact_text(value: Any, secrets: Iterable[str] = ()) -> str:
+    text = str(value)
+    for secret in secrets:
+        if secret:
+            text = text.replace(str(secret), "[REDACTED]")
+    return re.sub(
+        r"(?i)(authorization\s*[:=]\s*bearer\s+)[^\s,;\"']+",
+        r"\1[REDACTED]",
+        text,
+    )
+
+
+def redact_provider_secrets(value: Any) -> str:
+    return _redact_text(
+        value,
+        tuple(
+            secret
+            for secret in (
+                os.environ.get("OPENAI_API_KEY"),
+                os.environ.get("LM_STUDIO_API_TOKEN"),
+            )
+            if secret
+        ),
+    )
 
 
 def _write_json(path: Path, value: Any) -> None:
@@ -154,6 +189,30 @@ class LMStudioClient:
         self.progress_interval = float(progress_interval)
         self.retries = max(0, int(retries))
         self.token = os.environ.get("LM_STUDIO_API_TOKEN")
+        self.provider = "lmstudio"
+
+    def validate_configuration(self) -> None:
+        return None
+
+    def _safe(self, value: Any) -> str:
+        return _redact_text(value, (self.token,) if self.token else ())
+
+    def _payload(
+        self, *, model: str, prompt: str, temperature: float,
+        max_output_tokens: int, seed: int
+    ) -> dict[str, Any]:
+        return {
+            "model": model,
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": float(temperature),
+            "max_tokens": int(max_output_tokens),
+            "seed": int(seed),
+            "stream": True,
+            "stream_options": {"include_usage": True},
+        }
+
+    def _http_error_category(self, status: int) -> str:
+        return "http_error"
 
     def _request(self, method: str, url: str, payload: dict | None = None) -> dict:
         data = None
@@ -177,7 +236,7 @@ class LMStudioClient:
                 return value
             except urllib.error.HTTPError as exc:
                 body = exc.read().decode("utf-8", errors="replace")
-                error = APIError(f"LM Studio HTTP {exc.code}: {body}")
+                error = APIError(f"LM Studio HTTP {exc.code}: {self._safe(body)}")
                 if 400 <= exc.code < 500:
                     raise error from exc
                 last_error = error
@@ -222,15 +281,14 @@ class LMStudioClient:
         seed: int,
         attempt_directory: str | Path,
     ) -> dict[str, Any]:
-        payload = {
-            "model": model,
-            "messages": [{"role": "user", "content": prompt}],
-            "temperature": float(temperature),
-            "max_tokens": int(max_output_tokens),
-            "seed": int(seed),
-            "stream": True,
-            "stream_options": {"include_usage": True},
-        }
+        self.validate_configuration()
+        payload = self._payload(
+            model=model,
+            prompt=prompt,
+            temperature=temperature,
+            max_output_tokens=max_output_tokens,
+            seed=seed,
+        )
         attempt_directory = Path(attempt_directory)
         _write_json(attempt_directory / "request.json", payload)
         data = json.dumps(payload, allow_nan=False).encode("utf-8")
@@ -273,11 +331,11 @@ class LMStudioClient:
                 {
                     "status": exc.category,
                     "error_type": type(exc).__name__,
-                    "error": str(exc),
+                    "error": self._safe(exc),
                 },
             )
-            raise APIError(str(exc), category=exc.category) from exc
-        if getattr(response, "status", 200) >= 400:
+            raise APIError(self._safe(exc), category=exc.category) from exc
+        if getattr(response, "status", 200) >= 300:
             remaining_total = max(
                 0.0, self.total_timeout - (time.monotonic() - request_started)
             )
@@ -285,8 +343,9 @@ class LMStudioClient:
                 response,
                 idle_timeout=self.timeout,
                 total_timeout=remaining_total,
+                redact=self._safe,
             )
-            body = body_bytes.decode("utf-8", errors="replace")
+            body = self._safe(body_bytes.decode("utf-8", errors="replace"))
             status = {
                 **body_status,
                 "http_status": int(response.status),
@@ -296,11 +355,12 @@ class LMStudioClient:
             _write_json(attempt_directory / "stream_status.json", status)
             if body_status["status"] != "complete":
                 raise APIError(
-                    body_status["failure"] or "HTTP error body read failed",
+                    self._safe(body_status["failure"] or "HTTP error body read failed"),
                     category=body_status["status"],
                 )
             raise APIError(
-                f"LM Studio HTTP {response.status}: {body}", category="http_error"
+                f"{self.provider} HTTP {response.status}: {body}",
+                category=self._http_error_category(int(response.status)),
             )
         remaining_total = self.total_timeout - (time.monotonic() - request_started)
         if remaining_total <= 0.0:
@@ -318,9 +378,10 @@ class LMStudioClient:
                 idle_timeout=self.timeout,
                 total_timeout=remaining_total,
                 progress_interval=self.progress_interval,
+                redact=self._safe,
             )
         except StreamTransportError as exc:
-            raise APIError(str(exc), category=exc.category) from exc
+            raise APIError(self._safe(exc), category=exc.category) from exc
         content = streamed["content"]
         reasoning = streamed["reasoning"]
         adapter = model_adapter(model)
@@ -358,7 +419,58 @@ class LMStudioClient:
             "request_elapsed_seconds": time.monotonic() - request_started,
             "stream_event_count": streamed["event_count"],
             "stream_received_bytes": streamed["received_bytes"],
+            "refusal": streamed.get("refusal"),
         }
+
+
+class OpenAIClient(LMStudioClient):
+    """OpenAI Chat Completions client without SDK retries or model inventory calls."""
+
+    def __init__(self, base_url=DEFAULT_OPENAI_BASE_URL, **kwargs):
+        retries = int(kwargs.pop("retries", 0))
+        if retries != 0:
+            raise ValueError("OpenAI paid generation retries must remain disabled")
+        normalized = str(base_url).rstrip("/")
+        if normalized != DEFAULT_OPENAI_BASE_URL:
+            raise ValueError(
+                "OpenAI provider only permits the official base URL "
+                f"{DEFAULT_OPENAI_BASE_URL!r}; custom endpoints are not supported"
+            )
+        super().__init__(normalized, retries=0, **kwargs)
+        self.provider = "openai"
+        self.token = os.environ.get("OPENAI_API_KEY")
+
+    def validate_configuration(self) -> None:
+        if not self.token:
+            raise APIError(
+                "OPENAI_API_KEY is required for OpenAI generation; set it in the "
+                "environment before starting the process",
+                category="authentication_error",
+            )
+
+    def list_models(self) -> dict[str, Any]:
+        raise RuntimeError("OpenAI provider does not use model inventory discovery")
+
+    def _payload(
+        self, *, model: str, prompt: str, temperature: float,
+        max_output_tokens: int, seed: int
+    ) -> dict[str, Any]:
+        return {
+            "model": model,
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": float(temperature),
+            "max_completion_tokens": int(max_output_tokens),
+            "seed": int(seed),
+            "stream": True,
+            "stream_options": {"include_usage": True},
+        }
+
+    def _http_error_category(self, status: int) -> str:
+        if status in {401, 403}:
+            return "authentication_error"
+        if status == 429:
+            return "rate_limit_or_quota_error"
+        return "http_error"
 
 
 def model_adapter(model: str) -> str:
@@ -418,6 +530,50 @@ def model_inventory_summary(inventory: dict[str, Any], requested: str) -> dict[s
         "actual_loaded_context_length": loaded_context,
         "native_inventory_error": inventory.get("native_error"),
     }
+
+
+def provider_base_url(provider: str, base_url: str | None) -> str:
+    provider = str(provider).lower()
+    if provider not in SUPPORTED_PROVIDERS:
+        raise ValueError(
+            f"provider must be one of {sorted(SUPPORTED_PROVIDERS)}, got {provider!r}"
+        )
+    if base_url is not None:
+        return str(base_url).rstrip("/")
+    return (
+        DEFAULT_OPENAI_BASE_URL
+        if provider == "openai"
+        else DEFAULT_LMSTUDIO_BASE_URL
+    )
+
+
+def planned_chat_request(
+    provider: str,
+    *,
+    model: str,
+    prompt: str,
+    temperature: float,
+    max_output_tokens: int,
+    seed: int,
+) -> dict[str, Any]:
+    token_field = "max_completion_tokens" if provider == "openai" else "max_tokens"
+    return {
+        "model": model,
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": float(temperature),
+        token_field: int(max_output_tokens),
+        "seed": int(seed),
+        "stream": True,
+        "stream_options": {"include_usage": True},
+    }
+
+
+def response_model_matches(provider: str, requested: str, returned: str) -> bool:
+    """Apply provider-specific, non-prefix model identity checks."""
+
+    if provider != "openai" or requested != "gpt-4o":
+        return returned == requested
+    return returned == requested or returned in GPT4O_SNAPSHOTS
 
 
 def _numeric_distribution(values: np.ndarray) -> dict[str, Any]:
@@ -921,7 +1077,11 @@ def _json_failure_report(exc: CandidateError) -> dict[str, Any]:
         "stage": "json",
         "location": location,
         "problem": str(exc),
-        "requirement": "Return one complete valid JSON object with no Markdown or surrounding text.",
+        "requirement": (
+            "Return one complete valid JSON object, either plain or as the entire body "
+            "of one `json`/unlabelled Markdown fence; include no surrounding text or "
+            "additional fence."
+        ),
         **details,
     }
     return {
@@ -971,6 +1131,20 @@ def _feedback_from_validation(report: dict[str, Any], category: str) -> dict[str
             "candidate JSON object using the unchanged interface and evaluation rules."
         ),
     }
+
+
+def _generated_feedback(
+    feedback: dict[str, Any], *, attempt: int, max_attempts: int
+) -> dict[str, Any]:
+    feedback = dict(feedback)
+    feedback["feedback_provenance"] = {
+        "record_role": "validation_feedback_generated_from_response",
+        "source_attempt": int(attempt),
+        "intended_next_attempt": (
+            int(attempt) + 1 if int(attempt) < int(max_attempts) else None
+        ),
+    }
+    return feedback
 
 
 def _shorten_feedback_text(value: Any, limit: int = 600) -> Any:
@@ -1241,7 +1415,8 @@ def run_design(
     *,
     fixed_sample: str | Path,
     model: str,
-    base_url: str = DEFAULT_BASE_URL,
+    provider: str = "lmstudio",
+    base_url: str | None = None,
     context_length: int = DEFAULT_CONTEXT_LENGTH,
     max_output_tokens: int = DEFAULT_MAX_OUTPUT_TOKENS,
     temperature: float = DEFAULT_TEMPERATURE,
@@ -1261,6 +1436,8 @@ def run_design(
     relative_tolerance: float = DEFAULT_RELATIVE_TOLERANCE,
     client: Any | None = None,
 ) -> dict[str, Any]:
+    provider = str(provider).lower()
+    resolved_base_url = provider_base_url(provider, base_url)
     if not model:
         raise ValueError("model API identifier is required")
     if int(context_length) <= 0 or int(max_output_tokens) <= 0:
@@ -1292,16 +1469,24 @@ def run_design(
         model, output_root=output_root, output_dir=output_dir
     )
     model_info = None
-    api_client = client or LMStudioClient(
-        base_url,
-        timeout=timeout,
-        connect_timeout=connect_timeout,
-        total_timeout=total_timeout,
-        progress_interval=progress_interval,
-    )
+    if client is not None:
+        api_client = client
+    else:
+        client_type = OpenAIClient if provider == "openai" else LMStudioClient
+        api_client = client_type(
+            resolved_base_url,
+            timeout=timeout,
+            connect_timeout=connect_timeout,
+            total_timeout=total_timeout,
+            progress_interval=progress_interval,
+        )
     if not dry_run:
-        inventory = api_client.list_models()
-        model_info = model_inventory_summary(inventory, model)
+        validate_configuration = getattr(api_client, "validate_configuration", None)
+        if callable(validate_configuration):
+            validate_configuration()
+        if provider == "lmstudio":
+            inventory = api_client.list_models()
+            model_info = model_inventory_summary(inventory, model)
     effective_context, context_info = _effective_context_budget(
         context_length, model_info
     )
@@ -1313,12 +1498,15 @@ def run_design(
         "prompt_version": PROMPT_VERSION,
         "candidate_schema": candidate_schema(),
         "model": {
+            "provider": provider,
             "requested_api_identifier": model,
             "adapter": model_adapter(model),
-            "base_url": str(base_url),
+            "base_url": resolved_base_url,
             "inventory": model_info,
             "quantization_or_load_information": (
-                "unknown in dry-run; no API request was sent"
+                "not applicable to OpenAI provider"
+                if provider == "openai"
+                else "unknown in dry-run; no API request was sent"
                 if dry_run
                 else model_info.get("native_model_information")
             ),
@@ -1344,6 +1532,7 @@ def run_design(
             "worker_timeout_seconds": float(worker_timeout),
             "structured_output": "disabled; strict JSON parsing and local validation remain mandatory",
             "streaming": True,
+            "provider": provider,
         },
         "context": context_info,
         "fixed_sample": {
@@ -1387,14 +1576,17 @@ def run_design(
     _write_json(
         output / "request_attempt_01.json",
         {
-            "model": model,
-            "messages": [{"role": "user", "content": first_prompt}],
-            "temperature": float(temperature),
-            "max_tokens": int(max_output_tokens),
-            "seed": int(seed),
-            "stream": True,
-            "stream_options": {"include_usage": True},
-            "context_length_note": "client budget only; not sent to alter LM Studio load configuration",
+            **planned_chat_request(
+                provider,
+                model=model,
+                prompt=first_prompt,
+                temperature=temperature,
+                max_output_tokens=max_output_tokens,
+                seed=seed,
+            ),
+            "context_length_note": (
+                "client budget only; not sent to alter provider model capacity"
+            ),
         },
     )
     if not first_budget["fits_client_budget"]:
@@ -1461,7 +1653,14 @@ def run_design(
             _feedback_prompt_variants(previous_attempt.get("feedback"))
             if previous_attempt is not None
             and previous_attempt.get("parsed_candidate") is not None
-            else [("full", None)]
+            else [
+                (
+                    "full",
+                    None
+                    if previous_attempt is None
+                    else previous_attempt.get("feedback"),
+                )
+            ]
         )
         prompt = None
         budget = None
@@ -1505,6 +1704,9 @@ def run_design(
         _write_json(
             round_directory / "prompt_feedback.json",
             {
+                "record_role": "incoming_feedback_used_to_build_request",
+                "target_attempt": attempt,
+                "source_attempt": None if previous_attempt is None else attempt - 1,
                 "strategy": selected_feedback_strategy,
                 "failed_raw_content_limit": selected_content_limit,
                 "feedback": selected_feedback,
@@ -1513,14 +1715,15 @@ def run_design(
         _write_json(
             round_directory / "request_planned.json",
             {
-                "model": model,
-                "messages": [{"role": "user", "content": prompt}],
-                "temperature": float(temperature),
-                "max_tokens": int(max_output_tokens),
-                "seed": int(seed),
-                "stream": True,
-                "stream_options": {"include_usage": True},
-                "context_length_note": "budget only; not a server load-setting request",
+                **planned_chat_request(
+                    provider,
+                    model=model,
+                    prompt=prompt,
+                    temperature=temperature,
+                    max_output_tokens=max_output_tokens,
+                    seed=seed,
+                ),
+                "context_length_note": "budget only; not a server capacity-setting request",
             },
         )
         if not budget["fits_client_budget"]:
@@ -1577,6 +1780,7 @@ def run_design(
                         "request_elapsed_seconds",
                         "stream_event_count",
                         "stream_received_bytes",
+                        "refusal",
                     )
                 },
             )
@@ -1589,10 +1793,18 @@ def run_design(
                     "generation response was not confirmed as a complete stream",
                     category="stream_incomplete",
                 )
-            if response.get("actual_model") not in {None, model}:
+            if response.get("actual_model") is not None and not response_model_matches(
+                provider, model, str(response.get("actual_model"))
+            ):
                 raise APIError(
-                    "LM Studio returned a different model identifier: "
-                    f"requested={model!r}, actual={response.get('actual_model')!r}"
+                    "provider returned a different model identifier: "
+                    f"provider={provider!r}, requested={model!r}, "
+                    f"actual={response.get('actual_model')!r}"
+                )
+            if response.get("refusal"):
+                raise APIError(
+                    f"model refused the generation request: {response.get('refusal')}",
+                    category="model_refusal",
                 )
             if response.get("reasoning") is not None:
                 (round_directory / "reasoning.txt").write_text(
@@ -1621,14 +1833,21 @@ def run_design(
                 reason = "model returned reasoning but no final JSON" if response.get("reasoning") else "model returned no final content"
                 raise CandidateError(reason)
             try:
-                candidate = parse_candidate_json(str(content))
+                candidate, parse_metadata = parse_candidate_json_envelope(str(content))
+                _write_json(
+                    round_directory / "candidate_parse_metadata.json", parse_metadata
+                )
             except CandidateError as exc:
                 validation_report = _json_failure_report(exc)
                 _write_json(
                     round_directory / "validation_report.json", validation_report
                 )
-                feedback = _feedback_from_validation(
-                    validation_report, "candidate_json_failure"
+                feedback = _generated_feedback(
+                    _feedback_from_validation(
+                        validation_report, "candidate_json_failure"
+                    ),
+                    attempt=attempt,
+                    max_attempts=max_attempts,
                 )
                 attempt_output["feedback"] = feedback
                 previous_attempt = attempt_output
@@ -1674,8 +1893,12 @@ def run_design(
                     },
                 }
                 _write_json(round_directory / "validation_report.json", duplicate_report)
-                feedback = _feedback_from_validation(
-                    duplicate_report, "duplicate_failed_candidate"
+                feedback = _generated_feedback(
+                    _feedback_from_validation(
+                        duplicate_report, "duplicate_failed_candidate"
+                    ),
+                    attempt=attempt,
+                    max_attempts=max_attempts,
                 )
                 attempt_output["feedback"] = feedback
                 previous_attempt = attempt_output
@@ -1690,8 +1913,12 @@ def run_design(
                 )
             if not staged["can_execute"]:
                 _write_json(round_directory / "validation_report.json", staged)
-                feedback = _feedback_from_validation(
-                    staged, "candidate_schema_or_static_failure"
+                feedback = _generated_feedback(
+                    _feedback_from_validation(
+                        staged, "candidate_schema_or_static_failure"
+                    ),
+                    attempt=attempt,
+                    max_attempts=max_attempts,
                 )
                 attempt_output["feedback"] = feedback
                 previous_attempt = attempt_output
@@ -1766,6 +1993,7 @@ def run_design(
                     provenance={
                         "run_directory": str(output),
                         "attempt": attempt,
+                        "provider": provider,
                         "model_requested": model,
                         "model_actual": response.get("actual_model"),
                         "fixed_sample_content_sha256": fixed_metadata[
@@ -1778,7 +2006,11 @@ def run_design(
                 )
                 history.append({"attempt": attempt, "status": "approved"})
                 break
-            feedback = _feedback_from_evaluation(evaluation)
+            feedback = _generated_feedback(
+                _feedback_from_evaluation(evaluation),
+                attempt=attempt,
+                max_attempts=max_attempts,
+            )
             attempt_output["feedback"] = feedback
             previous_attempt = attempt_output
             failed_candidates[current_candidate_fingerprint] = {
@@ -1790,7 +2022,11 @@ def run_design(
             history.append({"attempt": attempt, "status": evaluation["status"]})
         except APIError as exc:
             category = getattr(exc, "category", "api_failure")
-            feedback = _summarize_error(category, exc)
+            feedback = _generated_feedback(
+                _summarize_error(category, exc),
+                attempt=attempt,
+                max_attempts=max_attempts,
+            )
             feedback["retry_as_candidate_revision"] = False
             _write_json(round_directory / "failure.json", feedback)
             history.append({"attempt": attempt, "status": category})
@@ -1825,8 +2061,12 @@ def run_design(
             _write_json(
                 round_directory / "validation_report.json", execution_report
             )
-            feedback = _feedback_from_validation(
-                execution_report, "candidate_execution_failure"
+            feedback = _generated_feedback(
+                _feedback_from_validation(
+                    execution_report, "candidate_execution_failure"
+                ),
+                attempt=attempt,
+                max_attempts=max_attempts,
             )
             attempt_output["feedback"] = feedback
             previous_attempt = attempt_output
@@ -1839,7 +2079,11 @@ def run_design(
             _write_json(round_directory / "failure.json", feedback)
             history.append({"attempt": attempt, "status": "candidate_execution_failure"})
         except CandidateError as exc:
-            feedback = _summarize_error("candidate_format_or_validation_failure", exc)
+            feedback = _generated_feedback(
+                _summarize_error("candidate_format_or_validation_failure", exc),
+                attempt=attempt,
+                max_attempts=max_attempts,
+            )
             attempt_output["feedback"] = feedback
             previous_attempt = attempt_output
             if current_candidate_fingerprint is not None:

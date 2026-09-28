@@ -1,4 +1,4 @@
-"""CLI for offline LM Studio state/reward design against fixed samples."""
+"""CLI for offline LM-provider state/reward design against fixed samples."""
 
 from __future__ import annotations
 
@@ -11,7 +11,6 @@ from llm_design import (
     DEFAULT_API_PROGRESS_INTERVAL_SECONDS,
     DEFAULT_API_TOTAL_TIMEOUT_SECONDS,
     DEFAULT_API_TIMEOUT_SECONDS,
-    DEFAULT_BASE_URL,
     DEFAULT_BATCH_SIZE,
     DEFAULT_BETA,
     DEFAULT_CONTEXT_LENGTH,
@@ -22,6 +21,7 @@ from llm_design import (
     DEFAULT_SEED,
     DEFAULT_TEMPERATURE,
     DEFAULT_WORKER_TIMEOUT_SECONDS,
+    redact_provider_secrets,
     run_design,
 )
 
@@ -34,8 +34,18 @@ def build_parser() -> argparse.ArgumentParser:
         )
     )
     parser.add_argument("--fixed-sample", required=True)
-    parser.add_argument("--base-url", default=DEFAULT_BASE_URL)
-    parser.add_argument("--model", required=True, help="exact LM Studio API identifier")
+    parser.add_argument(
+        "--provider", choices=("lmstudio", "openai"), default="lmstudio"
+    )
+    parser.add_argument(
+        "--base-url",
+        default=None,
+        help=(
+            "provider endpoint; defaults to http://127.0.0.1:1234/v1 for "
+            "lmstudio and https://api.openai.com/v1 for openai"
+        ),
+    )
+    parser.add_argument("--model", required=True, help="exact provider API identifier")
     parser.add_argument("--context-length", type=int, default=DEFAULT_CONTEXT_LENGTH)
     parser.add_argument(
         "--max-output-tokens", type=int, default=DEFAULT_MAX_OUTPUT_TOKENS
@@ -50,7 +60,7 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=DEFAULT_API_TIMEOUT_SECONDS,
         help=(
-            "maximum idle seconds while reading one LM Studio stream "
+            "maximum idle seconds while reading one provider stream "
             "(default: 600); retained as the backward-compatible API timeout option"
         ),
     )
@@ -94,6 +104,7 @@ def main(argv=None) -> int:
     try:
         result = run_design(
             fixed_sample=args.fixed_sample,
+            provider=args.provider,
             model=args.model,
             base_url=args.base_url,
             context_length=args.context_length,
@@ -115,7 +126,12 @@ def main(argv=None) -> int:
             dry_run=args.dry_run,
         )
     except (OSError, RuntimeError, ValueError) as exc:
-        print(f"LLM design failed: {type(exc).__name__}: {exc}", file=sys.stderr)
+        print(
+            redact_provider_secrets(
+                f"LLM design failed: {type(exc).__name__}: {exc}"
+            ),
+            file=sys.stderr,
+        )
         return 2
     print(f"LLM design status: {result['status']}")
     print(f"Output: {result['output_directory']}")
@@ -125,6 +141,7 @@ def main(argv=None) -> int:
     budget = metadata.get("first_prompt_token_budget", {})
     model_metadata = metadata.get("model", {})
     print(f"Model: {model_metadata.get('requested_api_identifier', args.model)}")
+    print(f"Provider: {model_metadata.get('provider', args.provider)}")
     print(
         "Generation: "
         f"temperature={generation.get('temperature', args.temperature)}, "

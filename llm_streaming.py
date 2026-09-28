@@ -1,4 +1,4 @@
-"""Incremental SSE parsing and durable LM Studio stream capture."""
+"""Incremental SSE parsing and durable chat-completion stream capture."""
 
 from __future__ import annotations
 
@@ -407,6 +407,7 @@ def read_response_body_bounded(
     idle_timeout: float,
     total_timeout: float,
     maximum_bytes: int = 65_536,
+    redact=None,
 ) -> tuple[bytes, dict[str, Any]]:
     """Read an HTTP error body with the same bounded cancellation semantics."""
 
@@ -465,6 +466,8 @@ def read_response_body_bounded(
             else:
                 status = "stream_connection_error"
                 failure = f"HTTP error body read failed: {type(value).__name__}: {value}"
+                if callable(redact):
+                    failure = redact(failure)
                 break
     except KeyboardInterrupt:
         status = "stream_cancelled"
@@ -492,8 +495,12 @@ def capture_chat_stream(
     progress_interval: float = 10.0,
     cancel_event: threading.Event | None = None,
     cleanup_timeout: float = 0.5,
+    redact=None,
 ) -> dict[str, Any]:
     """Consume one HTTP SSE body while preserving every completed event."""
+
+    def safe_text(value: Any) -> str:
+        return redact(value) if callable(redact) else str(value)
 
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=True)
@@ -506,6 +513,7 @@ def capture_chat_stream(
     decoder = SSEDecoder()
     content_parts: list[str] = []
     reasoning_parts: list[str] = []
+    refusal_parts: list[str] = []
     finish_reason = None
     actual_model = None
     usage = None
@@ -549,6 +557,7 @@ def capture_chat_stream(
             "received_bytes": int(byte_count),
             "content_characters": sum(map(len, content_parts)),
             "reasoning_characters": sum(map(len, reasoning_parts)),
+            "refusal_characters": sum(map(len, refusal_parts)),
             "first_output_elapsed_seconds": first_output_elapsed,
             "elapsed_seconds": time.monotonic() - started,
             "failure": failure,
@@ -568,10 +577,11 @@ def capture_chat_stream(
                 nonlocal terminal_chunk_received, actual_model, usage
                 nonlocal tool_calls_seen, first_output_elapsed
                 event_count += 1
+                safe_data = redact(data) if callable(redact) else data
                 record: dict[str, Any] = {
                     "sequence": event_count,
                     "elapsed_seconds": time.monotonic() - started,
-                    "data": data,
+                    "data": safe_data,
                 }
                 # Persist the complete SSE data event before interpreting it so
                 # a malformed JSON event is still available after failure.
@@ -579,11 +589,11 @@ def capture_chat_stream(
                     json.dumps(record, ensure_ascii=False, allow_nan=False) + "\n"
                 )
                 event_file.flush()
-                if data.strip() == "[DONE]":
+                if safe_data.strip() == "[DONE]":
                     done_received = True
                 else:
                     try:
-                        value = json.loads(data)
+                        value = json.loads(safe_data)
                     except json.JSONDecodeError as exc:
                         raise StreamTransportError(
                             "stream_protocol_error",
@@ -597,7 +607,7 @@ def capture_chat_stream(
                     if value.get("error") is not None:
                         raise StreamTransportError(
                             "stream_server_error",
-                            f"LM Studio stream error: {value['error']}",
+                            f"chat completion stream error: {value['error']}",
                         )
                     if value.get("model") is not None:
                         actual_model = value["model"]
@@ -624,6 +634,7 @@ def capture_chat_stream(
                         reasoning = delta.get(
                             "reasoning_content", delta.get("reasoning")
                         )
+                        refusal = delta.get("refusal")
                         if content is not None:
                             if not isinstance(content, str):
                                 raise StreamTransportError(
@@ -634,6 +645,17 @@ def capture_chat_stream(
                                 content_parts.append(content)
                                 content_file.write(content)
                                 content_file.flush()
+                                first_output_elapsed = first_output_elapsed or (
+                                    time.monotonic() - started
+                                )
+                        if refusal is not None:
+                            if not isinstance(refusal, str):
+                                raise StreamTransportError(
+                                    "stream_protocol_error",
+                                    "stream refusal delta is not text",
+                                )
+                            if refusal:
+                                refusal_parts.append(refusal)
                                 first_output_elapsed = first_output_elapsed or (
                                     time.monotonic() - started
                                 )
@@ -704,7 +726,9 @@ def capture_chat_stream(
                 if kind == "error":
                     raise StreamTransportError(
                         "stream_connection_error",
-                        f"stream read failed: {type(value).__name__}: {value}",
+                        safe_text(
+                            f"stream read failed: {type(value).__name__}: {value}"
+                        ),
                     ) from value
                 if kind == "eof":
                     for event in decoder.feed(b"", final=True):
@@ -725,7 +749,7 @@ def capture_chat_stream(
         raise StreamTransportError("stream_cancelled", failure) from exc
     except StreamTransportError as exc:
         final_status = exc.category
-        failure = str(exc)
+        failure = safe_text(exc)
         raise
     finally:
         cleanup_started = time.monotonic()
@@ -740,6 +764,7 @@ def capture_chat_stream(
     return {
         "content": "".join(content_parts),
         "reasoning": "".join(reasoning_parts),
+        "refusal": "".join(refusal_parts) or None,
         "finish_reason": finish_reason,
         "actual_model": actual_model,
         "usage": usage,
