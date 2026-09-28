@@ -168,10 +168,16 @@ candidate plus its validation/evaluation feedback, or the failed raw final
 content plus its parse error. Reasoning-only text is stored locally but is not
 replayed as candidate code. Full validation reports remain on disk. If parsed
 candidate feedback is too large for the fixed context budget, a stable summary
-keeps representative distinct error types/root locations and records original,
-included, and omitted counts in `prompt_feedback.json`. The candidate itself
-is never truncated or rewritten; if even minimum feedback cannot fit, the run
-stops with `context_budget_exceeded`. The first
+keeps independently actionable roots and records original, included, omitted,
+and repeated-occurrence counts in `prompt_feedback.json`. Structured source
+declaration errors are keyed by feature index and source field, so two missing
+fields on one feature and the same missing field on two features remain separate.
+Repeated occurrences of the same root retain representative locations. A
+semantically repeated failed candidate carries the original concrete issues as
+a flat list alongside the matched attempt number; it does not nest earlier
+feedback or leave only a generic duplicate warning. The candidate itself is
+never truncated or rewritten; if even minimum actionable feedback cannot fit,
+the run stops with `context_budget_exceeded`. The first
 passing attempt creates:
 
 ```text

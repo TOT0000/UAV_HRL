@@ -1193,10 +1193,14 @@ def test_repeated_failed_candidate_is_diagnosed_and_cannot_be_approved(tmp_path)
     repeated = json.loads(json.dumps(first))
     repeated["candidate_name"] = "renamed-only"
     repeated["code"] = "# same program\n" + repeated["code"]
+    repeated_again = json.loads(json.dumps(first))
+    repeated_again["candidate_name"] = "renamed-twice"
+    repeated_again["code"] = "# another formatting-only change\n" + repeated_again["code"]
     client = MockClient(
         [
             _response(first),
             _response(repeated),
+            _response(repeated_again),
             _response(_candidate(name="actually-fixed")),
         ]
     )
@@ -1204,7 +1208,7 @@ def test_repeated_failed_candidate_is_diagnosed_and_cannot_be_approved(tmp_path)
         fixed_sample=fixed,
         model=client.model,
         client=client,
-        max_attempts=3,
+        max_attempts=4,
         output_dir=tmp_path / "duplicate-revision",
         worker_timeout=10,
     )
@@ -1212,11 +1216,163 @@ def test_repeated_failed_candidate_is_diagnosed_and_cannot_be_approved(tmp_path)
     report = json.loads(
         (tmp_path / "duplicate-revision" / "attempt_02" / "validation_report.json").read_text()
     )
-    assert report["errors"][0]["code"] == "DUPLICATE_FAILED_CANDIDATE"
+    assert [item["code"] for item in report["errors"]] == [
+        "DUPLICATE_FAILED_CANDIDATE",
+        "STATIC_EXPLICIT_FEATURE_REDUNDANCY",
+    ]
     assert report["checks"]["duplicate_failed_candidate"]["matched_attempt"] == 1
-    prompt = (tmp_path / "duplicate-revision" / "attempt_03" / "prompt.txt").read_text()
+    assert "previous_unresolved_feedback" not in json.dumps(report)
+    next_report = json.loads(
+        (tmp_path / "duplicate-revision" / "attempt_03" / "validation_report.json").read_text()
+    )
+    assert [item["code"] for item in next_report["errors"]] == [
+        "DUPLICATE_FAILED_CANDIDATE",
+        "STATIC_EXPLICIT_FEATURE_REDUNDANCY",
+    ]
+    assert next_report["checks"]["duplicate_failed_candidate"]["matched_attempt"] == 1
+    assert "previous_unresolved_feedback" not in json.dumps(next_report)
+    feedback = llm_design._feedback_from_validation(
+        report, "duplicate_failed_candidate"
+    )
+    variants = dict(llm_design._feedback_prompt_variants(feedback))
+    for name in ("full", "compact_all_roots"):
+        codes = [item["code"] for item in variants[name]["confirmed_errors"]]
+        assert "DUPLICATE_FAILED_CANDIDATE" in codes
+        assert "STATIC_EXPLICIT_FEATURE_REDUNDANCY" in codes
+    duplicate_summary = variants["compact_all_roots"]["prompt_feedback_summary"]
+    assert duplicate_summary["original_error_count"] == 2
+    assert duplicate_summary["included_error_count"] == 2
+    assert duplicate_summary["omitted_error_count"] == 0
+    selected, omitted = llm_design._select_feedback_representatives(
+        feedback["confirmed_errors"], 1
+    )
+    assert omitted == 0
+    assert {item["code"] for item in selected} == {
+        "DUPLICATE_FAILED_CANDIDATE",
+        "STATIC_EXPLICIT_FEATURE_REDUNDANCY",
+    }
+    prompt = (tmp_path / "duplicate-revision" / "attempt_04" / "prompt.txt").read_text()
     assert "semantically unchanged from failed attempt 1" in prompt
     assert "STATIC_EXPLICIT_FEATURE_REDUNDANCY" in prompt
+
+
+def test_structured_missing_source_roots_remain_independently_actionable(
+    design_fixture,
+):
+    _, _, _, _, constants = design_fixture
+    candidate = _candidate(
+        code=(
+            "def compute_extra_state(obs, constants):\n"
+            '    value = np.mean(obs["uav_hol_type"]) + np.mean(obs["uav_hol_valid"])\n'
+            "    return np.asarray([np.clip(value, 0.0, 1.0)], dtype=np.float32)\n"
+        )
+    )
+    report = llm_design.validate_candidate_staged(candidate, constants)
+    errors = [
+        item
+        for item in report["errors"]
+        if item["code"] == "STATIC_UNDECLARED_FEATURE_SOURCE"
+    ]
+    assert {(item["feature_index"], item["source_field"]) for item in errors} == {
+        (0, "obs.uav_hol_type"),
+        (0, "obs.uav_hol_valid"),
+    }
+    feedback = llm_design._feedback_from_validation(report, "static_failure")
+    compact = dict(llm_design._feedback_prompt_variants(feedback))["compact_all_roots"]
+    compact_errors = [
+        item
+        for item in compact["confirmed_errors"]
+        if item["code"] == "STATIC_UNDECLARED_FEATURE_SOURCE"
+    ]
+    assert {(item["feature_index"], item["source_field"]) for item in compact_errors} == {
+        (0, "obs.uav_hol_type"),
+        (0, "obs.uav_hol_valid"),
+    }
+    assert all("Add 'obs.uav_hol_" in item["requirement"] for item in compact_errors)
+
+
+def test_same_missing_source_field_on_two_features_is_not_merged(design_fixture):
+    _, _, _, _, constants = design_fixture
+    candidate = _candidate(
+        code=(
+            "def compute_extra_state(obs, constants):\n"
+            '    flags = obs["uav_hol_valid"]\n'
+            "    return np.asarray([np.mean(flags), np.max(flags)], dtype=np.float32)\n"
+        )
+    )
+    second = dict(candidate["features"][0])
+    second.update(
+        {
+            "index": 1,
+            "name": "second_hol_summary",
+            "description": "A second distinct HOL validity summary.",
+            "formula": "maximum of current HOL validity flags",
+        }
+    )
+    candidate["features"] = [candidate["features"][0], second]
+    report = llm_design.validate_candidate_staged(candidate, constants)
+    errors = [
+        item
+        for item in report["errors"]
+        if item["code"] == "STATIC_UNDECLARED_FEATURE_SOURCE"
+        and item.get("source_field") == "obs.uav_hol_valid"
+    ]
+    assert {item["feature_index"] for item in errors} == {0, 1}
+    compact = dict(
+        llm_design._feedback_prompt_variants(
+            llm_design._feedback_from_validation(report, "static_failure")
+        )
+    )["compact_all_roots"]
+    matching = [
+        item
+        for item in compact["confirmed_errors"]
+        if item.get("source_field") == "obs.uav_hol_valid"
+    ]
+    assert {item["feature_index"] for item in matching} == {0, 1}
+
+
+def test_repeated_structured_root_merges_occurrences_and_locations():
+    issues = [
+        {
+            "code": "STATIC_UNDECLARED_FEATURE_SOURCE",
+            "stage": "static",
+            "location": "$.features[0].source_fields",
+            "feature_index": 0,
+            "source_field": "obs.uav_hol_valid",
+            "feature_mapping": "resolved",
+            "source_locations": ["code:2:10"],
+            "problem": "missing declaration",
+            "requirement": "declare obs.uav_hol_valid",
+        },
+        {
+            "code": "STATIC_UNDECLARED_FEATURE_SOURCE",
+            "stage": "static",
+            "location": "$.features[0].source_fields",
+            "feature_index": 0,
+            "source_field": "obs.uav_hol_valid",
+            "feature_mapping": "resolved",
+            "source_locations": ["code:8:12"],
+            "problem": "missing declaration again",
+            "requirement": "declare obs.uav_hol_valid",
+        },
+    ]
+    selected, omitted = llm_design._select_feedback_representatives(issues, None)
+    assert omitted == 0
+    assert len(selected) == 1
+    assert selected[0]["occurrence_count"] == 2
+    assert selected[0]["representative_locations"] == ["code:2:10", "code:8:12"]
+    feedback = {
+        "category": "static_failure",
+        "confirmed_errors": issues,
+        "confirmed_error_count": 2,
+    }
+    summary = dict(llm_design._feedback_prompt_variants(feedback))[
+        "compact_all_roots"
+    ]["prompt_feedback_summary"]
+    assert summary["original_error_count"] == 1
+    assert summary["included_error_count"] == 1
+    assert summary["omitted_error_count"] == 0
+    assert summary["original_error_occurrence_count"] == 2
 
 
 @pytest.mark.parametrize("model", ["qwen/qwen3.5-9b", "google/gemma-4-e4b"])
@@ -1296,6 +1452,79 @@ def test_over_budget_validation_feedback_is_summarized_before_next_request(
     assert "omitted_error_count" in prompt
     assert result["metadata"]["context"]["effective_budget"] == 20_000
     assert result["metadata"]["generation"]["max_output_tokens"] == 4096
+
+
+@pytest.mark.parametrize("model", ["qwen/qwen3.5-9b", "google/gemma-4-e4b"])
+def test_budgeted_revision_prompt_keeps_each_structured_source_fix(
+    tmp_path, monkeypatch, model
+):
+    fixed = _fixed_artifact(tmp_path)
+    invalid = _candidate(
+        name="missing-two-source-fields",
+        code=(
+            "def compute_extra_state(obs, constants):\n"
+            '    value = np.clip(obs["state"][0] ** 3, 0.0, 1.0)\n'
+            "    return np.asarray([value], dtype=np.float32)\n"
+        ),
+    )
+    long_detail = " repeated diagnostic detail" * 3000
+    errors = [
+        {
+            "code": "STATIC_UNDECLARED_FEATURE_SOURCE",
+            "stage": "static",
+            "location": "$.features[0].source_fields",
+            "feature_index": 0,
+            "source_field": field,
+            "feature_mapping": "resolved",
+            "source_locations": [f"code:{line}:12"],
+            "problem": f"feature[0] uses {field} but does not declare it.{long_detail}",
+            "requirement": f"Add {field} to features[0].source_fields.{long_detail}",
+        }
+        for field, line in (("obs.uav_hol_type", 2), ("obs.uav_hol_valid", 3))
+    ]
+    original_validate = llm_design.validate_candidate_staged
+
+    def staged(candidate, constants):
+        if candidate.get("candidate_name") == "missing-two-source-fields":
+            return {
+                "status": "failed",
+                "can_execute": False,
+                "errors": errors,
+                "checks": {"static": {"status": "failed", "completed": True}},
+            }
+        return original_validate(candidate, constants)
+
+    monkeypatch.setattr(llm_design, "validate_candidate_staged", staged)
+    client = MockClient(
+        [_response(invalid, model=model), _response(_candidate(name="fixed"), model=model)],
+        model=model,
+    )
+    output = tmp_path / f"structured-feedback-{model.split('/')[0]}"
+    result = run_design(
+        fixed_sample=fixed,
+        model=model,
+        client=client,
+        max_attempts=2,
+        context_length=40_000,
+        output_dir=output,
+        worker_timeout=10,
+    )
+    assert result["status"] == "approved"
+    assert len(client.calls) == 2
+    prompt = client.calls[1]["prompt"]
+    assert '"candidate_name": "missing-two-source-fields"' in prompt
+    assert "obs.uav_hol_type" in prompt
+    assert "obs.uav_hol_valid" in prompt
+    assert "features[0].source_fields" in prompt
+    prompt_info = json.loads((output / "attempt_02" / "prompt_feedback.json").read_text())
+    summary = prompt_info["feedback"]["prompt_feedback_summary"]
+    assert prompt_info["strategy"] == "compact_all_roots"
+    assert summary["original_error_count"] == 2
+    assert summary["included_error_count"] == 2
+    assert summary["omitted_error_count"] == 0
+    assert summary["original_error_occurrence_count"] == 2
+    saved_report = json.loads((output / "attempt_01" / "validation_report.json").read_text())
+    assert saved_report["errors"] == errors
 
 
 def test_complete_candidate_is_not_truncated_when_minimum_feedback_cannot_fit(

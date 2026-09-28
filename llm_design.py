@@ -983,6 +983,19 @@ def _shorten_feedback_text(value: Any, limit: int = 600) -> Any:
 def _feedback_root_key(issue: dict[str, Any]) -> tuple[str, ...]:
     """Stable, value-insensitive key for one independently actionable problem."""
 
+    source_field = str(issue.get("source_field", ""))
+    feature_index = issue.get("feature_index")
+    feature_identity = (
+        f"feature:{int(feature_index)}"
+        if isinstance(feature_index, int) and not isinstance(feature_index, bool)
+        else f"mapping:{issue.get('feature_mapping', '')}"
+    )
+    if source_field:
+        return (
+            str(issue.get("code", "UNKNOWN")),
+            feature_identity,
+            source_field,
+        )
     return (
         str(issue.get("code", "UNKNOWN")),
         str(issue.get("exception_type", "")),
@@ -1005,12 +1018,24 @@ def _compact_feedback_issue(issue: dict[str, Any]) -> dict[str, Any]:
         "line",
         "column",
         "character",
+        "feature_index",
+        "source_field",
+        "source_locations",
+        "feature_mapping",
+        "matched_attempt",
+        "carried_from_attempt",
+        "representative_locations",
     )
     result = {
         key: _shorten_feedback_text(issue[key])
         for key in retained
         if key in issue and issue[key] is not None
     }
+    if isinstance(result.get("source_locations"), list):
+        locations = result["source_locations"]
+        result["source_locations"] = locations[:3]
+        if len(locations) > 3:
+            result["source_locations_omitted"] = len(locations) - 3
     examples = issue.get("representative_samples")
     if isinstance(examples, list) and examples:
         result["representative_samples"] = examples[:1]
@@ -1019,22 +1044,115 @@ def _compact_feedback_issue(issue: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
+def _actionable_feedback_issues(feedback: dict[str, Any]) -> list[dict[str, Any]]:
+    """Return flat, independently actionable issues for duplicate revisions."""
+
+    confirmed = feedback.get("confirmed_errors")
+    if isinstance(confirmed, list) and confirmed:
+        actionable = [
+            dict(issue)
+            for issue in confirmed
+            if isinstance(issue, dict)
+            and issue.get("code") != "DUPLICATE_FAILED_CANDIDATE"
+        ]
+        if actionable:
+            return actionable
+    by_lambda = feedback.get("by_lambda")
+    if isinstance(by_lambda, dict):
+        issues: list[dict[str, Any]] = []
+        for lambda_value, result in by_lambda.items():
+            if not isinstance(result, dict) or bool(result.get("passed")):
+                continue
+            issues.append(
+                {
+                    "code": "EVALUATION_NOT_IMPROVED",
+                    "stage": "evaluation",
+                    "location": f"lambda={lambda_value}",
+                    "problem": (
+                        "the candidate did not exceed the required Lipschitz improvement "
+                        f"at lambda={lambda_value}; baseline={result.get('baseline_l_hat')}, "
+                        f"candidate={result.get('candidate_l_hat')}"
+                    ),
+                    "requirement": (
+                        "Revise the feature computations or reward weights so this lambda "
+                        "passes the unchanged per-lambda improvement threshold."
+                    ),
+                    "lambda_value": str(lambda_value),
+                }
+            )
+        if issues:
+            return issues
+    return [
+        {
+            "code": str(feedback.get("category", "CANDIDATE_FAILURE")).upper(),
+            "stage": "revision",
+            "location": "candidate",
+            "problem": str(feedback.get("error", feedback.get("status", "candidate failed"))),
+            "requirement": str(
+                feedback.get(
+                    "instruction",
+                    "Correct the candidate and return one complete replacement JSON object.",
+                )
+            ),
+        }
+    ]
+
+
+def _merge_feedback_roots(
+    errors: list[dict[str, Any]], *, representative_limit: int = 3
+) -> list[dict[str, Any]]:
+    """Merge repeated occurrences without merging distinct actionable roots."""
+
+    merged: dict[tuple[str, ...], dict[str, Any]] = {}
+    for raw_issue in errors:
+        issue = dict(raw_issue)
+        key = _feedback_root_key(issue)
+        count = int(issue.get("occurrence_count", 1))
+        if key not in merged:
+            issue["occurrence_count"] = max(1, count)
+            issue["representative_locations"] = []
+            merged[key] = issue
+        else:
+            merged[key]["occurrence_count"] += max(1, count)
+        destination = merged[key]["representative_locations"]
+        locations = issue.get("source_locations")
+        if not isinstance(locations, list) or not locations:
+            locations = [issue.get("location")]
+        for location in locations:
+            if (
+                location is not None
+                and location not in destination
+                and len(destination) < int(representative_limit)
+            ):
+                destination.append(location)
+        samples = issue.get("representative_samples")
+        if isinstance(samples, list) and samples:
+            saved = merged[key].setdefault("representative_samples", [])
+            for sample in samples:
+                if sample not in saved and len(saved) < int(representative_limit):
+                    saved.append(sample)
+    return list(merged.values())
+
+
 def _select_feedback_representatives(
     errors: list[dict[str, Any]], maximum: int | None
 ) -> tuple[list[dict[str, Any]], int]:
-    # First collapse exact root keys while preserving first-seen order.  Then
-    # select one representative from each broad code before taking additional
-    # roots.  This prevents a flood of one error class from hiding another.
-    unique: list[dict[str, Any]] = []
-    seen_roots: set[tuple[str, ...]] = set()
-    for issue in errors:
-        key = _feedback_root_key(issue)
-        if key not in seen_roots:
-            seen_roots.add(key)
-            unique.append(issue)
+    # Collapse repeated occurrences while retaining distinct structured roots.
+    # Then select one representative from each broad code before taking
+    # additional roots. This prevents a flood of one class from hiding another.
+    unique = _merge_feedback_roots(errors)
     if maximum is None or len(unique) <= int(maximum):
-        return unique, len(errors) - len(unique)
+        return unique, 0
     maximum = max(1, int(maximum))
+    has_duplicate = any(
+        issue.get("code") == "DUPLICATE_FAILED_CANDIDATE" for issue in unique
+    )
+    has_actionable = any(
+        issue.get("code") != "DUPLICATE_FAILED_CANDIDATE" for issue in unique
+    )
+    if has_duplicate and has_actionable:
+        # A duplicate warning without an original fix is not actionable.
+        maximum = max(2, maximum)
     chosen: list[dict[str, Any]] = []
     deferred: list[dict[str, Any]] = []
     seen_codes: set[str] = set()
@@ -1049,7 +1167,7 @@ def _select_feedback_representatives(
         if len(chosen) >= maximum:
             break
         chosen.append(issue)
-    return chosen, len(errors) - len(chosen)
+    return chosen, len(unique) - len(chosen)
 
 
 def _feedback_prompt_variants(
@@ -1063,7 +1181,11 @@ def _feedback_prompt_variants(
     if not isinstance(errors, list) or not errors:
         return [("full", feedback)]
     variants: list[tuple[str, dict[str, Any]]] = [("full", feedback)]
-    original_count = len(errors)
+    merged_roots = _merge_feedback_roots(errors)
+    original_count = len(merged_roots)
+    original_occurrence_count = sum(
+        int(issue.get("occurrence_count", 1)) for issue in merged_roots
+    )
     for maximum in (None, 64, 32, 16, 8, 4, 2, 1):
         selected, omitted = _select_feedback_representatives(errors, maximum)
         compact = {
@@ -1080,6 +1202,7 @@ def _feedback_prompt_variants(
             "original_error_count": original_count,
             "included_error_count": len(selected),
             "omitted_error_count": omitted,
+            "original_error_occurrence_count": original_occurrence_count,
             "selection_rule": (
                 "stable first root per error code, then additional distinct roots; "
                 "long prose and repeated sample cases are shortened"
@@ -1518,6 +1641,10 @@ def run_design(
             current_candidate_fingerprint = candidate_semantic_fingerprint(candidate)
             prior_failure = failed_candidates.get(current_candidate_fingerprint)
             if prior_failure is not None:
+                unresolved = [
+                    {**dict(issue), "carried_from_attempt": int(prior_failure["attempt"])}
+                    for issue in prior_failure["unresolved_issues"]
+                ]
                 duplicate_report = {
                     "status": "failed",
                     "can_execute": False,
@@ -1532,13 +1659,12 @@ def run_design(
                                 "code comments, and code formatting"
                             ),
                             "requirement": (
-                                "Correct the unresolved issue by changing the feature definitions, "
-                                "source_fields, reward_weight values, or executable code; renaming or "
-                                "reformatting the same candidate is not a revision."
+                                "Make a substantive correction to the concrete unresolved issues "
+                                "listed below; renaming or reformatting is not a revision."
                             ),
-                            "previous_unresolved_feedback": prior_failure["feedback"],
+                            "matched_attempt": int(prior_failure["attempt"]),
                         }
-                    ],
+                    ] + unresolved,
                     "checks": {
                         "duplicate_failed_candidate": {
                             "status": "failed",
@@ -1572,6 +1698,7 @@ def run_design(
                 failed_candidates[current_candidate_fingerprint] = {
                     "attempt": attempt,
                     "feedback": feedback,
+                    "unresolved_issues": _actionable_feedback_issues(feedback),
                 }
                 _write_json(round_directory / "failure.json", feedback)
                 _write_json(round_directory / "feedback.json", feedback)
@@ -1657,6 +1784,7 @@ def run_design(
             failed_candidates[current_candidate_fingerprint] = {
                 "attempt": attempt,
                 "feedback": feedback,
+                "unresolved_issues": _actionable_feedback_issues(feedback),
             }
             _write_json(round_directory / "feedback.json", feedback)
             history.append({"attempt": attempt, "status": evaluation["status"]})
@@ -1706,6 +1834,7 @@ def run_design(
                 failed_candidates[current_candidate_fingerprint] = {
                     "attempt": attempt,
                     "feedback": feedback,
+                    "unresolved_issues": _actionable_feedback_issues(feedback),
                 }
             _write_json(round_directory / "failure.json", feedback)
             history.append({"attempt": attempt, "status": "candidate_execution_failure"})
@@ -1717,6 +1846,7 @@ def run_design(
                 failed_candidates[current_candidate_fingerprint] = {
                     "attempt": attempt,
                     "feedback": feedback,
+                    "unresolved_issues": _actionable_feedback_issues(feedback),
                 }
             _write_json(round_directory / "failure.json", feedback)
             history.append({"attempt": attempt, "status": "candidate_format_or_validation_failure"})

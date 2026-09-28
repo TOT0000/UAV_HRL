@@ -626,6 +626,7 @@ def _validation_issue(
     location: str,
     problem: str,
     requirement: str,
+    **details: Any,
 ) -> dict[str, Any]:
     return {
         "code": str(code),
@@ -633,6 +634,7 @@ def _validation_issue(
         "location": str(location),
         "problem": str(problem),
         "requirement": str(requirement),
+        **details,
     }
 
 
@@ -1091,6 +1093,10 @@ def _static_validation_issues(
                             f"$.features[{index}].source_fields",
                             f"feature[{index}] uses {field!r} at {locations or ['unknown code location']} but does not declare it",
                             f"Add {field!r} to features[{index}].source_fields; include fields used by masks, conditions, normalization, and missing-data handling.",
+                            feature_index=int(index),
+                            source_field=str(field),
+                            source_locations=list(locations),
+                            feature_mapping="resolved",
                         )
                     )
         else:
@@ -1103,6 +1109,9 @@ def _static_validation_issues(
                         f"$.code field {field}",
                         f"code uses {field!r} at {locations}; control/data flow prevents reliable mapping to one feature",
                         f"Declare {field!r} in every feature whose computation, mask, condition, normalization, or missing-data path uses it. No feature index is inferred here.",
+                        source_field=str(field),
+                        source_locations=list(locations),
+                        feature_mapping="unresolved",
                     )
                 )
         try:
