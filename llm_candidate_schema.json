@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "uav-hrl-llm-candidate-v1",
-  "title": "UAV HRL current-only LLM state and reward candidate",
+  "$id": "uav-hrl-llm-shared-feature-candidate-v2",
+  "title": "UAV HRL current-only shared state/reward feature candidate",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -9,22 +9,16 @@
     "candidate_name",
     "reward_input_mode",
     "features",
-    "reward_terms",
     "code"
   ],
   "properties": {
-    "schema_version": {"const": "uav-hrl-llm-candidate-v1"},
+    "schema_version": {"const": "uav-hrl-llm-shared-feature-candidate-v2"},
     "candidate_name": {"type": "string", "minLength": 1},
     "reward_input_mode": {"const": "current_only"},
     "features": {
       "type": "array",
       "minItems": 1,
       "items": {"$ref": "#/$defs/feature"}
-    },
-    "reward_terms": {
-      "type": "array",
-      "minItems": 1,
-      "items": {"$ref": "#/$defs/reward_term"}
     },
     "code": {"type": "string", "minLength": 1}
   },
@@ -49,37 +43,8 @@
         "range",
         "source_fields",
         "formula",
-        "missing_data_rule"
-      ],
-      "properties": {
-        "index": {"type": "integer", "minimum": 0},
-        "name": {"type": "string", "minLength": 1},
-        "dtype": {"const": "float32"},
-        "description": {"type": "string", "minLength": 1},
-        "range": {"$ref": "#/$defs/range"},
-        "source_fields": {
-          "type": "array",
-          "minItems": 1,
-          "uniqueItems": true,
-          "items": {"type": "string", "minLength": 1}
-        },
-        "formula": {"type": "string", "minLength": 1},
-        "missing_data_rule": {"type": "string", "minLength": 1}
-      }
-    },
-    "reward_term": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": [
-        "index",
-        "name",
-        "dtype",
-        "description",
-        "range",
-        "source_fields",
-        "formula",
         "missing_data_rule",
-        "weight"
+        "reward_weight"
       ],
       "properties": {
         "index": {"type": "integer", "minimum": 0},
@@ -95,7 +60,7 @@
         },
         "formula": {"type": "string", "minLength": 1},
         "missing_data_rule": {"type": "string", "minLength": 1},
-        "weight": {"type": "number"}
+        "reward_weight": {"type": "number"}
       }
     }
   }

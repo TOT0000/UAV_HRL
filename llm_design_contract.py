@@ -20,11 +20,11 @@ from llm_baseline import load_fixed_samples
 from replay_auxiliary import SNAPSHOT_FIELD_SPECS
 
 
-CANDIDATE_SCHEMA_VERSION = "uav-hrl-llm-candidate-v1"
+CANDIDATE_SCHEMA_VERSION = "uav-hrl-llm-shared-feature-candidate-v2"
 OBS_INTERFACE_VERSION = "uav-hrl-llm-current-observation-v1"
-PROMPT_VERSION = "uav-hrl-llm-design-prompt-v1"
-DESIGN_RUN_SCHEMA_VERSION = "uav-hrl-llm-design-run-v1"
-APPROVED_ARTIFACT_SCHEMA_VERSION = "uav-hrl-approved-design-v1"
+PROMPT_VERSION = "uav-hrl-llm-design-prompt-v2"
+DESIGN_RUN_SCHEMA_VERSION = "uav-hrl-llm-design-run-v2"
+APPROVED_ARTIFACT_SCHEMA_VERSION = "uav-hrl-approved-shared-feature-design-v2"
 ROOT = Path(__file__).resolve().parent
 SCHEMA_PATH = ROOT / "llm_candidate_schema.json"
 PROMPT_TEMPLATE_PATH = ROOT / "prompts" / "llm_design_prompt.txt"
@@ -335,44 +335,36 @@ def render_environment_interface(
 def format_schema_and_example(schema: dict[str, Any]) -> str:
     example = {
         "schema_version": CANDIDATE_SCHEMA_VERSION,
-        "candidate_name": "format_only_zero_example",
+        "candidate_name": "format_only_control_fraction_example",
         "reward_input_mode": "current_only",
         "features": [
             {
                 "index": 0,
-                "name": "format_only_zero_feature",
+                "name": "controlled_uav_fraction",
                 "dtype": "float32",
-                "description": "Constant zero used only to demonstrate the interface format; not a recommended design.",
-                "range": {"minimum": 0.0, "maximum": 0.0},
-                "source_fields": ["obs.state"],
-                "formula": "0",
-                "missing_data_rule": "Always zero.",
-            }
-        ],
-        "reward_terms": [
-            {
-                "index": 0,
-                "name": "format_only_zero_term",
-                "dtype": "float32",
-                "description": "Constant zero used only to demonstrate the interface format; not a recommended reward.",
+                "description": "Example of mask-aware normalization: the fraction of UAVs currently controlled by TD3. Its zero reward weight makes this an interface example, not a recommended reward design.",
                 "range": {"minimum": 0.0, "maximum": 1.0},
-                "source_fields": ["obs.state"],
-                "formula": "0",
-                "missing_data_rule": "Always zero.",
-                "weight": 0.0,
+                "source_fields": ["obs.movement_mask", "constants.num_uav"],
+                "formula": "count_nonzero(movement_mask) / max(num_uav, 1), clipped to [0,1]",
+                "missing_data_rule": "An all-false movement mask is a valid empty controlled set and returns 0.",
+                "reward_weight": 0.0,
             }
         ],
         "code": (
             "def compute_extra_state(obs, constants):\n"
-            "    return np.asarray([0.0], dtype=np.float32)\n\n"
-            "def compute_reward_terms(obs, constants):\n"
-            "    return np.asarray([0.0], dtype=np.float32)\n"
+            "    denominator = max(float(constants[\"num_uav\"]), 1.0)\n"
+            "    controlled_fraction = np.clip(\n"
+            "        float(np.count_nonzero(obs[\"movement_mask\"])) / denominator,\n"
+            "        0.0,\n"
+            "        1.0,\n"
+            "    )\n"
+            "    return np.asarray([controlled_fraction], dtype=np.float32)\n"
         ),
     }
     return (
         "JSON Schema (Draft 2020-12; no additional fields):\n"
         + json.dumps(schema, indent=2, ensure_ascii=False, allow_nan=False)
-        + "\n\nParseable format-only example (constant zeros are for interface testing, not a suggested design):\n"
+        + "\n\nParseable interface example (reward_weight=0 makes it formatting guidance, not a suggested reward design):\n"
         + json.dumps(example, indent=2, ensure_ascii=False, allow_nan=False)
     )
 

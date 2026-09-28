@@ -42,7 +42,7 @@ def _approved_fixture(root: Path, *, name="integration-fixture-only"):
         }.items()
     }
     candidate = {
-        "schema_version": "uav-hrl-llm-candidate-v1",
+        "schema_version": "uav-hrl-llm-shared-feature-candidate-v2",
         "candidate_name": name,
         "reward_input_mode": "current_only",
         "features": [{
@@ -52,27 +52,14 @@ def _approved_fixture(root: Path, *, name="integration-fixture-only"):
             "description": "Test-only derived state feature.",
             "range": {"minimum": 0.0, "maximum": 1.0},
             "source_fields": ["obs.state"],
-            "formula": "clip(state[0]^2,0,1)",
-            "missing_data_rule": "state is required",
-        }],
-        "reward_terms": [{
-            "index": 0,
-            "name": "bounded_state_magnitude",
-            "dtype": "float32",
-            "description": "Test-only current-state reward term.",
-            "range": {"minimum": 0.0, "maximum": 1.0},
-            "source_fields": ["obs.state"],
             "formula": "clip(abs(state[1]),0,1)",
             "missing_data_rule": "state is required",
-            "weight": 0.25,
+            "reward_weight": 0.25,
         }],
         "code": (
             "def compute_extra_state(obs, constants):\n"
-            '    x = np.clip(obs["state"][0] * obs["state"][0], 0.0, 1.0)\n'
-            "    return np.asarray([x], dtype=np.float32)\n\n"
-            "def compute_reward_terms(obs, constants):\n"
             '    x = np.clip(np.abs(obs["state"][1]), 0.0, 1.0)\n'
-            "    return np.asarray([x], dtype=np.float32)\n"
+            "    return np.asarray([x], dtype=np.float32)\n\n"
         ),
     }
     run = root / f"design-run-{name}"
@@ -109,6 +96,16 @@ def test_method_registry_and_cli_contract_are_isolated():
     assert llm_args.llm_artifact == "approved"
 
 
+def test_old_llm_artifact_contract_is_rejected_with_retraining_message(tmp_path):
+    approved = _approved_fixture(tmp_path)
+    artifact_path = approved / "artifact.json"
+    artifact = json.loads(artifact_path.read_text(encoding="utf-8"))
+    artifact["schema_version"] = "uav-hrl-approved-design-v1"
+    artifact_path.write_text(json.dumps(artifact), encoding="utf-8")
+    with pytest.raises(CandidateError, match="redesign and retrain"):
+        load_approved_design(approved)
+
+
 def test_llm_replay_reward_is_separate_and_added_once():
     replay = ReplayBufferJoint(2, 48, max_size=2, record_llm_reward=True)
     replay.add(
@@ -143,17 +140,15 @@ def test_persistent_runtime_matches_offline_adapter_and_dynamic_constants(tmp_pa
     obs = build_online_obs(state, np.zeros(16, dtype=bool), empty_snapshot())
     runtime = ApprovedDesignRuntime(design, metadata, timeout=10)
     try:
-        extra, terms, reward = runtime.evaluate(obs)
+        extra, reward = runtime.evaluate(obs)
     finally:
         runtime.close()
-    offline_extra, offline_terms, offline_reward = design.evaluate_obs_arrays(
+    offline_extra, offline_reward = design.evaluate_obs_arrays(
         {name: value[None, ...] for name, value in obs.items()}, timeout=10
     )
-    assert extra.tolist() == pytest.approx([0.25])
-    assert terms.tolist() == pytest.approx([0.4])
+    assert extra.tolist() == pytest.approx([0.4])
     assert reward == pytest.approx(0.1)
     assert extra == pytest.approx(offline_extra[0])
-    assert terms == pytest.approx(offline_terms[0])
     assert reward == pytest.approx(offline_reward[0])
     assert metadata["environment_width_m"]["value"] == 1500.0
 

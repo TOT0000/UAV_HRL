@@ -17,8 +17,10 @@ from llm_baseline import run_baseline
 from llm_candidate import (
     CandidateError,
     CandidateExecutionError,
+    candidate_semantic_fingerprint,
     candidate_numeric_diagnostics,
     execute_candidate_isolated,
+    feature_reward,
     load_approved_design,
     parse_candidate_json,
     validate_candidate,
@@ -164,12 +166,14 @@ def _candidate(*, passing=True, code=None, name="candidate"):
         )
         code = (
             "def compute_extra_state(obs, constants):\n"
-            f"    return np.asarray([{feature}], dtype=np.float32)\n\n"
-            "def compute_reward_terms(obs, constants):\n"
-            "    return np.asarray([0.0], dtype=np.float32)\n"
+            f"    return np.asarray([{feature}], dtype=np.float32)\n"
         )
+    elif "\ndef compute_reward_terms" in code:
+        # Legacy snippets below focus on compute_extra_state behavior. Adapt
+        # them to the v2 single-function contract before building the fixture.
+        code = code.split("\ndef compute_reward_terms", 1)[0].rstrip() + "\n"
     return {
-        "schema_version": "uav-hrl-llm-candidate-v1",
+        "schema_version": "uav-hrl-llm-shared-feature-candidate-v2",
         "candidate_name": name,
         "reward_input_mode": "current_only",
         "features": [
@@ -178,23 +182,11 @@ def _candidate(*, passing=True, code=None, name="candidate"):
                 "name": "state_distance_helper",
                 "dtype": "float32",
                 "description": "A bounded current-state feature.",
-                "range": {"minimum": -1.0, "maximum": 1.0},
+                "range": {"minimum": 0.0, "maximum": 1.0},
                 "source_fields": ["obs.state"],
                 "formula": "bounded square of original state index 0",
                 "missing_data_rule": "The original state is always present.",
-            }
-        ],
-        "reward_terms": [
-            {
-                "index": 0,
-                "name": "zero_term",
-                "dtype": "float32",
-                "description": "No supplementary reward in this fixture.",
-                "range": {"minimum": 0.0, "maximum": 1.0},
-                "source_fields": ["obs.state"],
-                "formula": "0",
-                "missing_data_rule": "Always zero.",
-                "weight": 0.0,
+                "reward_weight": 0.0,
             }
         ],
         "code": code,
@@ -359,7 +351,7 @@ def design_fixture(tmp_path):
 
 
 def test_prompt_is_complete_current_only_and_example_parses(design_fixture):
-    _, _, metadata, baseline, constants = design_fixture
+    _, arrays, metadata, baseline, constants = design_fixture
     prompt = render_prompt(
         fixed_metadata=metadata,
         baseline_report=baseline,
@@ -374,17 +366,91 @@ def test_prompt_is_complete_current_only_and_example_parses(design_fixture):
     assert "d_R=(h^2+d^2)/sqrt" in prompt
     assert "never use an object ID as a compact row" in prompt
     block = format_schema_and_example(candidate_schema())
-    example = json.loads(block.split("Parseable format-only example", 1)[1].split(":\n", 1)[1])
+    example = json.loads(block.split("Parseable interface example", 1)[1].split(":\n", 1)[1])
     validate_candidate(example, constants)
+    features, reward, _ = execute_candidate_isolated(
+        example, build_obs_arrays(arrays), constants, timeout=10
+    )
+    assert features.shape == (6, 1)
+    assert reward.tolist() == pytest.approx([0.0] * 6)
 
 
-def test_reward_term_schema_declares_weight_without_conflicting_inheritance():
+def test_feature_schema_declares_reward_weight_without_conflicting_inheritance():
     schema = candidate_schema()
-    reward_schema = schema["$defs"]["reward_term"]
-    assert reward_schema["additionalProperties"] is False
-    assert "weight" in reward_schema["required"]
-    assert reward_schema["properties"]["weight"] == {"type": "number"}
-    assert "allOf" not in reward_schema
+    feature_schema = schema["$defs"]["feature"]
+    assert feature_schema["additionalProperties"] is False
+    assert "reward_weight" in feature_schema["required"]
+    assert feature_schema["properties"]["reward_weight"] == {"type": "number"}
+    assert "allOf" not in feature_schema
+
+
+def test_shared_feature_weights_and_host_reward_are_strict():
+    candidate = _candidate()
+    candidate["features"] = [
+        {
+            **candidate["features"][0],
+            "index": index,
+            "name": f"feature_{index}",
+            "formula": f"derived formula {index}",
+            "reward_weight": weight,
+        }
+        for index, weight in enumerate((0.5, -0.25, 0.0))
+    ]
+    candidate["code"] = (
+        "def compute_extra_state(obs, constants):\n"
+        '    x = np.clip(np.abs(obs["state"][0]), 0.0, 1.0)\n'
+        "    return np.asarray([x * x, x, x * x * x], dtype=np.float32)\n"
+    )
+    values = np.asarray([0.8, 0.4, 0.2], dtype=np.float32)
+    r_extra = float(feature_reward(values, candidate))
+    assert r_extra == pytest.approx(0.3)
+    original = np.asarray([9.0, 8.0], dtype=np.float32)
+    assert np.concatenate((original, values)).tolist() == pytest.approx(
+        [9.0, 8.0, 0.8, 0.4, 0.2]
+    )
+    assert 2.0 + 2.0 * r_extra == pytest.approx(2.6)
+
+    for invalid in (True, float("inf")):
+        rejected = _candidate()
+        rejected["features"][0]["reward_weight"] = invalid
+        with pytest.raises(CandidateError, match="reward_weight|number|finite"):
+            validate_candidate(rejected, {"unused": {"value": 0}})
+    rejected = _candidate()
+    rejected["features"][0]["reward_weight"] = 1.01
+    with pytest.raises(CandidateError, match=r"sum\(abs"):
+        validate_candidate(rejected, {"unused": {"value": 0}})
+
+
+def test_v1_and_mixed_candidates_are_not_silently_converted(design_fixture):
+    _, _, _, _, constants = design_fixture
+    old = _candidate()
+    old["schema_version"] = "uav-hrl-llm-candidate-v1"
+    old["reward_terms"] = []
+    with pytest.raises(CandidateError, match="top-level|incompatible"):
+        validate_candidate(old, constants)
+    mixed = _candidate()
+    mixed["reward_terms"] = [{"legacy": True}]
+    with pytest.raises(CandidateError, match="top-level"):
+        validate_candidate(mixed, constants)
+
+
+def test_candidate_fingerprint_ignores_only_name_comments_and_formatting():
+    original = _candidate(name="first")
+    renamed = _candidate(
+        name="second",
+        code=(
+            "# formatting-only comment\n"
+            "def compute_extra_state(obs, constants):\n"
+            '    return np.asarray([ np.clip(obs["state"][0] * obs["state"][0], 0.0, 1.0) ], dtype=np.float32)\n'
+        ),
+    )
+    assert candidate_semantic_fingerprint(original) == candidate_semantic_fingerprint(renamed)
+    changed_weight = json.loads(json.dumps(renamed))
+    changed_weight["features"][0]["reward_weight"] = 0.1
+    assert candidate_semantic_fingerprint(original) != candidate_semantic_fingerprint(changed_weight)
+    changed_sources = json.loads(json.dumps(renamed))
+    changed_sources["features"][0]["source_fields"].append("obs.movement_mask")
+    assert candidate_semantic_fingerprint(original) != candidate_semantic_fingerprint(changed_sources)
 
 
 def test_dry_run_cli_prints_model_parameters_and_token_budget(monkeypatch, capsys):
@@ -987,7 +1053,7 @@ def test_forbidden_json_and_code_are_rejected(design_fixture):
             "def compute_reward_terms(obs, constants):\n    return np.asarray([0], dtype=np.float32)\n"
         )
     )
-    with pytest.raises(CandidateError, match="two top-level functions|disallowed"):
+    with pytest.raises(CandidateError, match="one top-level function|disallowed"):
         validate_candidate(forbidden, constants)
 
 
@@ -997,9 +1063,8 @@ def test_staged_validation_collects_independent_static_errors(design_fixture):
         code=(
             "import os\n"
             "def compute_extra_state(bad, signature):\n"
-            '    return np.asarray([np.sin(obs["not_a_field"])], dtype=np.float32)\n\n'
-            "def compute_reward_terms(obs, constants):\n"
-            "    return np.asarray([open('x')], dtype=np.float32)\n"
+            '    value = np.sin(obs["not_a_field"])\n'
+            "    return np.asarray([value + open('x')], dtype=np.float32)\n"
         )
     )
     report = llm_design.validate_candidate_staged(candidate, constants)
@@ -1019,7 +1084,7 @@ def test_staged_validation_collects_independent_schema_errors(design_fixture):
     candidate["unexpected"] = True
     candidate["features"][0]["dtype"] = "float64"
     candidate["features"][0]["range"] = {"minimum": -2.0, "maximum": 2.0}
-    candidate["reward_terms"][0]["weight"] = float("inf")
+    candidate["features"][0]["reward_weight"] = float("inf")
     report = llm_design.validate_candidate_staged(candidate, constants)
     codes = {item["code"] for item in report["errors"]}
     assert {
@@ -1040,9 +1105,8 @@ def test_static_failures_are_not_executed_and_all_reach_revision_prompt(
         code=(
             "import os\n"
             "def compute_extra_state(obs, constants):\n"
-            '    return np.asarray([np.sin(obs["missing"])], dtype=np.float32)\n\n'
-            "def compute_reward_terms(obs, constants):\n"
-            "    return np.asarray([open('x')], dtype=np.float32)\n"
+            '    value = np.sin(obs["missing"])\n'
+            "    return np.asarray([value + open('x')], dtype=np.float32)\n"
         ),
     )
     calls = []
@@ -1072,6 +1136,87 @@ def test_static_failures_are_not_executed_and_all_reach_revision_prompt(
     assert "multi-static-error" in prompt
     assert "STATIC_DISALLOWED_SYNTAX" in prompt
     assert "STATIC_FUNCTION_CALL" in prompt
+
+
+def test_source_field_feedback_maps_reliable_features_and_not_unresolved_indices(
+    design_fixture,
+):
+    _, _, _, _, constants = design_fixture
+    mapped = _candidate(
+        code=(
+            "def compute_extra_state(obs, constants):\n"
+            '    mask = obs["movement_mask"]\n'
+            '    values = obs["uav_backlog_bits"]\n'
+            "    value = np.mean(np.where(mask, values, 0.0))\n"
+            "    return np.asarray([value], dtype=np.float32)\n"
+        )
+    )
+    report = llm_design.validate_candidate_staged(mapped, constants)
+    mapped_errors = [
+        item
+        for item in report["errors"]
+        if item["code"] == "STATIC_UNDECLARED_FEATURE_SOURCE"
+    ]
+    assert mapped_errors
+    assert all(item["location"] == "$.features[0].source_fields" for item in mapped_errors)
+    assert any("obs.movement_mask" in item["problem"] and "code:" in item["problem"] for item in mapped_errors)
+
+    unresolved = _candidate(
+        code=(
+            "def compute_extra_state(obs, constants):\n"
+            '    value = np.clip(obs["state"][0] * obs["state"][0], 0.0, 1.0)\n'
+            '    if np.any(obs["movement_mask"]):\n'
+            "        value = value * 0.5\n"
+            "    return np.asarray([value], dtype=np.float32)\n"
+        )
+    )
+    report = llm_design.validate_candidate_staged(unresolved, constants)
+    errors = [
+        item
+        for item in report["errors"]
+        if item["code"] == "STATIC_UNDECLARED_FIELD_UNRESOLVED_FEATURE"
+    ]
+    assert errors
+    assert "prevents reliable mapping" in errors[0]["problem"]
+    assert "features[0]" not in errors[0]["location"]
+
+
+def test_repeated_failed_candidate_is_diagnosed_and_cannot_be_approved(tmp_path):
+    fixed = _fixed_artifact(tmp_path)
+    first = _candidate(
+        name="failed-first",
+        code=(
+            "def compute_extra_state(obs, constants):\n"
+            '    return np.asarray([obs["state"][0]], dtype=np.float32)\n'
+        ),
+    )
+    repeated = json.loads(json.dumps(first))
+    repeated["candidate_name"] = "renamed-only"
+    repeated["code"] = "# same program\n" + repeated["code"]
+    client = MockClient(
+        [
+            _response(first),
+            _response(repeated),
+            _response(_candidate(name="actually-fixed")),
+        ]
+    )
+    result = run_design(
+        fixed_sample=fixed,
+        model=client.model,
+        client=client,
+        max_attempts=3,
+        output_dir=tmp_path / "duplicate-revision",
+        worker_timeout=10,
+    )
+    assert result["status"] == "approved"
+    report = json.loads(
+        (tmp_path / "duplicate-revision" / "attempt_02" / "validation_report.json").read_text()
+    )
+    assert report["errors"][0]["code"] == "DUPLICATE_FAILED_CANDIDATE"
+    assert report["checks"]["duplicate_failed_candidate"]["matched_attempt"] == 1
+    prompt = (tmp_path / "duplicate-revision" / "attempt_03" / "prompt.txt").read_text()
+    assert "semantically unchanged from failed attempt 1" in prompt
+    assert "STATIC_EXPLICIT_FEATURE_REDUNDANCY" in prompt
 
 
 @pytest.mark.parametrize("model", ["qwen/qwen3.5-9b", "google/gemma-4-e4b"])
@@ -1108,7 +1253,17 @@ def test_over_budget_validation_feedback_is_summarized_before_next_request(
     client = MockClient(
         [
             _response(invalid, model=model),
-            _response(_candidate(name="corrected"), model=model),
+            _response(
+                _candidate(
+                    name="corrected",
+                    code=(
+                        "def compute_extra_state(obs, constants):\n"
+                        '    value = np.clip(obs["state"][0] ** 2, 0.0, 1.0)\n'
+                        "    return np.asarray([value], dtype=np.float32)\n"
+                    ),
+                ),
+                model=model,
+            ),
         ],
         model=model,
     )
@@ -1117,7 +1272,7 @@ def test_over_budget_validation_feedback_is_summarized_before_next_request(
         model=model,
         client=client,
         max_attempts=2,
-        context_length=20_000,
+        context_length=40_000,
         output_dir=tmp_path / "feedback-summary",
         worker_timeout=10,
     )
@@ -1203,8 +1358,9 @@ def test_runtime_errors_are_deduplicated_with_representative_samples(design_fixt
     candidate = _candidate(
         code=(
             "def compute_extra_state(obs, constants):\n"
-            "    return np.asarray([[0.0]], dtype=np.float32)\n\n"
-            "def compute_reward_terms(obs, constants):\n"
+            '    value = float(obs["state"][0])\n'
+            "    if value < 0.15:\n"
+            "        return np.asarray([[0.0]], dtype=np.float32)\n"
             "    return np.asarray([np.log(-1.0)], dtype=np.float32)\n"
         )
     )
@@ -1423,10 +1579,10 @@ def test_derived_feature_is_allowed_and_numeric_coincidence_remains_warning(desi
         )
     )
     validate_candidate(coincident, constants)
-    extra, terms, _ = execute_candidate_isolated(
+    extra, reward, _ = execute_candidate_isolated(
         coincident, build_obs_arrays(arrays), constants, timeout=10
     )
-    diagnostics = candidate_numeric_diagnostics(arrays["state"], extra, terms, coincident)
+    diagnostics = candidate_numeric_diagnostics(arrays["state"], extra, coincident)
     assert any("numerically duplicates original state" in item for item in diagnostics["warnings"])
 
 
@@ -1509,42 +1665,34 @@ def test_worker_timeout_is_terminable(design_fixture):
         )
 
 
-@pytest.mark.parametrize("invalid_output", ["state", "reward"])
-def test_empty_probe_uses_full_output_range_validation(design_fixture, invalid_output):
+def test_empty_probe_uses_full_output_range_validation(design_fixture):
     _, arrays, _, _, constants = design_fixture
     obs_arrays = {
         name: np.asarray(value).copy()
         for name, value in build_obs_arrays(arrays).items()
     }
     obs_arrays["state"][:, 0] = 0.5
-    feature_value = "bad" if invalid_output == "state" else "0.0"
-    reward_value = "bad" if invalid_output == "reward" else "0.0"
     candidate = _candidate(
         code=(
             "def compute_extra_state(obs, constants):\n"
             '    bad = 2.0 if np.count_nonzero(obs["state"]) == 0 else 0.0\n'
-            f"    return np.asarray([{feature_value}], dtype=np.float32)\n\n"
-            "def compute_reward_terms(obs, constants):\n"
-            '    bad = 2.0 if np.count_nonzero(obs["state"]) == 0 else 0.0\n'
-            f"    return np.asarray([{reward_value}], dtype=np.float32)\n"
+            "    return np.asarray([bad], dtype=np.float32)\n"
         )
     )
-    expected = (
-        r"compute_extra_state\(empty probe\).*feature\[0\]"
-        if invalid_output == "state"
-        else r"compute_reward_terms\(empty probe\).*reward_terms\[0\]"
-    )
-    with pytest.raises(CandidateExecutionError, match=expected):
+    with pytest.raises(
+        CandidateExecutionError,
+        match=r"compute_extra_state\(empty probe\).*feature\[0\]",
+    ):
         execute_candidate_isolated(candidate, obs_arrays, constants, timeout=10)
 
 
 def test_legal_empty_probe_still_passes(design_fixture):
     _, arrays, _, _, constants = design_fixture
-    extra, terms, report = execute_candidate_isolated(
+    extra, reward, report = execute_candidate_isolated(
         _candidate(), build_obs_arrays(arrays), constants, timeout=10
     )
     assert extra.shape == (6, 1)
-    assert terms.shape == (6, 1)
+    assert reward.shape == (6,)
     assert report["empty_probe_check"] == "passed"
 
 
@@ -1676,7 +1824,7 @@ def test_long_failed_output_is_marked_and_reasoning_only_is_not_replayed(tmp_pat
         model=long_client.model,
         client=long_client,
         max_attempts=2,
-        context_length=16_000,
+        context_length=40_000,
         output_dir=tmp_path / "long-output",
         worker_timeout=10,
     )
@@ -1801,12 +1949,10 @@ def test_candidate_uses_fixed_pair_set_and_zero_pair_remains_excluded():
         pair_hash="fixed",
     )
     extra = np.asarray([[0.0], [1.0], [0.0]], dtype=np.float32)
-    terms = np.zeros((3, 1), dtype=np.float32)
     report = evaluate_candidate(
         context,
         _candidate(),
         extra,
-        terms,
         beta=1.0,
         batch_size=1,
         absolute_tolerance=1e-12,
@@ -1832,8 +1978,7 @@ def test_approved_artifact_reload_recomputes_identically(tmp_path):
     from llm_design_contract import load_design_inputs
 
     arrays, _, _, _ = load_design_inputs(fixed)
-    extra, terms, reward = design.evaluate_fixed_samples(arrays, timeout=10)
+    extra, reward = design.evaluate_fixed_samples(arrays, timeout=10)
     assert extra.shape == (6, 1)
-    assert terms.shape == (6, 1)
     assert np.array_equal(reward, np.zeros(6))
     assert not list((tmp_path / "design").glob("*training*"))

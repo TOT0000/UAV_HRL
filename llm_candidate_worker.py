@@ -11,7 +11,7 @@ import traceback
 
 import numpy as np
 
-from llm_candidate import validate_candidate
+from llm_candidate import feature_reward, validate_candidate
 from llm_design_contract import OBS_KEYS
 
 
@@ -79,22 +79,19 @@ def _run_function(function, obs, constants, expected_size, label):
     return first
 
 
-def _validate_output_ranges(extra, terms, candidate, label):
+def _validate_output_ranges(extra, candidate, label):
     tolerance = 1e-6
     extra = np.asarray(extra)
-    terms = np.asarray(terms)
     if extra.ndim == 1:
         extra = extra[None, :]
-    if terms.ndim == 1:
-        terms = terms[None, :]
     for index, definition in enumerate(candidate["features"]):
         minimum = float(definition["range"]["minimum"])
         maximum = float(definition["range"]["maximum"])
         observed_minimum = float(np.min(extra[:, index]))
         observed_maximum = float(np.max(extra[:, index]))
-        if observed_minimum < -1.0 - tolerance or observed_maximum > 1.0 + tolerance:
+        if observed_minimum < -tolerance or observed_maximum > 1.0 + tolerance:
             raise ValueError(
-                f"compute_extra_state({label}) feature[{index}] is outside [-1,1]: "
+                f"compute_extra_state({label}) feature[{index}] is outside [0,1]: "
                 f"observed [{observed_minimum},{observed_maximum}]"
             )
         if observed_minimum < minimum - tolerance or observed_maximum > maximum + tolerance:
@@ -103,18 +100,7 @@ def _validate_output_ranges(extra, terms, candidate, label):
                 f"range [{minimum},{maximum}]: observed "
                 f"[{observed_minimum},{observed_maximum}]"
             )
-    for index in range(terms.shape[1]):
-        observed_minimum = float(np.min(terms[:, index]))
-        observed_maximum = float(np.max(terms[:, index]))
-        if observed_minimum < -tolerance or observed_maximum > 1.0 + tolerance:
-            raise ValueError(
-                f"compute_reward_terms({label}) reward_terms[{index}] is outside [0,1]: "
-                f"observed [{observed_minimum},{observed_maximum}]"
-            )
-    weights = np.asarray(
-        [item["weight"] for item in candidate["reward_terms"]], dtype=np.float64
-    )
-    weighted = np.asarray(terms, dtype=np.float64) @ weights
+    weighted = feature_reward(extra, candidate)
     if np.any(weighted < -1.0 - tolerance) or np.any(weighted > 1.0 + tolerance):
         raise ValueError(
             f"weighted extra reward({label}) is outside [-1,1]: observed "
@@ -242,19 +228,19 @@ def _check_function(function, obs, constants, expected_size, label, sample, issu
         return None
 
 
-def _check_ranges(extra, terms, candidate, label, sample, issues):
+def _check_ranges(extra, candidate, label, sample, issues):
     tolerance = 1e-6
     if extra is not None:
         for index, definition in enumerate(candidate["features"]):
             value = float(extra[index])
             minimum = float(definition["range"]["minimum"])
             maximum = float(definition["range"]["maximum"])
-            if value < -1.0 - tolerance or value > 1.0 + tolerance:
+            if value < -tolerance or value > 1.0 + tolerance:
                 issues.add(
                     "RUNTIME_FEATURE_BOUNDS",
                     f"compute_extra_state({label}) feature[{index}]",
-                    f"observed {value} outside [-1,1]",
-                    "Every extra-state value must remain within [-1,1].",
+                    f"observed {value} outside [0,1]",
+                    "Every shared feature value must remain within [0,1].",
                     sample,
                 )
             if value < minimum - tolerance or value > maximum + tolerance:
@@ -265,26 +251,14 @@ def _check_ranges(extra, terms, candidate, label, sample, issues):
                     "Make the implementation respect the feature's declared fixed range.",
                     sample,
                 )
-    if terms is not None:
-        for index, value in enumerate(np.asarray(terms, dtype=np.float64)):
-            if value < -tolerance or value > 1.0 + tolerance:
-                issues.add(
-                    "RUNTIME_REWARD_TERM_BOUNDS",
-                    f"compute_reward_terms({label}) reward_terms[{index}]",
-                    f"observed {float(value)} outside [0,1]",
-                    "Every unweighted reward term must remain within [0,1].",
-                    sample,
-                )
-        weights = np.asarray(
-            [item["weight"] for item in candidate["reward_terms"]], dtype=np.float64
-        )
-        weighted = float(np.asarray(terms, dtype=np.float64) @ weights)
+    if extra is not None:
+        weighted = float(feature_reward(extra, candidate))
         if weighted < -1.0 - tolerance or weighted > 1.0 + tolerance:
             issues.add(
                 "RUNTIME_WEIGHTED_REWARD_BOUNDS",
                 "weighted extra reward",
                 f"observed {weighted} outside [-1,1]",
-                "Keep term values and weights within the declared constraints so the weighted sum lies in [-1,1].",
+                "Keep feature values and reward weights within the declared constraints so the weighted sum lies in [-1,1].",
                 sample,
             )
 
@@ -317,11 +291,8 @@ def main(argv=None):
         namespace = {"__builtins__": SAFE_BUILTINS, "np": np}
         exec(compile(candidate["code"], "<approved-candidate>", "exec"), namespace, namespace)
         extra_function = namespace["compute_extra_state"]
-        reward_function = namespace["compute_reward_terms"]
         feature_count = len(candidate["features"])
-        term_count = len(candidate["reward_terms"])
         extra = np.empty((rows, feature_count), dtype=np.float32)
-        terms = np.empty((rows, term_count), dtype=np.float32)
         issues = _IssueAccumulator()
         for row in range(rows):
             obs = {name: array[row] for name, array in arrays.items()}
@@ -334,18 +305,8 @@ def main(argv=None):
                 {"fixed_sample_index": row},
                 issues,
             )
-            row_terms = _check_function(
-                reward_function,
-                obs,
-                constants,
-                term_count,
-                "compute_reward_terms",
-                {"fixed_sample_index": row},
-                issues,
-            )
             _check_ranges(
                 row_extra,
-                row_terms,
                 candidate,
                 "fixed sample",
                 {"fixed_sample_index": row},
@@ -353,8 +314,6 @@ def main(argv=None):
             )
             if row_extra is not None:
                 extra[row] = row_extra
-            if row_terms is not None:
-                terms[row] = row_terms
         probe = _empty_probe({name: array[0] for name, array in arrays.items()})
         probe_extra = _check_function(
             extra_function,
@@ -365,18 +324,8 @@ def main(argv=None):
             {"probe": "empty"},
             issues,
         )
-        probe_terms = _check_function(
-            reward_function,
-            probe,
-            constants,
-            term_count,
-            "compute_reward_terms(empty probe)",
-            {"probe": "empty"},
-            issues,
-        )
         _check_ranges(
             probe_extra,
-            probe_terms,
             candidate,
             "empty probe",
             {"probe": "empty"},
@@ -400,14 +349,18 @@ def main(argv=None):
                 },
             )
             return 1
-        np.savez_compressed(args.output, extra_state=extra, reward_terms=terms)
+        np.savez_compressed(
+            args.output,
+            extra_state=extra,
+            extra_reward=feature_reward(extra, candidate),
+        )
         _write_json(
             args.report,
             {
                 "status": "passed",
                 "sample_count": rows,
                 "feature_count": feature_count,
-                "reward_term_count": term_count,
+                "feature_reward_source": "host dot(feature_reward_weights, extra_state)",
                 "determinism_check": "all fixed samples plus empty probe",
                 "input_mutation_check": "passed with read-only arrays and before/after comparison",
                 "empty_probe_check": "passed",

@@ -2768,14 +2768,14 @@ def train(
                     else None
                 )
                 llm_extra_reward = 0.0
-                llm_reward_terms = None
+                llm_features = None
                 if llm_runtime is not None:
                     current_obs = build_online_obs(
                         original_state,
                         current_movement_mask,
                         current_auxiliary_snapshot,
                     )
-                    current_extra, llm_reward_terms, llm_extra_reward = (
+                    current_extra, llm_extra_reward = (
                         _evaluate_llm_observation(
                             llm_runtime,
                             current_obs,
@@ -2785,6 +2785,7 @@ def train(
                             "current",
                         )
                     )
+                    llm_features = current_extra
                     state = np.concatenate(
                         (original_state, current_extra), dtype=np.float32
                     )
@@ -3216,10 +3217,10 @@ def train(
                         "movement_gamma": float(movement_agent.gamma),
                         "reward_at_checkpoint_lambda": interval_reward,
                         "existing_movement_reward": interval_reward,
-                        "llm_reward_terms": (
+                        "llm_features": (
                             None
-                            if llm_reward_terms is None
-                            else llm_reward_terms.copy()
+                            if llm_features is None
+                            else llm_features.copy()
                         ),
                         "llm_extra_reward": float(llm_extra_reward),
                         "llm_reward_beta": (

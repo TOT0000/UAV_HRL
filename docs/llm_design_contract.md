@@ -9,10 +9,9 @@ approved design. It never imports a candidate as a trusted project module and
 never invokes training.
 
 The client uses LM Studio's OpenAI-compatible `GET /v1/models` and
-`POST /v1/chat/completions` endpoints. It first requests JSON-schema structured
-output. If the API explicitly rejects structured output, the fallback is
-recorded and the response is still subject to duplicate-key-aware strict JSON,
-schema, AST, worker, and numeric validation. The requested model must exactly
+`POST /v1/chat/completions` endpoints with streaming enabled and without a
+`response_format` override. Responses remain subject to duplicate-key-aware
+strict JSON, schema, AST, worker, and numeric validation. The requested model must exactly
 match a model identifier visible through `/v1/models`; no model substitution is
 performed. `LM_STUDIO_API_TOKEN` is used when present and is never saved.
 
@@ -30,12 +29,11 @@ evaluation rules, and output reservation are never silently removed.
 
 ## Current-only candidate interface
 
-Both candidate functions receive only information available before the current
+The candidate function receives only information available before the current
 movement action:
 
 ```python
 compute_extra_state(obs, constants)
-compute_reward_terms(obs, constants)
 ```
 
 `obs` contains the original 531-D state, the current 16-D movement mask, and
@@ -51,14 +49,16 @@ checkpoint/environment contracts. Only constants absent from per-run metadata
 but authoritative in the checked-in environment configuration are added, with
 that code source recorded.
 
-Candidate JSON uses schema `uav-hrl-llm-candidate-v1` and
+Candidate JSON uses schema `uav-hrl-llm-shared-feature-candidate-v2` and
 `reward_input_mode="current_only"`. Feature outputs are one-dimensional
-`float32` arrays within their declared subranges of `[-1,1]`. Reward terms are
-one-dimensional `float32` arrays in `[0,1]`; signed weights must satisfy
-`sum(abs(weight)) <= 1`. The host computes, without clipping:
+`float32` arrays within their declared subranges of `[0,1]`. Each feature has
+a finite signed `reward_weight`, and `sum(abs(reward_weight)) <= 1`. The exact
+same unweighted feature vector is appended to state and weighted by the host,
+without clipping or a second candidate call:
 
 ```text
-r_extra = dot(weights, reward_terms)
+s_aug = concat(s_original, features)
+r_extra = dot(feature_reward_weights, features)
 r_candidate(lambda) = r_base(lambda) + beta * r_extra
 ```
 
@@ -77,6 +77,16 @@ identical. It intentionally does not claim general algebraic equivalence or
 full control-flow data-flow analysis. Numeric equality found only on the fixed
 samples remains a diagnostic warning rather than an automatic rejection;
 derived features may still use the original state.
+
+For straight-line outputs that can be resolved reliably, source-field errors
+identify the feature index, JSON path, field, and candidate-code locations,
+including dependencies used by masks and conditions. For path-dependent
+control flow, the report lists the certain field locations but explicitly does
+not invent an output index. Failed candidates also receive a semantic
+fingerprint over feature metadata, source fields, weights, and normalized code
+AST. Changing only `candidate_name`, comments, or formatting is reported as a
+repeat of the earlier failed attempt; this is deliberately not a claim of
+general mathematical-equivalence detection.
 
 ## Fixed-pair acceptance
 
@@ -110,7 +120,7 @@ Dry-run against the current formal fixed baseline (no API request):
 & 'C:\Users\user\anaconda3\envs\LLM_HRL\python.exe' run_llm_design.py `
   --fixed-sample results/llm_baselines/baseline-20260927T130708Z-ba4bf287 `
   --model qwen/qwen3.5-9b `
-  --context-length 20000 --max-output-tokens 4096 --dry-run
+  --context-length 40000 --max-output-tokens 4096 --dry-run
 ```
 
 Qwen:
@@ -120,7 +130,7 @@ Qwen:
   --fixed-sample results/llm_baselines/baseline-20260927T130708Z-ba4bf287 `
   --base-url http://127.0.0.1:1234/v1 `
   --model qwen/qwen3.5-9b `
-  --context-length 20000 --max-output-tokens 4096 `
+  --context-length 40000 --max-output-tokens 4096 `
   --temperature 0.3 --seed 20260927 --max-attempts 5 `
   --beta 1.0 --batch-size 128 `
   --timeout 600 --worker-timeout 120
@@ -133,7 +143,7 @@ Gemma uses the same task, schema, evaluation, and thresholds:
   --fixed-sample results/llm_baselines/baseline-20260927T130708Z-ba4bf287 `
   --base-url http://127.0.0.1:1234/v1 `
   --model google/gemma-4-e4b `
-  --context-length 20000 --max-output-tokens 4096 `
+  --context-length 40000 --max-output-tokens 4096 `
   --temperature 0.3 --seed 20260927 --max-attempts 5 `
   --beta 1.0 --batch-size 128 `
   --timeout 600 --worker-timeout 120
@@ -183,17 +193,18 @@ from llm_candidate import load_approved_design
 
 fixed_arrays, _ = load_fixed_samples("results/llm_baselines/<baseline-run>")
 design = load_approved_design("results/llm_designs/<model>/<run>/approved")
-extra_state, reward_terms, r_extra = design.evaluate_fixed_samples(
+extra_state, r_extra = design.evaluate_fixed_samples(
     fixed_arrays, timeout=120
 )
 ```
 
-The formal `td3_dinkelbach_llm` training method is intentionally not registered
-or started by this tool.
+The formal `td3_dinkelbach_llm` training method is registered separately; this
+offline tool never starts it. Approved dual-function v1 artifacts are not
+silently converted because their state and reward functions may have different
+semantics. The v2 runtime rejects them with a redesign/retraining message.
 
 LM Studio interface references used by this implementation:
 
 - [OpenAI-compatible model listing](https://lmstudio.ai/docs/developer/openai-compat/models)
 - [OpenAI-compatible chat completions and supported parameters](https://beta.lmstudio.ai/docs/developer/openai-compat/chat-completions)
-- [JSON-schema structured output](https://lmstudio.ai/docs/developer/openai-compat/structured-output)
 - [Native model/load inventory and context metadata](https://lmstudio.ai/docs/developer/rest/list)

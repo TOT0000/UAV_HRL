@@ -6,12 +6,14 @@ import ast
 import copy
 from dataclasses import dataclass
 import hashlib
+import io
 import json
 import math
 from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import tokenize
 from typing import Any
 
 import numpy as np
@@ -33,7 +35,6 @@ TOP_FIELDS = {
     "candidate_name",
     "reward_input_mode",
     "features",
-    "reward_terms",
     "code",
 }
 ITEM_FIELDS = {
@@ -45,8 +46,8 @@ ITEM_FIELDS = {
     "source_fields",
     "formula",
     "missing_data_rule",
+    "reward_weight",
 }
-REWARD_ITEM_FIELDS = ITEM_FIELDS | {"weight"}
 SAFE_BUILTIN_CALLS = {
     "abs",
     "bool",
@@ -170,16 +171,15 @@ def _finite_number(value, label):
 def _validate_items(
     items: Any,
     *,
-    reward: bool,
     allowed_fields: set[str],
 ) -> None:
-    label = "reward_terms" if reward else "features"
+    label = "features"
     if not isinstance(items, list) or not items:
         raise CandidateError(f"{label} must contain at least one item")
     names = []
     formulas = []
     weights = []
-    exact_fields = REWARD_ITEM_FIELDS if reward else ITEM_FIELDS
+    exact_fields = ITEM_FIELDS
     for index, item in enumerate(items):
         if not isinstance(item, dict) or set(item) != exact_fields:
             raise CandidateError(
@@ -206,11 +206,8 @@ def _validate_items(
         maximum = _finite_number(declared_range["maximum"], f"{label}[{index}].maximum")
         if minimum > maximum:
             raise CandidateError(f"{label}[{index}] range is reversed")
-        if reward:
-            if minimum != 0.0 or maximum != 1.0:
-                raise CandidateError("every reward term must declare range [0,1]")
-        elif minimum < -1.0 or maximum > 1.0:
-            raise CandidateError("feature declared ranges must lie within [-1,1]")
+        if minimum < 0.0 or maximum > 1.0:
+            raise CandidateError("feature declared ranges must lie within [0,1]")
         source_fields = item["source_fields"]
         if (
             not isinstance(source_fields, list)
@@ -222,8 +219,11 @@ def _validate_items(
         unknown = sorted(set(source_fields).difference(allowed_fields))
         if unknown:
             raise CandidateError(f"{label}[{index}] declares forbidden fields: {unknown}")
-        if reward:
-            weights.append(_finite_number(item["weight"], f"{label}[{index}].weight"))
+        weights.append(
+            _finite_number(
+                item["reward_weight"], f"{label}[{index}].reward_weight"
+            )
+        )
     if len(set(names)) != len(names):
         raise CandidateError(f"{label} names must be unique")
     duplicate_formulas = sorted(
@@ -231,8 +231,8 @@ def _validate_items(
     )
     if duplicate_formulas:
         raise CandidateError(f"{label} contains duplicate formulas")
-    if reward and math.fsum(abs(value) for value in weights) > 1.0 + 1e-12:
-        raise CandidateError("sum(abs(reward term weights)) must be <= 1")
+    if math.fsum(abs(value) for value in weights) > 1.0 + 1e-12:
+        raise CandidateError("sum(abs(feature reward weights)) must be <= 1")
 
 
 def validate_candidate_schema(
@@ -251,8 +251,7 @@ def validate_candidate_schema(
     if not isinstance(candidate["code"], str) or not candidate["code"].strip():
         raise CandidateError("code must be a non-empty string")
     allowed = allowed_source_fields(constants_metadata)
-    _validate_items(candidate["features"], reward=False, allowed_fields=allowed)
-    _validate_items(candidate["reward_terms"], reward=True, allowed_fields=allowed)
+    _validate_items(candidate["features"], allowed_fields=allowed)
 
 
 def _dotted_name(node: ast.AST) -> str | None:
@@ -481,11 +480,11 @@ def validate_candidate_code(
     except SyntaxError as exc:
         raise CandidateError(f"candidate code has invalid syntax: {exc}") from exc
     top_functions = [node for node in tree.body if isinstance(node, ast.FunctionDef)]
-    if len(top_functions) != 2 or any(
+    if len(top_functions) != 1 or any(
         not isinstance(node, ast.FunctionDef) for node in tree.body
     ):
-        raise CandidateError("code must contain exactly the two top-level functions")
-    expected = {"compute_extra_state", "compute_reward_terms"}
+        raise CandidateError("code must contain exactly one top-level function")
+    expected = {"compute_extra_state"}
     if {node.name for node in top_functions} != expected:
         raise CandidateError(f"code functions must be exactly {sorted(expected)}")
     for function in top_functions:
@@ -506,18 +505,33 @@ def validate_candidate_code(
     forbidden = sorted(visitor.accessed_fields.difference(allowed))
     if forbidden:
         raise CandidateError(f"code accesses forbidden input fields: {forbidden}")
-    declared = {
-        value
-        for group in (candidate["features"], candidate["reward_terms"])
-        for item in group
-        for value in item["source_fields"]
-    }
-    undeclared = sorted(visitor.accessed_fields.difference(declared))
-    if undeclared:
-        raise CandidateError(f"code uses source fields absent from metadata: {undeclared}")
     extra_function = next(
         function for function in top_functions if function.name == "compute_extra_state"
     )
+    declared = {
+        value for item in candidate["features"] for value in item["source_fields"]
+    }
+    expressions = _returned_feature_expressions(extra_function)
+    if expressions is not None and len(expressions) == len(candidate["features"]):
+        for index, expression in enumerate(expressions):
+            expression_visitor = _CandidateVisitor()
+            expression_visitor.visit(expression)
+            missing = sorted(
+                expression_visitor.accessed_fields.difference(
+                    candidate["features"][index]["source_fields"]
+                )
+            )
+            if missing:
+                raise CandidateError(
+                    f"feature[{index}] uses source fields absent from its metadata: {missing}"
+                )
+    else:
+        undeclared = sorted(visitor.accessed_fields.difference(declared))
+        if undeclared:
+            raise CandidateError(
+                "code uses source fields absent from metadata and output indices "
+                f"cannot be reliably resolved: {undeclared}"
+            )
     redundancy = _validate_explicit_feature_redundancy(
         extra_function, len(candidate["features"])
     )
@@ -534,6 +548,76 @@ def validate_candidate(
 ) -> dict[str, Any]:
     validate_candidate_schema(candidate, constants_metadata)
     return validate_candidate_code(candidate, constants_metadata)
+
+
+def candidate_reward_weights(candidate: dict[str, Any]) -> np.ndarray:
+    """Return the single authoritative feature-to-reward weight vector."""
+
+    weights = np.asarray(
+        [item["reward_weight"] for item in candidate["features"]], dtype=np.float64
+    )
+    if weights.ndim != 1 or not np.all(np.isfinite(weights)):
+        raise CandidateError("feature reward weights must be a finite vector")
+    if float(np.sum(np.abs(weights), dtype=np.float64)) > 1.0 + 1e-12:
+        raise CandidateError("sum(abs(feature reward weights)) must be <= 1")
+    return weights
+
+
+def feature_reward(extra_state: np.ndarray, candidate: dict[str, Any]) -> np.ndarray:
+    """Apply approved weights to the exact feature array used by the state."""
+
+    values = np.asarray(extra_state, dtype=np.float64)
+    weights = candidate_reward_weights(candidate)
+    if values.ndim not in (1, 2) or values.shape[-1] != weights.size:
+        raise CandidateError("extra-state values and feature reward weights do not align")
+    reward = values @ weights
+    if not np.all(np.isfinite(reward)):
+        raise CandidateError("weighted extra reward is non-finite")
+    if np.any(reward < -1.0 - NUMERIC_TOLERANCE) or np.any(
+        reward > 1.0 + NUMERIC_TOLERANCE
+    ):
+        raise CandidateError("weighted extra reward is outside [-1,1]")
+    return np.asarray(reward, dtype=np.float64)
+
+
+def candidate_semantic_fingerprint(candidate: dict[str, Any]) -> str:
+    """Hash meaning-bearing candidate content, ignoring name/comments/formatting."""
+
+    payload = {
+        key: value
+        for key, value in candidate.items()
+        if key not in {"candidate_name", "code"}
+    }
+    code = candidate.get("code")
+    if isinstance(code, str):
+        try:
+            payload["code_ast"] = ast.dump(
+                ast.parse(code, mode="exec"),
+                annotate_fields=True,
+                include_attributes=False,
+            )
+        except SyntaxError:
+            try:
+                ignored = {
+                    tokenize.COMMENT,
+                    tokenize.NL,
+                    tokenize.NEWLINE,
+                    tokenize.INDENT,
+                    tokenize.DEDENT,
+                    tokenize.ENCODING,
+                    tokenize.ENDMARKER,
+                }
+                payload["code_tokens"] = [
+                    (token.type, token.string)
+                    for token in tokenize.generate_tokens(io.StringIO(code).readline)
+                    if token.type not in ignored
+                ]
+            except (IndentationError, tokenize.TokenError):
+                payload["code_text"] = code
+    encoded = json.dumps(
+        payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def _validation_issue(
@@ -612,7 +696,7 @@ def _schema_validation_issues(
 
     allowed = allowed_source_fields(constants_metadata)
     all_weights: list[float] = []
-    for group_name, reward in (("features", False), ("reward_terms", True)):
+    for group_name in ("features",):
         items = candidate.get(group_name)
         if not isinstance(items, list) or not items:
             add(
@@ -624,7 +708,7 @@ def _schema_validation_issues(
             continue
         names: list[str] = []
         formulas: list[str] = []
-        exact = REWARD_ITEM_FIELDS if reward else ITEM_FIELDS
+        exact = ITEM_FIELDS
         for index, item in enumerate(items):
             location = f"$.{group_name}[{index}]"
             if not isinstance(item, dict):
@@ -718,19 +802,12 @@ def _schema_validation_issues(
                             f"minimum {minimum} exceeds maximum {maximum}",
                             "Use minimum <= maximum.",
                         )
-                    if reward and (minimum != 0.0 or maximum != 1.0):
-                        add(
-                            "SCHEMA_REWARD_RANGE",
-                            f"{location}.range",
-                            f"declared [{minimum}, {maximum}]",
-                            "Every reward term must declare [0,1].",
-                        )
-                    if not reward and (minimum < -1.0 or maximum > 1.0):
+                    if minimum < 0.0 or maximum > 1.0:
                         add(
                             "SCHEMA_FEATURE_RANGE",
                             f"{location}.range",
                             f"declared [{minimum}, {maximum}]",
-                            "Feature ranges must lie within [-1,1].",
+                            "Feature ranges must lie within [0,1].",
                         )
             sources = item.get("source_fields")
             if not isinstance(sources, list) or not sources or any(
@@ -751,17 +828,16 @@ def _schema_validation_issues(
                         f"unknown fields: {unknown}",
                         "Use only fields from the supplied current-only interface.",
                     )
-            if reward:
-                weight = item.get("weight")
-                if isinstance(weight, bool) or not isinstance(weight, (int, float)) or not math.isfinite(float(weight)):
-                    add(
-                        "SCHEMA_WEIGHT",
-                        f"{location}.weight",
-                        f"received {weight!r}",
-                        "Each weight must be a finite signed number.",
-                    )
-                else:
-                    all_weights.append(float(weight))
+            weight = item.get("reward_weight")
+            if isinstance(weight, bool) or not isinstance(weight, (int, float)) or not math.isfinite(float(weight)):
+                add(
+                    "SCHEMA_WEIGHT",
+                    f"{location}.reward_weight",
+                    f"received {weight!r}",
+                    "Each reward_weight must be a finite signed number; booleans are invalid.",
+                )
+            else:
+                all_weights.append(float(weight))
         duplicate_names = sorted({value for value in names if names.count(value) > 1})
         for value in duplicate_names:
             add(
@@ -783,9 +859,9 @@ def _schema_validation_issues(
     if math.fsum(abs(value) for value in all_weights) > 1.0 + 1e-12:
         add(
             "SCHEMA_WEIGHT_L1",
-            "$.reward_terms",
+            "$.features",
             f"sum(abs(weight)) is {math.fsum(abs(value) for value in all_weights):.17g}",
-            "Keep sum(abs(weight)) <= 1.",
+            "Keep sum(abs(reward_weight)) <= 1.",
         )
     return issues
 
@@ -793,6 +869,7 @@ def _schema_validation_issues(
 class _CollectingCandidateVisitor(ast.NodeVisitor):
     def __init__(self):
         self.accessed_fields: set[str] = set()
+        self.field_locations: dict[str, list[str]] = {}
         self.issues: list[dict[str, Any]] = []
         self._seen: set[tuple[str, int, int, str]] = set()
 
@@ -879,7 +956,11 @@ class _CollectingCandidateVisitor(ast.NodeVisitor):
                     "Use literal field names from the supplied interface.",
                 )
             else:
-                self.accessed_fields.add(f"{node.value.id}.{key}")
+                field = f"{node.value.id}.{key}"
+                self.accessed_fields.add(field)
+                self.field_locations.setdefault(field, []).append(
+                    f"code:{int(getattr(node, 'lineno', 0))}:{int(getattr(node, 'col_offset', 0))}"
+                )
         self.generic_visit(node)
 
     def visit_Assign(self, node):
@@ -923,23 +1004,23 @@ def _static_validation_issues(
                 "static",
                 f"code:{exc.lineno or 0}:{exc.offset or 0}",
                 exc.msg,
-                "Return syntactically valid Python defining the two required functions.",
+                "Return syntactically valid Python defining compute_extra_state only.",
             )
         ], None
     issues: list[dict[str, Any]] = []
     top_functions = [node for node in tree.body if isinstance(node, ast.FunctionDef)]
     other_top = [node for node in tree.body if not isinstance(node, ast.FunctionDef)]
-    if len(top_functions) != 2 or other_top:
+    if len(top_functions) != 1 or other_top:
         issues.append(
             _validation_issue(
                 "STATIC_TOP_LEVEL",
                 "static",
                 "$.code",
-                "code does not contain exactly two top-level function definitions",
-                "Define only compute_extra_state and compute_reward_terms at top level.",
+                "code does not contain exactly one top-level function definition",
+                "Define only compute_extra_state at top level.",
             )
         )
-    expected = {"compute_extra_state", "compute_reward_terms"}
+    expected = {"compute_extra_state"}
     names = {node.name for node in top_functions}
     if names != expected:
         issues.append(
@@ -983,30 +1064,47 @@ def _static_validation_issues(
                 "Use only current-only obs/constants fields listed in the prompt.",
             )
         )
+    features = candidate.get("features")
     declared: set[str] = set()
-    for group in (candidate.get("features"), candidate.get("reward_terms")):
-        if isinstance(group, list):
-            for item in group:
-                if isinstance(item, dict) and isinstance(item.get("source_fields"), list):
-                    declared.update(
-                        value for value in item["source_fields"] if isinstance(value, str)
-                    )
-    for field in sorted(visitor.accessed_fields.difference(declared)):
-        issues.append(
-            _validation_issue(
-                "STATIC_UNDECLARED_FIELD",
-                "static",
-                f"$.code field {field}",
-                "code uses a source field absent from feature/reward metadata",
-                "Declare every actually used field in the corresponding source_fields.",
-            )
-        )
+    if isinstance(features, list):
+        for item in features:
+            if isinstance(item, dict) and isinstance(item.get("source_fields"), list):
+                declared.update(value for value in item["source_fields"] if isinstance(value, str))
     redundancy = None
     extra_function = next(
         (node for node in top_functions if node.name == "compute_extra_state"), None
     )
-    features = candidate.get("features")
     if extra_function is not None and isinstance(features, list) and features:
+        expressions = _returned_feature_expressions(extra_function)
+        if expressions is not None and len(expressions) == len(features):
+            for index, expression in enumerate(expressions):
+                expression_visitor = _CollectingCandidateVisitor()
+                expression_visitor.visit(expression)
+                item = features[index]
+                item_fields = set(item.get("source_fields", [])) if isinstance(item, dict) else set()
+                for field in sorted(expression_visitor.accessed_fields.difference(item_fields)):
+                    locations = expression_visitor.field_locations.get(field) or visitor.field_locations.get(field) or []
+                    issues.append(
+                        _validation_issue(
+                            "STATIC_UNDECLARED_FEATURE_SOURCE",
+                            "static",
+                            f"$.features[{index}].source_fields",
+                            f"feature[{index}] uses {field!r} at {locations or ['unknown code location']} but does not declare it",
+                            f"Add {field!r} to features[{index}].source_fields; include fields used by masks, conditions, normalization, and missing-data handling.",
+                        )
+                    )
+        else:
+            for field in sorted(visitor.accessed_fields.difference(declared)):
+                locations = visitor.field_locations.get(field, [])
+                issues.append(
+                    _validation_issue(
+                        "STATIC_UNDECLARED_FIELD_UNRESOLVED_FEATURE",
+                        "static",
+                        f"$.code field {field}",
+                        f"code uses {field!r} at {locations}; control/data flow prevents reliable mapping to one feature",
+                        f"Declare {field!r} in every feature whose computation, mask, condition, normalization, or missing-data path uses it. No feature index is inferred here.",
+                    )
+                )
         try:
             redundancy = _validate_explicit_feature_redundancy(
                 extra_function, len(features)
@@ -1148,37 +1246,33 @@ def execute_candidate_isolated(
             )
         with np.load(output_path, allow_pickle=False) as archive:
             extra = np.asarray(archive["extra_state"])
-            terms = np.asarray(archive["reward_terms"])
-        return extra, terms, {**static, **report}
+            reward = np.asarray(archive["extra_reward"])
+        return extra, reward, {**static, **report}
 
 
 def candidate_numeric_diagnostics(
     original_state: np.ndarray,
     extra_state: np.ndarray,
-    reward_terms: np.ndarray,
     candidate: dict[str, Any],
 ) -> dict[str, Any]:
-    result = {"features": [], "reward_terms": [], "warnings": []}
-    for kind, values, definitions in (
-        ("features", extra_state, candidate["features"]),
-        ("reward_terms", reward_terms, candidate["reward_terms"]),
-    ):
-        for index, definition in enumerate(definitions):
-            column = np.asarray(values[:, index], dtype=np.float64)
-            item = {
-                "index": index,
-                "name": definition["name"],
-                "minimum": float(np.min(column)),
-                "maximum": float(np.max(column)),
-                "mean": float(np.mean(column)),
-                "standard_deviation": float(np.std(column)),
-                "constant_on_fixed_samples": bool(np.ptp(column) <= NUMERIC_TOLERANCE),
-            }
-            result[kind].append(item)
-            if item["constant_on_fixed_samples"]:
-                result["warnings"].append(
-                    f"{kind}[{index}] is constant on the fixed samples; this is diagnostic, not proof of semantic uselessness"
-                )
+    result = {"features": [], "warnings": []}
+    for index, definition in enumerate(candidate["features"]):
+        column = np.asarray(extra_state[:, index], dtype=np.float64)
+        item = {
+            "index": index,
+            "name": definition["name"],
+            "reward_weight": float(definition["reward_weight"]),
+            "minimum": float(np.min(column)),
+            "maximum": float(np.max(column)),
+            "mean": float(np.mean(column)),
+            "standard_deviation": float(np.std(column)),
+            "constant_on_fixed_samples": bool(np.ptp(column) <= NUMERIC_TOLERANCE),
+        }
+        result["features"].append(item)
+        if item["constant_on_fixed_samples"]:
+            result["warnings"].append(
+                f"features[{index}] is constant on the fixed samples; this is diagnostic, not proof of semantic uselessness"
+            )
     state64 = np.asarray(original_state, dtype=np.float64)
     for index in range(extra_state.shape[1]):
         matches = np.flatnonzero(
@@ -1257,9 +1351,9 @@ def save_approved_artifact(
         "candidate_name": candidate["candidate_name"],
         "feature_count": len(candidate["features"]),
         "feature_order": [item["name"] for item in candidate["features"]],
-        "reward_term_count": len(candidate["reward_terms"]),
-        "reward_term_order": [item["name"] for item in candidate["reward_terms"]],
-        "reward_weights": [float(item["weight"]) for item in candidate["reward_terms"]],
+        "feature_reward_weights": [
+            float(item["reward_weight"]) for item in candidate["features"]
+        ],
         "files_sha256": files,
         "provenance": provenance,
     }
@@ -1285,23 +1379,22 @@ class ApprovedDesign:
 
     @property
     def weights(self) -> np.ndarray:
-        return np.asarray(self.artifact["reward_weights"], dtype=np.float64)
+        return np.asarray(self.artifact["feature_reward_weights"], dtype=np.float64)
 
     def evaluate_obs_arrays(
         self, obs_arrays: dict[str, np.ndarray], *, timeout: float = 60.0
-    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        extra, terms, _ = execute_candidate_isolated(
+    ) -> tuple[np.ndarray, np.ndarray]:
+        extra, reward, _ = execute_candidate_isolated(
             self.candidate,
             obs_arrays,
             self.constants_metadata,
             timeout=timeout,
         )
-        reward = np.asarray(terms, dtype=np.float64) @ self.weights
-        return extra, terms, reward
+        return extra, reward
 
     def evaluate_fixed_samples(
         self, fixed_arrays: dict[str, np.ndarray], *, timeout: float = 60.0
-    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    ) -> tuple[np.ndarray, np.ndarray]:
         return self.evaluate_obs_arrays(build_obs_arrays(fixed_arrays), timeout=timeout)
 
 
@@ -1311,11 +1404,15 @@ def load_approved_design(directory: str | Path) -> ApprovedDesign:
     if not artifact_path.is_file():
         raise FileNotFoundError(f"approved artifact metadata is missing: {artifact_path}")
     artifact = json.loads(artifact_path.read_text(encoding="utf-8"))
-    if (
-        artifact.get("schema_version") != APPROVED_ARTIFACT_SCHEMA_VERSION
-        or artifact.get("status") != "approved"
-    ):
-        raise CandidateError("artifact is not an approved compatible design")
+    artifact_version = artifact.get("schema_version")
+    if artifact_version != APPROVED_ARTIFACT_SCHEMA_VERSION:
+        raise CandidateError(
+            "approved artifact contract is incompatible with the shared-feature "
+            f"runtime: received {artifact_version!r}, required "
+            f"{APPROVED_ARTIFACT_SCHEMA_VERSION!r}; redesign and retrain the LLM method"
+        )
+    if artifact.get("status") != "approved":
+        raise CandidateError("artifact status is not approved")
     content_hash = artifact.pop("content_sha256", None)
     expected = hashlib.sha256(
         json.dumps(
@@ -1336,4 +1433,11 @@ def load_approved_design(directory: str | Path) -> ApprovedDesign:
     candidate = json.loads((directory / "candidate.json").read_text(encoding="utf-8"))
     constants = json.loads((directory / "constants.json").read_text(encoding="utf-8"))
     validate_candidate(candidate, constants)
+    if int(artifact.get("feature_count", -1)) != len(candidate["features"]):
+        raise CandidateError("approved artifact feature count is inconsistent")
+    if not np.array_equal(
+        np.asarray(artifact.get("feature_reward_weights"), dtype=np.float64),
+        candidate_reward_weights(candidate),
+    ):
+        raise CandidateError("approved artifact feature reward weights are inconsistent")
     return ApprovedDesign(directory, artifact, candidate, constants)

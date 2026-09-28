@@ -23,6 +23,7 @@ from HRL_task_aware import _normalize_evaluation_overrides, normalized_remaining
 from observation_strategy import ROUTING_STATE_DIM
 from paper_evaluation import (
     PAPER_EVALUATION_SUITES,
+    evaluation_method_supported,
     evaluation_sweep_points,
     run_paper_evaluation,
 )
@@ -59,9 +60,11 @@ class EnvironmentSizeSelectionTest(unittest.TestCase):
             resolve_environment_sizes_m(900)
 
     def test_suite_supports_every_registered_method_and_one_fixed_roi(self):
-        self.assertEqual(
-            set(PAPER_EVALUATION_SUITES["environment_size"]["methods"]),
-            set(METHOD_REGISTRY),
+        self.assertTrue(
+            all(
+                evaluation_method_supported(method_id, "environment_size")
+                for method_id in METHOD_REGISTRY
+            )
         )
         points = evaluation_sweep_points("environment_size")
         self.assertEqual(

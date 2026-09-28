@@ -13,7 +13,7 @@ from typing import Any
 
 import numpy as np
 
-from llm_candidate import ApprovedDesign, load_approved_design
+from llm_candidate import ApprovedDesign, feature_reward, load_approved_design
 from llm_candidate_worker import (
     SAFE_BUILTINS,
     _run_function,
@@ -23,7 +23,7 @@ from llm_design_contract import OBS_KEYS, runtime_constants
 from replay_auxiliary import SNAPSHOT_FIELD_SPECS
 
 
-LLM_RUNTIME_CONTRACT_VERSION = "uav-hrl-llm-runtime-v1"
+LLM_RUNTIME_CONTRACT_VERSION = "uav-hrl-llm-shared-feature-runtime-v2"
 RUN_ARTIFACT_DIRECTORY_NAME = "llm_artifact"
 
 
@@ -44,7 +44,9 @@ def artifact_identity(design: ApprovedDesign) -> dict[str, Any]:
         "artifact_content_sha256": str(design.artifact["content_sha256"]),
         "candidate_name": str(design.artifact["candidate_name"]),
         "feature_count": int(design.artifact["feature_count"]),
-        "reward_term_count": int(design.artifact["reward_term_count"]),
+        "feature_reward_weights": [
+            float(value) for value in design.artifact["feature_reward_weights"]
+        ],
         "beta": beta,
         "observation_interface_version": str(
             design.artifact["observation_interface_version"]
@@ -143,13 +145,7 @@ def _worker_main(connection, candidate, constants):
             namespace,
         )
         extra_function = namespace["compute_extra_state"]
-        reward_function = namespace["compute_reward_terms"]
         feature_count = len(candidate["features"])
-        term_count = len(candidate["reward_terms"])
-        weights = np.asarray(
-            [item["weight"] for item in candidate["reward_terms"]],
-            dtype=np.float64,
-        )
         connection.send({"status": "ready"})
         while True:
             request = connection.recv()
@@ -163,23 +159,13 @@ def _worker_main(connection, candidate, constants):
             extra = _run_function(
                 extra_function, obs, constants, feature_count, "compute_extra_state"
             )
+            _validate_output_ranges(extra, candidate, "online observation")
             if request.get("mode") == "state":
-                # Reuse the common range checker with a known-valid zero reward
-                # vector; reward terms are intentionally not evaluated at the
-                # next-state boundary.
-                zero_terms = np.zeros((term_count,), dtype=np.float32)
-                _validate_output_ranges(
-                    extra, zero_terms, candidate, "online next observation"
-                )
                 connection.send({"status": "ok", "extra": extra})
                 continue
-            terms = _run_function(
-                reward_function, obs, constants, term_count, "compute_reward_terms"
-            )
-            _validate_output_ranges(extra, terms, candidate, "online observation")
-            reward = float(np.asarray(terms, dtype=np.float64) @ weights)
+            reward = float(feature_reward(extra, candidate))
             connection.send(
-                {"status": "ok", "extra": extra, "terms": terms, "reward": reward}
+                {"status": "ok", "extra": extra, "reward": reward}
             )
     except EOFError:
         return
@@ -250,7 +236,6 @@ class ApprovedDesignRuntime:
             )
         return (
             np.asarray(response["extra"], dtype=np.float32),
-            np.asarray(response["terms"], dtype=np.float32),
             float(response["reward"]),
         )
 

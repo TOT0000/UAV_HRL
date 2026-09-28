@@ -147,8 +147,8 @@ counts. Candidate JSON/code is never truncated; if it cannot fit with minimum
 feedback, the run stops with `context_budget_exceeded`.
 
 ```powershell
-python -X utf8 run_llm_design.py --fixed-sample results/llm_baselines/baseline-20260927T130708Z-ba4bf287 --base-url http://127.0.0.1:1234/v1 --model qwen/qwen3.5-9b --context-length 20000 --max-output-tokens 4096 --temperature 0.3 --seed 20260927 --max-attempts 5 --beta 1 --batch-size 128 --connect-timeout 30 --timeout 600 --total-timeout 1800 --worker-timeout 120
-python -X utf8 run_llm_design.py --fixed-sample results/llm_baselines/baseline-20260927T130708Z-ba4bf287 --base-url http://127.0.0.1:1234/v1 --model google/gemma-4-e4b --context-length 20000 --max-output-tokens 4096 --temperature 0.3 --seed 20260927 --max-attempts 5 --beta 1 --batch-size 128 --connect-timeout 30 --timeout 600 --total-timeout 1800 --worker-timeout 120
+python -X utf8 run_llm_design.py --fixed-sample results/llm_baselines/baseline-20260927T130708Z-ba4bf287 --base-url http://127.0.0.1:1234/v1 --model qwen/qwen3.5-9b --context-length 40000 --max-output-tokens 4096 --temperature 0.3 --seed 20260927 --max-attempts 5 --beta 1 --batch-size 128 --connect-timeout 30 --timeout 600 --total-timeout 1800 --worker-timeout 120
+python -X utf8 run_llm_design.py --fixed-sample results/llm_baselines/baseline-20260927T130708Z-ba4bf287 --base-url http://127.0.0.1:1234/v1 --model google/gemma-4-e4b --context-length 40000 --max-output-tokens 4096 --temperature 0.3 --seed 20260927 --max-attempts 5 --beta 1 --batch-size 128 --connect-timeout 30 --timeout 600 --total-timeout 1800 --worker-timeout 120
 ```
 
 ```powershell

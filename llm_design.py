@@ -23,8 +23,10 @@ from llm_baseline import estimate_empirical_lipschitz, reconstruct_baseline_rewa
 from llm_candidate import (
     CandidateError,
     CandidateExecutionError,
+    candidate_semantic_fingerprint,
     candidate_numeric_diagnostics,
     execute_candidate_isolated,
+    feature_reward,
     parse_candidate_json,
     save_approved_artifact,
     validate_candidate,
@@ -48,7 +50,7 @@ from llm_streaming import (
 
 
 DEFAULT_BASE_URL = "http://127.0.0.1:1234/v1"
-DEFAULT_CONTEXT_LENGTH = 20_000
+DEFAULT_CONTEXT_LENGTH = 40_000
 DEFAULT_MAX_OUTPUT_TOKENS = 4096
 DEFAULT_TEMPERATURE = 0.3
 DEFAULT_SEED = 20260927
@@ -556,7 +558,6 @@ def evaluate_candidate(
     context: EvaluationContext,
     candidate: dict[str, Any],
     extra_state: np.ndarray,
-    reward_terms: np.ndarray,
     *,
     beta: float,
     batch_size: int,
@@ -564,11 +565,7 @@ def evaluate_candidate(
     relative_tolerance: float,
 ) -> dict[str, Any]:
     extra = np.asarray(extra_state, dtype=np.float64)
-    terms = np.asarray(reward_terms, dtype=np.float64)
-    weights = np.asarray(
-        [item["weight"] for item in candidate["reward_terms"]], dtype=np.float64
-    )
-    reward_extra = terms @ weights
+    reward_extra = feature_reward(extra, candidate)
     candidate_rewards = {
         key: base + float(beta) * reward_extra
         for key, base in context.base_rewards.items()
@@ -889,7 +886,9 @@ def _feedback_from_evaluation(report: dict[str, Any]) -> dict[str, Any]:
         "category": "candidate_not_improved_for_all_lambdas",
         "status": report["status"],
         "by_lambda": report["by_lambda"],
-        "feature_and_reward_diagnostics": report.get("candidate_numeric_diagnostics"),
+        "shared_feature_and_weighted_reward_diagnostics": report.get(
+            "candidate_numeric_diagnostics"
+        ),
         "distance_amplification_distribution": report[
             "distance_amplification_distribution"
         ],
@@ -1308,9 +1307,11 @@ def run_design(
     actual_models = []
     adapter_fallbacks = []
     seed_sent_values = []
+    failed_candidates: dict[str, dict[str, Any]] = {}
     for attempt in range(1, int(max_attempts) + 1):
         round_directory = output / f"attempt_{attempt:02d}"
         round_directory.mkdir()
+        current_candidate_fingerprint = None
         raw_failure = (
             previous_attempt is not None
             and previous_attempt.get("parsed_candidate") is None
@@ -1514,6 +1515,48 @@ def run_design(
                 continue
             attempt_output["parsed_candidate"] = candidate
             _write_json(round_directory / "candidate.json", candidate)
+            current_candidate_fingerprint = candidate_semantic_fingerprint(candidate)
+            prior_failure = failed_candidates.get(current_candidate_fingerprint)
+            if prior_failure is not None:
+                duplicate_report = {
+                    "status": "failed",
+                    "can_execute": False,
+                    "errors": [
+                        {
+                            "code": "DUPLICATE_FAILED_CANDIDATE",
+                            "stage": "revision",
+                            "location": "$.features and $.code",
+                            "problem": (
+                                "this candidate is semantically unchanged from failed "
+                                f"attempt {prior_failure['attempt']} after ignoring candidate_name, "
+                                "code comments, and code formatting"
+                            ),
+                            "requirement": (
+                                "Correct the unresolved issue by changing the feature definitions, "
+                                "source_fields, reward_weight values, or executable code; renaming or "
+                                "reformatting the same candidate is not a revision."
+                            ),
+                            "previous_unresolved_feedback": prior_failure["feedback"],
+                        }
+                    ],
+                    "checks": {
+                        "duplicate_failed_candidate": {
+                            "status": "failed",
+                            "matched_attempt": int(prior_failure["attempt"]),
+                            "semantic_fingerprint": current_candidate_fingerprint,
+                        }
+                    },
+                }
+                _write_json(round_directory / "validation_report.json", duplicate_report)
+                feedback = _feedback_from_validation(
+                    duplicate_report, "duplicate_failed_candidate"
+                )
+                attempt_output["feedback"] = feedback
+                previous_attempt = attempt_output
+                _write_json(round_directory / "failure.json", feedback)
+                _write_json(round_directory / "feedback.json", feedback)
+                history.append({"attempt": attempt, "status": "duplicate_failed_candidate"})
+                continue
             staged = validate_candidate_staged(candidate, constants_metadata)
             if isinstance(candidate.get("code"), str):
                 (round_directory / "candidate.py").write_text(
@@ -1526,6 +1569,10 @@ def run_design(
                 )
                 attempt_output["feedback"] = feedback
                 previous_attempt = attempt_output
+                failed_candidates[current_candidate_fingerprint] = {
+                    "attempt": attempt,
+                    "feedback": feedback,
+                }
                 _write_json(round_directory / "failure.json", feedback)
                 _write_json(round_directory / "feedback.json", feedback)
                 history.append(
@@ -1533,7 +1580,7 @@ def run_design(
                 )
                 continue
             static = validate_candidate(candidate, constants_metadata)
-            extra, terms, execution = execute_candidate_isolated(
+            extra, worker_reward, execution = execute_candidate_isolated(
                 candidate,
                 obs_arrays,
                 constants_metadata,
@@ -1555,15 +1602,32 @@ def run_design(
                 context,
                 candidate,
                 extra,
-                terms,
                 beta=beta,
                 batch_size=batch_size,
                 absolute_tolerance=absolute_tolerance,
                 relative_tolerance=relative_tolerance,
             )
             evaluation["candidate_numeric_diagnostics"] = candidate_numeric_diagnostics(
-                arrays["state"], extra, terms, candidate
+                arrays["state"], extra, candidate
             )
+            evaluation["shared_feature_reward_consistency"] = {
+                "maximum_absolute_difference": float(
+                    np.max(np.abs(feature_reward(extra, candidate) - worker_reward))
+                ),
+                "passed": bool(
+                    np.allclose(
+                        feature_reward(extra, candidate),
+                        worker_reward,
+                        rtol=0.0,
+                        atol=1e-12,
+                    )
+                ),
+            }
+            if not evaluation["shared_feature_reward_consistency"]["passed"]:
+                raise CandidateError(
+                    "isolated worker reward does not match the authoritative host-side "
+                    "dot(feature_reward_weights, extra_state) calculation"
+                )
             _write_json(round_directory / "evaluation_report.json", evaluation)
             if evaluation["passed"]:
                 approved = save_approved_artifact(
@@ -1590,6 +1654,10 @@ def run_design(
             feedback = _feedback_from_evaluation(evaluation)
             attempt_output["feedback"] = feedback
             previous_attempt = attempt_output
+            failed_candidates[current_candidate_fingerprint] = {
+                "attempt": attempt,
+                "feedback": feedback,
+            }
             _write_json(round_directory / "feedback.json", feedback)
             history.append({"attempt": attempt, "status": evaluation["status"]})
         except APIError as exc:
@@ -1634,12 +1702,22 @@ def run_design(
             )
             attempt_output["feedback"] = feedback
             previous_attempt = attempt_output
+            if current_candidate_fingerprint is not None:
+                failed_candidates[current_candidate_fingerprint] = {
+                    "attempt": attempt,
+                    "feedback": feedback,
+                }
             _write_json(round_directory / "failure.json", feedback)
             history.append({"attempt": attempt, "status": "candidate_execution_failure"})
         except CandidateError as exc:
             feedback = _summarize_error("candidate_format_or_validation_failure", exc)
             attempt_output["feedback"] = feedback
             previous_attempt = attempt_output
+            if current_candidate_fingerprint is not None:
+                failed_candidates[current_candidate_fingerprint] = {
+                    "attempt": attempt,
+                    "feedback": feedback,
+                }
             _write_json(round_directory / "failure.json", feedback)
             history.append({"attempt": attempt, "status": "candidate_format_or_validation_failure"})
         if feedback is not None:
