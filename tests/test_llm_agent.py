@@ -45,6 +45,35 @@ class ScriptedToolModel(Model):
         )
 
 
+class MultiToolModel(ScriptedToolModel):
+    """Return one or more ordered tool calls for each scripted generation."""
+
+    def generate(self, messages, tools_to_call_from=None, **kwargs):
+        self.calls.append(
+            {
+                "messages": messages,
+                "tools": [tool.name for tool in tools_to_call_from or []],
+            }
+        )
+        if not self.actions:
+            raise AssertionError("unexpected model call")
+        actions = self.actions.pop(0)
+        calls = [
+            ChatMessageToolCall(
+                function=ChatMessageToolCallFunction(name=name, arguments=arguments),
+                id=f"mock-call-{len(self.calls)}-{index}",
+                type="function",
+            )
+            for index, (name, arguments) in enumerate(actions)
+        ]
+        return ChatMessage(
+            role=MessageRole.ASSISTANT,
+            content=None,
+            tool_calls=calls,
+            token_usage=TokenUsage(input_tokens=10, output_tokens=5),
+        )
+
+
 class TransportFailureModel(Model):
     def __init__(self):
         super().__init__(model_id="mock/transport-failure")
@@ -57,6 +86,98 @@ class TransportFailureModel(Model):
 
 def _candidate_id(candidate):
     return f"candidate-{llm_agent._content_hash(candidate)[:12]}"
+
+
+def _workspace(tmp_path, fixed, *, name="workspace", max_model_calls=20):
+    return AgentWorkspace(
+        directory=tmp_path / name,
+        fixed_sample=fixed,
+        provider="lmstudio",
+        model="mock/tool-model",
+        beta=1.0,
+        batch_size=2,
+        worker_timeout=20,
+        absolute_tolerance=1e-12,
+        relative_tolerance=1e-6,
+        max_model_calls=max_model_calls,
+    )
+
+
+def _request_settings(*, context_length=100_000, max_output_tokens=1_024):
+    return {
+        "base_url": "http://127.0.0.1:1234/v1",
+        "context_length": context_length,
+        "max_output_tokens": max_output_tokens,
+        "temperature": llm_agent.DEFAULT_TEMPERATURE,
+        "seed": llm_agent.DEFAULT_SEED,
+        "reasoning_effort": None,
+        "timeout": llm_agent.DEFAULT_API_TIMEOUT_SECONDS,
+        "connect_timeout": llm_agent.DEFAULT_API_CONNECT_TIMEOUT_SECONDS,
+        "total_timeout": llm_agent.DEFAULT_API_TOTAL_TIMEOUT_SECONDS,
+        "progress_interval": llm_agent.DEFAULT_API_PROGRESS_INTERVAL_SECONDS,
+    }
+
+
+def _tool_sse(*, model, finish_reason, arguments, refusal=None, done=True):
+    delta = {
+        "tool_calls": [
+            {
+                "index": 0,
+                "id": "stream-call-1",
+                "type": "function",
+                "function": {
+                    "name": "inspect_interface",
+                    "arguments": arguments,
+                },
+            }
+        ]
+    }
+    if refusal is not None:
+        delta["refusal"] = refusal
+    event = {
+        "model": model,
+        "choices": [{"delta": delta, "finish_reason": finish_reason}],
+    }
+    chunks = [f"data: {json.dumps(event)}\n\n".encode("utf-8")]
+    if done:
+        chunks.append(b"data: [DONE]\n\n")
+    return chunks
+
+
+def _direct_streaming_model(tmp_path, fixed, *, chunks, provider="openai"):
+    workspace = _workspace(tmp_path, fixed, name=f"stream-{provider}")
+    model_id = "gpt-4o" if provider == "openai" else "openai/gpt-oss-20b"
+    class FixtureClient:
+        def __init__(self):
+            self.base_url = "http://127.0.0.1:1234/v1"
+            self.token = None
+            self.timeout = 1
+            self.connect_timeout = 1
+            self.total_timeout = 2
+            self.progress_interval = 60
+            self.response = ChunkedResponse(chunks)
+
+        def _open_stream(self, request, **kwargs):
+            return self.response
+
+        @staticmethod
+        def _safe(value):
+            return str(value)
+
+    budget = ModelCallBudget(2)
+    model = llm_agent.StreamingProviderModel(
+        workspace=workspace,
+        client=FixtureClient(),
+        provider=provider,
+        model_id=model_id,
+        budget=budget,
+        context_length=100_000,
+        max_output_tokens=1_024,
+        temperature=0.3,
+        seed=20260927,
+        reasoning_effort=None,
+    )
+    return workspace, model, budget
 
 
 def test_mock_agent_autonomously_queries_revises_tests_and_approves(tmp_path):
@@ -134,7 +255,7 @@ def test_final_answer_small_test_and_budget_never_approve(tmp_path):
         context_length=100_000,
         output_dir=tmp_path / "budget",
     )
-    assert exhausted["status"] == "stopped_without_approval"
+    assert exhausted["status"] == "paused_budget_exhausted"
     assert exhausted["model_calls_used"] == 1
     assert len(inspect_model.calls) == 1
     assert exhausted["approved_artifact"] is None
@@ -214,18 +335,7 @@ def test_resume_preserves_candidate_and_marks_inflight_operation_interrupted(tmp
     submitted = workspace.submit_candidate(json.dumps(_candidate()), None)
     workspace.begin_operation("test_candidate", {"candidate_id": submitted["candidate_id"]})
     workspace.state["model_calls_used"] = 2
-    workspace.state["request_settings"] = {
-        "base_url": "http://127.0.0.1:1234/v1",
-        "context_length": 100_000,
-        "max_output_tokens": 1_024,
-        "temperature": llm_agent.DEFAULT_TEMPERATURE,
-        "seed": llm_agent.DEFAULT_SEED,
-        "reasoning_effort": None,
-        "timeout": llm_agent.DEFAULT_API_TIMEOUT_SECONDS,
-        "connect_timeout": llm_agent.DEFAULT_API_CONNECT_TIMEOUT_SECONDS,
-        "total_timeout": llm_agent.DEFAULT_API_TOTAL_TIMEOUT_SECONDS,
-        "progress_interval": llm_agent.DEFAULT_API_PROGRESS_INTERVAL_SECONDS,
-    }
+    workspace.state["request_settings"] = _request_settings()
     workspace._save()
     resumed = run_agent(
         resume=directory,
@@ -268,13 +378,13 @@ def test_new_candidate_keeps_parent_issues_unverified_until_full_test(tmp_path):
     record = workspace.state["candidates"][child["candidate_id"]]
     assert record["inherited_issue_context"]
     assert {item["status"] for item in record["inherited_issue_context"]} == {
-        "not_revalidated"
+        "resolved"
     }
     assert workspace.test_candidate(
         child["candidate_id"], mode="small", sample_indices=[0]
     )["status"] == "passed"
     assert {item["status"] for item in record["inherited_issue_context"]} == {
-        "not_revalidated"
+        "resolved"
     }
     assert workspace.test_candidate(child["candidate_id"], mode="full")[
         "status"
@@ -359,10 +469,10 @@ def test_resume_with_exhausted_call_budget_does_not_make_an_extra_call(tmp_path)
         resume=directory,
         model_backend=resumed_model,
     )
-    assert resumed["status"] == "stopped_without_approval"
+    assert resumed["status"] == "paused_budget_exhausted"
     assert resumed["model_calls_used"] == 2
     assert resumed_model.calls == []
-    assert "already exhausted" in resumed["stop_reason"]
+    assert "budget is exhausted" in resumed["stop_reason"]
 
 
 def test_streamed_tool_arguments_execute_only_after_lossless_aggregation(tmp_path):
@@ -418,6 +528,395 @@ def test_transport_failure_stops_without_becoming_a_candidate_error(tmp_path):
     assert "transport" in state["stop_reason"].lower()
 
 
+def test_multi_tool_approval_stops_sequentially_and_skips_remaining_call(tmp_path):
+    fixed = _fixed_artifact(tmp_path)
+    candidate = _candidate(name="multi-tool-approved")
+    candidate_id = _candidate_id(candidate)
+    model = MultiToolModel(
+        [
+            [
+                (
+                    "submit_candidate",
+                    {"candidate_json": json.dumps(candidate), "parent_candidate_id": None},
+                )
+            ],
+            [
+                ("formal_evaluate", {"candidate_id": candidate_id}),
+                ("inspect_interface", {"section": "overview"}),
+            ],
+        ]
+    )
+    result = run_agent(
+        fixed_sample=fixed,
+        provider="lmstudio",
+        model=model.model_id,
+        model_backend=model,
+        max_model_calls=5,
+        context_length=100_000,
+        output_dir=tmp_path / "multi-approved",
+    )
+    assert result["status"] == "approved"
+    assert len(model.calls) == 2
+    state = json.loads((tmp_path / "multi-approved" / "agent_state.json").read_text())
+    assert [item["tool"] for item in state["tool_operations"]] == [
+        "submit_candidate",
+        "formal_evaluate",
+    ]
+    assert [item["status"] for item in state["framework_tool_calls"]] == [
+        "completed",
+        "completed",
+        "skipped_after_approval",
+    ]
+    assert "skipped_after_approval" in state["framework_tool_calls"][-1]["output"]
+
+
+def test_multi_tool_nonapproval_continues_in_model_order(tmp_path):
+    fixed = _fixed_artifact(tmp_path)
+    candidate = _candidate(passing=False, name="multi-tool-not-approved")
+    candidate_id = _candidate_id(candidate)
+    model = MultiToolModel(
+        [
+            [
+                (
+                    "submit_candidate",
+                    {"candidate_json": json.dumps(candidate), "parent_candidate_id": None},
+                )
+            ],
+            [
+                ("formal_evaluate", {"candidate_id": candidate_id}),
+                ("inspect_interface", {"section": "evaluation"}),
+            ],
+        ]
+    )
+    result = run_agent(
+        fixed_sample=fixed,
+        provider="lmstudio",
+        model=model.model_id,
+        model_backend=model,
+        max_model_calls=2,
+        context_length=100_000,
+        output_dir=tmp_path / "multi-failed",
+    )
+    assert result["status"] == "paused_budget_exhausted"
+    state = json.loads((tmp_path / "multi-failed" / "agent_state.json").read_text())
+    assert [item["tool"] for item in state["tool_operations"]] == [
+        "submit_candidate",
+        "formal_evaluate",
+        "inspect_interface",
+    ]
+    assert all(item["status"] == "completed" for item in state["framework_tool_calls"])
+
+
+@pytest.mark.parametrize(
+    ("finish_reason", "arguments", "refusal", "category"),
+    [
+        ("length", '{"section":"overview"}', None, "output_truncated"),
+        ("length", '{"section":', None, "output_truncated"),
+        ("stop", '{"section":"overview"}', "I cannot comply", "model_refusal"),
+        ("content_filter", '{"section":"overview"}', None, "content_filter"),
+        ("unknown_reason", '{"section":"overview"}', None, "invalid_finish_reason"),
+    ],
+)
+def test_stream_completion_failures_never_expose_tool_calls_for_execution(
+    tmp_path, finish_reason, arguments, refusal, category
+):
+    fixed = _fixed_artifact(tmp_path)
+    chunks = _tool_sse(
+        model="gpt-4o",
+        finish_reason=finish_reason,
+        arguments=arguments,
+        refusal=refusal,
+    )
+    workspace, model, budget = _direct_streaming_model(
+        tmp_path, fixed, chunks=chunks, provider="openai"
+    )
+    with pytest.raises(APIError) as caught:
+        model.generate(
+            [ChatMessage(role=MessageRole.USER, content="fixture")],
+            tools_to_call_from=llm_agent.build_agent_tools(workspace),
+        )
+    assert caught.value.category == category
+    assert budget.used == 1
+    assert workspace.state["tool_operations"] == []
+    saved = json.loads(
+        (workspace.directory / "model_call_001" / "response.json").read_text()
+    )
+    assert saved["finish_reason"] == finish_reason
+    assert saved["tool_calls"]
+    assert saved["refusal"] == refusal
+
+
+def test_missing_stream_completion_signal_is_saved_and_not_executed(tmp_path):
+    fixed = _fixed_artifact(tmp_path)
+    chunks = _tool_sse(
+        model="gpt-4o",
+        finish_reason=None,
+        arguments='{"section":"overview"}',
+    )
+    workspace, model, budget = _direct_streaming_model(
+        tmp_path, fixed, chunks=chunks, provider="openai"
+    )
+    with pytest.raises(APIError) as caught:
+        model.generate(
+            [ChatMessage(role=MessageRole.USER, content="fixture")],
+            tools_to_call_from=llm_agent.build_agent_tools(workspace),
+        )
+    assert caught.value.category == "stream_incomplete"
+    assert budget.used == 1
+    assert workspace.state["tool_operations"] == []
+    stream_status = json.loads(
+        (workspace.directory / "model_call_001" / "stream_status.json").read_text()
+    )
+    assert stream_status["status"] == "stream_incomplete"
+
+
+@pytest.mark.parametrize(
+    ("provider", "finish_reason", "actual_model"),
+    [
+        ("openai", "tool_calls", "gpt-4o"),
+        ("lmstudio", "stop", "openai/gpt-oss-20b"),
+    ],
+)
+def test_recognized_complete_stream_returns_tool_call(
+    tmp_path, provider, finish_reason, actual_model
+):
+    fixed = _fixed_artifact(tmp_path)
+    chunks = _tool_sse(
+        model=actual_model,
+        finish_reason=finish_reason,
+        arguments='{"section":"overview"}',
+    )
+    workspace, model, budget = _direct_streaming_model(
+        tmp_path, fixed, chunks=chunks, provider=provider
+    )
+    response = model.generate(
+        [ChatMessage(role=MessageRole.USER, content="fixture")],
+        tools_to_call_from=llm_agent.build_agent_tools(workspace),
+    )
+    assert budget.used == 1
+    assert response.tool_calls[0].function.name == "inspect_interface"
+    assert response.tool_calls[0].function.arguments == {"section": "overview"}
+
+
+def test_formal_issue_survives_child_runtime_pass_and_resume_messages(tmp_path):
+    fixed = _fixed_artifact(tmp_path)
+    directory = tmp_path / "resume-memory"
+    workspace = AgentWorkspace(
+        directory=directory,
+        fixed_sample=fixed,
+        provider="lmstudio",
+        model="mock/tool-model",
+        beta=1.0,
+        batch_size=2,
+        worker_timeout=20,
+        absolute_tolerance=1e-12,
+        relative_tolerance=1e-6,
+        max_model_calls=4,
+    )
+    parent = workspace.submit_candidate(
+        json.dumps(_candidate(passing=False, name="failed-parent")), None
+    )
+    failed = workspace.formal_evaluate(parent["candidate_id"])
+    assert failed["passed"] is False
+    child_candidate = _candidate(name="revised-child")
+    child = workspace.submit_candidate(
+        json.dumps(child_candidate), parent["candidate_id"]
+    )
+    assert workspace.test_candidate(child["candidate_id"], mode="full")["status"] == "passed"
+    inherited_formal = [
+        issue
+        for issue in workspace.state["candidates"][child["candidate_id"]][
+            "inherited_issue_context"
+        ]
+        if issue["check_stage"] == "formal_evaluation"
+    ]
+    assert inherited_formal
+    assert {issue["status"] for issue in inherited_formal} == {"not_revalidated"}
+    workspace.state["model_calls_used"] = 1
+    workspace.state["request_settings"] = _request_settings()
+    workspace.state["status"] = "paused_budget_exhausted"
+    workspace._save()
+
+    model = ScriptedToolModel(
+        [("final_answer", {"answer": "fixture stop after inspecting resumed state"})]
+    )
+    result = run_agent(resume=directory, model_backend=model)
+    assert result["status"] == "stopped_without_approval"
+    actual_request = json.dumps(
+        [message.dict() for message in model.calls[0]["messages"]],
+        ensure_ascii=False,
+        default=str,
+    )
+    assert child["candidate_id"] in actual_request
+    assert parent["candidate_id"] in actual_request
+    assert "LIPSCHITZ_NOT_IMPROVED" in actual_request
+    assert "related_formal_evaluations" in actual_request
+    assert "by_lambda" in actual_request
+    assert "record_type" in actual_request
+    assert "evaluation" in actual_request
+
+
+def test_resume_budget_extension_is_cumulative_and_dry_run_is_nonmutating(tmp_path):
+    fixed = _fixed_artifact(tmp_path)
+    directory = tmp_path / "budget-extension"
+    initial_model = ScriptedToolModel(
+        [("inspect_interface", {"section": "overview"})]
+    )
+    initial = run_agent(
+        fixed_sample=fixed,
+        provider="lmstudio",
+        model=initial_model.model_id,
+        model_backend=initial_model,
+        max_model_calls=1,
+        context_length=100_000,
+        output_dir=directory,
+    )
+    assert initial["status"] == "paused_budget_exhausted"
+
+    no_extension_model = ScriptedToolModel([])
+    no_extension = run_agent(resume=directory, model_backend=no_extension_model)
+    assert no_extension["status"] == "paused_budget_exhausted"
+    assert no_extension_model.calls == []
+
+    dry = run_agent(
+        resume=directory,
+        model_backend=ScriptedToolModel([]),
+        additional_model_calls=2,
+        dry_run=True,
+    )
+    assert dry["status"] == "dry_run_complete"
+    state_after_dry = json.loads((directory / "agent_state.json").read_text())
+    assert state_after_dry["settings"]["max_model_calls"] == 1
+    assert state_after_dry["model_calls_used"] == 1
+    assert state_after_dry["budget_extension_events"] == []
+
+    before_invalid = (directory / "agent_state.json").read_bytes()
+    with pytest.raises(ValueError, match="must be positive"):
+        run_agent(
+            resume=directory,
+            model_backend=ScriptedToolModel([]),
+            additional_model_calls=0,
+        )
+    assert (directory / "agent_state.json").read_bytes() == before_invalid
+
+    resumed_model = ScriptedToolModel(
+        [("final_answer", {"answer": "fixture finished without approval"})]
+    )
+    resumed = run_agent(
+        resume=directory,
+        model_backend=resumed_model,
+        additional_model_calls=2,
+    )
+    assert resumed["model_calls_used"] == 2
+    state = json.loads((directory / "agent_state.json").read_text())
+    assert state["settings"]["max_model_calls"] == 3
+    assert state["budget_extension_events"][-1]["previous_max_model_calls"] == 1
+    assert state["budget_extension_events"][-1]["new_max_model_calls"] == 3
+    assert state["budget_extension_events"][-1]["model_calls_used"] == 1
+
+
+def test_approved_run_cannot_be_resumed(tmp_path):
+    fixed = _fixed_artifact(tmp_path)
+    directory = tmp_path / "approved-resume"
+    candidate = _candidate(name="approved-no-resume")
+    candidate_id = _candidate_id(candidate)
+    model = ScriptedToolModel(
+        [
+            (
+                "submit_candidate",
+                {"candidate_json": json.dumps(candidate), "parent_candidate_id": None},
+            ),
+            ("formal_evaluate", {"candidate_id": candidate_id}),
+        ]
+    )
+    assert run_agent(
+        fixed_sample=fixed,
+        provider="lmstudio",
+        model=model.model_id,
+        model_backend=model,
+        max_model_calls=2,
+        context_length=100_000,
+        output_dir=directory,
+    )["status"] == "approved"
+    with pytest.raises(ValueError, match="cannot be resumed"):
+        run_agent(
+            resume=directory,
+            model_backend=ScriptedToolModel([]),
+            additional_model_calls=2,
+        )
+
+
+def test_request_budget_includes_tool_schemas(tmp_path):
+    fixed = _fixed_artifact(tmp_path)
+    workspace = _workspace(tmp_path, fixed, name="tool-budget")
+    model = ScriptedToolModel([])
+    messages = [
+        ChatMessage(
+            role=MessageRole.USER,
+            content="A short request whose conversation alone fits.",
+        )
+    ]
+    without_tools, _ = llm_agent._request_token_budget(
+        model,
+        messages,
+        [],
+        context_length=100_000,
+        max_output_tokens=256,
+    )
+    with_tools, completion = llm_agent._request_token_budget(
+        model,
+        messages,
+        llm_agent.build_agent_tools(workspace),
+        context_length=100_000,
+        max_output_tokens=256,
+    )
+    assert completion["tools"]
+    assert (
+        with_tools["estimated_total_upper"]
+        > without_tools["estimated_total_upper"]
+    )
+    boundary = without_tools["estimated_total_upper"]
+    without_tools_at_boundary, _ = llm_agent._request_token_budget(
+        model,
+        messages,
+        [],
+        context_length=boundary,
+        max_output_tokens=256,
+    )
+    with_tools_at_boundary, _ = llm_agent._request_token_budget(
+        model,
+        messages,
+        llm_agent.build_agent_tools(workspace),
+        context_length=boundary,
+        max_output_tokens=256,
+    )
+    assert without_tools_at_boundary["fits_client_budget"] is True
+    assert with_tools_at_boundary["fits_client_budget"] is False
+
+
+def test_minimum_request_over_budget_sends_nothing_and_counts_nothing(tmp_path):
+    fixed = _fixed_artifact(tmp_path)
+    model = ScriptedToolModel([])
+    directory = tmp_path / "context-too-small"
+    with pytest.raises(llm_agent.AgentContextBudgetError):
+        run_agent(
+            fixed_sample=fixed,
+            provider="lmstudio",
+            model=model.model_id,
+            model_backend=model,
+            max_model_calls=2,
+            context_length=2_000,
+            max_output_tokens=1_024,
+            output_dir=directory,
+        )
+    assert model.calls == []
+    state = json.loads((directory / "agent_state.json").read_text())
+    assert state["model_calls_used"] == 0
+    assert state["status"] == "failed_context_budget"
+    request_shape = json.loads((directory / "initial_request_shape.json").read_text())
+    assert request_shape["tools"]
+
+
 def test_legacy_entry_imports_without_optional_smolagents_dependency():
     script = r'''
 import builtins
@@ -466,7 +965,7 @@ def test_context_compaction_keeps_complete_candidate_and_tool_pairs(tmp_path):
         model=model.model_id,
         model_backend=model,
         max_model_calls=4,
-        context_length=19_000,
+        context_length=23_500,
         max_output_tokens=1_024,
         output_dir=tmp_path / "compaction",
     )
@@ -481,10 +980,10 @@ def test_context_compaction_keeps_complete_candidate_and_tool_pairs(tmp_path):
     compact_summaries = []
     for message in model.calls[-1]["messages"]:
         content = getattr(message, "content", None)
-        if isinstance(content, str) and content.startswith(
-            "Host-generated compact work-state summary."
-        ):
-            compact_summaries.append(json.loads(content.split("\n", 1)[1]))
+        marker = "Host-generated compact work-state summary."
+        if isinstance(content, str) and marker in content:
+            summary = content.split(marker, 1)[1]
+            compact_summaries.append(json.loads(summary.split("\n", 1)[1]))
     assert compact_summaries
     assert compact_summaries[-1]["current_candidate"]["candidate"] == candidate
     assert len(state["framework_tool_calls"]) == 4

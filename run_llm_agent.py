@@ -86,6 +86,14 @@ def build_parser() -> argparse.ArgumentParser:
             "evaluation settings, and call budget are restored and compatibility-checked"
         ),
     )
+    parser.add_argument(
+        "--additional-model-calls",
+        type=int,
+        help=(
+            "positive number of model calls to add to a resumed run's saved "
+            "total budget; accumulated usage is preserved"
+        ),
+    )
     return parser
 
 
@@ -125,6 +133,7 @@ def main(argv=None) -> int:
             output_dir=args.output_dir,
             dry_run=args.dry_run,
             resume=args.resume,
+            additional_model_calls=args.additional_model_calls,
         )
     except (ImportError, OSError, RuntimeError, ValueError) as exc:
         print(
@@ -142,6 +151,11 @@ def main(argv=None) -> int:
         print(f"Approved artifact: {result['approved_artifact']}")
     if result.get("stop_reason"):
         print(f"Stop reason: {result['stop_reason']}")
+    if result["status"] == "paused_budget_exhausted":
+        print(
+            "The design is not approved. Resume with --additional-model-calls N "
+            "to extend the cumulative call budget."
+        )
     return 0 if result["status"] in {"approved", "dry_run_complete"} else 2
 
 

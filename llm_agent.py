@@ -28,9 +28,12 @@ try:
         Model,
         TokenUsage,
         Tool,
+        ToolCall,
         ToolCallingAgent,
         ToolOutput,
     )
+    from smolagents.agents import ActionOutput
+    from smolagents.memory import TaskStep
     from smolagents.models import ChatMessageToolCallFunction, get_tool_json_schema
 except ImportError as exc:  # pragma: no cover - exercised in a clean subprocess
     raise ImportError(
@@ -117,6 +120,38 @@ class AgentBudgetError(RuntimeError):
 
 class AgentContextBudgetError(RuntimeError):
     pass
+
+
+def _request_token_budget(
+    model: Model,
+    messages: list[ChatMessage],
+    tools: Iterable[Tool],
+    *,
+    context_length: int,
+    max_output_tokens: int,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Build and budget the same message/tool payload used for generation."""
+    completion = model._prepare_completion_kwargs(
+        messages,
+        stop_sequences=None,
+        response_format=None,
+        tools_to_call_from=list(tools),
+        tool_choice="required",
+    )
+    serialized = json.dumps(
+        completion,
+        ensure_ascii=False,
+        allow_nan=False,
+        separators=(",", ":"),
+    )
+    return (
+        estimate_token_budget(
+            serialized,
+            context_length=int(context_length),
+            max_output_tokens=int(max_output_tokens),
+        ),
+        completion,
+    )
 
 
 def _content_hash(value: Any) -> str:
@@ -290,6 +325,7 @@ class AgentWorkspace:
                     "max_model_calls": int(max_model_calls),
                 },
                 "model_calls_used": 0,
+                "budget_extension_events": [],
                 "tool_operations": [],
                 "framework_tool_calls": [],
                 "candidates": {},
@@ -352,20 +388,108 @@ class AgentWorkspace:
         self.state["updated_at_utc"] = datetime.now(timezone.utc).isoformat()
         _write_json(self.directory / "agent_state.json", self.state)
 
-    def work_state(self, *, include_candidate: bool = True) -> dict[str, Any]:
+    @staticmethod
+    def _issue_with_defaults(
+        issue: dict[str, Any],
+        *,
+        candidate_id: str,
+        status: str = "open",
+        check_stage: str | None = None,
+    ) -> dict[str, Any]:
+        validation_check = str(issue.get("validation_check") or "")
+        if check_stage is None:
+            if "runtime" in validation_check or "worker" in validation_check:
+                check_stage = "runtime_validation"
+            else:
+                check_stage = "static_validation"
+        return {
+            **issue,
+            "status": issue.get("status", status),
+            "check_stage": issue.get("check_stage", check_stage),
+            "source_candidate_id": issue.get("source_candidate_id", candidate_id),
+        }
+
+    def _latest_evaluation_summary(
+        self, candidate_id: str, record: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        paths = list((record.get("evaluations") or {}).values())
+        if not paths:
+            return None
+        relative_path = paths[-1]
+        report_path = self.directory / relative_path
+        if not report_path.is_file():
+            return {
+                "candidate_id": candidate_id,
+                "report_id": relative_path,
+                "status": "report_missing",
+            }
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+        diagnostics = report.get("evaluation_diagnostics") or {}
+        compact_diagnostics, compaction = _compact_evaluation_diagnostics(
+            diagnostics, 4
+        )
+        diagnostic_by_lambda = diagnostics.get("by_lambda") or {}
+        compact_by_lambda = {}
+        for lambda_value, values in (report.get("by_lambda") or {}).items():
+            maximum_pair = values.get("maximum_pair") or {}
+            compact_by_lambda[lambda_value] = {
+                key: values.get(key)
+                for key in (
+                    "lambda_mbit_per_joule",
+                    "baseline_l_hat",
+                    "candidate_l_hat",
+                    "improvement",
+                    "required_margin",
+                    "passed",
+                )
+            }
+            compact_by_lambda[lambda_value]["maximum_pair_ref"] = (
+                (diagnostic_by_lambda.get(lambda_value) or {}).get(
+                    "maximum_pair_ref"
+                )
+            )
+            if maximum_pair:
+                compact_by_lambda[lambda_value]["maximum_pair_indices"] = {
+                    "i": maximum_pair.get("i"),
+                    "j": maximum_pair.get("j"),
+                }
+            if not values.get("passed"):
+                compact_by_lambda[lambda_value]["failure_reason"] = (
+                    "candidate_l_hat did not beat baseline_l_hat by the required margin"
+                )
+        return {
+            "candidate_id": candidate_id,
+            "report_id": relative_path,
+            "status": report.get("status"),
+            "passed": bool(report.get("passed")),
+            "by_lambda": compact_by_lambda,
+            "critical_pair_diagnostics": compact_diagnostics,
+            "diagnostic_compaction": compaction,
+            "source_is_exact_candidate": True,
+        }
+
+    def work_state(
+        self,
+        *,
+        include_candidate: bool = True,
+        model_calls_maximum: int | None = None,
+    ) -> dict[str, Any]:
         current_id = self.state.get("current_candidate_id")
         current = self.state["candidates"].get(current_id) if current_id else None
+        maximum = int(
+            self.state["settings"]["max_model_calls"]
+            if model_calls_maximum is None
+            else model_calls_maximum
+        )
         result = {
             "status": self.state["status"],
             "current_candidate_id": current_id,
             "candidate_count": len(self.state["candidate_order"]),
             "approved_candidate_id": self.state.get("approved_candidate_id"),
             "model_calls_used": self.state["model_calls_used"],
-            "model_calls_maximum": self.state["settings"]["max_model_calls"],
-            "model_calls_remaining": (
-                int(self.state["settings"]["max_model_calls"])
-                - int(self.state["model_calls_used"])
-            ),
+            "model_calls_maximum": maximum,
+            "model_calls_remaining": maximum - int(self.state["model_calls_used"]),
+            "budget_extension_events": self.state.get("budget_extension_events", []),
             "recent_operations": [
                 {
                     key: operation.get(key)
@@ -375,13 +499,75 @@ class AgentWorkspace:
             ],
         }
         if current is not None:
+            related_evaluation_candidate_ids: list[str] = []
+            for candidate_id in [
+                current_id,
+                *[
+                    issue.get("source_candidate_id")
+                    for issue in (
+                        list(current.get("inherited_issue_context", []))
+                        + list(current.get("formal_evaluation_issues", []))
+                    )
+                ],
+            ]:
+                if (
+                    candidate_id
+                    and candidate_id in self.state["candidates"]
+                    and candidate_id not in related_evaluation_candidate_ids
+                ):
+                    related_evaluation_candidate_ids.append(candidate_id)
+            related_evaluations = []
+            for candidate_id in related_evaluation_candidate_ids:
+                summary = self._latest_evaluation_summary(
+                    candidate_id, self.state["candidates"][candidate_id]
+                )
+                if summary is not None:
+                    summary["is_current_candidate"] = candidate_id == current_id
+                    summary["history_index"] = {
+                        "candidate_id": candidate_id,
+                        "record_type": "evaluation",
+                    }
+                    if candidate_id != current_id:
+                        summary["relationship_to_current"] = (
+                            "source candidate for inherited formal-evaluation issues; "
+                            "the current candidate still requires its own formal evaluation"
+                        )
+                    related_evaluations.append(summary)
             result["current_candidate"] = {
                 "candidate_id": current_id,
                 "content_sha256": current["content_sha256"],
                 "parent_candidate_id": current.get("parent_candidate_id"),
                 "validation_status": current.get("validation_status"),
                 "evaluation_status": current.get("evaluation_status"),
-                "issues": current.get("issues", []),
+                "open_issues": current.get("issues", []),
+                "inherited_issue_context": current.get(
+                    "inherited_issue_context", []
+                ),
+                "formal_evaluation_issues": current.get(
+                    "formal_evaluation_issues", []
+                ),
+                "latest_formal_evaluation": self._latest_evaluation_summary(
+                    current_id, current
+                ),
+                "related_formal_evaluations": related_evaluations,
+                "history_indexes": {
+                    "candidate": {
+                        "candidate_id": current_id,
+                        "record_type": "candidate",
+                    },
+                    "issues": {
+                        "candidate_id": current_id,
+                        "record_type": "issues",
+                    },
+                    "tests": {
+                        "candidate_id": current_id,
+                        "record_type": "tests",
+                    },
+                    "evaluation": {
+                        "candidate_id": current_id,
+                        "record_type": "evaluation",
+                    },
+                },
             }
             if include_candidate:
                 result["current_candidate"]["candidate"] = current.get("candidate")
@@ -456,6 +642,21 @@ class AgentWorkspace:
                 if record["tool_call_id"] == str(call_id):
                     record["status"] = "completed"
                     record["output"] = str(output)
+                    break
+            self._save()
+
+    def skip_framework_call(self, call_id: str, *, reason: str) -> None:
+        with self._lock:
+            for record in reversed(self.state["framework_tool_calls"]):
+                if record["tool_call_id"] == str(call_id):
+                    record["status"] = "skipped_after_approval"
+                    record["output"] = json.dumps(
+                        {
+                            "status": "skipped_after_approval",
+                            "reason": str(reason),
+                        },
+                        ensure_ascii=False,
+                    )
                     break
             self._save()
 
@@ -598,15 +799,36 @@ class AgentWorkspace:
         staged = validate_candidate_staged(candidate, self.constants)
         inherited = []
         if parent_candidate_id:
-            for issue in self.state["candidates"][parent_candidate_id].get("issues", []):
+            parent = self.state["candidates"][parent_candidate_id]
+            parent_issues = (
+                list(parent.get("issues", []))
+                + list(parent.get("inherited_issue_context", []))
+                + list(parent.get("formal_evaluation_issues", []))
+            )
+            for issue in parent_issues:
+                normalized = self._issue_with_defaults(
+                    issue,
+                    candidate_id=parent_candidate_id,
+                )
                 inherited.append(
                     {
-                        **issue,
+                        **normalized,
                         "status": "not_revalidated",
-                        "source_candidate_id": parent_candidate_id,
+                        "carried_from_candidate_id": parent_candidate_id,
                         "note": "A new candidate version has not yet completed the relevant check.",
                     }
                 )
+            if staged["can_execute"]:
+                for issue in inherited:
+                    if issue.get("check_stage") == "static_validation":
+                        issue["status"] = "resolved"
+                        issue["resolution_evidence"] = (
+                            "the revised candidate completed staged static validation"
+                        )
+        current_issues = [
+            self._issue_with_defaults(issue, candidate_id=candidate_id)
+            for issue in (staged.get("errors") or [])
+        ]
         record = {
             "candidate_id": candidate_id,
             "content_sha256": digest,
@@ -616,8 +838,9 @@ class AgentWorkspace:
             "created_at_utc": datetime.now(timezone.utc).isoformat(),
             "validation_status": "static_passed" if staged["can_execute"] else "static_failed",
             "evaluation_status": "not_run",
-            "issues": list(staged.get("errors") or []),
+            "issues": current_issues,
             "inherited_issue_context": inherited,
+            "formal_evaluation_issues": [],
             "tests": {},
             "evaluations": {},
         }
@@ -754,14 +977,37 @@ class AgentWorkspace:
             record["validation_status"] = f"{mode}_passed"
             if mode == "full":
                 record["issues"] = []
-                record["inherited_issue_context"] = [
-                    {**issue, "status": "resolved", "resolution_evidence": str(report_path.relative_to(self.directory))}
-                    for issue in record.get("inherited_issue_context", [])
-                ]
+                updated = []
+                for issue in record.get("inherited_issue_context", []):
+                    if issue.get("check_stage") == "runtime_validation":
+                        issue = {
+                            **issue,
+                            "status": "resolved",
+                            "resolution_evidence": str(
+                                report_path.relative_to(self.directory)
+                            ),
+                        }
+                    updated.append(issue)
+                record["inherited_issue_context"] = updated
         else:
             record["validation_status"] = f"{mode}_failed"
             errors = (report.get("worker_report") or {}).get("errors") or []
-            record["issues"] = errors or [{"code": report.get("error_type", "EXECUTION_ERROR"), "problem": report.get("error")}]
+            record["issues"] = [
+                self._issue_with_defaults(
+                    issue,
+                    candidate_id=candidate_id,
+                    check_stage="runtime_validation",
+                )
+                for issue in (
+                    errors
+                    or [
+                        {
+                            "code": report.get("error_type", "EXECUTION_ERROR"),
+                            "problem": report.get("error"),
+                        }
+                    ]
+                )
+            ]
         self._save()
         return tool_result
 
@@ -844,6 +1090,17 @@ class AgentWorkspace:
         record["evaluations"][cache_key] = relative_report
         record["evaluation_status"] = "passed" if report["passed"] else "failed"
         if report["passed"]:
+            record["formal_evaluation_issues"] = []
+            record["inherited_issue_context"] = [
+                {
+                    **issue,
+                    "status": "resolved",
+                    "resolution_evidence": relative_report,
+                }
+                if issue.get("check_stage") == "formal_evaluation"
+                else issue
+                for issue in record.get("inherited_issue_context", [])
+            ]
             artifact = save_approved_artifact(
                 self.directory,
                 candidate=record["candidate"],
@@ -871,6 +1128,34 @@ class AgentWorkspace:
             self.state["approved_artifact"] = str(artifact)
             self.state["status"] = "approved"
             self.state["stop_reason"] = "host-approved formal evaluation"
+        else:
+            evaluation_issues = []
+            diagnostic_by_lambda = (
+                (report.get("evaluation_diagnostics") or {}).get("by_lambda") or {}
+            )
+            for lambda_value, result in (report.get("by_lambda") or {}).items():
+                if result.get("passed"):
+                    continue
+                diagnostic = diagnostic_by_lambda.get(lambda_value) or {}
+                evaluation_issues.append(
+                    {
+                        "code": "LIPSCHITZ_NOT_IMPROVED",
+                        "problem": (
+                            "Candidate L_hat did not improve over the baseline by "
+                            "the required margin for this lambda."
+                        ),
+                        "check_stage": "formal_evaluation",
+                        "status": "open",
+                        "source_candidate_id": candidate_id,
+                        "lambda": lambda_value,
+                        "baseline_l_hat": result.get("baseline_l_hat"),
+                        "candidate_l_hat": result.get("candidate_l_hat"),
+                        "required_margin": result.get("required_margin"),
+                        "maximum_pair_ref": diagnostic.get("maximum_pair_ref"),
+                        "report_id": relative_report,
+                    }
+                )
+            record["formal_evaluation_issues"] = evaluation_issues
         self._save()
         return self._evaluation_tool_result(candidate_id, report, cache_hit=False)
 
@@ -904,7 +1189,17 @@ class AgentWorkspace:
         if record_type == "candidate":
             return {"status": "ok", "candidate_id": candidate_id, "candidate": record["candidate"], "parent_candidate_id": record.get("parent_candidate_id")}
         if record_type == "issues":
-            return {"status": "ok", "candidate_id": candidate_id, "issues": record.get("issues", []), "inherited_issue_context": record.get("inherited_issue_context", [])}
+            return {
+                "status": "ok",
+                "candidate_id": candidate_id,
+                "issues": record.get("issues", []),
+                "inherited_issue_context": record.get(
+                    "inherited_issue_context", []
+                ),
+                "formal_evaluation_issues": record.get(
+                    "formal_evaluation_issues", []
+                ),
+            }
         if record_type == "tests":
             return {"status": "ok", "candidate_id": candidate_id, "tests": record.get("tests", {})}
         if record_type == "evaluation":
@@ -1044,16 +1339,10 @@ class StreamingProviderModel(Model):
     def generate(self, messages, stop_sequences=None, response_format=None, tools_to_call_from=None, **kwargs):
         if response_format is not None:
             raise ValueError("agent mode does not use response_format")
-        completion = self._prepare_completion_kwargs(
+        token_budget, completion = _request_token_budget(
+            self,
             messages,
-            stop_sequences=None,
-            response_format=None,
-            tools_to_call_from=tools_to_call_from,
-            tool_choice="required",
-        )
-        serialized = json.dumps(completion, ensure_ascii=False, allow_nan=False)
-        token_budget = estimate_token_budget(
-            serialized,
+            tools_to_call_from or [],
             context_length=self.context_length,
             max_output_tokens=self.max_output_tokens,
         )
@@ -1063,9 +1352,6 @@ class StreamingProviderModel(Model):
         _write_json(call_dir / "token_budget.json", token_budget)
         if not token_budget["fits_client_budget"]:
             raise AgentContextBudgetError("agent messages plus output reservation exceed the client context budget")
-        call_number = self.budget.consume()
-        self.workspace.state["model_calls_used"] = self.budget.used
-        self.workspace._save()
         payload = {
             "model": self.model_id,
             **completion,
@@ -1091,6 +1377,11 @@ class StreamingProviderModel(Model):
             method="POST",
             headers=headers,
         )
+        # Count a generation only when the fully validated request is about to
+        # be sent.  Local parameter/context failures above consume no budget.
+        call_number = self.budget.consume()
+        self.workspace.state["model_calls_used"] = self.budget.used
+        self.workspace._save()
         try:
             response = self.client._open_stream(
                 request,
@@ -1124,16 +1415,63 @@ class StreamingProviderModel(Model):
         if not streamed["transport_completed"]:
             raise APIError("agent generation stream did not complete", category="stream_incomplete")
         actual = streamed.get("actual_model")
-        if actual is not None and not response_model_matches(self.provider, str(self.model_id), str(actual)):
-            raise APIError(f"provider returned a different model: requested={self.model_id!r}, actual={actual!r}")
         content, inline_reasoning = adapter_separate_reasoning(
             model_adapter(str(self.model_id)), streamed.get("content")
         )
         reasoning = streamed.get("reasoning")
         if inline_reasoning:
             reasoning = inline_reasoning if not reasoning else f"{reasoning}\n{inline_reasoning}"
+        raw_record = {
+            "actual_model": actual,
+            "finish_reason": streamed.get("finish_reason"),
+            "content": content,
+            "reasoning": reasoning,
+            "refusal": streamed.get("refusal"),
+            "done_received": streamed.get("done_received"),
+            "terminal_chunk_received": streamed.get("terminal_chunk_received"),
+            "tool_calls": streamed.get("tool_calls") or [],
+            "usage": streamed.get("usage") or {},
+        }
+        _write_json(call_dir / "response.json", raw_record)
+        if actual is not None and not response_model_matches(
+            self.provider, str(self.model_id), str(actual)
+        ):
+            raise APIError(
+                "provider returned a different model: "
+                f"requested={self.model_id!r}, actual={actual!r}"
+            )
+        refusal = streamed.get("refusal")
+        if refusal:
+            raise APIError(
+                "model refused the agent request; no tool call was executed",
+                category="model_refusal",
+            )
+        finish_reason = streamed.get("finish_reason")
+        raw_tool_calls = streamed.get("tool_calls") or []
+        if finish_reason == "length":
+            raise APIError(
+                "agent output was truncated at the generation limit; no tool call was executed",
+                category="output_truncated",
+            )
+        if finish_reason == "content_filter":
+            raise APIError(
+                "agent output was stopped by content filtering; no tool call was executed",
+                category="content_filter",
+            )
+        normal_tool_completion = finish_reason == "tool_calls"
+        lmstudio_stop_tool_completion = (
+            self.provider == "lmstudio"
+            and finish_reason == "stop"
+            and bool(raw_tool_calls)
+        )
+        if not (normal_tool_completion or lmstudio_stop_tool_completion):
+            raise APIError(
+                "agent response did not end with a recognized complete tool-call signal "
+                f"(finish_reason={finish_reason!r}); no tool call was executed",
+                category="invalid_finish_reason",
+            )
         tool_calls = []
-        for index, raw in enumerate(streamed.get("tool_calls") or []):
+        for index, raw in enumerate(raw_tool_calls):
             function = raw.get("function") or {}
             arguments = function.get("arguments", "")
             try:
@@ -1151,6 +1489,11 @@ class StreamingProviderModel(Model):
                     type=str(raw.get("type") or "function"),
                 )
             )
+        if not tool_calls:
+            raise APIError(
+                "agent response completed without a tool call",
+                category="missing_tool_call",
+            )
         usage = streamed.get("usage") or {}
         token_usage = None
         if usage.get("prompt_tokens") is not None and usage.get("completion_tokens") is not None:
@@ -1158,15 +1501,6 @@ class StreamingProviderModel(Model):
                 input_tokens=int(usage["prompt_tokens"]),
                 output_tokens=int(usage["completion_tokens"]),
             )
-        raw_record = {
-            "actual_model": actual,
-            "finish_reason": streamed.get("finish_reason"),
-            "content": content,
-            "reasoning": reasoning,
-            "tool_calls": streamed.get("tool_calls") or [],
-            "usage": usage,
-        }
-        _write_json(call_dir / "response.json", raw_record)
         return ChatMessage(
             role=MessageRole.ASSISTANT,
             content=content,
@@ -1202,30 +1536,84 @@ class ControlledToolCallingAgent(ToolCallingAgent):
         super().__init__(*args, max_tool_threads=1, planning_interval=None, **kwargs)
 
     def process_tool_calls(self, chat_message, memory_step):
-        self.workspace.register_framework_calls(chat_message.tool_calls or [])
-        for output in super().process_tool_calls(chat_message, memory_step):
-            if isinstance(output, ToolOutput):
-                self.workspace.complete_framework_call(output.id, output.output)
-                if self.workspace.approved:
-                    output.is_final_answer = True
-                    output.output = json.dumps(
-                        {
-                            "status": "approved",
-                            "candidate_id": self.workspace.state["approved_candidate_id"],
-                            "approved_artifact": self.workspace.state["approved_artifact"],
-                        }
-                    )
+        chat_calls = list(chat_message.tool_calls or [])
+        self.workspace.register_framework_calls(chat_calls)
+        memory_calls: list[ToolCall] = []
+        observations: list[str] = []
+        approval_reason = "a prior tool in this model response received host approval"
+        for chat_call in chat_calls:
+            tool_call = ToolCall(
+                name=chat_call.function.name,
+                arguments=chat_call.function.arguments,
+                id=chat_call.id,
+            )
+            memory_calls.append(tool_call)
+            yield tool_call
+            if self.workspace.approved:
+                skipped = {
+                    "status": "skipped_after_approval",
+                    "tool_call_id": tool_call.id,
+                    "tool": tool_call.name,
+                    "reason": approval_reason,
+                }
+                self.workspace.skip_framework_call(
+                    tool_call.id,
+                    reason=approval_reason,
+                )
+                observation = json.dumps(skipped, ensure_ascii=False)
+                observations.append(
+                    f"tool_call_id={tool_call.id}: {observation}"
+                )
+                yield ToolOutput(
+                    id=tool_call.id,
+                    output=skipped,
+                    is_final_answer=False,
+                    observation=observation,
+                    tool_call=tool_call,
+                )
+                continue
+            result = self.execute_tool_call(tool_call.name, tool_call.arguments or {})
+            self.workspace.complete_framework_call(tool_call.id, result)
+            observation = str(result).strip()
+            observations.append(
+                f"tool_call_id={tool_call.id}: {observation}"
+            )
+            yield ToolOutput(
+                id=tool_call.id,
+                output=result,
+                is_final_answer=tool_call.name == "final_answer",
+                observation=observation,
+                tool_call=tool_call,
+            )
+        memory_step.tool_calls = memory_calls
+        memory_step.observations = "\n".join(observations) if observations else None
+
+    def _step_stream(self, memory_step):
+        for output in super()._step_stream(memory_step):
             yield output
+        if self.workspace.approved:
+            yield ActionOutput(
+                output=json.dumps(
+                    {
+                        "status": "approved",
+                        "candidate_id": self.workspace.state[
+                            "approved_candidate_id"
+                        ],
+                        "approved_artifact": self.workspace.state[
+                            "approved_artifact"
+                        ],
+                    },
+                    ensure_ascii=False,
+                ),
+                is_final_answer=True,
+            )
 
     def write_memory_to_messages(self, summary_mode: bool = False):
         messages = super().write_memory_to_messages(summary_mode=summary_mode)
-        serialized = json.dumps(
-            [message.dict() if hasattr(message, "dict") else str(message) for message in messages],
-            default=str,
-            ensure_ascii=False,
-        )
-        budget = estimate_token_budget(
-            serialized,
+        budget, _ = _request_token_budget(
+            self.model,
+            messages,
+            self.tools_and_managed_agents,
             context_length=self.context_length,
             max_output_tokens=self.max_output_tokens,
         )
@@ -1235,19 +1623,41 @@ class ControlledToolCallingAgent(ToolCallingAgent):
         system_messages = self.memory.system_prompt.to_messages(summary_mode=False)
         task_messages = self.memory.steps[0].to_messages(summary_mode=False) if self.memory.steps else []
         groups = [step.to_messages(summary_mode=False) for step in self.memory.steps[1:]]
-        summary_message = ChatMessage(
-            role=MessageRole.USER,
-            content=(
-                "Host-generated compact work-state summary. Structured facts only; "
-                "older full messages remain on disk:\n"
-                + json.dumps(self.workspace.work_state(include_candidate=True), ensure_ascii=False, allow_nan=False)
-            ),
+        summary_text = (
+            "Host-generated compact work-state summary. Structured facts only; "
+            "older full messages remain on disk:\n"
+            + json.dumps(
+                self.workspace.work_state(include_candidate=True),
+                ensure_ascii=False,
+                allow_nan=False,
+            )
         )
+        # Keep the framework's valid system -> user -> assistant/tool ordering.
+        # A second standalone USER message would be rejected by smolagents when
+        # all older action groups have been removed.
+        compact_task_messages = list(task_messages)
+        if compact_task_messages:
+            task_message = compact_task_messages[-1]
+            task_content = task_message.content
+            if not isinstance(task_content, str):
+                task_content = json.dumps(task_content, ensure_ascii=False, default=str)
+            compact_task_messages[-1] = ChatMessage(
+                role=MessageRole.USER,
+                content=f"{task_content}\n\n{summary_text}",
+            )
+        else:  # Defensive: an agent memory should always contain its TaskStep.
+            compact_task_messages = [
+                ChatMessage(role=MessageRole.USER, content=summary_text)
+            ]
         kept = list(groups)
         while kept:
-            candidate = system_messages + task_messages + [summary_message] + [message for group in kept for message in group]
-            estimate = estimate_token_budget(
-                json.dumps([str(message) for message in candidate], ensure_ascii=False),
+            candidate = system_messages + compact_task_messages + [
+                message for group in kept for message in group
+            ]
+            estimate, _ = _request_token_budget(
+                self.model,
+                candidate,
+                self.tools_and_managed_agents,
                 context_length=self.context_length,
                 max_output_tokens=self.max_output_tokens,
             )
@@ -1265,9 +1675,11 @@ class ControlledToolCallingAgent(ToolCallingAgent):
                 self.workspace._save()
                 return candidate
             kept.pop(0)
-        minimum = system_messages + task_messages + [summary_message]
-        estimate = estimate_token_budget(
-            json.dumps([str(message) for message in minimum], ensure_ascii=False),
+        minimum = system_messages + compact_task_messages
+        estimate, _ = _request_token_budget(
+            self.model,
+            minimum,
+            self.tools_and_managed_agents,
             context_length=self.context_length,
             max_output_tokens=self.max_output_tokens,
         )
@@ -1275,12 +1687,26 @@ class ControlledToolCallingAgent(ToolCallingAgent):
             raise AgentContextBudgetError(
                 "system/task prompt, complete current candidate, unresolved state, and output reservation do not fit"
             )
+        self.workspace.state["context_compactions"].append(
+            {
+                "created_at_utc": datetime.now(timezone.utc).isoformat(),
+                "omitted_complete_step_groups": len(groups),
+                "retained_complete_step_groups": 0,
+                "candidate_code_truncated": False,
+                "tool_call_result_pairs_split": False,
+                "token_budget": estimate,
+            }
+        )
+        self.workspace._save()
         return minimum
 
     def _handle_max_steps_reached(self, task: str) -> Any:
         # smolagents normally makes one extra model call here.  Returning a
         # deterministic host result keeps --max-model-calls an exact bound.
-        self.workspace.state["stop_reason"] = "model call/step budget exhausted without host approval"
+        self.workspace.state["status"] = "paused_budget_exhausted"
+        self.workspace.state["stop_reason"] = (
+            "offline design is unfinished because the model call budget was exhausted"
+        )
         self.workspace._save()
         return json.dumps(
             {
@@ -1328,10 +1754,17 @@ def run_agent(
     output_dir: str | Path | None = None,
     dry_run: bool = False,
     resume: str | Path | None = None,
+    additional_model_calls: int | None = None,
     model_backend: Model | None = None,
     client: LMStudioClient | None = None,
 ) -> dict[str, Any]:
+    if additional_model_calls is not None:
+        if resume is None:
+            raise ValueError("--additional-model-calls is valid only with --resume")
+        if int(additional_model_calls) <= 0:
+            raise ValueError("--additional-model-calls must be positive")
     resume_state = None
+    original_model_call_maximum = int(max_model_calls)
     if resume is not None:
         directory = Path(resume).resolve()
         resume_state = _load_resume_state(directory)
@@ -1344,7 +1777,8 @@ def run_agent(
         worker_timeout = settings["worker_timeout"]
         absolute_tolerance = settings["absolute_tolerance"]
         relative_tolerance = settings["relative_tolerance"]
-        max_model_calls = settings["max_model_calls"]
+        original_model_call_maximum = int(settings["max_model_calls"])
+        max_model_calls = original_model_call_maximum
         request_settings = resume_state.get("request_settings")
         if not isinstance(request_settings, dict):
             raise ValueError("agent resume state is missing request settings")
@@ -1364,6 +1798,7 @@ def run_agent(
         directory = _agent_directory(
             str(model), output_root=output_root, output_dir=output_dir
         )
+        original_model_call_maximum = int(max_model_calls)
     provider = str(provider).lower()
     if provider not in {"lmstudio", "openai"}:
         raise ValueError("provider must be lmstudio or openai")
@@ -1400,7 +1835,13 @@ def run_agent(
         workspace._save()
     elif workspace.state.get("request_settings") != request_settings:
         raise ValueError("agent resume request settings are incompatible")
-    budget = ModelCallBudget(max_model_calls, workspace.state["model_calls_used"])
+    effective_model_call_maximum = original_model_call_maximum + int(
+        additional_model_calls or 0
+    )
+    budget = ModelCallBudget(
+        effective_model_call_maximum,
+        workspace.state["model_calls_used"],
+    )
     model_info = None
     if client is None and model_backend is None:
         client_type = OpenAIClient if provider == "openai" else LMStudioClient
@@ -1426,7 +1867,10 @@ def run_agent(
         beta=workspace.beta,
         absolute_tolerance=workspace.absolute_tolerance,
         relative_tolerance=workspace.relative_tolerance,
-        current_work_state=workspace.work_state(include_candidate=True),
+        current_work_state=workspace.work_state(
+            include_candidate=True,
+            model_calls_maximum=effective_model_call_maximum,
+        ),
     )
     if model_backend is None:
         assert client is not None
@@ -1455,9 +1899,14 @@ def run_agent(
         add_base_tools=False,
         stream_outputs=False,
     )
-    combined_prompt = agent.system_prompt + "\n\n" + task
-    prompt_budget = estimate_token_budget(
-        combined_prompt,
+    initial_messages = (
+        agent.memory.system_prompt.to_messages(summary_mode=False)
+        + TaskStep(task=task).to_messages(summary_mode=False)
+    )
+    prompt_budget, initial_completion = _request_token_budget(
+        agent.model,
+        initial_messages,
+        agent.tools_and_managed_agents,
         context_length=effective_context,
         max_output_tokens=max_output_tokens,
     )
@@ -1467,6 +1916,7 @@ def run_agent(
         directory / "tool_schemas.json",
         [get_tool_json_schema(tool) for tool in tools],
     )
+    _write_json(directory / "initial_request_shape.json", initial_completion)
     metadata = {
         "schema_version": AGENT_RUN_SCHEMA_VERSION,
         "agent_framework": {
@@ -1481,7 +1931,9 @@ def run_agent(
         "base_url": resolved_base,
         "model_inventory": model_info,
         "generation": {
-            "max_model_calls": max_model_calls,
+            "original_max_model_calls": original_model_call_maximum,
+            "additional_model_calls": int(additional_model_calls or 0),
+            "effective_max_model_calls": effective_model_call_maximum,
             "temperature": temperature,
             "seed": seed,
             "max_output_tokens": max_output_tokens,
@@ -1508,11 +1960,25 @@ def run_agent(
         workspace._save()
         raise AgentContextBudgetError(workspace.state["stop_reason"])
     if dry_run:
-        workspace.state["status"] = "dry_run_complete"
-        workspace.state["stop_reason"] = "dry run; no generation request sent"
-        workspace._save()
+        if resume is None:
+            workspace.state["status"] = "dry_run_complete"
+            workspace.state["stop_reason"] = "dry run; no generation request sent"
+            workspace._save()
         return {"status": "dry_run_complete", "output_directory": str(directory), "metadata": metadata, "model_calls_used": budget.used}
     if resume is not None:
+        if additional_model_calls:
+            workspace.state.setdefault("budget_extension_events", []).append(
+                {
+                    "created_at_utc": datetime.now(timezone.utc).isoformat(),
+                    "additional_model_calls": int(additional_model_calls),
+                    "previous_max_model_calls": original_model_call_maximum,
+                    "new_max_model_calls": effective_model_call_maximum,
+                    "model_calls_used": budget.used,
+                }
+            )
+            workspace.state["settings"]["max_model_calls"] = (
+                effective_model_call_maximum
+            )
         workspace.state.setdefault("resume_events", []).append(
             {
                 "resumed_at_utc": datetime.now(timezone.utc).isoformat(),
@@ -1524,9 +1990,9 @@ def run_agent(
         workspace.state["stop_reason"] = None
         workspace._save()
     if available_model_calls == 0:
-        workspace.state["status"] = "stopped_without_approval"
+        workspace.state["status"] = "paused_budget_exhausted"
         workspace.state["stop_reason"] = (
-            "saved model call budget is already exhausted without host approval"
+            "offline design remains unfinished; the saved model call budget is exhausted"
         )
         workspace._save()
         return {
@@ -1554,6 +2020,17 @@ def run_agent(
     except KeyboardInterrupt:
         workspace.state["status"] = "interrupted"
         workspace.state["stop_reason"] = "cancelled by user; no unknown request is retried"
+    except AgentContextBudgetError as exc:
+        workspace.state["status"] = "failed_context_budget"
+        workspace.state["stop_reason"] = f"context_budget_exceeded: {exc}"
+        _write_json(
+            directory / "failure.json",
+            {
+                "error_type": type(exc).__name__,
+                "category": "context_budget_exceeded",
+                "error": str(exc),
+            },
+        )
     except Exception as exc:
         workspace.state["status"] = "failed"
         workspace.state["stop_reason"] = f"{type(exc).__name__}: {exc}"

@@ -47,7 +47,7 @@ C:\Users\user\anaconda3\envs\LLM_HRL\python.exe run_llm_agent.py `
   --base-url http://127.0.0.1:1234/v1 `
   --model openai/gpt-oss-20b `
   --context-length 50000 `
-  --max-output-tokens 4096 `
+  --max-output-tokens 8192 `
   --max-model-calls 20 `
   --reasoning-effort low `
   --dry-run
@@ -62,7 +62,7 @@ C:\Users\user\anaconda3\envs\LLM_HRL\python.exe run_llm_agent.py `
   --base-url http://127.0.0.1:1234/v1 `
   --model openai/gpt-oss-20b `
   --context-length 50000 `
-  --max-output-tokens 4096 `
+  --max-output-tokens 8192 `
   --max-model-calls 20 `
   --reasoning-effort low
 ```
@@ -74,6 +74,22 @@ cache entries:
 C:\Users\user\anaconda3\envs\LLM_HRL\python.exe run_llm_agent.py `
   --resume <RUN_DIRECTORY>
 ```
+
+If a run is `paused_budget_exhausted`, explicitly add another 20 model calls.
+The saved cumulative usage is retained: a 20-call run that used all 20 calls
+will have a total budget of 40 and 20 calls remaining after this command.
+
+```powershell
+C:\Users\user\anaconda3\envs\LLM_HRL\python.exe run_llm_agent.py `
+  --resume <RUN_DIRECTORY> `
+  --additional-model-calls 20
+```
+
+`--additional-model-calls` is valid only with `--resume`. A resume dry-run may
+show the proposed effective budget, but it neither sends a request nor records
+the extension. A real resume records the timestamp, old and new total, added
+amount, and cumulative calls already used. Resuming without an extension uses
+the saved remaining budget; an exhausted run stays paused without a model call.
 
 Use the exact ID returned by LM Studio's model list for another local model. At
 the time this contract was verified, visible IDs included
@@ -120,11 +136,24 @@ budget. Tool executions have no separate count limit; formal evaluation remains
 cacheable but unrestricted. A legal tool call produced by the last allowed
 model generation is executed before stopping.
 
+The terminal run states distinguish `approved`, `paused_budget_exhausted`,
+`interrupted`, transport/provider failures, and context-budget failures. A
+paused run is unfinished and has no approved artifact. Within one model
+response, tool calls run sequentially in the provided order. If formal
+evaluation approves a candidate, later calls from that same response are saved
+as `skipped_after_approval`, receive no side effects, and no further generation
+is requested.
+
 Before each generation, the client budgets the complete framework system
 prompt, task, tool definitions, memory, and output reservation. When necessary,
 whole older action groups are replaced with a host-generated structured summary;
 tool-call/result pairs are never split and the current candidate is not
-truncated. If the minimum state still does not fit, the run is saved and stops.
+truncated. The estimate uses the same serialized messages and tool schemas sent
+to the provider, plus the configured output reservation. If the minimum state
+still does not fit, the run is saved and stops without consuming a model call.
+The compact work state includes the full current candidate, issue provenance and
+status, relevant per-lambda formal-evaluation summaries, critical-pair
+diagnostics, history lookup indexes, and cumulative call-budget state.
 On resume, compatibility hashes and settings are checked, running operations are
 marked interrupted rather than passed, completed candidate tests/evaluations use
 their content-keyed caches, and requests of unknown completion status are not
@@ -133,3 +162,15 @@ generation settings, and timeout settings are restored from the run state so a
 plain `--resume` does not silently change the request contract. Resume also
 requires the saved prompt/tool/interface contracts and Git revision; a changed
 implementation must start a separate run instead of mixing evaluation evidence.
+
+Provider responses are not exposed to tool execution until streaming completed
+and the termination reason is accepted. Standard `tool_calls` is accepted;
+LM Studio `stop` is accepted only when it includes complete tool calls. Truncated
+(`length`), refused, content-filtered, interrupted, missing-terminal, and unknown
+termination responses are preserved as failures and are not retried or treated
+as candidate-validation feedback.
+
+Agent runs created by another Git revision cannot be resumed by design. This
+prevents old framework-memory, tool, or validation evidence from being silently
+mixed with a changed implementation. Start a new run when compatibility checks
+reject an older directory; the old directory remains intact for inspection.
