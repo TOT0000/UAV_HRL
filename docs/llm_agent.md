@@ -204,6 +204,15 @@ indexes and any still-pending result, so resume can deliver it without rerunning
 the operation. “Delivered” means included in a request that completed; it does
 not claim that the model understood the result.
 
+Formal-evaluation delivery is checked again after every reduction step against
+the serialized representation actually placed in the tool-result message. Its
+bounded form keeps every lambda score and pass decision, expands a shared
+maximum pair only once, and limits feature/finding evidence by deterministic
+rules. Full traces, sample inputs, contracts, and omitted feature details remain
+in the registered report. Candidate-history results are the intentional
+exception to the general tool-result character limit: candidate source remains
+complete and the whole request budget decides whether it can be delivered.
+
 Evaluation-history pages summarize each registered report before applying the
 page-size limit. Every entry keeps the candidate/report IDs, approval status,
 all per-lambda baseline and candidate estimates, improvement, required margin,
@@ -223,8 +232,16 @@ nearest-ancestor formal-evaluation summary, compact history indexes, and
 cumulative call-budget state. Repeated issues retain source counts and recent
 source IDs; omitted details remain available through `get_history`. Older
 evaluation reports are indexed instead of expanded, and run-history lookup is
-paged. Context compaction rebuilds the common task around this one fresh work
-state, so the original stale summary is not retained alongside a new copy.
+paged. Shared maximum pairs are stored once and referenced by all applicable
+lambda entries. If removing delivered history is insufficient, the host uses a
+second bounded work-state level before failing; neither level truncates the
+candidate. Context compaction rebuilds the common task around this one fresh
+work state, so the original stale summary is not retained alongside a new copy.
+Saved compaction diagnostics separate serialized character counts from inexact
+token estimates and identify system, task/interface, tools, candidate,
+evaluation, issue/query summaries, pending results, retained history, and the
+exact output-token reservation. The unified full-request estimate remains the
+accept/reject decision.
 On a real resume, compatibility hashes and settings are checked, running operations are
 marked interrupted rather than passed, completed candidate tests/evaluations use
 their content-keyed caches, and requests of unknown completion status are not

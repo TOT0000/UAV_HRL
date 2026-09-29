@@ -218,6 +218,8 @@ def _install_oversized_evaluation_report(
     workspace, candidate_id, *, suffix="oversized", padding_character="x"
 ):
     by_lambda = {}
+    diagnostic_by_lambda = {}
+    pair_ref = "fixture-pair-4-19"
     for index, lambda_value in enumerate((0.0, 0.00007, 0.00013, 0.00014, 0.00015)):
         baseline = 1.3 + index * 0.01
         candidate = baseline + 0.2
@@ -243,15 +245,67 @@ def _install_oversized_evaluation_report(
                 },
             },
         }
+        diagnostic_by_lambda[f"{lambda_value:.5f}"] = {
+            "maximum_pair_ref": pair_ref,
+            "reward_outcomes_after_action": {
+                "base_reward_difference_i_minus_j": 4.0 + index,
+                "extra_reward_difference_i_minus_j": 0.0,
+                "total_reward_difference_i_minus_j": 4.0 + index,
+            },
+        }
+    features = [
+        {
+            "index": index,
+            "name": f"feature_{index}",
+            "reward_weight": 0.0,
+            "feature_i": index / 100.0,
+            "feature_j": (index + 1) / 100.0,
+            "feature_difference_i_minus_j": -0.01,
+            "weighted_contribution_difference_i_minus_j_excludes_beta": 0.0,
+        }
+        for index in range(24)
+    ]
     report = {
         "status": "failed",
         "passed": False,
         "by_lambda": by_lambda,
         "evaluation_diagnostics": {
             "long_single_line": padding_character * 8_000,
-            "by_lambda": {
-                key: {"maximum_pair_ref": f"fixture-pair-{key}"}
-                for key in by_lambda
+            "by_lambda": diagnostic_by_lambda,
+            "pairs": {
+                pair_ref: {
+                    "sample_i_ref": "sample_4",
+                    "sample_j_ref": "sample_19",
+                    "original_state_distance": 0.25,
+                    "augmented_state_distance": 0.5,
+                    "extra_reward_i": 0.0,
+                    "extra_reward_j": 0.0,
+                    "extra_reward_difference_i_minus_j": 0.0,
+                    "features": features,
+                    "full_transition_trace": padding_character * 12_000,
+                }
+            },
+            "findings": [
+                {
+                    "code": "FIXTURE_SHARED_MAXIMUM_PAIR",
+                    "pair_ref": pair_ref,
+                    "lambda_refs": list(by_lambda),
+                    "evidence": {
+                        "original_state_distance": 0.25,
+                        "augmented_state_distance": 0.5,
+                    },
+                    "explanation": padding_character * 2_000,
+                }
+            ],
+            "finding_definitions": {
+                "fixture": {"description": padding_character * 4_000}
+            },
+            "source_field_contracts": {
+                "obs.state": {"description": padding_character * 4_000}
+            },
+            "samples": {
+                "sample_4": {"feature_input_data": padding_character * 4_000},
+                "sample_19": {"feature_input_data": padding_character * 4_000},
             },
         },
     }
@@ -1640,7 +1694,8 @@ def test_work_summary_bounds_twenty_candidate_evaluation_history(tmp_path):
     assert current["selected_formal_evaluation"]["candidate_id"] == parent_id
     assert current["selected_formal_evaluation"]["report_id"] == report_paths[-1]
     assert "related_formal_evaluations" not in current
-    assert json.dumps(summary).count(report_paths[-1]) == 1
+    # The report appears once as identity and once in the executable details query.
+    assert json.dumps(summary).count(report_paths[-1]) == 2
     history_index = current["evaluation_history_index"]
     assert history_index["total_evaluated_candidates"] == 20
     assert len(history_index["recent"]) == llm_agent.WORK_SUMMARY_MAX_EVALUATION_INDEXES
@@ -1670,7 +1725,7 @@ def test_work_summary_bounds_twenty_candidate_evaluation_history(tmp_path):
     assert parent_id in prompt
     assert workspace.state["candidates"][parent_id]["candidate"]["candidate_name"] in prompt
     assert "compute_extra_state" in prompt
-    assert prompt.count("critical_pair_diagnostics") == 1
+    assert prompt.count('"critical_pairs"') == 1
     assert report_paths[0] not in prompt
 
 
@@ -2357,6 +2412,24 @@ def test_pending_result_that_cannot_fit_stops_before_incomplete_request(tmp_path
     failure = state["context_compactions"][-1]
     assert failure["status"] == "context_budget_exceeded"
     assert record["record_id"] in failure["pending_result_record_ids"]
+    assert failure["work_summary_level"] == "minimal"
+    assert failure["candidate_code_truncated"] is False
+    assert failure["token_budget"]["fits_client_budget"] is False
+    components = failure["budget_components"]
+    for key in (
+        "system",
+        "task_and_interface_excluding_work_state",
+        "tool_definitions",
+        "candidate",
+        "work_summary_evaluation",
+        "work_summary_issues",
+        "work_summary_queries",
+        "pending_tool_results",
+        "other_retained_history",
+        "output_reservation",
+    ):
+        assert key in components
+    assert components["pending_tool_results"]["serialized_characters"] > 0
 
 
 def test_interface_pages_preserve_order_and_offer_exact_next_arguments(tmp_path):
@@ -2508,6 +2581,238 @@ def test_oversized_evaluation_history_formats_summary_and_lossless_details(
         len(item["text"]) <= llm_agent.REPORT_TEXT_SEGMENT_MAX_CHARS
         for item in reconstructed_segments
     )
+
+
+def test_formal_evaluation_model_result_is_actually_bounded_and_retrievable(
+    tmp_path
+):
+    fixed = _fixed_artifact(tmp_path)
+    workspace = _workspace(tmp_path, fixed, name="bounded-formal-result")
+    submitted = workspace.submit_candidate(_candidate(name="bounded-formal"), None)
+    candidate_id = submitted["candidate_id"]
+    report_id, report = _install_oversized_evaluation_report(
+        workspace, candidate_id, suffix="formal-tool"
+    )
+    raw_result = workspace._evaluation_tool_result(
+        candidate_id,
+        report,
+        cache_hit=False,
+        report_id=report_id,
+    )
+    assert workspace._serialized_size(raw_result) > llm_agent.MODEL_TOOL_RESULT_MAX_CHARS
+
+    call = ChatMessageToolCall(
+        function=ChatMessageToolCallFunction(
+            name="formal_evaluate", arguments={"candidate_id": candidate_id}
+        ),
+        id="bounded-formal-call",
+        type="function",
+    )
+    workspace.register_framework_calls([call])
+    model_result = workspace.finish_framework_call(
+        call.id,
+        status="completed",
+        output=json.dumps(raw_result, ensure_ascii=False),
+    )
+    assert workspace._serialized_size(model_result) <= llm_agent.MODEL_TOOL_RESULT_MAX_CHARS
+    assert model_result["model_delivery"]["full_result_preserved"] is True
+    assert len(model_result["by_lambda"]) == 5
+    assert len(model_result["critical_pairs"]) == 1
+    for lambda_key, expected in report["by_lambda"].items():
+        actual = model_result["by_lambda"][lambda_key]
+        for key in (
+            "baseline_l_hat",
+            "candidate_l_hat",
+            "improvement",
+            "required_margin",
+            "passed",
+        ):
+            assert actual[key] == expected[key]
+
+    details = model_result["details_query"]
+    page = workspace.get_history(**details["arguments"])
+    assert page["status"] == "ok"
+    assert page["report_id"] == report_id
+    framework_record = workspace.state["framework_tool_calls"][-1]
+    assert framework_record["raw_result_serialized_characters"] > 6_000
+    assert framework_record["model_result_serialized_characters"] <= 6_000
+    indexed = workspace.get_history(
+        None,
+        "tool_result",
+        report_id=framework_record["record_id"],
+    )
+    indexed_for_model = workspace._compact_model_tool_result(
+        tool="get_history",
+        arguments={"record_type": "tool_result"},
+        result=indexed,
+    )
+    assert (
+        workspace._serialized_size(indexed_for_model)
+        <= llm_agent.MODEL_TOOL_RESULT_MAX_CHARS
+    )
+    assert indexed_for_model["record_id"] == framework_record["record_id"]
+    persisted = json.loads(
+        (workspace.directory / framework_record["raw_result_path"]).read_text()
+    )
+    assert persisted["result"] == raw_result
+
+
+def test_complete_candidate_history_is_an_explicit_size_limit_exception(tmp_path):
+    fixed = _fixed_artifact(tmp_path)
+    workspace = _workspace(tmp_path, fixed, name="complete-candidate-exception")
+    code = "def compute_extra_state(obs, constants):\n" + "    # source\n" * 1_000
+    result = {
+        "status": "ok",
+        "record_type": "candidate",
+        "candidate": {"candidate_name": "large-source", "code": code},
+    }
+    assert workspace._serialized_size(result) > llm_agent.MODEL_TOOL_RESULT_MAX_CHARS
+    delivered = workspace._compact_model_tool_result(
+        tool="get_history",
+        arguments={"record_type": "candidate"},
+        result=result,
+    )
+    assert delivered["candidate"]["code"] == code
+    metadata = delivered["model_delivery"]
+    assert metadata["summary_level"] == "complete_candidate_size_limit_exception"
+    assert metadata["general_character_limit_applied"] is False
+    assert metadata["serialized_characters"] > llm_agent.MODEL_TOOL_RESULT_MAX_CHARS
+
+
+def test_work_state_deduplicates_shared_pair_and_omits_report_sized_details(
+    tmp_path
+):
+    fixed = _fixed_artifact(tmp_path)
+    workspace = _workspace(tmp_path, fixed, name="bounded-work-state")
+    candidate = _candidate(name="bounded-work-state")
+    submitted = workspace.submit_candidate(candidate, None)
+    candidate_id = submitted["candidate_id"]
+    report_id, report = _install_oversized_evaluation_report(
+        workspace, candidate_id, suffix="work-state"
+    )
+    record = workspace.state["candidates"][candidate_id]
+    record["evaluation_status"] = "failed"
+    record["formal_evaluation_issues"] = [
+        {
+            "code": "LIPSCHITZ_NOT_IMPROVED",
+            "check_stage": "formal_evaluation",
+            "status": "open",
+            "source_candidate_id": candidate_id,
+            "lambda": lambda_key,
+            "report_id": report_id,
+        }
+        for lambda_key in report["by_lambda"]
+    ]
+    workspace._save()
+
+    state = workspace.work_state(include_candidate=True)
+    compact = json.dumps(state, ensure_ascii=False, separators=(",", ":"))
+    evaluation = state["current_candidate"]["selected_formal_evaluation"]
+    assert state["current_candidate"]["candidate"] == candidate
+    assert len(evaluation["by_lambda"]) == 5
+    assert list(evaluation["critical_pairs"]) == ["fixture-pair-4-19"]
+    feature_summary = evaluation["critical_pairs"]["fixture-pair-4-19"][
+        "feature_difference_summary"
+    ]
+    assert feature_summary["total_feature_count"] == 24
+    assert feature_summary["included_feature_count"] == 6
+    assert feature_summary["omitted_feature_count"] == 18
+    assert "full_transition_trace" not in compact
+    assert "source_field_contracts" not in compact
+    assert '"finding_definitions":' not in compact
+    assert len(compact) < workspace._serialized_size(report)
+    assert evaluation["details_query"]["arguments"]["report_id"] == report_id
+    unresolved = state["current_candidate"]["unresolved_issue_summary"]
+    assert unresolved["total_distinct_unresolved"] == 5
+
+
+def test_fifty_thousand_context_delivers_pending_report_page_after_history_compaction(
+    tmp_path
+):
+    fixed = _fixed_artifact(tmp_path)
+    directory = tmp_path / "fifty-thousand-context"
+    workspace = _workspace(
+        tmp_path, fixed, name="fifty-thousand-context", max_model_calls=10
+    )
+    candidate = _candidate(name="fifty-thousand-context")
+    submitted = workspace.submit_candidate(candidate, None)
+    candidate_id = submitted["candidate_id"]
+    report_id, report = _install_oversized_evaluation_report(
+        workspace, candidate_id, suffix="request"
+    )
+    record = workspace.state["candidates"][candidate_id]
+    record["evaluation_status"] = "failed"
+    workspace.state["request_settings"] = _request_settings(
+        context_length=50_000, max_output_tokens=8_192
+    )
+    workspace.state["status"] = "paused_budget_exhausted"
+    workspace._save()
+
+    steps = []
+    for index in range(8):
+        steps.append(
+            lambda _request, index=index: [
+                (
+                    "query_samples",
+                    {
+                        "fields": ["obs.state", "obs.movement_mask"],
+                        "start": index,
+                        "limit": 1,
+                        "condition_field": None,
+                        # Simulate previously delivered verbose tool-call history.
+                        # It must be removable without dropping the later pending page.
+                        "condition": f"history-padding-{index}-" + "h" * 8_000,
+                    },
+                )
+            ]
+        )
+
+    def request_report(_request):
+        return [
+            (
+                "get_history",
+                {
+                    "candidate_id": candidate_id,
+                    "record_type": "report",
+                    "report_id": report_id,
+                    "start": 0,
+                    "limit": 50,
+                },
+            )
+        ]
+
+    def verify_report_delivery(request):
+        assert report_id in request
+        assert "data_segments" in request
+        assert "fixture-pair-4-19" in request
+        assert candidate["candidate_name"] in request
+        assert "compute_extra_state" in request
+        return [("final_answer", {"answer": "fixture budget stop"})]
+
+    steps.extend([request_report, verify_report_delivery])
+    model = RequestAwareToolModel(steps, model_id="gpt-4o")
+    result = run_agent(resume=directory, model_backend=model)
+    assert result["status"] == "paused_budget_exhausted"
+    assert len(model.calls) == 10
+    state = json.loads((directory / "agent_state.json").read_text())
+    report_call = next(
+        item
+        for item in state["framework_tool_calls"]
+        if item["name"] == "get_history"
+    )
+    assert report_call["delivery_status"] == "delivered"
+    assert report_call["delivered_model_call_number"] == 10
+    final_compaction = state["context_compactions"][-1]
+    assert final_compaction["token_budget"]["fits_client_budget"] is True
+    assert final_compaction["token_budget"]["client_context_budget"] == 50_000
+    assert final_compaction["token_budget"]["reserved_output_tokens"] == 8_192
+    assert final_compaction["token_budget"]["estimated_total_upper"] <= 50_000
+    assert final_compaction["omitted_complete_step_groups"] > 0
+    assert final_compaction["candidate_code_truncated"] is False
+    assert final_compaction["retained_pending_result_groups"] >= 1
+    assert final_compaction["budget_components"]["pending_tool_results"][
+        "serialized_characters"
+    ] > 0
 
 
 def test_evaluation_history_pages_progress_without_gaps_or_duplicates(

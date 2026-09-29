@@ -106,13 +106,16 @@ from llm_streaming import (
 
 AGENT_RUN_SCHEMA_VERSION = "uav-hrl-llm-feature-agent-run-v1"
 AGENT_PROMPT_VERSION = "uav-hrl-llm-feature-agent-prompt-v4"
-AGENT_TOOL_CONTRACT_VERSION = "uav-hrl-llm-feature-agent-tools-v6"
+AGENT_TOOL_CONTRACT_VERSION = "uav-hrl-llm-feature-agent-tools-v7"
 DEFAULT_MAX_MODEL_CALLS = 20
 DEFAULT_AGENT_OUTPUT_ROOT = Path("results") / "llm_agents"
 DEFAULT_AGENT_PREVIEW_ROOT = Path("results") / "llm_agent_previews"
 WORK_SUMMARY_MAX_ISSUE_GROUPS = 16
 WORK_SUMMARY_MAX_EVALUATION_INDEXES = 12
 WORK_SUMMARY_MAX_QUERY_INDEXES = 8
+WORK_SUMMARY_MAX_CRITICAL_PAIRS = 3
+WORK_SUMMARY_MAX_PAIR_FEATURES = 6
+WORK_SUMMARY_MAX_FINDINGS = 6
 MODEL_TOOL_RESULT_MAX_CHARS = 6_000
 PAGED_TOOL_PAYLOAD_MAX_CHARS = 5_000
 REPORT_TEXT_SEGMENT_MAX_CHARS = 512
@@ -179,6 +182,38 @@ def _request_token_budget(
     )
 
 
+def _json_characters(value: Any) -> int:
+    return len(
+        json.dumps(
+            value,
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+            default=str,
+        )
+    )
+
+
+def _message_characters(messages: list[ChatMessage]) -> int:
+    return _json_characters([message.dict() for message in messages])
+
+
+def _budget_component(characters: int) -> dict[str, Any]:
+    """Report a transparent character-based range, never an exact token count."""
+
+    characters = max(0, int(characters))
+    return {
+        "serialized_characters": characters,
+        "token_estimate": {
+            "exact": False,
+            "method": "character-ratio uncertainty range; no tokenizer used",
+            "lower": math.ceil(characters / 4.5),
+            "central": math.ceil(characters / 3.5),
+            "upper": math.ceil(characters / 2.5),
+        },
+    }
+
+
 def _content_hash(value: Any) -> str:
     return hashlib.sha256(
         json.dumps(
@@ -235,6 +270,254 @@ def _evaluation_history_summary(
                 "start": 0,
                 "limit": 50,
             },
+        },
+    }
+
+
+def _bounded_mapping(value: Any, *, maximum_items: int = 8) -> Any:
+    """Keep small scalar evidence without re-expanding report-sized payloads."""
+
+    if isinstance(value, dict):
+        keys = list(value)[:maximum_items]
+        return {
+            key: _bounded_mapping(value[key], maximum_items=maximum_items)
+            for key in keys
+        }
+    if isinstance(value, list):
+        return [
+            _bounded_mapping(item, maximum_items=maximum_items)
+            for item in value[:maximum_items]
+        ]
+    if isinstance(value, str) and len(value) > 256:
+        return {
+            "prefix": value[:256],
+            "original_character_count": len(value),
+            "omitted_character_count": len(value) - 256,
+        }
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return copy.deepcopy(value)
+    return str(value)
+
+
+def _compact_tool_arguments(tool: str, arguments: Any) -> Any:
+    """Keep executable paging/candidate arguments while bounding invalid noise."""
+
+    if not isinstance(arguments, dict):
+        return _bounded_mapping(arguments)
+    if tool == "submit_candidate":
+        # Immutable candidate source is subject to the request budget, never a
+        # lossy per-field truncation.
+        return copy.deepcopy(arguments)
+    allowed_by_tool = {
+        "query_samples": (
+            "fields",
+            "start",
+            "limit",
+            "condition_field",
+            "condition",
+        ),
+        "inspect_interface": ("section", "start", "limit"),
+        "get_history": (
+            "candidate_id",
+            "record_type",
+            "start",
+            "limit",
+            "report_id",
+        ),
+        "test_candidate": ("candidate_id",),
+        "formal_evaluate": ("candidate_id",),
+        "final_answer": ("answer",),
+    }
+    selected = {
+        key: copy.deepcopy(arguments[key])
+        for key in allowed_by_tool.get(tool, tuple(arguments))
+        if key in arguments
+    }
+    shortened = []
+    for key, value in list(selected.items()):
+        if isinstance(value, str) and len(value) > 256:
+            selected[key] = {
+                "prefix": value[:256],
+                "original_character_count": len(value),
+                "omitted_character_count": len(value) - 256,
+                "complete_value_available_in": "get_history(record_type='tool_calls')",
+            }
+            shortened.append(key)
+        elif isinstance(value, list) and len(value) > 20:
+            selected[key] = copy.deepcopy(value[:20])
+            shortened.append(key)
+    if shortened:
+        selected["summary_omissions"] = {
+            "shortened_argument_fields": shortened,
+            "full_arguments_preserved": True,
+        }
+    return selected
+
+
+def _evaluation_model_summary(
+    *,
+    candidate_id: str,
+    report_id: str,
+    report: dict[str, Any],
+    maximum_pairs: int = WORK_SUMMARY_MAX_CRITICAL_PAIRS,
+    maximum_features_per_pair: int = WORK_SUMMARY_MAX_PAIR_FEATURES,
+    maximum_findings: int = WORK_SUMMARY_MAX_FINDINGS,
+) -> dict[str, Any]:
+    """Summarize one formal evaluation without repeating pair diagnostics."""
+
+    diagnostics = report.get("evaluation_diagnostics") or {}
+    diagnostic_by_lambda = diagnostics.get("by_lambda") or {}
+    all_pairs = diagnostics.get("pairs") or {}
+    pair_references: list[str] = []
+    by_lambda: dict[str, Any] = {}
+    for lambda_key, source in (report.get("by_lambda") or {}).items():
+        source = source or {}
+        diagnostic = diagnostic_by_lambda.get(lambda_key) or {}
+        pair_ref = diagnostic.get("maximum_pair_ref")
+        if pair_ref is not None and str(pair_ref) not in pair_references:
+            pair_references.append(str(pair_ref))
+        maximum_pair = source.get("maximum_pair") or {}
+        entry = {
+            key: copy.deepcopy(source.get(key))
+            for key in (
+                "lambda_mbit_per_joule",
+                "baseline_l_hat",
+                "candidate_l_hat",
+                "improvement",
+                "required_margin",
+                "passed",
+            )
+            if key in source
+        }
+        if pair_ref is not None:
+            entry["maximum_pair_ref"] = str(pair_ref)
+        if "i" in maximum_pair or "j" in maximum_pair:
+            entry["maximum_pair_indices"] = {
+                key: copy.deepcopy(maximum_pair.get(key))
+                for key in ("i", "j")
+                if key in maximum_pair
+            }
+        reward_outcomes = diagnostic.get("reward_outcomes_after_action") or {}
+        if reward_outcomes:
+            entry["reward_differences_i_minus_j"] = {
+                key: copy.deepcopy(reward_outcomes.get(key))
+                for key in (
+                    "base_reward_difference_i_minus_j",
+                    "extra_reward_difference_i_minus_j",
+                    "total_reward_difference_i_minus_j",
+                )
+                if key in reward_outcomes
+            }
+        by_lambda[str(lambda_key)] = entry
+
+    selected_pair_refs = pair_references[: max(0, int(maximum_pairs))]
+    pair_summaries: dict[str, Any] = {}
+    for pair_ref in selected_pair_refs:
+        source_pair = all_pairs.get(pair_ref) or {}
+        features = list(source_pair.get("features") or [])
+
+        def feature_rank(item: tuple[int, Any]) -> tuple[float, int]:
+            position, feature = item
+            if not isinstance(feature, dict):
+                return (0.0, position)
+            difference = feature.get("feature_difference_i_minus_j")
+            try:
+                magnitude = abs(float(difference))
+            except (TypeError, ValueError):
+                magnitude = 0.0
+            return (-magnitude, position)
+
+        selected_features = sorted(enumerate(features), key=feature_rank)[
+            : max(0, int(maximum_features_per_pair))
+        ]
+        feature_summaries = []
+        for _, feature in selected_features:
+            if not isinstance(feature, dict):
+                continue
+            feature_summaries.append(
+                {
+                    key: copy.deepcopy(feature.get(key))
+                    for key in (
+                        "index",
+                        "name",
+                        "reward_weight",
+                        "feature_i",
+                        "feature_j",
+                        "feature_difference_i_minus_j",
+                        "weighted_contribution_difference_i_minus_j_excludes_beta",
+                    )
+                    if key in feature
+                }
+            )
+        pair_summaries[pair_ref] = {
+            key: copy.deepcopy(source_pair.get(key))
+            for key in (
+                "sample_i_ref",
+                "sample_j_ref",
+                "original_state_distance",
+                "augmented_state_distance",
+                "extra_reward_i",
+                "extra_reward_j",
+                "extra_reward_difference_i_minus_j",
+            )
+            if key in source_pair
+        } | {
+            "feature_difference_summary": {
+                "total_feature_count": len(features),
+                "included_feature_count": len(feature_summaries),
+                "omitted_feature_count": max(0, len(features) - len(feature_summaries)),
+                "selection_rule": (
+                    "largest absolute feature_difference_i_minus_j, then original "
+                    "feature order"
+                ),
+                "features": feature_summaries,
+            }
+        }
+
+    findings = []
+    for finding in list(diagnostics.get("findings") or [])[: max(0, int(maximum_findings))]:
+        if not isinstance(finding, dict):
+            continue
+        findings.append(
+            {
+                key: _bounded_mapping(finding.get(key))
+                for key in ("code", "pair_ref", "lambda_refs", "evidence")
+                if key in finding
+            }
+        )
+    details_query = {
+        "tool": "get_history",
+        "arguments": {
+            "candidate_id": candidate_id,
+            "record_type": "report",
+            "report_id": report_id,
+            "start": 0,
+            "limit": 50,
+        },
+    }
+    return {
+        "candidate_id": candidate_id,
+        "report_id": report_id,
+        "status": "approved" if report.get("passed") else report.get("status"),
+        "passed": bool(report.get("passed")),
+        "by_lambda": by_lambda,
+        "critical_pairs": pair_summaries,
+        "critical_pair_summary": {
+            "total_referenced_pair_count": len(pair_references),
+            "included_pair_count": len(pair_summaries),
+            "omitted_pair_count": max(0, len(pair_references) - len(pair_summaries)),
+            "deduplication": "each maximum_pair_ref is expanded at most once",
+        },
+        "findings": findings,
+        "finding_count": len(diagnostics.get("findings") or []),
+        "omitted_finding_count": max(
+            0, len(diagnostics.get("findings") or []) - len(findings)
+        ),
+        "details_query": details_query,
+        "summary_contract": {
+            "level": "evaluation_failure_diagnostics",
+            "full_report_preserved": True,
+            "samples_traces_contracts_and_finding_definitions_omitted": True,
         },
     }
 
@@ -439,9 +722,9 @@ def _render_agent_prompt(
         "{{EVALUATION_SETTINGS_AND_BASELINE}}": evaluation,
         "{{CURRENT_WORK_STATE}}": json.dumps(
             current_work_state,
-            indent=2,
             ensure_ascii=False,
             allow_nan=False,
+            separators=(",", ":"),
         ),
     }
     for placeholder, replacement in replacements.items():
@@ -641,7 +924,11 @@ class AgentWorkspace:
         }
 
     def _latest_evaluation_summary(
-        self, candidate_id: str, record: dict[str, Any]
+        self,
+        candidate_id: str,
+        record: dict[str, Any],
+        *,
+        summary_level: str = "standard",
     ) -> dict[str, Any] | None:
         paths = list((record.get("evaluations") or {}).values())
         if not paths:
@@ -655,49 +942,20 @@ class AgentWorkspace:
                 "status": "report_missing",
             }
         report = json.loads(report_path.read_text(encoding="utf-8"))
-        diagnostics = report.get("evaluation_diagnostics") or {}
-        compact_diagnostics, compaction = _compact_evaluation_diagnostics(
-            diagnostics, 4
+        minimal = summary_level == "minimal"
+        summary = _evaluation_model_summary(
+            candidate_id=candidate_id,
+            report_id=relative_path,
+            report=report,
+            maximum_pairs=1 if minimal else WORK_SUMMARY_MAX_CRITICAL_PAIRS,
+            maximum_features_per_pair=(
+                2 if minimal else WORK_SUMMARY_MAX_PAIR_FEATURES
+            ),
+            maximum_findings=2 if minimal else WORK_SUMMARY_MAX_FINDINGS,
         )
-        diagnostic_by_lambda = diagnostics.get("by_lambda") or {}
-        compact_by_lambda = {}
-        for lambda_value, values in (report.get("by_lambda") or {}).items():
-            maximum_pair = values.get("maximum_pair") or {}
-            compact_by_lambda[lambda_value] = {
-                key: values.get(key)
-                for key in (
-                    "lambda_mbit_per_joule",
-                    "baseline_l_hat",
-                    "candidate_l_hat",
-                    "improvement",
-                    "required_margin",
-                    "passed",
-                )
-            }
-            compact_by_lambda[lambda_value]["maximum_pair_ref"] = (
-                (diagnostic_by_lambda.get(lambda_value) or {}).get(
-                    "maximum_pair_ref"
-                )
-            )
-            if maximum_pair:
-                compact_by_lambda[lambda_value]["maximum_pair_indices"] = {
-                    "i": maximum_pair.get("i"),
-                    "j": maximum_pair.get("j"),
-                }
-            if not values.get("passed"):
-                compact_by_lambda[lambda_value]["failure_reason"] = (
-                    "candidate_l_hat did not beat baseline_l_hat by the required margin"
-                )
-        return {
-            "candidate_id": candidate_id,
-            "report_id": relative_path,
-            "status": report.get("status"),
-            "passed": bool(report.get("passed")),
-            "by_lambda": compact_by_lambda,
-            "critical_pair_diagnostics": compact_diagnostics,
-            "diagnostic_compaction": compaction,
-            "source_is_exact_candidate": True,
-        }
+        summary["source_is_exact_candidate"] = True
+        summary["work_summary_level"] = summary_level
+        return summary
 
     @staticmethod
     def _work_issue_key(issue: dict[str, Any]) -> str:
@@ -725,7 +983,11 @@ class AgentWorkspace:
         return json.dumps(identity, sort_keys=True, ensure_ascii=False, default=str)
 
     def _compact_unresolved_issues(
-        self, current_id: str, current: dict[str, Any]
+        self,
+        current_id: str,
+        current: dict[str, Any],
+        *,
+        maximum_groups: int = WORK_SUMMARY_MAX_ISSUE_GROUPS,
     ) -> dict[str, Any]:
         all_issues = (
             list(current.get("issues", []))
@@ -787,8 +1049,8 @@ class AgentWorkspace:
             group["source_candidate_count"] = len(sources)
             group["source_candidate_ids"] = sources[-8:]
             group["omitted_source_candidate_count"] = max(0, len(sources) - 8)
-        compact = [groups[key] for key in order[:WORK_SUMMARY_MAX_ISSUE_GROUPS]]
-        omitted = [groups[key] for key in order[WORK_SUMMARY_MAX_ISSUE_GROUPS:]]
+        compact = [groups[key] for key in order[:maximum_groups]]
+        omitted = [groups[key] for key in order[maximum_groups:]]
         omitted_by_kind: dict[str, int] = {}
         for issue in omitted:
             kind = f"{issue.get('check_stage', 'unknown')}:{issue.get('code', 'UNKNOWN')}"
@@ -811,12 +1073,18 @@ class AgentWorkspace:
         }
 
     def _selected_evaluation_summary(
-        self, current_id: str, current: dict[str, Any]
+        self,
+        current_id: str,
+        current: dict[str, Any],
+        *,
+        summary_level: str = "standard",
     ) -> dict[str, Any] | None:
         candidate_id: str | None = current_id
         record = current
         while candidate_id:
-            summary = self._latest_evaluation_summary(candidate_id, record)
+            summary = self._latest_evaluation_summary(
+                candidate_id, record, summary_level=summary_level
+            )
             if summary is not None:
                 summary["is_current_candidate"] = candidate_id == current_id
                 summary["history_index"] = {
@@ -907,7 +1175,11 @@ class AgentWorkspace:
         model_calls_maximum: int | None = None,
         include_pending_payloads: bool = False,
         pending_payload_record_ids: set[str] | None = None,
+        summary_level: str = "standard",
     ) -> dict[str, Any]:
+        if summary_level not in {"standard", "minimal"}:
+            raise ValueError("summary_level must be standard or minimal")
+        minimal = summary_level == "minimal"
         current_id = self.state.get("current_candidate_id")
         current = self.state["candidates"].get(current_id) if current_id else None
         maximum = int(
@@ -917,7 +1189,7 @@ class AgentWorkspace:
         )
         completion_events = self.state.get("completion_rejections", [])
         completion_summaries = []
-        for event in completion_events[-4:]:
+        for event in completion_events[-(2 if minimal else 4):]:
             answer = (event.get("arguments") or {}).get("answer")
             answer_text = answer if isinstance(answer, str) else json.dumps(
                 answer, ensure_ascii=False, default=str
@@ -968,19 +1240,27 @@ class AgentWorkspace:
                     "total_segment_count",
                 ):
                     if key in result:
-                        result_summary[key] = copy.deepcopy(result[key])
+                        result_summary[key] = (
+                            _compact_tool_arguments(
+                                str(record.get("name")), result[key]
+                            )
+                            if key == "next_query_arguments"
+                            else copy.deepcopy(result[key])
+                        )
             recent_queries.append(
                 {
                     "record_id": record.get("record_id"),
                     "tool_call_id": record.get("tool_call_id"),
                     "tool": record.get("name"),
-                    "arguments": copy.deepcopy(record.get("arguments")),
+                    "arguments": _compact_tool_arguments(
+                        str(record.get("name")), record.get("arguments")
+                    ),
                     "execution_status": record.get("status"),
                     "delivery_status": record.get("delivery_status"),
                     "result_summary": result_summary,
                 }
             )
-            if len(recent_queries) >= WORK_SUMMARY_MAX_QUERY_INDEXES:
+            if len(recent_queries) >= (4 if minimal else WORK_SUMMARY_MAX_QUERY_INDEXES):
                 break
         recent_queries.reverse()
         pending_payload_filter = pending_payload_record_ids
@@ -990,7 +1270,9 @@ class AgentWorkspace:
                 "record_id": record.get("record_id"),
                 "tool_call_id": record.get("tool_call_id"),
                 "tool": record.get("name"),
-                "arguments": copy.deepcopy(record.get("arguments")),
+                "arguments": _compact_tool_arguments(
+                    str(record.get("name")), record.get("arguments")
+                ),
                 "execution_status": record.get("status"),
                 "delivery_status": "pending",
                 "delivery_note": (
@@ -1015,6 +1297,7 @@ class AgentWorkspace:
             "model_calls_used": self.state["model_calls_used"],
             "model_calls_maximum": maximum,
             "model_calls_remaining": maximum - int(self.state["model_calls_used"]),
+            "work_summary_level": summary_level,
             "budget_extension_events": self.state.get("budget_extension_events", []),
             "completion_rejections": {
                 "count": len(completion_events),
@@ -1050,7 +1333,7 @@ class AgentWorkspace:
                     key: operation.get(key)
                     for key in ("operation_id", "tool", "candidate_id", "status", "result_summary")
                 }
-                for operation in self.state["tool_operations"][-8:]
+                for operation in self.state["tool_operations"][-(4 if minimal else 8):]
             ],
         }
         if current is not None:
@@ -1061,10 +1344,12 @@ class AgentWorkspace:
                 "validation_status": current.get("validation_status"),
                 "evaluation_status": current.get("evaluation_status"),
                 "unresolved_issue_summary": self._compact_unresolved_issues(
-                    current_id, current
+                    current_id,
+                    current,
+                    maximum_groups=8 if minimal else WORK_SUMMARY_MAX_ISSUE_GROUPS,
                 ),
                 "selected_formal_evaluation": self._selected_evaluation_summary(
-                    current_id, current
+                    current_id, current, summary_level=summary_level
                 ),
                 "latest_complete_test": self._latest_test_summary(
                     current_id, current
@@ -1216,7 +1501,14 @@ class AgentWorkspace:
             # Candidate code is never silently truncated. The request budget
             # check will stop explicitly if the complete immutable candidate
             # cannot be delivered.
-            return result
+            complete_candidate = copy.deepcopy(result)
+            complete_candidate["model_delivery"] = {
+                "summary_level": "complete_candidate_size_limit_exception",
+                "general_character_limit_applied": False,
+                "reason": "candidate code must not be truncated",
+                "serialized_characters": self._serialized_size(result),
+            }
+            return complete_candidate
         if not isinstance(result, dict):
             return {
                 "status": "result_too_large",
@@ -1256,22 +1548,65 @@ class AgentWorkspace:
         )
         candidate_id = result.get("candidate_id")
         if tool == "formal_evaluate":
-            compact["by_lambda"] = copy.deepcopy(result.get("by_lambda"))
-            diagnostics, diagnostics_summary = _compact_evaluation_diagnostics(
-                result.get("evaluation_diagnostics") or {}, 0
+            evaluation_summary = _evaluation_model_summary(
+                candidate_id=str(candidate_id),
+                report_id=str(result.get("report_id") or ""),
+                report=result,
             )
-            compact["evaluation_diagnostics"] = diagnostics
-            compact["diagnostic_compaction"] = diagnostics_summary
-            compact["details_query"] = {
-                "tool": "get_history",
-                "arguments": {
-                    "candidate_id": candidate_id,
-                    "record_type": "report",
-                    "start": 0,
-                    "limit": 50,
-                    "report_id": result.get("report_id"),
-                },
+            compact.update(evaluation_summary)
+            compact["cache_hit"] = bool(result.get("cache_hit"))
+            compact["approved_artifact"] = result.get("approved_artifact")
+            compact["approval_is_host_determined"] = bool(
+                result.get("approval_is_host_determined", True)
+            )
+            compact["model_delivery"] = {
+                "summary_level": "bounded_formal_evaluation",
+                "original_serialized_characters": self._serialized_size(result),
+                "delivery_character_limit": MODEL_TOOL_RESULT_MAX_CHARS,
+                "full_result_preserved": True,
             }
+            if self._serialized_size(compact) > MODEL_TOOL_RESULT_MAX_CHARS:
+                compact_summary = _evaluation_model_summary(
+                    candidate_id=str(candidate_id),
+                    report_id=str(result.get("report_id") or ""),
+                    report=result,
+                    maximum_pairs=1,
+                    maximum_features_per_pair=2,
+                    maximum_findings=2,
+                )
+                compact = {
+                    **{
+                        key: copy.deepcopy(result.get(key))
+                        for key in ("cache_hit", "approved_artifact")
+                        if key in result
+                    },
+                    **compact_summary,
+                    "approval_is_host_determined": bool(
+                        result.get("approval_is_host_determined", True)
+                    ),
+                    "model_delivery": {
+                        "summary_level": "minimal_formal_evaluation",
+                        "original_serialized_characters": self._serialized_size(result),
+                        "delivery_character_limit": MODEL_TOOL_RESULT_MAX_CHARS,
+                        "full_result_preserved": True,
+                    },
+                }
+            if self._serialized_size(compact) > MODEL_TOOL_RESULT_MAX_CHARS:
+                score_summary = _evaluation_history_summary(
+                    candidate_id=str(candidate_id),
+                    report_id=str(result.get("report_id") or ""),
+                    report=result,
+                )
+                compact = {
+                    **score_summary,
+                    "model_delivery": {
+                        "summary_level": "scores_only_formal_evaluation",
+                        "original_serialized_characters": self._serialized_size(result),
+                        "delivery_character_limit": MODEL_TOOL_RESULT_MAX_CHARS,
+                        "full_result_preserved": True,
+                        "diagnostics_omitted": True,
+                    },
+                }
         elif tool == "test_candidate":
             numeric = copy.deepcopy(result.get("numeric_diagnostics") or {})
             features = list(numeric.get("features") or [])
@@ -1342,11 +1677,50 @@ class AgentWorkspace:
                             "delivery_status",
                             "result",
                             "raw_result_sha256",
+                            "raw_result_serialized_characters",
+                            "model_result_serialized_characters",
+                            "model_result_summary_level",
                         )
                         if key in result
                     }
                 )
-                return compact
+                if self._serialized_size(compact) <= MODEL_TOOL_RESULT_MAX_CHARS:
+                    return compact
+                nested_result = copy.deepcopy(result.get("result"))
+                minimum = {
+                    "status": result.get("status"),
+                    "record_type": "tool_result",
+                    "record_id": result.get("record_id"),
+                    "tool_call_id": result.get("tool_call_id"),
+                    "tool": result.get("tool"),
+                    "result": nested_result,
+                    "wrapper_fields_omitted": True,
+                }
+                if self._serialized_size(minimum) <= MODEL_TOOL_RESULT_MAX_CHARS:
+                    return minimum
+                details_query = (
+                    nested_result.get("details_query")
+                    if isinstance(nested_result, dict)
+                    else None
+                )
+                return {
+                    "status": "result_delivery_budget_exceeded",
+                    "record_type": "tool_result",
+                    "record_id": result.get("record_id"),
+                    "tool_call_id": result.get("tool_call_id"),
+                    "tool": result.get("tool"),
+                    "original_result_status": (
+                        nested_result.get("status")
+                        if isinstance(nested_result, dict)
+                        else None
+                    ),
+                    "details_query": copy.deepcopy(details_query),
+                    "error": (
+                        "The indexed model-facing result plus its history wrapper "
+                        "does not fit the delivery limit. Use details_query when "
+                        "available; the original indexed result remains preserved."
+                    ),
+                }
             elif record_type == "issues":
                 source_items = list(result.get("issue_records") or [])
                 key = "issue_records"
@@ -1444,20 +1818,7 @@ class AgentWorkspace:
         if self._serialized_size(compact) > MODEL_TOOL_RESULT_MAX_CHARS:
             # Last-resort structured reduction.  Status and scoring facts remain;
             # verbose diagnostics stay available through the declared history page.
-            if tool == "formal_evaluate":
-                diagnostics = compact.get("evaluation_diagnostics") or {}
-                compact["evaluation_diagnostics"] = {
-                    key: copy.deepcopy(diagnostics.get(key))
-                    for key in (
-                        "schema_version",
-                        "by_lambda",
-                        "findings",
-                        "finding_definitions",
-                        "pairs",
-                    )
-                    if key in diagnostics
-                }
-            elif tool == "test_candidate":
+            if tool == "test_candidate":
                 compact.pop("representative_outputs", None)
             elif tool == "get_history" and compact.get("record_type") == "run":
                 compact["work_state"] = {
@@ -1472,6 +1833,33 @@ class AgentWorkspace:
                     )
                     if key in (compact.get("work_state") or {})
                 }
+        if self._serialized_size(compact) > MODEL_TOOL_RESULT_MAX_CHARS:
+            details_query = compact.get("details_query")
+            compact = {
+                key: copy.deepcopy(compact.get(key))
+                for key in ("status", "candidate_id", "passed", "report_id")
+                if key in compact
+            } | {
+                "status": "result_delivery_budget_exceeded",
+                "original_status": compact.get("status"),
+                "tool": tool,
+                "details_query": copy.deepcopy(details_query),
+                "model_delivery": {
+                    "summary_level": "minimum_result_budget_failure",
+                    "original_serialized_characters": self._serialized_size(result),
+                    "delivery_character_limit": MODEL_TOOL_RESULT_MAX_CHARS,
+                    "full_result_preserved": True,
+                },
+                "error": (
+                    "The minimum structured result does not fit the model-facing "
+                    "tool-result limit; the complete result remains indexed."
+                ),
+            }
+        if isinstance(compact.get("model_delivery"), dict):
+            for _ in range(3):
+                compact["model_delivery"]["serialized_characters"] = (
+                    self._serialized_size(compact)
+                )
         return compact
 
     def _framework_record(self, record_id: str) -> dict[str, Any] | None:
@@ -1612,6 +2000,22 @@ class AgentWorkspace:
                         default=str,
                     )
                     record["model_result"] = model_result
+                    record["raw_result_serialized_characters"] = self._serialized_size(
+                        decoded
+                    )
+                    record["model_result_serialized_characters"] = (
+                        self._serialized_size(model_result)
+                    )
+                    delivery_metadata = (
+                        model_result.get("model_delivery")
+                        if isinstance(model_result, dict)
+                        else None
+                    )
+                    record["model_result_summary_level"] = (
+                        delivery_metadata.get("summary_level")
+                        if isinstance(delivery_metadata, dict)
+                        else "complete"
+                    )
                     record["raw_result_path"] = str(
                         result_path.relative_to(self.directory)
                     )
@@ -2479,6 +2883,9 @@ class AgentWorkspace:
                             "delivered_model_call_number",
                             "raw_result_path",
                             "raw_result_sha256",
+                            "raw_result_serialized_characters",
+                            "model_result_serialized_characters",
+                            "model_result_summary_level",
                         )
                         if item.get(key) is not None
                     }
@@ -2513,6 +2920,15 @@ class AgentWorkspace:
                 "delivery_status": framework_record.get("delivery_status"),
                 "result": copy.deepcopy(framework_record.get("model_result")),
                 "raw_result_sha256": framework_record.get("raw_result_sha256"),
+                "raw_result_serialized_characters": framework_record.get(
+                    "raw_result_serialized_characters"
+                ),
+                "model_result_serialized_characters": framework_record.get(
+                    "model_result_serialized_characters"
+                ),
+                "model_result_summary_level": framework_record.get(
+                    "model_result_summary_level"
+                ),
             }
         if not candidate_id:
             return {"status": "invalid_arguments", "error": "candidate_id is required for this record type"}
@@ -3367,85 +3783,187 @@ class ControlledToolCallingAgent(ToolCallingAgent):
             == current_candidate_id
             for record in all_pending_records
         )
-        compact_work_state = self.workspace.work_state(
-            include_candidate=not pending_supplies_current_candidate,
-            model_calls_maximum=self.model_calls_maximum,
-            include_pending_payloads=bool(pending_without_memory),
-            pending_payload_record_ids=pending_without_memory,
-        )
-        if self.task_renderer is None:  # Defensive for direct construction.
-            compact_task = (
-                "Host-generated compact work-state summary. Structured facts only; "
-                "older full messages remain on disk:\n"
-                + json.dumps(
-                    compact_work_state,
-                    ensure_ascii=False,
-                    allow_nan=False,
-                )
-            )
-        else:
-            # Rebuild the common task around exactly one fresh work-state block.
-            # This avoids retaining the stale initial summary and appending a
-            # second, ever-growing copy during context compaction or resume.
-            compact_task = self.task_renderer(compact_work_state)
-        compact_task_messages = TaskStep(task=compact_task).to_messages(
-            summary_mode=False
-        )
         kept_indexes = list(range(len(group_records)))
 
-        def request_messages(indexes: list[int]) -> list[ChatMessage]:
-            return system_messages + compact_task_messages + [
+        def compact_context(summary_level: str):
+            work_state = self.workspace.work_state(
+                include_candidate=not pending_supplies_current_candidate,
+                model_calls_maximum=self.model_calls_maximum,
+                include_pending_payloads=bool(pending_without_memory),
+                pending_payload_record_ids=pending_without_memory,
+                summary_level=summary_level,
+            )
+            if self.task_renderer is None:  # Defensive for direct construction.
+                task = (
+                    "Host-generated compact work-state summary. Structured facts only; "
+                    "older full messages remain on disk:\n"
+                    + json.dumps(
+                        work_state,
+                        ensure_ascii=False,
+                        allow_nan=False,
+                        separators=(",", ":"),
+                    )
+                )
+            else:
+                # Rebuild the common task around exactly one fresh work-state block.
+                # This avoids retaining the stale initial summary and appending a
+                # second, ever-growing copy during context compaction or resume.
+                task = self.task_renderer(work_state)
+            task_messages = TaskStep(task=task).to_messages(summary_mode=False)
+            return work_state, task, task_messages
+
+        def request_messages(
+            task_messages: list[ChatMessage], indexes: list[int]
+        ) -> list[ChatMessage]:
+            return system_messages + task_messages + [
                 message
                 for index in indexes
                 for message in group_records[index]["messages"]
             ]
 
-        while True:
-            candidate = request_messages(kept_indexes)
-            estimate, _ = _request_token_budget(
-                self.model,
-                candidate,
-                self.tools_and_managed_agents,
-                context_length=self.context_length,
-                max_output_tokens=self.max_output_tokens,
+        def budget_components(
+            work_state: dict[str, Any],
+            task: str,
+            task_messages: list[ChatMessage],
+            indexes: list[int],
+            *,
+            summary_level: str,
+        ) -> dict[str, Any]:
+            current = work_state.get("current_candidate") or {}
+            work_state_characters = _json_characters(work_state)
+            candidate_characters = _json_characters(current.get("candidate") or {})
+            evaluation_characters = _json_characters(
+                current.get("selected_formal_evaluation") or {}
             )
-            if estimate["fits_client_budget"]:
-                omitted = len(group_records) - len(kept_indexes)
-                protected = sum(
-                    bool(group_records[index]["pending_record_ids"])
-                    for index in kept_indexes
-                )
-                self.workspace.state["context_compactions"].append(
-                    {
-                        "created_at_utc": datetime.now(timezone.utc).isoformat(),
-                        "omitted_complete_step_groups": omitted,
-                        "retained_complete_step_groups": len(kept_indexes),
-                        "retained_pending_result_groups": protected,
-                        "pending_result_record_ids": all_pending_ids,
-                        "pending_results_embedded_in_work_state": sorted(
-                            pending_without_memory
-                        ),
-                        "candidate_code_truncated": False,
-                        "tool_call_result_pairs_split": False,
-                        "token_budget": estimate,
-                    }
-                )
-                self.workspace._save()
-                self.workspace.prepare_result_delivery(all_pending_ids)
-                return candidate
-            removable = next(
-                (
-                    index
-                    for index in kept_indexes
-                    if not group_records[index]["pending_record_ids"]
+            issue_characters = _json_characters(
+                current.get("unresolved_issue_summary") or {}
+            )
+            query_characters = _json_characters(
+                work_state.get("recent_completed_queries") or {}
+            )
+            pending_characters = sum(
+                _json_characters(record.get("model_result"))
+                for record in all_pending_records
+            )
+            retained_history_characters = sum(
+                _message_characters(group_records[index]["messages"])
+                for index in indexes
+            )
+            tool_characters = _json_characters(
+                [get_tool_json_schema(tool) for tool in self.tools_and_managed_agents]
+            )
+            work_known = (
+                candidate_characters
+                + evaluation_characters
+                + issue_characters
+                + query_characters
+            )
+            return {
+                "summary_level": summary_level,
+                "components_are_diagnostic_not_additive": True,
+                "system": _budget_component(_message_characters(system_messages)),
+                "task_and_interface_excluding_work_state": _budget_component(
+                    max(0, len(task) - work_state_characters)
                 ),
-                None,
-            )
-            if removable is None:
-                break
-            kept_indexes.remove(removable)
+                "tool_definitions": _budget_component(tool_characters),
+                "candidate": _budget_component(candidate_characters),
+                "work_summary_evaluation": _budget_component(
+                    evaluation_characters
+                ),
+                "work_summary_issues": _budget_component(issue_characters),
+                "work_summary_queries": _budget_component(query_characters),
+                "work_summary_other": _budget_component(
+                    max(0, work_state_characters - work_known)
+                ),
+                "pending_tool_results": _budget_component(pending_characters),
+                "other_retained_history": _budget_component(
+                    retained_history_characters
+                ),
+                "compact_task_messages": _budget_component(
+                    _message_characters(task_messages)
+                ),
+                "output_reservation": {
+                    "tokens": self.max_output_tokens,
+                    "exact_for_client_setting": True,
+                },
+            }
 
-        minimum = request_messages(kept_indexes)
+        summary_levels = ("standard", "minimal")
+        last_context = None
+        for summary_level in summary_levels:
+            compact_work_state, compact_task, compact_task_messages = compact_context(
+                summary_level
+            )
+            while True:
+                candidate = request_messages(compact_task_messages, kept_indexes)
+                estimate, _ = _request_token_budget(
+                    self.model,
+                    candidate,
+                    self.tools_and_managed_agents,
+                    context_length=self.context_length,
+                    max_output_tokens=self.max_output_tokens,
+                )
+                components = budget_components(
+                    compact_work_state,
+                    compact_task,
+                    compact_task_messages,
+                    kept_indexes,
+                    summary_level=summary_level,
+                )
+                last_context = (
+                    compact_work_state,
+                    compact_task,
+                    compact_task_messages,
+                    estimate,
+                    components,
+                )
+                if estimate["fits_client_budget"]:
+                    omitted = len(group_records) - len(kept_indexes)
+                    protected = sum(
+                        bool(group_records[index]["pending_record_ids"])
+                        for index in kept_indexes
+                    )
+                    self.workspace.state["context_compactions"].append(
+                        {
+                            "created_at_utc": datetime.now(timezone.utc).isoformat(),
+                            "omitted_complete_step_groups": omitted,
+                            "retained_complete_step_groups": len(kept_indexes),
+                            "retained_pending_result_groups": protected,
+                            "pending_result_record_ids": all_pending_ids,
+                            "pending_results_embedded_in_work_state": sorted(
+                                pending_without_memory
+                            ),
+                            "candidate_code_truncated": False,
+                            "tool_call_result_pairs_split": False,
+                            "work_summary_level": summary_level,
+                            "token_budget": estimate,
+                            "budget_components": components,
+                        }
+                    )
+                    self.workspace._save()
+                    self.workspace.prepare_result_delivery(all_pending_ids)
+                    return candidate
+                removable = next(
+                    (
+                        index
+                        for index in kept_indexes
+                        if not group_records[index]["pending_record_ids"]
+                    ),
+                    None,
+                )
+                if removable is None:
+                    break
+                kept_indexes.remove(removable)
+
+        assert last_context is not None
+        (
+            compact_work_state,
+            compact_task,
+            compact_task_messages,
+            estimate,
+            components,
+        ) = last_context
+        minimum = request_messages(compact_task_messages, kept_indexes)
         estimate, _ = _request_token_budget(
             self.model,
             minimum,
@@ -3470,17 +3988,9 @@ class ControlledToolCallingAgent(ToolCallingAgent):
                 ),
                 "candidate_code_truncated": False,
                 "tool_call_result_pairs_split": False,
+                "work_summary_level": "minimal",
                 "token_budget": estimate,
-                "budget_components": {
-                    "system_message_count": len(system_messages),
-                    "compact_task_message_count": len(compact_task_messages),
-                    "protected_pending_group_count": sum(
-                        bool(group_records[index]["pending_record_ids"])
-                        for index in kept_indexes
-                    ),
-                    "pending_result_count": len(all_pending_ids),
-                    "output_token_reservation": self.max_output_tokens,
-                },
+                "budget_components": components,
             }
         )
         self.workspace._save()
