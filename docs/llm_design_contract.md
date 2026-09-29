@@ -269,8 +269,25 @@ matched attempt, and reused-validation-report attempt.
 It does not overwrite the original source with the matched attempt, nest
 earlier feedback, or leave only a generic duplicate warning. The candidate itself is
 never truncated or rewritten; if even minimum actionable feedback cannot fit,
-the run stops with `context_budget_exceeded`. The first
-passing attempt creates:
+the run stops with `context_budget_exceeded`.
+
+When implementation checks pass but the fixed-pair Lipschitz criterion does
+not, the revision request uses a dedicated evaluation review. The full report
+deduplicates maximum-ratio pairs and samples across lambdas and records each
+feature value, signed `i-j` difference, `w*f` contribution (before beta), base/
+extra/combined rewards, original/augmented distances, the ratio on that exact
+pair, and the separate global baseline/candidate estimates. Current-only input
+fields are selected from statically validated `source_fields`; validity masks,
+movement mask, constants, axis/ID semantics, and any dependency limitation are
+kept separate from post-action reward outcomes. Large input arrays may be
+represented in the prompt by a deterministic row-major selection with shape,
+selected indices, counts, and explicit omissions. The complete diagnostic stays
+in `evaluation_report.json` and `feedback.json`, while
+`prompt_feedback.json` records the exact compact variant sent. Candidate code is
+never shortened, and a revision that cannot retain the minimum diagnostic stops
+with `context_budget_exceeded`.
+
+The first passing attempt creates:
 
 ```text
 approved/artifact.json

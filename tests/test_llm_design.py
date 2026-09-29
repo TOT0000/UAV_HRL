@@ -3561,9 +3561,27 @@ def test_revision_then_pass_and_max_attempt_exhaustion(tmp_path):
     second_prompt = (tmp_path / "revision" / "attempt_02" / "prompt.txt").read_text()
     assert '"candidate_name": "first"' in second_prompt
     assert "Latest validation/evaluation feedback for that same output" in second_prompt
+    assert "Your candidate passed the implementation checks" in second_prompt
+    assert second_prompt.count("Evaluation diagnostics:") == 1
+    assert "global_baseline_l_hat_over_all_primary_pairs" in second_prompt
+    assert "weighted_contribution_excludes_beta_i" in second_prompt
     assert "{{ROUND_REQUEST}}" not in second_prompt
     assert "1. Task and control scope" in second_prompt
     assert "7. Request for this round" in second_prompt
+    full_feedback = json.loads(
+        (tmp_path / "revision" / "attempt_01" / "feedback.json").read_text()
+    )
+    prompt_feedback = json.loads(
+        (tmp_path / "revision" / "attempt_02" / "prompt_feedback.json").read_text()
+    )
+    assert full_feedback["evaluation_diagnostics"]["samples"]
+    assert prompt_feedback["source_attempt"] == 1
+    assert prompt_feedback["target_attempt"] == 2
+    assert prompt_feedback["source_candidate_identity"]["candidate_name"] == "first"
+    if prompt_feedback["strategy"] != "full":
+        summary = prompt_feedback["feedback"]["prompt_feedback_summary"]
+        assert summary["omitted_array_or_schema_elements"] > 0
+        assert summary["candidate_code_truncated_or_rewritten"] is False
 
     exhausted_client = MockClient([failing, failing])
     exhausted = run_design(
@@ -3576,6 +3594,82 @@ def test_revision_then_pass_and_max_attempt_exhaustion(tmp_path):
     )
     assert exhausted["status"] == "failed_no_approved_candidate"
     assert not (tmp_path / "exhausted" / "approved").exists()
+    exhausted_feedback = json.loads(
+        (tmp_path / "exhausted" / "attempt_02" / "feedback.json").read_text()
+    )
+    assert exhausted_feedback["feedback_provenance"]["intended_next_attempt"] is None
+
+
+def test_evaluation_revision_feedback_is_shared_by_all_mock_providers(design_fixture):
+    fixed, _, _, _, _ = design_fixture
+    cases = (
+        ("lmstudio", "qwen/qwen3.5-9b"),
+        ("lmstudio", "google/gemma-4-e4b"),
+        ("openai", "gpt-4o"),
+    )
+    for provider, model in cases:
+        client = MockClient(
+            [
+                _response(_candidate(passing=False, name="first"), model=model),
+                _response(_candidate(passing=True, name="second"), model=model),
+            ],
+            model=model,
+        )
+        output = fixed.parent / f"shared-evaluation-feedback-{provider}-{model.split('/')[-1]}"
+        result = run_design(
+            fixed_sample=fixed,
+            provider=provider,
+            model=model,
+            client=client,
+            max_attempts=2,
+            output_dir=output,
+            timeout=10,
+        )
+        assert result["status"] == "approved"
+        assert len(client.calls) == 2
+        request = client.calls[1]["prompt"]
+        assert request.count("Evaluation diagnostics:") == 1
+        assert "passed the implementation checks" in request
+        assert '"candidate_name": "first"' in request
+
+
+def test_evaluation_diagnostics_stop_when_minimum_revision_exceeds_budget(
+    design_fixture,
+):
+    fixed, _, _, _, _ = design_fixture
+    marker = "EVALUATION-CANDIDATE-END"
+    failing_candidate = _candidate(
+        passing=False,
+        name="evaluation-budget-candidate",
+        code=(
+            "def compute_extra_state(obs, constants):\n"
+            "    return np.asarray([0.0], dtype=np.float32)\n"
+            f"# {marker}\n"
+        ),
+    )
+    client = MockClient([_response(failing_candidate)])
+    output = fixed.parent / "evaluation-diagnostic-overflow"
+    result = run_design(
+        fixed_sample=fixed,
+        model=client.model,
+        client=client,
+        max_attempts=2,
+        context_length=16_000,
+        output_dir=output,
+        timeout=10,
+    )
+    assert result["status"] == "failed_no_approved_candidate"
+    assert len(client.calls) == 1
+    assert result["metadata"]["attempt_history"][-1]["status"] == "context_budget_exceeded"
+    planned_prompt = (output / "attempt_02" / "prompt.txt").read_text()
+    assert marker in planned_prompt
+    assert "Your candidate passed the implementation checks" in planned_prompt
+    assert "Evaluation diagnostics:" in planned_prompt
+    prompt_feedback = json.loads((output / "attempt_02" / "prompt_feedback.json").read_text())
+    assert prompt_feedback["strategy"].startswith("evaluation_diagnostics_")
+    assert prompt_feedback["feedback"]["prompt_feedback_summary"][
+        "candidate_code_truncated_or_rewritten"
+    ] is False
 
 
 def test_parse_failure_revision_includes_latest_raw_content_and_error(tmp_path):
@@ -3872,6 +3966,223 @@ def test_candidate_uses_fixed_pair_set_and_zero_pair_remains_excluded():
     assert report["baseline_excluded_pairs"]["zero_pairs_with_nonzero_augmented_distance"] == 1
     assert report["baseline_excluded_pairs"]["included_in_primary_candidate_estimate"] is False
     assert report["direct_concat_distance_check"]["passed"] is True
+
+
+def test_lipschitz_failure_diagnostics_match_manual_pair_calculations():
+    state = np.asarray([[0.0], [1.0], [2.0]], dtype=np.float64)
+    distances = np.asarray([1.0, 2.0, 1.0], dtype=np.float64)
+    base_zero = np.asarray([0.0, 2.0, 3.0], dtype=np.float64)
+    base_one = np.asarray([0.0, 1.0, 5.0], dtype=np.float64)
+    context = EvaluationContext(
+        original_state=state,
+        original_distances=distances,
+        primary_mask=np.ones(3, dtype=bool),
+        zero_mask=np.zeros(3, dtype=bool),
+        near_mask=np.zeros(3, dtype=bool),
+        base_rewards={"0": base_zero, "1": base_one},
+        lambdas=(0.0, 1.0),
+        baseline_values={"0": 99.0, "1": 88.0},
+        distance_epsilon=1e-8,
+        reward_epsilon=1e-12,
+        fixed_metadata={"selection": [{"fixed_index": i} for i in range(3)]},
+        fixed_arrays={},
+        pair_hash="manual-fixed-pairs",
+    )
+    candidate = _candidate(name="manual-diagnostics")
+    candidate["features"] = [
+        {
+            **candidate["features"][0],
+            "index": 0,
+            "name": "queue_signal",
+            "source_fields": [
+                "obs.uav_backlog_bits",
+                "obs.uav_queue_valid",
+                "obs.uav_queue_empty",
+            ],
+            "reward_weight": 0.5,
+        },
+        {
+            **candidate["features"][0],
+            "index": 1,
+            "name": "fleet_signal",
+            "source_fields": ["constants.num_uav"],
+            "reward_weight": -0.25,
+        },
+    ]
+    extra = np.asarray(
+        [[0.2, 0.8], [0.5, 0.4], [0.9, 0.1]], dtype=np.float32
+    )
+    obs = {
+        "snapshot_valid": np.ones((3, 1), dtype=bool),
+        "movement_mask": np.asarray(
+            [[False, False], [True, False], [True, True]], dtype=bool
+        ),
+        "uav_backlog_bits": np.asarray(
+            [[0.0, 0.0], [0.0, 1.0], [2.0, 0.0]], dtype=np.float32
+        ),
+        "uav_queue_valid": np.asarray(
+            [[True, False], [False, True], [True, True]], dtype=bool
+        ),
+        "uav_queue_empty": np.asarray(
+            [[True, False], [False, False], [False, True]], dtype=bool
+        ),
+    }
+    constants = {
+        "num_uav": {
+            "value": 2,
+            "dtype": "int",
+            "unit": None,
+            "meaning": "fixture UAV count",
+            "source": "fixture",
+        }
+    }
+    report = evaluate_candidate(
+        context,
+        candidate,
+        extra,
+        beta=2.0,
+        batch_size=2,
+        absolute_tolerance=1e-12,
+        relative_tolerance=1e-6,
+        obs_arrays=obs,
+        constants_metadata=constants,
+    )
+    diagnostics = report["evaluation_diagnostics"]
+    assert diagnostics["deduplication"] == {
+        "unique_pair_count": 2,
+        "unique_sample_count": 3,
+        "lambda_count": 2,
+        "pairs_and_samples_are_referenced_instead_of_repeated": True,
+    }
+    assert diagnostics["by_lambda"]["0"]["maximum_pair_ref"] == "pair_0_1"
+    assert diagnostics["by_lambda"]["1"]["maximum_pair_ref"] == "pair_1_2"
+    pair = diagnostics["pairs"]["pair_0_1"]
+    assert pair["original_state_distance"] == pytest.approx(1.0)
+    assert pair["augmented_state_distance"] == pytest.approx(np.sqrt(1.25))
+    assert pair["features"][0]["feature_difference_i_minus_j"] == pytest.approx(-0.3)
+    assert pair["features"][0]["weighted_contribution_excludes_beta_i"] == pytest.approx(0.1)
+    assert pair["features"][1]["weighted_contribution_excludes_beta_j"] == pytest.approx(-0.1)
+    assert pair["extra_reward_i"] == pytest.approx(-0.1)
+    assert pair["extra_reward_j"] == pytest.approx(0.15)
+    assert pair["sum_weighted_contributions_excludes_beta_i"] == pytest.approx(-0.1)
+    assert pair["weighted_sum_matches_extra_reward"] is True
+    lambda_zero = diagnostics["by_lambda"]["0"]
+    assert lambda_zero["reward_outcomes_after_action"]["total_reward_i"] == pytest.approx(-0.2)
+    assert lambda_zero["reward_outcomes_after_action"]["total_reward_j"] == pytest.approx(2.3)
+    assert lambda_zero["ratios_on_this_candidate_maximum_pair"][
+        "baseline_ratio_abs_base_difference_over_original_distance"
+    ] == pytest.approx(2.0)
+    assert lambda_zero["ratios_on_this_candidate_maximum_pair"][
+        "candidate_ratio_abs_total_difference_over_augmented_distance"
+    ] == pytest.approx(2.5 / np.sqrt(1.25))
+    assert lambda_zero["global_baseline_l_hat_over_all_primary_pairs"] == 99.0
+    assert diagnostics["constants"]["constants.num_uav"]["value"] == 2
+    sample_zero = diagnostics["samples"]["sample_0"]["current_only_inputs"]
+    assert sample_zero["obs.movement_mask"]["true_element_count"] == 0
+    assert sample_zero["obs.uav_backlog_bits"]["zero_element_count"] == 2
+    assert sample_zero["obs.uav_queue_valid"]["value"] == [True, False]
+    assert sample_zero["obs.snapshot_valid"]["value"] == [True]
+    assert "next" not in json.dumps(diagnostics).lower()
+
+    shared_context = EvaluationContext(
+        **{
+            **context.__dict__,
+            "base_rewards": {"0": base_zero, "1": base_zero.copy()},
+        }
+    )
+    shared = evaluate_candidate(
+        shared_context,
+        candidate,
+        extra,
+        beta=2.0,
+        batch_size=2,
+        absolute_tolerance=1e-12,
+        relative_tolerance=1e-6,
+        obs_arrays=obs,
+        constants_metadata=constants,
+    )["evaluation_diagnostics"]
+    assert shared["deduplication"]["unique_pair_count"] == 1
+    assert {
+        item["maximum_pair_ref"] for item in shared["by_lambda"].values()
+    } == {"pair_0_1"}
+
+
+def test_evaluation_feedback_prompt_is_unique_and_non_evaluation_feedback_is_unchanged():
+    diagnostics = {
+        "pairs": {"pair_0_1": {"original_state_distance": 1.0}},
+        "by_lambda": {"0": {"global_candidate_l_hat_over_all_primary_pairs": 2.0}},
+    }
+    feedback = {
+        "category": "candidate_not_improved_for_all_lambdas",
+        "evaluation_diagnostics": diagnostics,
+    }
+    previous = {
+        "parsed_candidate": _candidate(name="previous-full-candidate"),
+        "raw_final_content": None,
+        "feedback": feedback,
+    }
+    prompt = llm_design._round_request(2, 5, previous)
+    assert prompt.count("Evaluation diagnostics:") == 1
+    assert prompt.count('"pair_0_1"') == 1
+    assert "passed the implementation checks" in prompt
+    assert '"candidate_name": "previous-full-candidate"' in prompt
+
+    validation_feedback = {
+        "category": "candidate_schema_or_static_failure",
+        "confirmed_errors": [{"code": "STATIC_FIXTURE", "requirement": "fix it"}],
+    }
+    previous["feedback"] = validation_feedback
+    validation_prompt = llm_design._round_request(2, 5, previous)
+    assert "passed the implementation checks" not in validation_prompt
+    assert "STATIC_FIXTURE" in validation_prompt
+
+
+def test_evaluation_feedback_compaction_records_omissions_without_cutting_candidate():
+    diagnostics = {
+        "samples": {
+            "sample_0": {
+                "current_only_inputs": {
+                    "obs.state": {
+                        "shape": [1000],
+                        "dtype": "float32",
+                        "value": list(range(1000)),
+                    }
+                }
+            }
+        },
+        "source_field_contracts": {},
+        "constants": {},
+        "pairs": {"pair_0_1": {"features": [{"index": 0, "feature_i": 0.0}] }},
+        "by_lambda": {"0": {"maximum_pair_ref": "pair_0_1"}},
+    }
+    feedback = {
+        "category": "candidate_not_improved_for_all_lambdas",
+        "evaluation_diagnostics": diagnostics,
+    }
+    variants = dict(llm_design._feedback_prompt_variants(feedback))
+    compact = variants["evaluation_diagnostics_4_items"]
+    summary = compact["prompt_feedback_summary"]
+    assert summary["included_array_or_schema_elements"] == 4
+    assert summary["omitted_array_or_schema_elements"] == 996
+    stored = compact["evaluation_diagnostics"]["samples"]["sample_0"][
+        "current_only_inputs"
+    ]["obs.state"]["value"]
+    assert stored["selected_flat_indices"] == [0, 1, 2, 3]
+    assert stored["complete_value_in_prompt"] is False
+    marker = "CANDIDATE-CODE-END"
+    candidate = _candidate(name="budgeted", code=(
+        "def compute_extra_state(obs, constants):\n"
+        "    return np.asarray([0.0], dtype=np.float32)\n"
+        f"# {marker}\n"
+    ))
+    prompt = llm_design._round_request(
+        2,
+        5,
+        {"parsed_candidate": candidate, "feedback": feedback},
+        feedback_override=compact,
+    )
+    assert marker in prompt
+    assert "omitted_element_count" in prompt
 
 
 def test_approved_artifact_reload_recomputes_identically(tmp_path):
