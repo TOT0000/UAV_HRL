@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import hashlib
 import json
 from pathlib import Path
 import re
@@ -127,6 +128,8 @@ class _IssueAccumulator:
         candidate_line=None,
         problem_signature=None,
         diagnostics=None,
+        operation_fingerprint=None,
+        operation_identity=None,
     ):
         key = (
             str(code),
@@ -136,6 +139,7 @@ class _IssueAccumulator:
             "" if candidate_function is None else str(candidate_function),
             "" if candidate_line is None else str(candidate_line),
             "" if problem_signature is None else str(problem_signature),
+            "" if operation_fingerprint is None else str(operation_fingerprint),
         )
         details = {}
         if exception_type is not None:
@@ -148,6 +152,10 @@ class _IssueAccumulator:
             details["problem_signature"] = str(problem_signature)
         if diagnostics:
             details["runtime_diagnostics"] = diagnostics
+        if operation_fingerprint is not None:
+            details["operation_fingerprint"] = str(operation_fingerprint)
+        if operation_identity:
+            details["operation_identity"] = operation_identity
         item = self._items.setdefault(
             key,
             {
@@ -245,83 +253,272 @@ def _safe_local_array_summaries(frame):
     return summaries
 
 
-def _state_aliases_and_open_slices(source):
-    """Return statically evident unbounded slices of obs['state'] aliases."""
+def _iter_nodes_with_paths(node, path=()):
+    yield node, path
+    for field, value in ast.iter_fields(node):
+        if isinstance(value, ast.AST):
+            yield from _iter_nodes_with_paths(value, path + (field,))
+        elif isinstance(value, list):
+            for index, item in enumerate(value):
+                if isinstance(item, ast.AST):
+                    yield from _iter_nodes_with_paths(
+                        item, path + (f"{field}[{index}]",)
+                    )
 
+
+def _candidate_function_ast(source, function_name):
     try:
         tree = ast.parse(source)
     except (SyntaxError, TypeError):
-        return []
-    aliases = set()
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.Assign) or len(node.targets) != 1:
+        return None
+    return next(
+        (
+            node
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef) and node.name == function_name
+        ),
+        None,
+    )
+
+
+def _node_contains_line(node, line):
+    start = getattr(node, "lineno", None)
+    stop = getattr(node, "end_lineno", start)
+    return isinstance(start, int) and start <= line <= stop
+
+
+def _local_array_summary(expression, summaries):
+    if isinstance(expression, ast.Name):
+        return summaries.get(expression.id)
+    return None
+
+
+def _traceback_subscript(function, line, summaries):
+    candidates = []
+    for node, path in _iter_nodes_with_paths(function):
+        if not isinstance(node, ast.Subscript) or not _node_contains_line(node, line):
             continue
-        target = node.targets[0]
-        value = node.value
-        if (
-            isinstance(target, ast.Name)
-            and isinstance(value, ast.Subscript)
-            and isinstance(value.value, ast.Name)
-            and value.value.id == "obs"
-            and isinstance(value.slice, ast.Constant)
-            and value.slice.value == "state"
+        indexed = _local_array_summary(node.value, summaries)
+        mask = _local_array_summary(node.slice, summaries)
+        score = 0
+        if mask and mask.get("dtype") == "bool":
+            score += 4
+        if indexed and indexed.get("dtype") != "bool":
+            score += 2
+        if getattr(node, "lineno", None) == line:
+            score += 1
+        candidates.append((score, len(path), node, path))
+    if not candidates:
+        return None, None
+    _, _, node, path = max(candidates, key=lambda item: (item[0], item[1]))
+    return node, path
+
+
+def _operation_identity(source, function, line, summaries, exception_type):
+    if function is None or not isinstance(line, int):
+        return None
+    node, path = (
+        _traceback_subscript(function, line, summaries)
+        if exception_type == "IndexError"
+        else (None, None)
+    )
+    if node is None:
+        eligible = (
+            ast.Subscript,
+            ast.BinOp,
+            ast.Call,
+            ast.Compare,
+            ast.BoolOp,
+            ast.UnaryOp,
+        )
+        candidates = [
+            (candidate, candidate_path)
+            for candidate, candidate_path in _iter_nodes_with_paths(function)
+            if isinstance(candidate, eligible)
+            and _node_contains_line(candidate, line)
+        ]
+        if exception_type == "ZeroDivisionError":
+            division_candidates = [
+                item
+                for item in candidates
+                if isinstance(item[0], ast.BinOp)
+                and isinstance(item[0].op, (ast.Div, ast.FloorDiv, ast.Mod))
+            ]
+            if division_candidates:
+                candidates = division_candidates
+        if candidates:
+            node, path = max(candidates, key=lambda item: len(item[1]))
+    if node is None:
+        return None
+    normalized_ast = ast.dump(node, annotate_fields=True, include_attributes=False)
+    identity = {
+        "node_type": type(node).__name__,
+        "function_structural_path": list(path),
+        "normalized_ast": normalized_ast,
+        "source": ast.get_source_segment(source, node),
+    }
+    identity["fingerprint"] = hashlib.sha256(
+        json.dumps(
+            identity,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        ).encode("utf-8")
+    ).hexdigest()
+    return identity
+
+
+def _assigned_names(node):
+    return {
+        item.id
+        for item in ast.walk(node)
+        if isinstance(item, (ast.Name, ast.arg))
+        and isinstance(getattr(item, "ctx", None), ast.Store)
+    }
+
+
+def _bindings_before_line(function, line):
+    """Track only straight-line simple assignments before the traceback line."""
+
+    bindings = {}
+    for statement in function.body:
+        start = getattr(statement, "lineno", 0)
+        stop = getattr(statement, "end_lineno", start)
+        if start <= line <= stop:
+            break
+        if stop >= line:
+            break
+        if isinstance(statement, ast.Assign) and len(statement.targets) == 1:
+            target = statement.targets[0]
+            if isinstance(target, ast.Name):
+                bindings[target.id] = statement.value
+            else:
+                for name in _assigned_names(target):
+                    bindings.pop(name, None)
+        elif isinstance(statement, ast.AnnAssign) and isinstance(
+            statement.target, ast.Name
         ):
-            aliases.add(target.id)
-    results = []
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.Subscript) or not isinstance(node.slice, ast.Slice):
-            continue
-        base_is_state = isinstance(node.value, ast.Name) and node.value.id in aliases
-        direct_state = (
-            isinstance(node.value, ast.Subscript)
-            and isinstance(node.value.value, ast.Name)
-            and node.value.value.id == "obs"
-            and isinstance(node.value.slice, ast.Constant)
-            and node.value.slice.value == "state"
-        )
-        if not (base_is_state or direct_state) or node.slice.upper is not None:
-            continue
-        step = node.slice.step
-        if not isinstance(step, ast.Constant) or not isinstance(step.value, int):
-            continue
-        lower = node.slice.lower
-        results.append(
-            {
-                "line": int(getattr(node, "lineno", 0)),
-                "start": (
-                    int(lower.value)
-                    if isinstance(lower, ast.Constant) and isinstance(lower.value, int)
-                    else None
-                ),
-                "step": int(step.value),
-                "expression": ast.get_source_segment(source, node),
-            }
-        )
-    return results
+            if statement.value is None:
+                bindings.pop(statement.target.id, None)
+            else:
+                bindings[statement.target.id] = statement.value
+        elif isinstance(statement, ast.AugAssign):
+            for name in _assigned_names(statement.target):
+                bindings.pop(name, None)
+        else:
+            # Branches, loops, destructuring, and other side effects are outside
+            # this intentionally small data-flow analysis. Invalidate every name
+            # they may assign instead of reusing a stale source binding.
+            for name in _assigned_names(statement):
+                bindings.pop(name, None)
+    return bindings
 
 
-def _runtime_diagnostics(exc, frame, candidate_source, candidate_line, contract):
+def _resolve_binding(expression, bindings, seen=None):
+    seen = set() if seen is None else set(seen)
+    while isinstance(expression, ast.Name) and expression.id in bindings:
+        if expression.id in seen:
+            return None
+        seen.add(expression.id)
+        expression = bindings[expression.id]
+    return expression
+
+
+def _is_obs_field(expression, field, bindings):
+    expression = _resolve_binding(expression, bindings)
+    return (
+        isinstance(expression, ast.Subscript)
+        and isinstance(expression.value, ast.Name)
+        and expression.value.id == "obs"
+        and isinstance(expression.slice, ast.Constant)
+        and expression.slice.value == field
+    )
+
+
+def _state_stride_origin(expression, bindings, local_dimension, source):
+    expression = _resolve_binding(expression, bindings)
+    if not isinstance(expression, ast.Subscript) or not isinstance(
+        expression.slice, ast.Slice
+    ):
+        return None
+    state_slice = expression.slice
+    if state_slice.upper is not None:
+        return None
+    step = state_slice.step
+    if (
+        not isinstance(step, ast.Constant)
+        or not isinstance(step.value, int)
+        or int(step.value) != int(local_dimension)
+        or not _is_obs_field(expression.value, "state", bindings)
+    ):
+        return None
+    lower = state_slice.lower
+    if not isinstance(lower, ast.Constant) or not isinstance(lower.value, int):
+        return None
+    if not 0 <= int(lower.value) < int(local_dimension):
+        return None
+    return {
+        "line": int(getattr(expression, "lineno", 0)),
+        "start": int(lower.value),
+        "step": int(step.value),
+        "expression": ast.get_source_segment(source, expression),
+    }
+
+
+def _traceback_index_analysis(
+    source, function, line, summaries, local_dimension
+):
+    if function is None or not isinstance(line, int) or local_dimension is None:
+        return {"status": "unresolved", "reason": "traceback operation unavailable"}
+    operation, _ = _traceback_subscript(function, line, summaries)
+    if operation is None:
+        return {
+            "status": "unresolved",
+            "reason": "no boolean-index subscript was identified at the traceback line",
+        }
+    bindings = _bindings_before_line(function, line)
+    indexed_summary = _local_array_summary(operation.value, summaries)
+    mask_summary = _local_array_summary(operation.slice, summaries)
+    result = {
+        "status": "unresolved",
+        "indexed_expression": ast.get_source_segment(source, operation.value),
+        "mask_expression": ast.get_source_segment(source, operation.slice),
+        "indexed_array_summary": indexed_summary,
+        "mask_array_summary": mask_summary,
+    }
+    if not (mask_summary and mask_summary.get("dtype") == "bool"):
+        result["reason"] = "the traceback index was not linked to a local boolean array"
+        return result
+    if not _is_obs_field(operation.slice, "movement_mask", bindings):
+        result["reason"] = "the traceback boolean index was not linked to obs.movement_mask"
+        return result
+    origin = _state_stride_origin(
+        operation.value, bindings, local_dimension, source
+    )
+    if origin is None:
+        result["reason"] = (
+            "the traceback indexed array was not reliably linked to an unbounded "
+            "stride slice of obs.state"
+        )
+        return result
+    result.update({"status": "confirmed_state_stride", "state_slice_origin": origin})
+    return result
+
+
+def _runtime_diagnostics(
+    exc,
+    frame,
+    candidate_source,
+    candidate_function,
+    candidate_line,
+    contract,
+):
     diagnostics = {
         "candidate_source_excerpt": _candidate_source_excerpt(
             candidate_source, candidate_line
         ),
         "local_array_summaries": _safe_local_array_summaries(frame),
     }
-    excerpt_text = "\n".join(
-        str(item.get("code", "")) for item in diagnostics["candidate_source_excerpt"]
-    )
-    relevant_interface = {}
-    if "state" in excerpt_text and isinstance(contract, dict) and contract.get("state"):
-        relevant_interface["obs.state"] = contract["state"]
-    if (
-        "movement_mask" in excerpt_text
-        and isinstance(contract, dict)
-        and contract.get("movement_mask")
-    ):
-        relevant_interface["obs.movement_mask"] = contract["movement_mask"]
-    if relevant_interface:
-        diagnostics["related_interface"] = relevant_interface
-
     message = str(exc)
     state_contract = contract.get("state", {}) if isinstance(contract, dict) else {}
     block = state_contract.get("uav_block", {}) if isinstance(state_contract, dict) else {}
@@ -329,44 +526,57 @@ def _runtime_diagnostics(exc, frame, candidate_source, candidate_line, contract)
     expected_mask = (mask_contract.get("shape") or [None])[0]
     local_dimension = block.get("features_per_uav")
     array_summaries = diagnostics["local_array_summaries"]
-    bool_lengths = {
-        value["shape"][0]
-        for value in array_summaries.values()
-        if value.get("dtype") == "bool" and len(value.get("shape", [])) == 1
-    }
-    vector_lengths = {
-        value["shape"][0]
-        for value in array_summaries.values()
-        if value.get("dtype") != "bool" and len(value.get("shape", [])) == 1
-    }
-    slices = _state_aliases_and_open_slices(candidate_source)
-    suspect_slices = [
-        item
-        for item in slices
-        if local_dimension is not None and item.get("step") == int(local_dimension)
-    ]
+    function = _candidate_function_ast(candidate_source, candidate_function)
+    operation_identity = _operation_identity(
+        candidate_source,
+        function,
+        candidate_line,
+        array_summaries,
+        type(exc).__name__,
+    )
+    if operation_identity is not None:
+        diagnostics["traceback_operation"] = operation_identity
+    index_analysis = (
+        _traceback_index_analysis(
+            candidate_source,
+            function,
+            candidate_line,
+            array_summaries,
+            local_dimension,
+        )
+        if type(exc).__name__ == "IndexError"
+        else {
+            "status": "not_applicable",
+            "reason": "the runtime exception is not an IndexError",
+        }
+    )
+    diagnostics["index_source_analysis"] = index_analysis
+    related_interface = {}
+    if index_analysis.get("mask_expression") is not None and mask_contract:
+        related_interface["obs.movement_mask"] = mask_contract
+    if index_analysis.get("status") == "confirmed_state_stride" and state_contract:
+        related_interface["obs.state"] = state_contract
+    if related_interface:
+        diagnostics["related_interface"] = related_interface
     confident_uav_slice = (
         type(exc).__name__ == "IndexError"
         and "boolean index" in message.lower()
-        and expected_mask in bool_lengths
-        and any(length != expected_mask for length in vector_lengths)
-        and bool(suspect_slices)
-        and all(
-            item.get("start") is None or 0 <= int(item["start"]) < int(local_dimension)
-            for item in suspect_slices
-        )
+        and index_analysis.get("status") == "confirmed_state_stride"
+        and (index_analysis.get("mask_array_summary") or {}).get("shape")
+        == [expected_mask]
     )
     if confident_uav_slice:
         start = int(block["start"])
         stop = int(block["stop_exclusive"])
         num_uav = int(block["num_uav"])
         per_uav = int(block["features_per_uav"])
-        observed_vectors = sorted(
-            length
-            for length in vector_lengths
-            if length != state_contract.get("shape", [None])[0]
+        indexed_shape = (index_analysis.get("indexed_array_summary") or {}).get(
+            "shape"
         )
-        diagnostics["suspected_state_slices"] = suspect_slices
+        observed_vectors = indexed_shape or ["reported by IndexError"]
+        diagnostics["confirmed_state_slice_origin"] = index_analysis[
+            "state_slice_origin"
+        ]
         diagnostics["diagnostic_summary"] = (
             f"The authoritative UAV state block is indices {start}..{stop - 1}: "
             f"{num_uav} UAV groups with {per_uav} values each. The candidate produced "
@@ -399,13 +609,27 @@ def _check_function(
         exception_type, candidate_function, candidate_line, signature, frame = (
             _candidate_exception_details(exc)
         )
-        diagnostics = _runtime_diagnostics(
-            exc,
-            frame,
-            candidate_source,
-            candidate_line,
-            diagnostic_contract,
-        )
+        try:
+            diagnostics = _runtime_diagnostics(
+                exc,
+                frame,
+                candidate_source,
+                candidate_function,
+                candidate_line,
+                diagnostic_contract,
+            )
+        except BaseException as diagnostic_exc:
+            # Diagnostics are strictly supplemental. Never replace the original
+            # candidate exception with an analysis failure.
+            diagnostics = {
+                "candidate_source_excerpt": _candidate_source_excerpt(
+                    candidate_source, candidate_line
+                ),
+                "local_array_summaries": _safe_local_array_summaries(frame),
+                "diagnostic_status": "failed_without_affecting_runtime_error",
+                "diagnostic_error_type": type(diagnostic_exc).__name__,
+            }
+        operation_identity = diagnostics.get("traceback_operation") or {}
         location = label
         if candidate_function is not None and candidate_line is not None:
             location = f"{candidate_function} at candidate line {candidate_line}"
@@ -424,6 +648,8 @@ def _check_function(
             candidate_line=candidate_line,
             problem_signature=signature,
             diagnostics=diagnostics,
+            operation_fingerprint=operation_identity.get("fingerprint"),
+            operation_identity=operation_identity or None,
         )
         return None
 

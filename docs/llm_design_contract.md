@@ -247,10 +247,19 @@ the common unbounded `state[offset::per_uav_width]` error, the worker derives
 the UAV block boundary, UAV count, and block width from the saved authoritative
 movement-state schema; it does not maintain a second hard-coded layout. A
 specific slice correction is emitted only when the exception, local shapes,
-mask shape, and statically visible slice agree. Otherwise the report keeps the
-original exception and source excerpt without guessing a cause. No array
+mask shape, traceback subscript, and limited straight-line alias provenance all
+agree. An unrelated state slice elsewhere in the function is not attribution
+evidence, and reassignment invalidates the old alias. Otherwise the report
+keeps the original exception and source excerpt without guessing a cause. No array
 contents, arbitrary object representations, environment variables, or
 credentials are captured.
+
+Execution issues use a normalized AST operation plus its function-structural
+path as their cross-attempt identity. Comments and blank lines therefore do not
+change identity, while two equivalent-looking operations at different places
+remain separate. If an operation cannot be identified reliably, tracking falls
+back to the saved source location and conservatively retains separate issues;
+an old location always remains attached to its source attempt/candidate.
 
 `artifact.json` includes content/file hashes, field order, weights, interface
 version, model/sample/pair provenance, and approved status. Later integration

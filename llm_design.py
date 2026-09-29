@@ -1145,14 +1145,21 @@ def _feedback_from_validation(
 
 
 def _tracked_issue_key(issue: dict[str, Any]) -> tuple[str, ...]:
-    """Cross-attempt identity; deliberately ignores stale candidate line numbers."""
+    """Use a stable AST operation when available; otherwise preserve location."""
 
     if str(issue.get("stage", "")) == "execution":
+        operation = str(issue.get("operation_fingerprint", ""))
         return (
             str(issue.get("code", "UNKNOWN")),
             str(issue.get("exception_type", "")),
             str(issue.get("candidate_function", "")),
             str(issue.get("problem_signature", issue.get("problem", ""))),
+            (
+                f"operation:{operation}"
+                if operation
+                else "location:"
+                + str(issue.get("candidate_line", issue.get("location", "")))
+            ),
         )
     return _feedback_root_key(issue)
 
@@ -1349,11 +1356,17 @@ def _feedback_root_key(issue: dict[str, Any]) -> tuple[str, ...]:
             feature_identity,
             source_field,
         )
+    operation = str(issue.get("operation_fingerprint", ""))
     return (
         str(issue.get("code", "UNKNOWN")),
         str(issue.get("exception_type", "")),
         str(issue.get("candidate_function", "")),
-        str(issue.get("candidate_line", issue.get("location", ""))),
+        (
+            f"operation:{operation}"
+            if operation
+            else "location:"
+            + str(issue.get("candidate_line", issue.get("location", "")))
+        ),
     )
 
 
@@ -1385,6 +1398,8 @@ def _compact_feedback_issue(issue: dict[str, Any]) -> dict[str, Any]:
         "status_note",
         "problem_signature",
         "runtime_diagnostics",
+        "operation_fingerprint",
+        "operation_identity",
         "representative_locations",
     )
     result = {

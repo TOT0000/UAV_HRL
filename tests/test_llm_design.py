@@ -9,6 +9,7 @@ import urllib.request
 import numpy as np
 import pytest
 import llm_candidate
+import llm_candidate_worker
 import llm_design
 import llm_streaming
 import run_llm_design
@@ -2054,6 +2055,273 @@ def test_runtime_feedback_includes_source_shapes_and_authoritative_uav_layout(
     assert any("state[7::17]" in item["code"] for item in excerpt)
     assert "half-open UAV block [0:272)" in issue["requirement"]
     assert "length-16 movement_mask" in issue["requirement"]
+    assert diagnostic["index_source_analysis"]["status"] == "confirmed_state_stride"
+    assert issue["operation_fingerprint"] == diagnostic["traceback_operation"][
+        "fingerprint"
+    ]
+
+
+def _local_mask_mismatch_candidate(*, comment="", name="local-mask-mismatch"):
+    candidate = _candidate(
+        name=name,
+        code=(
+            "def compute_extra_state(obs, constants):\n"
+            '    state = obs["state"]\n'
+            "    unused = state[7::17]\n"
+            '    movement_mask = obs["movement_mask"]\n'
+            "    short = np.zeros(3)\n"
+            f"{comment}"
+            "    value = short[movement_mask]\n"
+            "    return np.asarray([np.sum(value)], dtype=np.float32)\n"
+        ),
+    )
+    candidate["features"][0]["source_fields"] = ["obs.state", "obs.movement_mask"]
+    candidate["features"][0]["formula"] = "sum of a local masked test vector"
+    return candidate
+
+
+def test_unrelated_open_state_slice_does_not_receive_uav_slice_fix(design_fixture):
+    _, arrays, metadata, _, constants = design_fixture
+    with pytest.raises(CandidateExecutionError) as captured:
+        execute_candidate_isolated(
+            _local_mask_mismatch_candidate(),
+            build_obs_arrays(arrays),
+            constants,
+            timeout=10,
+            diagnostic_contract=runtime_diagnostic_contract(metadata, constants),
+        )
+    issue = captured.value.report["errors"][0]
+    diagnostic = issue["runtime_diagnostics"]
+    assert issue["exception_type"] == "IndexError"
+    assert "dimension is 3" in issue["problem"]
+    assert diagnostic["index_source_analysis"]["status"] == "unresolved"
+    assert "not reliably linked" in diagnostic["index_source_analysis"]["reason"]
+    assert set(diagnostic["related_interface"]) == {"obs.movement_mask"}
+    assert "half-open UAV block" not in issue["requirement"]
+    assert "targeted_requirement" not in diagnostic
+
+
+def test_reassigned_state_alias_is_not_treated_as_obs_state_slice(design_fixture):
+    _, arrays, metadata, _, constants = design_fixture
+    candidate = _candidate(
+        name="reassigned-state-alias",
+        code=(
+            "def compute_extra_state(obs, constants):\n"
+            '    state = obs["state"]\n'
+            "    unused = state[7::17]\n"
+            "    state = np.zeros(3)\n"
+            '    movement_mask = obs["movement_mask"]\n'
+            "    value = state[movement_mask]\n"
+            "    return np.asarray([np.sum(value)], dtype=np.float32)\n"
+        ),
+    )
+    candidate["features"][0]["source_fields"] = ["obs.state", "obs.movement_mask"]
+    with pytest.raises(CandidateExecutionError) as captured:
+        execute_candidate_isolated(
+            candidate,
+            build_obs_arrays(arrays),
+            constants,
+            timeout=10,
+            diagnostic_contract=runtime_diagnostic_contract(metadata, constants),
+        )
+    issue = captured.value.report["errors"][0]
+    assert issue["runtime_diagnostics"]["index_source_analysis"]["status"] == "unresolved"
+    assert "half-open UAV block" not in issue["requirement"]
+
+
+def test_runtime_operation_fingerprint_ignores_comment_line_shift(design_fixture):
+    _, arrays, metadata, _, constants = design_fixture
+    reports = []
+    for comment in ("", "    # inserted comment and blank line\n\n"):
+        with pytest.raises(CandidateExecutionError) as captured:
+            execute_candidate_isolated(
+                _local_mask_mismatch_candidate(comment=comment),
+                build_obs_arrays(arrays),
+                constants,
+                timeout=10,
+                diagnostic_contract=runtime_diagnostic_contract(metadata, constants),
+            )
+        reports.append(captured.value.report)
+    first, second = (report["errors"][0] for report in reports)
+    assert first["candidate_line"] != second["candidate_line"]
+    assert first["operation_fingerprint"] == second["operation_fingerprint"]
+    tracker = llm_design._IssueTracker()
+    tracker.apply(
+        reports[0], attempt=1, candidate_identity={"semantic_fingerprint": "first"}
+    )
+    tracker.apply(
+        reports[1], attempt=2, candidate_identity={"semantic_fingerprint": "second"}
+    )
+    records = tracker.snapshot()["records"]
+    assert len(records) == 1
+    assert records[0]["latest_location"].endswith(
+        f"candidate line {second['candidate_line']}"
+    )
+    assert [item["location"] for item in records[0]["history"][:2]] == [
+        first["location"],
+        second["location"],
+    ]
+
+
+def test_tracker_and_feedback_keep_same_signature_at_distinct_operations():
+    base = {
+        "code": "RUNTIME_FUNCTION_ERROR",
+        "stage": "execution",
+        "exception_type": "IndexError",
+        "candidate_function": "compute_extra_state",
+        "problem_signature": "same normalized message",
+        "problem": "IndexError: same normalized message",
+        "requirement": "fix this operation",
+        "occurrence_count": 4,
+    }
+    issues = [
+        {
+            **base,
+            "location": "compute_extra_state at candidate line 10",
+            "candidate_line": 10,
+            "operation_fingerprint": "operation-a",
+        },
+        {
+            **base,
+            "location": "compute_extra_state at candidate line 20",
+            "candidate_line": 20,
+            "operation_fingerprint": "operation-b",
+        },
+    ]
+    tracker = llm_design._IssueTracker()
+    tracker.apply(
+        {
+            "errors": issues,
+            "checks": {"execution": {"status": "failed", "completed": True}},
+        },
+        attempt=1,
+        candidate_identity={"semantic_fingerprint": "candidate-a"},
+    )
+    carried = tracker.apply(
+        llm_design._json_failure_report(CandidateError("invalid JSON")),
+        attempt=2,
+        candidate_identity={"kind": "unparsed_response", "raw": "candidate-b"},
+    )
+    assert len(tracker.snapshot()["records"]) == 3  # two runtime + current JSON
+    historical = [item for item in carried if item["stage"] == "execution"]
+    assert len(historical) == 2
+    assert {item["source_location"] for item in historical} == {
+        "compute_extra_state at candidate line 10",
+        "compute_extra_state at candidate line 20",
+    }
+    feedback = llm_design._feedback_from_validation(
+        llm_design._json_failure_report(CandidateError("invalid JSON")),
+        "candidate_json_failure",
+        historical_unverified=historical,
+    )
+    compact = dict(llm_design._feedback_prompt_variants(feedback))[
+        "compact_all_roots"
+    ]
+    assert len(compact["historical_unverified_errors"]) == 2
+
+
+def test_two_runtime_locations_survive_json_failure_prompt_and_duplicate_check(
+    tmp_path,
+):
+    fixed = _fixed_artifact(tmp_path)
+    candidate = _candidate(
+        name="two-runtime-locations",
+        code=(
+            "def compute_extra_state(obs, constants):\n"
+            '    value = float(obs["state"][0])\n'
+            '    movement_mask = obs["movement_mask"]\n'
+            "    first = np.zeros(3)\n"
+            "    second = np.zeros(3)\n"
+            "    if value < 0.15:\n"
+            "        selected = first[movement_mask]\n"
+            "    else:\n"
+            "        selected = second[movement_mask]\n"
+            "    return np.asarray([np.sum(selected)], dtype=np.float32)\n"
+        ),
+    )
+    candidate["features"][0]["source_fields"] = ["obs.state", "obs.movement_mask"]
+    raw_claim = "The runtime error is fixed.\n" + json.dumps(candidate)
+    client = MockClient(
+        [
+            _response(candidate),
+            {**_response(candidate), "content": raw_claim},
+            _response(candidate),
+        ]
+    )
+    result = run_design(
+        fixed_sample=fixed,
+        model=client.model,
+        client=client,
+        max_attempts=3,
+        output_dir=tmp_path / "two-runtime-history",
+        worker_timeout=10,
+    )
+    assert result["status"] == "failed_no_approved_candidate"
+    first_report = json.loads(
+        (tmp_path / "two-runtime-history" / "attempt_01" / "validation_report.json").read_text()
+    )
+    runtime = [item for item in first_report["errors"] if item["stage"] == "execution"]
+    assert len(runtime) == 2
+    assert len({item["operation_fingerprint"] for item in runtime}) == 2
+    assert all(item["occurrence_count"] >= 2 for item in runtime)
+
+    third_prompt = client.calls[2]["prompt"]
+    assert "Previous failed raw final content" in third_prompt
+    assert "[TRUNCATED:" in third_prompt
+    assert "JSON_PARSE_ERROR" in third_prompt
+    assert third_prompt.count("previously_found_not_revalidated") >= 2
+    assert "candidate line 7" in third_prompt
+    assert "candidate line 9" in third_prompt
+    duplicate = json.loads(
+        (tmp_path / "two-runtime-history" / "attempt_03" / "validation_report.json").read_text()
+    )
+    assert [item["code"] for item in duplicate["errors"]] == [
+        "DUPLICATE_FAILED_CANDIDATE",
+        "RUNTIME_FUNCTION_ERROR",
+        "RUNTIME_FUNCTION_ERROR",
+    ]
+    compact = dict(
+        llm_design._feedback_prompt_variants(
+            llm_design._feedback_from_validation(
+                duplicate, "duplicate_failed_candidate"
+            )
+        )
+    )["compact_all_roots"]
+    assert len(
+        [
+            item
+            for item in compact["confirmed_errors"]
+            if item["code"] == "RUNTIME_FUNCTION_ERROR"
+        ]
+    ) == 2
+
+
+def test_diagnostic_failure_never_replaces_original_runtime_error(monkeypatch):
+    def broken(_obs, _constants):
+        raise IndexError("original candidate failure")
+
+    def fail_diagnostics(*_args, **_kwargs):
+        raise RuntimeError("diagnostic implementation failed")
+
+    monkeypatch.setattr(llm_candidate_worker, "_runtime_diagnostics", fail_diagnostics)
+    issues = llm_candidate_worker._IssueAccumulator()
+    result = llm_candidate_worker._check_function(
+        broken,
+        {"state": np.zeros(1, dtype=np.float32)},
+        {},
+        1,
+        "compute_extra_state",
+        {"fixed_sample_index": 0},
+        issues,
+        candidate_source="def compute_extra_state(obs, constants):\n    pass\n",
+        diagnostic_contract={},
+    )
+    assert result is None
+    assert len(issues.errors) == 1
+    assert issues.errors[0]["problem"] == "IndexError: original candidate failure"
+    diagnostic = issues.errors[0]["runtime_diagnostics"]
+    assert diagnostic["diagnostic_status"] == "failed_without_affecting_runtime_error"
+    assert diagnostic["diagnostic_error_type"] == "RuntimeError"
 
 
 def test_unrelated_index_error_does_not_get_uav_slice_advice(design_fixture):
