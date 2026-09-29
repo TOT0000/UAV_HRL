@@ -37,7 +37,7 @@ preference for the parser-error location. The environment interface, schema,
 evaluation rules, and output reservation are never silently removed.
 
 Qwen, Gemma, and GPT-4o use the same provider-neutral English master prompt
-(`uav-hrl-llm-design-prompt-v4`). Provider adapters change only transport and
+(`uav-hrl-llm-design-prompt-v5`). Provider adapters change only transport and
 provider-specific request fields; they do not maintain separate task prompts.
 The saved prompt for each attempt is the exact fully assembled request content.
 Its environment interface is generated from the fixed artifact's authoritative
@@ -105,7 +105,13 @@ aliases and slices retain that ownership. Direct input aliases, input slices,
 `asarray` views that may share input storage, rebinding to an input, and a
 control-flow merge with any input-backed path remain read-only. An unresolved
 write target is rejected as unconfirmed rather than falsely reported as proven
-input mutation. This limited ownership analysis is shared by design-time
+input mutation. Proven immutable numeric locals and independently allocated
+NumPy arrays may use augmented assignment. Loop bindings are joined to a finite
+fixed point so a later iteration cannot reuse an earlier local-only result;
+`and`/`or` preserve their possible operand sources. Python containers are not
+treated as proof that every nested member is independent: storing a mutable or
+input-backed reference for later nested mutation is conservatively rejected.
+This limited ownership analysis is shared by design-time
 validation, isolated execution, and approved-artifact loading; the worker's
 read-only arrays and before/after comparison remain independent defenses.
 

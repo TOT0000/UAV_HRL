@@ -54,6 +54,7 @@ from llm_design_contract import (
     build_obs_arrays,
     candidate_schema,
     format_schema_and_example,
+    load_design_inputs,
     render_environment_interface,
     render_prompt,
     runtime_diagnostic_contract,
@@ -456,7 +457,7 @@ def test_prompt_is_complete_current_only_and_example_parses(design_fixture):
 
 def test_master_prompt_has_exact_placeholder_contract_and_supported_operations_match():
     template = PROMPT_TEMPLATE_PATH.read_text(encoding="utf-8")
-    assert PROMPT_VERSION == "uav-hrl-llm-design-prompt-v4"
+    assert PROMPT_VERSION == "uav-hrl-llm-design-prompt-v5"
     assert {
         token
         for token in (
@@ -2693,6 +2694,249 @@ def test_local_temporary_array_loop_writes_pass_static_worker_and_preserve_input
     assert reward.tolist() == pytest.approx([0.0] * 6)
     assert report["input_mutation_check"].startswith("passed")
     assert all(np.array_equal(obs[name], value) for name, value in before.items())
+
+
+def test_local_numeric_accumulator_passes_static_worker_and_artifact_loader(tmp_path):
+    fixed = _fixed_artifact(tmp_path)
+    arrays, _, _, constants = load_design_inputs(fixed)
+    literal_candidate = _candidate(
+        name="literal-numeric-accumulator",
+        code=(
+            "def compute_extra_state(obs, constants):\n"
+            "    total = 0.0\n"
+            "    for k in range(4):\n"
+            "        total += 0.1\n"
+            "    return np.asarray([total], dtype=np.float32)\n"
+        ),
+    )
+    assert validate_candidate_staged(literal_candidate, constants)["status"] == "passed"
+    validate_candidate(literal_candidate, constants)
+    literal_extra, _, literal_execution = execute_candidate_isolated(
+        literal_candidate, build_obs_arrays(arrays), constants, timeout=10
+    )
+    assert literal_extra[:, 0].tolist() == pytest.approx(
+        [0.4] * literal_extra.shape[0]
+    )
+    assert literal_execution["input_mutation_check"].startswith("passed")
+
+    candidate = _candidate(
+        name="numeric-accumulator",
+        code=(
+            "def compute_extra_state(obs, constants):\n"
+            "    total = 0.0\n"
+            '    value = np.clip(obs["state"][0] * obs["state"][0], 0.0, 1.0)\n'
+            "    for k in range(1):\n"
+            "        total += value\n"
+            "    return np.asarray([np.clip(total, 0.0, 1.0)], dtype=np.float32)\n"
+        ),
+    )
+    staged = validate_candidate_staged(candidate, constants)
+    assert staged["status"] == "passed"
+    validate_candidate(candidate, constants)
+    extra, _, execution = execute_candidate_isolated(
+        candidate, build_obs_arrays(arrays), constants, timeout=10
+    )
+    expected = np.clip(np.asarray(arrays["state"])[:, 0] ** 2, 0.0, 1.0)
+    assert extra[:, 0].tolist() == pytest.approx(expected.tolist())
+    assert execution["input_mutation_check"].startswith("passed")
+
+    result = run_design(
+        fixed_sample=fixed,
+        model="qwen/qwen3.5-9b",
+        client=MockClient([_response(candidate)]),
+        max_attempts=1,
+        output_dir=tmp_path / "numeric-accumulator-design",
+        worker_timeout=10,
+    )
+    assert result["status"] == "approved"
+    loaded = load_approved_design(result["approved_artifact"])
+    assert loaded.candidate["candidate_name"] == "numeric-accumulator"
+
+
+def test_local_owned_array_augmented_assignment_remains_allowed(design_fixture):
+    _, arrays, _, _, constants = design_fixture
+    candidate = _candidate(
+        code=(
+            "def compute_extra_state(obs, constants):\n"
+            "    values = np.zeros(3)\n"
+            "    alias = values\n"
+            "    alias += 0.1\n"
+            "    view = values[1:]\n"
+            "    view *= 2.0\n"
+            "    return np.asarray([np.mean(values)], dtype=np.float32)\n"
+        )
+    )
+    validate_candidate(candidate, constants)
+    extra, _, execution = execute_candidate_isolated(
+        candidate, build_obs_arrays(arrays), constants, timeout=10
+    )
+    assert extra[:, 0].tolist() == pytest.approx([1.0 / 6.0] * extra.shape[0])
+    assert execution["input_mutation_check"].startswith("passed")
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        '    target = obs["state"]\n    target += 0.1\n',
+        '    target = obs["state"]\n    target[0] += 0.1\n',
+    ],
+)
+def test_input_augmented_assignment_remains_rejected(design_fixture, mutation):
+    _, _, _, _, constants = design_fixture
+    candidate = _candidate(
+        code=(
+            "def compute_extra_state(obs, constants):\n"
+            f"{mutation}"
+            "    return np.asarray([0.0], dtype=np.float32)\n"
+        )
+    )
+    staged = validate_candidate_staged(candidate, constants)
+    issue = next(
+        item for item in staged["errors"] if item["code"] == "STATIC_INPUT_MUTATION"
+    )
+    assert issue["validation_check"] == "static.mutation"
+    assert issue["write_kind"] == "augmented_assignment"
+    with pytest.raises(CandidateError, match="may share data with obs or constants"):
+        validate_candidate(candidate, constants)
+
+
+@pytest.mark.parametrize(
+    "loop_body",
+    [
+        (
+            "    x = np.zeros(16)\n"
+            "    for k in range(2):\n"
+            "        x[0] = 0.5\n"
+            '        x = obs["state"]\n'
+        ),
+        (
+            "    x = np.zeros(16)\n"
+            "    k = 0\n"
+            "    while k < 2:\n"
+            "        x[0] = 0.5\n"
+            '        x = obs["state"]\n'
+            "        k += 1\n"
+        ),
+        (
+            "    x = np.zeros(16)\n"
+            "    for k in range(2):\n"
+            "        x[0] = 0.5\n"
+            "        if k > 0:\n"
+            '            x = obs["state"]\n'
+        ),
+        (
+            "    x = np.zeros(16)\n"
+            "    for outer in range(2):\n"
+            "        for inner in range(2):\n"
+            "            x[0] = 0.5\n"
+            '            x = obs["state"]\n'
+        ),
+    ],
+    ids=["for-back-edge", "while-back-edge", "branch-back-edge", "nested-loop"],
+)
+def test_loop_fixed_point_rejects_later_iteration_input_rebinding(
+    design_fixture, loop_body
+):
+    _, _, _, _, constants = design_fixture
+    candidate = _candidate(
+        code=(
+            "def compute_extra_state(obs, constants):\n"
+            f"{loop_body}"
+            "    return np.asarray([0.0], dtype=np.float32)\n"
+        )
+    )
+    staged = validate_candidate_staged(candidate, constants)
+    mutation = [
+        item for item in staged["errors"] if item["code"] == "STATIC_INPUT_MUTATION"
+    ]
+    assert mutation
+    assert len(
+        {(item["operation_fingerprint"], item["code"]) for item in mutation}
+    ) == len(mutation)
+    with pytest.raises(CandidateError, match="may share data with obs or constants"):
+        validate_candidate(candidate, constants)
+
+
+@pytest.mark.parametrize("operator", ["and", "or"])
+def test_boolean_expression_that_can_return_input_is_not_owned(
+    design_fixture, operator
+):
+    _, _, _, _, constants = design_fixture
+    left = "True" if operator == "and" else "False"
+    candidate = _candidate(
+        code=(
+            "def compute_extra_state(obs, constants):\n"
+            f'    target = {left} {operator} obs["state"]\n'
+            "    target[0] = 0.5\n"
+            "    return np.asarray([0.0], dtype=np.float32)\n"
+        )
+    )
+    staged = validate_candidate_staged(candidate, constants)
+    assert any(item["code"] == "STATIC_INPUT_MUTATION" for item in staged["errors"])
+
+
+def test_boolean_conditions_do_not_block_normal_local_loop(design_fixture):
+    _, arrays, _, _, constants = design_fixture
+    candidate = _candidate(
+        code=(
+            "def compute_extra_state(obs, constants):\n"
+            "    total = 0.0\n"
+            "    for k in range(4):\n"
+            "        if (k >= 0 and k < 2) or k == 3:\n"
+            "            total += 0.1\n"
+            "    return np.asarray([total], dtype=np.float32)\n"
+        )
+    )
+    validate_candidate(candidate, constants)
+    extra, _, _ = execute_candidate_isolated(
+        candidate, build_obs_arrays(arrays), constants, timeout=10
+    )
+    assert extra[:, 0].tolist() == pytest.approx([0.3] * extra.shape[0])
+
+
+def test_container_cannot_store_input_reference_then_hide_nested_mutation(
+    design_fixture,
+):
+    _, _, _, _, constants = design_fixture
+    candidate = _candidate(
+        code=(
+            "def compute_extra_state(obs, constants):\n"
+            "    values = [np.zeros(16)]\n"
+            '    values[0] = obs["state"]\n'
+            "    values[0][0] = 0.5\n"
+            "    return np.asarray([0.0], dtype=np.float32)\n"
+        )
+    )
+    staged = validate_candidate_staged(candidate, constants)
+    codes = {item["code"] for item in staged["errors"]}
+    assert "STATIC_UNCONFIRMED_CONTAINER_REFERENCE" in codes
+    assert "STATIC_INPUT_MUTATION" in codes
+    container_issue = next(
+        item
+        for item in staged["errors"]
+        if item["code"] == "STATIC_UNCONFIRMED_CONTAINER_REFERENCE"
+    )
+    assert "nested container-reference mutation is not statically supported" in (
+        container_issue["requirement"]
+    )
+
+
+def test_local_container_scalar_fills_remain_supported(design_fixture):
+    _, arrays, _, _, constants = design_fixture
+    candidate = _candidate(
+        code=(
+            "def compute_extra_state(obs, constants):\n"
+            "    values = [0.0, 0.0]\n"
+            "    values[0] = 0.1\n"
+            "    values[1] = 0.2\n"
+            "    return np.asarray([sum(values)], dtype=np.float32)\n"
+        )
+    )
+    validate_candidate(candidate, constants)
+    extra, _, _ = execute_candidate_isolated(
+        candidate, build_obs_arrays(arrays), constants, timeout=10
+    )
+    assert extra[:, 0].tolist() == pytest.approx([0.3] * extra.shape[0])
 
 
 @pytest.mark.parametrize(

@@ -333,12 +333,17 @@ def _root_name(node: ast.AST) -> str | None:
 
 _SOURCE_INPUT = "input_shared"
 _SOURCE_OWNED = "local_owned"
-_SOURCE_VALUE = "value"
+_SOURCE_IMMUTABLE = "immutable_value"
+_SOURCE_CONTAINER = "local_container"
 _SOURCE_UNKNOWN = "unknown"
 _INPUT_SOURCES = frozenset({_SOURCE_INPUT})
 _OWNED_SOURCES = frozenset({_SOURCE_OWNED})
-_VALUE_SOURCES = frozenset({_SOURCE_VALUE})
+_IMMUTABLE_SOURCES = frozenset({_SOURCE_IMMUTABLE})
+_CONTAINER_SOURCES = frozenset({_SOURCE_CONTAINER})
 _UNKNOWN_SOURCES = frozenset({_SOURCE_UNKNOWN})
+_SAFE_AUGMENTED_NAME_SOURCES = frozenset(
+    {_SOURCE_OWNED, _SOURCE_IMMUTABLE}
+)
 _LOCAL_ALLOCATING_NUMPY_CALLS = {
     "np.abs",
     "np.arange",
@@ -355,6 +360,20 @@ _LOCAL_ALLOCATING_NUMPY_CALLS = {
     "np.stack",
     "np.where",
     "np.zeros",
+}
+_LOCAL_NUMPY_VALUE_OR_ARRAY_CALLS = {
+    "np.all",
+    "np.any",
+    "np.bool_",
+    "np.count_nonzero",
+    "np.float32",
+    "np.float64",
+    "np.int32",
+    "np.int64",
+    "np.isfinite",
+    "np.linalg.norm",
+    "np.mean",
+    "np.sum",
 }
 
 
@@ -423,6 +442,20 @@ class _MutationSourceAnalyzer:
         self.source_lines = source.splitlines()
         self.identities = identities
         self.issues: list[dict[str, Any]] = []
+        self._issue_indices: dict[tuple[str, str, str], int] = {}
+
+    @staticmethod
+    def _new_numeric_result(
+        operand_sources: list[frozenset[str]],
+    ) -> frozenset[str]:
+        combined = set().union(*operand_sources) if operand_sources else set()
+        if _SOURCE_UNKNOWN in combined or _SOURCE_CONTAINER in combined:
+            return _UNKNOWN_SOURCES
+        if _SOURCE_INPUT in combined or _SOURCE_OWNED in combined:
+            return _OWNED_SOURCES
+        if combined and combined <= {_SOURCE_IMMUTABLE}:
+            return _IMMUTABLE_SOURCES
+        return _UNKNOWN_SOURCES
 
     def expression_sources(
         self, node: ast.AST | None, environment: dict[str, frozenset[str]]
@@ -432,7 +465,7 @@ class _MutationSourceAnalyzer:
         if isinstance(node, ast.Name):
             return environment.get(node.id, _UNKNOWN_SOURCES)
         if isinstance(node, ast.Constant):
-            return _VALUE_SOURCES
+            return _IMMUTABLE_SOURCES
         if isinstance(node, ast.Subscript):
             return self.expression_sources(node.value, environment)
         if isinstance(node, ast.Attribute):
@@ -448,7 +481,7 @@ class _MutationSourceAnalyzer:
                 children = [*node.keys, *node.values]
             else:
                 children = list(node.elts)
-            sources = {_SOURCE_OWNED}
+            sources = {_SOURCE_CONTAINER}
             for child in children:
                 child_sources = self.expression_sources(child, environment)
                 if _SOURCE_INPUT in child_sources:
@@ -456,11 +489,39 @@ class _MutationSourceAnalyzer:
                 if _SOURCE_UNKNOWN in child_sources:
                     sources.add(_SOURCE_UNKNOWN)
             return frozenset(sources)
-        if isinstance(
-            node,
-            (ast.BinOp, ast.UnaryOp, ast.BoolOp, ast.Compare, ast.JoinedStr),
-        ):
-            return _OWNED_SOURCES
+        if isinstance(node, ast.BoolOp):
+            # Python and/or return one operand rather than a fresh bool.
+            return frozenset(
+                set().union(
+                    *(
+                        self.expression_sources(value, environment)
+                        for value in node.values
+                    )
+                )
+            )
+        if isinstance(node, ast.BinOp):
+            return self._new_numeric_result(
+                [
+                    self.expression_sources(node.left, environment),
+                    self.expression_sources(node.right, environment),
+                ]
+            )
+        if isinstance(node, ast.UnaryOp):
+            return self._new_numeric_result(
+                [self.expression_sources(node.operand, environment)]
+            )
+        if isinstance(node, ast.Compare):
+            return self._new_numeric_result(
+                [
+                    self.expression_sources(node.left, environment),
+                    *(
+                        self.expression_sources(value, environment)
+                        for value in node.comparators
+                    ),
+                ]
+            )
+        if isinstance(node, ast.JoinedStr):
+            return _IMMUTABLE_SOURCES
         if isinstance(node, ast.Call):
             dotted = _dotted_name(node.func)
             if dotted == "np.asarray":
@@ -488,24 +549,57 @@ class _MutationSourceAnalyzer:
                 return _OWNED_SOURCES
             if dotted in _LOCAL_ALLOCATING_NUMPY_CALLS:
                 return _OWNED_SOURCES
+            if dotted in _LOCAL_NUMPY_VALUE_OR_ARRAY_CALLS:
+                return frozenset({_SOURCE_IMMUTABLE, _SOURCE_OWNED})
             if isinstance(node.func, ast.Name) and node.func.id == "list":
-                return _OWNED_SOURCES
+                return _CONTAINER_SOURCES
             if isinstance(node.func, ast.Name) and node.func.id in {
-                "abs",
                 "bool",
                 "float",
                 "int",
                 "len",
-                "max",
-                "min",
-                "sum",
-                "tuple",
             }:
-                return _VALUE_SOURCES
+                return _IMMUTABLE_SOURCES
+            if isinstance(node.func, ast.Name) and node.func.id in {"abs", "sum"}:
+                return self._new_numeric_result(
+                    [
+                        self.expression_sources(argument, environment)
+                        for argument in node.args
+                    ]
+                )
+            if isinstance(node.func, ast.Name) and node.func.id in {"max", "min"}:
+                sources = set()
+                for argument in node.args:
+                    sources.update(self.expression_sources(argument, environment))
+                return frozenset(sources or {_SOURCE_UNKNOWN})
+            if isinstance(node.func, ast.Name) and node.func.id in {
+                "tuple",
+                "enumerate",
+                "zip",
+            }:
+                sources = {_SOURCE_CONTAINER}
+                for argument in node.args:
+                    argument_sources = self.expression_sources(argument, environment)
+                    if _SOURCE_INPUT in argument_sources:
+                        sources.add(_SOURCE_INPUT)
+                    if _SOURCE_UNKNOWN in argument_sources:
+                        sources.add(_SOURCE_UNKNOWN)
+                return frozenset(sources)
+            if isinstance(node.func, ast.Name) and node.func.id == "range":
+                return _IMMUTABLE_SOURCES
             return _UNKNOWN_SOURCES
         return _UNKNOWN_SOURCES
 
-    def _issue(self, target: ast.AST, sources: frozenset[str], *, augmented: bool):
+    def _issue(
+        self,
+        target: ast.AST,
+        sources: frozenset[str],
+        *,
+        augmented: bool,
+        code_override: str | None = None,
+        problem_override: str | None = None,
+        requirement_override: str | None = None,
+    ):
         identity = self.identities.get(id(target), {})
         line = int(getattr(target, "lineno", 0))
         code_line = (
@@ -514,7 +608,11 @@ class _MutationSourceAnalyzer:
             else None
         )
         target_text = ast.unparse(target)
-        if isinstance(target, ast.Attribute):
+        if code_override is not None:
+            code = code_override
+            problem = str(problem_override)
+            requirement = str(requirement_override)
+        elif isinstance(target, ast.Attribute):
             code = "STATIC_ATTRIBUTE_MUTATION"
             problem = f"attribute assignment to {target_text!r} is not allowed"
             requirement = (
@@ -545,24 +643,32 @@ class _MutationSourceAnalyzer:
                 "independent allocation such as np.zeros, np.ones, np.arange, or "
                 "np.array(...) before writing through it."
             )
-        self.issues.append(
-            _validation_issue(
-                code,
-                "static",
-                f"code:{line}:{int(getattr(target, 'col_offset', 0))}",
-                problem,
-                requirement,
-                validation_check="static.mutation",
-                candidate_function=identity.get("candidate_function"),
-                candidate_line=line,
-                candidate_source_line=code_line,
-                write_target=target_text,
-                write_kind="augmented_assignment" if augmented else "assignment",
-                target_sources=sorted(sources),
-                operation_fingerprint=identity.get("fingerprint"),
-                operation_identity=identity or None,
-            )
+        issue = _validation_issue(
+            code,
+            "static",
+            f"code:{line}:{int(getattr(target, 'col_offset', 0))}",
+            problem,
+            requirement,
+            validation_check="static.mutation",
+            candidate_function=identity.get("candidate_function"),
+            candidate_line=line,
+            candidate_source_line=code_line,
+            write_target=target_text,
+            write_kind="augmented_assignment" if augmented else "assignment",
+            target_sources=sorted(sources),
+            operation_fingerprint=identity.get("fingerprint"),
+            operation_identity=identity or None,
         )
+        issue_key = (
+            str(identity.get("fingerprint", f"line:{line}")),
+            "augmented" if augmented else "assignment",
+            code,
+        )
+        if issue_key in self._issue_indices:
+            self.issues[self._issue_indices[issue_key]] = issue
+        else:
+            self._issue_indices[issue_key] = len(self.issues)
+            self.issues.append(issue)
 
     def validate_write(
         self,
@@ -570,6 +676,7 @@ class _MutationSourceAnalyzer:
         environment: dict[str, frozenset[str]],
         *,
         augmented: bool,
+        value_sources: frozenset[str] | None = None,
     ):
         if isinstance(target, ast.Name) and not augmented:
             return
@@ -581,8 +688,137 @@ class _MutationSourceAnalyzer:
             sources = self.expression_sources(target.value, environment)
         else:
             sources = _UNKNOWN_SOURCES
+        if isinstance(target, ast.Name) and augmented:
+            right_sources = value_sources or _UNKNOWN_SOURCES
+            if (
+                sources
+                and sources <= _SAFE_AUGMENTED_NAME_SOURCES
+                and _SOURCE_UNKNOWN not in right_sources
+                and _SOURCE_CONTAINER not in right_sources
+            ):
+                return
+        elif (
+            isinstance(target, ast.Subscript)
+            and sources == _CONTAINER_SOURCES
+            and value_sources is not None
+        ):
+            if value_sources == _IMMUTABLE_SOURCES:
+                return
+            self._issue(
+                target,
+                sources,
+                augmented=augmented,
+                code_override="STATIC_UNCONFIRMED_CONTAINER_REFERENCE",
+                problem_override=(
+                    f"assignment through local container target {ast.unparse(target)!r} "
+                    "may retain a mutable or input-backed reference"
+                ),
+                requirement_override=(
+                    "Only store proven immutable scalar values through local container "
+                    "indices. Use a directly allocated NumPy buffer for numeric copies; "
+                    "nested container-reference mutation is not statically supported."
+                ),
+            )
+            return
         if isinstance(target, ast.Attribute) or sources != _OWNED_SOURCES:
             self._issue(target, sources, augmented=augmented)
+
+    @staticmethod
+    def _bind_target(
+        target: ast.AST,
+        sources: frozenset[str],
+        environment: dict[str, frozenset[str]],
+    ):
+        if isinstance(target, ast.Name):
+            environment[target.id] = sources
+        elif isinstance(target, (ast.Tuple, ast.List)):
+            for element in target.elts:
+                _MutationSourceAnalyzer._bind_target(
+                    element, sources, environment
+                )
+
+    def _record_container_contents(
+        self,
+        target: ast.AST,
+        value_sources: frozenset[str],
+        environment: dict[str, frozenset[str]],
+    ):
+        if not isinstance(target, ast.Subscript):
+            return
+        root = _root_name(target)
+        if root is None:
+            return
+        existing = environment.get(root, _UNKNOWN_SOURCES)
+        if _SOURCE_CONTAINER in existing:
+            risky_contents = set(value_sources).difference({_SOURCE_IMMUTABLE})
+            if risky_contents:
+                environment[root] = frozenset(set(existing) | risky_contents)
+
+    @staticmethod
+    def _augmented_result_sources(
+        left_sources: frozenset[str], right_sources: frozenset[str]
+    ) -> frozenset[str]:
+        if _SOURCE_INPUT in left_sources:
+            return left_sources
+        if _SOURCE_UNKNOWN in left_sources or _SOURCE_UNKNOWN in right_sources:
+            return _UNKNOWN_SOURCES
+        result = set(left_sources)
+        if _SOURCE_INPUT in right_sources or _SOURCE_OWNED in right_sources:
+            result.add(_SOURCE_OWNED)
+        return frozenset(result or {_SOURCE_UNKNOWN})
+
+    def _loop_target_sources(
+        self, iterator: ast.AST, environment: dict[str, frozenset[str]]
+    ) -> frozenset[str]:
+        if isinstance(iterator, ast.Call) and _dotted_name(iterator.func) == "range":
+            return _IMMUTABLE_SOURCES
+        sources = self.expression_sources(iterator, environment)
+        if _SOURCE_INPUT in sources:
+            return frozenset({_SOURCE_INPUT, _SOURCE_IMMUTABLE})
+        return sources
+
+    def _analyze_loop(
+        self,
+        statement: ast.For | ast.While,
+        incoming: dict[str, frozenset[str]],
+    ) -> dict[str, frozenset[str]]:
+        # The finite source lattice grows monotonically at the loop head. This
+        # covers zero iterations and every back-edge without unrolling runtime
+        # iteration counts.
+        loop_head = dict(incoming)
+        maximum_iterations = max(
+            2,
+            5 * (len(set(loop_head)) + len(list(ast.walk(statement))) + 1),
+        )
+        for _ in range(maximum_iterations):
+            iteration_environment = dict(loop_head)
+            if isinstance(statement, ast.For):
+                self._bind_target(
+                    statement.target,
+                    self._loop_target_sources(statement.iter, iteration_environment),
+                    iteration_environment,
+                )
+            body_exit = self.analyze_statements(
+                statement.body, iteration_environment
+            )
+            next_head = _merge_source_environments(incoming, body_exit)
+            if next_head == loop_head:
+                loop_head = next_head
+                break
+            loop_head = next_head
+        else:
+            # Defensive termination fallback: uncertainty is safer than using
+            # a stale pre-loop binding.
+            loop_head = {
+                name: frozenset(set(sources) | {_SOURCE_UNKNOWN})
+                for name, sources in loop_head.items()
+            }
+        if statement.orelse:
+            return _merge_source_environments(
+                loop_head,
+                self.analyze_statements(statement.orelse, dict(loop_head)),
+            )
+        return loop_head
 
     def analyze_statements(
         self,
@@ -600,31 +836,37 @@ class _MutationSourceAnalyzer:
                 )
                 sources = self.expression_sources(value, environment)
                 for target in targets:
-                    self.validate_write(target, environment, augmented=False)
-                    if isinstance(target, ast.Name):
-                        environment[target.id] = sources
+                    self.validate_write(
+                        target,
+                        environment,
+                        augmented=False,
+                        value_sources=sources,
+                    )
+                    self._record_container_contents(target, sources, environment)
+                    self._bind_target(target, sources, environment)
             elif isinstance(statement, ast.AugAssign):
-                self.validate_write(statement.target, environment, augmented=True)
+                right_sources = self.expression_sources(statement.value, environment)
+                left_sources = (
+                    environment.get(statement.target.id, _UNKNOWN_SOURCES)
+                    if isinstance(statement.target, ast.Name)
+                    else self.expression_sources(statement.target, environment)
+                )
+                self.validate_write(
+                    statement.target,
+                    environment,
+                    augmented=True,
+                    value_sources=right_sources,
+                )
                 if isinstance(statement.target, ast.Name):
-                    # NumPy augmented assignment mutates rather than proving a copy.
-                    environment[statement.target.id] = environment.get(
-                        statement.target.id, _UNKNOWN_SOURCES
+                    environment[statement.target.id] = self._augmented_result_sources(
+                        left_sources, right_sources
                     )
             elif isinstance(statement, ast.If):
                 body = self.analyze_statements(statement.body, dict(environment))
                 orelse = self.analyze_statements(statement.orelse, dict(environment))
                 environment = _merge_source_environments(body, orelse)
             elif isinstance(statement, (ast.For, ast.While)):
-                loop_environment = dict(environment)
-                if isinstance(statement, ast.For) and isinstance(statement.target, ast.Name):
-                    loop_environment[statement.target.id] = _VALUE_SOURCES
-                body = self.analyze_statements(statement.body, loop_environment)
-                environment = _merge_source_environments(environment, body)
-                if statement.orelse:
-                    environment = _merge_source_environments(
-                        environment,
-                        self.analyze_statements(statement.orelse, dict(environment)),
-                    )
+                environment = self._analyze_loop(statement, environment)
             elif isinstance(statement, ast.FunctionDef):
                 function_environment = {
                     "obs": _INPUT_SOURCES,

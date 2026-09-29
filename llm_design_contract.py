@@ -23,7 +23,7 @@ from replay_auxiliary import SNAPSHOT_FIELD_SPECS
 
 CANDIDATE_SCHEMA_VERSION = "uav-hrl-llm-shared-feature-candidate-v2"
 OBS_INTERFACE_VERSION = "uav-hrl-llm-current-observation-v1"
-PROMPT_VERSION = "uav-hrl-llm-design-prompt-v4"
+PROMPT_VERSION = "uav-hrl-llm-design-prompt-v5"
 DESIGN_RUN_SCHEMA_VERSION = "uav-hrl-llm-design-run-v2"
 APPROVED_ARTIFACT_SCHEMA_VERSION = "uav-hrl-approved-shared-feature-design-v2"
 ROOT = Path(__file__).resolve().parent
@@ -506,6 +506,8 @@ SUPPORTED_OPERATIONS = """Supported code subset:
 - Safe built-ins: abs, bool, enumerate, float, int, len, list, max, min, range, sum, tuple, zip.
 - NumPy: abs, all, any, arange, array, asarray, bool_, clip, concatenate, count_nonzero, exp, float32, float64, int32, int64, isfinite, log, log1p, maximum, mean, minimum, ones, sqrt, stack, sum, where, zeros, and linalg.norm.
 - Indexed writes may fill arrays independently created inside the function by supported allocating operations such as np.zeros, np.ones, np.arange, and np.array. Safe local aliases and slices of those arrays remain writable.
+- Augmented assignment may update a proven immutable numeric local or an independently created local NumPy array. It may not update an input-backed or uncertain target.
+- Do not store input-backed or otherwise mutable references in Python containers for later nested mutation; that container-reference pattern is conservatively rejected.
 - obs, constants, and aliases, slices, or np.asarray views that may share their data must remain unchanged. If ownership cannot be confirmed across every control-flow path, indexed writes are rejected.
 - A feature that directly copies one original-state scalar, or two features with the same statically resolved output expression, is rejected. Derived quantities such as relative distances, normalized deadlines, and queue loads remain allowed.
 - The same operation whitelist still applies: do not use array/object methods, imports, file/network/process access, eval/exec, reflection, globals, randomness, or time."""
