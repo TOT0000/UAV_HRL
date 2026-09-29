@@ -331,6 +331,317 @@ def _root_name(node: ast.AST) -> str | None:
     return current.id if isinstance(current, ast.Name) else None
 
 
+_SOURCE_INPUT = "input_shared"
+_SOURCE_OWNED = "local_owned"
+_SOURCE_VALUE = "value"
+_SOURCE_UNKNOWN = "unknown"
+_INPUT_SOURCES = frozenset({_SOURCE_INPUT})
+_OWNED_SOURCES = frozenset({_SOURCE_OWNED})
+_VALUE_SOURCES = frozenset({_SOURCE_VALUE})
+_UNKNOWN_SOURCES = frozenset({_SOURCE_UNKNOWN})
+_LOCAL_ALLOCATING_NUMPY_CALLS = {
+    "np.abs",
+    "np.arange",
+    "np.array",
+    "np.clip",
+    "np.concatenate",
+    "np.exp",
+    "np.log",
+    "np.log1p",
+    "np.maximum",
+    "np.minimum",
+    "np.ones",
+    "np.sqrt",
+    "np.stack",
+    "np.where",
+    "np.zeros",
+}
+
+
+def _operation_identities(tree: ast.AST, source: str) -> dict[int, dict[str, Any]]:
+    """Return line-insensitive structural identities for candidate operations."""
+
+    source_lines = source.splitlines()
+    identities: dict[int, dict[str, Any]] = {}
+
+    def walk(node: ast.AST, path: tuple[str, ...], function_name: str | None):
+        current_function = (
+            node.name if isinstance(node, ast.FunctionDef) else function_name
+        )
+        normalized = ast.dump(node, annotate_fields=True, include_attributes=False)
+        payload = {
+            "candidate_function": current_function,
+            "function_structural_path": list(path),
+            "normalized_ast": normalized,
+        }
+        payload["fingerprint"] = hashlib.sha256(
+            json.dumps(
+                payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+            ).encode("utf-8")
+        ).hexdigest()
+        line = int(getattr(node, "lineno", 0))
+        payload["source"] = (
+            source_lines[line - 1].strip()
+            if 0 < line <= len(source_lines)
+            else None
+        )
+        identities[id(node)] = payload
+        for field, value in ast.iter_fields(node):
+            if isinstance(value, ast.AST):
+                walk(value, path + (field,), current_function)
+            elif isinstance(value, list):
+                for index, child in enumerate(value):
+                    if isinstance(child, ast.AST):
+                        walk(child, path + (f"{field}[{index}]",), current_function)
+
+    walk(tree, (), None)
+    return identities
+
+
+def _merge_source_environments(
+    *environments: dict[str, frozenset[str]],
+) -> dict[str, frozenset[str]]:
+    names = set().union(*(environment.keys() for environment in environments))
+    merged = {}
+    for name in names:
+        sources: set[str] = set()
+        for environment in environments:
+            sources.update(environment.get(name, _UNKNOWN_SOURCES))
+        merged[name] = frozenset(sources)
+    return merged
+
+
+class _MutationSourceAnalyzer:
+    """Conservative, function-local ownership analysis for write targets."""
+
+    def __init__(
+        self,
+        source: str,
+        identities: dict[int, dict[str, Any]],
+    ):
+        self.source = source
+        self.source_lines = source.splitlines()
+        self.identities = identities
+        self.issues: list[dict[str, Any]] = []
+
+    def expression_sources(
+        self, node: ast.AST | None, environment: dict[str, frozenset[str]]
+    ) -> frozenset[str]:
+        if node is None:
+            return _UNKNOWN_SOURCES
+        if isinstance(node, ast.Name):
+            return environment.get(node.id, _UNKNOWN_SOURCES)
+        if isinstance(node, ast.Constant):
+            return _VALUE_SOURCES
+        if isinstance(node, ast.Subscript):
+            return self.expression_sources(node.value, environment)
+        if isinstance(node, ast.Attribute):
+            return self.expression_sources(node.value, environment)
+        if isinstance(node, ast.IfExp):
+            return frozenset(
+                set(self.expression_sources(node.body, environment))
+                | set(self.expression_sources(node.orelse, environment))
+            )
+        if isinstance(node, (ast.List, ast.Tuple, ast.Set, ast.Dict)):
+            children = []
+            if isinstance(node, ast.Dict):
+                children = [*node.keys, *node.values]
+            else:
+                children = list(node.elts)
+            sources = {_SOURCE_OWNED}
+            for child in children:
+                child_sources = self.expression_sources(child, environment)
+                if _SOURCE_INPUT in child_sources:
+                    sources.add(_SOURCE_INPUT)
+                if _SOURCE_UNKNOWN in child_sources:
+                    sources.add(_SOURCE_UNKNOWN)
+            return frozenset(sources)
+        if isinstance(
+            node,
+            (ast.BinOp, ast.UnaryOp, ast.BoolOp, ast.Compare, ast.JoinedStr),
+        ):
+            return _OWNED_SOURCES
+        if isinstance(node, ast.Call):
+            dotted = _dotted_name(node.func)
+            if dotted == "np.asarray":
+                return (
+                    self.expression_sources(node.args[0], environment)
+                    if node.args
+                    else _UNKNOWN_SOURCES
+                )
+            if dotted == "np.array":
+                copy_keyword = next(
+                    (keyword.value for keyword in node.keywords if keyword.arg == "copy"),
+                    None,
+                )
+                if isinstance(copy_keyword, ast.Constant) and copy_keyword.value is False:
+                    return (
+                        self.expression_sources(node.args[0], environment)
+                        if node.args
+                        else _UNKNOWN_SOURCES
+                    )
+                if copy_keyword is not None and not (
+                    isinstance(copy_keyword, ast.Constant)
+                    and copy_keyword.value is True
+                ):
+                    return _UNKNOWN_SOURCES
+                return _OWNED_SOURCES
+            if dotted in _LOCAL_ALLOCATING_NUMPY_CALLS:
+                return _OWNED_SOURCES
+            if isinstance(node.func, ast.Name) and node.func.id == "list":
+                return _OWNED_SOURCES
+            if isinstance(node.func, ast.Name) and node.func.id in {
+                "abs",
+                "bool",
+                "float",
+                "int",
+                "len",
+                "max",
+                "min",
+                "sum",
+                "tuple",
+            }:
+                return _VALUE_SOURCES
+            return _UNKNOWN_SOURCES
+        return _UNKNOWN_SOURCES
+
+    def _issue(self, target: ast.AST, sources: frozenset[str], *, augmented: bool):
+        identity = self.identities.get(id(target), {})
+        line = int(getattr(target, "lineno", 0))
+        code_line = (
+            self.source_lines[line - 1].strip()
+            if 0 < line <= len(self.source_lines)
+            else None
+        )
+        target_text = ast.unparse(target)
+        if isinstance(target, ast.Attribute):
+            code = "STATIC_ATTRIBUTE_MUTATION"
+            problem = f"attribute assignment to {target_text!r} is not allowed"
+            requirement = (
+                "Keep object attributes unchanged. Use a local array allocated by an "
+                "allowed NumPy constructor and write only its indexed elements."
+            )
+        elif _SOURCE_INPUT in sources:
+            code = "STATIC_INPUT_MUTATION"
+            problem = (
+                f"{'augmented assignment' if augmented else 'indexed assignment'} "
+                f"target {target_text!r} may share data with obs or constants"
+            )
+            requirement = (
+                "Do not write to obs, constants, their aliases or slices, or an "
+                "np.asarray view. Allocate an independent buffer with np.zeros, "
+                "np.ones, np.arange, or np.array(...), then write to that buffer."
+            )
+        else:
+            code = "STATIC_UNCONFIRMED_WRITE_TARGET"
+            problem = (
+                "the validator cannot confirm that "
+                f"{'augmented assignment' if augmented else 'indexed assignment'} "
+                f"target {target_text!r} "
+                "is independent of obs and constants"
+            )
+            requirement = (
+                "Bind the target directly, on every control-flow path, to a supported "
+                "independent allocation such as np.zeros, np.ones, np.arange, or "
+                "np.array(...) before writing through it."
+            )
+        self.issues.append(
+            _validation_issue(
+                code,
+                "static",
+                f"code:{line}:{int(getattr(target, 'col_offset', 0))}",
+                problem,
+                requirement,
+                validation_check="static.mutation",
+                candidate_function=identity.get("candidate_function"),
+                candidate_line=line,
+                candidate_source_line=code_line,
+                write_target=target_text,
+                write_kind="augmented_assignment" if augmented else "assignment",
+                target_sources=sorted(sources),
+                operation_fingerprint=identity.get("fingerprint"),
+                operation_identity=identity or None,
+            )
+        )
+
+    def validate_write(
+        self,
+        target: ast.AST,
+        environment: dict[str, frozenset[str]],
+        *,
+        augmented: bool,
+    ):
+        if isinstance(target, ast.Name) and not augmented:
+            return
+        if isinstance(target, ast.Name):
+            sources = environment.get(target.id, _UNKNOWN_SOURCES)
+        elif isinstance(target, ast.Attribute):
+            sources = self.expression_sources(target.value, environment)
+        elif isinstance(target, ast.Subscript):
+            sources = self.expression_sources(target.value, environment)
+        else:
+            sources = _UNKNOWN_SOURCES
+        if isinstance(target, ast.Attribute) or sources != _OWNED_SOURCES:
+            self._issue(target, sources, augmented=augmented)
+
+    def analyze_statements(
+        self,
+        statements: list[ast.stmt],
+        incoming: dict[str, frozenset[str]],
+    ) -> dict[str, frozenset[str]]:
+        environment = dict(incoming)
+        for statement in statements:
+            if isinstance(statement, (ast.Assign, ast.AnnAssign)):
+                value = statement.value
+                targets = (
+                    statement.targets
+                    if isinstance(statement, ast.Assign)
+                    else [statement.target]
+                )
+                sources = self.expression_sources(value, environment)
+                for target in targets:
+                    self.validate_write(target, environment, augmented=False)
+                    if isinstance(target, ast.Name):
+                        environment[target.id] = sources
+            elif isinstance(statement, ast.AugAssign):
+                self.validate_write(statement.target, environment, augmented=True)
+                if isinstance(statement.target, ast.Name):
+                    # NumPy augmented assignment mutates rather than proving a copy.
+                    environment[statement.target.id] = environment.get(
+                        statement.target.id, _UNKNOWN_SOURCES
+                    )
+            elif isinstance(statement, ast.If):
+                body = self.analyze_statements(statement.body, dict(environment))
+                orelse = self.analyze_statements(statement.orelse, dict(environment))
+                environment = _merge_source_environments(body, orelse)
+            elif isinstance(statement, (ast.For, ast.While)):
+                loop_environment = dict(environment)
+                if isinstance(statement, ast.For) and isinstance(statement.target, ast.Name):
+                    loop_environment[statement.target.id] = _VALUE_SOURCES
+                body = self.analyze_statements(statement.body, loop_environment)
+                environment = _merge_source_environments(environment, body)
+                if statement.orelse:
+                    environment = _merge_source_environments(
+                        environment,
+                        self.analyze_statements(statement.orelse, dict(environment)),
+                    )
+            elif isinstance(statement, ast.FunctionDef):
+                function_environment = {
+                    "obs": _INPUT_SOURCES,
+                    "constants": _INPUT_SOURCES,
+                }
+                self.analyze_statements(statement.body, function_environment)
+        return environment
+
+
+def _mutation_validation_issues(
+    tree: ast.AST, source: str, identities: dict[int, dict[str, Any]]
+) -> list[dict[str, Any]]:
+    analyzer = _MutationSourceAnalyzer(source, identities)
+    analyzer.analyze_statements(list(getattr(tree, "body", [])), {})
+    return analyzer.issues
+
+
 class _CandidateVisitor(ast.NodeVisitor):
     def __init__(self):
         self.accessed_fields: set[str] = set()
@@ -368,22 +679,6 @@ class _CandidateVisitor(ast.NodeVisitor):
                 )
             self.accessed_fields.add(f"{node.value.id}.{key}")
         self.generic_visit(node)
-
-    def visit_Assign(self, node):
-        for target in node.targets:
-            if _root_name(target) in {"obs", "constants"} or isinstance(
-                target, (ast.Subscript, ast.Attribute)
-            ):
-                raise CandidateError("assignment may target local names only")
-        self.generic_visit(node)
-
-    def visit_AugAssign(self, node):
-        if _root_name(node.target) in {"obs", "constants"} or isinstance(
-            node.target, (ast.Subscript, ast.Attribute)
-        ):
-            raise CandidateError("augmented assignment may target local names only")
-        self.generic_visit(node)
-
 
 class _LocalNameResolver(ast.NodeTransformer):
     """Resolve straight-line local aliases without attempting general data flow."""
@@ -537,6 +832,15 @@ def validate_candidate_code(
         tree = ast.parse(candidate["code"], mode="exec")
     except SyntaxError as exc:
         raise CandidateError(f"candidate code has invalid syntax: {exc}") from exc
+    identities = _operation_identities(tree, candidate["code"])
+    mutation_issues = _mutation_validation_issues(
+        tree, candidate["code"], identities
+    )
+    if mutation_issues:
+        issue = mutation_issues[0]
+        raise CandidateError(
+            f"{issue['location']}: {issue['problem']}; {issue['requirement']}"
+        )
     top_functions = [node for node in tree.body if isinstance(node, ast.FunctionDef)]
     if len(top_functions) != 1 or any(
         not isinstance(node, ast.FunctionDef) for node in tree.body
@@ -927,11 +1231,24 @@ def _schema_validation_issues(
 
 
 class _CollectingCandidateVisitor(ast.NodeVisitor):
-    def __init__(self):
+    def __init__(
+        self,
+        source: str = "",
+        identities: dict[int, dict[str, Any]] | None = None,
+    ):
         self.accessed_fields: set[str] = set()
         self.field_locations: dict[str, list[str]] = {}
         self.issues: list[dict[str, Any]] = []
         self._seen: set[tuple[str, int, int, str]] = set()
+        self.source_lines = source.splitlines()
+        self.identities = identities or {}
+        self.current_function: str | None = None
+
+    def visit_FunctionDef(self, node):
+        previous = self.current_function
+        self.current_function = node.name
+        self.generic_visit(node)
+        self.current_function = previous
 
     def add(self, code: str, node: ast.AST, problem: str, requirement: str):
         line = int(getattr(node, "lineno", 0))
@@ -939,6 +1256,12 @@ class _CollectingCandidateVisitor(ast.NodeVisitor):
         key = (code, line, column, problem)
         if key not in self._seen:
             self._seen.add(key)
+            identity = self.identities.get(id(node), {})
+            validation_check = (
+                "static.source_fields"
+                if code in {"STATIC_DYNAMIC_FIELD", "STATIC_FORBIDDEN_FIELD"}
+                else "static.allowed_operations"
+            )
             self.issues.append(
                 _validation_issue(
                     code,
@@ -946,6 +1269,18 @@ class _CollectingCandidateVisitor(ast.NodeVisitor):
                     f"code:{line}:{column}",
                     problem,
                     requirement,
+                    validation_check=validation_check,
+                    candidate_function=(
+                        identity.get("candidate_function") or self.current_function
+                    ),
+                    candidate_line=line,
+                    candidate_source_line=(
+                        self.source_lines[line - 1].strip()
+                        if 0 < line <= len(self.source_lines)
+                        else None
+                    ),
+                    operation_fingerprint=identity.get("fingerprint"),
+                    operation_identity=identity or None,
                 )
             )
 
@@ -983,11 +1318,21 @@ class _CollectingCandidateVisitor(ast.NodeVisitor):
         else:
             dotted = _dotted_name(node.func)
             if dotted not in SAFE_NUMPY_CALLS:
+                if dotted and dotted.endswith(".append"):
+                    requirement = (
+                        "Array/list append methods are outside the candidate operation "
+                        "whitelist. Preallocate an independently owned local NumPy array "
+                        "with np.zeros, np.ones, np.arange, or np.array, then fill it by "
+                        "indexed assignment. Do not write through obs, constants, or their "
+                        "aliases/views."
+                    )
+                else:
+                    requirement = "Use only documented builtins and np operations."
                 self.add(
                     "STATIC_NUMPY_CALL",
                     node,
                     f"function call {dotted!r} is not allowed",
-                    "Use only documented np operations.",
+                    requirement,
                 )
         for keyword in node.keywords:
             if keyword.arg in {"out", "like"}:
@@ -1023,38 +1368,16 @@ class _CollectingCandidateVisitor(ast.NodeVisitor):
                 )
         self.generic_visit(node)
 
-    def visit_Assign(self, node):
-        for target in node.targets:
-            if _root_name(target) in {"obs", "constants"} or isinstance(
-                target, (ast.Subscript, ast.Attribute)
-            ):
-                self.add(
-                    "STATIC_INPUT_MUTATION",
-                    target,
-                    "assignment may modify an input or non-local target",
-                    "Assign only to local variable names; functions must be side-effect free.",
-                )
-        self.generic_visit(node)
-
-    def visit_AugAssign(self, node):
-        if _root_name(node.target) in {"obs", "constants"} or isinstance(
-            node.target, (ast.Subscript, ast.Attribute)
-        ):
-            self.add(
-                "STATIC_INPUT_MUTATION",
-                node.target,
-                "augmented assignment may modify an input or non-local target",
-                "Apply augmented assignment only to local variable names.",
-            )
-        self.generic_visit(node)
-
-
 def _static_validation_issues(
     candidate: dict[str, Any], constants_metadata: dict[str, Any]
-) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
+) -> tuple[
+    list[dict[str, Any]],
+    dict[str, Any] | None,
+    dict[str, dict[str, Any]],
+]:
     code = candidate.get("code")
     if not isinstance(code, str) or not code.strip():
-        return [], None
+        return [], None, {}
     try:
         tree = ast.parse(code, mode="exec")
     except SyntaxError as exc:
@@ -1065,9 +1388,65 @@ def _static_validation_issues(
                 f"code:{exc.lineno or 0}:{exc.offset or 0}",
                 exc.msg,
                 "Return syntactically valid Python defining compute_extra_state only.",
+                validation_check="static.syntax",
+                candidate_line=int(exc.lineno or 0),
+                candidate_source_line=(
+                    code.splitlines()[int(exc.lineno) - 1].strip()
+                    if exc.lineno and int(exc.lineno) <= len(code.splitlines())
+                    else None
+                ),
             )
-        ], None
+        ], None, {
+            "syntax": {"status": "failed", "completed": True},
+            "structure": {
+                "status": "not_run",
+                "completed": False,
+                "skipped_reason": "Python syntax is invalid",
+            },
+            "allowed_operations": {
+                "status": "not_run",
+                "completed": False,
+                "skipped_reason": "Python syntax is invalid",
+            },
+            "mutation": {
+                "status": "not_run",
+                "completed": False,
+                "skipped_reason": "Python syntax is invalid",
+            },
+            "source_fields": {
+                "status": "not_run",
+                "completed": False,
+                "skipped_reason": "Python syntax is invalid",
+            },
+            "feature_sources": {
+                "status": "not_run",
+                "completed": False,
+                "skipped_reason": "Python syntax is invalid",
+            },
+            "redundancy": {
+                "status": "not_run",
+                "completed": False,
+                "skipped_reason": "Python syntax is invalid",
+            },
+        }
+    identities = _operation_identities(tree, code)
     issues: list[dict[str, Any]] = []
+    subchecks: dict[str, dict[str, Any]] = {
+        name: {
+            "status": "passed" if completed else "not_run",
+            "completed": completed,
+            "error_count": 0,
+        }
+        for name, completed in {
+            "syntax": True,
+            "structure": True,
+            "allowed_operations": True,
+            "mutation": True,
+            "source_fields": True,
+            "feature_sources": False,
+            "redundancy": False,
+        }.items()
+    }
     top_functions = [node for node in tree.body if isinstance(node, ast.FunctionDef)]
     other_top = [node for node in tree.body if not isinstance(node, ast.FunctionDef)]
     if len(top_functions) != 1 or other_top:
@@ -1078,6 +1457,7 @@ def _static_validation_issues(
                 "$.code",
                 "code does not contain exactly one top-level function definition",
                 "Define only compute_extra_state at top level.",
+                validation_check="static.structure",
             )
         )
     expected = {"compute_extra_state"}
@@ -1090,6 +1470,7 @@ def _static_validation_issues(
                 "$.code",
                 f"found function names {sorted(names)}",
                 f"Define exactly {sorted(expected)}.",
+                validation_check="static.structure",
             )
         )
     for function in top_functions:
@@ -1108,11 +1489,16 @@ def _static_validation_issues(
                     f"code:{function.lineno}:0 {function.name}",
                     "function signature is incompatible",
                     f"Define {function.name}(obs, constants) with no other parameters.",
+                    validation_check="static.structure",
+                    candidate_function=function.name,
+                    candidate_line=int(function.lineno),
+                    candidate_source_line=code.splitlines()[function.lineno - 1].strip(),
                 )
             )
-    visitor = _CollectingCandidateVisitor()
+    visitor = _CollectingCandidateVisitor(code, identities)
     visitor.visit(tree)
     issues.extend(visitor.issues)
+    issues.extend(_mutation_validation_issues(tree, code, identities))
     allowed = allowed_source_fields(constants_metadata)
     for field in sorted(visitor.accessed_fields.difference(allowed)):
         issues.append(
@@ -1122,6 +1508,8 @@ def _static_validation_issues(
                 f"$.code field {field}",
                 "code accesses a field outside the supplied interface",
                 "Use only current-only obs/constants fields listed in the prompt.",
+                validation_check="static.source_fields",
+                source_field=str(field),
             )
         )
     features = candidate.get("features")
@@ -1137,8 +1525,11 @@ def _static_validation_issues(
     if extra_function is not None and isinstance(features, list) and features:
         expressions = _returned_feature_expressions(extra_function)
         if expressions is not None and len(expressions) == len(features):
+            subchecks["feature_sources"].update(
+                {"status": "passed", "completed": True}
+            )
             for index, expression in enumerate(expressions):
-                expression_visitor = _CollectingCandidateVisitor()
+                expression_visitor = _CollectingCandidateVisitor(code, identities)
                 expression_visitor.visit(expression)
                 item = features[index]
                 item_fields = set(item.get("source_fields", [])) if isinstance(item, dict) else set()
@@ -1155,6 +1546,7 @@ def _static_validation_issues(
                             source_field=str(field),
                             source_locations=list(locations),
                             feature_mapping="resolved",
+                            validation_check="static.feature_sources",
                         )
                     )
         else:
@@ -1170,13 +1562,21 @@ def _static_validation_issues(
                         source_field=str(field),
                         source_locations=list(locations),
                         feature_mapping="unresolved",
+                        validation_check="static.feature_sources",
                     )
                 )
         try:
             redundancy = _validate_explicit_feature_redundancy(
                 extra_function, len(features)
             )
+            if redundancy.get("status") != "not_statically_resolved":
+                subchecks["redundancy"].update(
+                    {"status": "passed", "completed": True}
+                )
         except CandidateError as exc:
+            subchecks["redundancy"].update(
+                {"status": "failed", "completed": True}
+            )
             issues.append(
                 _validation_issue(
                     "STATIC_EXPLICIT_FEATURE_REDUNDANCY",
@@ -1184,9 +1584,18 @@ def _static_validation_issues(
                     "compute_extra_state return",
                     str(exc),
                     "Do not directly copy an original state dimension or return the same statically confirmed expression twice.",
+                    validation_check="static.redundancy",
                 )
             )
-    return issues, redundancy
+    for name, check in subchecks.items():
+        check_id = f"static.{name}"
+        error_count = sum(
+            1 for issue in issues if issue.get("validation_check") == check_id
+        )
+        check["error_count"] = error_count
+        if error_count:
+            check["status"] = "failed"
+    return issues, redundancy, subchecks
 
 
 def validate_candidate_staged(
@@ -1199,10 +1608,12 @@ def validate_candidate_staged(
     redundancy = None
     static_completed = False
     if isinstance(candidate, dict) and isinstance(candidate.get("code"), str):
-        static_issues, redundancy = _static_validation_issues(
+        static_issues, redundancy, static_subchecks = _static_validation_issues(
             candidate, constants_metadata
         )
         static_completed = True
+    else:
+        static_subchecks = {}
     issues = schema_issues + static_issues
     return {
         "status": "passed" if not issues else "failed",
@@ -1227,6 +1638,7 @@ def validate_candidate_staged(
                     None if static_completed else "code is unavailable or not text"
                 ),
                 "explicit_feature_redundancy_check": redundancy,
+                "subchecks": static_subchecks,
             },
             "execution": {
                 "status": "not_run",

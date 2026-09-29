@@ -1117,8 +1117,21 @@ def _feedback_from_validation(
     category: str,
     historical_unverified: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    errors = list(report.get("errors") or [])
-    historical = list(historical_unverified or [])
+    errors = []
+    tracked_historical = list(historical_unverified or [])
+    report_historical = []
+    for raw_issue in report.get("errors") or []:
+        issue = dict(raw_issue)
+        if issue.get("issue_status") == "not_revalidated" or issue.get(
+            "carried_from_attempt"
+        ) is not None:
+            report_historical.append(issue)
+        else:
+            issue.setdefault("issue_status", "confirmed_current")
+            errors.append(issue)
+    # A duplicate report contains the most specific carry provenance for this
+    # attempt. Keep it ahead of the tracker copy when both describe one root.
+    historical = _merge_feedback_roots(report_historical + tracked_historical)
     compact_checks = {
         name: {
             key: value
@@ -1133,12 +1146,14 @@ def _feedback_from_validation(
         "status": report.get("status", "failed"),
         "confirmed_errors": errors,
         "confirmed_error_count": len(errors),
+        "confirmed_error_status": "confirmed_current",
         "historical_unverified_errors": historical,
         "historical_unverified_error_count": len(historical),
+        "historical_error_status": "not_revalidated",
         "checks": compact_checks,
         "instruction": (
-            "Correct every confirmed error above, and also address each prior issue marked "
-            "previously_found_not_revalidated. Return one complete replacement candidate "
+            "Correct every confirmed_current error above, and also address each prior "
+            "issue marked not_revalidated. Return one complete replacement candidate "
             "JSON object using the unchanged interface and evaluation rules."
         ),
     }
@@ -1193,36 +1208,27 @@ class _IssueTracker:
         candidate_identity: dict[str, Any] | None,
     ) -> list[dict[str, Any]]:
         checks = report.get("checks") or {}
-        passed_stages = {
+        completed_checks = {
             str(name)
             for name, check in checks.items()
             if isinstance(check, dict) and check.get("status") == "passed"
         }
+        for stage, check in checks.items():
+            if not isinstance(check, dict):
+                continue
+            for name, subcheck in (check.get("subchecks") or {}).items():
+                if isinstance(subcheck, dict) and subcheck.get("completed") is True:
+                    completed_checks.add(f"{stage}.{name}")
         evidence = {
             "attempt": int(attempt),
             "candidate": self._identity(candidate_identity),
-            "passed_checks": sorted(passed_stages),
+            "completed_checks": sorted(completed_checks),
+            "passed_checks": sorted(
+                str(name)
+                for name, check in checks.items()
+                if isinstance(check, dict) and check.get("status") == "passed"
+            ),
         }
-        for record in self._records.values():
-            if record["status"] == "resolved":
-                continue
-            if record["stage"] in passed_stages:
-                record["status"] = "resolved"
-                record["resolved_attempt"] = int(attempt)
-                record["resolution_evidence"] = {
-                    **evidence,
-                    "reason": (
-                        f"the {record['stage']} check completed successfully over its "
-                        "configured validation scope"
-                    ),
-                }
-                record["history"].append(
-                    {
-                        "attempt": int(attempt),
-                        "status": "resolved",
-                        "evidence": record["resolution_evidence"],
-                    }
-                )
 
         current_keys = set()
         for raw_issue in report.get("errors") or []:
@@ -1244,6 +1250,9 @@ class _IssueTracker:
                 self._records[key] = {
                     "issue_id": issue_id,
                     "stage": _issue_stage(issue),
+                    "validation_check": issue.get(
+                        "validation_check", _issue_stage(issue)
+                    ),
                     "status": "confirmed_current",
                     "first_detected_attempt": int(attempt),
                     "latest_confirmed_attempt": int(attempt),
@@ -1253,12 +1262,15 @@ class _IssueTracker:
                     "history": [],
                 }
             record = self._records[key]
+            record.pop("resolved_attempt", None)
+            record.pop("resolution_evidence", None)
             record.update(
                 {
                     "status": "confirmed_current",
                     "latest_confirmed_attempt": int(attempt),
                     "latest_candidate": self._identity(candidate_identity),
                     "latest_location": issue.get("location"),
+                    "latest_validation_attempt": int(attempt),
                     "issue": issue,
                 }
             )
@@ -1273,26 +1285,60 @@ class _IssueTracker:
 
         carried = []
         for key, record in self._records.items():
-            if key in current_keys or record["status"] == "resolved":
+            if key in current_keys:
                 continue
-            record["status"] = "previously_found_not_revalidated"
+            validation_check = str(
+                record.get("validation_check", record.get("stage", "unknown"))
+            )
+            if validation_check in completed_checks:
+                if record["status"] != "resolved":
+                    record["status"] = "resolved"
+                    record["resolved_attempt"] = int(attempt)
+                    record["latest_validation_attempt"] = int(attempt)
+                    record["resolution_evidence"] = {
+                        **evidence,
+                        "validation_check": validation_check,
+                        "reason": (
+                            f"the {validation_check} check completed over its configured "
+                            "scope and did not report this issue"
+                        ),
+                    }
+                    record["history"].append(
+                        {
+                            "attempt": int(attempt),
+                            "status": "resolved",
+                            "evidence": record["resolution_evidence"],
+                        }
+                    )
+                continue
+            if record["status"] == "resolved":
+                continue
+            record["status"] = "not_revalidated"
+            record["latest_validation_attempt"] = int(attempt)
             carry = dict(record["issue"])
             carry.update(
                 {
-                    "issue_status": "previously_found_not_revalidated",
+                    "issue_status": "not_revalidated",
                     "tracked_issue_id": record["issue_id"],
-                    "source_attempt": int(record["latest_confirmed_attempt"]),
-                    "source_candidate": record.get(
+                    "source_attempt": int(record["first_detected_attempt"]),
+                    "source_candidate": record["source_candidate"],
+                    "source_location": record.get("source_location"),
+                    "latest_confirmed_attempt": int(
+                        record["latest_confirmed_attempt"]
+                    ),
+                    "latest_confirmed_candidate": record.get(
                         "latest_candidate", record["source_candidate"]
                     ),
-                    "source_location": record.get(
+                    "latest_confirmed_location": record.get(
                         "latest_location", record.get("source_location")
                     ),
+                    "latest_validation_attempt": int(attempt),
+                    "feedback_carried_forward_by_attempt": int(attempt),
                     "status_note": (
                         "Previously confirmed, but this attempt did not complete the "
-                        f"{record['stage']} check successfully. The saved source location "
-                        "belongs to the earlier candidate and is not asserted as a line in "
-                        "the latest raw response."
+                        f"{validation_check} check. The source and latest-confirmed "
+                        "locations belong to their recorded candidates and are not asserted "
+                        "as lines in the current candidate."
                     ),
                 }
             )
@@ -1300,11 +1346,44 @@ class _IssueTracker:
             record["history"].append(
                 {
                     "attempt": int(attempt),
-                    "status": "previously_found_not_revalidated",
+                    "status": "not_revalidated",
                     "evidence": evidence,
                 }
             )
         return carried
+
+    def annotate_confirmed(
+        self, errors: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        annotated = []
+        for raw_issue in errors:
+            issue = dict(raw_issue)
+            if (
+                issue.get("carried_from_attempt") is None
+                and issue.get("code") != "DUPLICATE_FAILED_CANDIDATE"
+            ):
+                record = self._records.get(_tracked_issue_key(issue))
+                if record is not None:
+                    issue.update(
+                        {
+                            "issue_status": "confirmed_current",
+                            "tracked_issue_id": record["issue_id"],
+                            "source_attempt": int(record["first_detected_attempt"]),
+                            "source_candidate": record["source_candidate"],
+                            "source_location": record.get("source_location"),
+                            "latest_confirmed_attempt": int(
+                                record["latest_confirmed_attempt"]
+                            ),
+                            "latest_confirmed_candidate": record.get(
+                                "latest_candidate", record["source_candidate"]
+                            ),
+                            "latest_confirmed_location": record.get(
+                                "latest_location", record.get("source_location")
+                            ),
+                        }
+                    )
+            annotated.append(issue)
+        return annotated
 
     def snapshot(self) -> dict[str, Any]:
         records = sorted(
@@ -1312,7 +1391,7 @@ class _IssueTracker:
             key=lambda item: (int(item["first_detected_attempt"]), item["issue_id"]),
         )
         return {
-            "schema_version": "uav-hrl-llm-issue-tracker-v1",
+            "schema_version": "uav-hrl-llm-issue-tracker-v2",
             "records": records,
             "pending_count": sum(item["status"] != "resolved" for item in records),
             "resolved_count": sum(item["status"] == "resolved" for item in records),
@@ -1378,6 +1457,7 @@ def _compact_feedback_issue(issue: dict[str, Any]) -> dict[str, Any]:
         "exception_type",
         "candidate_function",
         "candidate_line",
+        "candidate_source_line",
         "problem",
         "requirement",
         "occurrence_count",
@@ -1389,24 +1469,119 @@ def _compact_feedback_issue(issue: dict[str, Any]) -> dict[str, Any]:
         "source_locations",
         "feature_mapping",
         "matched_attempt",
+        "duplicate_matched_attempt",
         "carried_from_attempt",
+        "feedback_carried_from_attempt",
+        "feedback_carried_forward_by_attempt",
+        "reused_validation_report",
+        "reused_validation_report_from_attempt",
         "issue_status",
         "tracked_issue_id",
         "source_attempt",
         "source_candidate",
         "source_location",
+        "latest_confirmed_attempt",
+        "latest_confirmed_candidate",
+        "latest_confirmed_location",
+        "latest_validation_attempt",
         "status_note",
-        "problem_signature",
+        "validation_check",
+        "write_target",
+        "write_kind",
+        "target_sources",
         "runtime_diagnostics",
-        "operation_fingerprint",
-        "operation_identity",
-        "representative_locations",
     )
     result = {
         key: _shorten_feedback_text(issue[key])
         for key in retained
         if key in issue and issue[key] is not None
     }
+    diagnostics = result.get("runtime_diagnostics")
+    if isinstance(diagnostics, dict):
+        # Full diagnostics remain in validation_report.json.  The revision
+        # prompt keeps the failing operation, nearby source, relevant shapes,
+        # and interface facts without allowing one runtime root to crowd out
+        # other independently actionable roots.
+        line = issue.get("candidate_line")
+        excerpt = diagnostics.get("candidate_source_excerpt")
+        if isinstance(excerpt, list):
+            nearby = [
+                item
+                for item in excerpt
+                if isinstance(item, dict)
+                and (
+                    not isinstance(line, int)
+                    or abs(int(item.get("line", -1000000)) - line) <= 1
+                )
+            ]
+        else:
+            nearby = None
+        source_analysis = diagnostics.get("index_source_analysis")
+        relevant_names: set[str] = set()
+        origin_line = None
+        if isinstance(source_analysis, dict):
+            for key in ("indexed_expression", "mask_expression"):
+                value = source_analysis.get(key)
+                if isinstance(value, str) and value.isidentifier():
+                    relevant_names.add(value)
+            origin = source_analysis.get("state_slice_origin")
+            if isinstance(origin, dict) and isinstance(origin.get("line"), int):
+                origin_line = int(origin["line"])
+        if isinstance(excerpt, list) and origin_line is not None:
+            for item in excerpt:
+                if (
+                    isinstance(item, dict)
+                    and item.get("line") == origin_line
+                    and item not in nearby
+                ):
+                    nearby.insert(0, item)
+        local_summaries = diagnostics.get("local_array_summaries")
+        if isinstance(local_summaries, dict) and relevant_names:
+            local_summaries = {
+                name: value
+                for name, value in local_summaries.items()
+                if name in relevant_names
+            }
+        compact_diagnostics = {
+            key: diagnostics[key]
+            for key in (
+                "diagnostic_status",
+                "related_interface",
+                "diagnostic_summary",
+                "targeted_requirement",
+                "diagnostic_error_type",
+                "diagnostic_error",
+            )
+            if key in diagnostics
+        }
+        operation = diagnostics.get("traceback_operation")
+        if isinstance(operation, dict):
+            compact_diagnostics["traceback_operation"] = {
+                key: operation[key]
+                for key in ("node_type", "source")
+                if key in operation
+            }
+        if isinstance(source_analysis, dict):
+            compact_diagnostics["index_source_analysis"] = {
+                key: source_analysis[key]
+                for key in (
+                    "status",
+                    "indexed_expression",
+                    "mask_expression",
+                    "reason",
+                    "state_slice_origin",
+                )
+                if key in source_analysis
+            }
+        if nearby:
+            compact_diagnostics["candidate_source_excerpt"] = nearby
+        if local_summaries:
+            compact_diagnostics["local_array_summaries"] = local_summaries
+        result["runtime_diagnostics"] = compact_diagnostics
+    if result.get("latest_confirmed_candidate") == result.get("source_candidate"):
+        result.pop("latest_confirmed_candidate", None)
+    if result.get("latest_confirmed_location") == result.get("source_location"):
+        result.pop("latest_confirmed_location", None)
     if isinstance(result.get("source_locations"), list):
         locations = result["source_locations"]
         result["source_locations"] = locations[:3]
@@ -1904,9 +2079,13 @@ def run_design(
         snapshot = issue_tracker.snapshot()
         _write_json(directory / "issue_tracker.json", snapshot)
         _write_json(output / "issue_tracker.json", snapshot)
+        annotated_report = dict(report)
+        annotated_report["errors"] = issue_tracker.annotate_confirmed(
+            list(report.get("errors") or [])
+        )
         return _generated_feedback(
             _feedback_from_validation(
-                report,
+                annotated_report,
                 category,
                 historical_unverified=historical_unverified,
             ),
@@ -2171,27 +2350,63 @@ def run_design(
             )
             prior_failure = failed_candidates.get(current_candidate_fingerprint)
             if prior_failure is not None:
-                unresolved = [
-                    {
-                        **dict(issue),
-                        "carried_from_attempt": int(prior_failure["attempt"]),
-                        "issue_status": "previously_found_not_revalidated",
-                        "source_attempt": int(prior_failure["attempt"]),
-                        "source_candidate": prior_failure.get(
+                unresolved = []
+                for raw_issue in prior_failure["unresolved_issues"]:
+                    issue = dict(raw_issue)
+                    original_source_attempt = int(
+                        issue.get("source_attempt", prior_failure["attempt"])
+                    )
+                    original_source_candidate = issue.get(
+                        "source_candidate",
+                        prior_failure.get(
                             "candidate_identity",
                             {
                                 "kind": "parsed_candidate",
                                 "semantic_fingerprint": current_candidate_fingerprint,
                             },
                         ),
-                        "status_note": (
-                            "The duplicate check reused this earlier actionable issue; "
-                            "the current candidate was not re-executed, so the saved line "
-                            "belongs to the earlier candidate."
-                        ),
-                    }
-                    for issue in prior_failure["unresolved_issues"]
-                ]
+                    )
+                    original_source_location = issue.get(
+                        "source_location", issue.get("location")
+                    )
+                    issue.update(
+                        {
+                            "carried_from_attempt": int(attempt - 1),
+                            "feedback_carried_from_attempt": int(attempt - 1),
+                            "duplicate_matched_attempt": int(
+                                prior_failure["attempt"]
+                            ),
+                            "reused_validation_report": True,
+                            "reused_validation_report_from_attempt": int(
+                                prior_failure["attempt"]
+                            ),
+                            "issue_status": "not_revalidated",
+                            "source_attempt": original_source_attempt,
+                            "source_candidate": original_source_candidate,
+                            "source_location": original_source_location,
+                            "latest_confirmed_attempt": int(
+                                issue.get(
+                                    "latest_confirmed_attempt",
+                                    prior_failure["attempt"],
+                                )
+                            ),
+                            "latest_confirmed_candidate": issue.get(
+                                "latest_confirmed_candidate",
+                                prior_failure.get("candidate_identity"),
+                            ),
+                            "latest_confirmed_location": issue.get(
+                                "latest_confirmed_location", issue.get("location")
+                            ),
+                            "status_note": (
+                                "The duplicate check reused the validation report from "
+                                f"attempt {prior_failure['attempt']}; the current candidate "
+                                "was not revalidated. Source fields identify the original "
+                                "candidate, while latest-confirmed fields identify the most "
+                                "recent actual confirmation."
+                            ),
+                        }
+                    )
+                    unresolved.append(issue)
                 duplicate_report = {
                     "status": "failed",
                     "can_execute": False,
@@ -2210,6 +2425,7 @@ def run_design(
                                 "listed below; renaming or reformatting is not a revision."
                             ),
                             "matched_attempt": int(prior_failure["attempt"]),
+                            "reused_validation_report": True,
                         }
                     ] + unresolved,
                     "checks": {

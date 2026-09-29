@@ -37,7 +37,7 @@ preference for the parser-error location. The environment interface, schema,
 evaluation rules, and output reservation are never silently removed.
 
 Qwen, Gemma, and GPT-4o use the same provider-neutral English master prompt
-(`uav-hrl-llm-design-prompt-v3`). Provider adapters change only transport and
+(`uav-hrl-llm-design-prompt-v4`). Provider adapters change only transport and
 provider-specific request fields; they do not maintain separate task prompts.
 The saved prompt for each attempt is the exact fully assembled request content.
 Its environment interface is generated from the fixed artifact's authoritative
@@ -91,12 +91,23 @@ r_candidate(lambda) = r_base(lambda) + beta * r_extra
 ```
 
 The worker statically excludes imports, arbitrary attributes/calls, reflection,
-I/O, dynamic execution, randomness, and mutation. It exposes only the listed
+I/O, dynamic execution, randomness, and mutation of input-backed data. It exposes only the listed
 NumPy subset and safe built-ins, runs in a terminable subprocess, checks every
 fixed sample twice for determinism, compares inputs before/after, and exercises
 an empty/missing-data probe. Fixed samples and the empty probe share the same
 dtype, shape, finite-value, declared-range, global-range, determinism, mutation,
 and weighted-extra-reward checks.
+
+Indexed assignment may fill an independently allocated local array created by
+the documented NumPy operations (`zeros`, `ones`, `arange`, or copying
+`array`, together with other whitelisted array-producing expressions). Local
+aliases and slices retain that ownership. Direct input aliases, input slices,
+`asarray` views that may share input storage, rebinding to an input, and a
+control-flow merge with any input-backed path remain read-only. An unresolved
+write target is rejected as unconfirmed rather than falsely reported as proven
+input mutation. This limited ownership analysis is shared by design-time
+validation, isolated execution, and approved-artifact loading; the worker's
+read-only arrays and before/after comparison remain independent defenses.
 
 The prompt's parseable example is deliberately a zero-weight formatting
 example, not an approved design recommendation. It selects movement-controlled
@@ -225,10 +236,14 @@ always uses the immediately preceding output as its correction target: a
 successfully parsed full candidate, or the failed raw final content plus its
 parse error. It also carries earlier actionable issues whose relevant check
 could not run successfully in the latest attempt. Such issues are marked
-`previously_found_not_revalidated`, retain their source attempt/candidate and
-old location, and leave the pending prompt only after that validation stage
-passes over its configured scope. `issue_tracker.json` preserves pending and
-resolved histories plus the evidence for each status change. Reasoning-only
+`not_revalidated`, retain their original source attempt/candidate/location and
+their latest actual confirmation separately, and leave the pending prompt only
+after the corresponding fine-grained check completes without finding the root.
+For example, a completed allowed-call check can resolve a removed `append` even
+when a separate source-field check still fails. Python syntax failure leaves
+AST-dependent roots `not_revalidated`. `issue_tracker.json` preserves
+`confirmed_current`, `not_revalidated`, and `resolved` histories plus the
+evidence for each status change. Reasoning-only
 text is stored locally but is not replayed as candidate code. Each attempt's
 `prompt_feedback.json` is explicitly
 the incoming feedback used for that request and records its source attempt;
@@ -243,8 +258,10 @@ declaration errors are keyed by feature index and source field, so two missing
 fields on one feature and the same missing field on two features remain separate.
 Repeated occurrences of the same root retain representative locations. A
 semantically repeated failed candidate carries the original concrete issues as
-a flat list alongside the matched attempt number; it does not nest earlier
-feedback or leave only a generic duplicate warning. The candidate itself is
+a flat list alongside the immediately preceding feedback attempt, duplicate
+matched attempt, and reused-validation-report attempt.
+It does not overwrite the original source with the matched attempt, nest
+earlier feedback, or leave only a generic duplicate warning. The candidate itself is
 never truncated or rewritten; if even minimum actionable feedback cannot fit,
 the run stops with `context_budget_exceeded`. The first
 passing attempt creates:

@@ -28,6 +28,7 @@ from llm_candidate import (
     parse_candidate_json,
     parse_candidate_json_envelope,
     validate_candidate,
+    validate_candidate_staged,
 )
 from llm_design import (
     APIError,
@@ -202,6 +203,31 @@ def _candidate(*, passing=True, code=None, name="candidate"):
         ],
         "code": code,
     }
+
+
+def _local_buffer_candidate(*, name="local-buffer-candidate"):
+    candidate = _candidate(
+        name=name,
+        code=(
+            "def compute_extra_state(obs, constants):\n"
+            "    count = int(constants[\"num_uav\"])\n"
+            "    values = np.zeros(count)\n"
+            "    for k in range(count):\n"
+            "        raw = obs[\"state\"][17 * k]\n"
+            "        values[k] = np.clip(raw * raw, 0.0, 1.0)\n"
+            "    return np.asarray([np.mean(values)], dtype=np.float32)\n"
+        ),
+    )
+    candidate["features"][0].update(
+        {
+            "name": "mean_squared_uav_x",
+            "description": "Test fixture using a local temporary array.",
+            "source_fields": ["obs.state", "constants.num_uav"],
+            "formula": "mean of squared normalized UAV x values",
+            "missing_data_rule": "The fixed UAV block is always present.",
+        }
+    )
+    return candidate
 
 
 def _response(candidate, *, finish_reason="stop", model="qwen/qwen3.5-9b"):
@@ -430,7 +456,7 @@ def test_prompt_is_complete_current_only_and_example_parses(design_fixture):
 
 def test_master_prompt_has_exact_placeholder_contract_and_supported_operations_match():
     template = PROMPT_TEMPLATE_PATH.read_text(encoding="utf-8")
-    assert PROMPT_VERSION == "uav-hrl-llm-design-prompt-v3"
+    assert PROMPT_VERSION == "uav-hrl-llm-design-prompt-v4"
     assert {
         token
         for token in (
@@ -1641,13 +1667,16 @@ def test_repeated_failed_candidate_is_diagnosed_and_cannot_be_approved(tmp_path)
     for name in ("full", "compact_all_roots"):
         codes = [item["code"] for item in variants[name]["confirmed_errors"]]
         assert "DUPLICATE_FAILED_CANDIDATE" in codes
-        assert "STATIC_EXPLICIT_FEATURE_REDUNDANCY" in codes
+        historical_codes = [
+            item["code"] for item in variants[name]["historical_unverified_errors"]
+        ]
+        assert "STATIC_EXPLICIT_FEATURE_REDUNDANCY" in historical_codes
     duplicate_summary = variants["compact_all_roots"]["prompt_feedback_summary"]
     assert duplicate_summary["original_error_count"] == 2
     assert duplicate_summary["included_error_count"] == 2
     assert duplicate_summary["omitted_error_count"] == 0
     selected, omitted = llm_design._select_feedback_representatives(
-        feedback["confirmed_errors"], 1
+        feedback["confirmed_errors"] + feedback["historical_unverified_errors"], 1
     )
     assert omitted == 0
     assert {item["code"] for item in selected} == {
@@ -2386,7 +2415,7 @@ def test_two_runtime_locations_survive_json_failure_prompt_and_duplicate_check(
     assert "Previous failed raw final content" in third_prompt
     assert raw_claim in third_prompt or "[TRUNCATED:" in third_prompt
     assert "JSON_PARSE_ERROR" in third_prompt
-    assert third_prompt.count("previously_found_not_revalidated") >= 2
+    assert third_prompt.count("not_revalidated") >= 2
     assert "candidate line 7" in third_prompt
     assert "candidate line 9" in third_prompt
     duplicate = json.loads(
@@ -2407,7 +2436,7 @@ def test_two_runtime_locations_survive_json_failure_prompt_and_duplicate_check(
     assert len(
         [
             item
-            for item in compact["confirmed_errors"]
+            for item in compact["historical_unverified_errors"]
             if item["code"] == "RUNTIME_FUNCTION_ERROR"
         ]
     ) == 2
@@ -2499,7 +2528,7 @@ def test_parse_failure_carries_prior_runtime_issue_into_actual_next_request(
     third_prompt = client.calls[2]["prompt"]
     assert raw_claim in third_prompt
     assert "JSON_PARSE_ERROR" in third_prompt
-    assert "previously_found_not_revalidated" in third_prompt
+    assert "not_revalidated" in third_prompt
     assert "IndexError" in third_prompt
     assert "state[7::17]" in third_prompt
     assert "half-open UAV block [0:272)" in third_prompt
@@ -2563,7 +2592,7 @@ def test_runtime_issue_resolves_only_after_execution_passes_and_history_remains(
         "static",
     ]
     assert any(
-        item["status"] == "previously_found_not_revalidated"
+        item["status"] == "not_revalidated"
         for item in runtime["history"]
     )
 
@@ -2592,7 +2621,7 @@ def test_compact_feedback_keeps_current_and_historical_issue_provenance():
                 "problem_signature": "boolean index dimension mismatch",
                 "problem": "boolean index length mismatch",
                 "requirement": "Limit the state slice to the UAV block.",
-                "issue_status": "previously_found_not_revalidated",
+                "issue_status": "not_revalidated",
                 "source_attempt": 1,
                 "source_candidate": {"semantic_fingerprint": "abc"},
                 "source_location": "compute_extra_state at candidate line 7",
@@ -2608,7 +2637,7 @@ def test_compact_feedback_keeps_current_and_historical_issue_provenance():
     ]
     historical = smallest["historical_unverified_errors"]
     assert len(historical) == 1
-    assert historical[0]["issue_status"] == "previously_found_not_revalidated"
+    assert historical[0]["issue_status"] == "not_revalidated"
     assert historical[0]["source_attempt"] == 1
     summary = smallest["prompt_feedback_summary"]
     assert summary["historical_unverified_original_count"] == 1
@@ -2643,8 +2672,370 @@ def test_earlier_new_runtime_failure_does_not_resolve_old_runtime_issue(tmp_path
     assert result["status"] == "approved"
     third_prompt = client.calls[2]["prompt"]
     assert "index 9999 is out of bounds" in third_prompt
-    assert "previously_found_not_revalidated" in third_prompt
+    assert "not_revalidated" in third_prompt
     assert "state[7::17]" in third_prompt
+
+
+def test_local_temporary_array_loop_writes_pass_static_worker_and_preserve_inputs(
+    design_fixture,
+):
+    _, arrays, _, _, constants = design_fixture
+    candidate = _local_buffer_candidate()
+    staged = validate_candidate_staged(candidate, constants)
+    assert staged["status"] == "passed"
+    validate_candidate(candidate, constants)
+    obs = build_obs_arrays(arrays)
+    before = {name: np.asarray(value).copy() for name, value in obs.items()}
+    extra, reward, report = execute_candidate_isolated(
+        candidate, obs, constants, timeout=10
+    )
+    assert extra.shape == (6, 1)
+    assert reward.tolist() == pytest.approx([0.0] * 6)
+    assert report["input_mutation_check"].startswith("passed")
+    assert all(np.array_equal(obs[name], value) for name, value in before.items())
+
+
+@pytest.mark.parametrize(
+    "alias_lines",
+    [
+        (
+            "    values = np.zeros(3)\n"
+            "    alias = values\n"
+            '    alias[0] = np.clip(obs["state"][0] * obs["state"][0], 0.0, 1.0)\n'
+        ),
+        (
+            "    values = np.zeros(3)\n"
+            "    view = values[1:]\n"
+            '    view[0] = np.clip(obs["state"][0] * obs["state"][0], 0.0, 1.0)\n'
+        ),
+    ],
+)
+def test_local_owned_alias_and_slice_writes_are_allowed(design_fixture, alias_lines):
+    _, arrays, _, _, constants = design_fixture
+    candidate = _candidate(
+        code=(
+            "def compute_extra_state(obs, constants):\n"
+            f"{alias_lines}"
+            "    return np.asarray([np.mean(values)], dtype=np.float32)\n"
+        )
+    )
+    validate_candidate(candidate, constants)
+    extra, _, report = execute_candidate_isolated(
+        candidate, build_obs_arrays(arrays), constants, timeout=10
+    )
+    assert extra.shape == (6, 1)
+    assert report["input_mutation_check"].startswith("passed")
+
+
+@pytest.mark.parametrize(
+    "setup,target",
+    [
+        ('    target = obs["state"]\n', "target[0]"),
+        ('    target = obs["state"][0:16]\n', "target[0]"),
+        ('    target = np.asarray(obs["state"])\n', "target[0]"),
+        ("", 'obs["state"][0]'),
+    ],
+)
+def test_input_alias_slice_and_asarray_writes_remain_rejected(
+    design_fixture, setup, target
+):
+    _, _, _, _, constants = design_fixture
+    candidate = _candidate(
+        code=(
+            "def compute_extra_state(obs, constants):\n"
+            f"{setup}"
+            f"    {target} = 0.0\n"
+            '    value = np.clip(obs["state"][0] * obs["state"][0], 0.0, 1.0)\n'
+            "    return np.asarray([value], dtype=np.float32)\n"
+        )
+    )
+    staged = validate_candidate_staged(candidate, constants)
+    mutation = [
+        issue
+        for issue in staged["errors"]
+        if issue["code"] == "STATIC_INPUT_MUTATION"
+    ]
+    assert len(mutation) == 1
+    assert mutation[0]["validation_check"] == "static.mutation"
+    assert "independent buffer" in mutation[0]["requirement"]
+    with pytest.raises(CandidateError, match="may share data with obs or constants"):
+        validate_candidate(candidate, constants)
+
+
+@pytest.mark.parametrize(
+    "setup",
+    [
+        '    target = np.zeros(16)\n    target = obs["state"]\n',
+        (
+            "    target = np.zeros(16)\n"
+            '    if obs["state"][0] > 0.0:\n'
+            '        target = obs["state"]\n'
+        ),
+    ],
+)
+def test_rebinding_or_branch_merge_cannot_retain_stale_local_ownership(
+    design_fixture, setup
+):
+    _, _, _, _, constants = design_fixture
+    candidate = _candidate(
+        code=(
+            "def compute_extra_state(obs, constants):\n"
+            f"{setup}"
+            "    target[0] = 0.0\n"
+            '    value = np.clip(obs["state"][0] * obs["state"][0], 0.0, 1.0)\n'
+            "    return np.asarray([value], dtype=np.float32)\n"
+        )
+    )
+    report = validate_candidate_staged(candidate, constants)
+    issue = next(
+        issue for issue in report["errors"] if issue["code"] == "STATIC_INPUT_MUTATION"
+    )
+    assert "input_shared" in issue["target_sources"]
+
+
+def _append_static_failure_candidate(*, name, leading_comment=False):
+    comment = "    # line movement must not change root identity\n" if leading_comment else ""
+    candidate = _candidate(
+        name=name,
+        code=(
+            "def compute_extra_state(obs, constants):\n"
+            f"{comment}"
+            "    values = list()\n"
+            "    values.append(0.0)\n"
+            "    return np.asarray([0.0], dtype=np.float32)\n"
+        ),
+    )
+    return candidate
+
+
+def test_static_subcheck_resolves_removed_call_despite_other_static_error(
+    design_fixture,
+):
+    _, _, _, _, constants = design_fixture
+    tracker = llm_design._IssueTracker()
+    first = validate_candidate_staged(
+        _append_static_failure_candidate(name="append-first"), constants
+    )
+    assert any(issue["code"] == "STATIC_NUMPY_CALL" for issue in first["errors"])
+    tracker.apply(first, attempt=1, candidate_identity={"candidate_name": "append-first"})
+
+    second_candidate = _candidate(
+        name="missing-source",
+        code=(
+            "def compute_extra_state(obs, constants):\n"
+            '    value = np.count_nonzero(obs["movement_mask"])\n'
+            "    return np.asarray([np.clip(value, 0.0, 1.0)], dtype=np.float32)\n"
+        ),
+    )
+    second = validate_candidate_staged(second_candidate, constants)
+    assert any(
+        issue["code"] == "STATIC_UNDECLARED_FEATURE_SOURCE"
+        for issue in second["errors"]
+    )
+    carried = tracker.apply(
+        second, attempt=2, candidate_identity={"candidate_name": "missing-source"}
+    )
+    assert not any(issue["code"] == "STATIC_NUMPY_CALL" for issue in carried)
+    snapshot = tracker.snapshot()
+    append_record = next(
+        item for item in snapshot["records"] if item["issue"]["code"] == "STATIC_NUMPY_CALL"
+    )
+    assert append_record["status"] == "resolved"
+    assert append_record["resolution_evidence"]["validation_check"] == (
+        "static.allowed_operations"
+    )
+
+
+def test_syntax_failure_keeps_prior_static_issue_not_revalidated(design_fixture):
+    _, _, _, _, constants = design_fixture
+    tracker = llm_design._IssueTracker()
+    first = validate_candidate_staged(
+        _append_static_failure_candidate(name="append-first"), constants
+    )
+    tracker.apply(first, attempt=1, candidate_identity={"candidate_name": "append-first"})
+    syntax = _candidate(
+        name="syntax-error",
+        code="def compute_extra_state(obs, constants):\n    if:\n        return 0\n",
+    )
+    second = validate_candidate_staged(syntax, constants)
+    assert second["checks"]["static"]["subchecks"]["allowed_operations"][
+        "completed"
+    ] is False
+    carried = tracker.apply(
+        second, attempt=2, candidate_identity={"candidate_name": "syntax-error"}
+    )
+    append = next(issue for issue in carried if issue["code"] == "STATIC_NUMPY_CALL")
+    assert append["issue_status"] == "not_revalidated"
+    assert append["source_attempt"] == 1
+    assert append["latest_validation_attempt"] == 2
+
+
+def test_static_issue_identity_ignores_comment_line_shift_but_not_distinct_position(
+    design_fixture,
+):
+    _, _, _, _, constants = design_fixture
+    tracker = llm_design._IssueTracker()
+    first = validate_candidate_staged(
+        _append_static_failure_candidate(name="first"), constants
+    )
+    shifted = validate_candidate_staged(
+        _append_static_failure_candidate(name="shifted", leading_comment=True), constants
+    )
+    tracker.apply(first, attempt=1, candidate_identity={"candidate_name": "first"})
+    tracker.apply(shifted, attempt=2, candidate_identity={"candidate_name": "shifted"})
+    append_records = [
+        item
+        for item in tracker.snapshot()["records"]
+        if item["issue"]["code"] == "STATIC_NUMPY_CALL"
+    ]
+    assert len(append_records) == 1
+    assert append_records[0]["first_detected_attempt"] == 1
+    assert append_records[0]["latest_confirmed_attempt"] == 2
+
+    two_positions = _candidate(
+        name="two-distinct-appends",
+        code=(
+            "def compute_extra_state(obs, constants):\n"
+            "    first = list()\n"
+            "    first.append(0.0)\n"
+            "    second = list()\n"
+            "    second.append(1.0)\n"
+            "    return np.asarray([0.0], dtype=np.float32)\n"
+        ),
+    )
+    distinct = validate_candidate_staged(two_positions, constants)
+    tracker.apply(
+        distinct, attempt=3, candidate_identity={"candidate_name": "two-distinct-appends"}
+    )
+    current_append_records = [
+        item
+        for item in tracker.snapshot()["records"]
+        if item["issue"]["code"] == "STATIC_NUMPY_CALL"
+        and item["status"] == "confirmed_current"
+    ]
+    assert len(current_append_records) == 2
+    assert len(
+        {item["issue"]["operation_fingerprint"] for item in current_append_records}
+    ) == 2
+
+
+def test_unconfirmed_write_target_is_rejected_without_claiming_input_mutation(
+    design_fixture,
+):
+    _, _, _, _, constants = design_fixture
+    candidate = _candidate(
+        name="unknown-write-owner",
+        code=(
+            "def compute_extra_state(obs, constants):\n"
+            '    target = np.mean(obs["state"])\n'
+            "    target[0] = 0.0\n"
+            "    return np.asarray([0.0], dtype=np.float32)\n"
+        ),
+    )
+    report = validate_candidate_staged(candidate, constants)
+    issue = next(
+        item
+        for item in report["errors"]
+        if item["code"] == "STATIC_UNCONFIRMED_WRITE_TARGET"
+    )
+    assert "cannot confirm" in issue["problem"]
+    assert "may share" not in issue["problem"]
+    assert "supported independent allocation" in issue["requirement"]
+
+
+def test_duplicate_reuse_preserves_original_issue_provenance(tmp_path):
+    fixed = _fixed_artifact(tmp_path)
+    first = _append_static_failure_candidate(name="first")
+    second = _append_static_failure_candidate(name="renamed", leading_comment=True)
+    third = _append_static_failure_candidate(name="renamed-again", leading_comment=True)
+    client = MockClient([_response(first), _response(second), _response(third)])
+    result = run_design(
+        fixed_sample=fixed,
+        model=client.model,
+        client=client,
+        max_attempts=3,
+        output_dir=tmp_path / "duplicate-provenance",
+        worker_timeout=10,
+    )
+    assert result["status"] == "failed_no_approved_candidate"
+    for attempt in (2, 3):
+        report = json.loads(
+            (
+                tmp_path
+                / "duplicate-provenance"
+                / f"attempt_{attempt:02d}"
+                / "validation_report.json"
+            ).read_text()
+        )
+        reused = next(
+            issue for issue in report["errors"] if issue["code"] == "STATIC_NUMPY_CALL"
+        )
+        assert reused["source_attempt"] == 1
+        assert reused["latest_confirmed_attempt"] == 1
+        assert reused["feedback_carried_from_attempt"] == attempt - 1
+        assert reused["duplicate_matched_attempt"] == 1
+        assert reused["reused_validation_report"] is True
+        assert reused["reused_validation_report_from_attempt"] == 1
+        feedback = json.loads(
+            (
+                tmp_path
+                / "duplicate-provenance"
+                / f"attempt_{attempt:02d}"
+                / "feedback.json"
+            ).read_text()
+        )
+        carried = next(
+            issue
+            for issue in feedback["historical_unverified_errors"]
+            if issue["code"] == "STATIC_NUMPY_CALL"
+        )
+        assert carried["source_attempt"] == 1
+        assert carried["feedback_carried_from_attempt"] == attempt - 1
+        assert carried["duplicate_matched_attempt"] == 1
+
+
+@pytest.mark.parametrize(
+    "provider,model",
+    [
+        ("lmstudio", "qwen/qwen3.5-9b"),
+        ("lmstudio", "google/gemma-4-e4b"),
+        ("openai", "gpt-4o"),
+    ],
+)
+def test_all_providers_receive_actionable_mutation_feedback_then_accept_local_buffer(
+    tmp_path, provider, model
+):
+    fixed = _fixed_artifact(tmp_path)
+    invalid = _candidate(
+        name="input-write",
+        code=(
+            "def compute_extra_state(obs, constants):\n"
+            '    target = obs["state"]\n'
+            "    target[0] = 0.0\n"
+            '    value = np.clip(obs["state"][0] * obs["state"][0], 0.0, 1.0)\n'
+            "    return np.asarray([value], dtype=np.float32)\n"
+        ),
+    )
+    fixed_candidate = _local_buffer_candidate(name="fixed-local-buffer")
+    client = MockClient(
+        [_response(invalid, model=model), _response(fixed_candidate, model=model)],
+        model=model,
+    )
+    result = run_design(
+        fixed_sample=fixed,
+        provider=provider,
+        model=model,
+        client=client,
+        max_attempts=2,
+        output_dir=tmp_path / f"mutation-{provider}-{model.split('/')[-1]}",
+        worker_timeout=10,
+    )
+    assert result["status"] == "approved"
+    assert len(client.calls) == 2
+    assert "STATIC_INPUT_MUTATION" in client.calls[1]["prompt"]
+    assert "independent buffer" in client.calls[1]["prompt"]
+    loaded = load_approved_design(result["approved_artifact"])
+    assert loaded.candidate["candidate_name"] == "fixed-local-buffer"
 
 
 @pytest.mark.parametrize(
