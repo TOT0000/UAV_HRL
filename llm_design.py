@@ -79,6 +79,8 @@ DEFAULT_ABSOLUTE_TOLERANCE = 1e-12
 DEFAULT_RELATIVE_TOLERANCE = 1e-6
 DEFAULT_OUTPUT_ROOT = Path("results") / "llm_designs"
 DEFAULT_FAILED_CONTENT_LIMIT = 12_000
+EVALUATION_DIAGNOSTICS_VERSION = "uav-hrl-lipschitz-evaluation-diagnostics-v2"
+EVALUATION_FINDING_ABSOLUTE_TOLERANCE = 1e-6
 
 EVALUATION_REVISION_INSTRUCTION = """Your candidate passed the implementation checks but did not meet
 the Lipschitz improvement criterion.
@@ -810,7 +812,7 @@ def _source_field_contract(
 
 def _candidate_diagnostic_dependencies(
     candidate: dict[str, Any],
-) -> tuple[dict[str, list[str]], list[str], list[str]]:
+) -> tuple[dict[str, list[str]], list[str], list[str], dict[str, list[str]]]:
     by_feature: dict[str, list[str]] = {}
     declared: set[str] = set()
     for index, feature in enumerate(candidate["features"]):
@@ -821,17 +823,72 @@ def _candidate_diagnostic_dependencies(
         )
         by_feature[str(index)] = fields
         declared.update(fields)
-    supporting = {"obs.movement_mask"}
+    supporting: set[str] = set()
+    reasons: dict[str, set[str]] = {}
+
+    def add_support(field: str, reason: str) -> None:
+        supporting.add(field)
+        reasons.setdefault(field, set()).add(reason)
+
+    add_support(
+        "obs.movement_mask",
+        "distinguishes the current centralized-control set and its empty-set case",
+    )
     for field in declared:
         if not field.startswith("obs."):
             continue
-        spec = SNAPSHOT_FIELD_SPECS.get(field[4:])
+        name = field[4:]
+        spec = SNAPSHOT_FIELD_SPECS.get(name)
         if spec is not None:
             if field != "obs.snapshot_valid":
-                supporting.add("obs.snapshot_valid")
+                add_support(
+                    "obs.snapshot_valid",
+                    f"establishes whether the snapshot containing {field} was recorded",
+                )
             if spec.get("mask"):
-                supporting.add(f"obs.{spec['mask']}")
-    return by_feature, sorted(declared), sorted(supporting.difference(declared))
+                add_support(
+                    f"obs.{spec['mask']}",
+                    f"is the authoritative validity mask for {field}",
+                )
+        if name.startswith("sr_") or name.startswith("s2u_"):
+            add_support("obs.sr_id", f"maps compact SR rows used by {field} to SR ids")
+            add_support(
+                "obs.sr_observable",
+                f"marks which compact SR rows used by {field} are observable",
+            )
+        if name.startswith("roi_") or name.startswith("vs_"):
+            add_support("obs.roi_id", f"maps compact RoI rows relevant to {field}")
+            add_support(
+                "obs.roi_observable",
+                f"marks which compact RoI rows relevant to {field} are observable",
+            )
+        if name.startswith("sr_roi_"):
+            add_support(
+                "obs.sr_roi_id", f"provides the observable SR-to-RoI id mapping for {field}"
+            )
+            add_support(
+                "obs.sr_roi_mapping_valid",
+                f"validates the SR-to-RoI id mapping used to interpret {field}",
+            )
+        if name.startswith("task_"):
+            for support_name, purpose in (
+                ("task_type", "identifies whether a target id denotes an RoI or SR"),
+                ("task_target_id", "provides the assigned service-target id"),
+                ("task_pair_valid", "marks populated task-assignment slots"),
+                ("task_target_valid", "marks decision-visible service targets"),
+                ("sr_id", "maps COM target ids to observable SR rows"),
+                ("sr_observable", "marks observable SR rows"),
+                ("roi_id", "maps VS target ids to discovered RoI rows"),
+                ("roi_observable", "marks observable RoI rows"),
+            ):
+                add_support(f"obs.{support_name}", f"{purpose} for {field}")
+    support_only = sorted(supporting.difference(declared))
+    return (
+        by_feature,
+        sorted(declared),
+        support_only,
+        {field: sorted(reasons.get(field, set())) for field in support_only},
+    )
 
 
 def _sample_input_diagnostic(
@@ -882,6 +939,143 @@ def _sample_input_diagnostic(
     return values, limitations
 
 
+def _pair_numeric_findings(
+    *,
+    pair_records: dict[str, Any],
+    lambda_records: dict[str, Any],
+    extra: np.ndarray,
+    reward_extra: np.ndarray,
+    obs_arrays: dict[str, np.ndarray] | None,
+) -> list[dict[str, Any]]:
+    pair_lambdas: dict[str, list[str]] = {}
+    for lambda_key, record in lambda_records.items():
+        pair_lambdas.setdefault(str(record["maximum_pair_ref"]), []).append(lambda_key)
+    findings: list[dict[str, Any]] = []
+    tolerance = float(EVALUATION_FINDING_ABSOLUTE_TOLERANCE)
+    movement = None if obs_arrays is None else obs_arrays.get("movement_mask")
+    movement = None if movement is None else np.asarray(movement, dtype=bool)
+    for pair_ref, pair in pair_records.items():
+        i = int(str(pair["sample_i_ref"]).split("_", 1)[1])
+        j = int(str(pair["sample_j_ref"]).split("_", 1)[1])
+        difference = np.asarray(extra[i] - extra[j], dtype=np.float64)
+        maximum_absolute_difference = (
+            0.0 if difference.size == 0 else float(np.max(np.abs(difference)))
+        )
+        difference_norm = float(np.linalg.norm(difference))
+        exactly_equal = bool(np.array_equal(extra[i], extra[j]))
+        within_tolerance = bool(
+            np.allclose(extra[i], extra[j], rtol=0.0, atol=tolerance)
+        )
+        extra_reward_difference = float(reward_extra[i] - reward_extra[j])
+        common = {
+            "pair_ref": pair_ref,
+            "lambda_refs": sorted(pair_lambdas.get(pair_ref, [])),
+            "evidence": {
+                "feature_vector_comparison": (
+                    "exactly_equal"
+                    if exactly_equal
+                    else "different_but_within_tolerance"
+                    if within_tolerance
+                    else "different_beyond_tolerance"
+                ),
+                "feature_difference_l2_norm": difference_norm,
+                "maximum_absolute_feature_difference": maximum_absolute_difference,
+                "extra_reward_difference_i_minus_j": extra_reward_difference,
+            },
+        }
+        if exactly_equal:
+            findings.append(
+                {
+                    "code": "IDENTICAL_ADDED_FEATURE_VECTOR_ON_MAXIMUM_PAIR",
+                    **common,
+                    "message": (
+                        "The added feature vectors are identical on this pair. "
+                        "Consequently, the added state distance and the extra-reward "
+                        "difference are zero. Changing only the fixed weights while "
+                        "preserving these feature outputs cannot change this pair's ratio."
+                    ),
+                    "revision_direction": (
+                        "Review feature selection and computation for this pair rather "
+                        "than changing only the fixed weights."
+                    ),
+                    "scope_note": (
+                        "This conclusion applies only to this pair and these exact "
+                        "feature outputs; it is not a claim about all fixed samples."
+                    ),
+                }
+            )
+        elif extra_reward_difference == 0.0:
+            findings.append(
+                {
+                    "code": "EQUAL_EXTRA_REWARD_WITH_DIFFERENT_FEATURE_VECTOR",
+                    **common,
+                    "message": (
+                        "The added feature vectors differ, but the current fixed weights "
+                        "produce equal extra reward on this pair. The current extra reward "
+                        "does not change the pair's reward difference, while the added "
+                        "features can still change its state distance."
+                    ),
+                    "revision_direction": (
+                        "Inspect the per-feature weighted contributions for cancellation "
+                        "or missing task-relevant distinctions."
+                    ),
+                    "scope_note": (
+                        "Equal extra reward under the current weights does not imply that "
+                        "the added features have no effect."
+                    ),
+                }
+            )
+        if not exactly_equal and within_tolerance:
+            findings.append(
+                {
+                    "code": "NEAR_BUT_NOT_IDENTICAL_ADDED_FEATURE_VECTOR",
+                    **common,
+                    "message": (
+                        "The added feature vectors are not exactly identical, although "
+                        "their differences are within the recorded diagnostic tolerance."
+                    ),
+                    "revision_direction": (
+                        "Treat the nonzero differences as measured evidence; do not infer "
+                        "that changing weights is mathematically unable to affect this pair."
+                    ),
+                    "scope_note": "No exact-equality conclusion is made for this pair.",
+                }
+            )
+        if (
+            movement is not None
+            and i < movement.shape[0]
+            and j < movement.shape[0]
+            and not np.any(movement[i])
+            and not np.any(movement[j])
+        ):
+            findings.append(
+                {
+                    "code": "EMPTY_MOVEMENT_MASK_ON_BOTH_PAIR_OBSERVATIONS",
+                    "pair_ref": pair_ref,
+                    "lambda_refs": sorted(pair_lambdas.get(pair_ref, [])),
+                    "evidence": {
+                        "sample_i_true_indices": [],
+                        "sample_j_true_indices": [],
+                        "movement_mask_shape": list(movement[i].shape),
+                    },
+                    "message": (
+                        "Both observations have an empty movement_mask. Inspect whether "
+                        "empty-selection handling limits feature discrimination. An empty "
+                        "control mask does not imply that all observable information is invalid."
+                    ),
+                    "revision_direction": (
+                        "Check empty-selection branches while retaining other valid "
+                        "current-only observable inputs."
+                    ),
+                    "scope_note": (
+                        "This is an observed condition, not evidence that the movement "
+                        "mask caused every feature output."
+                    ),
+                }
+            )
+    return findings
+
+
 def _build_lipschitz_evaluation_diagnostics(
     *,
     context: EvaluationContext,
@@ -896,7 +1090,7 @@ def _build_lipschitz_evaluation_diagnostics(
     obs_arrays: dict[str, np.ndarray] | None,
     constants_metadata: dict[str, Any] | None,
 ) -> dict[str, Any]:
-    by_feature, declared_fields, supporting_fields = (
+    by_feature, declared_fields, supporting_fields, supporting_field_reasons = (
         _candidate_diagnostic_dependencies(candidate)
     )
     all_input_fields = sorted(set(declared_fields).union(supporting_fields))
@@ -1061,7 +1255,53 @@ def _build_lipschitz_evaluation_diagnostics(
         )
         for field in all_input_fields
     }
+    findings = _pair_numeric_findings(
+        pair_records=pair_records,
+        lambda_records=lambda_records,
+        extra=extra,
+        reward_extra=reward_extra,
+        obs_arrays=obs_arrays,
+    )
+    finding_definitions: dict[str, dict[str, str]] = {}
+    for finding in findings:
+        code = str(finding["code"])
+        finding_definitions.setdefault(
+            code,
+            {
+                key: str(finding.pop(key))
+                for key in ("message", "revision_direction", "scope_note")
+            },
+        )
+    observed_names = {
+        field[4:] for field in all_input_fields if field.startswith("obs.")
+    }
+    axis_and_id_mapping: dict[str, str] = {}
+    if any(
+        name == "state"
+        or name == "movement_mask"
+        or name.startswith(("uav_", "u2u_", "u2g_", "s2u_", "task_", "vs_"))
+        for name in observed_names
+    ):
+        axis_and_id_mapping["uav"] = "UAV array row index equals UAV id"
+    if any(
+        name.startswith(("sr_", "roi_", "s2u_", "task_", "vs_"))
+        for name in observed_names
+    ):
+        axis_and_id_mapping["roi_and_sr"] = (
+            "RoI/SR arrays use compact padded rows; roi_id/sr_id must be matched "
+            "under observability/validity flags and are not row indices"
+        )
+        axis_and_id_mapping["missingness"] = (
+            "invalid/padded IDs use -1 and numeric padding uses zero; validity flags "
+            "distinguish missing/invalid data from valid zero values and empty queues"
+        )
+    if any(name.startswith(("u2u_", "u2g_", "s2u_")) for name in observed_names):
+        axis_and_id_mapping["links"] = (
+            "U2U=[sender_uav,receiver_uav], U2G=[sender_uav], "
+            "S2U=[compact_sr_row,receiver_uav]"
+        )
     return {
+        "schema_version": EVALUATION_DIAGNOSTICS_VERSION,
         "diagnostic_scope": (
             "candidate maximum-ratio pairs from the unchanged fixed primary pair set; "
             "this is finite-sample evidence, not a training guarantee"
@@ -1078,31 +1318,28 @@ def _build_lipschitz_evaluation_diagnostics(
             "feature_source_fields": by_feature,
             "declared_source_fields": declared_fields,
             "supporting_fields_added_for_interpretation": supporting_fields,
+            "supporting_field_reasons": supporting_field_reasons,
             "limitation": (
                 "source_fields identify allowed field dependencies but are not a general "
                 "runtime tracer; no unverified intermediate expression or state slice is inferred"
             ),
         },
-        "axis_and_id_mapping": {
-            "uav": "UAV array row index equals UAV id",
-            "roi_and_sr": (
-                "RoI/SR arrays use compact padded rows; roi_id/sr_id must be matched "
-                "under observability/validity flags and are not row indices"
-            ),
-            "links": (
-                "U2U=[sender_uav,receiver_uav], U2G=[sender_uav], "
-                "S2U=[compact_sr_row,receiver_uav]"
-            ),
-            "missingness": (
-                "invalid/padded IDs use -1 and numeric padding uses zero; validity flags "
-                "distinguish missing/invalid data from valid zero values and empty queues"
-            ),
-        },
+        "axis_and_id_mapping": axis_and_id_mapping,
         "source_field_contracts": contracts,
         "constants": constant_values,
         "samples": samples,
         "pairs": pair_records,
         "by_lambda": lambda_records,
+        "findings": findings,
+        "finding_definitions": finding_definitions,
+        "finding_contract": {
+            "exact_equality": "np.array_equal over the complete added feature vectors",
+            "near_equality": (
+                "np.allclose with relative_tolerance=0 and the recorded absolute tolerance"
+            ),
+            "absolute_tolerance": float(EVALUATION_FINDING_ABSOLUTE_TOLERANCE),
+            "findings_are_rejection_conditions": False,
+        },
         "deduplication": {
             "unique_pair_count": len(pair_records),
             "unique_sample_count": len(samples),
@@ -1486,6 +1723,7 @@ def _failed_content_excerpt(
 def _feedback_from_evaluation(report: dict[str, Any]) -> dict[str, Any]:
     return {
         "category": "candidate_not_improved_for_all_lambdas",
+        "feedback_contract_version": EVALUATION_DIAGNOSTICS_VERSION,
         "status": report["status"],
         "by_lambda": report["by_lambda"],
         "evaluation_diagnostics": report["evaluation_diagnostics"],
@@ -2179,49 +2417,177 @@ def _select_feedback_representatives(
     return chosen, len(unique) - len(chosen)
 
 
-def _summarize_diagnostic_array(
-    entry: dict[str, Any], maximum_items: int
+def _coordinate_lists(mask: np.ndarray) -> list[list[int]]:
+    return [list(map(int, coordinate)) for coordinate in np.argwhere(mask)]
+
+
+def _lossless_boolean_diagnostic(
+    entry: dict[str, Any], array: np.ndarray
 ) -> tuple[dict[str, Any], int, int]:
     result = dict(entry)
-    value = result.get("value")
-    try:
-        array = np.asarray(value)
-    except (TypeError, ValueError):
-        return result, 0, 0
-    flat = array.reshape(-1)
-    total = int(flat.size)
-    if total <= int(maximum_items):
-        return result, total, 0
-    maximum_items = max(0, int(maximum_items))
-    selected = [
-        {"flat_index": index, "value": _json_native(flat[index])}
-        for index in range(min(maximum_items, total))
-    ]
-    summary: dict[str, Any] = {
-        "representation": "partial_flat_selection",
+    true_coordinates = _coordinate_lists(np.asarray(array, dtype=bool))
+    result["value"] = {
+        "representation": "lossless_true_coordinates",
         "original_shape": list(array.shape),
-        "original_element_count": total,
-        "selected_elements": selected,
-        "selected_flat_indices": [item["flat_index"] for item in selected],
-        "selection_method": "first N flattened values in row-major order",
-        "omitted_element_count": total - len(selected),
-        "complete_value_in_prompt": False,
+        "coordinate_order": "row-major axes in the original array order",
+        "true_coordinates": true_coordinates,
+        "all_unlisted_positions_are_false": True,
+        "true_element_count": len(true_coordinates),
+        "empty_true_set": len(true_coordinates) == 0,
+        "complete_value_in_prompt": True,
     }
-    if total and (
-        np.issubdtype(array.dtype, np.number)
-        or np.issubdtype(array.dtype, np.bool_)
-    ):
-        summary["zero_element_count"] = int(np.count_nonzero(flat == 0))
-        if np.issubdtype(array.dtype, np.bool_):
-            summary["true_element_count"] = int(np.count_nonzero(flat))
-        elif np.all(np.isfinite(flat.astype(np.float64))):
-            summary["minimum"] = float(np.min(flat))
-            summary["maximum"] = float(np.max(flat))
-    result["value"] = summary
-    # Avoid repeating aggregate counts both beside and inside the summarized value.
     result.pop("zero_element_count", None)
     result.pop("true_element_count", None)
-    return result, len(selected), total - len(selected)
+    result.pop("shape", None)
+    result.pop("empty_array", None)
+    return result, int(array.size), 0
+
+
+def _valid_data_coordinates(
+    array: np.ndarray, validity: np.ndarray
+) -> list[tuple[int, ...]] | None:
+    if array.shape == validity.shape:
+        return [tuple(map(int, coordinate)) for coordinate in np.argwhere(validity)]
+    if (
+        array.ndim >= validity.ndim
+        and tuple(array.shape[: validity.ndim]) == tuple(validity.shape)
+    ):
+        suffix_shape = array.shape[validity.ndim :]
+        suffixes = list(np.ndindex(suffix_shape)) if suffix_shape else [()]
+        return [
+            tuple(map(int, prefix)) + tuple(map(int, suffix))
+            for prefix in np.argwhere(validity)
+            for suffix in suffixes
+        ]
+    return None
+
+
+def _validity_aligned_diagnostic(
+    entry: dict[str, Any],
+    array: np.ndarray,
+    validity: np.ndarray,
+    validity_field: str,
+) -> tuple[dict[str, Any], int, int] | None:
+    coordinates = _valid_data_coordinates(array, validity)
+    if coordinates is None:
+        return None
+    selected = [
+        {"coordinate": list(coordinate), "value": _json_native(array[coordinate])}
+        for coordinate in coordinates
+    ]
+    result = dict(entry)
+    result["value"] = {
+        "representation": "validity_aligned_original_coordinates",
+        "original_shape": list(array.shape),
+        "coordinate_order": "original array axes; coordinates are not reindexed",
+        "validity_field": validity_field,
+        "validity_shape": list(validity.shape),
+        "validity_true_coordinates": _coordinate_lists(validity),
+        "selected_elements": selected,
+        "selection_method": (
+            "all values whose authoritative validity coordinate is true; trailing "
+            "data axes are retained in full"
+        ),
+        "valid_mask_true_count": int(np.count_nonzero(validity)),
+        "retained_data_element_count": len(selected),
+        "omitted_invalid_data_element_count": int(array.size) - len(selected),
+        "empty_valid_set": not bool(np.any(validity)),
+        "complete_valid_values_in_prompt": True,
+        "complete_value_in_prompt": len(selected) == int(array.size),
+    }
+    result.pop("zero_element_count", None)
+    result.pop("true_element_count", None)
+    result.pop("shape", None)
+    result.pop("empty_array", None)
+    return result, len(selected), int(array.size) - len(selected)
+
+
+def _unresolved_large_array_diagnostic(
+    entry: dict[str, Any], array: np.ndarray, *, field: str
+) -> tuple[dict[str, Any], int, int]:
+    result = dict(entry)
+    is_state = field == "obs.state"
+    result["value"] = {
+        "representation": (
+            "state_dependency_indices_unresolved"
+            if is_state
+            else "unmasked_large_value_not_partially_selected"
+        ),
+        "original_shape": list(array.shape),
+        "original_element_count": int(array.size),
+        "selected_elements": [],
+        "selected_coordinates": [],
+        "selection_method": (
+            "no state indices selected because verified per-feature state dependency "
+            "indices are unavailable"
+            if is_state
+            else "no partial selection; the field has no authoritative validity mask"
+        ),
+        "omitted_element_count": int(array.size),
+        "complete_value_in_prompt": False,
+        "dependency_indices_known": False if is_state else None,
+    }
+    if array.size and np.issubdtype(array.dtype, np.number):
+        finite = array.astype(np.float64)
+        if np.all(np.isfinite(finite)):
+            result["value"]["minimum"] = float(np.min(finite))
+            result["value"]["maximum"] = float(np.max(finite))
+    result.pop("zero_element_count", None)
+    result.pop("true_element_count", None)
+    result.pop("shape", None)
+    result.pop("empty_array", None)
+    return result, 0, int(array.size)
+
+
+def _compact_diagnostic_inputs(
+    inputs: dict[str, Any], maximum_items: int
+) -> tuple[dict[str, Any], int, int, int]:
+    original = json.loads(json.dumps(inputs, ensure_ascii=False, allow_nan=False))
+    compact: dict[str, Any] = {}
+    included = omitted = summarized = 0
+    for field, entry in original.items():
+        if not isinstance(entry, dict) or "value" not in entry:
+            compact[field] = entry
+            continue
+        try:
+            array = np.asarray(entry["value"])
+        except (TypeError, ValueError):
+            compact[field] = entry
+            continue
+        if np.issubdtype(array.dtype, np.bool_):
+            result, kept, removed = _lossless_boolean_diagnostic(entry, array)
+        else:
+            spec = (
+                SNAPSHOT_FIELD_SPECS.get(field[4:])
+                if field.startswith("obs.")
+                else None
+            )
+            validity_field = (
+                None
+                if spec is None or not spec.get("mask")
+                else f"obs.{spec['mask']}"
+            )
+            aligned = None
+            if validity_field and validity_field in original:
+                validity_entry = original[validity_field]
+                if isinstance(validity_entry, dict) and "value" in validity_entry:
+                    validity = np.asarray(validity_entry["value"], dtype=bool)
+                    aligned = _validity_aligned_diagnostic(
+                        entry, array, validity, validity_field
+                    )
+            if aligned is not None:
+                result, kept, removed = aligned
+            elif int(array.size) <= int(maximum_items):
+                result, kept, removed = entry, int(array.size), 0
+            else:
+                result, kept, removed = _unresolved_large_array_diagnostic(
+                    entry, array, field=field
+                )
+        compact[field] = result
+        included += kept
+        omitted += removed
+        summarized += int(removed > 0 or result.get("value") != entry.get("value"))
+    return compact, included, omitted, summarized
 
 
 def _compact_evaluation_diagnostics(
@@ -2245,26 +2611,22 @@ def _compact_evaluation_diagnostics(
             sample["trace"] = {key: trace[key] for key in trace_keys if key in trace}
         if not isinstance(inputs, dict):
             continue
-        for field, entry in list(inputs.items()):
-            if not isinstance(entry, dict) or "value" not in entry:
-                continue
-            summarized, kept, removed = _summarize_diagnostic_array(
-                entry, maximum_array_items
-            )
-            inputs[field] = summarized
-            included += kept
-            omitted += removed
-            summarized_fields += int(removed > 0)
-    for field, entry in list((compact.get("constants") or {}).items()):
-        if not isinstance(entry, dict) or "value" not in entry:
-            continue
-        summarized, kept, removed = _summarize_diagnostic_array(
-            entry, maximum_array_items
+        compact_inputs, kept, removed, summarized = _compact_diagnostic_inputs(
+            inputs, maximum_array_items
         )
-        compact["constants"][field] = summarized
+        sample["current_only_inputs"] = compact_inputs
         included += kept
         omitted += removed
-        summarized_fields += int(removed > 0)
+        summarized_fields += summarized
+    constants = compact.get("constants") or {}
+    if isinstance(constants, dict):
+        compact_constants, kept, removed, summarized = _compact_diagnostic_inputs(
+            constants, maximum_array_items
+        )
+        compact["constants"] = compact_constants
+        included += kept
+        omitted += removed
+        summarized_fields += summarized
     if int(maximum_array_items) <= 4:
         for pair in (compact.get("pairs") or {}).values():
             if not isinstance(pair, dict):
@@ -2272,6 +2634,44 @@ def _compact_evaluation_diagnostics(
             pair.pop("sum_weighted_contributions_excludes_beta_i", None)
             pair.pop("sum_weighted_contributions_excludes_beta_j", None)
             pair.pop("weighted_sum_matches_extra_reward", None)
+            for feature in pair.get("features") or []:
+                if isinstance(feature, dict):
+                    feature.pop("source_fields", None)
+    if int(maximum_array_items) == 0:
+        compact.pop("diagnostic_scope", None)
+        compact.pop("input_timing", None)
+        dependency = compact.get("dependency_selection")
+        if isinstance(dependency, dict):
+            dependency.pop("basis", None)
+            dependency.pop("limitation", None)
+        for field, contract in list(
+            (compact.get("source_field_contracts") or {}).items()
+        ):
+            if not isinstance(contract, dict):
+                continue
+            compact["source_field_contracts"][field] = {
+                "contract_reference": (
+                    "the current-only environment interface in this same prompt"
+                ),
+                **{
+                    key: contract[key]
+                    for key in ("shape", "dtype", "unit", "validity_field")
+                    if key in contract and contract[key] is not None
+                },
+            }
+        for pair in (compact.get("pairs") or {}).values():
+            if isinstance(pair, dict):
+                pair.pop("difference_direction", None)
+                pair.pop("extra_reward_identity", None)
+        for record in (compact.get("by_lambda") or {}).values():
+            if not isinstance(record, dict):
+                continue
+            outcomes = record.get("reward_outcomes_after_action")
+            if isinstance(outcomes, dict):
+                outcomes.pop("total_reward_identity", None)
+            ratios = record.get("ratios_on_this_candidate_maximum_pair")
+            if isinstance(ratios, dict):
+                ratios.pop("note", None)
 
     state_contract = (compact.get("source_field_contracts") or {}).get("obs.state")
     if isinstance(state_contract, dict):
@@ -2284,15 +2684,25 @@ def _compact_evaluation_diagnostics(
                 for key in ("schema_version", "dimension", "ordering")
                 if key in schema
             }
-            summarized_schema["features"] = {
-                "representation": "partial_ordered_feature_schema",
-                "selected_features": kept,
-                "selected_indices": [item.get("index") for item in kept],
-                "selection_method": "first N schema entries in authoritative index order",
-                "total_feature_count": len(features),
-                "omitted_feature_count": len(features) - len(kept),
-                "complete_schema_in_prompt": False,
-            }
+            if kept:
+                summarized_schema["features"] = {
+                    "representation": "partial_ordered_feature_schema",
+                    "selected_features": kept,
+                    "selected_indices": [item.get("index") for item in kept],
+                    "selection_method": "first N authoritative schema entries",
+                    "total_feature_count": len(features),
+                    "omitted_feature_count": len(features) - len(kept),
+                    "complete_schema_in_prompt": False,
+                }
+            else:
+                summarized_schema["features"] = {
+                    "representation": "schema_entries_omitted",
+                    "selected_indices": [],
+                    "selection_method": "none at the minimum prompt budget",
+                    "total_feature_count": len(features),
+                    "omitted_feature_count": len(features),
+                    "complete_schema_in_prompt": False,
+                }
             for index_kind in ("continuous_indices", "discrete_indices"):
                 values = schema.get(index_kind)
                 if isinstance(values, list):
@@ -2610,6 +3020,7 @@ def run_design(
             "baseline_schema_version": baseline["schema_version"],
         },
         "evaluation": {
+            "diagnostics_version": EVALUATION_DIAGNOSTICS_VERSION,
             "beta": float(beta),
             "batch_size": int(batch_size),
             "absolute_tolerance": float(absolute_tolerance),

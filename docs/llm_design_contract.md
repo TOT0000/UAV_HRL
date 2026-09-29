@@ -280,12 +280,30 @@ pair, and the separate global baseline/candidate estimates. Current-only input
 fields are selected from statically validated `source_fields`; validity masks,
 movement mask, constants, axis/ID semantics, and any dependency limitation are
 kept separate from post-action reward outcomes. Large input arrays may be
-represented in the prompt by a deterministic row-major selection with shape,
-selected indices, counts, and explicit omissions. The complete diagnostic stays
+represented relationally: Boolean masks use lossless true coordinates, while
+values governed by an authoritative validity mask retain all valid values at
+their original coordinates, including valid zeros. Empty valid sets remain
+distinct from unavailable fields. SR/RoI/task/link diagnostics add only the
+observable ID maps and validity fields needed to interpret the declared data;
+S2U coordinates retain their `[compact_sr_row, receiver_uav]` axis meaning.
+State values are not projected through a UAV mask or partially selected unless
+their exact dependency indices are known. The complete diagnostic stays
 in `evaluation_report.json` and `feedback.json`, while
 `prompt_feedback.json` records the exact compact variant sent. Candidate code is
 never shortened, and a revision that cannot retain the minimum diagnostic stops
 with `context_budget_exceeded`.
+
+Diagnostic contract v2 also derives structured numerical findings from the
+complete, uncompressed maximum-pair data. It distinguishes exact equality of
+the full added feature vectors, near-but-nonzero differences under a recorded
+absolute tolerance, equal weighted extra rewards produced by different feature
+vectors, and pairs whose two movement masks are empty. Exact feature equality
+supports the narrow conclusion that changing only fixed weights cannot alter
+that pair while preserving the feature outputs. Equal reward alone does not:
+different features may still change the state distance. Empty movement masks
+are reported as an observed condition, not as proof that every observable field
+or feature is invalid. These findings guide revision only and do not add a new
+candidate rejection rule.
 
 The first passing attempt creates:
 

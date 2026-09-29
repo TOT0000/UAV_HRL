@@ -3631,6 +3631,10 @@ def test_evaluation_revision_feedback_is_shared_by_all_mock_providers(design_fix
         assert request.count("Evaluation diagnostics:") == 1
         assert "passed the implementation checks" in request
         assert '"candidate_name": "first"' in request
+        assert "IDENTICAL_ADDED_FEATURE_VECTOR_ON_MAXIMUM_PAIR" in request
+        assert "EMPTY_MOVEMENT_MASK_ON_BOTH_PAIR_OBSERVATIONS" in request
+        assert "Changing only the fixed weights" in request
+        assert "all observable information is invalid" in request
 
 
 def test_evaluation_diagnostics_stop_when_minimum_revision_exceeds_budget(
@@ -3665,6 +3669,7 @@ def test_evaluation_diagnostics_stop_when_minimum_revision_exceeds_budget(
     assert marker in planned_prompt
     assert "Your candidate passed the implementation checks" in planned_prompt
     assert "Evaluation diagnostics:" in planned_prompt
+    assert "IDENTICAL_ADDED_FEATURE_VECTOR_ON_MAXIMUM_PAIR" in planned_prompt
     prompt_feedback = json.loads((output / "attempt_02" / "prompt_feedback.json").read_text())
     assert prompt_feedback["strategy"].startswith("evaluation_diagnostics_")
     assert prompt_feedback["feedback"]["prompt_feedback_summary"][
@@ -4048,6 +4053,7 @@ def test_lipschitz_failure_diagnostics_match_manual_pair_calculations():
         constants_metadata=constants,
     )
     diagnostics = report["evaluation_diagnostics"]
+    assert diagnostics["schema_version"] == llm_design.EVALUATION_DIAGNOSTICS_VERSION
     assert diagnostics["deduplication"] == {
         "unique_pair_count": 2,
         "unique_sample_count": 3,
@@ -4107,6 +4113,176 @@ def test_lipschitz_failure_diagnostics_match_manual_pair_calculations():
     } == {"pair_0_1"}
 
 
+def test_numeric_findings_distinguish_exact_equal_near_and_reward_cancellation():
+    pair_records = {
+        "pair_0_1": {"sample_i_ref": "sample_0", "sample_j_ref": "sample_1"},
+        "pair_2_3": {"sample_i_ref": "sample_2", "sample_j_ref": "sample_3"},
+        "pair_4_5": {"sample_i_ref": "sample_4", "sample_j_ref": "sample_5"},
+    }
+    lambda_records = {
+        "0": {"maximum_pair_ref": "pair_0_1"},
+        "1": {"maximum_pair_ref": "pair_0_1"},
+        "2": {"maximum_pair_ref": "pair_2_3"},
+        "3": {"maximum_pair_ref": "pair_4_5"},
+    }
+    extra = np.asarray(
+        [
+            [0.25, 0.75],
+            [0.25, 0.75],
+            [0.2, 0.8],
+            [0.4, 0.6],
+            [0.1, 0.3],
+            [0.1 + 5e-7, 0.3],
+        ],
+        dtype=np.float64,
+    )
+    reward_extra = np.asarray([0.5, 0.5, 0.5, 0.5, 0.2, 0.20000025])
+    movement = np.ones((6, 2), dtype=bool)
+    movement[0:2] = False
+    findings = llm_design._pair_numeric_findings(
+        pair_records=pair_records,
+        lambda_records=lambda_records,
+        extra=extra,
+        reward_extra=reward_extra,
+        obs_arrays={"movement_mask": movement},
+    )
+    by_pair = {}
+    for finding in findings:
+        by_pair.setdefault(finding["pair_ref"], {})[finding["code"]] = finding
+
+    exact = by_pair["pair_0_1"]["IDENTICAL_ADDED_FEATURE_VECTOR_ON_MAXIMUM_PAIR"]
+    assert exact["lambda_refs"] == ["0", "1"]
+    assert exact["evidence"]["feature_vector_comparison"] == "exactly_equal"
+    assert exact["evidence"]["feature_difference_l2_norm"] == 0.0
+    assert "Changing only the fixed weights" in exact["message"]
+    empty = by_pair["pair_0_1"]["EMPTY_MOVEMENT_MASK_ON_BOTH_PAIR_OBSERVATIONS"]
+    assert "does not imply that all observable information is invalid" in empty["message"]
+    assert "caused every feature output" in empty["scope_note"]
+
+    cancellation = by_pair["pair_2_3"][
+        "EQUAL_EXTRA_REWARD_WITH_DIFFERENT_FEATURE_VECTOR"
+    ]
+    assert cancellation["evidence"]["feature_vector_comparison"] == "different_beyond_tolerance"
+    assert cancellation["evidence"]["feature_difference_l2_norm"] > 0.0
+    assert "features can still change its state distance" in cancellation["message"]
+    assert "IDENTICAL_ADDED_FEATURE_VECTOR_ON_MAXIMUM_PAIR" not in by_pair["pair_2_3"]
+
+    near = by_pair["pair_4_5"]["NEAR_BUT_NOT_IDENTICAL_ADDED_FEATURE_VECTOR"]
+    assert near["evidence"]["feature_vector_comparison"] == "different_but_within_tolerance"
+    assert 0.0 < near["evidence"]["maximum_absolute_feature_difference"] <= 1e-6
+    assert "No exact-equality conclusion" in near["scope_note"]
+
+
+def test_relational_compaction_preserves_valid_zero_empty_and_last_uav():
+    inputs = {
+        "obs.movement_mask": {
+            "shape": [16],
+            "dtype": "bool",
+            "value": [False] * 15 + [True],
+            "empty_array": False,
+            "true_element_count": 1,
+        },
+        "obs.uav_queue_valid": {
+            "shape": [16],
+            "dtype": "bool",
+            "value": [False] * 15 + [True],
+            "empty_array": False,
+            "true_element_count": 1,
+        },
+        "obs.uav_backlog_bits": {
+            "shape": [16],
+            "dtype": "float32",
+            "value": [123.0] * 15 + [0.0],
+            "empty_array": False,
+            "zero_element_count": 1,
+        },
+    }
+    compact, included, omitted, summarized = llm_design._compact_diagnostic_inputs(
+        inputs, 4
+    )
+    mask = compact["obs.movement_mask"]["value"]
+    assert mask["true_coordinates"] == [[15]]
+    assert mask["all_unlisted_positions_are_false"] is True
+    backlog = compact["obs.uav_backlog_bits"]["value"]
+    assert backlog["validity_field"] == "obs.uav_queue_valid"
+    assert backlog["selected_elements"] == [{"coordinate": [15], "value": 0.0}]
+    assert backlog["empty_valid_set"] is False
+    assert backlog["omitted_invalid_data_element_count"] == 15
+    assert included > 0 and omitted == 15 and summarized > 0
+
+    empty_inputs = copy.deepcopy(inputs)
+    empty_inputs["obs.uav_queue_valid"]["value"] = [False] * 16
+    empty_inputs["obs.uav_queue_valid"]["true_element_count"] = 0
+    empty, _, _, _ = llm_design._compact_diagnostic_inputs(empty_inputs, 4)
+    empty_backlog = empty["obs.uav_backlog_bits"]["value"]
+    assert empty_backlog["selected_elements"] == []
+    assert empty_backlog["empty_valid_set"] is True
+    assert "obs.unavailable_field" not in empty
+
+
+def test_relational_compaction_preserves_sr_roi_ids_and_s2u_axes():
+    sr_observable = [False] * 8
+    sr_observable[1] = True
+    sr_observable[6] = True
+    roi_observable = [False] * 8
+    roi_observable[0] = True
+    roi_observable[5] = True
+    link_valid = np.zeros((8, 16), dtype=bool)
+    link_valid[1, 15] = True
+    link_valid[6, 2] = True
+    distances = np.full((8, 16), 999.0, dtype=np.float32)
+    distances[1, 15] = 0.0
+    distances[6, 2] = 300.0
+    inputs = {
+        "obs.sr_observable": {"dtype": "bool", "value": sr_observable},
+        "obs.sr_id": {"dtype": "int16", "value": [-1, 42, -1, -1, -1, -1, 7, -1]},
+        "obs.roi_observable": {"dtype": "bool", "value": roi_observable},
+        "obs.roi_id": {"dtype": "int16", "value": [99, -1, -1, -1, -1, 3, -1, -1]},
+        "obs.s2u_link_valid": {"dtype": "bool", "value": link_valid.tolist()},
+        "obs.s2u_distance_m": {"dtype": "float32", "value": distances.tolist()},
+    }
+    compact, _, _, _ = llm_design._compact_diagnostic_inputs(inputs, 4)
+    assert compact["obs.sr_id"]["value"]["selected_elements"] == [
+        {"coordinate": [1], "value": 42},
+        {"coordinate": [6], "value": 7},
+    ]
+    assert compact["obs.roi_id"]["value"]["selected_elements"] == [
+        {"coordinate": [0], "value": 99},
+        {"coordinate": [5], "value": 3},
+    ]
+    assert compact["obs.s2u_link_valid"]["value"]["true_coordinates"] == [
+        [1, 15],
+        [6, 2],
+    ]
+    assert compact["obs.s2u_distance_m"]["value"]["selected_elements"] == [
+        {"coordinate": [1, 15], "value": 0.0},
+        {"coordinate": [6, 2], "value": 300.0},
+    ]
+
+    candidate = _candidate()
+    candidate["features"][0]["source_fields"] = [
+        "obs.s2u_distance_m",
+        "obs.sr_roi_id",
+        "obs.task_target_id",
+    ]
+    _, declared, supporting, reasons = llm_design._candidate_diagnostic_dependencies(
+        candidate
+    )
+    assert "obs.s2u_distance_m" in declared
+    for field in (
+        "obs.s2u_link_valid",
+        "obs.sr_id",
+        "obs.sr_observable",
+        "obs.sr_roi_mapping_valid",
+        "obs.task_type",
+        "obs.task_target_valid",
+        "obs.roi_id",
+        "obs.roi_observable",
+    ):
+        assert field in supporting
+        assert reasons[field]
+
+
 def test_evaluation_feedback_prompt_is_unique_and_non_evaluation_feedback_is_unchanged():
     diagnostics = {
         "pairs": {"pair_0_1": {"original_state_distance": 1.0}},
@@ -4162,12 +4338,14 @@ def test_evaluation_feedback_compaction_records_omissions_without_cutting_candid
     variants = dict(llm_design._feedback_prompt_variants(feedback))
     compact = variants["evaluation_diagnostics_4_items"]
     summary = compact["prompt_feedback_summary"]
-    assert summary["included_array_or_schema_elements"] == 4
-    assert summary["omitted_array_or_schema_elements"] == 996
+    assert summary["included_array_or_schema_elements"] == 0
+    assert summary["omitted_array_or_schema_elements"] == 1000
     stored = compact["evaluation_diagnostics"]["samples"]["sample_0"][
         "current_only_inputs"
     ]["obs.state"]["value"]
-    assert stored["selected_flat_indices"] == [0, 1, 2, 3]
+    assert stored["representation"] == "state_dependency_indices_unresolved"
+    assert stored["selected_coordinates"] == []
+    assert stored["dependency_indices_known"] is False
     assert stored["complete_value_in_prompt"] is False
     marker = "CANDIDATE-CODE-END"
     candidate = _candidate(name="budgeted", code=(
