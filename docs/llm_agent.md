@@ -7,8 +7,8 @@ not import smolagents and continue to work when this optional dependency is not
 installed.
 
 The agent may choose the order in which it reads the contract or fixed samples,
-submits immutable candidate versions, runs small or full isolated validation,
-performs formal fixed-pair scoring, and retrieves prior reports. It receives no
+submits immutable candidate versions, runs isolated validation over the complete
+loaded fixed-sample artifact, performs formal fixed-pair scoring, and retrieves prior reports. It receives no
 shell, arbitrary file, project-write, sample-write, evaluator-write, or training
 tool. Sample queries expose only fields produced by the existing current-only
 adapter. Sample IDs, baseline rewards, and scoring results are labelled as
@@ -149,6 +149,25 @@ calls in that response are explicitly recorded as `skipped_after_tool_error`.
 Approval remains stronger: once a formal evaluation approves, every remaining
 call is `skipped_after_approval` and generation stops.
 
+`test_candidate` accepts only `candidate_id` and always evaluates every sample
+in the loaded fixed-sample artifact. Its report distinguishes the fixed-sample
+count, attempted samples, successful outputs, and whether complete outputs were
+obtained. `query_samples` remains a
+bounded inspection tool and is not validation. Numeric constant diagnostics are
+produced only after complete outputs exist; fewer than two evaluated samples are
+reported as insufficient for a variation judgment. Empty-probe checks remain
+separate from fixed-sample distribution statistics. A complete candidate test
+still does not approve a design.
+
+The host, not model prose, controls completion. Before an approved artifact
+exists, `final_answer` and complete plain-text replies become recorded
+`completion_rejected` observations containing current validation/evaluation
+state, unresolved issues, and remaining call budget. The next model request sees
+that observation and continues. Repeated stop requests consume the normal model
+call budget and eventually pause the run; no extra final-answer generation is
+added. A formal evaluation that saves the approved artifact remains the sole
+successful terminal condition.
+
 `--max-model-calls` counts actual agent generations. Planning is disabled,
 provider generation retries are zero, and the SDK's extra max-step final-answer
 generation is replaced by a deterministic host result, so it cannot exceed the
@@ -201,4 +220,7 @@ mixed with a changed implementation. Start a new run when compatibility checks
 reject an older directory; the old directory remains intact for inspection.
 This includes runs created with the former string-valued `candidate_json` tool
 contract: their candidates and approved artifacts remain readable, but the agent
-conversation cannot be resumed under the object-valued tool contract.
+conversation cannot be resumed under the object-valued tool contract. Runs from
+the earlier structured-candidate contract that exposed small-test arguments are
+also incompatible with the complete-fixed-sample-only tool contract; their
+saved candidates and approved artifacts remain readable.

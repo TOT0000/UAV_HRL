@@ -105,8 +105,8 @@ from llm_streaming import (
 
 
 AGENT_RUN_SCHEMA_VERSION = "uav-hrl-llm-feature-agent-run-v1"
-AGENT_PROMPT_VERSION = "uav-hrl-llm-feature-agent-prompt-v2"
-AGENT_TOOL_CONTRACT_VERSION = "uav-hrl-llm-feature-agent-tools-v3"
+AGENT_PROMPT_VERSION = "uav-hrl-llm-feature-agent-prompt-v3"
+AGENT_TOOL_CONTRACT_VERSION = "uav-hrl-llm-feature-agent-tools-v4"
 DEFAULT_MAX_MODEL_CALLS = 20
 DEFAULT_AGENT_OUTPUT_ROOT = Path("results") / "llm_agents"
 DEFAULT_AGENT_PREVIEW_ROOT = Path("results") / "llm_agent_previews"
@@ -114,6 +114,24 @@ WORK_SUMMARY_MAX_ISSUE_GROUPS = 16
 WORK_SUMMARY_MAX_EVALUATION_INDEXES = 12
 AGENT_PROMPT_TEMPLATE_PATH = Path(__file__).with_name("prompts") / "llm_agent_prompt.txt"
 SMOLAGENTS_VERSION = distribution_version("smolagents")
+
+HOST_CONTROLLED_SYSTEM_PROMPT = """You are an expert assistant solving an offline design task through tool calls.
+
+Each tool call is an action. Read its observation before deciding the next action, and do not repeat a completed call with identical arguments.
+
+Only the host can complete this task: completion requires a candidate to pass formal_evaluate and an approved artifact to be saved. The final_answer tool is only a request to stop. Before host approval it will return completion_rejected and you must continue using the available tools. Plain text without a tool call is treated the same way. Never infer completion from your own prose.
+
+Available tools:
+{%- for tool in tools.values() %}
+- {{ tool.to_tool_calling_prompt() }}
+{%- endfor %}
+
+{%- if custom_instructions %}
+{{ custom_instructions }}
+{%- endif %}
+
+Always issue a tool call with arguments matching its schema. Use the concrete values returned by earlier tools. Begin now.
+"""
 
 
 class AgentBudgetError(RuntimeError):
@@ -423,6 +441,7 @@ class AgentWorkspace:
                 "budget_extension_events": [],
                 "tool_operations": [],
                 "framework_tool_calls": [],
+                "completion_rejections": [],
                 "candidates": {},
                 "candidate_order": [],
                 "current_candidate_id": None,
@@ -741,6 +760,23 @@ class AgentWorkspace:
             if model_calls_maximum is None
             else model_calls_maximum
         )
+        completion_events = self.state.get("completion_rejections", [])
+        completion_summaries = []
+        for event in completion_events[-4:]:
+            answer = (event.get("arguments") or {}).get("answer")
+            answer_text = answer if isinstance(answer, str) else json.dumps(
+                answer, ensure_ascii=False, default=str
+            )
+            completion_summaries.append(
+                {
+                    "created_at_utc": event.get("created_at_utc"),
+                    "tool_call_id": event.get("tool_call_id"),
+                    "source": event.get("source"),
+                    "requested_answer_preview": answer_text[:500],
+                    "requested_answer_truncated": len(answer_text) > 500,
+                    "result": event.get("result"),
+                }
+            )
         result = {
             "status": self.state["status"],
             "current_candidate_id": current_id,
@@ -750,6 +786,11 @@ class AgentWorkspace:
             "model_calls_maximum": maximum,
             "model_calls_remaining": maximum - int(self.state["model_calls_used"]),
             "budget_extension_events": self.state.get("budget_extension_events", []),
+            "completion_rejections": {
+                "count": len(completion_events),
+                "recent": completion_summaries,
+                "full_records": "agent_state.json",
+            },
             "recent_operations": [
                 {
                     key: operation.get(key)
@@ -784,6 +825,60 @@ class AgentWorkspace:
                 result["current_candidate"]["candidate"] = current.get("candidate")
         return result
 
+    def reject_completion(
+        self,
+        *,
+        tool_call_id: str,
+        arguments: dict[str, Any],
+        model_calls_maximum: int,
+        source: str,
+    ) -> dict[str, Any]:
+        """Persist and explain a model completion request that lacks approval."""
+
+        current_id = self.state.get("current_candidate_id")
+        current = self.state["candidates"].get(current_id) if current_id else None
+        unresolved = (
+            self._compact_unresolved_issues(current_id, current)
+            if current_id and current is not None
+            else {
+                "total_distinct_unresolved": 0,
+                "included_distinct_unresolved": 0,
+                "omitted_distinct_unresolved": 0,
+                "issues": [],
+            }
+        )
+        used = int(self.state.get("model_calls_used", 0))
+        result = {
+            "status": "completion_rejected",
+            "reason": "no_host_approved_artifact",
+            "source": str(source),
+            "current_candidate_id": current_id,
+            "validation_status": (
+                current.get("validation_status") if current is not None else None
+            ),
+            "evaluation_status": (
+                current.get("evaluation_status") if current is not None else None
+            ),
+            "unresolved_issue_summary": unresolved,
+            "model_calls_used": used,
+            "model_calls_maximum": int(model_calls_maximum),
+            "model_calls_remaining": max(0, int(model_calls_maximum) - used),
+            "required_next_action": (
+                "The task is unfinished. Continue with query_samples, "
+                "submit_candidate, test_candidate, formal_evaluate, or get_history."
+            ),
+        }
+        event = {
+            "created_at_utc": datetime.now(timezone.utc).isoformat(),
+            "tool_call_id": str(tool_call_id),
+            "source": str(source),
+            "arguments": copy.deepcopy(arguments),
+            "result": copy.deepcopy(result),
+        }
+        self.state.setdefault("completion_rejections", []).append(event)
+        self._save()
+        return result
+
     def begin_operation(self, tool: str, arguments: dict[str, Any]) -> dict[str, Any]:
         with self._lock:
             operation = {
@@ -813,6 +908,11 @@ class AgentWorkspace:
                     "passed",
                     "approved_artifact",
                     "error",
+                    "test_scope",
+                    "fixed_sample_count",
+                    "tested_sample_count",
+                    "successful_output_sample_count",
+                    "complete_fixed_sample",
                 )
                 if key in result
             }
@@ -913,6 +1013,14 @@ class AgentWorkspace:
                 "baseline_by_lambda": baseline_lines(self.baseline),
                 "sample_count": self.fixed_metadata["sample_count"],
                 "primary_pair_count": self.baseline["lipschitz"]["primary_pair_count"],
+                "candidate_test_scope": (
+                    "test_candidate always validates the complete loaded fixed-sample "
+                    "artifact; query_samples is inspection only"
+                ),
+                "completion_control": (
+                    "Only a successful host formal evaluation and saved approved "
+                    "artifact complete the task; an earlier final_answer is rejected"
+                ),
                 "diagnostic_only_note": (
                     "baseline rewards, sample ids, and evaluation results may be used "
                     "for analysis but are not candidate feature inputs"
@@ -1142,33 +1250,43 @@ class AgentWorkspace:
     def test_candidate(
         self,
         candidate_id: str,
-        *,
-        mode: str,
-        sample_indices: list[int] | None = None,
     ) -> dict[str, Any]:
         record = self._candidate_record(candidate_id)
-        if mode not in {"small", "full"}:
-            return {"status": "invalid_arguments", "error": "mode must be small or full", "candidate_id": candidate_id}
+        total = int(self.fixed_metadata["sample_count"])
+        scope = "full_fixed_samples"
         if record["validation_status"] == "static_failed":
             return {
                 "status": "prerequisite_failed",
                 "candidate_id": candidate_id,
+                "test_scope": scope,
+                "fixed_sample_count": total,
+                "tested_sample_count": 0,
+                "successful_output_sample_count": 0,
+                "complete_fixed_sample": False,
                 "errors": record["issues"],
+                "checks_not_run": [
+                    "isolated runtime validation",
+                    "full fixed-sample numeric diagnostics",
+                ],
             }
-        total = int(self.fixed_metadata["sample_count"])
-        if mode == "full":
-            indices = list(range(total))
-        elif sample_indices:
-            indices = sorted(set(int(value) for value in sample_indices))
-            if not indices or indices[0] < 0 or indices[-1] >= total or len(indices) > 32:
-                return {"status": "invalid_arguments", "candidate_id": candidate_id, "error": "small-test sample indices must be 1..32 valid fixed indices"}
-        else:
-            indices = sorted(set(np.linspace(0, total - 1, min(8, total), dtype=int).tolist()))
-        key = _content_hash({"mode": mode, "indices": indices, "worker_contract": self.diagnostic_contract})
+        key = _content_hash(
+            {
+                "scope": scope,
+                "candidate": record["content_sha256"],
+                "fixed_sample": self.fixed_metadata["sample_content_sha256"],
+                "sample_count": total,
+                "worker_contract": self.diagnostic_contract,
+            }
+        )
         cached = record["tests"].get(key)
-        if cached is not None and cached.get("status") in {"passed", "failed"}:
+        if (
+            cached is not None
+            and cached.get("status") in {"passed", "failed"}
+            and cached.get("test_scope") == scope
+            and cached.get("fixed_sample_count") == total
+        ):
             return {**cached["tool_result"], "cache_hit": True}
-        obs = {name: np.asarray(value)[indices] for name, value in self.obs_arrays.items()}
+        obs = self.obs_arrays
         try:
             static = validate_candidate(record["candidate"], self.constants)
             extra, worker_reward, execution = execute_candidate_isolated(
@@ -1179,16 +1297,18 @@ class AgentWorkspace:
                 diagnostic_contract=self.diagnostic_contract,
             )
             numeric = candidate_numeric_diagnostics(
-                np.asarray(self.arrays["state"])[indices], extra, record["candidate"]
+                np.asarray(self.arrays["state"]), extra, record["candidate"]
             )
             expected = feature_reward(extra, record["candidate"])
             consistency = bool(np.allclose(expected, worker_reward, rtol=0.0, atol=1e-12))
             report = {
                 "status": "passed" if consistency else "failed",
                 "candidate_id": candidate_id,
-                "mode": mode,
-                "sample_indices": indices,
-                "sample_count": len(indices),
+                "test_scope": scope,
+                "fixed_sample_count": total,
+                "tested_sample_count": total,
+                "successful_output_sample_count": total,
+                "complete_fixed_sample": True,
                 "static": static,
                 "execution": execution,
                 "numeric_diagnostics": numeric,
@@ -1199,37 +1319,57 @@ class AgentWorkspace:
                 "representative_outputs": [
                     {
                         "sample_ref": f"sample_{index}",
-                        "features": _json_native(extra[position]),
-                        "extra_reward": float(expected[position]),
+                        "features": _json_native(extra[index]),
+                        "extra_reward": float(expected[index]),
                     }
-                    for position, index in enumerate(indices[:8])
+                    for index in range(min(8, total))
                 ],
-                "checks_not_run": [] if mode == "full" else ["remaining fixed samples", "formal Lipschitz evaluation"],
+                "checks_not_run": ["formal Lipschitz evaluation"],
+                "empty_probe_statistics_included": False,
             }
         except CandidateExecutionError as exc:
+            attempted = (
+                ((exc.report or {}).get("checks") or {})
+                .get("execution", {})
+                .get("sample_count_attempted")
+            )
             report = {
                 "status": "failed",
                 "candidate_id": candidate_id,
-                "mode": mode,
-                "sample_indices": indices,
+                "test_scope": scope,
+                "fixed_sample_count": total,
+                "tested_sample_count": (
+                    int(attempted) if attempted is not None else 0
+                ),
+                "successful_output_sample_count": 0,
+                "complete_fixed_sample": False,
                 "error_type": type(exc).__name__,
                 "error": str(exc),
                 "worker_report": exc.report,
+                "checks_not_run": [
+                    "complete fixed-sample output validation",
+                    "full fixed-sample numeric diagnostics",
+                    "formal Lipschitz evaluation",
+                ],
             }
         candidate_dir = self.directory / "candidates" / candidate_id
-        report_path = candidate_dir / f"test_{mode}_{key[:12]}.json"
+        report_path = candidate_dir / f"test_full_{key[:12]}.json"
         _write_json(report_path, report)
         tool_result = {
             key_name: report.get(key_name)
             for key_name in (
                 "status",
                 "candidate_id",
-                "mode",
-                "sample_count",
+                "test_scope",
+                "fixed_sample_count",
+                "tested_sample_count",
+                "successful_output_sample_count",
+                "complete_fixed_sample",
                 "numeric_diagnostics",
                 "reward_consistency",
                 "representative_outputs",
                 "checks_not_run",
+                "empty_probe_statistics_included",
                 "error_type",
                 "error",
                 "worker_report",
@@ -1239,28 +1379,28 @@ class AgentWorkspace:
         tool_result["cache_hit"] = False
         record["tests"][key] = {
             "status": report["status"],
-            "mode": mode,
+            "test_scope": scope,
+            "fixed_sample_count": total,
             "report": str(report_path.relative_to(self.directory)),
             "tool_result": tool_result,
         }
         if report["status"] == "passed":
-            record["validation_status"] = f"{mode}_passed"
-            if mode == "full":
-                record["issues"] = []
-                updated = []
-                for issue in record.get("inherited_issue_context", []):
-                    if issue.get("check_stage") == "runtime_validation":
-                        issue = {
-                            **issue,
-                            "status": "resolved",
-                            "resolution_evidence": str(
-                                report_path.relative_to(self.directory)
-                            ),
-                        }
-                    updated.append(issue)
-                record["inherited_issue_context"] = updated
+            record["validation_status"] = "full_passed"
+            record["issues"] = []
+            updated = []
+            for issue in record.get("inherited_issue_context", []):
+                if issue.get("check_stage") == "runtime_validation":
+                    issue = {
+                        **issue,
+                        "status": "resolved",
+                        "resolution_evidence": str(
+                            report_path.relative_to(self.directory)
+                        ),
+                    }
+                updated.append(issue)
+            record["inherited_issue_context"] = updated
         else:
-            record["validation_status"] = f"{mode}_failed"
+            record["validation_status"] = "full_failed"
             errors = (report.get("worker_report") or {}).get("errors") or []
             record["issues"] = [
                 self._issue_with_defaults(
@@ -1306,7 +1446,7 @@ class AgentWorkspace:
         if cached is not None:
             report = json.loads((self.directory / cached["report"]).read_text(encoding="utf-8"))
             return self._evaluation_tool_result(candidate_id, report, cache_hit=True)
-        validation_result = self.test_candidate(candidate_id, mode="full")
+        validation_result = self.test_candidate(candidate_id)
         if validation_result["status"] != "passed":
             return {
                 "status": "validation_failed",
@@ -1575,16 +1715,18 @@ class SubmitCandidateTool(_WorkspaceTool):
 
 class TestCandidateTool(_WorkspaceTool):
     name = "test_candidate"
-    description = "Run isolated candidate validation in small or full mode. Small success is not approval and does not run formal scoring."
+    description = "Run isolated candidate validation on every sample in the loaded fixed-sample artifact. A complete test pass is not approval and does not run formal Lipschitz scoring."
     inputs = {
         "candidate_id": {"type": "string", "description": "immutable candidate id returned by submit_candidate"},
-        "mode": {"type": "string", "description": "small or full"},
-        "sample_indices": {"type": "array", "description": "optional fixed indices for small mode", "items": {"type": "integer"}, "nullable": True},
     }
     output_type = "string"
 
-    def forward(self, candidate_id: str, mode: str, sample_indices: list[int] | None = None) -> str:
-        return self.workspace.invoke(self.name, {"candidate_id": candidate_id, "mode": mode, "sample_indices": sample_indices}, lambda: self.workspace.test_candidate(candidate_id, mode=mode, sample_indices=sample_indices))
+    def forward(self, candidate_id: str) -> str:
+        return self.workspace.invoke(
+            self.name,
+            {"candidate_id": candidate_id},
+            lambda: self.workspace.test_candidate(candidate_id),
+        )
 
 
 class FormalEvaluateTool(_WorkspaceTool):
@@ -1642,6 +1784,28 @@ def build_agent_tools(workspace: AgentWorkspace) -> list[Tool]:
         FormalEvaluateTool(workspace),
         GetHistoryTool(workspace),
     ]
+
+
+def _normalize_plain_text_completion_request(
+    message: ChatMessage, *, call_id: str
+) -> ChatMessage:
+    """Turn a complete plain-text reply into a host-rejectable stop request."""
+
+    if message.tool_calls or message.content is None:
+        return message
+    if isinstance(message.content, str) and not message.content.strip():
+        return message
+    message.tool_calls = [
+        ChatMessageToolCall(
+            function=ChatMessageToolCallFunction(
+                name="final_answer",
+                arguments={"answer": message.content},
+            ),
+            id=f"plain-text-{call_id}",
+            type="function",
+        )
+    ]
+    return message
 
 
 class StreamingProviderModel(Model):
@@ -1800,12 +1964,38 @@ class StreamingProviderModel(Model):
             and finish_reason == "stop"
             and bool(raw_tool_calls)
         )
-        if not (normal_tool_completion or lmstudio_stop_tool_completion):
+        normal_text_completion = (
+            finish_reason == "stop"
+            and not raw_tool_calls
+            and content is not None
+            and (not isinstance(content, str) or bool(content.strip()))
+        )
+        if not (
+            normal_tool_completion
+            or lmstudio_stop_tool_completion
+            or normal_text_completion
+        ):
             raise APIError(
                 "agent response did not end with a recognized complete tool-call signal "
                 f"(finish_reason={finish_reason!r}); no tool call was executed",
                 category="invalid_finish_reason",
             )
+        if normal_text_completion:
+            raw_tool_calls = [
+                {
+                    "index": 0,
+                    "id": f"plain-text-{call_number}",
+                    "type": "function",
+                    "function": {
+                        "name": "final_answer",
+                        "arguments": json.dumps(
+                            {"answer": content},
+                            ensure_ascii=False,
+                            allow_nan=False,
+                        ),
+                    },
+                }
+            ]
         tool_calls = []
         for index, raw in enumerate(raw_tool_calls):
             function = raw.get("function") or {}
@@ -1859,7 +2049,10 @@ class BudgetedModelProxy(Model):
         self.budget.consume()
         self.workspace.state["model_calls_used"] = self.budget.used
         self.workspace._save()
-        return self.delegate.generate(*args, **kwargs)
+        message = self.delegate.generate(*args, **kwargs)
+        return _normalize_plain_text_completion_request(
+            message, call_id=str(self.budget.used)
+        )
 
 
 class ControlledToolCallingAgent(ToolCallingAgent):
@@ -1881,6 +2074,13 @@ class ControlledToolCallingAgent(ToolCallingAgent):
         self.task_renderer = task_renderer
         self.model_calls_maximum = model_calls_maximum
         super().__init__(*args, max_tool_threads=1, planning_interval=None, **kwargs)
+        self.prompt_templates["system_prompt"] = HOST_CONTROLLED_SYSTEM_PROMPT
+        final_tool = self.tools.get("final_answer")
+        if final_tool is not None:
+            final_tool.description = (
+                "Request task completion. The host rejects this request unless a "
+                "formal evaluation has already saved an approved artifact."
+            )
 
     def process_tool_calls(self, chat_message, memory_step):
         chat_calls = list(chat_message.tool_calls or [])
@@ -1968,6 +2168,37 @@ class ControlledToolCallingAgent(ToolCallingAgent):
                     tool_call=tool_call,
                 )
                 continue
+            if tool_call.name == "final_answer":
+                arguments = tool_call.arguments or {}
+                result = self.workspace.reject_completion(
+                    tool_call_id=tool_call.id,
+                    arguments=arguments,
+                    model_calls_maximum=int(
+                        self.model_calls_maximum
+                        or self.workspace.state["settings"]["max_model_calls"]
+                    ),
+                    source=(
+                        "plain_text_response"
+                        if str(tool_call.id).startswith("plain-text-")
+                        else "final_answer_tool"
+                    ),
+                )
+                self.workspace.finish_framework_call(
+                    tool_call.id,
+                    status="completion_rejected",
+                    output=result,
+                )
+                observation = append_observation(
+                    tool_call, "completion_rejected", result
+                )
+                yield ToolOutput(
+                    id=tool_call.id,
+                    output=result,
+                    is_final_answer=False,
+                    observation=observation,
+                    tool_call=tool_call,
+                )
+                continue
             try:
                 result = self.execute_tool_call(
                     tool_call.name, tool_call.arguments or {}
@@ -2019,9 +2250,7 @@ class ControlledToolCallingAgent(ToolCallingAgent):
             yield ToolOutput(
                 id=tool_call.id,
                 output=result,
-                is_final_answer=(
-                    tool_call.name == "final_answer" and not correctable_failure
-                ),
+                is_final_answer=False,
                 observation=observation,
                 tool_call=tool_call,
             )

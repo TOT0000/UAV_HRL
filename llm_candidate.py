@@ -1986,24 +1986,48 @@ def candidate_numeric_diagnostics(
     extra_state: np.ndarray,
     candidate: dict[str, Any],
 ) -> dict[str, Any]:
-    result = {"features": [], "warnings": []}
+    sample_count = int(np.asarray(extra_state).shape[0])
+    result = {
+        "sample_count": sample_count,
+        "features": [],
+        "warnings": [],
+    }
     for index, definition in enumerate(candidate["features"]):
         column = np.asarray(extra_state[:, index], dtype=np.float64)
+        enough_samples = sample_count >= 2
         item = {
             "index": index,
             "name": definition["name"],
             "reward_weight": float(definition["reward_weight"]),
-            "minimum": float(np.min(column)),
-            "maximum": float(np.max(column)),
-            "mean": float(np.mean(column)),
-            "standard_deviation": float(np.std(column)),
-            "constant_on_fixed_samples": bool(np.ptp(column) <= NUMERIC_TOLERANCE),
+            "minimum": float(np.min(column)) if sample_count else None,
+            "maximum": float(np.max(column)) if sample_count else None,
+            "mean": float(np.mean(column)) if sample_count else None,
+            "standard_deviation": (
+                float(np.std(column)) if sample_count else None
+            ),
+            "constant_on_fixed_samples": (
+                bool(np.ptp(column) <= NUMERIC_TOLERANCE)
+                if enough_samples
+                else None
+            ),
+            "constant_diagnostic_tolerance": float(NUMERIC_TOLERANCE),
+            "constant_diagnostic_reason": (
+                None
+                if enough_samples
+                else "fewer than two evaluated samples; variation cannot be determined"
+            ),
         }
         result["features"].append(item)
-        if item["constant_on_fixed_samples"]:
+        if not enough_samples:
+            result["warnings"].append(
+                f"features[{index}] has fewer than two evaluated samples; variation cannot be determined"
+            )
+        elif item["constant_on_fixed_samples"]:
             result["warnings"].append(
                 f"features[{index}] is constant on the fixed samples; this is diagnostic, not proof of semantic uselessness"
             )
+    if sample_count == 0:
+        return result
     state64 = np.asarray(original_state, dtype=np.float64)
     for index in range(extra_state.shape[1]):
         matches = np.flatnonzero(
