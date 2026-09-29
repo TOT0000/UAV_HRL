@@ -87,7 +87,12 @@ C:\Users\user\anaconda3\envs\LLM_HRL\python.exe run_llm_agent.py `
 
 `--additional-model-calls` is valid only with `--resume`. A resume dry-run may
 show the proposed effective budget, but it neither sends a request nor records
-the extension. A real resume records the timestamp, old and new total, added
+the extension. It validates an in-memory copy and writes any preview prompt and
+metadata to a separate `results/llm_agent_previews/...` directory (or the
+explicit `--output-dir`), never beneath or over the source run. The source
+run's files, running-operation states, timestamps, candidate history, and
+budget remain byte-for-byte unchanged, including on compatibility or context
+budget failure. A real resume records the timestamp, old and new total, added
 amount, and cumulative calls already used. Resuming without an extension uses
 the saved remaining budget; an exhausted run stays paused without a model call.
 
@@ -129,6 +134,14 @@ call IDs, tool results, model-call count, and stop reason. Complete prompts,
 requests, SSE events, reasoning/final content, reports, and generated candidates
 are stored separately in the same run.
 
+Tool results are committed to framework memory one call at a time. If a later
+call in the same model response has an unknown name or invalid arguments, prior
+successful results remain visible on the next model turn and are not replayed.
+The failed call receives an actionable result keyed by its tool-call ID; later
+calls in that response are explicitly recorded as `skipped_after_tool_error`.
+Approval remains stronger: once a formal evaluation approves, every remaining
+call is `skipped_after_approval` and generation stops.
+
 `--max-model-calls` counts actual agent generations. Planning is disabled,
 provider generation retries are zero, and the SDK's extra max-step final-answer
 generation is replaced by a deterministic host result, so it cannot exceed the
@@ -151,10 +164,15 @@ tool-call/result pairs are never split and the current candidate is not
 truncated. The estimate uses the same serialized messages and tool schemas sent
 to the provider, plus the configured output reservation. If the minimum state
 still does not fit, the run is saved and stops without consuming a model call.
-The compact work state includes the full current candidate, issue provenance and
-status, relevant per-lambda formal-evaluation summaries, critical-pair
-diagnostics, history lookup indexes, and cumulative call-budget state.
-On resume, compatibility hashes and settings are checked, running operations are
+The compact work state includes the full current candidate, a deterministic
+bounded grouping of unresolved or unverified issues, exactly one current or
+nearest-ancestor formal-evaluation summary, compact history indexes, and
+cumulative call-budget state. Repeated issues retain source counts and recent
+source IDs; omitted details remain available through `get_history`. Older
+evaluation reports are indexed instead of expanded, and run-history lookup is
+paged. Context compaction rebuilds the common task around this one fresh work
+state, so the original stale summary is not retained alongside a new copy.
+On a real resume, compatibility hashes and settings are checked, running operations are
 marked interrupted rather than passed, completed candidate tests/evaluations use
 their content-keyed caches, and requests of unknown completion status are not
 automatically resent. The original provider endpoint, context/output budgets,

@@ -6,6 +6,7 @@ not import it, so an environment without smolagents keeps the legacy behavior.
 
 from __future__ import annotations
 
+import copy
 from datetime import datetime, timezone
 import hashlib
 from importlib.metadata import version as distribution_version
@@ -107,9 +108,12 @@ from llm_streaming import (
 
 AGENT_RUN_SCHEMA_VERSION = "uav-hrl-llm-feature-agent-run-v1"
 AGENT_PROMPT_VERSION = "uav-hrl-llm-feature-agent-prompt-v1"
-AGENT_TOOL_CONTRACT_VERSION = "uav-hrl-llm-feature-agent-tools-v1"
+AGENT_TOOL_CONTRACT_VERSION = "uav-hrl-llm-feature-agent-tools-v2"
 DEFAULT_MAX_MODEL_CALLS = 20
 DEFAULT_AGENT_OUTPUT_ROOT = Path("results") / "llm_agents"
+DEFAULT_AGENT_PREVIEW_ROOT = Path("results") / "llm_agent_previews"
+WORK_SUMMARY_MAX_ISSUE_GROUPS = 16
+WORK_SUMMARY_MAX_EVALUATION_INDEXES = 12
 AGENT_PROMPT_TEMPLATE_PATH = Path(__file__).with_name("prompts") / "llm_agent_prompt.txt"
 SMOLAGENTS_VERSION = distribution_version("smolagents")
 
@@ -189,6 +193,36 @@ def _agent_directory(
         except FileExistsError:
             continue
     raise FileExistsError(f"could not allocate a unique agent run below {root}")
+
+
+def _resume_preview_directory(
+    source_directory: Path,
+    *,
+    output_root: str | Path,
+    output_dir: str | Path | None,
+) -> Path:
+    """Allocate dry-run output away from the immutable source run."""
+    if output_dir is not None:
+        path = Path(output_dir).resolve()
+        if path == source_directory.resolve() or source_directory.resolve() in path.parents:
+            raise ValueError("resume dry-run output must be outside the source run")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.mkdir()
+        return path
+    root = Path(output_root).resolve().parent / DEFAULT_AGENT_PREVIEW_ROOT.name
+    root.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    for counter in range(100):
+        suffix = hashlib.sha256(
+            f"{source_directory}-{time.time_ns()}-{counter}".encode()
+        ).hexdigest()[:8]
+        path = root / f"{source_directory.name}-preview-{stamp}-{suffix}"
+        try:
+            path.mkdir()
+            return path
+        except FileExistsError:
+            continue
+    raise FileExistsError(f"could not allocate a resume preview below {root}")
 
 
 def _render_agent_prompt(
@@ -272,9 +306,17 @@ class AgentWorkspace:
         relative_tolerance: float,
         max_model_calls: int,
         resume_state: dict[str, Any] | None = None,
+        read_only: bool = False,
     ):
         self.directory = Path(directory).resolve()
-        self.directory.mkdir(parents=True, exist_ok=True)
+        self.read_only = bool(read_only)
+        if self.read_only:
+            if not self.directory.is_dir():
+                raise FileNotFoundError(
+                    f"read-only agent workspace does not exist: {self.directory}"
+                )
+        else:
+            self.directory.mkdir(parents=True, exist_ok=True)
         self.arrays, self.fixed_metadata, self.baseline, self.constants = (
             load_design_inputs(fixed_sample)
         )
@@ -338,15 +380,16 @@ class AgentWorkspace:
                 "context_compactions": [],
             }
         else:
-            self.state = resume_state
-            for operation in self.state.get("tool_operations", []):
-                if operation.get("status") == "running":
-                    operation["status"] = "interrupted"
-                    operation["completed_at_utc"] = datetime.now(timezone.utc).isoformat()
-                    operation["result_summary"] = {
-                        "status": "interrupted",
-                        "reusable_as_pass": False,
-                    }
+            self.state = copy.deepcopy(resume_state)
+            if not self.read_only:
+                for operation in self.state.get("tool_operations", []):
+                    if operation.get("status") == "running":
+                        operation["status"] = "interrupted"
+                        operation["completed_at_utc"] = datetime.now(timezone.utc).isoformat()
+                        operation["result_summary"] = {
+                            "status": "interrupted",
+                            "reusable_as_pass": False,
+                        }
         self._validate_compatibility(max_model_calls)
         self._save()
 
@@ -385,6 +428,8 @@ class AgentWorkspace:
         return self.state.get("approved_candidate_id") is not None
 
     def _save(self) -> None:
+        if self.read_only:
+            return
         self.state["updated_at_utc"] = datetime.now(timezone.utc).isoformat()
         _write_json(self.directory / "agent_state.json", self.state)
 
@@ -468,6 +513,168 @@ class AgentWorkspace:
             "source_is_exact_candidate": True,
         }
 
+    @staticmethod
+    def _work_issue_key(issue: dict[str, Any]) -> str:
+        """Group only issues that have the same actionable root."""
+        identity_fields = (
+            "check_stage",
+            "validation_check",
+            "code",
+            "exception_type",
+            "candidate_function",
+            "candidate_line",
+            "location",
+            "feature_index",
+            "source_field",
+            "lambda",
+        )
+        identity = {
+            key: issue.get(key)
+            for key in identity_fields
+            if issue.get(key) is not None
+        }
+        location_fields = identity_fields[3:]
+        if not any(issue.get(key) is not None for key in location_fields):
+            identity["problem"] = issue.get("problem")
+        return json.dumps(identity, sort_keys=True, ensure_ascii=False, default=str)
+
+    def _compact_unresolved_issues(
+        self, current_id: str, current: dict[str, Any]
+    ) -> dict[str, Any]:
+        all_issues = (
+            list(current.get("issues", []))
+            + list(current.get("formal_evaluation_issues", []))
+            + [
+                issue
+                for issue in current.get("inherited_issue_context", [])
+                if issue.get("status") != "resolved"
+            ]
+        )
+        groups: dict[str, dict[str, Any]] = {}
+        order: list[str] = []
+        for issue in all_issues:
+            key = self._work_issue_key(issue)
+            if key not in groups:
+                representative = {
+                    field: issue.get(field)
+                    for field in (
+                        "code",
+                        "problem",
+                        "requirement",
+                        "fix",
+                        "check_stage",
+                        "validation_check",
+                        "exception_type",
+                        "candidate_function",
+                        "candidate_line",
+                        "location",
+                        "feature_index",
+                        "source_field",
+                        "lambda",
+                        "baseline_l_hat",
+                        "candidate_l_hat",
+                        "required_margin",
+                        "maximum_pair_ref",
+                    )
+                    if issue.get(field) is not None
+                }
+                groups[key] = {
+                    **representative,
+                    "status": "not_revalidated",
+                    "occurrence_count": 0,
+                    "source_candidate_ids": [],
+                    "history_index": {
+                        "candidate_id": current_id,
+                        "record_type": "issues",
+                    },
+                }
+                order.append(key)
+            group = groups[key]
+            group["occurrence_count"] += int(issue.get("occurrence_count", 1))
+            source = issue.get("source_candidate_id") or current_id
+            if source not in group["source_candidate_ids"]:
+                group["source_candidate_ids"].append(source)
+            if source == current_id and issue.get("status", "open") != "resolved":
+                group["status"] = "confirmed_current"
+        for group in groups.values():
+            sources = list(group["source_candidate_ids"])
+            group["source_candidate_count"] = len(sources)
+            group["source_candidate_ids"] = sources[-8:]
+            group["omitted_source_candidate_count"] = max(0, len(sources) - 8)
+        compact = [groups[key] for key in order[:WORK_SUMMARY_MAX_ISSUE_GROUPS]]
+        omitted = [groups[key] for key in order[WORK_SUMMARY_MAX_ISSUE_GROUPS:]]
+        omitted_by_kind: dict[str, int] = {}
+        for issue in omitted:
+            kind = f"{issue.get('check_stage', 'unknown')}:{issue.get('code', 'UNKNOWN')}"
+            omitted_by_kind[kind] = omitted_by_kind.get(kind, 0) + 1
+        return {
+            "total_distinct_unresolved": len(order),
+            "included_distinct_unresolved": len(compact),
+            "omitted_distinct_unresolved": len(omitted),
+            "issues": compact,
+            "omitted_by_kind": omitted_by_kind,
+            "omitted_details_history_index": (
+                {"candidate_id": current_id, "record_type": "issues"}
+                if omitted
+                else None
+            ),
+            "selection_rule": (
+                "stable first occurrence after grouping by stage, code, location, "
+                "field, lambda, and problem; resolved issues are excluded"
+            ),
+        }
+
+    def _selected_evaluation_summary(
+        self, current_id: str, current: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        candidate_id: str | None = current_id
+        record = current
+        while candidate_id:
+            summary = self._latest_evaluation_summary(candidate_id, record)
+            if summary is not None:
+                summary["is_current_candidate"] = candidate_id == current_id
+                summary["history_index"] = {
+                    "candidate_id": candidate_id,
+                    "record_type": "evaluation",
+                }
+                if candidate_id != current_id:
+                    summary["relationship_to_current"] = (
+                        "nearest evaluated ancestor; the current candidate has not yet "
+                        "completed formal evaluation"
+                    )
+                return summary
+            candidate_id = record.get("parent_candidate_id")
+            record = self.state["candidates"].get(candidate_id) if candidate_id else None
+            if record is None:
+                break
+        return None
+
+    def _evaluation_history_index(self, current_id: str) -> dict[str, Any]:
+        evaluated = [
+            candidate_id
+            for candidate_id in self.state["candidate_order"]
+            if self.state["candidates"][candidate_id].get("evaluations")
+        ]
+        recent = evaluated[-WORK_SUMMARY_MAX_EVALUATION_INDEXES:]
+        return {
+            "total_evaluated_candidates": len(evaluated),
+            "recent": [
+                {"candidate_id": candidate_id, "record_type": "evaluation"}
+                for candidate_id in recent
+            ],
+            "omitted_count": len(evaluated) - len(recent),
+            "catalog_history_index": {
+                "candidate_id": None,
+                "record_type": "run",
+                "start": 0,
+                "limit": 20,
+            },
+            "note": (
+                "Older evaluation details are not expanded automatically; use "
+                "get_history with the indexed candidate id."
+            ),
+        }
+
     def work_state(
         self,
         *,
@@ -499,74 +706,25 @@ class AgentWorkspace:
             ],
         }
         if current is not None:
-            related_evaluation_candidate_ids: list[str] = []
-            for candidate_id in [
-                current_id,
-                *[
-                    issue.get("source_candidate_id")
-                    for issue in (
-                        list(current.get("inherited_issue_context", []))
-                        + list(current.get("formal_evaluation_issues", []))
-                    )
-                ],
-            ]:
-                if (
-                    candidate_id
-                    and candidate_id in self.state["candidates"]
-                    and candidate_id not in related_evaluation_candidate_ids
-                ):
-                    related_evaluation_candidate_ids.append(candidate_id)
-            related_evaluations = []
-            for candidate_id in related_evaluation_candidate_ids:
-                summary = self._latest_evaluation_summary(
-                    candidate_id, self.state["candidates"][candidate_id]
-                )
-                if summary is not None:
-                    summary["is_current_candidate"] = candidate_id == current_id
-                    summary["history_index"] = {
-                        "candidate_id": candidate_id,
-                        "record_type": "evaluation",
-                    }
-                    if candidate_id != current_id:
-                        summary["relationship_to_current"] = (
-                            "source candidate for inherited formal-evaluation issues; "
-                            "the current candidate still requires its own formal evaluation"
-                        )
-                    related_evaluations.append(summary)
             result["current_candidate"] = {
                 "candidate_id": current_id,
                 "content_sha256": current["content_sha256"],
                 "parent_candidate_id": current.get("parent_candidate_id"),
                 "validation_status": current.get("validation_status"),
                 "evaluation_status": current.get("evaluation_status"),
-                "open_issues": current.get("issues", []),
-                "inherited_issue_context": current.get(
-                    "inherited_issue_context", []
-                ),
-                "formal_evaluation_issues": current.get(
-                    "formal_evaluation_issues", []
-                ),
-                "latest_formal_evaluation": self._latest_evaluation_summary(
+                "unresolved_issue_summary": self._compact_unresolved_issues(
                     current_id, current
                 ),
-                "related_formal_evaluations": related_evaluations,
+                "selected_formal_evaluation": self._selected_evaluation_summary(
+                    current_id, current
+                ),
+                "evaluation_history_index": self._evaluation_history_index(current_id),
                 "history_indexes": {
-                    "candidate": {
+                    record_type: {
                         "candidate_id": current_id,
-                        "record_type": "candidate",
-                    },
-                    "issues": {
-                        "candidate_id": current_id,
-                        "record_type": "issues",
-                    },
-                    "tests": {
-                        "candidate_id": current_id,
-                        "record_type": "tests",
-                    },
-                    "evaluation": {
-                        "candidate_id": current_id,
-                        "record_type": "evaluation",
-                    },
+                        "record_type": record_type,
+                    }
+                    for record_type in ("candidate", "issues", "tests", "evaluation")
                 },
             }
             if include_candidate:
@@ -613,7 +771,12 @@ class AgentWorkspace:
             result = function()
             if not isinstance(result, dict):
                 raise TypeError("agent tool implementation did not return an object")
-            self.finish_operation(operation, status="completed", result=result)
+            operation_status = (
+                "failed"
+                if result.get("status") in {"invalid_arguments", "tool_error"}
+                else "completed"
+            )
+            self.finish_operation(operation, status=operation_status, result=result)
         except Exception as exc:
             result = {
                 "status": "tool_error",
@@ -637,22 +800,34 @@ class AgentWorkspace:
             self._save()
 
     def complete_framework_call(self, call_id: str, output: Any) -> None:
+        self.finish_framework_call(call_id, status="completed", output=output)
+
+    def finish_framework_call(
+        self, call_id: str, *, status: str, output: Any
+    ) -> None:
         with self._lock:
             for record in reversed(self.state["framework_tool_calls"]):
                 if record["tool_call_id"] == str(call_id):
-                    record["status"] = "completed"
+                    record["status"] = str(status)
                     record["output"] = str(output)
                     break
             self._save()
 
     def skip_framework_call(self, call_id: str, *, reason: str) -> None:
+        self.skip_framework_call_with_status(
+            call_id, status="skipped_after_approval", reason=reason
+        )
+
+    def skip_framework_call_with_status(
+        self, call_id: str, *, status: str, reason: str
+    ) -> None:
         with self._lock:
             for record in reversed(self.state["framework_tool_calls"]):
                 if record["tool_call_id"] == str(call_id):
-                    record["status"] = "skipped_after_approval"
+                    record["status"] = str(status)
                     record["output"] = json.dumps(
                         {
-                            "status": "skipped_after_approval",
+                            "status": str(status),
                             "reason": str(reason),
                         },
                         ensure_ascii=False,
@@ -1179,10 +1354,48 @@ class AgentWorkspace:
         }
 
     def get_history(
-        self, candidate_id: str | None, record_type: str
+        self,
+        candidate_id: str | None,
+        record_type: str,
+        *,
+        start: int = 0,
+        limit: int = 20,
     ) -> dict[str, Any]:
         if record_type == "run":
-            return {"status": "ok", "work_state": self.work_state(include_candidate=True)}
+            start = max(0, int(start))
+            limit = min(50, max(1, int(limit)))
+            candidate_ids = list(self.state["candidate_order"])
+            selected = candidate_ids[start : start + limit]
+            return {
+                "status": "ok",
+                "work_state": self.work_state(include_candidate=False),
+                "candidate_history_page": [
+                    {
+                        "candidate_id": item,
+                        "parent_candidate_id": self.state["candidates"][item].get(
+                            "parent_candidate_id"
+                        ),
+                        "validation_status": self.state["candidates"][item].get(
+                            "validation_status"
+                        ),
+                        "evaluation_status": self.state["candidates"][item].get(
+                            "evaluation_status"
+                        ),
+                        "has_evaluation": bool(
+                            self.state["candidates"][item].get("evaluations")
+                        ),
+                    }
+                    for item in selected
+                ],
+                "page_start": start,
+                "page_limit": limit,
+                "total_candidate_count": len(candidate_ids),
+                "next_start": (
+                    start + len(selected)
+                    if start + len(selected) < len(candidate_ids)
+                    else None
+                ),
+            }
         if not candidate_id:
             return {"status": "invalid_arguments", "error": "candidate_id is required for this record type"}
         record = self._candidate_record(candidate_id)
@@ -1290,11 +1503,34 @@ class GetHistoryTool(_WorkspaceTool):
     inputs = {
         "candidate_id": {"type": "string", "description": "candidate id, or null only for run history", "nullable": True},
         "record_type": {"type": "string", "description": "run, candidate, issues, tests, or evaluation"},
+        "start": {"type": "integer", "description": "run-history page offset", "nullable": True},
+        "limit": {"type": "integer", "description": "run-history page size, capped at 50", "nullable": True},
     }
     output_type = "string"
 
-    def forward(self, record_type: str, candidate_id: str | None = None) -> str:
-        return self.workspace.invoke(self.name, {"candidate_id": candidate_id, "record_type": record_type}, lambda: self.workspace.get_history(candidate_id, record_type))
+    def forward(
+        self,
+        record_type: str,
+        candidate_id: str | None = None,
+        start: int | None = None,
+        limit: int | None = None,
+    ) -> str:
+        arguments = {
+            "candidate_id": candidate_id,
+            "record_type": record_type,
+            "start": 0 if start is None else start,
+            "limit": 20 if limit is None else limit,
+        }
+        return self.workspace.invoke(
+            self.name,
+            arguments,
+            lambda: self.workspace.get_history(
+                candidate_id,
+                record_type,
+                start=arguments["start"],
+                limit=arguments["limit"],
+            ),
+        )
 
 
 def build_agent_tools(workspace: AgentWorkspace) -> list[Tool]:
@@ -1529,10 +1765,21 @@ class BudgetedModelProxy(Model):
 class ControlledToolCallingAgent(ToolCallingAgent):
     """Framework agent with sequential tools, bounded calls, and host approval stop."""
 
-    def __init__(self, *args, workspace: AgentWorkspace, context_length: int, max_output_tokens: int, **kwargs):
+    def __init__(
+        self,
+        *args,
+        workspace: AgentWorkspace,
+        context_length: int,
+        max_output_tokens: int,
+        task_renderer=None,
+        model_calls_maximum: int | None = None,
+        **kwargs,
+    ):
         self.workspace = workspace
         self.context_length = int(context_length)
         self.max_output_tokens = int(max_output_tokens)
+        self.task_renderer = task_renderer
+        self.model_calls_maximum = model_calls_maximum
         super().__init__(*args, max_tool_threads=1, planning_interval=None, **kwargs)
 
     def process_tool_calls(self, chat_message, memory_step):
@@ -1541,6 +1788,28 @@ class ControlledToolCallingAgent(ToolCallingAgent):
         memory_calls: list[ToolCall] = []
         observations: list[str] = []
         approval_reason = "a prior tool in this model response received host approval"
+        prior_tool_error: dict[str, Any] | None = None
+
+        def sync_memory() -> None:
+            memory_step.tool_calls = list(memory_calls)
+            memory_step.observations = (
+                "\n".join(observations) if observations else None
+            )
+
+        def append_observation(tool_call: ToolCall, status: str, value: Any) -> str:
+            payload = {
+                "tool_call_id": tool_call.id,
+                "tool": tool_call.name,
+                "status": status,
+                "result": value,
+            }
+            observation = json.dumps(
+                payload, ensure_ascii=False, allow_nan=False, default=str
+            )
+            observations.append(observation)
+            sync_memory()
+            return observation
+
         for chat_call in chat_calls:
             tool_call = ToolCall(
                 name=chat_call.function.name,
@@ -1548,6 +1817,7 @@ class ControlledToolCallingAgent(ToolCallingAgent):
                 id=chat_call.id,
             )
             memory_calls.append(tool_call)
+            sync_memory()
             yield tool_call
             if self.workspace.approved:
                 skipped = {
@@ -1560,9 +1830,8 @@ class ControlledToolCallingAgent(ToolCallingAgent):
                     tool_call.id,
                     reason=approval_reason,
                 )
-                observation = json.dumps(skipped, ensure_ascii=False)
-                observations.append(
-                    f"tool_call_id={tool_call.id}: {observation}"
+                observation = append_observation(
+                    tool_call, "skipped_after_approval", skipped
                 )
                 yield ToolOutput(
                     id=tool_call.id,
@@ -1572,21 +1841,97 @@ class ControlledToolCallingAgent(ToolCallingAgent):
                     tool_call=tool_call,
                 )
                 continue
-            result = self.execute_tool_call(tool_call.name, tool_call.arguments or {})
-            self.workspace.complete_framework_call(tool_call.id, result)
-            observation = str(result).strip()
-            observations.append(
-                f"tool_call_id={tool_call.id}: {observation}"
-            )
+            if prior_tool_error is not None:
+                skipped = {
+                    "status": "skipped_after_tool_error",
+                    "tool_call_id": tool_call.id,
+                    "tool": tool_call.name,
+                    "reason": (
+                        "not executed because an earlier tool call in this model "
+                        "response failed; correct the failed call in the next turn"
+                    ),
+                    "earlier_failed_tool_call_id": prior_tool_error["tool_call_id"],
+                }
+                self.workspace.skip_framework_call_with_status(
+                    tool_call.id,
+                    status="skipped_after_tool_error",
+                    reason=skipped["reason"],
+                )
+                observation = append_observation(
+                    tool_call, "skipped_after_tool_error", skipped
+                )
+                yield ToolOutput(
+                    id=tool_call.id,
+                    output=skipped,
+                    is_final_answer=False,
+                    observation=observation,
+                    tool_call=tool_call,
+                )
+                continue
+            try:
+                result = self.execute_tool_call(
+                    tool_call.name, tool_call.arguments or {}
+                )
+                parsed_result = None
+                if isinstance(result, str):
+                    try:
+                        parsed_result = json.loads(result)
+                    except (TypeError, ValueError):
+                        pass
+                result_status = (
+                    str(parsed_result.get("status"))
+                    if isinstance(parsed_result, dict)
+                    else "completed"
+                )
+                correctable_failure = result_status in {
+                    "invalid_arguments",
+                    "tool_error",
+                }
+                framework_status = "failed" if correctable_failure else "completed"
+                self.workspace.finish_framework_call(
+                    tool_call.id, status=framework_status, output=result
+                )
+            except Exception as exc:
+                available = sorted(
+                    str(getattr(tool, "name", tool))
+                    for tool in self.tools_and_managed_agents
+                )
+                result_status = "tool_error"
+                framework_status = "failed"
+                result = {
+                    "status": result_status,
+                    "tool_call_id": tool_call.id,
+                    "tool": tool_call.name,
+                    "error_type": type(exc).__name__,
+                    "error": str(exc),
+                    "correction": (
+                        "Use one of the available tool names and match its declared "
+                        "argument schema before retrying. Previously completed calls "
+                        "will not be replayed automatically."
+                    ),
+                    "available_tools": available,
+                }
+                self.workspace.finish_framework_call(
+                    tool_call.id, status=framework_status, output=result
+                )
+                correctable_failure = True
+            observation = append_observation(tool_call, framework_status, result)
             yield ToolOutput(
                 id=tool_call.id,
                 output=result,
-                is_final_answer=tool_call.name == "final_answer",
+                is_final_answer=(
+                    tool_call.name == "final_answer" and not correctable_failure
+                ),
                 observation=observation,
                 tool_call=tool_call,
             )
-        memory_step.tool_calls = memory_calls
-        memory_step.observations = "\n".join(observations) if observations else None
+            if correctable_failure:
+                prior_tool_error = {
+                    "tool_call_id": tool_call.id,
+                    "tool": tool_call.name,
+                    "status": result_status,
+                }
+        sync_memory()
 
     def _step_stream(self, memory_step):
         for output in super()._step_stream(memory_step):
@@ -1621,34 +1966,29 @@ class ControlledToolCallingAgent(ToolCallingAgent):
             return messages
         # Keep whole memory-step message groups, never split tool calls from results.
         system_messages = self.memory.system_prompt.to_messages(summary_mode=False)
-        task_messages = self.memory.steps[0].to_messages(summary_mode=False) if self.memory.steps else []
         groups = [step.to_messages(summary_mode=False) for step in self.memory.steps[1:]]
-        summary_text = (
-            "Host-generated compact work-state summary. Structured facts only; "
-            "older full messages remain on disk:\n"
-            + json.dumps(
-                self.workspace.work_state(include_candidate=True),
-                ensure_ascii=False,
-                allow_nan=False,
-            )
+        compact_work_state = self.workspace.work_state(
+            include_candidate=True,
+            model_calls_maximum=self.model_calls_maximum,
         )
-        # Keep the framework's valid system -> user -> assistant/tool ordering.
-        # A second standalone USER message would be rejected by smolagents when
-        # all older action groups have been removed.
-        compact_task_messages = list(task_messages)
-        if compact_task_messages:
-            task_message = compact_task_messages[-1]
-            task_content = task_message.content
-            if not isinstance(task_content, str):
-                task_content = json.dumps(task_content, ensure_ascii=False, default=str)
-            compact_task_messages[-1] = ChatMessage(
-                role=MessageRole.USER,
-                content=f"{task_content}\n\n{summary_text}",
+        if self.task_renderer is None:  # Defensive for direct construction.
+            compact_task = (
+                "Host-generated compact work-state summary. Structured facts only; "
+                "older full messages remain on disk:\n"
+                + json.dumps(
+                    compact_work_state,
+                    ensure_ascii=False,
+                    allow_nan=False,
+                )
             )
-        else:  # Defensive: an agent memory should always contain its TaskStep.
-            compact_task_messages = [
-                ChatMessage(role=MessageRole.USER, content=summary_text)
-            ]
+        else:
+            # Rebuild the common task around exactly one fresh work-state block.
+            # This avoids retaining the stale initial summary and appending a
+            # second, ever-growing copy during context compaction or resume.
+            compact_task = self.task_renderer(compact_work_state)
+        compact_task_messages = TaskStep(task=compact_task).to_messages(
+            summary_mode=False
+        )
         kept = list(groups)
         while kept:
             candidate = system_messages + compact_task_messages + [
@@ -1764,10 +2104,12 @@ def run_agent(
         if int(additional_model_calls) <= 0:
             raise ValueError("--additional-model-calls must be positive")
     resume_state = None
+    source_directory: Path | None = None
     original_model_call_maximum = int(max_model_calls)
     if resume is not None:
-        directory = Path(resume).resolve()
-        resume_state = _load_resume_state(directory)
+        source_directory = Path(resume).resolve()
+        directory = source_directory
+        resume_state = _load_resume_state(source_directory)
         fixed_sample = resume_state["fixed_sample"]["directory"]
         provider = resume_state["provider"]
         model = resume_state["model"]
@@ -1817,6 +2159,7 @@ def run_agent(
         relative_tolerance=relative_tolerance,
         max_model_calls=max_model_calls,
         resume_state=resume_state,
+        read_only=bool(resume is not None and dry_run),
     )
     request_settings = {
         "base_url": resolved_base,
@@ -1835,6 +2178,15 @@ def run_agent(
         workspace._save()
     elif workspace.state.get("request_settings") != request_settings:
         raise ValueError("agent resume request settings are incompatible")
+    if resume is not None and dry_run:
+        assert source_directory is not None
+        artifact_directory = _resume_preview_directory(
+            source_directory,
+            output_root=output_root,
+            output_dir=output_dir,
+        )
+    else:
+        artifact_directory = directory
     effective_model_call_maximum = original_model_call_maximum + int(
         additional_model_calls or 0
     )
@@ -1860,17 +2212,22 @@ def run_agent(
             model_info = model_inventory_summary(client.list_models(), str(model))
     effective_context, context_info = _effective_context_budget(context_length, model_info)
     tools = build_agent_tools(workspace)
-    task = _render_agent_prompt(
-        fixed_metadata=workspace.fixed_metadata,
-        baseline=workspace.baseline,
-        constants_metadata=workspace.constants,
-        beta=workspace.beta,
-        absolute_tolerance=workspace.absolute_tolerance,
-        relative_tolerance=workspace.relative_tolerance,
-        current_work_state=workspace.work_state(
+    def render_task(current_work_state: dict[str, Any]) -> str:
+        return _render_agent_prompt(
+            fixed_metadata=workspace.fixed_metadata,
+            baseline=workspace.baseline,
+            constants_metadata=workspace.constants,
+            beta=workspace.beta,
+            absolute_tolerance=workspace.absolute_tolerance,
+            relative_tolerance=workspace.relative_tolerance,
+            current_work_state=current_work_state,
+        )
+
+    task = render_task(
+        workspace.work_state(
             include_candidate=True,
             model_calls_maximum=effective_model_call_maximum,
-        ),
+        )
     )
     if model_backend is None:
         assert client is not None
@@ -1895,6 +2252,8 @@ def run_agent(
         workspace=workspace,
         context_length=effective_context,
         max_output_tokens=max_output_tokens,
+        task_renderer=render_task,
+        model_calls_maximum=effective_model_call_maximum,
         max_steps=max(1, available_model_calls),
         add_base_tools=False,
         stream_outputs=False,
@@ -1910,13 +2269,13 @@ def run_agent(
         context_length=effective_context,
         max_output_tokens=max_output_tokens,
     )
-    (directory / "agent_task_prompt.txt").write_text(task, encoding="utf-8")
-    (directory / "framework_system_prompt.txt").write_text(agent.system_prompt, encoding="utf-8")
+    (artifact_directory / "agent_task_prompt.txt").write_text(task, encoding="utf-8")
+    (artifact_directory / "framework_system_prompt.txt").write_text(agent.system_prompt, encoding="utf-8")
     _write_json(
-        directory / "tool_schemas.json",
+        artifact_directory / "tool_schemas.json",
         [get_tool_json_schema(tool) for tool in tools],
     )
-    _write_json(directory / "initial_request_shape.json", initial_completion)
+    _write_json(artifact_directory / "initial_request_shape.json", initial_completion)
     metadata = {
         "schema_version": AGENT_RUN_SCHEMA_VERSION,
         "agent_framework": {
@@ -1946,25 +2305,52 @@ def run_agent(
         "initial_context_budget": prompt_budget,
         "dry_run": bool(dry_run),
         "resume": resume is not None,
+        "source_run_directory": (
+            str(source_directory) if source_directory is not None else None
+        ),
+        "resume_source_mutated": False if resume is not None and dry_run else None,
         "git_sha": _git_sha(),
     }
     if resume is None:
-        metadata_path = directory / "run_metadata.json"
+        metadata_path = artifact_directory / "run_metadata.json"
+    elif dry_run:
+        metadata_path = artifact_directory / "resume_preview_metadata.json"
     else:
         resume_number = len(workspace.state.get("resume_events", [])) + 1
-        metadata_path = directory / f"resume_metadata_{resume_number:03d}.json"
+        metadata_path = artifact_directory / f"resume_metadata_{resume_number:03d}.json"
     _write_json(metadata_path, metadata)
     if not prompt_budget["fits_client_budget"]:
         workspace.state["status"] = "failed_context_budget"
         workspace.state["stop_reason"] = "initial framework system/task/tool prompt exceeds context budget"
         workspace._save()
-        raise AgentContextBudgetError(workspace.state["stop_reason"])
+        if resume is not None and dry_run:
+            _write_json(
+                artifact_directory / "failure.json",
+                {
+                    "error_type": "AgentContextBudgetError",
+                    "category": "context_budget_exceeded",
+                    "error": workspace.state["stop_reason"],
+                    "source_run_mutated": False,
+                },
+            )
+        error_message = workspace.state["stop_reason"]
+        if resume is not None and dry_run:
+            error_message += f"; resume dry-run preview: {artifact_directory}"
+        raise AgentContextBudgetError(error_message)
     if dry_run:
         if resume is None:
             workspace.state["status"] = "dry_run_complete"
             workspace.state["stop_reason"] = "dry run; no generation request sent"
             workspace._save()
-        return {"status": "dry_run_complete", "output_directory": str(directory), "metadata": metadata, "model_calls_used": budget.used}
+        return {
+            "status": "dry_run_complete",
+            "output_directory": str(artifact_directory),
+            "source_run_directory": (
+                str(source_directory) if source_directory is not None else None
+            ),
+            "metadata": metadata,
+            "model_calls_used": budget.used,
+        }
     if resume is not None:
         if additional_model_calls:
             workspace.state.setdefault("budget_extension_events", []).append(
@@ -2010,8 +2396,8 @@ def run_agent(
             max_steps=available_model_calls,
             return_full_result=True,
         )
-        (directory / "framework_final_output.txt").write_text(str(result.output), encoding="utf-8")
-        _write_json(directory / "framework_steps.json", result.steps)
+        (artifact_directory / "framework_final_output.txt").write_text(str(result.output), encoding="utf-8")
+        _write_json(artifact_directory / "framework_steps.json", result.steps)
         if workspace.approved:
             workspace.state["status"] = "approved"
         elif workspace.state["status"] == "running":
@@ -2024,7 +2410,7 @@ def run_agent(
         workspace.state["status"] = "failed_context_budget"
         workspace.state["stop_reason"] = f"context_budget_exceeded: {exc}"
         _write_json(
-            directory / "failure.json",
+            artifact_directory / "failure.json",
             {
                 "error_type": type(exc).__name__,
                 "category": "context_budget_exceeded",
@@ -2034,13 +2420,13 @@ def run_agent(
     except Exception as exc:
         workspace.state["status"] = "failed"
         workspace.state["stop_reason"] = f"{type(exc).__name__}: {exc}"
-        _write_json(directory / "failure.json", {"error_type": type(exc).__name__, "error": str(exc)})
+        _write_json(artifact_directory / "failure.json", {"error_type": type(exc).__name__, "error": str(exc)})
     finally:
         workspace.state["model_calls_used"] = budget.used
         workspace._save()
     return {
         "status": workspace.state["status"],
-        "output_directory": str(directory),
+        "output_directory": str(artifact_directory),
         "approved_artifact": workspace.state.get("approved_artifact"),
         "model_calls_used": budget.used,
         "tool_operations": len(workspace.state["tool_operations"]),

@@ -1,4 +1,5 @@
 import json
+import hashlib
 from pathlib import Path
 import subprocess
 import sys
@@ -115,6 +116,14 @@ def _request_settings(*, context_length=100_000, max_output_tokens=1_024):
         "connect_timeout": llm_agent.DEFAULT_API_CONNECT_TIMEOUT_SECONDS,
         "total_timeout": llm_agent.DEFAULT_API_TOTAL_TIMEOUT_SECONDS,
         "progress_interval": llm_agent.DEFAULT_API_PROGRESS_INTERVAL_SECONDS,
+    }
+
+
+def _tree_hashes(directory):
+    return {
+        str(path.relative_to(directory)): hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in sorted(directory.rglob("*"))
+        if path.is_file()
     }
 
 
@@ -317,7 +326,7 @@ def test_candidate_reports_cache_and_approval_are_bound_to_content(tmp_path):
     assert stored_report["by_lambda"] == legacy_report["by_lambda"]
 
 
-def test_resume_preserves_candidate_and_marks_inflight_operation_interrupted(tmp_path):
+def test_resume_dry_run_preserves_candidate_and_does_not_interrupt_source(tmp_path):
     fixed = _fixed_artifact(tmp_path)
     directory = tmp_path / "resume"
     workspace = AgentWorkspace(
@@ -337,18 +346,39 @@ def test_resume_preserves_candidate_and_marks_inflight_operation_interrupted(tmp
     workspace.state["model_calls_used"] = 2
     workspace.state["request_settings"] = _request_settings()
     workspace._save()
+    before = _tree_hashes(directory)
     resumed = run_agent(
         resume=directory,
         dry_run=True,
         context_length=100_000,
         max_output_tokens=1024,
+        output_dir=tmp_path / "resume-preview",
     )
     assert resumed["status"] == "dry_run_complete"
+    assert Path(resumed["output_directory"]) == (tmp_path / "resume-preview")
+    assert resumed["source_run_directory"] == str(directory.resolve())
+    assert _tree_hashes(directory) == before
     state = json.loads((directory / "agent_state.json").read_text())
     assert state["current_candidate_id"] == submitted["candidate_id"]
     assert state["model_calls_used"] == 2
-    assert state["tool_operations"][-1]["status"] == "interrupted"
-    assert state["tool_operations"][-1]["result_summary"]["reusable_as_pass"] is False
+    assert state["tool_operations"][-1]["status"] == "running"
+    assert (tmp_path / "resume-preview" / "resume_preview_metadata.json").is_file()
+
+    actual = run_agent(
+        resume=directory,
+        model_backend=ScriptedToolModel(
+            [("final_answer", {"answer": "fixture real resume"})]
+        ),
+    )
+    assert actual["status"] == "stopped_without_approval"
+    state_after_resume = json.loads((directory / "agent_state.json").read_text())
+    assert state_after_resume["tool_operations"][-1]["status"] == "interrupted"
+    assert (
+        state_after_resume["tool_operations"][-1]["result_summary"][
+            "reusable_as_pass"
+        ]
+        is False
+    )
 
 
 def test_new_candidate_keeps_parent_issues_unverified_until_full_test(tmp_path):
@@ -608,6 +638,76 @@ def test_multi_tool_nonapproval_continues_in_model_order(tmp_path):
 
 
 @pytest.mark.parametrize(
+    ("failing_name", "failing_arguments", "expected_text", "expected_operations"),
+    [
+        ("unknown_fixture_tool", {}, "unknown_fixture_tool", ["submit_candidate"]),
+        (
+            "inspect_interface",
+            {"section": "not-a-section"},
+            "section must be",
+            ["submit_candidate", "inspect_interface"],
+        ),
+    ],
+)
+def test_multi_tool_failure_preserves_prior_result_in_next_model_messages(
+    tmp_path, failing_name, failing_arguments, expected_text, expected_operations
+):
+    fixed = _fixed_artifact(tmp_path)
+    candidate = _candidate(passing=False, name=f"before-{failing_name}")
+    candidate_id = _candidate_id(candidate)
+    model = MultiToolModel(
+        [
+            [
+                (
+                    "submit_candidate",
+                    {"candidate_json": json.dumps(candidate), "parent_candidate_id": None},
+                ),
+                (failing_name, failing_arguments),
+                ("inspect_interface", {"section": "evaluation"}),
+            ],
+            [("final_answer", {"answer": "stop after correcting the tool call"})],
+        ]
+    )
+    directory = tmp_path / f"partial-{failing_name}"
+    result = run_agent(
+        fixed_sample=fixed,
+        provider="lmstudio",
+        model=model.model_id,
+        model_backend=model,
+        max_model_calls=2,
+        context_length=100_000,
+        output_dir=directory,
+    )
+    assert result["status"] == "stopped_without_approval"
+    assert len(model.calls) == 2
+    next_request = json.dumps(
+        [message.dict() for message in model.calls[1]["messages"]],
+        ensure_ascii=False,
+        default=str,
+    )
+    assert candidate_id in next_request
+    assert "mock-call-1-0" in next_request
+    assert "mock-call-1-1" in next_request
+    assert "mock-call-1-2" in next_request
+    assert expected_text in next_request
+    assert "completed" in next_request
+    assert "failed" in next_request
+    assert "skipped_after_tool_error" in next_request
+    state = json.loads((directory / "agent_state.json").read_text())
+    assert [item["tool"] for item in state["tool_operations"]] == expected_operations
+    assert state["tool_operations"][-1]["status"] == (
+        "completed" if failing_name == "unknown_fixture_tool" else "failed"
+    )
+    assert [item["status"] for item in state["framework_tool_calls"]] == [
+        "completed",
+        "failed",
+        "skipped_after_tool_error",
+        "completed",
+    ]
+    assert state["candidate_order"] == [candidate_id]
+
+
+@pytest.mark.parametrize(
     ("finish_reason", "arguments", "refusal", "category"),
     [
         ("length", '{"section":"overview"}', None, "output_truncated"),
@@ -750,10 +850,152 @@ def test_formal_issue_survives_child_runtime_pass_and_resume_messages(tmp_path):
     assert child["candidate_id"] in actual_request
     assert parent["candidate_id"] in actual_request
     assert "LIPSCHITZ_NOT_IMPROVED" in actual_request
-    assert "related_formal_evaluations" in actual_request
+    assert "selected_formal_evaluation" in actual_request
+    assert "nearest evaluated ancestor" in actual_request
     assert "by_lambda" in actual_request
     assert "record_type" in actual_request
     assert "evaluation" in actual_request
+
+
+def test_work_summary_bounds_twenty_candidate_evaluation_history(tmp_path):
+    fixed = _fixed_artifact(tmp_path)
+    workspace = _workspace(tmp_path, fixed, name="bounded-history")
+    parent_id = None
+    candidate_ids = []
+    report_paths = []
+    for index in range(20):
+        submitted = workspace.submit_candidate(
+            json.dumps(_candidate(passing=False, name=f"revision-{index:02d}")),
+            parent_id,
+        )
+        candidate_id = submitted["candidate_id"]
+        candidate_ids.append(candidate_id)
+        record = workspace.state["candidates"][candidate_id]
+        by_lambda = {}
+        diagnostic_by_lambda = {}
+        formal_issues = []
+        for lambda_value in ("0", "0.1"):
+            by_lambda[lambda_value] = {
+                "lambda_mbit_per_joule": float(lambda_value),
+                "baseline_l_hat": 10.0,
+                "candidate_l_hat": 10.5,
+                "improvement": -0.5,
+                "required_margin": 1e-5,
+                "passed": False,
+                "maximum_pair": {"i": 0, "j": 1},
+            }
+            diagnostic_by_lambda[lambda_value] = {
+                "maximum_pair_ref": f"pair-{lambda_value}"
+            }
+            formal_issues.append(
+                {
+                    "code": "LIPSCHITZ_NOT_IMPROVED",
+                    "problem": "fixture repeated formal failure",
+                    "check_stage": "formal_evaluation",
+                    "status": "open",
+                    "source_candidate_id": candidate_id,
+                    "lambda": lambda_value,
+                }
+            )
+        relative_report = (
+            f"candidates/{candidate_id}/evaluation_fixture_{index:02d}.json"
+        )
+        report_paths.append(relative_report)
+        llm_agent._write_json(
+            workspace.directory / relative_report,
+            {
+                "status": "failed",
+                "passed": False,
+                "by_lambda": by_lambda,
+                "evaluation_diagnostics": {"by_lambda": diagnostic_by_lambda},
+            },
+        )
+        record["evaluations"][f"fixture-{index:02d}"] = relative_report
+        record["evaluation_status"] = "failed"
+        record["formal_evaluation_issues"] = formal_issues
+        workspace._save()
+        parent_id = candidate_id
+
+    summary = workspace.work_state(include_candidate=True)
+    current = summary["current_candidate"]
+    unresolved = current["unresolved_issue_summary"]
+    assert current["candidate"] == workspace.state["candidates"][parent_id]["candidate"]
+    assert unresolved["total_distinct_unresolved"] == 2
+    assert unresolved["omitted_distinct_unresolved"] == 0
+    assert {issue["lambda"] for issue in unresolved["issues"]} == {"0", "0.1"}
+    assert all(issue["source_candidate_count"] == 20 for issue in unresolved["issues"])
+    assert all(
+        issue["omitted_source_candidate_count"] == 12
+        for issue in unresolved["issues"]
+    )
+    assert current["selected_formal_evaluation"]["candidate_id"] == parent_id
+    assert current["selected_formal_evaluation"]["report_id"] == report_paths[-1]
+    assert "related_formal_evaluations" not in current
+    assert json.dumps(summary).count(report_paths[-1]) == 1
+    history_index = current["evaluation_history_index"]
+    assert history_index["total_evaluated_candidates"] == 20
+    assert len(history_index["recent"]) == llm_agent.WORK_SUMMARY_MAX_EVALUATION_INDEXES
+    assert history_index["omitted_count"] == 8
+    assert len(json.dumps(summary, ensure_ascii=False)) < 60_000
+
+    first_history = workspace.get_history(candidate_ids[0], "evaluation")
+    assert first_history["evaluations"][0]["path_id"] == report_paths[0]
+    page = workspace.get_history(None, "run", start=0, limit=7)
+    assert len(page["candidate_history_page"]) == 7
+    assert page["next_start"] == 7
+    assert page["total_candidate_count"] == 20
+
+    workspace.state["request_settings"] = _request_settings(context_length=100_000)
+    workspace.state["status"] = "paused_budget_exhausted"
+    workspace._save()
+    before_preview = _tree_hashes(workspace.directory)
+    preview = run_agent(
+        resume=workspace.directory,
+        dry_run=True,
+        model_backend=ScriptedToolModel([]),
+        output_dir=tmp_path / "bounded-history-preview",
+    )
+    assert preview["metadata"]["initial_context_budget"]["fits_client_budget"]
+    assert _tree_hashes(workspace.directory) == before_preview
+    prompt = Path(preview["output_directory"], "agent_task_prompt.txt").read_text()
+    assert parent_id in prompt
+    assert workspace.state["candidates"][parent_id]["candidate"]["candidate_name"] in prompt
+    assert "compute_extra_state" in prompt
+    assert prompt.count("critical_pair_diagnostics") == 1
+    assert report_paths[0] not in prompt
+
+
+def test_work_summary_omitted_issue_details_remain_indexed(tmp_path):
+    fixed = _fixed_artifact(tmp_path)
+    workspace = _workspace(tmp_path, fixed, name="bounded-issues")
+    submitted = workspace.submit_candidate(json.dumps(_candidate(name="many-issues")), None)
+    candidate_id = submitted["candidate_id"]
+    record = workspace.state["candidates"][candidate_id]
+    record["issues"] = [
+        {
+            "code": f"FIXTURE_{index:02d}",
+            "problem": f"distinct fixture issue {index}",
+            "check_stage": "runtime_validation",
+            "status": "open",
+            "source_candidate_id": candidate_id,
+            "candidate_function": "compute_extra_state",
+            "candidate_line": index + 1,
+        }
+        for index in range(20)
+    ]
+    workspace._save()
+    unresolved = workspace.work_state()["current_candidate"][
+        "unresolved_issue_summary"
+    ]
+    assert unresolved["total_distinct_unresolved"] == 20
+    assert unresolved["included_distinct_unresolved"] == 16
+    assert unresolved["omitted_distinct_unresolved"] == 4
+    assert unresolved["omitted_details_history_index"] == {
+        "candidate_id": candidate_id,
+        "record_type": "issues",
+    }
+    history = workspace.get_history(candidate_id, "issues")
+    assert len(history["issues"]) == 20
 
 
 def test_resume_budget_extension_is_cumulative_and_dry_run_is_nonmutating(tmp_path):
@@ -778,13 +1020,19 @@ def test_resume_budget_extension_is_cumulative_and_dry_run_is_nonmutating(tmp_pa
     assert no_extension["status"] == "paused_budget_exhausted"
     assert no_extension_model.calls == []
 
+    before_dry = _tree_hashes(directory)
+    dry_preview = tmp_path / "budget-extension-preview"
     dry = run_agent(
         resume=directory,
         model_backend=ScriptedToolModel([]),
         additional_model_calls=2,
         dry_run=True,
+        output_dir=dry_preview,
     )
     assert dry["status"] == "dry_run_complete"
+    assert Path(dry["output_directory"]) == dry_preview
+    assert _tree_hashes(directory) == before_dry
+    assert dry["metadata"]["generation"]["effective_max_model_calls"] == 3
     state_after_dry = json.loads((directory / "agent_state.json").read_text())
     assert state_after_dry["settings"]["max_model_calls"] == 1
     assert state_after_dry["model_calls_used"] == 1
@@ -813,6 +1061,62 @@ def test_resume_budget_extension_is_cumulative_and_dry_run_is_nonmutating(tmp_pa
     assert state["budget_extension_events"][-1]["previous_max_model_calls"] == 1
     assert state["budget_extension_events"][-1]["new_max_model_calls"] == 3
     assert state["budget_extension_events"][-1]["model_calls_used"] == 1
+    assert state["resume_events"]
+
+
+def test_resume_dry_run_context_failure_does_not_modify_source(tmp_path):
+    fixed = _fixed_artifact(tmp_path)
+    directory = tmp_path / "context-preview-source"
+    workspace = _workspace(
+        tmp_path,
+        fixed,
+        name="context-preview-source",
+        max_model_calls=3,
+    )
+    workspace.state["request_settings"] = _request_settings(
+        context_length=2_000, max_output_tokens=1_024
+    )
+    workspace._save()
+    before = _tree_hashes(directory)
+    preview = tmp_path / "context-preview-output"
+    with pytest.raises(llm_agent.AgentContextBudgetError):
+        run_agent(
+            resume=directory,
+            dry_run=True,
+            model_backend=ScriptedToolModel([]),
+            output_dir=preview,
+        )
+    assert _tree_hashes(directory) == before
+    failure = json.loads((preview / "failure.json").read_text())
+    assert failure["category"] == "context_budget_exceeded"
+    assert failure["source_run_mutated"] is False
+
+
+def test_resume_dry_run_compatibility_failure_does_not_modify_source(
+    tmp_path, monkeypatch
+):
+    fixed = _fixed_artifact(tmp_path)
+    directory = tmp_path / "incompatible-preview-source"
+    workspace = _workspace(
+        tmp_path,
+        fixed,
+        name="incompatible-preview-source",
+        max_model_calls=3,
+    )
+    workspace.state["request_settings"] = _request_settings()
+    workspace._save()
+    before = _tree_hashes(directory)
+    saved_sha = workspace.state["git_sha"]
+    monkeypatch.setattr(llm_agent, "_git_sha", lambda: f"different-{saved_sha}")
+    with pytest.raises(ValueError, match="git revision"):
+        run_agent(
+            resume=directory,
+            dry_run=True,
+            model_backend=ScriptedToolModel([]),
+            output_dir=tmp_path / "incompatible-preview-output",
+        )
+    assert _tree_hashes(directory) == before
+    assert not (tmp_path / "incompatible-preview-output").exists()
 
 
 def test_approved_run_cannot_be_resumed(tmp_path):
@@ -977,15 +1281,18 @@ def test_context_compaction_keeps_complete_candidate_and_tool_pairs(tmp_path):
         and item["tool_call_result_pairs_split"] is False
         for item in state["context_compactions"]
     )
-    compact_summaries = []
+    compact_tasks = []
     for message in model.calls[-1]["messages"]:
-        content = getattr(message, "content", None)
-        marker = "Host-generated compact work-state summary."
-        if isinstance(content, str) and marker in content:
-            summary = content.split(marker, 1)[1]
-            compact_summaries.append(json.loads(summary.split("\n", 1)[1]))
-    assert compact_summaries
-    assert compact_summaries[-1]["current_candidate"]["candidate"] == candidate
+        serialized_message = json.dumps(
+            message.dict(), ensure_ascii=False, default=str
+        )
+        if "The current work record is:" in serialized_message:
+            compact_tasks.append(serialized_message)
+    assert len(compact_tasks) == 1
+    assert compact_tasks[0].count("The current work record is:") == 1
+    assert candidate_id in compact_tasks[0]
+    assert candidate["candidate_name"] in compact_tasks[0]
+    assert "Host-generated compact work-state summary." not in compact_tasks[0]
     assert len(state["framework_tool_calls"]) == 4
     assert all(item["status"] == "completed" for item in state["framework_tool_calls"])
 
