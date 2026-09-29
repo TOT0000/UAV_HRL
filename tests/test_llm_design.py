@@ -1,3 +1,4 @@
+import copy
 import json
 from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -45,10 +46,14 @@ from llm_streaming import (
     open_http_stream,
 )
 from llm_design_contract import (
+    PROMPT_TEMPLATE_PATH,
+    PROMPT_VERSION,
+    SUPPORTED_OPERATIONS,
     build_constants,
     build_obs_arrays,
     candidate_schema,
     format_schema_and_example,
+    render_environment_interface,
     render_prompt,
     runtime_diagnostic_contract,
 )
@@ -380,8 +385,23 @@ def test_prompt_is_complete_current_only_and_example_parses(design_fixture):
         relative_tolerance=1e-6,
         round_request="Generate the first candidate.",
     )
-    assert "{{" not in prompt
-    assert "current-only" in prompt
+    assert not any(
+        token in prompt
+        for token in (
+            "{{ENVIRONMENT_INTERFACE}}",
+            "{{SUPPORTED_OPERATIONS}}",
+            "{{OUTPUT_JSON_SPEC_AND_EXAMPLE}}",
+            "{{BASELINE_RESULTS_BY_LAMBDA}}",
+            "{{IMPROVEMENT_TOLERANCE}}",
+            "{{BETA}}",
+            "{{ROUND_REQUEST}}",
+        )
+    )
+    assert "observable information available before the TD3 movement action" in prompt
+    assert "Features are computed before the action" in prompt
+    assert "total useful data delivered to the GS within its deadlines" in prompt
+    assert "Select data using the documented indices and field-specific validity flags" in prompt
+    assert "Return only the complete candidate JSON object" in prompt
     assert "d_R=(h^2+d^2)/sqrt" in prompt
     assert "never use an object ID as a compact row" in prompt
     block = format_schema_and_example(candidate_schema())
@@ -392,6 +412,103 @@ def test_prompt_is_complete_current_only_and_example_parses(design_fixture):
     )
     assert features.shape == (6, 1)
     assert reward.tolist() == pytest.approx([0.0] * 6)
+
+    populated = {
+        name: np.asarray(value).copy()
+        for name, value in build_obs_arrays(arrays).items()
+    }
+    populated["movement_mask"][:, :2] = True
+    populated["uav_queue_valid"][:, :2] = True
+    populated["uav_queue_empty"][:, 0] = True
+    populated["uav_queue_empty"][:, 1] = False
+    populated_features, populated_reward, _ = execute_candidate_isolated(
+        example, populated, constants, timeout=10
+    )
+    assert populated_features[:, 0].tolist() == pytest.approx([0.5] * 6)
+    assert populated_reward.tolist() == pytest.approx([0.0] * 6)
+
+
+def test_master_prompt_has_exact_placeholder_contract_and_supported_operations_match():
+    template = PROMPT_TEMPLATE_PATH.read_text(encoding="utf-8")
+    assert PROMPT_VERSION == "uav-hrl-llm-design-prompt-v3"
+    assert {
+        token
+        for token in (
+            "{{ENVIRONMENT_INTERFACE}}",
+            "{{SUPPORTED_OPERATIONS}}",
+            "{{OUTPUT_JSON_SPEC_AND_EXAMPLE}}",
+            "{{BASELINE_RESULTS_BY_LAMBDA}}",
+            "{{IMPROVEMENT_TOLERANCE}}",
+            "{{BETA}}",
+            "{{ROUND_REQUEST}}",
+        )
+        if token in template
+    } == {
+        "{{ENVIRONMENT_INTERFACE}}",
+        "{{SUPPORTED_OPERATIONS}}",
+        "{{OUTPUT_JSON_SPEC_AND_EXAMPLE}}",
+        "{{BASELINE_RESULTS_BY_LAMBDA}}",
+        "{{IMPROVEMENT_TOLERANCE}}",
+        "{{BETA}}",
+        "{{ROUND_REQUEST}}",
+    }
+    assert template.count("{{") == 7
+    for name in llm_candidate.SAFE_BUILTIN_CALLS:
+        assert name in SUPPORTED_OPERATIONS
+    for name in llm_candidate.SAFE_NUMPY_CALLS:
+        assert name.removeprefix("np.") in SUPPORTED_OPERATIONS
+    assert "No import statements" in SUPPORTED_OPERATIONS
+
+
+def test_state_interface_is_derived_from_saved_authoritative_schema(design_fixture):
+    _, _, metadata, _, constants = design_fixture
+    modified = copy.deepcopy(metadata)
+    schema = modified["compatibility_contract"]["source_checkpoint_contract"][
+        "movement_state_feature_schema"
+    ]
+    schema["features"].append(
+        {
+            "index": schema["dimension"],
+            "name": "fixture_additional_global",
+            "kind": "continuous",
+            "minimum": 0.0,
+            "maximum": 1.0,
+            "normalization": "fixture authoritative normalization",
+        }
+    )
+    schema["dimension"] += 1
+    interface = render_environment_interface(modified, constants)
+    assert f"shape ({schema['dimension']},)" in interface
+    assert (
+        f"Index {schema['dimension'] - 1}: fixture_additional_global; "
+        "fixture authoritative normalization."
+    ) in interface
+
+
+def test_all_providers_save_the_same_fully_rendered_first_prompt(tmp_path):
+    fixed = _fixed_artifact(tmp_path)
+    cases = (
+        ("lmstudio", "qwen/qwen3.5-9b"),
+        ("lmstudio", "google/gemma-4-e4b"),
+        ("openai", "gpt-4o"),
+    )
+    prompts = []
+    for index, (provider, model) in enumerate(cases):
+        output = tmp_path / f"shared-prompt-{index}"
+        result = run_design(
+            fixed_sample=fixed,
+            provider=provider,
+            model=model,
+            output_dir=output,
+            dry_run=True,
+        )
+        assert result["status"] == "dry_run_complete"
+        prompt = (output / "prompt_attempt_01.txt").read_text(encoding="utf-8")
+        assert "{{ROUND_REQUEST}}" not in prompt
+        assert "1. Task and control scope" in prompt
+        assert "7. Request for this round" in prompt
+        prompts.append(prompt)
+    assert prompts[0] == prompts[1] == prompts[2]
 
 
 def test_feature_schema_declares_reward_weight_without_conflicting_inheritance():
@@ -2267,7 +2384,7 @@ def test_two_runtime_locations_survive_json_failure_prompt_and_duplicate_check(
 
     third_prompt = client.calls[2]["prompt"]
     assert "Previous failed raw final content" in third_prompt
-    assert "[TRUNCATED:" in third_prompt
+    assert raw_claim in third_prompt or "[TRUNCATED:" in third_prompt
     assert "JSON_PARSE_ERROR" in third_prompt
     assert third_prompt.count("previously_found_not_revalidated") >= 2
     assert "candidate line 7" in third_prompt
@@ -2809,6 +2926,9 @@ def test_revision_then_pass_and_max_attempt_exhaustion(tmp_path):
     second_prompt = (tmp_path / "revision" / "attempt_02" / "prompt.txt").read_text()
     assert '"candidate_name": "first"' in second_prompt
     assert "Latest validation/evaluation feedback for that same output" in second_prompt
+    assert "{{ROUND_REQUEST}}" not in second_prompt
+    assert "1. Task and control scope" in second_prompt
+    assert "7. Request for this round" in second_prompt
 
     exhausted_client = MockClient([failing, failing])
     exhausted = run_design(

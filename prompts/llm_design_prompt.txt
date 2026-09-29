@@ -1,135 +1,148 @@
-Design additional state features and their reward weights for the UAV post-disaster data collection task below. These features will help a centralized TD3 agent learn movement control.
+Design additional state features and fixed reward weights for the UAV post-disaster data collection task below. These features will augment the observations of a centralized TD3 movement policy.
 
-1. Task and objectives
+Return one JSON candidate containing feature definitions, reward weights, and executable Python code.
 
-A fleet of 16 UAVs operates in a standard 1000 x 1000 m area. Each episode contains 2 to 8 regions of interest (RoIs) and lasts 60 seconds. UAVs discover RoIs, acquire visual sensing (VS) data and communication (COM) data from ground sources (SRs), and deliver the data to a ground station (GS) through a UAV relay network.
+1. Task and control scope
+
+A fleet of 16 UAVs operates in a standard 1000 x 1000 m area. Each episode lasts 60 seconds and contains 2 to 8 regions of interest (RoIs).
+
+UAVs discover RoIs, acquire visual sensing (VS) data and communication (COM) data from ground sources (SRs), and deliver the data through a UAV relay network to a ground station (GS).
+
+VS data generation requires valid sensing geometry. Its useful amount depends on RoI coverage and image quality at capture time. COM data is uploaded from an SR to its serving UAV. Both types may wait in queues and traverse multiple relay hops. Useful data is credited when it reaches the GS within its deadline.
+
+VS and COM deadlines are 2.5 seconds and 2.0 seconds, respectively, measured from data generation and including source-side waiting and subsequent transmissions.
 
 The objectives are to improve energy efficiency and reduce end-to-end deadline violations:
 
-Energy efficiency = total useful data delivered to the GS within its deadlines / total movement energy of all UAVs.
+Energy efficiency =
+total useful data delivered to the GS within its deadlines
+/
+total movement energy of all UAVs.
 
-VS data generation depends on valid sensing geometry; its useful amount depends on RoI coverage and image quality at capture time. COM data is uploaded from an SR to its serving UAV. Both types may wait in queues and traverse multiple relay hops. Collection is credited when useful data reaches the GS within its deadline.
+This ratio uses totals over the entire episode. Interpret energy consumption, backlog, and deadline violations together with task service: lower values can also result from acquiring or delivering less data.
 
-VS and COM deadlines are 2.5 seconds and 2.0 seconds, respectively, measured from data generation through source-side waiting and subsequent transmissions.
+An existing task allocator determines UAV tasks and service targets, and a routing controller selects packet next hops. TD3 controls movement for the VS/COM UAVs identified by movement_mask. Search UAVs follow the existing search controller, and hovering UAVs remain hovering.
 
-Interpret queue load and deadline pressure in the context of task service: low backlog or few violations can also result from acquiring less data.
+TD3 acts once per second. Each movement interval contains four communication slots of 0.25 seconds. Each UAV has three action components: speed, horizontal heading, and vertical speed, giving 48 joint action dimensions.
 
-2. TD3 control scope
+A UAV may serve VS and COM tasks simultaneously with different targets. Movement affects sensing quality, SR uploads, backhaul connectivity and capacity, queue service, and energy consumption. Design features that help the policy recognize these relationships and their trade-offs.
 
-An existing task allocator determines UAV tasks and service targets, and a routing controller selects packet next hops. TD3 controls movement for the VS/COM UAVs identified by the movement mask. Search UAVs follow the existing search controller, while hovering UAVs remain hovering.
+2. Available information
 
-TD3 acts once per second. Each movement interval contains four communication slots of 0.25 seconds. Each UAV has three action components - speed, horizontal heading, and vertical speed - for 48 joint action dimensions.
+Your function receives:
 
-A UAV may simultaneously serve VS and COM tasks with different targets. Movement affects sensing quality, SR uploads, UAV backhaul connectivity and capacity, queue service, and energy consumption. Design features that help the policy recognize these relationships.
-
-3. Available inputs
-
-Your function receives two inputs:
-
-- obs: information observable before the TD3 action.
+- obs: observable information available before the TD3 movement action.
 - constants: fixed environment parameters.
 
-Available information includes the original state, movement mask, UAV tasks and service targets, discovered RoIs, observable SRs, queue summaries, remaining packet deadlines, sensing geometry, coverage, image quality, and communication link information.
-
-The interface below is the complete input specification. It defines field names, shapes, units, validity flags, ID mappings, constants, sensing constraints, and useful-data calculations.
+The following interface defines all available fields, shapes, units, state indices, ID mappings, validity flags, constants, and relevant environment formulas.
 
 {{ENVIRONMENT_INTERFACE}}
 
-Use these current inputs to represent sensing, upload, and backhaul conditions. The host program accounts for realized delivery and movement energy in the original reward.
+Use only these inputs. Select data using the documented indices and field-specific validity flags before aggregation, and define the result when the valid set is empty. Distinguish missing observations from valid zeros or observed empty queues.
 
-Apply validity flags according to their definitions. Distinguish missing observations from observed empty queues or zero values.
+movement_mask identifies control ownership; validity flags identify usable observations. Select the entities relevant to each feature. Network-level features may include other observable UAVs when they affect the controlled UAVs.
 
-4. Feature function and reward construction
+3. Feature and reward construction
 
 Implement:
 
 compute_extra_state(obs, constants)
 
-Return a one-dimensional NumPy array of shape (K,) and dtype float32 containing the unweighted features f_k.
+Return an unweighted feature vector f as a one-dimensional NumPy array with shape (K,) and dtype float32.
 
-You may choose K. Each feature must have a distinct task-related meaning, a fixed position in the array, and a fixed normalization rule mapping it into [0, 1]. Explain the physical or mathematical basis of its normalization.
+Choose K. Each feature must have a distinct task-related meaning, a fixed output position, and a fixed normalization rule mapping its value into [0, 1]. Explain the normalization using physical quantities, mathematical bounds, or a stated derivation from available constants. Keep this rule consistent across samples and episodes.
 
-Assign each feature a fixed reward_weight w_k satisfying:
+Name and describe each feature according to what its formula measures. If it is a proxy for an objective, explain the connection.
+
+Assign a fixed reward_weight w_k to each feature:
 
 sum_k abs(w_k) <= 1
 
-Positive weights reward larger feature values; negative weights penalize them. A zero weight keeps the feature in the state without directly contributing to reward.
+Positive weights reward larger feature values; negative weights penalize them. A zero weight retains the feature in the state without directly contributing to reward.
 
-The host program uses the same feature values to compute:
+The host program computes:
 
 s_aug = concat(s_original, f)
 r_extra = sum_k w_k * f_k
 r_total = r_base + beta * r_extra
 
-The original state and reward are preserved. Your function computes only f; the host program performs the weighted sum. The supplementary reward r_extra lies in [-1, 1].
-
-The complete original reward is:
+Your function computes only f. The original state is preserved, and the original reward remains:
 
 r_base = B_timely_Mbit - lambda * E_movement_J - P_C9 - P_C10 - P_COM
 
-B_timely_Mbit is the useful data delivered to the GS within its deadlines during the movement interval. E_movement_J is the movement energy of all UAVs during that interval. P_C9, P_C10, and P_COM are the existing sensing-geometry and communication-distance penalties defined in the environment interface.
+B_timely_Mbit is useful data delivered to the GS within its deadlines during the movement interval, measured in Mbit.
+E_movement_J is the movement energy of all UAVs during that interval, measured in J.
+P_C9, P_C10, and P_COM are the existing sensing-geometry and communication-distance penalties defined in the interface.
 
-The training procedure manages lambda. For this evaluation, beta = {{BETA}}. The original and total rewards are not restricted to [-1, 1].
+Features are computed before the action; the original reward reflects outcomes during the subsequent movement interval. The training procedure manages lambda.
 
-Use the pre-provided np and the supported operations below. The function must be deterministic, preserve its inputs, and return finite values with the required shape and range, including for missing-data and empty-set cases.
+For this evaluation:
+
+beta = {{BETA}}
+
+The supplementary reward r_extra lies in [-1, 1]. The original and total rewards are not restricted to this range.
+
+4. Implementation and output contract
+
+Use the pre-provided np and the supported operations below:
 
 {{SUPPORTED_OPERATIONS}}
 
+The function must be deterministic, preserve its inputs, and return finite values satisfying the required shape, dtype, and range.
+
+Return one JSON object containing the required candidate identification fields, complete Python code, and the following metadata for each feature:
+
+- index and name: matching the returned array order.
+- dtype and range.
+- description: what the feature measures, its relevance to movement control, and the rationale for its reward weight.
+- formula: computation and fixed normalization rule.
+- source_fields: every obs and constants dependency, including those used for filtering, conditions, normalization, and missing-data handling.
+- missing_data_rule.
+- reward_weight.
+
+The schema and executable example below specify the exact output structure. The example demonstrates interface use; choose your own task-relevant feature design.
+
+{{OUTPUT_JSON_SPEC_AND_EXAMPLE}}
+
 5. Offline evaluation
 
-The host program evaluates every candidate using the same fixed samples and the same eligible sample pairs:
+The host evaluates every candidate using the same fixed samples and eligible sample pairs:
 
-L_hat(lambda) = max_(i,j) |r_i(lambda) - r_j(lambda)| / ||x_i - x_j||_2
+L_hat(lambda) =
+max_(i,j) |r_i(lambda) - r_j(lambda)| / ||x_i - x_j||_2
 
-For the baseline, x is the original state and r is r_base.
-For the candidate, x is s_aug and r is r_total.
+Baseline:
+x = s_original
+r = r_base
+
+Candidate:
+x = s_aug
+r = r_total
 
 Evaluated lambda values and baseline estimates:
 
 {{BASELINE_RESULTS_BY_LAMBDA}}
 
-The candidate must improve upon the baseline for every evaluated lambda according to:
+The candidate must improve upon the baseline for every evaluated lambda under this rule:
 
 {{IMPROVEMENT_TOLERANCE}}
 
-Use this metric to refine task-relevant features and weights. Each feature should have a useful interpretation beyond increasing the state distance. A lower offline estimate alone does not establish improved task performance.
+Seek improvement through task-relevant features and weights. Features should provide useful information beyond merely increasing state distances. A lower offline estimate does not establish improved task performance; that requires subsequent training and evaluation.
 
-The host program validates and evaluates your candidate, then supplies feedback for revision.
+In revision rounds, use the supplied feedback to revise the relevant computation or weights and update the corresponding metadata.
 
-6. Design and self-check
+6. Final design check
 
-Before responding, internally check:
+Before submitting, internally verify that:
 
-1. How each feature relates to movement control and the task objectives.
-2. Whether its formula and normalization behave meaningfully for representative inputs, boundary cases, and missing data, rather than becoming unintentionally constant or saturated.
-3. Whether its weight encourages the intended behavior, considering possible reductions in task service.
-4. Whether the code, feature metadata, and output specification agree.
-5. In revision rounds, whether every reported issue has actually been corrected.
+1. Each feature's formula and normalization match its stated meaning.
+2. Its behavior is meaningful for representative inputs, boundary cases, and missing data.
+3. Its weighted reward contribution is consistent with the task objectives.
 
-Keep the checking process internal and include concise design rationale in the feature descriptions.
+Keep this review internal and include concise design rationale in the existing description and formula fields.
 
-7. Output specification
-
-Return one JSON object following the schema and example below.
-
-For each feature, provide:
-
-- index and name, matching the returned array order.
-- dtype and range.
-- description: task relevance and rationale for the reward weight.
-- formula: computation and normalization rule.
-- source_fields: every obs and constants field used, including dependencies for masks, conditions, normalization, and missing-data handling.
-- missing_data_rule.
-- reward_weight.
-
-Include the required candidate identification fields and complete Python code defining compute_extra_state(obs, constants).
-
-The example demonstrates the interface and output format; choose your own task-relevant feature design.
-
-{{OUTPUT_JSON_SPEC_AND_EXAMPLE}}
-
-Return only the JSON object as the final answer.
-
-8. Request for this round
+7. Request for this round
 
 {{ROUND_REQUEST}}
+
+Return only the complete candidate JSON object as the final answer.

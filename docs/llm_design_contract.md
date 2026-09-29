@@ -36,6 +36,15 @@ final-content excerpt may be explicitly shortened, with truncation markers and
 preference for the parser-error location. The environment interface, schema,
 evaluation rules, and output reservation are never silently removed.
 
+Qwen, Gemma, and GPT-4o use the same provider-neutral English master prompt
+(`uav-hrl-llm-design-prompt-v3`). Provider adapters change only transport and
+provider-specific request fields; they do not maintain separate task prompts.
+The saved prompt for each attempt is the exact fully assembled request content.
+Its environment interface is generated from the fixed artifact's authoritative
+movement-state feature schema plus the replay auxiliary field specifications,
+and its baseline values, tolerances, beta, schema/example, supported operations,
+and round-specific request are injected before the context budget is computed.
+
 Candidate parsing accepts either a plain JSON object or a whole response made
 of exactly one `json`/unlabelled Markdown code fence containing one JSON object.
 It removes only that outer fence and records the action in
@@ -53,9 +62,11 @@ movement action:
 compute_extra_state(obs, constants)
 ```
 
-`obs` contains the original 531-D state, the current 16-D movement mask, and
-the named current auxiliary snapshot fields. It excludes action, all `next_`
-fields, delivered data, movement energy, C9/C10/COM reward components,
+`obs` contains the original state in the dimension and order declared by the
+fixed artifact's authoritative movement-state feature schema, the current
+movement mask, and the named current auxiliary snapshot fields. For the current
+formal contract these are 531 and 16 dimensions, respectively. It excludes
+action, all `next_` fields, delivered data, movement energy, C9/C10/COM reward components,
 Dinkelbach lambda, and episode/scenario/checkpoint/source trace identifiers.
 The prompt generated for each run is the authoritative field/shape/dtype/unit,
 mask, compact-row/ID, link-axis, sensing, capacity, and reward description.
@@ -86,6 +97,13 @@ fixed sample twice for determinism, compares inputs before/after, and exercises
 an empty/missing-data probe. Fixed samples and the empty probe share the same
 dtype, shape, finite-value, declared-range, global-range, determinism, mutation,
 and weighted-extra-reward checks.
+
+The prompt's parseable example is deliberately a zero-weight formatting
+example, not an approved design recommendation. It selects movement-controlled
+UAV rows only when their queue summaries are valid, distinguishes observed
+empty queues from missing summaries, defines the empty applicable set as zero,
+uses a fixed bounded fraction, and returns `float32`. Tests run that example
+through schema, static, fixed-sample, and empty-probe validation.
 
 A limited AST redundancy check rejects direct scalar copies such as
 `obs["state"][i]`, including simple straight-line local aliases, and rejects

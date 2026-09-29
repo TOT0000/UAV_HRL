@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import math
 from pathlib import Path
+import re
 from typing import Any
 
 import numpy as np
@@ -22,7 +23,7 @@ from replay_auxiliary import SNAPSHOT_FIELD_SPECS
 
 CANDIDATE_SCHEMA_VERSION = "uav-hrl-llm-shared-feature-candidate-v2"
 OBS_INTERFACE_VERSION = "uav-hrl-llm-current-observation-v1"
-PROMPT_VERSION = "uav-hrl-llm-design-prompt-v2"
+PROMPT_VERSION = "uav-hrl-llm-design-prompt-v3"
 DESIGN_RUN_SCHEMA_VERSION = "uav-hrl-llm-design-run-v2"
 APPROVED_ARTIFACT_SCHEMA_VERSION = "uav-hrl-approved-shared-feature-design-v2"
 ROOT = Path(__file__).resolve().parent
@@ -318,38 +319,100 @@ def _state_schema_lines(fixed_metadata: dict[str, Any]) -> list[str]:
     checkpoint = fixed_metadata["compatibility_contract"]["source_checkpoint_contract"]
     schema = checkpoint.get("movement_state_feature_schema") or {}
     features = schema.get("features") or []
-    if int(schema.get("dimension", -1)) != 531 or len(features) != 531:
-        raise ValueError("fixed artifact lacks the authoritative 531-D state schema")
+    dimension = int(schema.get("dimension", -1))
+    if dimension <= 0 or len(features) != dimension:
+        raise ValueError("fixed artifact lacks a complete authoritative state schema")
+
+    num_uav = int(checkpoint.get("num_uav", -1))
+    uav_features: dict[int, list[dict[str, Any]]] = {}
+    coverage_features = []
+    global_features = []
+    for item in features:
+        name = str(item.get("name", ""))
+        prefix, separator, _ = name.partition(".")
+        if separator and prefix.startswith("uav_") and prefix[4:].isdigit():
+            uav_features.setdefault(int(prefix[4:]), []).append(item)
+        elif name.startswith("coverage_macro[") and name.endswith("]"):
+            coverage_features.append(item)
+        else:
+            global_features.append(item)
+    if num_uav <= 0 or set(uav_features) != set(range(num_uav)):
+        raise ValueError("authoritative state schema has inconsistent UAV rows")
+    local_dimensions = {len(items) for items in uav_features.values()}
+    if len(local_dimensions) != 1:
+        raise ValueError("authoritative state schema has inconsistent UAV block widths")
+    local_dimension = local_dimensions.pop()
+    uav_stop = num_uav * local_dimension
+    uav_indices = sorted(
+        int(item["index"]) for items in uav_features.values() for item in items
+    )
+    if uav_indices != list(range(uav_stop)):
+        raise ValueError("authoritative state schema UAV blocks are not contiguous")
+
+    coverage_indices = sorted(int(item["index"]) for item in coverage_features)
+    if coverage_indices:
+        coverage_start = coverage_indices[0]
+        coverage_stop = coverage_indices[-1] + 1
+        if coverage_indices != list(range(coverage_start, coverage_stop)):
+            raise ValueError("authoritative coverage state block is not contiguous")
+        coordinates = []
+        for item in coverage_features:
+            raw = str(item["name"])[len("coverage_macro[") : -1]
+            try:
+                row, column = (int(value) for value in raw.split(",", 1))
+            except (TypeError, ValueError) as exc:
+                raise ValueError("authoritative coverage feature name is invalid") from exc
+            coordinates.append((row, column))
+        row_count = max(row for row, _ in coordinates) + 1
+        column_count = max(column for _, column in coordinates) + 1
+        if set(coordinates) != {
+            (row, column)
+            for row in range(row_count)
+            for column in range(column_count)
+        }:
+            raise ValueError("authoritative coverage state grid is incomplete")
+    else:
+        coverage_start = coverage_stop = row_count = column_count = 0
+
+    first_uav = sorted(uav_features[0], key=lambda item: int(item["index"]))
     lines = [
-        "Original state obs['state']: shape (531,), dtype float32, unchanged ordering/scales.",
-        "Indices 0..271 are 16 UAV blocks of 17 values. For UAV id k, base=17*k:",
+        f"Original state obs['state']: shape ({dimension},), dtype float32, unchanged ordering/scales.",
+        (
+            f"Indices 0..{uav_stop - 1} are {num_uav} UAV blocks of "
+            f"{local_dimension} values. For UAV id k, base={local_dimension}*k:"
+        ),
     ]
-    for item in features[:17]:
+    for item in first_uav:
         local_name = str(item["name"]).split(".", 1)[1]
+        local_offset = int(item["index"])
         lines.append(
-            f"  base+{item['index']}: {local_name}; range [{item['minimum']},{item['maximum']}]; "
+            f"  base+{local_offset}: {local_name}; range [{item['minimum']},{item['maximum']}]; "
             f"{item['normalization']}"
         )
-    lines.extend(
-        (
-            "Indices 272..527 are coverage_macro[row,column], a 16x16 row-major map of visited-cell fractions in [0,1].",
-            f"Index 528: {features[528]['name']}; {features[528]['normalization']}.",
-            f"Index 529: {features[529]['name']}; {features[529]['normalization']}.",
-            f"Index 530: {features[530]['name']}; {features[530]['normalization']}.",
+    if coverage_features:
+        lines.append(
+            f"Indices {coverage_start}..{coverage_stop - 1} are "
+            f"coverage_macro[row,column], a {row_count}x{column_count} row-major "
+            "map of visited-cell fractions in [0,1]."
         )
-    )
+    for item in sorted(global_features, key=lambda value: int(value["index"])):
+        lines.append(
+            f"Index {item['index']}: {item['name']}; {item['normalization']}."
+        )
     return lines
 
 
 def render_environment_interface(
     fixed_metadata: dict[str, Any], constants_metadata: dict[str, Any]
 ) -> str:
+    num_uav = int(constants_metadata["num_uav"]["value"])
+    max_task_slots = int(SNAPSHOT_FIELD_SPECS["task_type"]["shape"][1])
     lines = [
         f"Interface version: {OBS_INTERFACE_VERSION}",
         "Timing: every obs value is current-only and available before the movement action. No action, next-state, post-action delivery/energy/penalty, lambda, checkpoint, episode, scenario, or source identity is exposed.",
         "",
         *_state_schema_lines(fixed_metadata),
-        "obs['movement_mask']: shape (16,), bool; true exactly where centralized movement control owns the UAV. An all-false mask is legal.",
+        f"obs['movement_mask']: shape ({num_uav},), bool; true exactly where centralized movement control owns the UAV. An all-false mask is legal.",
         "",
         "Current auxiliary fields (all arrays are per one observation):",
     ]
@@ -362,7 +425,7 @@ def render_environment_interface(
         (
             "",
             "Axis and missing-data rules:",
-            "- UAV arrays use UAV id as row index 0..15. task_type/task_target_id axes are [uav_id, assignment_slot], with at most two typed assignments.",
+            f"- UAV arrays use UAV id as row index 0..{num_uav - 1}. task_type/task_target_id axes are [uav_id, assignment_slot], with at most {max_task_slots} typed assignments.",
             "- RoI and SR arrays are compact padded rows. roi_id[row] and sr_id[row] give object IDs; never use an object ID as a compact row. Match IDs explicitly under roi_observable/sr_observable and mapping-valid flags.",
             "- U2U matrices are [sender_uav_id, receiver_uav_id]. U2G vectors are [sender_uav_id]. S2U matrices are [compact_sr_row, receiver_uav_id].",
             "- Invalid/padded IDs are -1; numeric padding is zero. Empty queues, no discovered RoI, no service target, and all-false masks are legal, not errors.",
@@ -373,8 +436,8 @@ def render_environment_interface(
             "- C9 uses G=clip(b1*h/(d+epsilon),0,1), violation=1-G, averaged over currently assigned VS pairs. model_range_valid is d<=b1*h with valid positive geometry.",
             "- After C9 is model-range-valid, d_L=(h^2+d^2)/(b1*h+d) and d_R=(h^2+d^2)/sqrt(b2^2*h^2+(1+b2^2)*d^2). C10 violation=1-clip(min(d_L,d_R)/(RoI_radius+epsilon),0,1), averaged only over finite C9-valid pairs.",
             "- vs_geometry_valid, vs_c10_geometry_valid, and vs_capture_valid are distinct. The exact C9 boundary may be model-range-valid while capture-invalid because of a horizontal corner ray.",
-            "- Packet generation requires vs_capture_valid, but incomplete C10 coverage is not a separate hard gate. When capture is valid, physical size uses min(max(image_quantity,0),1); useful delivered VS bits additionally use frozen capture coverage.",
-            "- COM violation=1-clip(communication_range_3d/(assigned_S2U_distance_3d+epsilon),0,1), averaged over all assigned COM pairs, including out-of-range pairs.",
+            "- Packet generation requires vs_capture_valid, but incomplete C10 coverage is not a separate hard gate. When capture is valid, VS physical size is packet_max_bits*min(max(image_quantity,0),1). On timely GS delivery, useful VS bits equal that frozen physical size times frozen capture coverage; useful COM bits equal timely physical bits.",
+            "- COM violation=1-clip(communication_range_m/(assigned_S2U_distance_3d+epsilon),0,1), averaged over all assigned COM pairs, including out-of-range pairs.",
             "- The three stored baseline penalties are per-task-type means and each has weight 1; they are post-action reward components and therefore are not present in obs.",
             "",
             "constants contains these verified fixed entries (candidate code accesses constants[name] to get the value):",
@@ -390,35 +453,48 @@ def render_environment_interface(
 def format_schema_and_example(schema: dict[str, Any]) -> str:
     example = {
         "schema_version": CANDIDATE_SCHEMA_VERSION,
-        "candidate_name": "format_only_control_fraction_example",
+        "candidate_name": "format_only_observed_queue_fraction_example",
         "reward_input_mode": "current_only",
         "features": [
             {
                 "index": 0,
-                "name": "controlled_uav_fraction",
+                "name": "controlled_uav_nonempty_queue_fraction",
                 "dtype": "float32",
-                "description": "Example of mask-aware normalization: the fraction of UAVs currently controlled by TD3. Its zero reward weight makes this an interface example, not a recommended reward design.",
+                "description": "Formatting example of selecting controlled UAVs whose queue summaries are valid, then measuring the fraction with a nonempty queue. Its zero reward weight makes this interface guidance, not a recommended reward design.",
                 "range": {"minimum": 0.0, "maximum": 1.0},
-                "source_fields": ["obs.movement_mask", "constants.num_uav"],
-                "formula": "count_nonzero(movement_mask) / max(num_uav, 1), clipped to [0,1]",
-                "missing_data_rule": "An all-false movement mask is a valid empty controlled set and returns 0.",
+                "source_fields": [
+                    "obs.movement_mask",
+                    "obs.uav_queue_valid",
+                    "obs.uav_queue_empty",
+                ],
+                "formula": "Among movement-controlled UAVs with valid queue summaries, count_nonzero(not queue_empty) / applicable_count; this fixed bounded fraction is clipped to [0,1].",
+                "missing_data_rule": "Ignore UAVs without valid queue summaries. If no controlled UAV has a valid summary, return 0; an observed empty queue remains a valid zero contribution.",
                 "reward_weight": 0.0,
             }
         ],
         "code": (
             "def compute_extra_state(obs, constants):\n"
-            "    denominator = max(float(constants[\"num_uav\"]), 1.0)\n"
-            "    controlled_fraction = np.clip(\n"
-            "        float(np.count_nonzero(obs[\"movement_mask\"])) / denominator,\n"
-            "        0.0,\n"
-            "        1.0,\n"
-            "    )\n"
-            "    return np.asarray([controlled_fraction], dtype=np.float32)\n"
+            "    applicable = obs[\"movement_mask\"] & obs[\"uav_queue_valid\"]\n"
+            "    applicable_count = int(np.count_nonzero(applicable))\n"
+            "    value = 0.0\n"
+            "    if applicable_count > 0:\n"
+            "        nonempty = applicable & (~obs[\"uav_queue_empty\"])\n"
+            "        value = np.clip(\n"
+            "            float(np.count_nonzero(nonempty)) / float(applicable_count),\n"
+            "            0.0,\n"
+            "            1.0,\n"
+            "        )\n"
+            "    return np.asarray([value], dtype=np.float32)\n"
         ),
     }
     return (
         "JSON Schema (Draft 2020-12; no additional fields):\n"
-        + json.dumps(schema, indent=2, ensure_ascii=False, allow_nan=False)
+        + json.dumps(
+            schema,
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+        )
         + "\n\nParseable interface example (reward_weight=0 makes it formatting guidance, not a suggested reward design):\n"
         + json.dumps(example, indent=2, ensure_ascii=False, allow_nan=False)
     )
@@ -476,7 +552,7 @@ def render_prompt(
     }
     for placeholder, value in replacements.items():
         template = template.replace(placeholder, value)
-    if "{{" in template or "}}" in template:
+    if re.search(r"\{\{[A-Z][A-Z0-9_]*\}\}", template):
         raise RuntimeError("prompt contains an unfilled placeholder")
     return template
 
