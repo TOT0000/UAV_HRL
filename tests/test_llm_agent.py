@@ -153,9 +153,53 @@ def _tool_sse(*, model, finish_reason, arguments, refusal=None, done=True):
     return chunks
 
 
-def _direct_streaming_model(tmp_path, fixed, *, chunks, provider="openai"):
+def _fragmented_tool_sse(*, model, tool_name, arguments, finish_reason):
+    serialized = json.dumps(arguments, ensure_ascii=False, separators=(",", ":"))
+    cut_points = sorted(
+        {
+            1,
+            max(2, len(serialized) // 5),
+            max(3, len(serialized) // 2),
+            max(4, len(serialized) - 3),
+            len(serialized),
+        }
+    )
+    fragments = []
+    start = 0
+    for end in cut_points:
+        if end > start:
+            fragments.append(serialized[start:end])
+            start = end
+    chunks = []
+    for index, fragment in enumerate(fragments):
+        function = {"arguments": fragment}
+        call = {"index": 0, "function": function}
+        if index == 0:
+            call.update({"id": "stream-candidate-1", "type": "function"})
+            function["name"] = tool_name
+        event = {
+            "model": model,
+            "choices": [
+                {
+                    "delta": {"tool_calls": [call]},
+                    "finish_reason": (
+                        finish_reason if index == len(fragments) - 1 else None
+                    ),
+                }
+            ],
+        }
+        chunks.append(f"data: {json.dumps(event, ensure_ascii=False)}\n\n".encode())
+    chunks.append(b"data: [DONE]\n\n")
+    return chunks
+
+
+def _direct_streaming_model(
+    tmp_path, fixed, *, chunks, provider="openai", model_id=None
+):
     workspace = _workspace(tmp_path, fixed, name=f"stream-{provider}")
-    model_id = "gpt-4o" if provider == "openai" else "openai/gpt-oss-20b"
+    model_id = model_id or (
+        "gpt-4o" if provider == "openai" else "openai/gpt-oss-20b"
+    )
     class FixtureClient:
         def __init__(self):
             self.base_url = "http://127.0.0.1:1234/v1"
@@ -199,9 +243,9 @@ def test_mock_agent_autonomously_queries_revises_tests_and_approves(tmp_path):
     model = ScriptedToolModel(
         [
             ("query_samples", {"fields": ["obs.movement_mask"], "start": 0, "limit": 1, "condition_field": None, "condition": None}),
-            ("submit_candidate", {"candidate_json": json.dumps(bad), "parent_candidate_id": None}),
+            ("submit_candidate", {"candidate": bad, "parent_candidate_id": None}),
             ("test_candidate", {"candidate_id": bad_id, "mode": "small", "sample_indices": [0]}),
-            ("submit_candidate", {"candidate_json": json.dumps(good), "parent_candidate_id": bad_id}),
+            ("submit_candidate", {"candidate": good, "parent_candidate_id": bad_id}),
             ("test_candidate", {"candidate_id": good_id, "mode": "small", "sample_indices": [0, 2, 4]}),
             ("formal_evaluate", {"candidate_id": good_id}),
         ]
@@ -286,8 +330,12 @@ def test_candidate_reports_cache_and_approval_are_bound_to_content(tmp_path):
     )
     failing = _candidate(passing=False, name="failing")
     passing = _candidate(passing=True, name="passing")
-    first = workspace.submit_candidate(json.dumps(failing), None)
-    second = workspace.submit_candidate(json.dumps(passing), first["candidate_id"])
+    first = workspace.submit_candidate(failing, None)
+    second = workspace.submit_candidate(passing, first["candidate_id"])
+    duplicate = workspace.submit_candidate(json.loads(json.dumps(passing)), None)
+    assert duplicate["status"] == "duplicate_candidate"
+    assert duplicate["candidate_id"] == second["candidate_id"]
+    assert second["parent_candidate_id"] == first["candidate_id"]
     first_eval = workspace.formal_evaluate(first["candidate_id"])
     first_cached = workspace.formal_evaluate(first["candidate_id"])
     second_eval = workspace.formal_evaluate(second["candidate_id"])
@@ -341,7 +389,7 @@ def test_resume_dry_run_preserves_candidate_and_does_not_interrupt_source(tmp_pa
         relative_tolerance=1e-6,
         max_model_calls=4,
     )
-    submitted = workspace.submit_candidate(json.dumps(_candidate()), None)
+    submitted = workspace.submit_candidate(_candidate(), None)
     workspace.begin_operation("test_candidate", {"candidate_id": submitted["candidate_id"]})
     workspace.state["model_calls_used"] = 2
     workspace.state["request_settings"] = _request_settings()
@@ -401,9 +449,9 @@ def test_new_candidate_keeps_parent_issues_unverified_until_full_test(tmp_path):
         "def compute_extra_state(obs, constants):\n"
         "    return np.asarray([0.0], dtype=np.float32)\n"
     )
-    parent = workspace.submit_candidate(json.dumps(bad), None)
+    parent = workspace.submit_candidate(bad, None)
     child = workspace.submit_candidate(
-        json.dumps(_candidate(name="corrected-child")), parent["candidate_id"]
+        _candidate(name="corrected-child"), parent["candidate_id"]
     )
     record = workspace.state["candidates"][child["candidate_id"]]
     assert record["inherited_issue_context"]
@@ -460,7 +508,7 @@ def test_tools_reject_paths_and_sample_queries_only_expose_current_adapter(tmp_p
         workspace.get_history("C:/arbitrary/path", "candidate")
 
     invalid_parent = workspace.submit_candidate(
-        json.dumps(_candidate()), "candidate-not-present"
+        _candidate(), "candidate-not-present"
     )
     assert invalid_parent == {
         "status": "invalid_arguments",
@@ -536,6 +584,134 @@ def test_streamed_tool_arguments_execute_only_after_lossless_aggregation(tmp_pat
     assert json.loads(result["tool_calls"][0]["function"]["arguments"])["limit"] == 1
 
 
+def test_submit_candidate_api_schema_embeds_canonical_object_schema(tmp_path):
+    fixed = _fixed_artifact(tmp_path)
+    workspace = _workspace(tmp_path, fixed, name="candidate-tool-schema")
+    tool = next(
+        item
+        for item in llm_agent.build_agent_tools(workspace)
+        if item.name == "submit_candidate"
+    )
+    schema = llm_agent.get_tool_json_schema(tool)
+    parameters = schema["function"]["parameters"]
+    candidate = parameters["properties"]["candidate"]
+    canonical = llm_agent.candidate_schema()
+    assert candidate["type"] == "object"
+    assert candidate["additionalProperties"] is False
+    assert candidate["required"] == canonical["required"]
+    assert candidate["properties"]["code"]["type"] == "string"
+    assert candidate["properties"]["features"]["items"]["type"] == "object"
+    assert "$ref" not in json.dumps(candidate)
+    assert "candidate" in parameters["required"]
+    assert "candidate_json" not in parameters["properties"]
+
+
+@pytest.mark.parametrize(
+    ("provider", "model_id", "finish_reason"),
+    [
+        ("lmstudio", "openai/gpt-oss-20b", "stop"),
+        ("lmstudio", "qwen/qwen3.5-9b", "stop"),
+        ("lmstudio", "google/gemma-4-e4b", "stop"),
+        ("openai", "gpt-4o", "tool_calls"),
+    ],
+)
+def test_nested_candidate_object_survives_fragmented_stream_exactly(
+    tmp_path, provider, model_id, finish_reason
+):
+    fixed = _fixed_artifact(tmp_path)
+    candidate = _candidate(name=f"streamed-{model_id}")
+    candidate["code"] = (
+        "def compute_extra_state(obs, constants):\n"
+        "    # double \" quote, single ' quote, path C:\\\\tmp\\\\feature\n"
+        "    value = np.clip(obs['state'][0] * obs[\"state\"][0], 0.0, 1.0)\n"
+        "    return np.asarray([value], dtype=np.float32)\n"
+    )
+    arguments = {"candidate": candidate, "parent_candidate_id": None}
+    chunks = _fragmented_tool_sse(
+        model=model_id,
+        tool_name="submit_candidate",
+        arguments=arguments,
+        finish_reason=finish_reason,
+    )
+    workspace, model, budget = _direct_streaming_model(
+        tmp_path,
+        fixed,
+        chunks=chunks,
+        provider=provider,
+        model_id=model_id,
+    )
+    response = model.generate(
+        [ChatMessage(role=MessageRole.USER, content="fixture")],
+        tools_to_call_from=llm_agent.build_agent_tools(workspace),
+    )
+    decoded = response.tool_calls[0].function.arguments
+    assert decoded == arguments
+    assert decoded["candidate"]["code"] == candidate["code"]
+    tool = next(
+        item
+        for item in llm_agent.build_agent_tools(workspace)
+        if item.name == "submit_candidate"
+    )
+    submitted = json.loads(tool.forward(**decoded))
+    assert submitted["status"] == "static_passed"
+    assert workspace.state["candidates"][submitted["candidate_id"]]["candidate"][
+        "code"
+    ] == candidate["code"]
+    tested = workspace.test_candidate(
+        submitted["candidate_id"], mode="small", sample_indices=[0]
+    )
+    assert tested["status"] == "passed"
+    assert budget.used == 1
+
+
+@pytest.mark.parametrize("value", [None, [], '{"schema_version":"nested"}'])
+def test_submit_candidate_rejects_non_object_values_clearly(tmp_path, value):
+    fixed = _fixed_artifact(tmp_path)
+    workspace = _workspace(tmp_path, fixed, name=f"invalid-{type(value).__name__}")
+    tool = next(
+        item
+        for item in llm_agent.build_agent_tools(workspace)
+        if item.name == "submit_candidate"
+    )
+    result = json.loads(tool.forward(value, None))
+    assert result["status"] == "invalid_arguments"
+    assert result["candidate_created"] is False
+    assert "candidate must be a JSON object" in result["error"]
+    if isinstance(value, str):
+        assert "JSON-encoded string" in result["error"]
+    assert workspace.state["candidates"] == {}
+
+
+def test_missing_fields_and_invalid_python_never_become_executable(tmp_path):
+    fixed = _fixed_artifact(tmp_path)
+    workspace = _workspace(tmp_path, fixed, name="invalid-candidates")
+    missing = _candidate(name="missing-code")
+    missing.pop("code")
+    missing_result = workspace.submit_candidate(missing, None)
+    assert missing_result["status"] == "static_failed"
+    assert missing_result["can_execute"] is False
+    assert any("code" in issue["location"] for issue in missing_result["errors"])
+    assert workspace.test_candidate(
+        missing_result["candidate_id"], mode="small", sample_indices=[0]
+    )["status"] == "prerequisite_failed"
+
+    invalid = _candidate(name="invalid-python")
+    invalid["code"] = (
+        "def compute_extra_state(obs, constants):\n"
+        "    ctrl = obs[\"movement_mask\"]\n"
+        "    return np.asarray([ctrl[0]], dtype=np.float32\n"
+    )
+    invalid_result = workspace.submit_candidate(invalid, None)
+    assert invalid_result["status"] == "static_failed"
+    assert invalid_result["can_execute"] is False
+    saved = workspace.state["candidates"][invalid_result["candidate_id"]]["candidate"]
+    assert saved["code"] == invalid["code"]
+    assert any(
+        issue["code"] == "STATIC_PYTHON_SYNTAX"
+        for issue in invalid_result["errors"]
+    )
+
+
 def test_transport_failure_stops_without_becoming_a_candidate_error(tmp_path):
     fixed = _fixed_artifact(tmp_path)
     model = TransportFailureModel()
@@ -567,7 +743,7 @@ def test_multi_tool_approval_stops_sequentially_and_skips_remaining_call(tmp_pat
             [
                 (
                     "submit_candidate",
-                    {"candidate_json": json.dumps(candidate), "parent_candidate_id": None},
+                    {"candidate": candidate, "parent_candidate_id": None},
                 )
             ],
             [
@@ -609,7 +785,7 @@ def test_multi_tool_nonapproval_continues_in_model_order(tmp_path):
             [
                 (
                     "submit_candidate",
-                    {"candidate_json": json.dumps(candidate), "parent_candidate_id": None},
+                    {"candidate": candidate, "parent_candidate_id": None},
                 )
             ],
             [
@@ -660,7 +836,7 @@ def test_multi_tool_failure_preserves_prior_result_in_next_model_messages(
             [
                 (
                     "submit_candidate",
-                    {"candidate_json": json.dumps(candidate), "parent_candidate_id": None},
+                    {"candidate": candidate, "parent_candidate_id": None},
                 ),
                 (failing_name, failing_arguments),
                 ("inspect_interface", {"section": "evaluation"}),
@@ -814,13 +990,13 @@ def test_formal_issue_survives_child_runtime_pass_and_resume_messages(tmp_path):
         max_model_calls=4,
     )
     parent = workspace.submit_candidate(
-        json.dumps(_candidate(passing=False, name="failed-parent")), None
+        _candidate(passing=False, name="failed-parent"), None
     )
     failed = workspace.formal_evaluate(parent["candidate_id"])
     assert failed["passed"] is False
     child_candidate = _candidate(name="revised-child")
     child = workspace.submit_candidate(
-        json.dumps(child_candidate), parent["candidate_id"]
+        child_candidate, parent["candidate_id"]
     )
     assert workspace.test_candidate(child["candidate_id"], mode="full")["status"] == "passed"
     inherited_formal = [
@@ -865,7 +1041,7 @@ def test_work_summary_bounds_twenty_candidate_evaluation_history(tmp_path):
     report_paths = []
     for index in range(20):
         submitted = workspace.submit_candidate(
-            json.dumps(_candidate(passing=False, name=f"revision-{index:02d}")),
+            _candidate(passing=False, name=f"revision-{index:02d}"),
             parent_id,
         )
         candidate_id = submitted["candidate_id"]
@@ -968,7 +1144,7 @@ def test_work_summary_bounds_twenty_candidate_evaluation_history(tmp_path):
 def test_work_summary_omitted_issue_details_remain_indexed(tmp_path):
     fixed = _fixed_artifact(tmp_path)
     workspace = _workspace(tmp_path, fixed, name="bounded-issues")
-    submitted = workspace.submit_candidate(json.dumps(_candidate(name="many-issues")), None)
+    submitted = workspace.submit_candidate(_candidate(name="many-issues"), None)
     candidate_id = submitted["candidate_id"]
     record = workspace.state["candidates"][candidate_id]
     record["issues"] = [
@@ -1119,6 +1295,28 @@ def test_resume_dry_run_compatibility_failure_does_not_modify_source(
     assert not (tmp_path / "incompatible-preview-output").exists()
 
 
+def test_old_string_submit_tool_contract_is_rejected_on_resume(tmp_path):
+    fixed = _fixed_artifact(tmp_path)
+    workspace = _workspace(tmp_path, fixed, name="old-submit-contract")
+    old_state = json.loads(json.dumps(workspace.state))
+    old_state["contracts"]["tools"] = "uav-hrl-llm-feature-agent-tools-v2"
+    with pytest.raises(ValueError, match="resume contracts are incompatible"):
+        AgentWorkspace(
+            directory=workspace.directory,
+            fixed_sample=fixed,
+            provider="lmstudio",
+            model="mock/tool-model",
+            beta=1.0,
+            batch_size=2,
+            worker_timeout=20,
+            absolute_tolerance=1e-12,
+            relative_tolerance=1e-6,
+            max_model_calls=20,
+            resume_state=old_state,
+            read_only=True,
+        )
+
+
 def test_approved_run_cannot_be_resumed(tmp_path):
     fixed = _fixed_artifact(tmp_path)
     directory = tmp_path / "approved-resume"
@@ -1128,7 +1326,7 @@ def test_approved_run_cannot_be_resumed(tmp_path):
         [
             (
                 "submit_candidate",
-                {"candidate_json": json.dumps(candidate), "parent_candidate_id": None},
+                {"candidate": candidate, "parent_candidate_id": None},
             ),
             ("formal_evaluate", {"candidate_id": candidate_id}),
         ]
@@ -1253,7 +1451,7 @@ def test_context_compaction_keeps_complete_candidate_and_tool_pairs(tmp_path):
         [
             (
                 "submit_candidate",
-                {"candidate_json": json.dumps(candidate), "parent_candidate_id": None},
+                {"candidate": candidate, "parent_candidate_id": None},
             ),
             ("inspect_interface", {"section": "overview"}),
             (

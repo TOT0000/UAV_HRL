@@ -44,12 +44,10 @@ except ImportError as exc:  # pragma: no cover - exercised in a clean subprocess
     ) from exc
 
 from llm_candidate import (
-    CandidateError,
     CandidateExecutionError,
     candidate_numeric_diagnostics,
     execute_candidate_isolated,
     feature_reward,
-    parse_candidate_json_envelope,
     save_approved_artifact,
     validate_candidate,
     validate_candidate_staged,
@@ -107,8 +105,8 @@ from llm_streaming import (
 
 
 AGENT_RUN_SCHEMA_VERSION = "uav-hrl-llm-feature-agent-run-v1"
-AGENT_PROMPT_VERSION = "uav-hrl-llm-feature-agent-prompt-v1"
-AGENT_TOOL_CONTRACT_VERSION = "uav-hrl-llm-feature-agent-tools-v2"
+AGENT_PROMPT_VERSION = "uav-hrl-llm-feature-agent-prompt-v2"
+AGENT_TOOL_CONTRACT_VERSION = "uav-hrl-llm-feature-agent-tools-v3"
 DEFAULT_MAX_MODEL_CALLS = 20
 DEFAULT_AGENT_OUTPUT_ROOT = Path("results") / "llm_agents"
 DEFAULT_AGENT_PREVIEW_ROOT = Path("results") / "llm_agent_previews"
@@ -168,6 +166,58 @@ def _content_hash(value: Any) -> str:
             allow_nan=False,
         ).encode("utf-8")
     ).hexdigest()
+
+
+def _candidate_tool_input_schema() -> dict[str, Any]:
+    """Embed the canonical candidate schema as one tool argument.
+
+    The source schema uses root-relative ``#/$defs`` references. Resolve those
+    while copying because the candidate schema is nested below the tool's
+    ``candidate`` property. This avoids maintaining a second schema.
+    """
+
+    schema = candidate_schema()
+    definitions = schema.get("$defs", {})
+
+    def resolve(value: Any) -> Any:
+        if isinstance(value, dict):
+            reference = value.get("$ref")
+            if isinstance(reference, str) and reference.startswith("#/$defs/"):
+                name = reference.removeprefix("#/$defs/")
+                if name not in definitions:
+                    raise ValueError(
+                        f"candidate schema contains an unknown local reference: {reference}"
+                    )
+                resolved = resolve(copy.deepcopy(definitions[name]))
+                siblings = {key: item for key, item in value.items() if key != "$ref"}
+                if siblings:
+                    resolved.update(resolve(siblings))
+                return resolved
+            result = {
+                key: resolve(item)
+                for key, item in value.items()
+                if key not in {"$schema", "$id", "$defs", "title"}
+            }
+            if "const" in result and "type" not in result:
+                const_type = {
+                    str: "string",
+                    bool: "boolean",
+                    int: "integer",
+                    float: "number",
+                }.get(type(result["const"]))
+                if const_type is not None:
+                    result["type"] = const_type
+            return result
+        if isinstance(value, list):
+            return [resolve(item) for item in value]
+        return copy.deepcopy(value)
+
+    resolved = resolve(schema)
+    resolved["description"] = (
+        "Complete shared-feature v2 candidate as a JSON object. Pass the object "
+        "directly; do not serialize it into a JSON string."
+    )
+    return resolved
 
 
 def _agent_directory(
@@ -238,6 +288,9 @@ def _render_agent_prompt(
     template = AGENT_PROMPT_TEMPLATE_PATH.read_text(encoding="utf-8")
     candidate_contract = (
         format_schema_and_example(candidate_schema())
+        + "\n\nSubmission interface:\n"
+        + "- Call submit_candidate with the complete example-shaped object in the candidate argument.\n"
+        + "- Do not serialize that object into a candidate_json string. The host receives candidate.code as decoded Python source and handles persistence serialization.\n"
         + "\n\n"
         + SUPPORTED_OPERATIONS
     )
@@ -842,6 +895,14 @@ class AgentWorkspace:
         elif section == "candidate":
             value = {
                 "schema": candidate_schema(),
+                "submit_candidate_arguments": {
+                    "candidate": "direct object matching schema",
+                    "parent_candidate_id": "optional immutable candidate id or null",
+                },
+                "serialization_note": (
+                    "Pass candidate as an object, not a JSON-encoded string. "
+                    "The host serializes submissions for persistence."
+                ),
                 "supported_operations": SUPPORTED_OPERATIONS,
             }
         elif section == "evaluation":
@@ -935,25 +996,56 @@ class AgentWorkspace:
         }
 
     def submit_candidate(
-        self, candidate_json: str, parent_candidate_id: str | None
+        self, candidate: Any, parent_candidate_id: str | None
     ) -> dict[str, Any]:
-        raw_hash = hashlib.sha256(str(candidate_json).encode("utf-8")).hexdigest()
-        try:
-            candidate, envelope = parse_candidate_json_envelope(str(candidate_json))
-        except CandidateError as exc:
-            submission_id = f"submission-{raw_hash[:12]}"
-            path = self.directory / "submissions" / submission_id
-            path.mkdir(parents=True, exist_ok=True)
-            (path / "raw.txt").write_text(str(candidate_json), encoding="utf-8")
+        if not isinstance(candidate, dict):
+            type_name = type(candidate).__name__
             report = {
-                "status": "failed",
-                "candidate_id": submission_id,
-                "error_type": type(exc).__name__,
-                "error": str(exc),
+                "status": "invalid_arguments",
+                "error_type": "CandidateTypeError",
+                "error": (
+                    "candidate must be a JSON object, not a JSON-encoded string"
+                    if isinstance(candidate, str)
+                    else f"candidate must be a JSON object, not {type_name}"
+                ),
                 "candidate_created": False,
             }
+            raw_hash = hashlib.sha256(
+                json.dumps(
+                    {"type": type_name, "value": candidate},
+                    sort_keys=True,
+                    ensure_ascii=False,
+                    default=str,
+                ).encode("utf-8")
+            ).hexdigest()
+            path = self.directory / "submissions" / f"submission-{raw_hash[:12]}"
+            path.mkdir(parents=True, exist_ok=True)
             _write_json(path / "submission_report.json", report)
             return report
+        try:
+            serialized = json.dumps(
+                candidate,
+                sort_keys=True,
+                ensure_ascii=False,
+                allow_nan=False,
+                separators=(",", ":"),
+            )
+            candidate = json.loads(serialized)
+        except (TypeError, ValueError) as exc:
+            report = {
+                "status": "invalid_arguments",
+                "error_type": type(exc).__name__,
+                "error": f"candidate must be a finite JSON object: {exc}",
+                "candidate_created": False,
+            }
+            raw_hash = hashlib.sha256(
+                f"{type(exc).__name__}:{exc}".encode("utf-8")
+            ).hexdigest()
+            path = self.directory / "submissions" / f"submission-{raw_hash[:12]}"
+            path.mkdir(parents=True, exist_ok=True)
+            _write_json(path / "submission_report.json", report)
+            return report
+        envelope = {"format": "direct_tool_object", "host_serialized": True}
         digest = _content_hash(candidate)
         candidate_id = f"candidate-{digest[:12]}"
         existing = self.state["candidates"].get(candidate_id)
@@ -1025,7 +1117,10 @@ class AgentWorkspace:
         candidate_dir = self.directory / "candidates" / candidate_id
         candidate_dir.mkdir(parents=True, exist_ok=True)
         _write_json(candidate_dir / "candidate.json", candidate)
-        (candidate_dir / "candidate.py").write_text(candidate["code"], encoding="utf-8")
+        if isinstance(candidate.get("code"), str):
+            (candidate_dir / "candidate.py").write_text(
+                candidate["code"], encoding="utf-8"
+            )
         _write_json(candidate_dir / "staged_validation.json", staged)
         self._save()
         return {
@@ -1462,15 +1557,20 @@ class QuerySamplesTool(_WorkspaceTool):
 
 class SubmitCandidateTool(_WorkspaceTool):
     name = "submit_candidate"
-    description = "Submit one complete shared-feature candidate JSON. Every distinct content hash creates an immutable version; the host never repairs it."
+    description = "Submit one complete shared-feature candidate object. Pass the object directly, never a JSON-encoded string. Every distinct content hash creates an immutable version; the host never repairs it."
     inputs = {
-        "candidate_json": {"type": "string", "description": "complete JSON object matching the supplied candidate schema"},
+        "candidate": _candidate_tool_input_schema(),
         "parent_candidate_id": {"type": "string", "description": "optional candidate id this revision derives from", "nullable": True},
     }
     output_type = "string"
 
-    def forward(self, candidate_json: str, parent_candidate_id: str | None = None) -> str:
-        return self.workspace.invoke(self.name, {"candidate_json": candidate_json, "parent_candidate_id": parent_candidate_id}, lambda: self.workspace.submit_candidate(candidate_json, parent_candidate_id))
+    def forward(self, candidate: dict[str, Any], parent_candidate_id: str | None = None) -> str:
+        arguments = {"candidate": candidate, "parent_candidate_id": parent_candidate_id}
+        return self.workspace.invoke(
+            self.name,
+            arguments,
+            lambda: self.workspace.submit_candidate(candidate, parent_candidate_id),
+        )
 
 
 class TestCandidateTool(_WorkspaceTool):

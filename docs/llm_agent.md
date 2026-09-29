@@ -19,6 +19,13 @@ full validation and the existing all-lambda Lipschitz rule pass. The resulting
 `approved/` directory uses the existing artifact contract consumed by
 `td3_dinkelbach_llm`. No training starts automatically.
 
+`submit_candidate` accepts the complete shared-feature v2 candidate directly in
+its `candidate` object argument. The model must not serialize that object into a
+second `candidate_json` string. The `code` member is still an ordinary JSON
+string; after the tool arguments are decoded it contains the exact Python source,
+including real newlines and indentation. The host performs any serialization
+needed for durable records and never repairs quoting, backslashes, or Python.
+
 ## Install
 
 ```powershell
@@ -192,3 +199,6 @@ Agent runs created by another Git revision cannot be resumed by design. This
 prevents old framework-memory, tool, or validation evidence from being silently
 mixed with a changed implementation. Start a new run when compatibility checks
 reject an older directory; the old directory remains intact for inspection.
+This includes runs created with the former string-valued `candidate_json` tool
+contract: their candidates and approved artifacts remain readable, but the agent
+conversation cannot be resumed under the object-valued tool contract.

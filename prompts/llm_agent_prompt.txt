@@ -80,6 +80,6 @@ The current work record is:
 
 It identifies candidate versions, completed tests, unresolved or unverified issues, relevant findings, and remaining budget. Match each result to the candidate version it evaluated. Retrieve older records when needed.
 
-Submit candidates through the designated tool using the supplied schema. Tool calls and brief operational messages may occur during the process; the entire conversation need not be a single candidate JSON object.
+Submit candidates through the designated tool using the supplied schema. Pass the complete candidate directly in the tool's `candidate` object argument; do not serialize it into a `candidate_json` string. The `code` field remains a normal JSON string and is delivered to the host as decoded Python source. Tool calls and brief operational messages may occur during the process; the entire conversation need not be a single candidate JSON object.
 
 The host determines approval and saves the approved artifact. Once approval is confirmed, stop. If you stop without approval, report the candidate identifier, verified findings, and unresolved blockers. This task ends at offline design; training is a separate user-controlled step.
