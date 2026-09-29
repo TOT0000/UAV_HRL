@@ -520,6 +520,7 @@ def capture_chat_stream(
     done_received = False
     terminal_chunk_received = False
     tool_calls_seen = False
+    tool_call_parts: dict[int, dict[str, Any]] = {}
     event_count = 0
     byte_count = 0
     first_output_elapsed = None
@@ -630,6 +631,40 @@ def capture_chat_stream(
                             )
                         if delta.get("tool_calls") or delta.get("function_call"):
                             tool_calls_seen = True
+                        for fragment in delta.get("tool_calls") or []:
+                            if not isinstance(fragment, dict):
+                                raise StreamTransportError(
+                                    "stream_protocol_error",
+                                    "stream tool-call delta is not an object",
+                                )
+                            index = int(fragment.get("index", 0))
+                            accumulated = tool_call_parts.setdefault(
+                                index,
+                                {
+                                    "index": index,
+                                    "id": None,
+                                    "type": "function",
+                                    "function": {"name": "", "arguments": ""},
+                                },
+                            )
+                            if fragment.get("id") is not None:
+                                accumulated["id"] = str(fragment["id"])
+                            if fragment.get("type") is not None:
+                                accumulated["type"] = str(fragment["type"])
+                            function = fragment.get("function") or {}
+                            if not isinstance(function, dict):
+                                raise StreamTransportError(
+                                    "stream_protocol_error",
+                                    "stream tool-call function delta is not an object",
+                                )
+                            if function.get("name") is not None:
+                                accumulated["function"]["name"] += str(
+                                    function["name"]
+                                )
+                            if function.get("arguments") is not None:
+                                accumulated["function"]["arguments"] += str(
+                                    function["arguments"]
+                                )
                         content = delta.get("content")
                         reasoning = delta.get(
                             "reasoning_content", delta.get("reasoning")
@@ -772,6 +807,7 @@ def capture_chat_stream(
         "terminal_chunk_received": terminal_chunk_received,
         "transport_completed": True,
         "tool_calls_seen": tool_calls_seen,
+        "tool_calls": [tool_call_parts[index] for index in sorted(tool_call_parts)],
         "elapsed_seconds": time.monotonic() - started,
         "event_count": event_count,
         "received_bytes": byte_count,
