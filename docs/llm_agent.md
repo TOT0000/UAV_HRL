@@ -204,6 +204,15 @@ indexes and any still-pending result, so resume can deliver it without rerunning
 the operation. “Delivered” means included in a request that completed; it does
 not claim that the model understood the result.
 
+Evaluation-history pages summarize each registered report before applying the
+page-size limit. Every entry keeps the candidate/report IDs, approval status,
+all per-lambda baseline and candidate estimates, improvement, required margin,
+pass result, and a directly executable `details_query`. Detailed reports are
+returned as lossless ordered text segments with character and line positions;
+concatenating each segment's `text` reconstructs the canonical report JSON.
+This lets a single unusually long JSON line be paged without silent truncation
+or a zero-progress page.
+
 The estimate uses the same serialized messages and tool schemas sent to the
 provider, plus the configured output reservation. If the minimum state and a
 usable pending result page still do not fit, the run is saved and stops without

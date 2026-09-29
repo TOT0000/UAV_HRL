@@ -214,6 +214,54 @@ def _request_settings(*, context_length=100_000, max_output_tokens=1_024):
     }
 
 
+def _install_oversized_evaluation_report(
+    workspace, candidate_id, *, suffix="oversized", padding_character="x"
+):
+    by_lambda = {}
+    for index, lambda_value in enumerate((0.0, 0.00007, 0.00013, 0.00014, 0.00015)):
+        baseline = 1.3 + index * 0.01
+        candidate = baseline + 0.2
+        by_lambda[f"{lambda_value:.5f}"] = {
+            "lambda_mbit_per_joule": lambda_value,
+            "baseline_l_hat": baseline,
+            "candidate_l_hat": candidate,
+            "improvement": baseline - candidate,
+            "required_margin": 1e-6 * baseline,
+            "passed": False,
+            "maximum_pair": {
+                "i": index,
+                "j": index + 10,
+                "numerator": 4.0 + index,
+                "denominator": 0.25 + index,
+                "transition_i": {
+                    "trace": padding_character * 1_100,
+                    "state": [float(value) for value in range(80)],
+                },
+                "transition_j": {
+                    "trace": padding_character * 1_100,
+                    "state": [float(value) for value in range(80, 160)],
+                },
+            },
+        }
+    report = {
+        "status": "failed",
+        "passed": False,
+        "by_lambda": by_lambda,
+        "evaluation_diagnostics": {
+            "long_single_line": padding_character * 8_000,
+            "by_lambda": {
+                key: {"maximum_pair_ref": f"fixture-pair-{key}"}
+                for key in by_lambda
+            },
+        },
+    }
+    report_id = f"candidates/{candidate_id}/evaluation_{suffix}.json"
+    llm_agent._write_json(workspace.directory / report_id, report)
+    workspace.state["candidates"][candidate_id]["evaluations"][suffix] = report_id
+    workspace._save()
+    return report_id, report
+
+
 def _tree_hashes(directory):
     return {
         str(path.relative_to(directory)): hashlib.sha256(path.read_bytes()).hexdigest()
@@ -2335,7 +2383,7 @@ def test_history_report_pages_are_model_retrievable_without_arbitrary_paths(
     candidate_id = submitted["candidate_id"]
     tested = workspace.test_candidate(candidate_id)
     report_id = tested["report_id"]
-    lines = []
+    segments = []
     arguments = {
         "candidate_id": candidate_id,
         "record_type": "report",
@@ -2348,11 +2396,16 @@ def test_history_report_pages_are_model_retrievable_without_arbitrary_paths(
         assert page["status"] == "ok"
         assert page["report_id"] == report_id
         assert workspace._serialized_size(page) <= llm_agent.MODEL_TOOL_RESULT_MAX_CHARS
-        lines.extend(page["data_lines"])
+        assert page["data_segments"]
+        segments.extend(page["data_segments"])
         if not page["has_more"]:
             break
+        assert page["next_start"] > page["page_start"]
         arguments = page["next_query_arguments"]
-    reconstructed = json.loads("\n".join(lines))
+    assert [item["segment_index"] for item in segments] == list(
+        range(len(segments))
+    )
+    reconstructed = json.loads("".join(item["text"] for item in segments))
     assert reconstructed["candidate_id"] == candidate_id
     assert reconstructed["test_scope"] == "full_fixed_samples"
 
@@ -2362,6 +2415,203 @@ def test_history_report_pages_are_model_retrievable_without_arbitrary_paths(
         report_id="C:/arbitrary/path.json",
     )
     assert rejected["status"] == "invalid_arguments"
+
+
+def test_oversized_evaluation_history_formats_summary_and_lossless_details(
+    tmp_path
+):
+    fixed = _fixed_artifact(tmp_path)
+    workspace = _workspace(tmp_path, fixed, name="oversized-evaluation-history")
+    submitted = workspace.submit_candidate(_candidate(name="large-evaluation"), None)
+    candidate_id = submitted["candidate_id"]
+    report_id, original_report = _install_oversized_evaluation_report(
+        workspace, candidate_id
+    )
+    assert workspace._serialized_size(original_report) > 6_000
+
+    arguments = {
+        "candidate_id": candidate_id,
+        "record_type": "evaluation",
+        "start": 0,
+        "limit": 20,
+        "report_id": None,
+    }
+    raw = workspace.get_history(**arguments)
+    call = ChatMessageToolCall(
+        function=ChatMessageToolCallFunction(
+            name="get_history", arguments=arguments
+        ),
+        id="oversized-evaluation-call",
+        type="function",
+    )
+    workspace.register_framework_calls([call])
+    model_result = workspace.finish_framework_call(
+        call.id,
+        status="completed",
+        output=json.dumps(raw, ensure_ascii=False),
+    )
+    assert workspace._serialized_size(model_result) <= llm_agent.MODEL_TOOL_RESULT_MAX_CHARS
+    assert model_result["status"] == "ok"
+    assert model_result["returned_count"] == 1
+    summary = model_result["evaluations"][0]
+    assert summary["candidate_id"] == candidate_id
+    assert summary["report_id"] == report_id
+    assert summary["status"] == original_report["status"]
+    assert summary["passed"] == original_report["passed"]
+    for lambda_key, expected in original_report["by_lambda"].items():
+        actual = summary["by_lambda"][lambda_key]
+        for key in (
+            "lambda_mbit_per_joule",
+            "baseline_l_hat",
+            "candidate_l_hat",
+            "improvement",
+            "required_margin",
+            "passed",
+        ):
+            assert actual[key] == expected[key]
+        assert actual["maximum_pair_indices"] == {
+            "i": expected["maximum_pair"]["i"],
+            "j": expected["maximum_pair"]["j"],
+        }
+
+    details = summary["details_query"]
+    assert details["tool"] == "get_history"
+    page_arguments = details["arguments"]
+    reconstructed_segments = []
+    previous_start = -1
+    while True:
+        page = workspace.get_history(**page_arguments)
+        assert page["status"] == "ok"
+        assert page["report_id"] == report_id
+        assert workspace._serialized_size(page) <= llm_agent.PAGED_TOOL_PAYLOAD_MAX_CHARS
+        assert page["page_start"] > previous_start
+        previous_start = page["page_start"]
+        reconstructed_segments.extend(page["data_segments"])
+        if not page["has_more"]:
+            break
+        assert page["next_start"] > page["page_start"]
+        page_arguments = page["next_query_arguments"]
+    reconstructed_text = "".join(
+        segment["text"] for segment in reconstructed_segments
+    )
+    assert hashlib.sha256(reconstructed_text.encode("utf-8")).hexdigest() == page[
+        "report_sha256"
+    ]
+    assert json.loads(reconstructed_text) == original_report
+    long_line_segments = [
+        item
+        for item in reconstructed_segments
+        if "x" * 100 in item["text"]
+    ]
+    assert len(long_line_segments) > 1
+    assert all(
+        len(item["text"]) <= llm_agent.REPORT_TEXT_SEGMENT_MAX_CHARS
+        for item in reconstructed_segments
+    )
+
+
+def test_evaluation_history_pages_progress_without_gaps_or_duplicates(
+    tmp_path, monkeypatch
+):
+    fixed = _fixed_artifact(tmp_path)
+    workspace = _workspace(tmp_path, fixed, name="evaluation-history-pages")
+    submitted = workspace.submit_candidate(_candidate(name="many-evaluations"), None)
+    candidate_id = submitted["candidate_id"]
+    expected = []
+    for index in range(3):
+        report_id, _ = _install_oversized_evaluation_report(
+            workspace,
+            candidate_id,
+            suffix=f"large-{index}",
+            padding_character=chr(ord("a") + index),
+        )
+        expected.append(report_id)
+    monkeypatch.setattr(llm_agent, "PAGED_TOOL_PAYLOAD_MAX_CHARS", 2_500)
+
+    actual = []
+    arguments = {
+        "candidate_id": candidate_id,
+        "record_type": "evaluation",
+        "start": 0,
+        "limit": 50,
+    }
+    while True:
+        page = workspace.get_history(**arguments)
+        assert page["returned_count"] >= 1
+        actual.extend(item["report_id"] for item in page["evaluations"])
+        if not page["has_more"]:
+            assert page["next_start"] is None
+            assert page["next_query_arguments"] is None
+            break
+        assert page["next_start"] > page["page_start"]
+        arguments = page["next_query_arguments"]
+    assert actual == expected
+
+    empty = workspace.submit_candidate(_candidate(name="empty-evaluations"), None)
+    empty_page = workspace.get_history(empty["candidate_id"], "evaluation")
+    assert empty_page["evaluations"] == []
+    assert empty_page["returned_count"] == 0
+    assert empty_page["has_more"] is False
+    assert empty_page["next_query_arguments"] is None
+
+
+def test_pending_oversized_evaluation_summary_reaches_actual_model_request(
+    tmp_path
+):
+    fixed = _fixed_artifact(tmp_path)
+    workspace = _workspace(
+        tmp_path, fixed, name="evaluation-request-delivery", max_model_calls=3
+    )
+    submitted = workspace.submit_candidate(_candidate(name="request-evaluation"), None)
+    candidate_id = submitted["candidate_id"]
+    report_id, report = _install_oversized_evaluation_report(
+        workspace, candidate_id
+    )
+    workspace.state["current_candidate_id"] = None
+    workspace.state["request_settings"] = _request_settings(context_length=20_000)
+    workspace.state["status"] = "paused_budget_exhausted"
+    workspace._save()
+
+    def request_history(_request_text):
+        return [
+            (
+                "get_history",
+                {
+                    "candidate_id": candidate_id,
+                    "record_type": "evaluation",
+                    "start": 0,
+                    "limit": 20,
+                    "report_id": None,
+                },
+            )
+        ]
+
+    def verify_delivery(request_text):
+        assert report_id in request_text
+        assert "details_query" in request_text
+        assert str(report["by_lambda"]["0.00013"]["candidate_l_hat"]) in request_text
+        return [("final_answer", {"answer": "fixture budget stop"})]
+
+    model = RequestAwareToolModel(
+        [
+            lambda _text: [("inspect_interface", {"section": "overview"})],
+            request_history,
+            verify_delivery,
+        ]
+    )
+    result = run_agent(resume=workspace.directory, model_backend=model)
+    assert result["status"] == "paused_budget_exhausted"
+    assert len(model.calls) == 3
+    state = json.loads((workspace.directory / "agent_state.json").read_text())
+    history_calls = [
+        item
+        for item in state["framework_tool_calls"]
+        if item["name"] == "get_history"
+    ]
+    assert len(history_calls) == 1
+    assert history_calls[0]["delivery_status"] == "delivered"
+    assert history_calls[0]["model_result"]["evaluations"]
+    assert state["context_compactions"][-1]["retained_pending_result_groups"] >= 1
 
 
 def test_bounded_query_index_links_to_paged_tool_call_history(tmp_path):

@@ -106,7 +106,7 @@ from llm_streaming import (
 
 AGENT_RUN_SCHEMA_VERSION = "uav-hrl-llm-feature-agent-run-v1"
 AGENT_PROMPT_VERSION = "uav-hrl-llm-feature-agent-prompt-v4"
-AGENT_TOOL_CONTRACT_VERSION = "uav-hrl-llm-feature-agent-tools-v5"
+AGENT_TOOL_CONTRACT_VERSION = "uav-hrl-llm-feature-agent-tools-v6"
 DEFAULT_MAX_MODEL_CALLS = 20
 DEFAULT_AGENT_OUTPUT_ROOT = Path("results") / "llm_agents"
 DEFAULT_AGENT_PREVIEW_ROOT = Path("results") / "llm_agent_previews"
@@ -115,6 +115,7 @@ WORK_SUMMARY_MAX_EVALUATION_INDEXES = 12
 WORK_SUMMARY_MAX_QUERY_INDEXES = 8
 MODEL_TOOL_RESULT_MAX_CHARS = 6_000
 PAGED_TOOL_PAYLOAD_MAX_CHARS = 5_000
+REPORT_TEXT_SEGMENT_MAX_CHARS = 512
 INTERFACE_PAGE_MAX_LINES = 80
 AGENT_PROMPT_TEMPLATE_PATH = Path(__file__).with_name("prompts") / "llm_agent_prompt.txt"
 SMOLAGENTS_VERSION = distribution_version("smolagents")
@@ -188,6 +189,113 @@ def _content_hash(value: Any) -> str:
             allow_nan=False,
         ).encode("utf-8")
     ).hexdigest()
+
+
+def _evaluation_history_summary(
+    *, candidate_id: str, report_id: str, report: dict[str, Any]
+) -> dict[str, Any]:
+    """Build a bounded, lossless-for-scores evaluation history entry."""
+
+    by_lambda: dict[str, Any] = {}
+    for lambda_key, source in (report.get("by_lambda") or {}).items():
+        source = source or {}
+        maximum_pair = source.get("maximum_pair") or {}
+        entry = {
+            key: copy.deepcopy(source.get(key))
+            for key in (
+                "lambda_mbit_per_joule",
+                "baseline_l_hat",
+                "candidate_l_hat",
+                "improvement",
+                "required_margin",
+                "passed",
+            )
+            if key in source
+        }
+        if "i" in maximum_pair or "j" in maximum_pair:
+            entry["maximum_pair_indices"] = {
+                key: copy.deepcopy(maximum_pair.get(key))
+                for key in ("i", "j")
+                if key in maximum_pair
+            }
+        by_lambda[str(lambda_key)] = entry
+    return {
+        "candidate_id": candidate_id,
+        "path_id": report_id,
+        "report_id": report_id,
+        "status": report.get("status"),
+        "passed": report.get("passed"),
+        "by_lambda": by_lambda,
+        "details_query": {
+            "tool": "get_history",
+            "arguments": {
+                "candidate_id": candidate_id,
+                "record_type": "report",
+                "report_id": report_id,
+                "start": 0,
+                "limit": 50,
+            },
+        },
+    }
+
+
+def _minimal_evaluation_history_summary(summary: dict[str, Any]) -> dict[str, Any]:
+    """Retain a usable report lookup if even the score summary cannot fit."""
+
+    return {
+        key: copy.deepcopy(summary.get(key))
+        for key in (
+            "candidate_id",
+            "path_id",
+            "report_id",
+            "status",
+            "passed",
+            "details_query",
+        )
+    } | {
+        "summary_omitted": True,
+        "summary_omitted_reason": (
+            "The per-lambda summary exceeds the model-facing page budget. "
+            "Use details_query to read the registered report losslessly."
+        ),
+    }
+
+
+def _report_text_segments(text: str) -> list[dict[str, Any]]:
+    """Split canonical report JSON without losing text or source positions."""
+
+    segments: list[dict[str, Any]] = []
+    absolute_start = 0
+    for line_number, line in enumerate(text.splitlines(keepends=True), start=1):
+        for line_start in range(0, len(line), REPORT_TEXT_SEGMENT_MAX_CHARS):
+            chunk = line[line_start : line_start + REPORT_TEXT_SEGMENT_MAX_CHARS]
+            segments.append(
+                {
+                    "segment_index": len(segments),
+                    "line_number": line_number,
+                    "line_character_start": line_start,
+                    "line_character_end": line_start + len(chunk),
+                    "absolute_character_start": absolute_start + line_start,
+                    "absolute_character_end": absolute_start + line_start + len(chunk),
+                    "completes_line": line_start + len(chunk) == len(line),
+                    "text": chunk,
+                }
+            )
+        absolute_start += len(line)
+    if not segments:
+        segments.append(
+            {
+                "segment_index": 0,
+                "line_number": 1,
+                "line_character_start": 0,
+                "line_character_end": 0,
+                "absolute_character_start": 0,
+                "absolute_character_end": 0,
+                "completes_line": True,
+                "text": "",
+            }
+        )
+    return segments
 
 
 def _candidate_tool_input_schema() -> dict[str, Any]:
@@ -855,6 +963,9 @@ class AgentWorkspace:
                     "remaining_count",
                     "returned_line_count",
                     "remaining_line_count",
+                    "returned_segment_count",
+                    "remaining_segment_count",
+                    "total_segment_count",
                 ):
                     if key in result:
                         result_summary[key] = copy.deepcopy(result[key])
@@ -1216,7 +1327,7 @@ class AgentWorkspace:
                 source_items = list(result.get("tool_call_records") or [])
                 key = "tool_call_records"
             elif record_type == "report":
-                # Report pages are already bounded complete-line views.
+                # Report pages are already bounded lossless text-segment views.
                 return result
             elif record_type == "tool_result":
                 compact.update(
@@ -1292,11 +1403,38 @@ class AgentWorkspace:
                     }
                 )
             if not selected and source_items:
-                compact["status"] = "page_too_large"
-                compact["error"] = (
-                    "One complete history record exceeds the model delivery budget; "
-                    "the host preserved it but cannot silently truncate it."
-                )
+                if record_type == "evaluation":
+                    minimal = _minimal_evaluation_history_summary(source_items[0])
+                    compact[key] = [minimal]
+                    selected = [minimal]
+                    total = int(result.get("total_record_count") or len(source_items))
+                    next_start = start + 1
+                    has_more = next_start < total
+                    compact.update(
+                        {
+                            "status": "summary_too_large",
+                            "returned_count": 1,
+                            "remaining_count": max(0, total - next_start),
+                            "has_more": has_more,
+                            "next_start": next_start if has_more else None,
+                            "next_query_arguments": (
+                                {
+                                    "candidate_id": arguments.get("candidate_id"),
+                                    "record_type": record_type,
+                                    "start": next_start,
+                                    "limit": limit,
+                                }
+                                if has_more
+                                else None
+                            ),
+                        }
+                    )
+                else:
+                    compact["status"] = "page_too_large"
+                    compact["error"] = (
+                        "One complete history record exceeds the model delivery budget; "
+                        "the host preserved it but cannot silently truncate it."
+                    )
         else:
             compact["correction"] = (
                 "Request a narrower page with the same filters; the complete result "
@@ -2394,19 +2532,20 @@ class AgentWorkspace:
                 }
             report_path = self.directory / str(report_id)
             report = json.loads(report_path.read_text(encoding="utf-8"))
-            lines = json.dumps(
+            serialized_report = json.dumps(
                 report,
                 ensure_ascii=False,
                 allow_nan=False,
                 indent=2,
                 default=str,
-            ).splitlines()
-            selected = lines[start : start + limit]
+            )
+            segments = _report_text_segments(serialized_report)
+            selected = segments[start : start + limit]
 
-            def report_page(page_lines: list[str]) -> dict[str, Any]:
+            def report_page(page_segments: list[dict[str, Any]]) -> dict[str, Any]:
                 next_start = (
-                    start + len(page_lines)
-                    if start + len(page_lines) < len(lines)
+                    start + len(page_segments)
+                    if start + len(page_segments) < len(segments)
                     else None
                 )
                 return {
@@ -2414,13 +2553,20 @@ class AgentWorkspace:
                     "candidate_id": candidate_id,
                     "record_type": "report",
                     "report_id": report_id,
-                    "content_format": "complete UTF-8 JSON lines in original order",
+                    "content_format": (
+                        "lossless ordered segments of canonical UTF-8 JSON; "
+                        "concatenate each data_segments[].text without separators"
+                    ),
+                    "report_sha256": hashlib.sha256(
+                        serialized_report.encode("utf-8")
+                    ).hexdigest(),
                     "page_start": start,
                     "page_limit": limit,
-                    "total_line_count": len(lines),
-                    "returned_line_count": len(page_lines),
-                    "remaining_line_count": max(
-                        0, len(lines) - start - len(page_lines)
+                    "total_character_count": len(serialized_report),
+                    "total_segment_count": len(segments),
+                    "returned_segment_count": len(page_segments),
+                    "remaining_segment_count": max(
+                        0, len(segments) - start - len(page_segments)
                     ),
                     "has_more": next_start is not None,
                     "next_start": next_start,
@@ -2435,7 +2581,7 @@ class AgentWorkspace:
                         if next_start is not None
                         else None
                     ),
-                    "data_lines": page_lines,
+                    "data_segments": page_segments,
                 }
 
             while (
@@ -2492,20 +2638,40 @@ class AgentWorkspace:
                 **pagination(len(entries), len(selected)),
             }
         if record_type == "evaluation":
-            reports = []
             paths = list((record.get("evaluations") or {}).values())
-            selected_paths = paths[start : start + limit]
-            for path in selected_paths:
+            reports: list[dict[str, Any]] = []
+            for path in paths[start : start + limit]:
                 report = json.loads((self.directory / path).read_text(encoding="utf-8"))
-                compact, summary = _compact_evaluation_diagnostics(report.get("evaluation_diagnostics") or {}, 0)
-                reports.append({"path_id": path, "status": report.get("status"), "passed": report.get("passed"), "by_lambda": report.get("by_lambda"), "evaluation_diagnostics": compact, "compaction": summary})
-            return {
+                summary = _evaluation_history_summary(
+                    candidate_id=candidate_id,
+                    report_id=path,
+                    report=report,
+                )
+                trial_reports = reports + [summary]
+                trial = {
+                    "status": "ok",
+                    "candidate_id": candidate_id,
+                    "record_type": "evaluation",
+                    "evaluations": trial_reports,
+                    **pagination(len(paths), len(trial_reports)),
+                }
+                if self._serialized_size(trial) > PAGED_TOOL_PAYLOAD_MAX_CHARS:
+                    if reports:
+                        break
+                    minimal = _minimal_evaluation_history_summary(summary)
+                    reports.append(minimal)
+                    break
+                reports.append(summary)
+            result = {
                 "status": "ok",
                 "candidate_id": candidate_id,
                 "record_type": "evaluation",
                 "evaluations": reports,
                 **pagination(len(paths), len(reports)),
             }
+            if reports and reports[0].get("summary_omitted"):
+                result["status"] = "summary_too_large"
+            return result
         return {"status": "invalid_arguments", "error": "record_type must be run, tool_calls, tool_result, candidate, issues, tests, evaluation, or report"}
 
 
