@@ -63,7 +63,7 @@ This is a finite-sample offline criterion, not proof of better TD3 training perf
 
 4. Autonomous investigation and revision
 
-The available tools let you inspect input documentation and samples, submit candidates, test each candidate on the complete loaded fixed-sample artifact, obtain full evaluations, and retrieve previous candidates and diagnostic reports. Their schemas define the exact arguments and results. `query_samples` is for controlled inspection only; it does not test a candidate.
+The available tools let you inspect input documentation and samples, submit candidates, test each candidate on the complete loaded fixed-sample artifact, obtain full evaluations, and retrieve previous candidates and diagnostic reports. Their schemas define the exact arguments and results. `query_samples` is for controlled inspection only; it does not test a candidate. Interface, sample, and history results are paged when needed; when `has_more` is true, use the returned `next_query_arguments` unchanged to continue the same ordered query.
 
 Choose your own sequence of actions. When a test or evaluation fails, connect the reported issue to the affected candidate, inspect relevant evidence, and make a substantive revision. Use subsequent tests to determine whether the revision addressed the issue.
 

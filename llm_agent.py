@@ -105,13 +105,17 @@ from llm_streaming import (
 
 
 AGENT_RUN_SCHEMA_VERSION = "uav-hrl-llm-feature-agent-run-v1"
-AGENT_PROMPT_VERSION = "uav-hrl-llm-feature-agent-prompt-v3"
-AGENT_TOOL_CONTRACT_VERSION = "uav-hrl-llm-feature-agent-tools-v4"
+AGENT_PROMPT_VERSION = "uav-hrl-llm-feature-agent-prompt-v4"
+AGENT_TOOL_CONTRACT_VERSION = "uav-hrl-llm-feature-agent-tools-v5"
 DEFAULT_MAX_MODEL_CALLS = 20
 DEFAULT_AGENT_OUTPUT_ROOT = Path("results") / "llm_agents"
 DEFAULT_AGENT_PREVIEW_ROOT = Path("results") / "llm_agent_previews"
 WORK_SUMMARY_MAX_ISSUE_GROUPS = 16
 WORK_SUMMARY_MAX_EVALUATION_INDEXES = 12
+WORK_SUMMARY_MAX_QUERY_INDEXES = 8
+MODEL_TOOL_RESULT_MAX_CHARS = 6_000
+PAGED_TOOL_PAYLOAD_MAX_CHARS = 5_000
+INTERFACE_PAGE_MAX_LINES = 80
 AGENT_PROMPT_TEMPLATE_PATH = Path(__file__).with_name("prompts") / "llm_agent_prompt.txt"
 SMOLAGENTS_VERSION = distribution_version("smolagents")
 
@@ -409,6 +413,7 @@ class AgentWorkspace:
         self.absolute_tolerance = float(absolute_tolerance)
         self.relative_tolerance = float(relative_tolerance)
         self._lock = threading.RLock()
+        self._prepared_delivery_record_ids: list[str] = []
         if resume_state is None:
             self.state = {
                 "schema_version": AGENT_RUN_SCHEMA_VERSION,
@@ -441,6 +446,7 @@ class AgentWorkspace:
                 "budget_extension_events": [],
                 "tool_operations": [],
                 "framework_tool_calls": [],
+                "tool_result_deliveries": [],
                 "completion_rejections": [],
                 "candidates": {},
                 "candidate_order": [],
@@ -721,6 +727,45 @@ class AgentWorkspace:
                 break
         return None
 
+    @staticmethod
+    def _latest_test_summary(
+        candidate_id: str, record: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        tests = list((record.get("tests") or {}).values())
+        if not tests:
+            return None
+        latest = tests[-1]
+        result = latest.get("tool_result") or {}
+        numeric = result.get("numeric_diagnostics") or {}
+        features = list(numeric.get("features") or [])
+        return {
+            key: copy.deepcopy(result.get(key))
+            for key in (
+                "status",
+                "candidate_id",
+                "test_scope",
+                "fixed_sample_count",
+                "tested_sample_count",
+                "successful_output_sample_count",
+                "complete_fixed_sample",
+                "reward_consistency",
+                "checks_not_run",
+                "error_type",
+                "error",
+            )
+            if key in result
+        } | {
+            "numeric_feature_count": len(features),
+            "numeric_feature_summaries": copy.deepcopy(features[:8]),
+            "omitted_numeric_feature_summaries": max(0, len(features) - 8),
+            "history_index": {
+                "candidate_id": candidate_id,
+                "record_type": "tests",
+                "start": 0,
+                "limit": 20,
+            },
+        }
+
     def _evaluation_history_index(self, current_id: str) -> dict[str, Any]:
         evaluated = [
             candidate_id
@@ -752,6 +797,8 @@ class AgentWorkspace:
         *,
         include_candidate: bool = True,
         model_calls_maximum: int | None = None,
+        include_pending_payloads: bool = False,
+        pending_payload_record_ids: set[str] | None = None,
     ) -> dict[str, Any]:
         current_id = self.state.get("current_candidate_id")
         current = self.state["candidates"].get(current_id) if current_id else None
@@ -777,6 +824,78 @@ class AgentWorkspace:
                     "result": event.get("result"),
                 }
             )
+        framework_calls = self.state.get("framework_tool_calls", [])
+        recent_queries = []
+        for record in reversed(framework_calls):
+            if record.get("name") not in {
+                "query_samples",
+                "inspect_interface",
+                "get_history",
+            }:
+                continue
+            result = record.get("model_result")
+            result_summary = {}
+            if isinstance(result, dict):
+                for key in (
+                    "status",
+                    "section",
+                    "matched_sample_count",
+                    "requested_start",
+                    "requested_limit",
+                    "returned_sample_count",
+                    "returned_sample_refs",
+                    "remaining_sample_count",
+                    "has_more",
+                    "next_start",
+                    "next_query_arguments",
+                    "record_type",
+                    "report_id",
+                    "page_start",
+                    "returned_count",
+                    "remaining_count",
+                    "returned_line_count",
+                    "remaining_line_count",
+                ):
+                    if key in result:
+                        result_summary[key] = copy.deepcopy(result[key])
+            recent_queries.append(
+                {
+                    "record_id": record.get("record_id"),
+                    "tool_call_id": record.get("tool_call_id"),
+                    "tool": record.get("name"),
+                    "arguments": copy.deepcopy(record.get("arguments")),
+                    "execution_status": record.get("status"),
+                    "delivery_status": record.get("delivery_status"),
+                    "result_summary": result_summary,
+                }
+            )
+            if len(recent_queries) >= WORK_SUMMARY_MAX_QUERY_INDEXES:
+                break
+        recent_queries.reverse()
+        pending_payload_filter = pending_payload_record_ids
+        pending_results = []
+        for record in self.pending_delivery_records():
+            item = {
+                "record_id": record.get("record_id"),
+                "tool_call_id": record.get("tool_call_id"),
+                "tool": record.get("name"),
+                "arguments": copy.deepcopy(record.get("arguments")),
+                "execution_status": record.get("status"),
+                "delivery_status": "pending",
+                "delivery_note": (
+                    "Not yet included in a request that produced a complete accepted "
+                    "model response; completion does not imply understanding."
+                ),
+            }
+            include_payload = include_pending_payloads and (
+                pending_payload_filter is None
+                or str(record.get("record_id")) in pending_payload_filter
+            )
+            if include_payload:
+                item["result"] = copy.deepcopy(record.get("model_result"))
+            else:
+                item["result_location"] = "paired tool-call/result memory step"
+            pending_results.append(item)
         result = {
             "status": self.state["status"],
             "current_candidate_id": current_id,
@@ -790,6 +909,30 @@ class AgentWorkspace:
                 "count": len(completion_events),
                 "recent": completion_summaries,
                 "full_records": "agent_state.json",
+            },
+            "recent_completed_queries": {
+                "included_count": len(recent_queries),
+                "total_count": sum(
+                    record.get("name")
+                    in {"query_samples", "inspect_interface", "get_history"}
+                    for record in framework_calls
+                ),
+                "items": recent_queries,
+                "selection_rule": "most recent bounded query/interface/history calls",
+                "older_history_index": {
+                    "candidate_id": None,
+                    "record_type": "tool_calls",
+                    "start": 0,
+                    "limit": 20,
+                },
+            },
+            "pending_tool_result_delivery": {
+                "count": len(pending_results),
+                "items": pending_results,
+                "status_meaning": (
+                    "pending means not yet included in a request with a complete "
+                    "accepted response; it does not mean the model understood it"
+                ),
             },
             "recent_operations": [
                 {
@@ -810,6 +953,9 @@ class AgentWorkspace:
                     current_id, current
                 ),
                 "selected_formal_evaluation": self._selected_evaluation_summary(
+                    current_id, current
+                ),
+                "latest_complete_test": self._latest_test_summary(
                     current_id, current
                 ),
                 "evaluation_history_index": self._evaluation_history_index(current_id),
@@ -918,6 +1064,339 @@ class AgentWorkspace:
             }
             self._save()
 
+    @staticmethod
+    def _decoded_tool_result(output: Any) -> Any:
+        if isinstance(output, str):
+            try:
+                return json.loads(output)
+            except (TypeError, ValueError):
+                return output
+        return copy.deepcopy(output)
+
+    @staticmethod
+    def _serialized_size(value: Any) -> int:
+        return len(
+            json.dumps(
+                value,
+                ensure_ascii=False,
+                allow_nan=False,
+                separators=(",", ":"),
+                default=str,
+            )
+        )
+
+    def _compact_model_tool_result(
+        self,
+        *,
+        tool: str,
+        arguments: dict[str, Any],
+        result: Any,
+    ) -> Any:
+        """Return a bounded, truthful model-facing view of a persisted result."""
+
+        if self._serialized_size(result) <= MODEL_TOOL_RESULT_MAX_CHARS:
+            return result
+        if (
+            tool == "get_history"
+            and isinstance(result, dict)
+            and str(result.get("record_type") or arguments.get("record_type"))
+            == "candidate"
+        ):
+            # Candidate code is never silently truncated. The request budget
+            # check will stop explicitly if the complete immutable candidate
+            # cannot be delivered.
+            return result
+        if not isinstance(result, dict):
+            return {
+                "status": "result_too_large",
+                "tool": tool,
+                "error": "The structured result exceeds the delivery budget.",
+                "correction": "Request a narrower interface section or history page.",
+            }
+        common_keys = (
+            "status",
+            "candidate_id",
+            "passed",
+            "cache_hit",
+            "approved_artifact",
+            "test_scope",
+            "fixed_sample_count",
+            "tested_sample_count",
+            "successful_output_sample_count",
+            "complete_fixed_sample",
+            "reward_consistency",
+            "checks_not_run",
+            "error_type",
+            "error",
+            "report_id",
+        )
+        compact = {
+            key: copy.deepcopy(result[key])
+            for key in common_keys
+            if key in result
+        }
+        compact.update(
+            {
+                "tool_result_compacted": True,
+                "original_serialized_characters": self._serialized_size(result),
+                "delivery_character_limit": MODEL_TOOL_RESULT_MAX_CHARS,
+                "omission_does_not_change_status": True,
+            }
+        )
+        candidate_id = result.get("candidate_id")
+        if tool == "formal_evaluate":
+            compact["by_lambda"] = copy.deepcopy(result.get("by_lambda"))
+            diagnostics, diagnostics_summary = _compact_evaluation_diagnostics(
+                result.get("evaluation_diagnostics") or {}, 0
+            )
+            compact["evaluation_diagnostics"] = diagnostics
+            compact["diagnostic_compaction"] = diagnostics_summary
+            compact["details_query"] = {
+                "tool": "get_history",
+                "arguments": {
+                    "candidate_id": candidate_id,
+                    "record_type": "report",
+                    "start": 0,
+                    "limit": 50,
+                    "report_id": result.get("report_id"),
+                },
+            }
+        elif tool == "test_candidate":
+            numeric = copy.deepcopy(result.get("numeric_diagnostics") or {})
+            features = list(numeric.get("features") or [])
+            numeric["features"] = features[:8]
+            numeric["feature_count"] = len(features)
+            numeric["omitted_feature_count"] = max(0, len(features) - 8)
+            compact["numeric_diagnostics"] = numeric
+            compact["representative_outputs"] = copy.deepcopy(
+                (result.get("representative_outputs") or [])[:4]
+            )
+            compact["details_query"] = {
+                "tool": "get_history",
+                "arguments": {
+                    "candidate_id": candidate_id,
+                    "record_type": "report",
+                    "start": 0,
+                    "limit": 50,
+                    "report_id": result.get("report_id"),
+                },
+            }
+        elif tool == "submit_candidate":
+            errors = list(result.get("errors") or [])
+            compact["errors"] = copy.deepcopy(errors[:8])
+            compact["error_count"] = len(errors)
+            compact["omitted_error_count"] = max(0, len(errors) - 8)
+            if candidate_id:
+                compact["details_query"] = {
+                    "tool": "get_history",
+                    "arguments": {
+                        "candidate_id": candidate_id,
+                        "record_type": "issues",
+                        "start": 0,
+                        "limit": 20,
+                    },
+                }
+        elif tool == "get_history":
+            record_type = str(result.get("record_type") or arguments.get("record_type"))
+            start = int(result.get("page_start", arguments.get("start", 0)))
+            limit = int(result.get("page_limit", arguments.get("limit", 20)))
+            compact.update(
+                {
+                    "record_type": record_type,
+                    "page_start": start,
+                    "page_limit": limit,
+                    "total_record_count": result.get("total_record_count"),
+                }
+            )
+            if record_type == "run":
+                source_items = list(result.get("candidate_history_page") or [])
+                key = "candidate_history_page"
+                compact["work_state"] = copy.deepcopy(result.get("work_state"))
+            elif record_type == "tool_calls":
+                source_items = list(result.get("tool_call_records") or [])
+                key = "tool_call_records"
+            elif record_type == "report":
+                # Report pages are already bounded complete-line views.
+                return result
+            elif record_type == "tool_result":
+                compact.update(
+                    {
+                        key: copy.deepcopy(result.get(key))
+                        for key in (
+                            "record_id",
+                            "tool_call_id",
+                            "tool",
+                            "arguments",
+                            "execution_status",
+                            "delivery_status",
+                            "result",
+                            "raw_result_sha256",
+                        )
+                        if key in result
+                    }
+                )
+                return compact
+            elif record_type == "issues":
+                source_items = list(result.get("issue_records") or [])
+                key = "issue_records"
+            elif record_type == "tests":
+                source_items = [
+                    {
+                        "test_key": key,
+                        "status": value.get("status"),
+                        "test_scope": value.get("test_scope"),
+                        "fixed_sample_count": value.get("fixed_sample_count"),
+                        "report_id": value.get("report"),
+                        "result_summary": self._compact_model_tool_result(
+                            tool="test_candidate",
+                            arguments={"candidate_id": candidate_id},
+                            result=value.get("tool_result") or {},
+                        ),
+                    }
+                    for key, value in (result.get("tests") or {}).items()
+                ]
+                key = "test_records"
+            elif record_type == "evaluation":
+                source_items = list(result.get("evaluations") or [])
+                key = "evaluations"
+            else:
+                source_items = []
+                key = "records"
+            selected = []
+            for item in source_items:
+                trial = {**compact, key: selected + [copy.deepcopy(item)]}
+                if self._serialized_size(trial) > MODEL_TOOL_RESULT_MAX_CHARS:
+                    break
+                selected.append(copy.deepcopy(item))
+            compact[key] = selected
+            total = result.get("total_record_count")
+            if total is not None:
+                next_start = start + len(selected)
+                has_more = next_start < int(total)
+                compact.update(
+                    {
+                        "returned_count": len(selected),
+                        "remaining_count": max(0, int(total) - next_start),
+                        "has_more": has_more,
+                        "next_start": next_start if has_more else None,
+                        "next_query_arguments": (
+                            {
+                                "candidate_id": arguments.get("candidate_id"),
+                                "record_type": record_type,
+                                "start": next_start,
+                                "limit": limit,
+                            }
+                            if has_more and selected
+                            else None
+                        ),
+                    }
+                )
+            if not selected and source_items:
+                compact["status"] = "page_too_large"
+                compact["error"] = (
+                    "One complete history record exceeds the model delivery budget; "
+                    "the host preserved it but cannot silently truncate it."
+                )
+        else:
+            compact["correction"] = (
+                "Request a narrower page with the same filters; the complete result "
+                "is preserved by the host."
+            )
+            compact["original_arguments"] = copy.deepcopy(arguments)
+        if self._serialized_size(compact) > MODEL_TOOL_RESULT_MAX_CHARS:
+            # Last-resort structured reduction.  Status and scoring facts remain;
+            # verbose diagnostics stay available through the declared history page.
+            if tool == "formal_evaluate":
+                diagnostics = compact.get("evaluation_diagnostics") or {}
+                compact["evaluation_diagnostics"] = {
+                    key: copy.deepcopy(diagnostics.get(key))
+                    for key in (
+                        "schema_version",
+                        "by_lambda",
+                        "findings",
+                        "finding_definitions",
+                        "pairs",
+                    )
+                    if key in diagnostics
+                }
+            elif tool == "test_candidate":
+                compact.pop("representative_outputs", None)
+            elif tool == "get_history" and compact.get("record_type") == "run":
+                compact["work_state"] = {
+                    key: copy.deepcopy((compact.get("work_state") or {}).get(key))
+                    for key in (
+                        "status",
+                        "current_candidate_id",
+                        "candidate_count",
+                        "model_calls_used",
+                        "model_calls_remaining",
+                        "unresolved_or_unverified_issues",
+                    )
+                    if key in (compact.get("work_state") or {})
+                }
+        return compact
+
+    def _framework_record(self, record_id: str) -> dict[str, Any] | None:
+        for record in self.state.get("framework_tool_calls", []):
+            if record.get("record_id") == str(record_id):
+                return record
+        return None
+
+    def pending_delivery_records(self) -> list[dict[str, Any]]:
+        return [
+            record
+            for record in self.state.get("framework_tool_calls", [])
+            if record.get("delivery_status") == "pending"
+        ]
+
+    def prepare_result_delivery(self, record_ids: Iterable[str]) -> None:
+        ordered = []
+        for record_id in record_ids:
+            record = self._framework_record(str(record_id))
+            if (
+                record is not None
+                and record.get("delivery_status") == "pending"
+                and record_id not in ordered
+            ):
+                ordered.append(str(record_id))
+        self._prepared_delivery_record_ids = ordered
+
+    def mark_prepared_results_delivered(self, *, model_call_number: int) -> None:
+        with self._lock:
+            delivered = []
+            for record_id in self._prepared_delivery_record_ids:
+                record = self._framework_record(record_id)
+                if record is None or record.get("delivery_status") != "pending":
+                    continue
+                record["delivery_status"] = "delivered"
+                record["delivered_model_call_number"] = int(model_call_number)
+                record["delivered_at_utc"] = datetime.now(timezone.utc).isoformat()
+                delivered.append(record_id)
+            if delivered:
+                self.state.setdefault("tool_result_deliveries", []).append(
+                    {
+                        "created_at_utc": datetime.now(timezone.utc).isoformat(),
+                        "model_call_number": int(model_call_number),
+                        "record_ids": delivered,
+                        "meaning": (
+                            "included in a request that produced a complete accepted "
+                            "model response; this does not claim model understanding"
+                        ),
+                    }
+                )
+                self._save()
+            self._prepared_delivery_record_ids = []
+
+    def pending_record_ids_for_call_ids(
+        self, tool_call_ids: Iterable[str]
+    ) -> list[str]:
+        ids = {str(value) for value in tool_call_ids}
+        return [
+            str(record["record_id"])
+            for record in self.pending_delivery_records()
+            if str(record.get("tool_call_id")) in ids
+        ]
+
     def invoke(self, tool: str, arguments: dict[str, Any], function) -> str:
         operation = self.begin_operation(tool, arguments)
         try:
@@ -942,12 +1421,17 @@ class AgentWorkspace:
     def register_framework_calls(self, calls: Iterable[Any]) -> None:
         with self._lock:
             for call in calls:
+                record_id = (
+                    f"framework-call-{len(self.state['framework_tool_calls']) + 1:06d}"
+                )
                 self.state["framework_tool_calls"].append(
                     {
+                        "record_id": record_id,
                         "tool_call_id": str(call.id),
                         "name": str(call.function.name),
-                        "arguments": call.function.arguments,
+                        "arguments": copy.deepcopy(call.function.arguments),
                         "status": "requested",
+                        "delivery_status": "not_available",
                     }
                 )
             self._save()
@@ -957,38 +1441,80 @@ class AgentWorkspace:
 
     def finish_framework_call(
         self, call_id: str, *, status: str, output: Any
-    ) -> None:
+    ) -> Any:
         with self._lock:
+            model_result = self._decoded_tool_result(output)
             for record in reversed(self.state["framework_tool_calls"]):
                 if record["tool_call_id"] == str(call_id):
+                    decoded = self._decoded_tool_result(output)
+                    result_directory = self.directory / "tool_results"
+                    result_directory.mkdir(parents=True, exist_ok=True)
+                    result_path = result_directory / f"{record['record_id']}.json"
+                    _write_json(
+                        result_path,
+                        {
+                            "record_id": record["record_id"],
+                            "tool_call_id": record["tool_call_id"],
+                            "tool": record["name"],
+                            "arguments": record.get("arguments"),
+                            "execution_status": str(status),
+                            "result": decoded,
+                        },
+                    )
+                    model_result = self._compact_model_tool_result(
+                        tool=str(record["name"]),
+                        arguments=record.get("arguments") or {},
+                        result=decoded,
+                    )
                     record["status"] = str(status)
-                    record["output"] = str(output)
+                    record["output"] = json.dumps(
+                        model_result,
+                        ensure_ascii=False,
+                        allow_nan=False,
+                        default=str,
+                    )
+                    record["model_result"] = model_result
+                    record["raw_result_path"] = str(
+                        result_path.relative_to(self.directory)
+                    )
+                    record["raw_result_sha256"] = hashlib.sha256(
+                        json.dumps(
+                            decoded,
+                            sort_keys=True,
+                            ensure_ascii=False,
+                            allow_nan=False,
+                            default=str,
+                        ).encode("utf-8")
+                    ).hexdigest()
+                    record["delivery_status"] = "pending"
+                    record["delivery_created_at_utc"] = datetime.now(
+                        timezone.utc
+                    ).isoformat()
                     break
             self._save()
+            return copy.deepcopy(model_result)
 
-    def skip_framework_call(self, call_id: str, *, reason: str) -> None:
-        self.skip_framework_call_with_status(
+    def skip_framework_call(self, call_id: str, *, reason: str) -> Any:
+        return self.skip_framework_call_with_status(
             call_id, status="skipped_after_approval", reason=reason
         )
 
     def skip_framework_call_with_status(
         self, call_id: str, *, status: str, reason: str
-    ) -> None:
-        with self._lock:
-            for record in reversed(self.state["framework_tool_calls"]):
-                if record["tool_call_id"] == str(call_id):
-                    record["status"] = str(status)
-                    record["output"] = json.dumps(
-                        {
-                            "status": str(status),
-                            "reason": str(reason),
-                        },
-                        ensure_ascii=False,
-                    )
-                    break
-            self._save()
+    ) -> Any:
+        return self.finish_framework_call(
+            call_id,
+            status=status,
+            output={"status": str(status), "reason": str(reason)},
+        )
 
-    def inspect_interface(self, section: str) -> dict[str, Any]:
+    def inspect_interface(
+        self,
+        section: str,
+        *,
+        start: int = 0,
+        limit: int = INTERFACE_PAGE_MAX_LINES,
+    ) -> dict[str, Any]:
         section = str(section or "overview")
         if section == "overview":
             value = render_environment_interface(self.fixed_metadata, self.constants)
@@ -1035,12 +1561,64 @@ class AgentWorkspace:
                 "status": "invalid_arguments",
                 "error": "section must be overview, fields, constants, candidate, or evaluation",
             }
-        return {
-            "status": "ok",
-            "contract_version": AGENT_TOOL_CONTRACT_VERSION,
-            "section": section,
-            "data": value,
-        }
+        rendered = (
+            value
+            if isinstance(value, str)
+            else json.dumps(
+                value,
+                ensure_ascii=False,
+                allow_nan=False,
+                indent=2,
+                default=str,
+            )
+        )
+        lines = rendered.splitlines() or [""]
+        page_start = max(0, int(start))
+        page_limit = min(
+            INTERFACE_PAGE_MAX_LINES,
+            max(1, int(limit)),
+        )
+        selected = lines[page_start : page_start + page_limit]
+
+        def interface_page(page_lines: list[str]) -> dict[str, Any]:
+            next_start = (
+                page_start + len(page_lines)
+                if page_start + len(page_lines) < len(lines)
+                else None
+            )
+            return {
+                "status": "ok",
+                "contract_version": AGENT_TOOL_CONTRACT_VERSION,
+                "section": section,
+                "content_format": "complete UTF-8 lines in original order",
+                "total_line_count": len(lines),
+                "page_start": page_start,
+                "page_limit": page_limit,
+                "returned_line_count": len(page_lines),
+                "remaining_line_count": max(
+                    0, len(lines) - page_start - len(page_lines)
+                ),
+                "has_more": next_start is not None,
+                "next_start": next_start,
+                "next_query_arguments": (
+                    {
+                        "section": section,
+                        "start": next_start,
+                        "limit": page_limit,
+                    }
+                    if next_start is not None
+                    else None
+                ),
+                "data_lines": page_lines,
+            }
+
+        while (
+            len(selected) > 1
+            and self._serialized_size(interface_page(selected))
+            > PAGED_TOOL_PAYLOAD_MAX_CHARS
+        ):
+            selected.pop()
+        return interface_page(selected)
 
     def query_samples(
         self,
@@ -1069,11 +1647,59 @@ class AgentWorkspace:
                 for index in indices
                 if (bool(np.any(condition_array[index])) if predicate == "any_true" else not bool(np.any(condition_array[index])))
             ]
-        start = max(0, int(start))
-        limit = min(20, max(1, int(limit)))
+        requested_start = int(start)
+        requested_limit = int(limit)
+        start = max(0, requested_start)
+        limit = min(20, max(1, requested_limit))
         selected = indices[start : start + limit]
         samples = []
         from llm_design import _compact_diagnostic_inputs, _sample_input_diagnostic
+
+        def page_result(page_samples: list[dict[str, Any]]) -> dict[str, Any]:
+            returned = len(page_samples)
+            next_start = (
+                start + returned if start + returned < len(indices) else None
+            )
+            next_arguments = (
+                {
+                    "fields": list(fields),
+                    "start": next_start,
+                    "limit": limit,
+                    "condition_field": condition_field,
+                    "condition": condition,
+                }
+                if next_start is not None
+                else None
+            )
+            return {
+                "status": "ok",
+                "fields": list(fields),
+                "feature_input_timing": "action-pre current-only",
+                "matched_sample_count": len(indices),
+                "requested_start": requested_start,
+                "requested_limit": requested_limit,
+                "effective_page_limit": limit,
+                "returned_sample_count": returned,
+                "returned_sample_refs": [
+                    sample["sample_ref"] for sample in page_samples
+                ],
+                "returned_fixed_indices": [
+                    sample["fixed_index"] for sample in page_samples
+                ],
+                "remaining_sample_count": max(
+                    0, len(indices) - (start + returned)
+                ),
+                "has_more": next_start is not None,
+                "page_start": start,
+                "page_limit": limit,
+                "next_start": next_start,
+                "next_query_arguments": next_arguments,
+                "selection_contract": (
+                    "Stable fixed-sample order after applying the declared condition; "
+                    "the next page preserves fields and filters."
+                ),
+                "samples": page_samples,
+            }
 
         for index in selected:
             values, limitations = _sample_input_diagnostic(
@@ -1084,7 +1710,7 @@ class AgentWorkspace:
             )
             compact, _, _, _ = _compact_diagnostic_inputs(values, 32)
             trace = (self.fixed_metadata.get("selection") or [])[index]
-            samples.append(
+            sample = (
                 {
                     "sample_ref": f"sample_{index}",
                     "fixed_index": trace.get("fixed_index", index),
@@ -1092,16 +1718,45 @@ class AgentWorkspace:
                     "limitations": limitations,
                 }
             )
-        return {
-            "status": "ok",
-            "fields": fields,
-            "feature_input_timing": "action-pre current-only",
-            "matched_sample_count": len(indices),
-            "page_start": start,
-            "page_limit": limit,
-            "next_start": start + len(selected) if start + len(selected) < len(indices) else None,
-            "samples": samples,
-        }
+            candidate_samples = samples + [sample]
+            if self._serialized_size(page_result(candidate_samples)) > PAGED_TOOL_PAYLOAD_MAX_CHARS:
+                break
+            samples = candidate_samples
+        if selected and not samples:
+            narrower_fields = list(fields[: max(1, len(fields) // 2)])
+            can_narrow = len(narrower_fields) < len(fields)
+            return {
+                "status": "page_too_large",
+                "fields": list(fields),
+                "matched_sample_count": len(indices),
+                "requested_start": requested_start,
+                "requested_limit": requested_limit,
+                "returned_sample_count": 0,
+                "remaining_sample_count": max(0, len(indices) - start),
+                "has_more": can_narrow,
+                "next_start": None,
+                "next_query_arguments": (
+                    {
+                        "fields": narrower_fields,
+                        "start": start,
+                        "limit": 1,
+                        "condition_field": condition_field,
+                        "condition": condition,
+                    }
+                    if can_narrow
+                    else None
+                ),
+                "error": (
+                    "One complete sample with the requested fields exceeds the model "
+                    "delivery budget. Retry with the provided narrower field set."
+                    if can_narrow
+                    else "One compacted value for the single requested field exceeds "
+                    "the model delivery budget; no unchanged zero-progress next page "
+                    "is offered. Inspect the field contract and request a different, "
+                    "narrower observable field."
+                ),
+            }
+        return page_result(samples)
 
     def submit_candidate(
         self, candidate: Any, parent_candidate_id: str | None
@@ -1377,6 +2032,7 @@ class AgentWorkspace:
             if key_name in report
         }
         tool_result["cache_hit"] = False
+        tool_result["report_id"] = str(report_path.relative_to(self.directory))
         record["tests"][key] = {
             "status": report["status"],
             "test_scope": scope,
@@ -1445,7 +2101,12 @@ class AgentWorkspace:
         cached = self.state["evaluation_cache"].get(cache_key)
         if cached is not None:
             report = json.loads((self.directory / cached["report"]).read_text(encoding="utf-8"))
-            return self._evaluation_tool_result(candidate_id, report, cache_hit=True)
+            return self._evaluation_tool_result(
+                candidate_id,
+                report,
+                cache_hit=True,
+                report_id=cached["report"],
+            )
         validation_result = self.test_candidate(candidate_id)
         if validation_result["status"] != "passed":
             return {
@@ -1567,10 +2228,20 @@ class AgentWorkspace:
                 )
             record["formal_evaluation_issues"] = evaluation_issues
         self._save()
-        return self._evaluation_tool_result(candidate_id, report, cache_hit=False)
+        return self._evaluation_tool_result(
+            candidate_id,
+            report,
+            cache_hit=False,
+            report_id=relative_report,
+        )
 
     def _evaluation_tool_result(
-        self, candidate_id: str, report: dict[str, Any], *, cache_hit: bool
+        self,
+        candidate_id: str,
+        report: dict[str, Any],
+        *,
+        cache_hit: bool,
+        report_id: str,
     ) -> dict[str, Any]:
         diagnostics, summary = _compact_evaluation_diagnostics(
             report.get("evaluation_diagnostics") or {}, 8
@@ -1580,6 +2251,7 @@ class AgentWorkspace:
             "candidate_id": candidate_id,
             "passed": bool(report.get("passed")),
             "cache_hit": bool(cache_hit),
+            "report_id": report_id,
             "by_lambda": report.get("by_lambda"),
             "candidate_numeric_diagnostics": report.get("candidate_numeric_diagnostics"),
             "evaluation_diagnostics": diagnostics,
@@ -1595,10 +2267,35 @@ class AgentWorkspace:
         *,
         start: int = 0,
         limit: int = 20,
+        report_id: str | None = None,
     ) -> dict[str, Any]:
+        start = max(0, int(start))
+        limit = min(50, max(1, int(limit)))
+
+        def pagination(total: int, returned: int) -> dict[str, Any]:
+            next_start = start + returned if start + returned < total else None
+            return {
+                "page_start": start,
+                "page_limit": limit,
+                "total_record_count": total,
+                "returned_count": returned,
+                "remaining_count": max(0, total - start - returned),
+                "has_more": next_start is not None,
+                "next_start": next_start,
+                "next_query_arguments": (
+                    {
+                        "candidate_id": candidate_id,
+                        "record_type": record_type,
+                        "start": next_start,
+                        "limit": limit,
+                        "report_id": report_id,
+                    }
+                    if next_start is not None
+                    else None
+                ),
+            }
+
         if record_type == "run":
-            start = max(0, int(start))
-            limit = min(50, max(1, int(limit)))
             candidate_ids = list(self.state["candidate_order"])
             selected = candidate_ids[start : start + limit]
             return {
@@ -1622,42 +2319,194 @@ class AgentWorkspace:
                     }
                     for item in selected
                 ],
-                "page_start": start,
-                "page_limit": limit,
                 "total_candidate_count": len(candidate_ids),
-                "next_start": (
-                    start + len(selected)
-                    if start + len(selected) < len(candidate_ids)
-                    else None
-                ),
+                **pagination(len(candidate_ids), len(selected)),
+            }
+        if record_type == "tool_calls":
+            records = list(self.state.get("framework_tool_calls", []))
+            selected = records[start : start + limit]
+            return {
+                "status": "ok",
+                "record_type": "tool_calls",
+                "tool_call_records": [
+                    {
+                        key: copy.deepcopy(item.get(key))
+                        for key in (
+                            "record_id",
+                            "tool_call_id",
+                            "name",
+                            "arguments",
+                            "status",
+                            "delivery_status",
+                            "delivered_model_call_number",
+                            "raw_result_path",
+                            "raw_result_sha256",
+                        )
+                        if item.get(key) is not None
+                    }
+                    | {
+                        "result_history_query": {
+                            "candidate_id": None,
+                            "record_type": "tool_result",
+                            "start": 0,
+                            "limit": 1,
+                            "report_id": item.get("record_id"),
+                        }
+                    }
+                    for item in selected
+                ],
+                **pagination(len(records), len(selected)),
+            }
+        if record_type == "tool_result":
+            framework_record = self._framework_record(str(report_id or ""))
+            if framework_record is None:
+                return {
+                    "status": "invalid_arguments",
+                    "error": "report_id must identify an indexed framework tool result",
+                }
+            return {
+                "status": "ok",
+                "record_type": "tool_result",
+                "record_id": framework_record.get("record_id"),
+                "tool_call_id": framework_record.get("tool_call_id"),
+                "tool": framework_record.get("name"),
+                "arguments": copy.deepcopy(framework_record.get("arguments")),
+                "execution_status": framework_record.get("status"),
+                "delivery_status": framework_record.get("delivery_status"),
+                "result": copy.deepcopy(framework_record.get("model_result")),
+                "raw_result_sha256": framework_record.get("raw_result_sha256"),
             }
         if not candidate_id:
             return {"status": "invalid_arguments", "error": "candidate_id is required for this record type"}
         record = self._candidate_record(candidate_id)
+        if record_type == "report":
+            allowed_reports = {
+                str(item.get("report"))
+                for item in (record.get("tests") or {}).values()
+                if item.get("report")
+            } | {
+                str(path) for path in (record.get("evaluations") or {}).values()
+            }
+            if not report_id or str(report_id) not in allowed_reports:
+                return {
+                    "status": "invalid_arguments",
+                    "error": "report_id must identify a report indexed for this candidate",
+                }
+            report_path = self.directory / str(report_id)
+            report = json.loads(report_path.read_text(encoding="utf-8"))
+            lines = json.dumps(
+                report,
+                ensure_ascii=False,
+                allow_nan=False,
+                indent=2,
+                default=str,
+            ).splitlines()
+            selected = lines[start : start + limit]
+
+            def report_page(page_lines: list[str]) -> dict[str, Any]:
+                next_start = (
+                    start + len(page_lines)
+                    if start + len(page_lines) < len(lines)
+                    else None
+                )
+                return {
+                    "status": "ok",
+                    "candidate_id": candidate_id,
+                    "record_type": "report",
+                    "report_id": report_id,
+                    "content_format": "complete UTF-8 JSON lines in original order",
+                    "page_start": start,
+                    "page_limit": limit,
+                    "total_line_count": len(lines),
+                    "returned_line_count": len(page_lines),
+                    "remaining_line_count": max(
+                        0, len(lines) - start - len(page_lines)
+                    ),
+                    "has_more": next_start is not None,
+                    "next_start": next_start,
+                    "next_query_arguments": (
+                        {
+                            "candidate_id": candidate_id,
+                            "record_type": "report",
+                            "start": next_start,
+                            "limit": limit,
+                            "report_id": report_id,
+                        }
+                        if next_start is not None
+                        else None
+                    ),
+                    "data_lines": page_lines,
+                }
+
+            while (
+                len(selected) > 1
+                and self._serialized_size(report_page(selected))
+                > PAGED_TOOL_PAYLOAD_MAX_CHARS
+            ):
+                selected.pop()
+            return report_page(selected)
         if record_type == "candidate":
             return {"status": "ok", "candidate_id": candidate_id, "candidate": record["candidate"], "parent_candidate_id": record.get("parent_candidate_id")}
         if record_type == "issues":
+            entries = [
+                {"issue_group": "current", "issue": item}
+                for item in record.get("issues", [])
+            ] + [
+                {"issue_group": "inherited", "issue": item}
+                for item in record.get("inherited_issue_context", [])
+            ] + [
+                {"issue_group": "formal_evaluation", "issue": item}
+                for item in record.get("formal_evaluation_issues", [])
+            ]
+            selected = entries[start : start + limit]
             return {
                 "status": "ok",
                 "candidate_id": candidate_id,
-                "issues": record.get("issues", []),
-                "inherited_issue_context": record.get(
-                    "inherited_issue_context", []
-                ),
-                "formal_evaluation_issues": record.get(
-                    "formal_evaluation_issues", []
-                ),
+                "record_type": "issues",
+                "issue_records": selected,
+                "issues": [
+                    item["issue"]
+                    for item in selected
+                    if item["issue_group"] == "current"
+                ],
+                "inherited_issue_context": [
+                    item["issue"]
+                    for item in selected
+                    if item["issue_group"] == "inherited"
+                ],
+                "formal_evaluation_issues": [
+                    item["issue"]
+                    for item in selected
+                    if item["issue_group"] == "formal_evaluation"
+                ],
+                **pagination(len(entries), len(selected)),
             }
         if record_type == "tests":
-            return {"status": "ok", "candidate_id": candidate_id, "tests": record.get("tests", {})}
+            entries = list((record.get("tests") or {}).items())
+            selected = entries[start : start + limit]
+            return {
+                "status": "ok",
+                "candidate_id": candidate_id,
+                "record_type": "tests",
+                "tests": {key: value for key, value in selected},
+                **pagination(len(entries), len(selected)),
+            }
         if record_type == "evaluation":
             reports = []
-            for path in record.get("evaluations", {}).values():
+            paths = list((record.get("evaluations") or {}).values())
+            selected_paths = paths[start : start + limit]
+            for path in selected_paths:
                 report = json.loads((self.directory / path).read_text(encoding="utf-8"))
-                compact, summary = _compact_evaluation_diagnostics(report.get("evaluation_diagnostics") or {}, 8)
+                compact, summary = _compact_evaluation_diagnostics(report.get("evaluation_diagnostics") or {}, 0)
                 reports.append({"path_id": path, "status": report.get("status"), "passed": report.get("passed"), "by_lambda": report.get("by_lambda"), "evaluation_diagnostics": compact, "compaction": summary})
-            return {"status": "ok", "candidate_id": candidate_id, "evaluations": reports}
-        return {"status": "invalid_arguments", "error": "record_type must be run, candidate, issues, tests, or evaluation"}
+            return {
+                "status": "ok",
+                "candidate_id": candidate_id,
+                "record_type": "evaluation",
+                "evaluations": reports,
+                **pagination(len(paths), len(reports)),
+            }
+        return {"status": "invalid_arguments", "error": "record_type must be run, tool_calls, tool_result, candidate, issues, tests, evaluation, or report"}
 
 
 class _WorkspaceTool(Tool):
@@ -1670,17 +2519,35 @@ class _WorkspaceTool(Tool):
 
 class InspectInterfaceTool(_WorkspaceTool):
     name = "inspect_interface"
-    description = "Read one controlled section of the authoritative current-only input, candidate, or evaluation contract."
-    inputs = {"section": {"type": "string", "description": "overview, fields, constants, candidate, or evaluation"}}
+    description = "Read a stable line page from one controlled section of the authoritative current-only input, candidate, or evaluation contract. Follow next_query_arguments when has_more is true."
+    inputs = {
+        "section": {"type": "string", "description": "overview, fields, constants, candidate, or evaluation"},
+        "start": {"type": "integer", "description": "optional zero-based line offset", "nullable": True},
+        "limit": {"type": "integer", "description": f"optional line count, capped at {INTERFACE_PAGE_MAX_LINES}", "nullable": True},
+    }
     output_type = "string"
 
-    def forward(self, section: str) -> str:
-        return self.workspace.invoke(self.name, {"section": section}, lambda: self.workspace.inspect_interface(section))
+    def forward(
+        self,
+        section: str,
+        start: int | None = None,
+        limit: int | None = None,
+    ) -> str:
+        arguments = {
+            "section": section,
+            "start": 0 if start is None else start,
+            "limit": INTERFACE_PAGE_MAX_LINES if limit is None else limit,
+        }
+        return self.workspace.invoke(
+            self.name,
+            arguments,
+            lambda: self.workspace.inspect_interface(**arguments),
+        )
 
 
 class QuerySamplesTool(_WorkspaceTool):
     name = "query_samples"
-    description = "Read a bounded page of current-only fixed-sample fields. IDs and evaluation outcomes are diagnostics, never candidate inputs."
+    description = "Read a bounded, complete page of current-only fixed-sample fields. The host may return fewer samples than requested to fit delivery; follow next_query_arguments without changing fields or filters. IDs and evaluation outcomes are diagnostics, never candidate inputs."
     inputs = {
         "fields": {"type": "array", "description": "1..12 obs.* current-only field names", "items": {"type": "string"}},
         "start": {"type": "integer", "description": "zero-based page offset"},
@@ -1741,12 +2608,13 @@ class FormalEvaluateTool(_WorkspaceTool):
 
 class GetHistoryTool(_WorkspaceTool):
     name = "get_history"
-    description = "Retrieve controlled run, candidate, issue, test, or evaluation history by immutable candidate id; arbitrary paths are not accepted."
+    description = "Retrieve controlled run, tool-call, candidate, issue, test, or evaluation history. Read an indexed model-facing tool result with record_type=tool_result and its record ID in report_id. Indexed test/evaluation reports use record_type=report and their returned report_id. Arbitrary paths are not accepted."
     inputs = {
         "candidate_id": {"type": "string", "description": "candidate id, or null only for run history", "nullable": True},
-        "record_type": {"type": "string", "description": "run, candidate, issues, tests, or evaluation"},
+        "record_type": {"type": "string", "description": "run, tool_calls, tool_result, candidate, issues, tests, evaluation, or report"},
         "start": {"type": "integer", "description": "run-history page offset", "nullable": True},
         "limit": {"type": "integer", "description": "run-history page size, capped at 50", "nullable": True},
+        "report_id": {"type": "string", "description": "optional host-indexed tool-result record id or test/evaluation report id", "nullable": True},
     }
     output_type = "string"
 
@@ -1756,12 +2624,14 @@ class GetHistoryTool(_WorkspaceTool):
         candidate_id: str | None = None,
         start: int | None = None,
         limit: int | None = None,
+        report_id: str | None = None,
     ) -> str:
         arguments = {
             "candidate_id": candidate_id,
             "record_type": record_type,
             "start": 0 if start is None else start,
             "limit": 20 if limit is None else limit,
+            "report_id": report_id,
         }
         return self.workspace.invoke(
             self.name,
@@ -1771,6 +2641,7 @@ class GetHistoryTool(_WorkspaceTool):
                 record_type,
                 start=arguments["start"],
                 limit=arguments["limit"],
+                report_id=arguments["report_id"],
             ),
         )
 
@@ -2027,6 +2898,9 @@ class StreamingProviderModel(Model):
                 input_tokens=int(usage["prompt_tokens"]),
                 output_tokens=int(usage["completion_tokens"]),
             )
+        self.workspace.mark_prepared_results_delivered(
+            model_call_number=call_number
+        )
         return ChatMessage(
             role=MessageRole.ASSISTANT,
             content=content,
@@ -2050,9 +2924,13 @@ class BudgetedModelProxy(Model):
         self.workspace.state["model_calls_used"] = self.budget.used
         self.workspace._save()
         message = self.delegate.generate(*args, **kwargs)
-        return _normalize_plain_text_completion_request(
+        normalized = _normalize_plain_text_completion_request(
             message, call_id=str(self.budget.used)
         )
+        self.workspace.mark_prepared_results_delivered(
+            model_call_number=self.budget.used
+        )
+        return normalized
 
 
 class ControlledToolCallingAgent(ToolCallingAgent):
@@ -2126,7 +3004,7 @@ class ControlledToolCallingAgent(ToolCallingAgent):
                     "tool": tool_call.name,
                     "reason": approval_reason,
                 }
-                self.workspace.skip_framework_call(
+                skipped = self.workspace.skip_framework_call(
                     tool_call.id,
                     reason=approval_reason,
                 )
@@ -2152,7 +3030,7 @@ class ControlledToolCallingAgent(ToolCallingAgent):
                     ),
                     "earlier_failed_tool_call_id": prior_tool_error["tool_call_id"],
                 }
-                self.workspace.skip_framework_call_with_status(
+                skipped = self.workspace.skip_framework_call_with_status(
                     tool_call.id,
                     status="skipped_after_tool_error",
                     reason=skipped["reason"],
@@ -2183,7 +3061,7 @@ class ControlledToolCallingAgent(ToolCallingAgent):
                         else "final_answer_tool"
                     ),
                 )
-                self.workspace.finish_framework_call(
+                result = self.workspace.finish_framework_call(
                     tool_call.id,
                     status="completion_rejected",
                     output=result,
@@ -2219,7 +3097,7 @@ class ControlledToolCallingAgent(ToolCallingAgent):
                     "tool_error",
                 }
                 framework_status = "failed" if correctable_failure else "completed"
-                self.workspace.finish_framework_call(
+                result = self.workspace.finish_framework_call(
                     tool_call.id, status=framework_status, output=result
                 )
             except Exception as exc:
@@ -2242,7 +3120,7 @@ class ControlledToolCallingAgent(ToolCallingAgent):
                     ),
                     "available_tools": available,
                 }
-                self.workspace.finish_framework_call(
+                result = self.workspace.finish_framework_call(
                     tool_call.id, status=framework_status, output=result
                 )
                 correctable_failure = True
@@ -2284,6 +3162,10 @@ class ControlledToolCallingAgent(ToolCallingAgent):
 
     def write_memory_to_messages(self, summary_mode: bool = False):
         messages = super().write_memory_to_messages(summary_mode=summary_mode)
+        all_pending_records = self.workspace.pending_delivery_records()
+        all_pending_ids = [
+            str(record["record_id"]) for record in all_pending_records
+        ]
         budget, _ = _request_token_budget(
             self.model,
             messages,
@@ -2292,13 +3174,38 @@ class ControlledToolCallingAgent(ToolCallingAgent):
             max_output_tokens=self.max_output_tokens,
         )
         if budget["fits_client_budget"]:
+            self.workspace.prepare_result_delivery(all_pending_ids)
             return messages
-        # Keep whole memory-step message groups, never split tool calls from results.
+        # Keep whole memory-step message groups. Pending results are protected;
+        # only older groups whose results were already delivered are removable.
         system_messages = self.memory.system_prompt.to_messages(summary_mode=False)
-        groups = [step.to_messages(summary_mode=False) for step in self.memory.steps[1:]]
+        group_records = []
+        represented_pending_ids: set[str] = set()
+        for step in self.memory.steps[1:]:
+            calls = list(getattr(step, "tool_calls", None) or [])
+            call_ids = [str(call.id) for call in calls]
+            pending_ids = self.workspace.pending_record_ids_for_call_ids(call_ids)
+            represented_pending_ids.update(pending_ids)
+            group_records.append(
+                {
+                    "messages": step.to_messages(summary_mode=False),
+                    "pending_record_ids": pending_ids,
+                }
+            )
+        pending_without_memory = set(all_pending_ids) - represented_pending_ids
+        current_candidate_id = self.workspace.state.get("current_candidate_id")
+        pending_supplies_current_candidate = any(
+            record.get("name") == "get_history"
+            and (record.get("arguments") or {}).get("record_type") == "candidate"
+            and (record.get("arguments") or {}).get("candidate_id")
+            == current_candidate_id
+            for record in all_pending_records
+        )
         compact_work_state = self.workspace.work_state(
-            include_candidate=True,
+            include_candidate=not pending_supplies_current_candidate,
             model_calls_maximum=self.model_calls_maximum,
+            include_pending_payloads=bool(pending_without_memory),
+            pending_payload_record_ids=pending_without_memory,
         )
         if self.task_renderer is None:  # Defensive for direct construction.
             compact_task = (
@@ -2318,11 +3225,17 @@ class ControlledToolCallingAgent(ToolCallingAgent):
         compact_task_messages = TaskStep(task=compact_task).to_messages(
             summary_mode=False
         )
-        kept = list(groups)
-        while kept:
-            candidate = system_messages + compact_task_messages + [
-                message for group in kept for message in group
+        kept_indexes = list(range(len(group_records)))
+
+        def request_messages(indexes: list[int]) -> list[ChatMessage]:
+            return system_messages + compact_task_messages + [
+                message
+                for index in indexes
+                for message in group_records[index]["messages"]
             ]
+
+        while True:
+            candidate = request_messages(kept_indexes)
             estimate, _ = _request_token_budget(
                 self.model,
                 candidate,
@@ -2331,20 +3244,42 @@ class ControlledToolCallingAgent(ToolCallingAgent):
                 max_output_tokens=self.max_output_tokens,
             )
             if estimate["fits_client_budget"]:
+                omitted = len(group_records) - len(kept_indexes)
+                protected = sum(
+                    bool(group_records[index]["pending_record_ids"])
+                    for index in kept_indexes
+                )
                 self.workspace.state["context_compactions"].append(
                     {
                         "created_at_utc": datetime.now(timezone.utc).isoformat(),
-                        "omitted_complete_step_groups": len(groups) - len(kept),
-                        "retained_complete_step_groups": len(kept),
+                        "omitted_complete_step_groups": omitted,
+                        "retained_complete_step_groups": len(kept_indexes),
+                        "retained_pending_result_groups": protected,
+                        "pending_result_record_ids": all_pending_ids,
+                        "pending_results_embedded_in_work_state": sorted(
+                            pending_without_memory
+                        ),
                         "candidate_code_truncated": False,
                         "tool_call_result_pairs_split": False,
                         "token_budget": estimate,
                     }
                 )
                 self.workspace._save()
+                self.workspace.prepare_result_delivery(all_pending_ids)
                 return candidate
-            kept.pop(0)
-        minimum = system_messages + compact_task_messages
+            removable = next(
+                (
+                    index
+                    for index in kept_indexes
+                    if not group_records[index]["pending_record_ids"]
+                ),
+                None,
+            )
+            if removable is None:
+                break
+            kept_indexes.remove(removable)
+
+        minimum = request_messages(kept_indexes)
         estimate, _ = _request_token_budget(
             self.model,
             minimum,
@@ -2352,22 +3287,43 @@ class ControlledToolCallingAgent(ToolCallingAgent):
             context_length=self.context_length,
             max_output_tokens=self.max_output_tokens,
         )
-        if not estimate["fits_client_budget"]:
-            raise AgentContextBudgetError(
-                "system/task prompt, complete current candidate, unresolved state, and output reservation do not fit"
-            )
         self.workspace.state["context_compactions"].append(
             {
                 "created_at_utc": datetime.now(timezone.utc).isoformat(),
-                "omitted_complete_step_groups": len(groups),
-                "retained_complete_step_groups": 0,
+                "status": "context_budget_exceeded",
+                "omitted_complete_step_groups": len(group_records)
+                - len(kept_indexes),
+                "retained_complete_step_groups": len(kept_indexes),
+                "retained_pending_result_groups": sum(
+                    bool(group_records[index]["pending_record_ids"])
+                    for index in kept_indexes
+                ),
+                "pending_result_record_ids": all_pending_ids,
+                "pending_results_embedded_in_work_state": sorted(
+                    pending_without_memory
+                ),
                 "candidate_code_truncated": False,
                 "tool_call_result_pairs_split": False,
                 "token_budget": estimate,
+                "budget_components": {
+                    "system_message_count": len(system_messages),
+                    "compact_task_message_count": len(compact_task_messages),
+                    "protected_pending_group_count": sum(
+                        bool(group_records[index]["pending_record_ids"])
+                        for index in kept_indexes
+                    ),
+                    "pending_result_count": len(all_pending_ids),
+                    "output_token_reservation": self.max_output_tokens,
+                },
             }
         )
         self.workspace._save()
-        return minimum
+        self.workspace.prepare_result_delivery([])
+        raise AgentContextBudgetError(
+            "system/task prompt, complete current candidate, tool definitions, "
+            "output reservation, and the minimum pending tool-result delivery do "
+            "not fit; pending results were preserved and no incomplete request was sent"
+        )
 
     def _handle_max_steps_reached(self, task: str) -> Any:
         # smolagents normally makes one extra model call here.  Returning a
@@ -2552,10 +3508,20 @@ def run_agent(
             current_work_state=current_work_state,
         )
 
+    resume_pending = workspace.pending_delivery_records() if resume is not None else []
+    current_candidate_id = workspace.state.get("current_candidate_id")
+    pending_supplies_current_candidate = any(
+        record.get("name") == "get_history"
+        and (record.get("arguments") or {}).get("record_type") == "candidate"
+        and (record.get("arguments") or {}).get("candidate_id")
+        == current_candidate_id
+        for record in resume_pending
+    )
     task = render_task(
         workspace.work_state(
-            include_candidate=True,
+            include_candidate=not pending_supplies_current_candidate,
             model_calls_maximum=effective_model_call_maximum,
+            include_pending_payloads=resume is not None,
         )
     )
     if model_backend is None:

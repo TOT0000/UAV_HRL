@@ -185,11 +185,29 @@ is requested.
 
 Before each generation, the client budgets the complete framework system
 prompt, task, tool definitions, memory, and output reservation. When necessary,
-whole older action groups are replaced with a host-generated structured summary;
-tool-call/result pairs are never split and the current candidate is not
-truncated. The estimate uses the same serialized messages and tool schemas sent
-to the provider, plus the configured output reservation. If the minimum state
-still does not fit, the run is saved and stops without consuming a model call.
+whole older, already-delivered action groups are replaced with a host-generated
+structured summary. A completed tool result remains pending until it is included
+in an actual request that receives a complete accepted model response; a failed
+or cancelled request leaves it pending for resume and never re-executes the tool.
+Pending tool-call/result pairs are not split or silently discarded, and the
+current candidate is not truncated. Each raw result is preserved separately
+from its bounded model-facing view with a record ID and content hash.
+
+`query_samples`, `inspect_interface`, and `get_history` return stable pages with
+the returned range, remaining count, `has_more`, and exact
+`next_query_arguments`. Sample pages preserve the requested field order and
+filter, and never offer an unchanged zero-progress page. Candidate tests and
+formal evaluations still run over their complete data; only their model-facing
+reports are summarized, with status, test scope, every lambda result, and a
+`get_history` lookup retained. The compact work state records recent query
+indexes and any still-pending result, so resume can deliver it without rerunning
+the operation. “Delivered” means included in a request that completed; it does
+not claim that the model understood the result.
+
+The estimate uses the same serialized messages and tool schemas sent to the
+provider, plus the configured output reservation. If the minimum state and a
+usable pending result page still do not fit, the run is saved and stops without
+consuming another model call; it does not continue with the result removed.
 The compact work state includes the full current candidate, a deterministic
 bounded grouping of unresolved or unverified issues, exactly one current or
 nearest-ancestor formal-evaluation summary, compact history indexes, and

@@ -108,6 +108,78 @@ class PlainTextModel(Model):
         )
 
 
+class RequestAwareToolModel(Model):
+    """Script tool calls only after assertions over the actual request."""
+
+    def __init__(self, steps, model_id="mock/request-aware"):
+        super().__init__(model_id=model_id)
+        self.steps = list(steps)
+        self.calls = []
+
+    def generate(self, messages, tools_to_call_from=None, **kwargs):
+        request_text = json.dumps(
+            [message.dict() for message in messages],
+            ensure_ascii=False,
+            default=str,
+        )
+        self.calls.append(
+            {
+                "messages": messages,
+                "request_text": request_text,
+                "tools": [tool.name for tool in tools_to_call_from or []],
+            }
+        )
+        if not self.steps:
+            raise AssertionError("unexpected model call")
+        action = self.steps.pop(0)(request_text)
+        calls = [
+            ChatMessageToolCall(
+                function=ChatMessageToolCallFunction(name=name, arguments=arguments),
+                id=f"aware-call-{len(self.calls)}-{index}",
+                type="function",
+            )
+            for index, (name, arguments) in enumerate(action)
+        ]
+        return ChatMessage(
+            role=MessageRole.ASSISTANT,
+            content=None,
+            tool_calls=calls,
+            token_usage=TokenUsage(input_tokens=10, output_tokens=5),
+        )
+
+
+class QueryThenTransportFailureModel(Model):
+    def __init__(self):
+        super().__init__(model_id="mock/query-then-transport-failure")
+        self.calls = []
+
+    def generate(self, messages, tools_to_call_from=None, **kwargs):
+        self.calls.append(messages)
+        if len(self.calls) == 1:
+            return ChatMessage(
+                role=MessageRole.ASSISTANT,
+                content=None,
+                tool_calls=[
+                    ChatMessageToolCall(
+                        function=ChatMessageToolCallFunction(
+                            name="query_samples",
+                            arguments={
+                                "fields": ["obs.movement_mask"],
+                                "start": 0,
+                                "limit": 20,
+                                "condition_field": None,
+                                "condition": None,
+                            },
+                        ),
+                        id="query-before-failure",
+                        type="function",
+                    )
+                ],
+                token_usage=TokenUsage(input_tokens=10, output_tokens=5),
+            )
+        raise APIError("fixture transport failed", category="stream_connection_error")
+
+
 def _candidate_id(candidate):
     return f"candidate-{llm_agent._content_hash(candidate)[:12]}"
 
@@ -1884,7 +1956,7 @@ def test_context_compaction_keeps_complete_candidate_and_tool_pairs(tmp_path):
         model=model.model_id,
         model_backend=model,
         max_model_calls=4,
-        context_length=23_500,
+        context_length=20_500,
         max_output_tokens=1_024,
         output_dir=tmp_path / "compaction",
     )
@@ -1906,7 +1978,12 @@ def test_context_compaction_keeps_complete_candidate_and_tool_pairs(tmp_path):
     assert len(compact_tasks) == 1
     assert compact_tasks[0].count("The current work record is:") == 1
     assert candidate_id in compact_tasks[0]
-    assert candidate["candidate_name"] in compact_tasks[0]
+    final_request = json.dumps(
+        [message.dict() for message in model.calls[-1]["messages"]],
+        ensure_ascii=False,
+        default=str,
+    )
+    assert candidate["candidate_name"] in final_request
     assert "Host-generated compact work-state summary." not in compact_tasks[0]
     assert len(state["framework_tool_calls"]) == 4
     assert [item["status"] for item in state["framework_tool_calls"]] == [
@@ -1915,6 +1992,424 @@ def test_context_compaction_keeps_complete_candidate_and_tool_pairs(tmp_path):
         "completed",
         "completion_rejected",
     ]
+
+
+def test_pending_query_page_survives_compaction_into_actual_request(tmp_path):
+    fixed = _fixed_artifact(tmp_path)
+    candidate = _candidate(name="uses-observed-sample")
+
+    def inspect_first(_request):
+        return [("inspect_interface", {"section": "overview"})]
+
+    def query_after_interface(request):
+        assert "inspect_interface" in request
+        return [
+            (
+                "query_samples",
+                {
+                    "fields": ["obs.movement_mask", "obs.uav_backlog_bits"],
+                    "start": 0,
+                    "limit": 20,
+                    "condition_field": None,
+                    "condition": None,
+                },
+            )
+        ]
+
+    def submit_only_after_page(request):
+        assert "query_samples" in request
+        assert "aware-call-2-0" in request
+        assert "returned_sample_count" in request
+        assert "samples" in request
+        assert "sample_0" in request
+        assert "next_query_arguments" in request
+        return [
+            (
+                "submit_candidate",
+                {"candidate": candidate, "parent_candidate_id": None},
+            )
+        ]
+
+    model = RequestAwareToolModel(
+        [inspect_first, query_after_interface, submit_only_after_page]
+    )
+    result = run_agent(
+        fixed_sample=fixed,
+        provider="openai",
+        model="gpt-4o",
+        model_backend=model,
+        max_model_calls=3,
+        context_length=21_000,
+        max_output_tokens=1_024,
+        output_dir=tmp_path / "pending-query-compaction",
+    )
+    state = json.loads(
+        (tmp_path / "pending-query-compaction" / "agent_state.json").read_text()
+    )
+    assert result["status"] == "paused_budget_exhausted"
+    assert state["context_compactions"]
+    query_record = next(
+        item
+        for item in state["framework_tool_calls"]
+        if item["name"] == "query_samples"
+    )
+    assert query_record["delivery_status"] == "delivered"
+    assert query_record["delivered_model_call_number"] == 3
+    raw = json.loads(
+        (
+            tmp_path
+            / "pending-query-compaction"
+            / query_record["raw_result_path"]
+        ).read_text()
+    )
+    assert raw["result"]["requested_limit"] == 20
+    assert raw["result"]["returned_sample_count"] > 0
+
+
+@pytest.mark.parametrize(
+    ("provider", "model_id"),
+    [
+        ("lmstudio", "openai/gpt-oss-20b"),
+        ("lmstudio", "qwen/qwen3.5-9b"),
+        ("lmstudio", "google/gemma-4-e4b"),
+        ("openai", "gpt-4o"),
+    ],
+)
+def test_multi_tool_results_are_all_paired_in_next_actual_request(
+    tmp_path, provider, model_id
+):
+    fixed = _fixed_artifact(tmp_path)
+
+    def issue_two_calls(_request):
+        return [
+            (
+                "query_samples",
+                {
+                    "fields": ["obs.movement_mask"],
+                    "start": 0,
+                    "limit": 20,
+                    "condition_field": None,
+                    "condition": None,
+                },
+            ),
+            ("inspect_interface", {"section": "evaluation"}),
+        ]
+
+    def verify_both(request):
+        for call_id, tool in (
+            ("aware-call-1-0", "query_samples"),
+            ("aware-call-1-1", "inspect_interface"),
+        ):
+            assert call_id in request
+            assert tool in request
+        assert "returned_sample_count" in request
+        assert "data_lines" in request
+        return [("final_answer", {"answer": "fixture stop"})]
+
+    model = RequestAwareToolModel([issue_two_calls, verify_both], model_id=model_id)
+    output = tmp_path / f"multi-result-{provider}-{model_id.replace('/', '-')}"
+    result = run_agent(
+        fixed_sample=fixed,
+        provider=provider,
+        model=model_id,
+        model_backend=model,
+        max_model_calls=2,
+        context_length=100_000,
+        output_dir=output,
+    )
+    assert result["status"] == "paused_budget_exhausted"
+    state = json.loads((output / "agent_state.json").read_text())
+    delivered = [
+        item
+        for item in state["framework_tool_calls"][:2]
+        if item["delivery_status"] == "delivered"
+    ]
+    assert len(delivered) == 2
+    assert {item["delivered_model_call_number"] for item in delivered} == {2}
+
+
+def test_transport_failure_keeps_completed_query_pending(tmp_path):
+    fixed = _fixed_artifact(tmp_path)
+    model = QueryThenTransportFailureModel()
+    result = run_agent(
+        fixed_sample=fixed,
+        provider="lmstudio",
+        model=model.model_id,
+        model_backend=model,
+        max_model_calls=2,
+        context_length=100_000,
+        output_dir=tmp_path / "pending-after-transport",
+    )
+    assert result["status"] == "failed"
+    state = json.loads(
+        (tmp_path / "pending-after-transport" / "agent_state.json").read_text()
+    )
+    query_record = state["framework_tool_calls"][0]
+    assert query_record["status"] == "completed"
+    assert query_record["delivery_status"] == "pending"
+    assert len(state["tool_operations"]) == 1
+
+
+def test_resume_delivers_pending_result_without_reexecuting_tool(tmp_path):
+    fixed = _fixed_artifact(tmp_path)
+    directory = tmp_path / "pending-resume"
+    first = ScriptedToolModel(
+        [
+            (
+                "query_samples",
+                {
+                    "fields": ["obs.movement_mask"],
+                    "start": 0,
+                    "limit": 20,
+                    "condition_field": None,
+                    "condition": None,
+                },
+            )
+        ]
+    )
+    initial = run_agent(
+        fixed_sample=fixed,
+        provider="lmstudio",
+        model=first.model_id,
+        model_backend=first,
+        max_model_calls=1,
+        context_length=100_000,
+        output_dir=directory,
+    )
+    assert initial["status"] == "paused_budget_exhausted"
+
+    def verify_resume(request):
+        assert "pending_tool_result_delivery" in request
+        assert "query_samples" in request
+        assert "sample_0" in request
+        return [("final_answer", {"answer": "fixture stop after reading"})]
+
+    resumed_model = RequestAwareToolModel([verify_resume], model_id=first.model_id)
+    resumed = run_agent(
+        resume=directory,
+        model_backend=resumed_model,
+        additional_model_calls=1,
+    )
+    assert resumed["status"] == "paused_budget_exhausted"
+    state = json.loads((directory / "agent_state.json").read_text())
+    assert [item["tool"] for item in state["tool_operations"]].count(
+        "query_samples"
+    ) == 1
+    query_record = state["framework_tool_calls"][0]
+    assert query_record["delivery_status"] == "delivered"
+    assert query_record["delivered_model_call_number"] == 2
+
+
+def test_query_sample_pages_are_stable_complete_and_make_progress(
+    tmp_path, monkeypatch
+):
+    fixed = _fixed_artifact(tmp_path)
+    workspace = _workspace(tmp_path, fixed, name="sample-pages")
+    monkeypatch.setattr(llm_agent, "PAGED_TOOL_PAYLOAD_MAX_CHARS", 2_800)
+    arguments = {
+        "fields": [
+            "obs.movement_mask",
+            "obs.uav_backlog_bits",
+            "obs.uav_queue_valid",
+        ],
+        "start": 0,
+        "limit": 20,
+        "condition_field": None,
+        "condition": None,
+    }
+    references = []
+    while True:
+        page = workspace.query_samples(**arguments)
+        assert page["status"] == "ok"
+        assert page["returned_sample_count"] > 0
+        assert page["fields"] == arguments["fields"]
+        references.extend(page["returned_sample_refs"])
+        if not page["has_more"]:
+            break
+        next_arguments = page["next_query_arguments"]
+        assert next_arguments["start"] > arguments["start"]
+        assert next_arguments["fields"] == arguments["fields"]
+        assert next_arguments["condition_field"] == arguments["condition_field"]
+        assert next_arguments["condition"] == arguments["condition"]
+        arguments = next_arguments
+    assert len(references) == workspace.fixed_metadata["sample_count"]
+    assert len(references) == len(set(references))
+    assert references == [f"sample_{index}" for index in range(len(references))]
+
+    final = workspace.query_samples(
+        fields=["obs.movement_mask"],
+        start=len(references),
+        limit=20,
+        condition_field=None,
+        condition=None,
+    )
+    assert final["status"] == "ok"
+    assert final["returned_sample_count"] == 0
+    assert final["has_more"] is False
+
+
+def test_single_sample_too_large_never_offers_zero_progress_page(
+    tmp_path, monkeypatch
+):
+    fixed = _fixed_artifact(tmp_path)
+    workspace = _workspace(tmp_path, fixed, name="oversized-sample")
+    monkeypatch.setattr(llm_agent, "PAGED_TOOL_PAYLOAD_MAX_CHARS", 250)
+    result = workspace.query_samples(
+        fields=["obs.state"],
+        start=0,
+        limit=20,
+        condition_field=None,
+        condition=None,
+    )
+    assert result["status"] == "page_too_large"
+    assert result["returned_sample_count"] == 0
+    assert result["next_query_arguments"] is None
+    assert result["has_more"] is False
+
+
+def test_pending_result_that_cannot_fit_stops_before_incomplete_request(tmp_path):
+    fixed = _fixed_artifact(tmp_path)
+    model = ScriptedToolModel(
+        [
+            (
+                "query_samples",
+                {
+                    "fields": [
+                        "obs.state",
+                        "obs.movement_mask",
+                        "obs.uav_backlog_bits",
+                        "obs.uav_queue_valid",
+                    ],
+                    "start": 0,
+                    "limit": 20,
+                    "condition_field": None,
+                    "condition": None,
+                },
+            )
+        ]
+    )
+    result = run_agent(
+        fixed_sample=fixed,
+        provider="lmstudio",
+        model=model.model_id,
+        model_backend=model,
+        max_model_calls=2,
+        context_length=18_500,
+        max_output_tokens=1_024,
+        output_dir=tmp_path / "pending-does-not-fit",
+    )
+    assert result["status"] == "failed_context_budget"
+    assert len(model.calls) == 1
+    state = json.loads(
+        (tmp_path / "pending-does-not-fit" / "agent_state.json").read_text()
+    )
+    record = state["framework_tool_calls"][0]
+    assert record["status"] == "completed"
+    assert record["delivery_status"] == "pending"
+    failure = state["context_compactions"][-1]
+    assert failure["status"] == "context_budget_exceeded"
+    assert record["record_id"] in failure["pending_result_record_ids"]
+
+
+def test_interface_pages_preserve_order_and_offer_exact_next_arguments(tmp_path):
+    fixed = _fixed_artifact(tmp_path)
+    workspace = _workspace(tmp_path, fixed, name="interface-pages")
+    first = workspace.inspect_interface("overview", start=0, limit=3)
+    assert first["status"] == "ok"
+    assert first["returned_line_count"] == 3
+    assert first["has_more"] is True
+    second = workspace.inspect_interface(**first["next_query_arguments"])
+    assert second["page_start"] == 3
+    assert second["data_lines"]
+    assert first["data_lines"] != second["data_lines"]
+    assert first["total_line_count"] == second["total_line_count"]
+    assert second["next_query_arguments"]["section"] == "overview"
+
+
+def test_history_report_pages_are_model_retrievable_without_arbitrary_paths(
+    tmp_path
+):
+    fixed = _fixed_artifact(tmp_path)
+    workspace = _workspace(tmp_path, fixed, name="history-report-pages")
+    submitted = workspace.submit_candidate(_candidate(name="history-report"), None)
+    candidate_id = submitted["candidate_id"]
+    tested = workspace.test_candidate(candidate_id)
+    report_id = tested["report_id"]
+    lines = []
+    arguments = {
+        "candidate_id": candidate_id,
+        "record_type": "report",
+        "start": 0,
+        "limit": 7,
+        "report_id": report_id,
+    }
+    while True:
+        page = workspace.get_history(**arguments)
+        assert page["status"] == "ok"
+        assert page["report_id"] == report_id
+        assert workspace._serialized_size(page) <= llm_agent.MODEL_TOOL_RESULT_MAX_CHARS
+        lines.extend(page["data_lines"])
+        if not page["has_more"]:
+            break
+        arguments = page["next_query_arguments"]
+    reconstructed = json.loads("\n".join(lines))
+    assert reconstructed["candidate_id"] == candidate_id
+    assert reconstructed["test_scope"] == "full_fixed_samples"
+
+    rejected = workspace.get_history(
+        candidate_id,
+        "report",
+        report_id="C:/arbitrary/path.json",
+    )
+    assert rejected["status"] == "invalid_arguments"
+
+
+def test_bounded_query_index_links_to_paged_tool_call_history(tmp_path):
+    fixed = _fixed_artifact(tmp_path)
+    workspace = _workspace(tmp_path, fixed, name="tool-call-history")
+    for index in range(10):
+        call = ChatMessageToolCall(
+            function=ChatMessageToolCallFunction(
+                name="query_samples",
+                arguments={
+                    "fields": ["obs.movement_mask"],
+                    "start": index,
+                    "limit": 1,
+                    "condition_field": None,
+                    "condition": None,
+                },
+            ),
+            id=f"history-query-{index}",
+            type="function",
+        )
+        workspace.register_framework_calls([call])
+        workspace.finish_framework_call(
+            call.id,
+            status="completed",
+            output={
+                "status": "ok",
+                "requested_start": index,
+                "returned_sample_count": 1,
+                "returned_sample_refs": [f"sample_{index}"],
+            },
+        )
+    summary = workspace.work_state()
+    recent = summary["recent_completed_queries"]
+    assert recent["total_count"] == 10
+    assert recent["included_count"] == llm_agent.WORK_SUMMARY_MAX_QUERY_INDEXES
+    history = workspace.get_history(
+        None, "tool_calls", start=0, limit=4
+    )
+    assert history["returned_count"] == 4
+    assert history["has_more"] is True
+    second = workspace.get_history(**history["next_query_arguments"])
+    assert second["tool_call_records"][0]["tool_call_id"] == "history-query-4"
+    detail = workspace.get_history(
+        **history["tool_call_records"][0]["result_history_query"]
+    )
+    assert detail["record_type"] == "tool_result"
+    assert detail["record_id"] == "framework-call-000001"
+    assert detail["result"]["returned_sample_refs"] == ["sample_0"]
 
 
 @pytest.mark.parametrize(
