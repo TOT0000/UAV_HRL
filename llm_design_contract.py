@@ -259,6 +259,61 @@ def runtime_constants(constants_metadata: dict[str, Any]) -> dict[str, Any]:
     return {name: item["value"] for name, item in constants_metadata.items()}
 
 
+def runtime_diagnostic_contract(
+    fixed_metadata: dict[str, Any], constants_metadata: dict[str, Any]
+) -> dict[str, Any]:
+    """Build worker-safe diagnostics from the authoritative saved interface.
+
+    The worker receives only structural metadata.  It never receives provenance,
+    credentials, or a second independently maintained state-layout definition.
+    """
+
+    checkpoint = fixed_metadata["compatibility_contract"][
+        "source_checkpoint_contract"
+    ]
+    schema = checkpoint.get("movement_state_feature_schema") or {}
+    features = schema.get("features") or []
+    state_dimension = int(schema.get("dimension", -1))
+    if state_dimension <= 0 or len(features) != state_dimension:
+        raise ValueError("fixed artifact lacks a complete authoritative state schema")
+    num_uav = int(constants_metadata["num_uav"]["value"])
+    uav_indices = [
+        int(item["index"])
+        for item in features
+        if isinstance(item, dict) and str(item.get("name", "")).startswith("uav_")
+    ]
+    if not uav_indices or len(uav_indices) % num_uav:
+        raise ValueError("authoritative state schema has inconsistent UAV blocks")
+    local_dimension = len(uav_indices) // num_uav
+    uav_start = min(uav_indices)
+    uav_stop = max(uav_indices) + 1
+    if uav_start != 0 or uav_stop != num_uav * local_dimension:
+        raise ValueError("authoritative state schema UAV blocks are not contiguous")
+    return {
+        "observation_interface_version": OBS_INTERFACE_VERSION,
+        "state": {
+            "shape": [state_dimension],
+            "dtype": "float32",
+            "uav_block": {
+                "start": uav_start,
+                "stop_exclusive": uav_stop,
+                "num_uav": num_uav,
+                "features_per_uav": local_dimension,
+                "layout_source": (
+                    "saved source_checkpoint_contract.movement_state_feature_schema"
+                ),
+            },
+        },
+        "movement_mask": {
+            "shape": [num_uav],
+            "dtype": "bool",
+            "semantics": (
+                "true exactly where centralized movement control owns the UAV"
+            ),
+        },
+    }
+
+
 def _state_schema_lines(fixed_metadata: dict[str, Any]) -> list[str]:
     checkpoint = fixed_metadata["compatibility_contract"]["source_checkpoint_contract"]
     schema = checkpoint.get("movement_state_feature_schema") or {}

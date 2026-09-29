@@ -49,6 +49,7 @@ from llm_design_contract import (
     candidate_schema,
     format_schema_and_example,
     render_prompt,
+    runtime_diagnostic_contract,
 )
 from replay_auxiliary import empty_snapshot, replay_auxiliary_metadata
 from scenario_manifest import generate_manifest
@@ -1991,6 +1992,274 @@ def test_distinct_runtime_roots_are_visible_in_revision_prompt(tmp_path):
     assert "IndexError" in prompt
     assert "ZeroDivisionError" in prompt
     assert "candidate_line" in prompt
+
+
+def _uav_slice_runtime_candidate(name="uav-slice-runtime"):
+    candidate = _candidate(
+        name=name,
+        code=(
+            "def compute_extra_state(obs, constants):\n"
+            '    state = obs["state"]\n'
+            '    movement_mask = obs["movement_mask"]\n'
+            "    uav_energy = state[7::17]\n"
+            "    uav_queue_load = state[8::17]\n"
+            "    average_uav_energy = np.clip(\n"
+            "        np.mean(uav_energy[movement_mask]), 0.0, 1.0\n"
+            "    )\n"
+            "    return np.asarray([average_uav_energy], dtype=np.float32)\n"
+        ),
+    )
+    candidate["features"][0]["source_fields"] = ["obs.state", "obs.movement_mask"]
+    candidate["features"][0]["formula"] = (
+        "mean clipped UAV energy over the current movement mask"
+    )
+    return candidate
+
+
+def test_runtime_feedback_includes_source_shapes_and_authoritative_uav_layout(
+    design_fixture,
+):
+    _, arrays, metadata, _, constants = design_fixture
+    contract = runtime_diagnostic_contract(metadata, constants)
+    with pytest.raises(CandidateExecutionError) as captured:
+        execute_candidate_isolated(
+            _uav_slice_runtime_candidate(),
+            build_obs_arrays(arrays),
+            constants,
+            timeout=10,
+            diagnostic_contract=contract,
+        )
+    issue = next(
+        item
+        for item in captured.value.report["errors"]
+        if item.get("exception_type") == "IndexError"
+    )
+    diagnostic = issue["runtime_diagnostics"]
+    assert issue["candidate_line"] == 7
+    assert diagnostic["local_array_summaries"]["uav_energy"] == {
+        "type": "ndarray",
+        "shape": [31],
+        "dtype": "float32",
+    }
+    assert diagnostic["local_array_summaries"]["movement_mask"]["shape"] == [16]
+    assert diagnostic["related_interface"]["obs.state"]["uav_block"] == {
+        "start": 0,
+        "stop_exclusive": 272,
+        "num_uav": 16,
+        "features_per_uav": 17,
+        "layout_source": "saved source_checkpoint_contract.movement_state_feature_schema",
+    }
+    excerpt = diagnostic["candidate_source_excerpt"]
+    assert {item["line"] for item in excerpt} >= {4, 7}
+    assert any("state[7::17]" in item["code"] for item in excerpt)
+    assert "half-open UAV block [0:272)" in issue["requirement"]
+    assert "length-16 movement_mask" in issue["requirement"]
+
+
+def test_unrelated_index_error_does_not_get_uav_slice_advice(design_fixture):
+    _, arrays, metadata, _, constants = design_fixture
+    unrelated = _candidate(
+        name="unrelated-index",
+        code=(
+            "def compute_extra_state(obs, constants):\n"
+            '    value = obs["state"][9999]\n'
+            "    return np.asarray([value * value], dtype=np.float32)\n"
+        ),
+    )
+    with pytest.raises(CandidateExecutionError) as captured:
+        execute_candidate_isolated(
+            unrelated,
+            build_obs_arrays(arrays),
+            constants,
+            timeout=10,
+            diagnostic_contract=runtime_diagnostic_contract(metadata, constants),
+        )
+    issue = captured.value.report["errors"][0]
+    assert issue["exception_type"] == "IndexError"
+    assert "half-open UAV block" not in issue["requirement"]
+    assert "targeted_requirement" not in issue["runtime_diagnostics"]
+
+
+@pytest.mark.parametrize(
+    "provider,model",
+    [
+        ("lmstudio", "qwen/qwen3.5-9b"),
+        ("lmstudio", "google/gemma-4-e4b"),
+        ("openai", "gpt-4o"),
+    ],
+)
+def test_parse_failure_carries_prior_runtime_issue_into_actual_next_request(
+    tmp_path, provider, model
+):
+    fixed = _fixed_artifact(tmp_path)
+    faulty = _uav_slice_runtime_candidate()
+    raw_claim = "I fixed the indexing issue.\n" + json.dumps(faulty)
+    responses = [
+        _response(faulty, model=model),
+        {**_response(faulty, model=model), "content": raw_claim},
+        _response(faulty, model=model),
+    ]
+    client = MockClient(responses, model=model)
+    result = run_design(
+        fixed_sample=fixed,
+        provider=provider,
+        model=model,
+        client=client,
+        max_attempts=3,
+        output_dir=tmp_path / f"history-{provider}-{model.split('/')[-1]}",
+        worker_timeout=10,
+    )
+    assert result["status"] == "failed_no_approved_candidate"
+    assert len(client.calls) == 3
+    third_prompt = client.calls[2]["prompt"]
+    assert raw_claim in third_prompt
+    assert "JSON_PARSE_ERROR" in third_prompt
+    assert "previously_found_not_revalidated" in third_prompt
+    assert "IndexError" in third_prompt
+    assert "state[7::17]" in third_prompt
+    assert "half-open UAV block [0:272)" in third_prompt
+    incoming = json.loads(
+        (
+            tmp_path
+            / f"history-{provider}-{model.split('/')[-1]}"
+            / "attempt_03"
+            / "prompt_feedback.json"
+        ).read_text()
+    )
+    assert incoming["feedback"]["confirmed_errors"][0]["code"] == "JSON_PARSE_ERROR"
+    assert incoming["feedback"]["historical_unverified_errors"][0][
+        "source_attempt"
+    ] == 1
+    duplicate_report = json.loads(
+        (
+            tmp_path
+            / f"history-{provider}-{model.split('/')[-1]}"
+            / "attempt_03"
+            / "validation_report.json"
+        ).read_text()
+    )
+    assert [item["code"] for item in duplicate_report["errors"]][:2] == [
+        "DUPLICATE_FAILED_CANDIDATE",
+        "RUNTIME_FUNCTION_ERROR",
+    ]
+    assert "half-open UAV block" in duplicate_report["errors"][1]["requirement"]
+
+
+def test_runtime_issue_resolves_only_after_execution_passes_and_history_remains(tmp_path):
+    fixed = _fixed_artifact(tmp_path)
+    faulty = _uav_slice_runtime_candidate()
+    raw_claim = "Fixed.\n" + json.dumps(faulty)
+    client = MockClient(
+        [
+            _response(faulty),
+            {**_response(faulty), "content": raw_claim},
+            _response(_candidate(name="runtime-fixed")),
+        ]
+    )
+    result = run_design(
+        fixed_sample=fixed,
+        model=client.model,
+        client=client,
+        max_attempts=3,
+        output_dir=tmp_path / "runtime-resolved",
+        worker_timeout=10,
+    )
+    assert result["status"] == "approved"
+    tracker = json.loads((tmp_path / "runtime-resolved" / "issue_tracker.json").read_text())
+    runtime = next(
+        item for item in tracker["records"] if item["stage"] == "execution"
+    )
+    assert runtime["status"] == "resolved"
+    assert runtime["resolved_attempt"] == 3
+    assert runtime["resolution_evidence"]["passed_checks"] == [
+        "execution",
+        "json",
+        "schema",
+        "static",
+    ]
+    assert any(
+        item["status"] == "previously_found_not_revalidated"
+        for item in runtime["history"]
+    )
+
+
+def test_compact_feedback_keeps_current_and_historical_issue_provenance():
+    feedback = {
+        "category": "candidate_json_failure",
+        "confirmed_errors": [
+            {
+                "code": "JSON_PARSE_ERROR",
+                "stage": "json",
+                "location": "line 1, column 1",
+                "problem": "explanatory text outside JSON",
+                "requirement": "Return only the complete JSON object.",
+            }
+        ],
+        "confirmed_error_count": 1,
+        "historical_unverified_errors": [
+            {
+                "code": "RUNTIME_FUNCTION_ERROR",
+                "stage": "execution",
+                "location": "compute_extra_state at candidate line 7",
+                "exception_type": "IndexError",
+                "candidate_function": "compute_extra_state",
+                "candidate_line": 7,
+                "problem_signature": "boolean index dimension mismatch",
+                "problem": "boolean index length mismatch",
+                "requirement": "Limit the state slice to the UAV block.",
+                "issue_status": "previously_found_not_revalidated",
+                "source_attempt": 1,
+                "source_candidate": {"semantic_fingerprint": "abc"},
+                "source_location": "compute_extra_state at candidate line 7",
+                "status_note": "The execution check did not run in attempt 2.",
+            }
+        ],
+        "historical_unverified_error_count": 1,
+    }
+    variants = dict(llm_design._feedback_prompt_variants(feedback))
+    smallest = variants["compact_all_roots"]
+    assert [item["code"] for item in smallest["confirmed_errors"]] == [
+        "JSON_PARSE_ERROR"
+    ]
+    historical = smallest["historical_unverified_errors"]
+    assert len(historical) == 1
+    assert historical[0]["issue_status"] == "previously_found_not_revalidated"
+    assert historical[0]["source_attempt"] == 1
+    summary = smallest["prompt_feedback_summary"]
+    assert summary["historical_unverified_original_count"] == 1
+    assert summary["historical_unverified_included_count"] == 1
+
+
+def test_earlier_new_runtime_failure_does_not_resolve_old_runtime_issue(tmp_path):
+    fixed = _fixed_artifact(tmp_path)
+    earlier = _candidate(
+        name="earlier-runtime-error",
+        code=(
+            "def compute_extra_state(obs, constants):\n"
+            '    output = obs["state"][9999]\n'
+            "    return np.asarray([output * output], dtype=np.float32)\n"
+        ),
+    )
+    client = MockClient(
+        [
+            _response(_uav_slice_runtime_candidate()),
+            _response(earlier),
+            _response(_candidate(name="fixed-after-two-runtime-errors")),
+        ]
+    )
+    result = run_design(
+        fixed_sample=fixed,
+        model=client.model,
+        client=client,
+        max_attempts=3,
+        output_dir=tmp_path / "earlier-runtime",
+        worker_timeout=10,
+    )
+    assert result["status"] == "approved"
+    third_prompt = client.calls[2]["prompt"]
+    assert "index 9999 is out of bounds" in third_prompt
+    assert "previously_found_not_revalidated" in third_prompt
+    assert "state[7::17]" in third_prompt
 
 
 @pytest.mark.parametrize(

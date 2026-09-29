@@ -40,6 +40,7 @@ from llm_design_contract import (
     estimate_token_budget,
     load_design_inputs,
     render_prompt,
+    runtime_diagnostic_contract,
 )
 from llm_streaming import (
     StreamTransportError,
@@ -988,7 +989,9 @@ def _round_request(
     return (
         f"Revision round {attempt} of {max_attempts}. Return a complete replacement JSON object, not a patch.\n\n"
         + previous
-        + "\n\nLatest validation/evaluation feedback for that same output:\n"
+        + "\n\nLatest validation/evaluation feedback for that same output, followed "
+        "by any separately marked prior issues that were not revalidated in this "
+        "attempt:\n"
         + json.dumps(feedback, indent=2, ensure_ascii=False, allow_nan=False)
     )
 
@@ -1109,8 +1112,13 @@ def _json_failure_report(exc: CandidateError) -> dict[str, Any]:
     }
 
 
-def _feedback_from_validation(report: dict[str, Any], category: str) -> dict[str, Any]:
+def _feedback_from_validation(
+    report: dict[str, Any],
+    category: str,
+    historical_unverified: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
     errors = list(report.get("errors") or [])
+    historical = list(historical_unverified or [])
     compact_checks = {
         name: {
             key: value
@@ -1125,12 +1133,183 @@ def _feedback_from_validation(report: dict[str, Any], category: str) -> dict[str
         "status": report.get("status", "failed"),
         "confirmed_errors": errors,
         "confirmed_error_count": len(errors),
+        "historical_unverified_errors": historical,
+        "historical_unverified_error_count": len(historical),
         "checks": compact_checks,
         "instruction": (
-            "Correct every confirmed error above and return one complete replacement "
-            "candidate JSON object using the unchanged interface and evaluation rules."
+            "Correct every confirmed error above, and also address each prior issue marked "
+            "previously_found_not_revalidated. Return one complete replacement candidate "
+            "JSON object using the unchanged interface and evaluation rules."
         ),
     }
+
+
+def _tracked_issue_key(issue: dict[str, Any]) -> tuple[str, ...]:
+    """Cross-attempt identity; deliberately ignores stale candidate line numbers."""
+
+    if str(issue.get("stage", "")) == "execution":
+        return (
+            str(issue.get("code", "UNKNOWN")),
+            str(issue.get("exception_type", "")),
+            str(issue.get("candidate_function", "")),
+            str(issue.get("problem_signature", issue.get("problem", ""))),
+        )
+    return _feedback_root_key(issue)
+
+
+def _issue_stage(issue: dict[str, Any]) -> str:
+    stage = str(issue.get("stage", ""))
+    return {
+        "json": "json",
+        "schema": "schema",
+        "static": "static",
+        "execution": "execution",
+        "evaluation": "evaluation",
+    }.get(stage, stage or "unknown")
+
+
+class _IssueTracker:
+    """Track validation evidence without treating an unrun check as a fix."""
+
+    def __init__(self):
+        self._records: dict[tuple[str, ...], dict[str, Any]] = {}
+
+    @staticmethod
+    def _identity(candidate_identity: dict[str, Any] | None) -> dict[str, Any]:
+        return dict(candidate_identity or {"kind": "unparsed_response"})
+
+    def apply(
+        self,
+        report: dict[str, Any],
+        *,
+        attempt: int,
+        candidate_identity: dict[str, Any] | None,
+    ) -> list[dict[str, Any]]:
+        checks = report.get("checks") or {}
+        passed_stages = {
+            str(name)
+            for name, check in checks.items()
+            if isinstance(check, dict) and check.get("status") == "passed"
+        }
+        evidence = {
+            "attempt": int(attempt),
+            "candidate": self._identity(candidate_identity),
+            "passed_checks": sorted(passed_stages),
+        }
+        for record in self._records.values():
+            if record["status"] == "resolved":
+                continue
+            if record["stage"] in passed_stages:
+                record["status"] = "resolved"
+                record["resolved_attempt"] = int(attempt)
+                record["resolution_evidence"] = {
+                    **evidence,
+                    "reason": (
+                        f"the {record['stage']} check completed successfully over its "
+                        "configured validation scope"
+                    ),
+                }
+                record["history"].append(
+                    {
+                        "attempt": int(attempt),
+                        "status": "resolved",
+                        "evidence": record["resolution_evidence"],
+                    }
+                )
+
+        current_keys = set()
+        for raw_issue in report.get("errors") or []:
+            if not isinstance(raw_issue, dict):
+                continue
+            issue = dict(raw_issue)
+            if issue.get("carried_from_attempt") is not None:
+                continue
+            if issue.get("code") == "DUPLICATE_FAILED_CANDIDATE":
+                continue
+            key = _tracked_issue_key(issue)
+            current_keys.add(key)
+            issue_id = hashlib.sha256(
+                json.dumps(key, ensure_ascii=False, separators=(",", ":")).encode(
+                    "utf-8"
+                )
+            ).hexdigest()[:16]
+            if key not in self._records:
+                self._records[key] = {
+                    "issue_id": issue_id,
+                    "stage": _issue_stage(issue),
+                    "status": "confirmed_current",
+                    "first_detected_attempt": int(attempt),
+                    "latest_confirmed_attempt": int(attempt),
+                    "source_candidate": self._identity(candidate_identity),
+                    "source_location": issue.get("location"),
+                    "issue": issue,
+                    "history": [],
+                }
+            record = self._records[key]
+            record.update(
+                {
+                    "status": "confirmed_current",
+                    "latest_confirmed_attempt": int(attempt),
+                    "latest_candidate": self._identity(candidate_identity),
+                    "latest_location": issue.get("location"),
+                    "issue": issue,
+                }
+            )
+            record["history"].append(
+                {
+                    "attempt": int(attempt),
+                    "status": "confirmed_current",
+                    "candidate": self._identity(candidate_identity),
+                    "location": issue.get("location"),
+                }
+            )
+
+        carried = []
+        for key, record in self._records.items():
+            if key in current_keys or record["status"] == "resolved":
+                continue
+            record["status"] = "previously_found_not_revalidated"
+            carry = dict(record["issue"])
+            carry.update(
+                {
+                    "issue_status": "previously_found_not_revalidated",
+                    "tracked_issue_id": record["issue_id"],
+                    "source_attempt": int(record["latest_confirmed_attempt"]),
+                    "source_candidate": record.get(
+                        "latest_candidate", record["source_candidate"]
+                    ),
+                    "source_location": record.get(
+                        "latest_location", record.get("source_location")
+                    ),
+                    "status_note": (
+                        "Previously confirmed, but this attempt did not complete the "
+                        f"{record['stage']} check successfully. The saved source location "
+                        "belongs to the earlier candidate and is not asserted as a line in "
+                        "the latest raw response."
+                    ),
+                }
+            )
+            carried.append(carry)
+            record["history"].append(
+                {
+                    "attempt": int(attempt),
+                    "status": "previously_found_not_revalidated",
+                    "evidence": evidence,
+                }
+            )
+        return carried
+
+    def snapshot(self) -> dict[str, Any]:
+        records = sorted(
+            (dict(value) for value in self._records.values()),
+            key=lambda item: (int(item["first_detected_attempt"]), item["issue_id"]),
+        )
+        return {
+            "schema_version": "uav-hrl-llm-issue-tracker-v1",
+            "records": records,
+            "pending_count": sum(item["status"] != "resolved" for item in records),
+            "resolved_count": sum(item["status"] == "resolved" for item in records),
+        }
 
 
 def _generated_feedback(
@@ -1198,6 +1377,14 @@ def _compact_feedback_issue(issue: dict[str, Any]) -> dict[str, Any]:
         "feature_mapping",
         "matched_attempt",
         "carried_from_attempt",
+        "issue_status",
+        "tracked_issue_id",
+        "source_attempt",
+        "source_candidate",
+        "source_location",
+        "status_note",
+        "problem_signature",
+        "runtime_diagnostics",
         "representative_locations",
     )
     result = {
@@ -1222,10 +1409,16 @@ def _actionable_feedback_issues(feedback: dict[str, Any]) -> list[dict[str, Any]
     """Return flat, independently actionable issues for duplicate revisions."""
 
     confirmed = feedback.get("confirmed_errors")
-    if isinstance(confirmed, list) and confirmed:
+    historical = feedback.get("historical_unverified_errors")
+    combined = []
+    if isinstance(confirmed, list):
+        combined.extend(confirmed)
+    if isinstance(historical, list):
+        combined.extend(historical)
+    if combined:
         actionable = [
             dict(issue)
-            for issue in confirmed
+            for issue in combined
             if isinstance(issue, dict)
             and issue.get("code") != "DUPLICATE_FAILED_CANDIDATE"
         ]
@@ -1327,6 +1520,16 @@ def _select_feedback_representatives(
     if has_duplicate and has_actionable:
         # A duplicate warning without an original fix is not actionable.
         maximum = max(2, maximum)
+    feedback_groups = {
+        str(issue.get("_feedback_group"))
+        for issue in unique
+        if issue.get("_feedback_group") is not None
+    }
+    if len(feedback_groups) > 1:
+        # A current format error without at least one pending historical root
+        # recreates the loss of actionable runtime feedback this summary exists
+        # to prevent.
+        maximum = max(len(feedback_groups), maximum)
     chosen: list[dict[str, Any]] = []
     deferred: list[dict[str, Any]] = []
     seen_codes: set[str] = set()
@@ -1351,10 +1554,22 @@ def _feedback_prompt_variants(
 
     if not isinstance(feedback, dict):
         return [("full", feedback)]
-    errors = feedback.get("confirmed_errors")
-    if not isinstance(errors, list) or not errors:
+    current_errors = feedback.get("confirmed_errors")
+    historical_errors = feedback.get("historical_unverified_errors")
+    current_errors = current_errors if isinstance(current_errors, list) else []
+    historical_errors = historical_errors if isinstance(historical_errors, list) else []
+    if not current_errors and not historical_errors:
         return [("full", feedback)]
     variants: list[tuple[str, dict[str, Any]]] = [("full", feedback)]
+    errors = [
+        {**dict(issue), "_feedback_group": "confirmed_current"}
+        for issue in current_errors
+        if isinstance(issue, dict)
+    ] + [
+        {**dict(issue), "_feedback_group": "historical_unverified"}
+        for issue in historical_errors
+        if isinstance(issue, dict)
+    ]
     merged_roots = _merge_feedback_roots(errors)
     original_count = len(merged_roots)
     original_occurrence_count = sum(
@@ -1365,18 +1580,38 @@ def _feedback_prompt_variants(
         compact = {
             key: value
             for key, value in feedback.items()
-            if key not in {"confirmed_errors", "confirmed_error_count"}
+            if key
+            not in {
+                "confirmed_errors",
+                "confirmed_error_count",
+                "historical_unverified_errors",
+                "historical_unverified_error_count",
+            }
         }
-        compact["confirmed_errors"] = [
-            _compact_feedback_issue(issue) for issue in selected
-        ]
-        compact["confirmed_error_count"] = original_count
+        selected_current = []
+        selected_historical = []
+        for issue in selected:
+            destination = (
+                selected_historical
+                if issue.get("_feedback_group") == "historical_unverified"
+                else selected_current
+            )
+            clean = {key: value for key, value in issue.items() if key != "_feedback_group"}
+            destination.append(_compact_feedback_issue(clean))
+        compact["confirmed_errors"] = selected_current
+        compact["confirmed_error_count"] = len(current_errors)
+        compact["historical_unverified_errors"] = selected_historical
+        compact["historical_unverified_error_count"] = len(historical_errors)
         compact["prompt_feedback_summary"] = {
             "summary_applied": True,
             "original_error_count": original_count,
             "included_error_count": len(selected),
             "omitted_error_count": omitted,
             "original_error_occurrence_count": original_occurrence_count,
+            "confirmed_current_original_count": len(current_errors),
+            "confirmed_current_included_count": len(selected_current),
+            "historical_unverified_original_count": len(historical_errors),
+            "historical_unverified_included_count": len(selected_historical),
             "selection_rule": (
                 "stable first root per error code, then additional distinct roots; "
                 "long prose and repeated sample cases are shortened"
@@ -1615,6 +1850,9 @@ def run_design(
     ]:
         raise ValueError("recomputed primary pair hash differs from fixed artifact")
     obs_arrays = build_obs_arrays(arrays)
+    worker_diagnostic_contract = runtime_diagnostic_contract(
+        fixed_metadata, constants_metadata
+    )
     previous_attempt = None
     feedback = None
     history = []
@@ -1623,6 +1861,44 @@ def run_design(
     adapter_fallbacks = []
     seed_sent_values = []
     failed_candidates: dict[str, dict[str, Any]] = {}
+    issue_tracker = _IssueTracker()
+
+    def tracked_validation_feedback(
+        report: dict[str, Any],
+        category: str,
+        *,
+        attempt_number: int,
+        candidate_identity: dict[str, Any] | None,
+        directory: Path,
+    ) -> dict[str, Any]:
+        historical_unverified = issue_tracker.apply(
+            report,
+            attempt=attempt_number,
+            candidate_identity=candidate_identity,
+        )
+        report_root_keys = {
+            _tracked_issue_key(issue)
+            for issue in report.get("errors") or []
+            if isinstance(issue, dict)
+        }
+        historical_unverified = [
+            issue
+            for issue in historical_unverified
+            if _tracked_issue_key(issue) not in report_root_keys
+        ]
+        snapshot = issue_tracker.snapshot()
+        _write_json(directory / "issue_tracker.json", snapshot)
+        _write_json(output / "issue_tracker.json", snapshot)
+        return _generated_feedback(
+            _feedback_from_validation(
+                report,
+                category,
+                historical_unverified=historical_unverified,
+            ),
+            attempt=attempt_number,
+            max_attempts=max_attempts,
+        )
+
     for attempt in range(1, int(max_attempts) + 1):
         round_directory = output / f"attempt_{attempt:02d}"
         round_directory.mkdir()
@@ -1652,7 +1928,6 @@ def run_design(
         feedback_variants = (
             _feedback_prompt_variants(previous_attempt.get("feedback"))
             if previous_attempt is not None
-            and previous_attempt.get("parsed_candidate") is not None
             else [
                 (
                     "full",
@@ -1842,12 +2117,18 @@ def run_design(
                 _write_json(
                     round_directory / "validation_report.json", validation_report
                 )
-                feedback = _generated_feedback(
-                    _feedback_from_validation(
-                        validation_report, "candidate_json_failure"
-                    ),
-                    attempt=attempt,
-                    max_attempts=max_attempts,
+                raw_identity = {
+                    "kind": "unparsed_response",
+                    "raw_final_content_sha256": hashlib.sha256(
+                        str(content).encode("utf-8")
+                    ).hexdigest(),
+                }
+                feedback = tracked_validation_feedback(
+                    validation_report,
+                    "candidate_json_failure",
+                    attempt_number=attempt,
+                    candidate_identity=raw_identity,
+                    directory=round_directory,
                 )
                 attempt_output["feedback"] = feedback
                 previous_attempt = attempt_output
@@ -1858,10 +2139,42 @@ def run_design(
             attempt_output["parsed_candidate"] = candidate
             _write_json(round_directory / "candidate.json", candidate)
             current_candidate_fingerprint = candidate_semantic_fingerprint(candidate)
+            candidate_identity = {
+                "kind": "parsed_candidate",
+                "semantic_fingerprint": current_candidate_fingerprint,
+                "candidate_name": candidate.get("candidate_name"),
+            }
+            # Parsing success is independent evidence that an earlier JSON-envelope
+            # problem is fixed, even if duplicate detection stops later checks.
+            issue_tracker.apply(
+                {
+                    "errors": [],
+                    "checks": {"json": {"status": "passed", "completed": True}},
+                },
+                attempt=attempt,
+                candidate_identity=candidate_identity,
+            )
             prior_failure = failed_candidates.get(current_candidate_fingerprint)
             if prior_failure is not None:
                 unresolved = [
-                    {**dict(issue), "carried_from_attempt": int(prior_failure["attempt"])}
+                    {
+                        **dict(issue),
+                        "carried_from_attempt": int(prior_failure["attempt"]),
+                        "issue_status": "previously_found_not_revalidated",
+                        "source_attempt": int(prior_failure["attempt"]),
+                        "source_candidate": prior_failure.get(
+                            "candidate_identity",
+                            {
+                                "kind": "parsed_candidate",
+                                "semantic_fingerprint": current_candidate_fingerprint,
+                            },
+                        ),
+                        "status_note": (
+                            "The duplicate check reused this earlier actionable issue; "
+                            "the current candidate was not re-executed, so the saved line "
+                            "belongs to the earlier candidate."
+                        ),
+                    }
                     for issue in prior_failure["unresolved_issues"]
                 ]
                 duplicate_report = {
@@ -1893,12 +2206,12 @@ def run_design(
                     },
                 }
                 _write_json(round_directory / "validation_report.json", duplicate_report)
-                feedback = _generated_feedback(
-                    _feedback_from_validation(
-                        duplicate_report, "duplicate_failed_candidate"
-                    ),
-                    attempt=attempt,
-                    max_attempts=max_attempts,
+                feedback = tracked_validation_feedback(
+                    duplicate_report,
+                    "duplicate_failed_candidate",
+                    attempt_number=attempt,
+                    candidate_identity=candidate_identity,
+                    directory=round_directory,
                 )
                 attempt_output["feedback"] = feedback
                 previous_attempt = attempt_output
@@ -1913,17 +2226,18 @@ def run_design(
                 )
             if not staged["can_execute"]:
                 _write_json(round_directory / "validation_report.json", staged)
-                feedback = _generated_feedback(
-                    _feedback_from_validation(
-                        staged, "candidate_schema_or_static_failure"
-                    ),
-                    attempt=attempt,
-                    max_attempts=max_attempts,
+                feedback = tracked_validation_feedback(
+                    staged,
+                    "candidate_schema_or_static_failure",
+                    attempt_number=attempt,
+                    candidate_identity=candidate_identity,
+                    directory=round_directory,
                 )
                 attempt_output["feedback"] = feedback
                 previous_attempt = attempt_output
                 failed_candidates[current_candidate_fingerprint] = {
                     "attempt": attempt,
+                    "candidate_identity": candidate_identity,
                     "feedback": feedback,
                     "unresolved_issues": _actionable_feedback_issues(feedback),
                 }
@@ -1939,6 +2253,7 @@ def run_design(
                 obs_arrays,
                 constants_metadata,
                 timeout=worker_timeout,
+                diagnostic_contract=worker_diagnostic_contract,
             )
             validation_report = {
                 "status": "passed",
@@ -1952,6 +2267,14 @@ def run_design(
                 "numeric_tolerance": 1e-6,
             }
             _write_json(round_directory / "validation_report.json", validation_report)
+            issue_tracker.apply(
+                validation_report,
+                attempt=attempt,
+                candidate_identity=candidate_identity,
+            )
+            tracker_snapshot = issue_tracker.snapshot()
+            _write_json(round_directory / "issue_tracker.json", tracker_snapshot)
+            _write_json(output / "issue_tracker.json", tracker_snapshot)
             evaluation = evaluate_candidate(
                 context,
                 candidate,
@@ -2015,6 +2338,7 @@ def run_design(
             previous_attempt = attempt_output
             failed_candidates[current_candidate_fingerprint] = {
                 "attempt": attempt,
+                "candidate_identity": candidate_identity,
                 "feedback": feedback,
                 "unresolved_issues": _actionable_feedback_issues(feedback),
             }
@@ -2061,18 +2385,30 @@ def run_design(
             _write_json(
                 round_directory / "validation_report.json", execution_report
             )
-            feedback = _generated_feedback(
-                _feedback_from_validation(
-                    execution_report, "candidate_execution_failure"
-                ),
-                attempt=attempt,
-                max_attempts=max_attempts,
+            candidate_identity = (
+                {
+                    "kind": "parsed_candidate",
+                    "semantic_fingerprint": current_candidate_fingerprint,
+                    "candidate_name": (
+                        attempt_output.get("parsed_candidate") or {}
+                    ).get("candidate_name"),
+                }
+                if current_candidate_fingerprint is not None
+                else {"kind": "candidate_execution_without_fingerprint"}
+            )
+            feedback = tracked_validation_feedback(
+                execution_report,
+                "candidate_execution_failure",
+                attempt_number=attempt,
+                candidate_identity=candidate_identity,
+                directory=round_directory,
             )
             attempt_output["feedback"] = feedback
             previous_attempt = attempt_output
             if current_candidate_fingerprint is not None:
                 failed_candidates[current_candidate_fingerprint] = {
                     "attempt": attempt,
+                    "candidate_identity": candidate_identity,
                     "feedback": feedback,
                     "unresolved_issues": _actionable_feedback_issues(feedback),
                 }
@@ -2089,6 +2425,7 @@ def run_design(
             if current_candidate_fingerprint is not None:
                 failed_candidates[current_candidate_fingerprint] = {
                     "attempt": attempt,
+                    "candidate_identity": candidate_identity,
                     "feedback": feedback,
                     "unresolved_issues": _actionable_feedback_issues(feedback),
                 }

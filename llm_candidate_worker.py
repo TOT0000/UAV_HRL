@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import ast
 import json
 from pathlib import Path
 import re
@@ -125,6 +126,7 @@ class _IssueAccumulator:
         candidate_function=None,
         candidate_line=None,
         problem_signature=None,
+        diagnostics=None,
     ):
         key = (
             str(code),
@@ -142,6 +144,10 @@ class _IssueAccumulator:
             details["candidate_function"] = str(candidate_function)
         if candidate_line is not None:
             details["candidate_line"] = int(candidate_line)
+        if problem_signature is not None:
+            details["problem_signature"] = str(problem_signature)
+        if diagnostics:
+            details["runtime_diagnostics"] = diagnostics
         item = self._items.setdefault(
             key,
             {
@@ -181,16 +187,21 @@ def _runtime_error_code(message):
 
 def _candidate_exception_details(exc):
     candidate_frame = None
-    for frame in traceback.extract_tb(exc.__traceback__):
-        if frame.filename == "<approved-candidate>":
-            candidate_frame = frame
+    candidate_summary = None
+    current = exc.__traceback__
+    while current is not None:
+        code = current.tb_frame.f_code
+        if code.co_filename == "<approved-candidate>":
+            candidate_frame = current.tb_frame
+            candidate_summary = traceback.extract_tb(current, limit=1)[0]
+        current = current.tb_next
     exception_type = type(exc).__name__
     if candidate_frame is None:
         function = None
         line = None
     else:
-        function = candidate_frame.name
-        line = int(candidate_frame.lineno)
+        function = candidate_frame.f_code.co_name
+        line = int(candidate_summary.lineno)
     # Numeric values and object addresses frequently differ by sample without
     # changing the faulty operation.  Field names and operation text remain,
     # so distinct accesses on the same source line can still stay separate.
@@ -200,15 +211,200 @@ def _candidate_exception_details(exc):
         "<number>",
         signature,
     )
-    return exception_type, function, line, signature
+    return exception_type, function, line, signature, candidate_frame
 
 
-def _check_function(function, obs, constants, expected_size, label, sample, issues):
+def _candidate_source_excerpt(source, line, radius=4):
+    if not isinstance(source, str) or not isinstance(line, int):
+        return []
+    lines = source.splitlines()
+    start = max(1, line - int(radius))
+    stop = min(len(lines), line + int(radius))
+    return [
+        {"line": number, "code": lines[number - 1]}
+        for number in range(start, stop + 1)
+    ]
+
+
+def _safe_local_array_summaries(frame):
+    if frame is None:
+        return {}
+    summaries = {}
+    for name, value in frame.f_locals.items():
+        if isinstance(value, np.ndarray):
+            summaries[str(name)] = {
+                "type": "ndarray",
+                "shape": [int(item) for item in value.shape],
+                "dtype": str(value.dtype),
+            }
+        elif isinstance(value, np.generic):
+            summaries[str(name)] = {
+                "type": "numpy_scalar",
+                "dtype": str(value.dtype),
+            }
+    return summaries
+
+
+def _state_aliases_and_open_slices(source):
+    """Return statically evident unbounded slices of obs['state'] aliases."""
+
+    try:
+        tree = ast.parse(source)
+    except (SyntaxError, TypeError):
+        return []
+    aliases = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Assign) or len(node.targets) != 1:
+            continue
+        target = node.targets[0]
+        value = node.value
+        if (
+            isinstance(target, ast.Name)
+            and isinstance(value, ast.Subscript)
+            and isinstance(value.value, ast.Name)
+            and value.value.id == "obs"
+            and isinstance(value.slice, ast.Constant)
+            and value.slice.value == "state"
+        ):
+            aliases.add(target.id)
+    results = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Subscript) or not isinstance(node.slice, ast.Slice):
+            continue
+        base_is_state = isinstance(node.value, ast.Name) and node.value.id in aliases
+        direct_state = (
+            isinstance(node.value, ast.Subscript)
+            and isinstance(node.value.value, ast.Name)
+            and node.value.value.id == "obs"
+            and isinstance(node.value.slice, ast.Constant)
+            and node.value.slice.value == "state"
+        )
+        if not (base_is_state or direct_state) or node.slice.upper is not None:
+            continue
+        step = node.slice.step
+        if not isinstance(step, ast.Constant) or not isinstance(step.value, int):
+            continue
+        lower = node.slice.lower
+        results.append(
+            {
+                "line": int(getattr(node, "lineno", 0)),
+                "start": (
+                    int(lower.value)
+                    if isinstance(lower, ast.Constant) and isinstance(lower.value, int)
+                    else None
+                ),
+                "step": int(step.value),
+                "expression": ast.get_source_segment(source, node),
+            }
+        )
+    return results
+
+
+def _runtime_diagnostics(exc, frame, candidate_source, candidate_line, contract):
+    diagnostics = {
+        "candidate_source_excerpt": _candidate_source_excerpt(
+            candidate_source, candidate_line
+        ),
+        "local_array_summaries": _safe_local_array_summaries(frame),
+    }
+    excerpt_text = "\n".join(
+        str(item.get("code", "")) for item in diagnostics["candidate_source_excerpt"]
+    )
+    relevant_interface = {}
+    if "state" in excerpt_text and isinstance(contract, dict) and contract.get("state"):
+        relevant_interface["obs.state"] = contract["state"]
+    if (
+        "movement_mask" in excerpt_text
+        and isinstance(contract, dict)
+        and contract.get("movement_mask")
+    ):
+        relevant_interface["obs.movement_mask"] = contract["movement_mask"]
+    if relevant_interface:
+        diagnostics["related_interface"] = relevant_interface
+
+    message = str(exc)
+    state_contract = contract.get("state", {}) if isinstance(contract, dict) else {}
+    block = state_contract.get("uav_block", {}) if isinstance(state_contract, dict) else {}
+    mask_contract = contract.get("movement_mask", {}) if isinstance(contract, dict) else {}
+    expected_mask = (mask_contract.get("shape") or [None])[0]
+    local_dimension = block.get("features_per_uav")
+    array_summaries = diagnostics["local_array_summaries"]
+    bool_lengths = {
+        value["shape"][0]
+        for value in array_summaries.values()
+        if value.get("dtype") == "bool" and len(value.get("shape", [])) == 1
+    }
+    vector_lengths = {
+        value["shape"][0]
+        for value in array_summaries.values()
+        if value.get("dtype") != "bool" and len(value.get("shape", [])) == 1
+    }
+    slices = _state_aliases_and_open_slices(candidate_source)
+    suspect_slices = [
+        item
+        for item in slices
+        if local_dimension is not None and item.get("step") == int(local_dimension)
+    ]
+    confident_uav_slice = (
+        type(exc).__name__ == "IndexError"
+        and "boolean index" in message.lower()
+        and expected_mask in bool_lengths
+        and any(length != expected_mask for length in vector_lengths)
+        and bool(suspect_slices)
+        and all(
+            item.get("start") is None or 0 <= int(item["start"]) < int(local_dimension)
+            for item in suspect_slices
+        )
+    )
+    if confident_uav_slice:
+        start = int(block["start"])
+        stop = int(block["stop_exclusive"])
+        num_uav = int(block["num_uav"])
+        per_uav = int(block["features_per_uav"])
+        observed_vectors = sorted(
+            length
+            for length in vector_lengths
+            if length != state_contract.get("shape", [None])[0]
+        )
+        diagnostics["suspected_state_slices"] = suspect_slices
+        diagnostics["diagnostic_summary"] = (
+            f"The authoritative UAV state block is indices {start}..{stop - 1}: "
+            f"{num_uav} UAV groups with {per_uav} values each. The candidate produced "
+            f"one-dimensional non-boolean local lengths {observed_vectors}, which cannot "
+            f"be indexed by the length-{expected_mask} movement mask."
+        )
+        diagnostics["targeted_requirement"] = (
+            f"Limit each per-UAV state slice to the authoritative half-open UAV block "
+            f"[{start}:{stop}) before applying the length-{expected_mask} movement_mask, "
+            "and update the corresponding feature formula/source description to match."
+        )
+    return diagnostics
+
+
+def _check_function(
+    function,
+    obs,
+    constants,
+    expected_size,
+    label,
+    sample,
+    issues,
+    *,
+    candidate_source,
+    diagnostic_contract,
+):
     try:
         return _run_function(function, obs, constants, expected_size, label)
     except BaseException as exc:
-        exception_type, candidate_function, candidate_line, signature = (
+        exception_type, candidate_function, candidate_line, signature, frame = (
             _candidate_exception_details(exc)
+        )
+        diagnostics = _runtime_diagnostics(
+            exc,
+            frame,
+            candidate_source,
+            candidate_line,
+            diagnostic_contract,
         )
         location = label
         if candidate_function is not None and candidate_line is not None:
@@ -217,13 +413,17 @@ def _check_function(function, obs, constants, expected_size, label, sample, issu
             _runtime_error_code(str(exc)),
             location,
             f"{exception_type}: {exc}",
-            "Return a deterministic, side-effect-free one-dimensional float32 "
-            "array of the declared length with finite values.",
+            diagnostics.get(
+                "targeted_requirement",
+                "Return a deterministic, side-effect-free one-dimensional float32 "
+                "array of the declared length with finite values.",
+            ),
             sample,
             exception_type=exception_type,
             candidate_function=candidate_function,
             candidate_line=candidate_line,
             problem_signature=signature,
+            diagnostics=diagnostics,
         )
         return None
 
@@ -270,10 +470,16 @@ def main(argv=None):
     parser.add_argument("--input", required=True)
     parser.add_argument("--output", required=True)
     parser.add_argument("--report", required=True)
+    parser.add_argument("--diagnostic-contract")
     args = parser.parse_args(argv)
     try:
         candidate = json.loads(Path(args.candidate).read_text(encoding="utf-8"))
         constants = json.loads(Path(args.constants).read_text(encoding="utf-8"))
+        diagnostic_contract = (
+            json.loads(Path(args.diagnostic_contract).read_text(encoding="utf-8"))
+            if args.diagnostic_contract
+            else {}
+        )
         constants_metadata = {
             key: {"value": value, "dtype": "runtime", "unit": None, "meaning": "runtime", "source": "approved contract"}
             for key, value in constants.items()
@@ -304,6 +510,8 @@ def main(argv=None):
                 "compute_extra_state",
                 {"fixed_sample_index": row},
                 issues,
+                candidate_source=candidate["code"],
+                diagnostic_contract=diagnostic_contract,
             )
             _check_ranges(
                 row_extra,
@@ -323,6 +531,8 @@ def main(argv=None):
             "compute_extra_state(empty probe)",
             {"probe": "empty"},
             issues,
+            candidate_source=candidate["code"],
+            diagnostic_contract=diagnostic_contract,
         )
         _check_ranges(
             probe_extra,

@@ -203,10 +203,16 @@ The default root is
 full prompt, request, raw response, finish reason/usage, extracted reasoning,
 candidate/code, validation, evaluation, and feedback. A failed run keeps
 history and `run_metadata.json` but has no `approved/` directory. A revision
-uses only the immediately preceding output: a successfully parsed full
-candidate plus its validation/evaluation feedback, or the failed raw final
-content plus its parse error. Reasoning-only text is stored locally but is not
-replayed as candidate code. Each attempt's `prompt_feedback.json` is explicitly
+always uses the immediately preceding output as its correction target: a
+successfully parsed full candidate, or the failed raw final content plus its
+parse error. It also carries earlier actionable issues whose relevant check
+could not run successfully in the latest attempt. Such issues are marked
+`previously_found_not_revalidated`, retain their source attempt/candidate and
+old location, and leave the pending prompt only after that validation stage
+passes over its configured scope. `issue_tracker.json` preserves pending and
+resolved histories plus the evidence for each status change. Reasoning-only
+text is stored locally but is not replayed as candidate code. Each attempt's
+`prompt_feedback.json` is explicitly
 the incoming feedback used for that request and records its source attempt;
 attempt 1 therefore correctly has `feedback: null`. Feedback generated after
 checking the response is saved separately in that attempt's `feedback.json`
@@ -233,6 +239,18 @@ approved/constants.json
 approved/validation_report.json
 approved/evaluation_report.json
 ```
+
+Runtime exception feedback includes a numbered excerpt from the generated
+candidate, safe summaries of candidate-local NumPy array shapes/dtypes, and
+relevant structural interface metadata when it can be matched reliably. For
+the common unbounded `state[offset::per_uav_width]` error, the worker derives
+the UAV block boundary, UAV count, and block width from the saved authoritative
+movement-state schema; it does not maintain a second hard-coded layout. A
+specific slice correction is emitted only when the exception, local shapes,
+mask shape, and statically visible slice agree. Otherwise the report keeps the
+original exception and source excerpt without guessing a cause. No array
+contents, arbitrary object representations, environment variables, or
+credentials are captured.
 
 `artifact.json` includes content/file hashes, field order, weights, interface
 version, model/sample/pair provenance, and approved status. Later integration

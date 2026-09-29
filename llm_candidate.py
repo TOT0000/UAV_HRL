@@ -1252,6 +1252,7 @@ def execute_candidate_isolated(
     constants_metadata: dict[str, Any],
     *,
     timeout: float,
+    diagnostic_contract: dict[str, Any] | None = None,
 ) -> tuple[np.ndarray, np.ndarray, dict[str, Any]]:
     static = validate_candidate(candidate, constants_metadata)
     with tempfile.TemporaryDirectory(prefix="uav-hrl-candidate-") as raw:
@@ -1261,9 +1262,12 @@ def execute_candidate_isolated(
         input_path = directory / "obs.npz"
         output_path = directory / "outputs.npz"
         report_path = directory / "report.json"
+        diagnostic_path = directory / "diagnostic_contract.json"
         _write_json(candidate_path, candidate)
         _write_json(constants_path, runtime_constants(constants_metadata))
         np.savez_compressed(input_path, **obs_arrays)
+        if diagnostic_contract is not None:
+            _write_json(diagnostic_path, diagnostic_contract)
         command = [
             sys.executable,
             str(Path(__file__).with_name("llm_candidate_worker.py")),
@@ -1278,6 +1282,8 @@ def execute_candidate_isolated(
             "--report",
             str(report_path),
         ]
+        if diagnostic_contract is not None:
+            command.extend(("--diagnostic-contract", str(diagnostic_path)))
         try:
             worker_environment = dict(os.environ)
             for name in ("OPENAI_API_KEY", "LM_STUDIO_API_TOKEN"):
