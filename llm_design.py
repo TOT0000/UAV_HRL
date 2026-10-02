@@ -2584,10 +2584,30 @@ def _validity_aligned_diagnostic(
 
 
 def _unresolved_large_array_diagnostic(
-    entry: dict[str, Any], array: np.ndarray, *, field: str
+    entry: dict[str, Any],
+    array: np.ndarray,
+    *,
+    field: str,
+    validity_field: str | None = None,
+    validity_always: bool = False,
+    validity_alignment_issue: str | None = None,
 ) -> tuple[dict[str, Any], int, int]:
     result = dict(entry)
     is_state = field == "obs.state"
+    if validity_alignment_issue is not None:
+        selection_method = (
+            f"no partial selection because {validity_alignment_issue}; "
+            "no valid coordinates were guessed"
+        )
+    elif validity_always:
+        selection_method = (
+            "the field is valid at every position and has no validity-mask field; "
+            "no partial selection was inferred for this oversized value"
+        )
+    else:
+        selection_method = (
+            "no partial selection; the field has no authoritative validity mask"
+        )
     result["value"] = {
         "representation": (
             "state_dependency_indices_unresolved"
@@ -2602,12 +2622,16 @@ def _unresolved_large_array_diagnostic(
             "no state indices selected because verified per-feature state dependency "
             "indices are unavailable"
             if is_state
-            else "no partial selection; the field has no authoritative validity mask"
+            else selection_method
         ),
         "omitted_element_count": int(array.size),
         "complete_value_in_prompt": False,
         "dependency_indices_known": False if is_state else None,
     }
+    if not is_state:
+        result["value"]["validity_field"] = validity_field
+        result["value"]["validity_is_always"] = bool(validity_always)
+        result["value"]["validity_alignment_issue"] = validity_alignment_issue
     if array.size and np.issubdtype(array.dtype, np.number):
         finite = array.astype(np.float64)
         if np.all(np.isfinite(finite)):
@@ -2618,6 +2642,25 @@ def _unresolved_large_array_diagnostic(
     result.pop("shape", None)
     result.pop("empty_array", None)
     return result, 0, int(array.size)
+
+
+def _diagnostic_validity_contract(field: str) -> tuple[str | None, bool]:
+    """Return the authoritative mask field, or whether validity is unconditional."""
+
+    if not field.startswith("obs."):
+        return None, False
+    name = field[4:]
+    named = NAMED_STATE_FIELD_SPECS.get(name)
+    if named is not None:
+        validity = named.get("validity")
+        if validity == "always":
+            return None, True
+        if isinstance(validity, str) and validity:
+            return f"obs.{validity}", False
+        return None, False
+    snapshot = SNAPSHOT_FIELD_SPECS.get(name)
+    mask = None if snapshot is None else snapshot.get("mask")
+    return (None if not mask else f"obs.{mask}"), False
 
 
 def _compact_diagnostic_inputs(
@@ -2638,31 +2681,45 @@ def _compact_diagnostic_inputs(
         if np.issubdtype(array.dtype, np.bool_):
             result, kept, removed = _lossless_boolean_diagnostic(entry, array)
         else:
-            spec = (
-                SNAPSHOT_FIELD_SPECS.get(field[4:])
-                if field.startswith("obs.")
-                else None
-            )
-            validity_field = (
-                None
-                if spec is None or not spec.get("mask")
-                else f"obs.{spec['mask']}"
-            )
+            validity_field, validity_always = _diagnostic_validity_contract(field)
             aligned = None
-            if validity_field and validity_field in original:
-                validity_entry = original[validity_field]
-                if isinstance(validity_entry, dict) and "value" in validity_entry:
-                    validity = np.asarray(validity_entry["value"], dtype=bool)
-                    aligned = _validity_aligned_diagnostic(
-                        entry, array, validity, validity_field
+            validity_alignment_issue = None
+            if validity_field:
+                validity_entry = original.get(validity_field)
+                if not isinstance(validity_entry, dict) or "value" not in validity_entry:
+                    validity_alignment_issue = (
+                        f"authoritative validity field {validity_field} is missing"
                     )
+                else:
+                    try:
+                        validity = np.asarray(validity_entry["value"], dtype=bool)
+                    except (TypeError, ValueError) as exc:
+                        validity_alignment_issue = (
+                            f"authoritative validity field {validity_field} could not "
+                            f"be read as boolean ({type(exc).__name__})"
+                        )
+                    else:
+                        aligned = _validity_aligned_diagnostic(
+                            entry, array, validity, validity_field
+                        )
+                        if aligned is None:
+                            validity_alignment_issue = (
+                                f"authoritative validity field {validity_field} has shape "
+                                f"{list(validity.shape)}, incompatible with data shape "
+                                f"{list(array.shape)}"
+                            )
             if aligned is not None:
                 result, kept, removed = aligned
             elif int(array.size) <= int(maximum_items):
                 result, kept, removed = entry, int(array.size), 0
             else:
                 result, kept, removed = _unresolved_large_array_diagnostic(
-                    entry, array, field=field
+                    entry,
+                    array,
+                    field=field,
+                    validity_field=validity_field,
+                    validity_always=validity_always,
+                    validity_alignment_issue=validity_alignment_issue,
                 )
         compact[field] = result
         included += kept

@@ -4332,6 +4332,136 @@ def test_relational_compaction_preserves_valid_zero_empty_and_last_uav():
     assert "obs.unavailable_field" not in empty
 
 
+def test_named_state_validity_aligned_compaction_reaches_revision_prompt():
+    com_valid = [False] * 16
+    com_valid[2] = True
+    com_valid[15] = True
+    com_capacity = [0.9] * 16
+    com_capacity[2] = 0.0
+    com_capacity[15] = 0.75
+    vs_valid = [False] * 16
+    vs_valid[14] = True
+    vs_targets = [[-1.0, -1.0] for _ in range(16)]
+    vs_targets[14] = [0.0, 0.625]
+    inputs = {
+        "obs.uav_com_reference_capacity_fraction": {
+            "shape": [16],
+            "dtype": "float32",
+            "value": com_capacity,
+        },
+        "obs.uav_task_com": {
+            "shape": [16],
+            "dtype": "bool",
+            "value": com_valid,
+        },
+        "obs.uav_vs_target_horizontal_normalized": {
+            "shape": [16, 2],
+            "dtype": "float32",
+            "value": vs_targets,
+        },
+        "obs.uav_task_vs": {
+            "shape": [16],
+            "dtype": "bool",
+            "value": vs_valid,
+        },
+    }
+    compact, _, _, _ = llm_design._compact_diagnostic_inputs(inputs, 4)
+    capacity = compact["obs.uav_com_reference_capacity_fraction"]["value"]
+    assert capacity["validity_field"] == "obs.uav_task_com"
+    assert capacity["validity_true_coordinates"] == [[2], [15]]
+    assert capacity["selected_elements"] == [
+        {"coordinate": [2], "value": 0.0},
+        {"coordinate": [15], "value": 0.75},
+    ]
+    target = compact["obs.uav_vs_target_horizontal_normalized"]["value"]
+    assert target["validity_field"] == "obs.uav_task_vs"
+    assert target["validity_shape"] == [16]
+    assert target["selected_elements"] == [
+        {"coordinate": [14, 0], "value": 0.0},
+        {"coordinate": [14, 1], "value": 0.625},
+    ]
+
+    diagnostics = {
+        "samples": {"sample_0": {"current_only_inputs": inputs}},
+        "source_field_contracts": {},
+        "constants": {},
+        "pairs": {"pair_0_1": {"original_state_distance": 1.0}},
+        "by_lambda": {"0": {"maximum_pair_ref": "pair_0_1"}},
+    }
+    feedback = {
+        "category": "candidate_not_improved_for_all_lambdas",
+        "evaluation_diagnostics": diagnostics,
+    }
+    compact_feedback = dict(llm_design._feedback_prompt_variants(feedback))[
+        "evaluation_diagnostics_4_items"
+    ]
+    prompt = llm_design._round_request(
+        2,
+        5,
+        {"parsed_candidate": _candidate(), "feedback": feedback},
+        feedback_override=compact_feedback,
+    )
+    assert '"validity_field":"obs.uav_task_com"' in prompt
+    assert '"coordinate":[2],"value":0.0' in prompt
+    assert '"coordinate":[15],"value":0.75' in prompt
+    assert '"validity_field":"obs.uav_task_vs"' in prompt
+    assert '"coordinate":[14,0],"value":0.0' in prompt
+    assert '"coordinate":[14,1],"value":0.625' in prompt
+
+
+def test_named_state_compaction_reports_empty_missing_and_incompatible_validity():
+    empty_inputs = {
+        "obs.uav_task_com": {"dtype": "bool", "value": [False] * 16},
+        "obs.uav_com_reference_capacity_fraction": {
+            "dtype": "float32",
+            "value": [0.0] * 16,
+        },
+    }
+    compact, _, _, _ = llm_design._compact_diagnostic_inputs(empty_inputs, 4)
+    empty = compact["obs.uav_com_reference_capacity_fraction"]["value"]
+    assert empty["selected_elements"] == []
+    assert empty["empty_valid_set"] is True
+    assert empty["valid_mask_true_count"] == 0
+
+    missing_inputs = {
+        "obs.uav_com_reference_capacity_fraction": {
+            "dtype": "float32",
+            "value": [0.25] * 16,
+        }
+    }
+    missing, _, _, _ = llm_design._compact_diagnostic_inputs(missing_inputs, 4)
+    missing_value = missing["obs.uav_com_reference_capacity_fraction"]["value"]
+    assert missing_value["selected_elements"] == []
+    assert missing_value["validity_field"] == "obs.uav_task_com"
+    assert "is missing" in missing_value["validity_alignment_issue"]
+    assert "no valid coordinates were guessed" in missing_value["selection_method"]
+
+    incompatible_inputs = {
+        **missing_inputs,
+        "obs.uav_task_com": {"dtype": "bool", "value": [True, False]},
+    }
+    incompatible, _, _, _ = llm_design._compact_diagnostic_inputs(
+        incompatible_inputs, 4
+    )
+    incompatible_value = incompatible[
+        "obs.uav_com_reference_capacity_fraction"
+    ]["value"]
+    assert "shape [2]" in incompatible_value["validity_alignment_issue"]
+    assert "data shape [16]" in incompatible_value["validity_alignment_issue"]
+
+    always_inputs = {
+        "obs.uav_remaining_energy_fraction": {
+            "dtype": "float32",
+            "value": [0.5] * 16,
+        }
+    }
+    always, _, _, _ = llm_design._compact_diagnostic_inputs(always_inputs, 4)
+    always_value = always["obs.uav_remaining_energy_fraction"]["value"]
+    assert always_value["validity_is_always"] is True
+    assert always_value["validity_field"] is None
+    assert "obs.always" not in json.dumps(always_value)
+
+
 def test_relational_compaction_preserves_sr_roi_ids_and_s2u_axes():
     sr_observable = [False] * 8
     sr_observable[1] = True
