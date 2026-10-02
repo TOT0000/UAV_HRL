@@ -45,10 +45,11 @@ except ImportError as exc:  # pragma: no cover - exercised in a clean subprocess
 
 from llm_candidate import (
     CandidateExecutionError,
+    ModelCandidateSchemaError,
     candidate_numeric_diagnostics,
     execute_candidate_isolated,
-    enrich_model_candidate,
     feature_reward,
+    normalize_candidate_submission,
     save_approved_artifact,
     validate_candidate,
     validate_candidate_staged,
@@ -106,7 +107,7 @@ from llm_streaming import (
 
 
 AGENT_RUN_SCHEMA_VERSION = "uav-hrl-llm-feature-agent-run-v1"
-AGENT_PROMPT_VERSION = "uav-hrl-llm-feature-agent-prompt-v5"
+AGENT_PROMPT_VERSION = "uav-hrl-llm-feature-agent-prompt-v6"
 AGENT_TOOL_CONTRACT_VERSION = "uav-hrl-llm-feature-agent-tools-v8"
 DEFAULT_MAX_MODEL_CALLS = 20
 DEFAULT_AGENT_OUTPUT_ROOT = Path("results") / "llm_agents"
@@ -141,6 +142,30 @@ Available tools:
 
 Always issue a tool call with arguments matching its schema. Use the concrete values returned by earlier tools. Begin now.
 """
+
+
+def _model_candidate_view(record: dict[str, Any]) -> dict[str, Any]:
+    """Return only model-editable fields, projecting legacy records if needed."""
+
+    stored = record.get("model_candidate")
+    if isinstance(stored, dict) and set(stored) == {"features", "code"}:
+        return copy.deepcopy(stored)
+    internal = record.get("candidate") if "candidate" in record else record
+    if not isinstance(internal, dict):
+        return {"features": [], "code": None}
+    features = internal.get("features")
+    return {
+        "features": [
+            {
+                "name": item.get("name"),
+                "description": item.get("description"),
+                "reward_weight": item.get("reward_weight"),
+            }
+            for item in (features if isinstance(features, list) else [])
+            if isinstance(item, dict)
+        ],
+        "code": internal.get("code"),
+    }
 
 
 class AgentBudgetError(RuntimeError):
@@ -1365,7 +1390,7 @@ class AgentWorkspace:
                 },
             }
             if include_candidate:
-                result["current_candidate"]["candidate"] = current.get("candidate")
+                result["current_candidate"]["candidate"] = _model_candidate_view(current)
         return result
 
     def reject_completion(
@@ -2329,20 +2354,8 @@ class AgentWorkspace:
             _write_json(path / "submission_report.json", report)
             return report
         try:
-            serialized = json.dumps(
-                candidate,
-                sort_keys=True,
-                ensure_ascii=False,
-                allow_nan=False,
-                separators=(",", ":"),
-            )
-            submitted_candidate = json.loads(serialized)
-            if set(submitted_candidate) == {"features", "code"}:
-                model_candidate = submitted_candidate
-                candidate, transformation = enrich_model_candidate(
-                    model_candidate, self.constants
-                )
-            elif {
+            submitted_candidate = copy.deepcopy(candidate)
+            if {
                 "schema_version", "candidate_name", "reward_input_mode", "features", "code"
             } == set(submitted_candidate):
                 # Programmatic/backward compatibility for saved pre-v6 agent
@@ -2366,9 +2379,61 @@ class AgentWorkspace:
                     "note": "accepted for persisted/programmatic compatibility only",
                 }
             else:
-                raise ValueError(
-                    "candidate must contain exactly features and code; host-owned metadata is not accepted in the model submission"
+                model_candidate, candidate, transformation = normalize_candidate_submission(
+                    submitted_candidate, self.constants
                 )
+            serialized = json.dumps(
+                submitted_candidate,
+                sort_keys=True,
+                ensure_ascii=False,
+                allow_nan=False,
+                separators=(",", ":"),
+            )
+            submitted_candidate = json.loads(serialized)
+        except ModelCandidateSchemaError as exc:
+            report = {
+                "status": "model_schema_failed",
+                "error_type": type(exc).__name__,
+                "error": str(exc),
+                "errors": copy.deepcopy(exc.issues),
+                "checks": {
+                    "json": {"status": "passed", "completed": True},
+                    "schema": {
+                        "status": "failed",
+                        "completed": True,
+                        "error_count": len(exc.issues),
+                    },
+                    "static": {
+                        "status": "not_run",
+                        "completed": False,
+                        "skipped_reason": "simplified candidate schema validation failed",
+                    },
+                    "execution": {
+                        "status": "not_run",
+                        "completed": False,
+                        "skipped_reason": "schema/static prerequisites failed",
+                    },
+                },
+                "candidate_created": False,
+            }
+            raw_serialized = json.dumps(
+                candidate,
+                sort_keys=True,
+                ensure_ascii=False,
+                default=str,
+                separators=(",", ":"),
+            )
+            raw_hash = hashlib.sha256(raw_serialized.encode("utf-8")).hexdigest()
+            path = self.directory / "submissions" / f"submission-{raw_hash[:12]}"
+            path.mkdir(parents=True, exist_ok=True)
+            try:
+                _write_json(path / "parsed_model_candidate.json", submitted_candidate)
+            except (TypeError, ValueError):
+                (path / "parsed_model_candidate_unserializable.txt").write_text(
+                    raw_serialized, encoding="utf-8"
+                )
+            _write_json(path / "submission_report.json", report)
+            return report
         except (TypeError, ValueError) as exc:
             report = {
                 "status": "invalid_arguments",
@@ -3047,7 +3112,14 @@ class AgentWorkspace:
                 selected.pop()
             return report_page(selected)
         if record_type == "candidate":
-            return {"status": "ok", "candidate_id": candidate_id, "candidate": record["candidate"], "parent_candidate_id": record.get("parent_candidate_id")}
+            return {
+                "status": "ok",
+                "candidate_id": candidate_id,
+                "candidate": _model_candidate_view(record),
+                "parent_candidate_id": record.get("parent_candidate_id"),
+                "validation_status": record.get("validation_status"),
+                "evaluation_status": record.get("evaluation_status"),
+            }
         if record_type == "issues":
             entries = [
                 {"issue_group": "current", "issue": item}

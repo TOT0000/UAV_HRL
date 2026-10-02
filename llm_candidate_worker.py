@@ -34,6 +34,17 @@ SAFE_BUILTINS = {
 }
 
 
+class CandidateOutputValidationError(ValueError):
+    """Structured raw-output violations found before host float32 conversion."""
+
+    def __init__(self, issues):
+        self.issues = list(issues)
+        summary = "; ".join(str(item["problem"]) for item in self.issues[:3])
+        if len(self.issues) > 3:
+            summary += f"; and {len(self.issues) - 3} more"
+        super().__init__(summary)
+
+
 def _write_json(path, value):
     Path(path).write_text(
         json.dumps(value, indent=2, ensure_ascii=False, allow_nan=False) + "\n",
@@ -67,33 +78,119 @@ def _run_function(function, obs, constants, expected_size, label):
     ) != constants_before:
         raise ValueError(f"{label} modified constants")
     def checked(value, run_name):
+        violations = []
         if not isinstance(value, (list, np.ndarray)):
-            raise ValueError(
-                f"{label} {run_name} must return a one-dimensional numeric list or NumPy array"
-            )
-        raw = np.asarray(value)
-        if raw.ndim != 1 or raw.dtype.kind not in "iuf":
-            raise ValueError(
-                f"{label} {run_name} must return a one-dimensional numeric list or NumPy array"
-            )
+            return None, [
+                {
+                    "code": "RUNTIME_OUTPUT_TYPE",
+                    "location": label,
+                    "problem": (
+                        f"{run_name} returned {type(value).__name__}; expected a "
+                        "one-dimensional numeric list or NumPy array"
+                    ),
+                    "requirement": (
+                        "Return a one-dimensional numeric list or NumPy array. The host "
+                        "validates it and then converts it to float32."
+                    ),
+                    "execution_run": run_name,
+                }
+            ]
+        try:
+            raw = np.asarray(value)
+        except (TypeError, ValueError) as exc:
+            return None, [
+                {
+                    "code": "RUNTIME_OUTPUT_TYPE",
+                    "location": label,
+                    "problem": f"{run_name} cannot be interpreted as a numeric array: {exc}",
+                    "requirement": "Return a rectangular one-dimensional numeric list or NumPy array.",
+                    "execution_run": run_name,
+                }
+            ]
+        if raw.ndim != 1:
+            return None, [
+                {
+                    "code": "RUNTIME_SHAPE",
+                    "location": label,
+                    "problem": f"{run_name} must be one-dimensional; returned shape {raw.shape}, expected ({expected_size},)",
+                    "requirement": f"Return exactly {expected_size} values in one dimension.",
+                    "execution_run": run_name,
+                    "observed_shape": list(raw.shape),
+                }
+            ]
+        if raw.dtype.kind not in "iuf":
+            return None, [
+                {
+                    "code": "RUNTIME_OUTPUT_TYPE",
+                    "location": label,
+                    "problem": f"{run_name} returned non-numeric dtype {raw.dtype}",
+                    "requirement": "Return numeric values in a list or NumPy array.",
+                    "execution_run": run_name,
+                    "observed_dtype": str(raw.dtype),
+                }
+            ]
         if raw.shape != (expected_size,):
-            raise ValueError(
-                f"{label} {run_name} returned shape {raw.shape}, expected ({expected_size},)"
-            )
+            return None, [
+                {
+                    "code": "RUNTIME_SHAPE",
+                    "location": label,
+                    "problem": f"{run_name} returned shape {raw.shape}; expected ({expected_size},)",
+                    "requirement": f"Return exactly {expected_size} values in feature order.",
+                    "execution_run": run_name,
+                    "observed_shape": list(raw.shape),
+                }
+            ]
         # Validate in float64 before the host's required float32 conversion so
         # conversion cannot hide NaN/Inf or an out-of-range raw value.
         raw64 = raw.astype(np.float64, copy=False)
-        if not np.isfinite(raw64).all():
-            raise ValueError(f"{label} {run_name} returned NaN or Infinity")
-        if np.any(raw64 < -1e-6) or np.any(raw64 > 1.0 + 1e-6):
-            raise ValueError(f"{label} {run_name} returned a value outside [0,1]")
+        for index, numeric in enumerate(raw64):
+            value_number = float(numeric)
+            if not np.isfinite(value_number):
+                violations.append(
+                    {
+                        "code": "RUNTIME_NONFINITE",
+                        "location": f"{label} feature[{index}]",
+                        "problem": f"{run_name} feature[{index}] returned NaN or Infinity ({value_number})",
+                        "requirement": "Every feature value must be finite before float32 conversion.",
+                        "execution_run": run_name,
+                        "feature_index": index,
+                        "observed_value": str(value_number),
+                    }
+                )
+            elif value_number < -1e-6 or value_number > 1.0 + 1e-6:
+                violations.append(
+                    {
+                        "code": "RUNTIME_FEATURE_BOUNDS",
+                        "location": f"{label} feature[{index}]",
+                        "problem": f"{run_name} feature[{index}] returned {value_number}, outside [0,1]",
+                        "requirement": "Every shared feature value must remain within [0,1]; do not rely on host clipping.",
+                        "execution_run": run_name,
+                        "feature_index": index,
+                        "observed_value": value_number,
+                        "allowed_range": {"minimum": 0.0, "maximum": 1.0},
+                    }
+                )
+        if violations:
+            return None, violations
         converted = raw64.astype(np.float32)
-        if not np.isfinite(converted).all():
-            raise ValueError(f"{label} {run_name} became non-finite after float32 conversion")
-        return converted
+        for index, numeric in enumerate(converted):
+            if not np.isfinite(float(numeric)):
+                violations.append(
+                    {
+                        "code": "RUNTIME_NONFINITE_AFTER_CONVERSION",
+                        "location": f"{label} feature[{index}]",
+                        "problem": f"{run_name} feature[{index}] became non-finite after float32 conversion",
+                        "requirement": "Return values representable as finite float32 numbers.",
+                        "execution_run": run_name,
+                        "feature_index": index,
+                    }
+                )
+        return converted, violations
 
-    first = checked(first, "first result")
-    second = checked(second, "second result")
+    first, first_issues = checked(first, "first result")
+    second, second_issues = checked(second, "second result")
+    if first_issues or second_issues:
+        raise CandidateOutputValidationError(first_issues + second_issues)
     if not np.array_equal(first, second):
         raise ValueError(f"{label} is not deterministic for identical input")
     return first
@@ -143,6 +240,7 @@ class _IssueAccumulator:
         diagnostics=None,
         operation_fingerprint=None,
         operation_identity=None,
+        structured_details=None,
     ):
         key = (
             str(code),
@@ -169,6 +267,8 @@ class _IssueAccumulator:
             details["operation_fingerprint"] = str(operation_fingerprint)
         if operation_identity:
             details["operation_identity"] = operation_identity
+        if structured_details:
+            details.update(structured_details)
         item = self._items.setdefault(
             key,
             {
@@ -615,9 +715,46 @@ def _check_function(
     *,
     candidate_source,
     diagnostic_contract,
+    feature_definitions=None,
 ):
     try:
         return _run_function(function, obs, constants, expected_size, label)
+    except CandidateOutputValidationError as exc:
+        for violation in exc.issues:
+            index = violation.get("feature_index")
+            feature_name = None
+            if (
+                isinstance(index, int)
+                and isinstance(feature_definitions, list)
+                and 0 <= index < len(feature_definitions)
+            ):
+                feature_name = feature_definitions[index].get("name")
+            representative = dict(sample)
+            representative["execution_run"] = violation.get("execution_run")
+            if "observed_value" in violation:
+                representative["observed_value"] = violation["observed_value"]
+            details = {
+                key: violation[key]
+                for key in (
+                    "feature_index",
+                    "observed_value",
+                    "allowed_range",
+                    "observed_shape",
+                    "observed_dtype",
+                )
+                if key in violation
+            }
+            if feature_name is not None:
+                details["feature_name"] = feature_name
+            issues.add(
+                violation["code"],
+                violation["location"],
+                violation["problem"],
+                violation["requirement"],
+                representative,
+                structured_details=details,
+            )
+        return None
     except BaseException as exc:
         exception_type, candidate_function, candidate_line, signature, frame = (
             _candidate_exception_details(exc)
@@ -652,8 +789,9 @@ def _check_function(
             f"{exception_type}: {exc}",
             diagnostics.get(
                 "targeted_requirement",
-                "Return a deterministic, side-effect-free one-dimensional float32 "
-                "array of the declared length with finite values.",
+                "Return a deterministic, side-effect-free one-dimensional numeric "
+                "list or NumPy array of the declared length with finite values; the "
+                "host converts validated output to float32.",
             ),
             sample,
             exception_type=exception_type,
@@ -743,6 +881,7 @@ def main(argv=None):
                 issues,
                 candidate_source=candidate["code"],
                 diagnostic_contract=diagnostic_contract,
+                feature_definitions=candidate["features"],
             )
             _check_ranges(
                 row_extra,
@@ -764,6 +903,7 @@ def main(argv=None):
             issues,
             candidate_source=candidate["code"],
             diagnostic_contract=diagnostic_contract,
+            feature_definitions=candidate["features"],
         )
         _check_ranges(
             probe_extra,
@@ -773,6 +913,18 @@ def main(argv=None):
             issues,
         )
         if issues.errors:
+            output_contract_failed = any(
+                item.get("code")
+                in {
+                    "RUNTIME_OUTPUT_TYPE",
+                    "RUNTIME_SHAPE",
+                    "RUNTIME_NONFINITE",
+                    "RUNTIME_NONFINITE_AFTER_CONVERSION",
+                    "RUNTIME_FEATURE_BOUNDS",
+                    "RUNTIME_DECLARED_FEATURE_RANGE",
+                }
+                for item in issues.errors
+            )
             _write_json(
                 args.report,
                 {
@@ -785,6 +937,22 @@ def main(argv=None):
                             "completed": True,
                             "sample_count_attempted": rows,
                             "empty_probe_attempted": True,
+                            "subchecks": {
+                                "raw_output_contract": {
+                                    "status": "failed" if output_contract_failed else "not_run",
+                                    "completed": output_contract_failed,
+                                    "skipped_reason": (
+                                        None
+                                        if output_contract_failed
+                                        else "candidate execution failed before a complete output was available"
+                                    ),
+                                },
+                                "host_float32_outputs_and_reward": {
+                                    "status": "not_run",
+                                    "completed": False,
+                                    "skipped_reason": "candidate execution or raw-output validation failed",
+                                },
+                            },
                         }
                     },
                 },

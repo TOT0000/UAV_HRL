@@ -129,6 +129,16 @@ class CandidateError(ValueError):
     pass
 
 
+class ModelCandidateSchemaError(CandidateError):
+    """One or more independently actionable model-submission schema errors."""
+
+    def __init__(self, issues: list[dict[str, Any]]):
+        self.issues = copy.deepcopy(issues)
+        super().__init__(
+            f"model candidate schema validation failed with {len(issues)} issue(s)"
+        )
+
+
 class CandidateExecutionError(RuntimeError):
     def __init__(self, message: str, *, report: dict[str, Any] | None = None):
         super().__init__(message)
@@ -144,8 +154,11 @@ def _reject_duplicate_key(pairs):
     return result
 
 
-def parse_candidate_json_envelope(text: str) -> tuple[dict[str, Any], dict[str, Any]]:
-    """Parse a strict object, optionally inside one whole-response JSON fence."""
+def parse_candidate_json_envelope(text: str) -> tuple[Any, dict[str, Any]]:
+    """Parse strict JSON, optionally inside one whole-response JSON fence.
+
+    Root-object validation belongs to the separately reported model-schema stage.
+    """
 
     if not isinstance(text, str) or not text.strip():
         raise CandidateError("candidate response is empty")
@@ -205,8 +218,6 @@ def parse_candidate_json_envelope(text: str) -> tuple[dict[str, Any], dict[str, 
             raise
         except json.JSONDecodeError as exc:
             raise CandidateError(f"invalid JSON inside Markdown code fence: {exc}") from exc
-    if not isinstance(value, dict):
-        raise CandidateError("candidate response must be one JSON object")
     return value, {
         "markdown_envelope_removed": bool(envelope_removed),
         "accepted_envelope": "single_json_fence" if envelope_removed else "plain_json",
@@ -215,36 +226,192 @@ def parse_candidate_json_envelope(text: str) -> tuple[dict[str, Any], dict[str, 
     }
 
 
-def parse_candidate_json(text: str) -> dict[str, Any]:
+def parse_candidate_json(text: str) -> Any:
     value, _ = parse_candidate_json_envelope(text)
     return value
 
 
-def validate_model_candidate_schema(candidate: dict[str, Any]) -> None:
+def _model_schema_issue(code: str, path: str, problem: str, requirement: str):
+    return {
+        "code": code,
+        "stage": "schema",
+        "validation_check": "schema",
+        "location": path,
+        "json_path": path,
+        "problem": problem,
+        "requirement": requirement,
+    }
+
+
+def model_candidate_schema_issues(candidate: Any) -> list[dict[str, Any]]:
+    """Collect every independently checkable simplified-submission error."""
+
+    issues: list[dict[str, Any]] = []
+    if not isinstance(candidate, dict):
+        return [
+            _model_schema_issue(
+                "MODEL_SCHEMA_ROOT_TYPE",
+                "$",
+                f"expected a JSON object, received {type(candidate).__name__}",
+                "Return one JSON object with exactly the features and code fields.",
+            )
+        ]
+    missing = sorted(MODEL_TOP_FIELDS.difference(candidate))
+    extra = sorted(set(candidate).difference(MODEL_TOP_FIELDS))
+    for name in missing:
+        issues.append(
+            _model_schema_issue(
+                "MODEL_SCHEMA_MISSING_FIELD",
+                f"$.{name}",
+                f"required field {name!r} is missing",
+                f"Add the {name!r} field using the documented simplified candidate schema.",
+            )
+        )
+    for name in extra:
+        issues.append(
+            _model_schema_issue(
+                "MODEL_SCHEMA_EXTRA_FIELD",
+                f"$.{name}",
+                f"unexpected model-owned field {name!r}",
+                "Remove this field; the host adds internal metadata after validation.",
+            )
+        )
+    if "code" in candidate:
+        code = candidate["code"]
+        if not isinstance(code, str):
+            issues.append(
+                _model_schema_issue(
+                    "MODEL_SCHEMA_INVALID_TYPE",
+                    "$.code",
+                    f"code must be a string, received {type(code).__name__}",
+                    "Provide the complete Python source as one JSON string.",
+                )
+            )
+        elif not code.strip():
+            issues.append(
+                _model_schema_issue(
+                    "MODEL_SCHEMA_EMPTY_TEXT",
+                    "$.code",
+                    "code is empty or whitespace-only",
+                    "Provide a non-empty compute_extra_state implementation.",
+                )
+            )
+    names: dict[str, int] = {}
+    if "features" in candidate:
+        items = candidate["features"]
+        if not isinstance(items, list):
+            issues.append(
+                _model_schema_issue(
+                    "MODEL_SCHEMA_INVALID_TYPE",
+                    "$.features",
+                    f"features must be an array, received {type(items).__name__}",
+                    "Provide a non-empty JSON array of feature objects.",
+                )
+            )
+        elif not items:
+            issues.append(
+                _model_schema_issue(
+                    "MODEL_SCHEMA_EMPTY_FEATURES",
+                    "$.features",
+                    "features is empty",
+                    "Provide at least one feature object.",
+                )
+            )
+        else:
+            for index, item in enumerate(items):
+                base = f"$.features[{index}]"
+                if not isinstance(item, dict):
+                    issues.append(
+                        _model_schema_issue(
+                            "MODEL_SCHEMA_INVALID_TYPE",
+                            base,
+                            f"feature must be an object, received {type(item).__name__}",
+                            "Provide an object with name, description, and reward_weight.",
+                        )
+                    )
+                    continue
+                for field in sorted(MODEL_ITEM_FIELDS.difference(item)):
+                    issues.append(
+                        _model_schema_issue(
+                            "MODEL_SCHEMA_MISSING_FIELD",
+                            f"{base}.{field}",
+                            f"required field {field!r} is missing",
+                            f"Add {field!r} to this feature.",
+                        )
+                    )
+                for field in sorted(set(item).difference(MODEL_ITEM_FIELDS)):
+                    issues.append(
+                        _model_schema_issue(
+                            "MODEL_SCHEMA_EXTRA_FIELD",
+                            f"{base}.{field}",
+                            f"unexpected field {field!r}",
+                            "Remove this host-managed or unsupported field.",
+                        )
+                    )
+                for field in ("name", "description"):
+                    if field not in item:
+                        continue
+                    value = item[field]
+                    if not isinstance(value, str):
+                        issues.append(
+                            _model_schema_issue(
+                                "MODEL_SCHEMA_INVALID_TYPE",
+                                f"{base}.{field}",
+                                f"{field} must be a string, received {type(value).__name__}",
+                                f"Provide {field} as non-empty text.",
+                            )
+                        )
+                    elif not value.strip():
+                        issues.append(
+                            _model_schema_issue(
+                                "MODEL_SCHEMA_EMPTY_TEXT",
+                                f"{base}.{field}",
+                                f"{field} is empty or whitespace-only",
+                                f"Provide a non-empty {field}.",
+                            )
+                        )
+                    elif field == "name":
+                        if value in names:
+                            issues.append(
+                                _model_schema_issue(
+                                    "MODEL_SCHEMA_DUPLICATE_NAME",
+                                    f"{base}.name",
+                                    f"feature name {value!r} duplicates $.features[{names[value]}].name",
+                                    "Use a unique feature name while preserving the intended output order.",
+                                )
+                            )
+                        else:
+                            names[value] = index
+                if "reward_weight" in item:
+                    value = item["reward_weight"]
+                    path = f"{base}.reward_weight"
+                    if isinstance(value, bool) or not isinstance(value, (int, float)):
+                        issues.append(
+                            _model_schema_issue(
+                                "MODEL_SCHEMA_INVALID_WEIGHT_TYPE",
+                                path,
+                                f"reward_weight must be numeric, received {type(value).__name__}",
+                                "Provide a finite JSON number; positive, negative, and zero are allowed.",
+                            )
+                        )
+                    elif not math.isfinite(float(value)):
+                        issues.append(
+                            _model_schema_issue(
+                                "MODEL_SCHEMA_NONFINITE_WEIGHT",
+                                path,
+                                "reward_weight is not finite",
+                                "Provide a finite JSON number; positive, negative, and zero are allowed.",
+                            )
+                        )
+    return issues
+
+
+def validate_model_candidate_schema(candidate: Any) -> None:
     """Validate the deliberately small object emitted by an LLM."""
 
-    if not isinstance(candidate, dict) or set(candidate) != MODEL_TOP_FIELDS:
-        raise CandidateError(
-            f"model candidate fields must be exactly {sorted(MODEL_TOP_FIELDS)}"
-        )
-    if not isinstance(candidate["code"], str) or not candidate["code"].strip():
-        raise CandidateError("code must be a non-empty string")
-    items = candidate["features"]
-    if not isinstance(items, list) or not items:
-        raise CandidateError("features must contain at least one item")
-    names = []
-    for index, item in enumerate(items):
-        if not isinstance(item, dict) or set(item) != MODEL_ITEM_FIELDS:
-            raise CandidateError(
-                f"features[{index}] fields must be exactly {sorted(MODEL_ITEM_FIELDS)}"
-            )
-        for name in ("name", "description"):
-            if not isinstance(item[name], str) or not item[name].strip():
-                raise CandidateError(f"features[{index}].{name} must be non-empty")
-        _finite_number(item["reward_weight"], f"features[{index}].reward_weight")
-        names.append(item["name"])
-    if len(set(names)) != len(names):
-        raise CandidateError("feature names must be unique")
+    issues = model_candidate_schema_issues(candidate)
+    if issues:
+        raise ModelCandidateSchemaError(issues)
 
 
 def enrich_model_candidate(
@@ -329,9 +496,6 @@ def normalize_candidate_submission(
     the current prompt and agent tool schema expose the simplified branch.
     """
 
-    if isinstance(submitted, dict) and set(submitted) == MODEL_TOP_FIELDS:
-        internal, metadata = enrich_model_candidate(submitted, constants_metadata)
-        return copy.deepcopy(submitted), internal, metadata
     if isinstance(submitted, dict) and set(submitted) == TOP_FIELDS:
         model_form = {
             "features": [
@@ -349,9 +513,8 @@ def normalize_candidate_submission(
             "mode": "legacy_internal_candidate_passthrough",
             "note": "accepted for persisted response compatibility; not exposed in the v6 prompt",
         }
-    raise CandidateError(
-        f"model candidate fields must be exactly {sorted(MODEL_TOP_FIELDS)}"
-    )
+    internal, metadata = enrich_model_candidate(submitted, constants_metadata)
+    return copy.deepcopy(submitted), internal, metadata
 
 
 def _finite_number(value, label):

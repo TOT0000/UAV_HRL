@@ -460,7 +460,7 @@ def test_prompt_is_complete_current_only_and_example_parses(design_fixture):
 
 def test_master_prompt_has_exact_placeholder_contract_and_supported_operations_match():
     template = PROMPT_TEMPLATE_PATH.read_text(encoding="utf-8")
-    assert PROMPT_VERSION == "uav-hrl-llm-design-prompt-v6"
+    assert PROMPT_VERSION == "uav-hrl-llm-design-prompt-v7"
     assert {
         token
         for token in (

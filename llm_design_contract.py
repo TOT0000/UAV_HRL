@@ -23,8 +23,8 @@ from replay_auxiliary import SNAPSHOT_FIELD_SPECS
 
 CANDIDATE_SCHEMA_VERSION = "uav-hrl-llm-shared-feature-candidate-v2"
 OBS_INTERFACE_VERSION = "uav-hrl-llm-current-observation-v1"
-PROMPT_VERSION = "uav-hrl-llm-design-prompt-v6"
-DESIGN_RUN_SCHEMA_VERSION = "uav-hrl-llm-design-run-v3"
+PROMPT_VERSION = "uav-hrl-llm-design-prompt-v7"
+DESIGN_RUN_SCHEMA_VERSION = "uav-hrl-llm-design-run-v4"
 APPROVED_ARTIFACT_SCHEMA_VERSION = "uav-hrl-approved-shared-feature-design-v2"
 ROOT = Path(__file__).resolve().parent
 SCHEMA_PATH = ROOT / "llm_candidate_schema.json"
@@ -432,7 +432,10 @@ def _state_schema_lines(fixed_metadata: dict[str, Any]) -> list[str]:
 
 
 def render_environment_interface(
-    fixed_metadata: dict[str, Any], constants_metadata: dict[str, Any]
+    fixed_metadata: dict[str, Any],
+    constants_metadata: dict[str, Any],
+    *,
+    include_system_semantics: bool = True,
 ) -> str:
     num_uav = int(constants_metadata["num_uav"]["value"])
     max_task_slots = int(SNAPSHOT_FIELD_SPECS["task_type"]["shape"][1])
@@ -459,15 +462,24 @@ def render_environment_interface(
             "- U2U matrices are [sender_uav_id, receiver_uav_id]. U2G vectors are [sender_uav_id]. S2U matrices are [compact_sr_row, receiver_uav_id].",
             "- Invalid/padded IDs are -1; numeric padding is zero. Empty queues, no discovered RoI, no service target, and all-false masks are legal, not errors.",
             "- Reference capacities are current expected physical capacities at the stated reference bandwidth, not scheduled or realized service and not delivered data.",
-            "",
-            "Visual sensing and existing reward semantics:",
-            "- For assigned VS geometry, h is relative altitude and d is horizontal UAV-RoI distance. b1=2*f/image_width and b2=2*f/image_length.",
-            "- C9 uses G=clip(b1*h/(d+epsilon),0,1), violation=1-G, averaged over currently assigned VS pairs. model_range_valid is d<=b1*h with valid positive geometry.",
-            "- After C9 is model-range-valid, d_L=(h^2+d^2)/(b1*h+d) and d_R=(h^2+d^2)/sqrt(b2^2*h^2+(1+b2^2)*d^2). C10 violation=1-clip(min(d_L,d_R)/(RoI_radius+epsilon),0,1), averaged only over finite C9-valid pairs.",
-            "- vs_geometry_valid, vs_c10_geometry_valid, and vs_capture_valid are distinct. The exact C9 boundary may be model-range-valid while capture-invalid because of a horizontal corner ray.",
-            "- Packet generation requires vs_capture_valid, but incomplete C10 coverage is not a separate hard gate. When capture is valid, VS physical size is packet_max_bits*min(max(image_quantity,0),1). On timely GS delivery, useful VS bits equal that frozen physical size times frozen capture coverage; useful COM bits equal timely physical bits.",
-            "- COM violation=1-clip(communication_range_m/(assigned_S2U_distance_3d+epsilon),0,1), averaged over all assigned COM pairs, including out-of-range pairs.",
-            "- The three stored baseline penalties are per-task-type means and each has weight 1; they are post-action reward components and therefore are not present in obs.",
+        )
+    )
+    if include_system_semantics:
+        lines.extend(
+            (
+                "",
+                "Visual sensing and existing reward semantics:",
+                "- For assigned VS geometry, h is relative altitude and d is horizontal UAV-RoI distance. b1=2*f/image_width and b2=2*f/image_length.",
+                "- C9 uses G=clip(b1*h/(d+epsilon),0,1), violation=1-G, averaged over currently assigned VS pairs. model_range_valid is d<=b1*h with valid positive geometry.",
+                "- After C9 is model-range-valid, d_L=(h^2+d^2)/(b1*h+d) and d_R=(h^2+d^2)/sqrt(b2^2*h^2+(1+b2^2)*d^2). C10 violation=1-clip(min(d_L,d_R)/(RoI_radius+epsilon),0,1), averaged only over finite C9-valid pairs.",
+                "- vs_geometry_valid, vs_c10_geometry_valid, and vs_capture_valid are distinct. The exact C9 boundary may be model-range-valid while capture-invalid because of a horizontal corner ray.",
+                "- Packet generation requires vs_capture_valid, but incomplete C10 coverage is not a separate hard gate. image_quantity is RoI area divided by the oblique camera-footprint area and its raw value may exceed 1. A valid capture creates physical_bits=packet_max_bits*clip(image_quantity,0,1). On timely GS delivery, useful VS bits equal those frozen physical bits times frozen capture coverage; useful COM bits equal timely physical bits.",
+                "- COM violation=1-clip(communication_range_m/(assigned_S2U_distance_3d+epsilon),0,1), averaged over all assigned COM pairs, including out-of-range pairs.",
+                "- The three stored baseline penalties are per-task-type means and each has weight 1; they are post-action reward components and therefore are not present in obs.",
+            )
+        )
+    lines.extend(
+        (
             "",
             "constants contains these verified fixed entries (candidate code accesses constants[name] to get the value):",
         )
@@ -584,8 +596,9 @@ def visual_sensing_spec(constants_metadata: dict[str, Any]) -> str:
         "mean(1-clip(min(d_L,d_R)/(RoI_radius+epsilon),0,1)) over finite eligible "
         "pairs. Capture validity is a distinct polygon/corner-ray geometry check; C10 "
         "incomplete coverage is not an additional packet-generation gate. Coverage is "
-        "the camera-footprint/RoI intersection area divided by pi*radius^2. Image "
-        "quantity is the canonical geometry's normalized image quantity. A valid capture "
+        "the camera-footprint/RoI intersection area divided by pi*radius^2. The camera "
+        "footprint area is the area of the same canonical oblique footprint polygon, and "
+        "image_quantity=RoI area/camera footprint area; this raw ratio may exceed 1. A valid capture "
         "creates physical_bits=packet_max_bits*clip(image_quantity,0,1), including partial "
         "coverage. Timely useful VS bits at GS equal the frozen physical bits times the "
         "frozen capture coverage. geometry-valid, C10-valid, and capture-valid flags in "
@@ -625,7 +638,7 @@ def render_prompt(
         "{{VISUAL_SENSING_SPEC}}": visual_sensing_spec(constants_metadata),
         "{{COMMUNICATION_SPEC}}": communication_spec(constants_metadata),
         "{{INPUT_FIELD_TABLE}}": render_environment_interface(
-            fixed_metadata, constants_metadata
+            fixed_metadata, constants_metadata, include_system_semantics=False
         ),
         "{{BETA}}": format(float(beta), ".17g"),
         "{{SUPPORTED_OPERATIONS}}": SUPPORTED_OPERATIONS,

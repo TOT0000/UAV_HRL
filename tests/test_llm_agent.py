@@ -214,6 +214,62 @@ def _request_settings(*, context_length=100_000, max_output_tokens=1_024):
     }
 
 
+def test_model_facing_candidate_views_are_simplified_but_internal_record_is_full(
+    tmp_path,
+):
+    fixed = _fixed_artifact(tmp_path)
+    workspace = _workspace(tmp_path, fixed, name="simplified-candidate-views")
+    internal = _candidate(name="legacy-record-fixture")
+    submitted = workspace.submit_candidate(internal, None)
+    candidate_id = submitted["candidate_id"]
+    record = workspace.state["candidates"][candidate_id]
+    expected = {
+        "features": [
+            {
+                "name": internal["features"][0]["name"],
+                "description": internal["features"][0]["description"],
+                "reward_weight": internal["features"][0]["reward_weight"],
+            }
+        ],
+        "code": internal["code"],
+    }
+    assert record["candidate"] == internal
+    assert workspace.work_state()["current_candidate"]["candidate"] == expected
+    assert workspace.get_history(candidate_id, "candidate")["candidate"] == expected
+
+    # Legacy persisted records without model_candidate use the same deterministic
+    # projection during resume/compaction rather than exposing host metadata.
+    record.pop("model_candidate")
+    workspace._save()
+    assert workspace.work_state()["current_candidate"]["candidate"] == expected
+    serialized = json.dumps(workspace.work_state(), ensure_ascii=False)
+    assert '"source_fields"' not in serialized
+    assert '"candidate_name"' not in serialized
+
+
+def test_agent_uses_aggregated_simplified_model_schema_validation(tmp_path):
+    fixed = _fixed_artifact(tmp_path)
+    workspace = _workspace(tmp_path, fixed, name="aggregated-model-schema")
+    result = workspace.submit_candidate(
+        {
+            "features": [
+                {"name": "a", "description": "fixture", "reward_weight": "bad"},
+                {"name": "b", "description": "fixture", "reward_weight": "also bad"},
+            ],
+            "code": "def compute_extra_state(obs, constants):\n    return [0.0, 0.0]\n",
+        },
+        None,
+    )
+    assert result["status"] == "model_schema_failed"
+    assert result["checks"]["json"]["status"] == "passed"
+    assert result["checks"]["static"]["status"] == "not_run"
+    assert {item["json_path"] for item in result["errors"]} == {
+        "$.features[0].reward_weight",
+        "$.features[1].reward_weight",
+    }
+    assert workspace.state["candidates"] == {}
+
+
 def _install_oversized_evaluation_report(
     workspace, candidate_id, *, suffix="oversized", padding_character="x"
 ):
@@ -1307,9 +1363,13 @@ def test_missing_fields_and_invalid_python_never_become_executable(tmp_path):
     missing = _candidate(name="missing-code")
     missing.pop("code")
     missing_result = workspace.submit_candidate(missing, None)
-    assert missing_result["status"] == "invalid_arguments"
+    assert missing_result["status"] == "model_schema_failed"
     assert missing_result["candidate_created"] is False
-    assert "code" in missing_result["error"]
+    assert any(
+        item["json_path"] == "$.code"
+        and item["code"] == "MODEL_SCHEMA_MISSING_FIELD"
+        for item in missing_result["errors"]
+    )
 
     invalid = _candidate(name="invalid-python")
     invalid["code"] = (
@@ -1715,7 +1775,9 @@ def test_work_summary_bounds_twenty_candidate_evaluation_history(tmp_path):
     summary = workspace.work_state(include_candidate=True)
     current = summary["current_candidate"]
     unresolved = current["unresolved_issue_summary"]
-    assert current["candidate"] == workspace.state["candidates"][parent_id]["candidate"]
+    assert current["candidate"] == llm_agent._model_candidate_view(
+        workspace.state["candidates"][parent_id]
+    )
     assert unresolved["total_distinct_unresolved"] == 2
     assert unresolved["omitted_distinct_unresolved"] == 0
     assert {issue["lambda"] for issue in unresolved["issues"]} == {"0", "0.1"}
@@ -1756,7 +1818,8 @@ def test_work_summary_bounds_twenty_candidate_evaluation_history(tmp_path):
     assert _tree_hashes(workspace.directory) == before_preview
     prompt = Path(preview["output_directory"], "agent_task_prompt.txt").read_text()
     assert parent_id in prompt
-    assert workspace.state["candidates"][parent_id]["candidate"]["candidate_name"] in prompt
+    assert workspace.state["candidates"][parent_id]["candidate"]["features"][0]["name"] in prompt
+    assert '"source_fields"' not in prompt
     assert "compute_extra_state" in prompt
     assert prompt.count('"critical_pairs"') == 1
     assert report_paths[0] not in prompt
@@ -2119,7 +2182,8 @@ def test_context_compaction_keeps_complete_candidate_and_tool_pairs(tmp_path):
         ensure_ascii=False,
         default=str,
     )
-    assert candidate["candidate_name"] in final_request
+    assert candidate["features"][0]["name"] in final_request
+    assert '"source_fields"' not in final_request
     assert "Host-generated compact work-state summary." not in compact_tasks[0]
     assert len(state["framework_tool_calls"]) == 4
     assert [item["status"] for item in state["framework_tool_calls"]] == [
@@ -2741,7 +2805,9 @@ def test_work_state_deduplicates_shared_pair_and_omits_report_sized_details(
     state = workspace.work_state(include_candidate=True)
     compact = json.dumps(state, ensure_ascii=False, separators=(",", ":"))
     evaluation = state["current_candidate"]["selected_formal_evaluation"]
-    assert state["current_candidate"]["candidate"] == candidate
+    assert state["current_candidate"]["candidate"] == llm_agent._model_candidate_view(
+        workspace.state["candidates"][candidate_id]
+    )
     assert len(evaluation["by_lambda"]) == 5
     assert list(evaluation["critical_pairs"]) == ["fixture-pair-4-19"]
     feature_summary = evaluation["critical_pairs"]["fixture-pair-4-19"][
@@ -2818,7 +2884,8 @@ def test_fifty_thousand_context_delivers_pending_report_page_after_history_compa
         assert report_id in request
         assert "data_segments" in request
         assert "fixture-pair-4-19" in request
-        assert candidate["candidate_name"] in request
+        assert candidate["features"][0]["name"] in request
+        assert '"source_fields"' not in request
         assert "compute_extra_state" in request
         return [("final_answer", {"answer": "fixture budget stop"})]
 

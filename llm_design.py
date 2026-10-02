@@ -23,6 +23,7 @@ from llm_baseline import estimate_empirical_lipschitz, reconstruct_baseline_rewa
 from llm_candidate import (
     CandidateError,
     CandidateExecutionError,
+    ModelCandidateSchemaError,
     candidate_semantic_fingerprint,
     candidate_numeric_diagnostics,
     normalize_candidate_submission,
@@ -1815,6 +1816,32 @@ def _json_failure_report(exc: CandidateError) -> dict[str, Any]:
     }
 
 
+def _model_schema_failure_report(exc: ModelCandidateSchemaError) -> dict[str, Any]:
+    return {
+        "status": "failed",
+        "can_execute": False,
+        "errors": list(exc.issues),
+        "checks": {
+            "json": {"status": "passed", "completed": True, "error_count": 0},
+            "schema": {
+                "status": "failed",
+                "completed": True,
+                "error_count": len(exc.issues),
+            },
+            "static": {
+                "status": "not_run",
+                "completed": False,
+                "skipped_reason": "simplified candidate schema validation failed",
+            },
+            "execution": {
+                "status": "not_run",
+                "completed": False,
+                "skipped_reason": "schema/static prerequisites failed",
+            },
+        },
+    }
+
+
 def _feedback_from_validation(
     report: dict[str, Any],
     category: str,
@@ -2157,6 +2184,7 @@ def _compact_feedback_issue(issue: dict[str, Any]) -> dict[str, Any]:
         "code",
         "stage",
         "location",
+        "json_path",
         "exception_type",
         "candidate_function",
         "candidate_line",
@@ -2168,6 +2196,11 @@ def _compact_feedback_issue(issue: dict[str, Any]) -> dict[str, Any]:
         "column",
         "character",
         "feature_index",
+        "feature_name",
+        "observed_value",
+        "allowed_range",
+        "observed_shape",
+        "observed_dtype",
         "source_field",
         "source_locations",
         "feature_mapping",
@@ -3384,14 +3417,6 @@ def run_design(
                 raise CandidateError(reason)
             try:
                 submitted_candidate, parse_metadata = parse_candidate_json_envelope(str(content))
-                model_candidate, candidate, transformation = normalize_candidate_submission(
-                    submitted_candidate, constants_metadata
-                )
-                parse_metadata["host_transformation"] = transformation
-                _write_json(
-                    round_directory / "candidate_parse_metadata.json", parse_metadata
-                )
-                _write_json(round_directory / "model_candidate.json", model_candidate)
             except CandidateError as exc:
                 validation_report = _json_failure_report(exc)
                 _write_json(
@@ -3416,6 +3441,56 @@ def run_design(
                 _write_json(round_directory / "failure.json", feedback)
                 _write_json(round_directory / "feedback.json", feedback)
                 history.append({"attempt": attempt, "status": "candidate_json_failure"})
+                continue
+            attempt_output["parsed_model_candidate"] = submitted_candidate
+            _write_json(
+                round_directory / "candidate_parse_metadata.json", parse_metadata
+            )
+            _write_json(
+                round_directory / "parsed_model_candidate.json", submitted_candidate
+            )
+            try:
+                model_candidate, candidate, transformation = normalize_candidate_submission(
+                    submitted_candidate, constants_metadata
+                )
+                parse_metadata["host_transformation"] = transformation
+                _write_json(
+                    round_directory / "candidate_parse_metadata.json", parse_metadata
+                )
+                _write_json(round_directory / "model_candidate.json", model_candidate)
+            except ModelCandidateSchemaError as exc:
+                validation_report = _model_schema_failure_report(exc)
+                _write_json(
+                    round_directory / "validation_report.json", validation_report
+                )
+                serialized = json.dumps(
+                    submitted_candidate,
+                    sort_keys=True,
+                    ensure_ascii=False,
+                    allow_nan=False,
+                    separators=(",", ":"),
+                )
+                candidate_identity = {
+                    "kind": "parsed_model_candidate_schema_failure",
+                    "model_candidate_sha256": hashlib.sha256(
+                        serialized.encode("utf-8")
+                    ).hexdigest(),
+                }
+                attempt_output["candidate_identity"] = candidate_identity
+                feedback = tracked_validation_feedback(
+                    validation_report,
+                    "candidate_model_schema_failure",
+                    attempt_number=attempt,
+                    candidate_identity=candidate_identity,
+                    directory=round_directory,
+                )
+                attempt_output["feedback"] = feedback
+                previous_attempt = attempt_output
+                _write_json(round_directory / "failure.json", feedback)
+                _write_json(round_directory / "feedback.json", feedback)
+                history.append(
+                    {"attempt": attempt, "status": "candidate_model_schema_failure"}
+                )
                 continue
             attempt_output["parsed_model_candidate"] = model_candidate
             attempt_output["parsed_candidate"] = candidate

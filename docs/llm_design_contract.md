@@ -37,7 +37,7 @@ preference for the parser-error location. The environment interface, schema,
 evaluation rules, and output reservation are never silently removed.
 
 Qwen, Gemma, GPT-OSS, and GPT-4o use the same provider-neutral English master prompt
-(`uav-hrl-llm-design-prompt-v6`). Provider adapters change only transport and
+(`uav-hrl-llm-design-prompt-v7`). Provider adapters change only transport and
 provider-specific request fields; they do not maintain separate task prompts.
 The saved prompt for each attempt is the exact fully assembled request content.
 Its environment interface is generated from the fixed artifact's authoritative
@@ -52,6 +52,12 @@ It removes only that outer fence and records the action in
 other language labels, invalid JSON, duplicate keys, and non-finite JSON values
 remain errors; no punctuation, field, number, weight, formula, or Python code is
 repaired.
+
+Successful JSON parsing and simplified-candidate schema validation are separate
+recorded stages. A syntactically valid response with several bad fields keeps
+the parsed object and reports every independently checkable field problem with
+its JSON path; static and runtime checks remain explicitly not run until that
+schema passes.
 
 ## Current-only candidate interface
 
@@ -101,6 +107,14 @@ fixed sample twice for determinism, compares inputs before/after, and exercises
 an empty/missing-data probe. Fixed samples and the empty probe share the same
 dtype, shape, finite-value, declared-range, global-range, determinism, mutation,
 and weighted-extra-reward checks.
+
+The sensing contract defines raw `image_quantity` as RoI area divided by the
+canonical oblique camera-footprint area, so it may exceed one. Valid captures
+use `packet_max_bits * clip(image_quantity, 0, 1)` for physical packet size;
+timely useful VS bits additionally use the coverage frozen at capture. C10
+incompleteness is not a separate hard packet-generation gate. These formulas
+appear once in the generated prompt; the input table focuses on field shape,
+unit, indexing, and validity.
 
 Indexed assignment may fill an independently allocated local array created by
 the documented NumPy operations (`zeros`, `ones`, `arange`, or copying
