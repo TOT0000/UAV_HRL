@@ -23,6 +23,7 @@ from llm_candidate import (
     candidate_semantic_fingerprint,
     candidate_numeric_diagnostics,
     execute_candidate_isolated,
+    enrich_model_candidate,
     feature_reward,
     load_approved_design,
     parse_candidate_json,
@@ -55,6 +56,7 @@ from llm_design_contract import (
     candidate_schema,
     format_schema_and_example,
     load_design_inputs,
+    model_candidate_schema,
     render_environment_interface,
     render_prompt,
     runtime_diagnostic_contract,
@@ -424,15 +426,16 @@ def test_prompt_is_complete_current_only_and_example_parses(design_fixture):
             "{{ROUND_REQUEST}}",
         )
     )
-    assert "observable information available before the TD3 movement action" in prompt
-    assert "Features are computed before the action" in prompt
-    assert "total useful data delivered to the GS within its deadlines" in prompt
-    assert "Select data using the documented indices and field-specific validity flags" in prompt
-    assert "Return only the complete candidate JSON object" in prompt
+    assert "Current observable information available before the TD3 movement action" in prompt
+    assert "Features are computed before action" in prompt
+    assert "useful data delivered to the GS within deadline" in prompt
+    assert "Use documented validity flags" in prompt
+    assert "Return only the candidate JSON object" in prompt
     assert "d_R=(h^2+d^2)/sqrt" in prompt
     assert "never use an object ID as a compact row" in prompt
-    block = format_schema_and_example(candidate_schema())
-    example = json.loads(block.split("Parseable interface example", 1)[1].split(":\n", 1)[1])
+    block = format_schema_and_example(model_candidate_schema())
+    submitted = json.loads(block.split("Parseable executable example", 1)[1].split(":\n", 1)[1])
+    example, _ = enrich_model_candidate(submitted, constants)
     validate_candidate(example, constants)
     features, reward, _ = execute_candidate_isolated(
         example, build_obs_arrays(arrays), constants, timeout=10
@@ -457,29 +460,33 @@ def test_prompt_is_complete_current_only_and_example_parses(design_fixture):
 
 def test_master_prompt_has_exact_placeholder_contract_and_supported_operations_match():
     template = PROMPT_TEMPLATE_PATH.read_text(encoding="utf-8")
-    assert PROMPT_VERSION == "uav-hrl-llm-design-prompt-v5"
+    assert PROMPT_VERSION == "uav-hrl-llm-design-prompt-v6"
     assert {
         token
         for token in (
-            "{{ENVIRONMENT_INTERFACE}}",
+            "{{MOVEMENT_AND_ENERGY_SPEC}}",
+            "{{VISUAL_SENSING_SPEC}}",
+            "{{COMMUNICATION_SPEC}}",
+            "{{INPUT_FIELD_TABLE}}",
             "{{SUPPORTED_OPERATIONS}}",
-            "{{OUTPUT_JSON_SPEC_AND_EXAMPLE}}",
-            "{{BASELINE_RESULTS_BY_LAMBDA}}",
-            "{{IMPROVEMENT_TOLERANCE}}",
+            "{{MINIMAL_EXECUTABLE_EXAMPLE}}",
+            "{{BASELINE_AND_ACCEPTANCE_RULE}}",
             "{{BETA}}",
-            "{{ROUND_REQUEST}}",
+            "{{ROUND_CONTEXT}}",
         )
         if token in template
     } == {
-        "{{ENVIRONMENT_INTERFACE}}",
+        "{{MOVEMENT_AND_ENERGY_SPEC}}",
+        "{{VISUAL_SENSING_SPEC}}",
+        "{{COMMUNICATION_SPEC}}",
+        "{{INPUT_FIELD_TABLE}}",
         "{{SUPPORTED_OPERATIONS}}",
-        "{{OUTPUT_JSON_SPEC_AND_EXAMPLE}}",
-        "{{BASELINE_RESULTS_BY_LAMBDA}}",
-        "{{IMPROVEMENT_TOLERANCE}}",
+        "{{MINIMAL_EXECUTABLE_EXAMPLE}}",
+        "{{BASELINE_AND_ACCEPTANCE_RULE}}",
         "{{BETA}}",
-        "{{ROUND_REQUEST}}",
+        "{{ROUND_CONTEXT}}",
     }
-    assert template.count("{{") == 7
+    assert template.count("{{") == 9
     for name in llm_candidate.SAFE_BUILTIN_CALLS:
         assert name in SUPPORTED_OPERATIONS
     for name in llm_candidate.SAFE_NUMPY_CALLS:
@@ -532,8 +539,8 @@ def test_all_providers_save_the_same_fully_rendered_first_prompt(tmp_path):
         assert result["status"] == "dry_run_complete"
         prompt = (output / "prompt_attempt_01.txt").read_text(encoding="utf-8")
         assert "{{ROUND_REQUEST}}" not in prompt
-        assert "1. Task and control scope" in prompt
-        assert "7. Request for this round" in prompt
+        assert "1. System operation and objective" in prompt
+        assert "6. Offline evaluation and revision" in prompt
         prompts.append(prompt)
     assert prompts[0] == prompts[1] == prompts[2]
 
@@ -580,8 +587,8 @@ def test_shared_feature_weights_and_host_reward_are_strict():
             validate_candidate(rejected, {"unused": {"value": 0}})
     rejected = _candidate()
     rejected["features"][0]["reward_weight"] = 1.01
-    with pytest.raises(CandidateError, match=r"sum\(abs"):
-        validate_candidate(rejected, {"unused": {"value": 0}})
+    validate_candidate(rejected, {"unused": {"value": 0}})
+    assert float(feature_reward(np.asarray([1.0]), rejected)) == pytest.approx(1.01)
 
 
 def test_v1_and_mixed_candidates_are_not_silently_converted(design_fixture):
@@ -3418,10 +3425,6 @@ def test_direct_state_copy_cannot_create_approved_artifact(tmp_path):
             "one-dimensional",
         ),
         (
-            "def compute_extra_state(obs, constants):\n    return np.asarray([0.0], dtype=np.float64)\n\ndef compute_reward_terms(obs, constants):\n    return np.asarray([0.0], dtype=np.float32)\n",
-            "dtype float32",
-        ),
-        (
             "def compute_extra_state(obs, constants):\n    return np.asarray([2.0], dtype=np.float32)\n\ndef compute_reward_terms(obs, constants):\n    return np.asarray([0.0], dtype=np.float32)\n",
             "outside",
         ),
@@ -3483,7 +3486,7 @@ def test_empty_probe_uses_full_output_range_validation(design_fixture):
     )
     with pytest.raises(
         CandidateExecutionError,
-        match=r"compute_extra_state\(empty probe\).*feature\[0\]",
+        match=r"compute_extra_state\(empty probe\).*outside \[0,1\]",
     ):
         execute_candidate_isolated(candidate, obs_arrays, constants, timeout=10)
 
@@ -3559,15 +3562,15 @@ def test_revision_then_pass_and_max_attempt_exhaustion(tmp_path):
     )
     assert result["status"] == "approved"
     second_prompt = (tmp_path / "revision" / "attempt_02" / "prompt.txt").read_text()
-    assert '"candidate_name": "first"' in second_prompt
+    assert '"name": "state_distance_helper"' in second_prompt
     assert "Latest validation/evaluation feedback for that same output" in second_prompt
     assert "Your candidate passed the implementation checks" in second_prompt
     assert second_prompt.count("Evaluation diagnostics:") == 1
     assert "global_baseline_l_hat_over_all_primary_pairs" in second_prompt
     assert "weighted_contribution_excludes_beta_i" in second_prompt
     assert "{{ROUND_REQUEST}}" not in second_prompt
-    assert "1. Task and control scope" in second_prompt
-    assert "7. Request for this round" in second_prompt
+    assert "1. System operation and objective" in second_prompt
+    assert "6. Offline evaluation and revision" in second_prompt
     full_feedback = json.loads(
         (tmp_path / "revision" / "attempt_01" / "feedback.json").read_text()
     )
@@ -3630,7 +3633,7 @@ def test_evaluation_revision_feedback_is_shared_by_all_mock_providers(design_fix
         request = client.calls[1]["prompt"]
         assert request.count("Evaluation diagnostics:") == 1
         assert "passed the implementation checks" in request
-        assert '"candidate_name": "first"' in request
+        assert '"name": "state_distance_helper"' in request
         assert "IDENTICAL_ADDED_FEATURE_VECTOR_ON_MAXIMUM_PAIR" in request
         assert "EMPTY_MOVEMENT_MASK_ON_BOTH_PAIR_OBSERVATIONS" in request
         assert "Changing only the fixed weights" in request

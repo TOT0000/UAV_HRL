@@ -66,16 +66,34 @@ def _run_function(function, obs, constants, expected_size, label):
         constants, sort_keys=True, separators=(",", ":"), allow_nan=False
     ) != constants_before:
         raise ValueError(f"{label} modified constants")
-    if not isinstance(first, np.ndarray) or first.ndim != 1:
-        raise ValueError(f"{label} must return a one-dimensional NumPy array")
-    if first.dtype != np.float32:
-        raise ValueError(f"{label} must return dtype float32")
-    if first.shape != (expected_size,):
-        raise ValueError(
-            f"{label} returned shape {first.shape}, expected ({expected_size},)"
-        )
-    if not np.isfinite(first).all():
-        raise ValueError(f"{label} returned NaN or Infinity")
+    def checked(value, run_name):
+        if not isinstance(value, (list, np.ndarray)):
+            raise ValueError(
+                f"{label} {run_name} must return a one-dimensional numeric list or NumPy array"
+            )
+        raw = np.asarray(value)
+        if raw.ndim != 1 or raw.dtype.kind not in "iuf":
+            raise ValueError(
+                f"{label} {run_name} must return a one-dimensional numeric list or NumPy array"
+            )
+        if raw.shape != (expected_size,):
+            raise ValueError(
+                f"{label} {run_name} returned shape {raw.shape}, expected ({expected_size},)"
+            )
+        # Validate in float64 before the host's required float32 conversion so
+        # conversion cannot hide NaN/Inf or an out-of-range raw value.
+        raw64 = raw.astype(np.float64, copy=False)
+        if not np.isfinite(raw64).all():
+            raise ValueError(f"{label} {run_name} returned NaN or Infinity")
+        if np.any(raw64 < -1e-6) or np.any(raw64 > 1.0 + 1e-6):
+            raise ValueError(f"{label} {run_name} returned a value outside [0,1]")
+        converted = raw64.astype(np.float32)
+        if not np.isfinite(converted).all():
+            raise ValueError(f"{label} {run_name} became non-finite after float32 conversion")
+        return converted
+
+    first = checked(first, "first result")
+    second = checked(second, "second result")
     if not np.array_equal(first, second):
         raise ValueError(f"{label} is not deterministic for identical input")
     return first
@@ -102,12 +120,7 @@ def _validate_output_ranges(extra, candidate, label):
                 f"range [{minimum},{maximum}]: observed "
                 f"[{observed_minimum},{observed_maximum}]"
             )
-    weighted = feature_reward(extra, candidate)
-    if np.any(weighted < -1.0 - tolerance) or np.any(weighted > 1.0 + tolerance):
-        raise ValueError(
-            f"weighted extra reward({label}) is outside [-1,1]: observed "
-            f"[{float(np.min(weighted))},{float(np.max(weighted))}]"
-        )
+    feature_reward(extra, candidate)
 
 
 class _IssueAccumulator:
@@ -678,15 +691,7 @@ def _check_ranges(extra, candidate, label, sample, issues):
                     sample,
                 )
     if extra is not None:
-        weighted = float(feature_reward(extra, candidate))
-        if weighted < -1.0 - tolerance or weighted > 1.0 + tolerance:
-            issues.add(
-                "RUNTIME_WEIGHTED_REWARD_BOUNDS",
-                "weighted extra reward",
-                f"observed {weighted} outside [-1,1]",
-                "Keep feature values and reward weights within the declared constraints so the weighted sum lies in [-1,1].",
-                sample,
-            )
+        feature_reward(extra, candidate)
 
 
 def main(argv=None):

@@ -25,6 +25,7 @@ from llm_candidate import (
     CandidateExecutionError,
     candidate_semantic_fingerprint,
     candidate_numeric_diagnostics,
+    normalize_candidate_submission,
     execute_candidate_isolated,
     feature_reward,
     parse_candidate_json_envelope,
@@ -37,6 +38,7 @@ from llm_design_contract import (
     PROMPT_VERSION,
     build_obs_arrays,
     candidate_schema,
+    model_candidate_schema,
     estimate_token_budget,
     load_design_inputs,
     render_prompt,
@@ -1090,6 +1092,12 @@ def _build_lipschitz_evaluation_diagnostics(
     obs_arrays: dict[str, np.ndarray] | None,
     constants_metadata: dict[str, Any] | None,
 ) -> dict[str, Any]:
+    host_managed_dependencies = all(
+        str(item.get("formula", "")).startswith(
+            "Host-managed executable definition:"
+        )
+        for item in candidate["features"]
+    )
     by_feature, declared_fields, supporting_fields, supporting_field_reasons = (
         _candidate_diagnostic_dependencies(candidate)
     )
@@ -1155,6 +1163,12 @@ def _build_lipschitz_evaluation_diagnostics(
                             contribution_i - contribution_j
                         ),
                         "source_fields": by_feature[str(index)],
+                        "source_field_mapping": (
+                            "aggregate literal subscriptions for the candidate; "
+                            "not asserted as exact for this output"
+                            if host_managed_dependencies
+                            else "legacy model-declared per-feature fields"
+                        ),
                     }
                 )
             pair_records[pair_ref] = {
@@ -1312,16 +1326,23 @@ def _build_lipschitz_evaluation_diagnostics(
         ),
         "dependency_selection": {
             "basis": (
-                "candidate source_fields accepted by static validation, plus their "
-                "declared validity masks and movement_mask"
+                "host-recorded aggregate literal field subscriptions, plus their "
+                "validity masks and movement_mask"
+                if host_managed_dependencies
+                else "legacy candidate source_fields accepted by static validation, "
+                "plus their declared validity masks and movement_mask"
             ),
             "feature_source_fields": by_feature,
             "declared_source_fields": declared_fields,
             "supporting_fields_added_for_interpretation": supporting_fields,
             "supporting_field_reasons": supporting_field_reasons,
             "limitation": (
-                "source_fields identify allowed field dependencies but are not a general "
-                "runtime tracer; no unverified intermediate expression or state slice is inferred"
+                "host-recorded source_fields are aggregate candidate dependencies and "
+                "are not mapped to individual outputs; the analysis is not a general "
+                "runtime tracer and infers no unverified expression or state slice"
+                if host_managed_dependencies
+                else "legacy source_fields identify allowed dependencies but are not a "
+                "general runtime tracer; no unverified expression or state slice is inferred"
             ),
         },
         "axis_and_id_mapping": axis_and_id_mapping,
@@ -1616,7 +1637,9 @@ def _round_request(
         return "Generate the first candidate."
     if previous_attempt is None:
         raise ValueError("revision round requires the immediately preceding attempt")
-    parsed = previous_attempt.get("parsed_candidate")
+    parsed = previous_attempt.get("parsed_model_candidate")
+    if parsed is None:
+        parsed = previous_attempt.get("parsed_candidate")
     raw_content = previous_attempt.get("raw_final_content")
     feedback = (
         previous_attempt.get("feedback")
@@ -2970,7 +2993,8 @@ def run_design(
         "created_at_utc": datetime.now(timezone.utc).isoformat(),
         "git_sha": _git_sha(),
         "prompt_version": PROMPT_VERSION,
-        "candidate_schema": candidate_schema(),
+        "model_candidate_schema": model_candidate_schema(),
+        "internal_candidate_schema": candidate_schema(),
         "model": {
             "provider": provider,
             "requested_api_identifier": model,
@@ -3266,6 +3290,7 @@ def run_design(
         attempt_output = {
             "raw_final_content": None,
             "parsed_candidate": None,
+            "parsed_model_candidate": None,
             "reasoning_present": False,
             "feedback": None,
             "candidate_identity": None,
@@ -3358,10 +3383,15 @@ def run_design(
                 reason = "model returned reasoning but no final JSON" if response.get("reasoning") else "model returned no final content"
                 raise CandidateError(reason)
             try:
-                candidate, parse_metadata = parse_candidate_json_envelope(str(content))
+                submitted_candidate, parse_metadata = parse_candidate_json_envelope(str(content))
+                model_candidate, candidate, transformation = normalize_candidate_submission(
+                    submitted_candidate, constants_metadata
+                )
+                parse_metadata["host_transformation"] = transformation
                 _write_json(
                     round_directory / "candidate_parse_metadata.json", parse_metadata
                 )
+                _write_json(round_directory / "model_candidate.json", model_candidate)
             except CandidateError as exc:
                 validation_report = _json_failure_report(exc)
                 _write_json(
@@ -3387,6 +3417,7 @@ def run_design(
                 _write_json(round_directory / "feedback.json", feedback)
                 history.append({"attempt": attempt, "status": "candidate_json_failure"})
                 continue
+            attempt_output["parsed_model_candidate"] = model_candidate
             attempt_output["parsed_candidate"] = candidate
             _write_json(round_directory / "candidate.json", candidate)
             current_candidate_fingerprint = candidate_semantic_fingerprint(candidate)

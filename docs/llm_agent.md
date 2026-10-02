@@ -19,12 +19,13 @@ full validation and the existing all-lambda Lipschitz rule pass. The resulting
 `approved/` directory uses the existing artifact contract consumed by
 `td3_dinkelbach_llm`. No training starts automatically.
 
-`submit_candidate` accepts the complete shared-feature v2 candidate directly in
-its `candidate` object argument. The model must not serialize that object into a
-second `candidate_json` string. The `code` member is still an ordinary JSON
-string; after the tool arguments are decoded it contains the exact Python source,
-including real newlines and indentation. The host performs any serialization
-needed for durable records and never repairs quoting, backslashes, or Python.
+`submit_candidate` accepts the simplified `{features, code}` object directly.
+Each ordered feature contains only `name`, `description`, and finite signed
+`reward_weight`; no weight-sum restriction applies. The model must not serialize
+that object into a second `candidate_json` string. The host deterministically
+adds internal artifact metadata and saves both forms. The `code` member remains
+ordinary decoded Python source. It may return a numeric list or NumPy array;
+the host validates raw `[0,1]` values before float32 conversion.
 
 ## Install
 
@@ -105,15 +106,16 @@ the saved remaining budget; an exhausted run stays paused without a model call.
 
 Use the exact ID returned by LM Studio's model list for another local model. At
 the time this contract was verified, visible IDs included
-`qwen/qwen3.5-9b` and `google/gemma-4-e4b`; do not assume either is loaded at a
-later time. Omit `--reasoning-effort` for these adapters:
+`qwen/qwen3.8-27b`; do not assume it is loaded at a later time. The common LM
+Studio adapter accepts any exact inventory ID. Do not apply GPT-OSS-only
+`--reasoning-effort` to Qwen, Gemma, or other adapters:
 
 ```powershell
 C:\Users\user\anaconda3\envs\LLM_HRL\python.exe run_llm_agent.py `
   --fixed-sample <FIXED_BASELINE_DIRECTORY> `
   --provider lmstudio `
   --base-url http://127.0.0.1:1234/v1 `
-  --model qwen/qwen3.5-9b `
+  --model qwen/qwen3.8-27b `
   --context-length <ACTUAL_LOADED_CONTEXT_LENGTH>
 ```
 
@@ -267,4 +269,7 @@ contract: their candidates and approved artifacts remain readable, but the agent
 conversation cannot be resumed under the object-valued tool contract. Runs from
 the earlier structured-candidate contract that exposed small-test arguments are
 also incompatible with the complete-fixed-sample-only tool contract; their
-saved candidates and approved artifacts remain readable.
+saved candidates and approved artifacts remain readable. Tool contract v8 now
+exposes only the simplified `{features, code}` model object; older verbose-object
+agent conversations are likewise inspectable but must start a new run, while
+their v2 internal candidates and approved artifacts remain loadable.

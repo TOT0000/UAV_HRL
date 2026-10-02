@@ -36,8 +36,8 @@ final-content excerpt may be explicitly shortened, with truncation markers and
 preference for the parser-error location. The environment interface, schema,
 evaluation rules, and output reservation are never silently removed.
 
-Qwen, Gemma, and GPT-4o use the same provider-neutral English master prompt
-(`uav-hrl-llm-design-prompt-v5`). Provider adapters change only transport and
+Qwen, Gemma, GPT-OSS, and GPT-4o use the same provider-neutral English master prompt
+(`uav-hrl-llm-design-prompt-v6`). Provider adapters change only transport and
 provider-specific request fields; they do not maintain separate task prompts.
 The saved prompt for each attempt is the exact fully assembled request content.
 Its environment interface is generated from the fixed artifact's authoritative
@@ -77,12 +77,16 @@ checkpoint/environment contracts. Only constants absent from per-run metadata
 but authoritative in the checked-in environment configuration are added, with
 that code source recorded.
 
-Candidate JSON uses schema `uav-hrl-llm-shared-feature-candidate-v2` and
-`reward_input_mode="current_only"`. Feature outputs are one-dimensional
-`float32` arrays within their declared subranges of `[0,1]`. Each feature has
-a finite signed `reward_weight`, and `sum(abs(reward_weight)) <= 1`. The exact
-same unweighted feature vector is appended to state and weighted by the host,
-without clipping or a second candidate call:
+The model-facing JSON contains only ordered `features` entries (`name`,
+`description`, finite signed `reward_weight`) and `code`. The host
+deterministically adds schema/version, candidate name, current-only mode,
+indices, float32 runtime dtype, fixed `[0,1]` range, and dependency diagnostics
+before saving the existing `uav-hrl-llm-shared-feature-candidate-v2` internal
+artifact. Raw model JSON and the enriched candidate are saved separately.
+Feature code may return a one-dimensional numeric list or NumPy array; raw
+values are checked before conversion to float32. There is no sum or
+absolute-sum restriction on finite weights, and the host never normalizes them.
+The exact same unweighted vector is appended to state and weighted once:
 
 ```text
 s_aug = concat(s_original, features)
@@ -115,11 +119,11 @@ This limited ownership analysis is shared by design-time
 validation, isolated execution, and approved-artifact loading; the worker's
 read-only arrays and before/after comparison remain independent defenses.
 
-The prompt's parseable example is deliberately a zero-weight formatting
+The prompt's parseable example is deliberately a zero-weight interface
 example, not an approved design recommendation. It selects movement-controlled
 UAV rows only when their queue summaries are valid, distinguishes observed
 empty queues from missing summaries, defines the empty applicable set as zero,
-uses a fixed bounded fraction, and returns `float32`. Tests run that example
+uses a fixed bounded fraction, and returns a numeric list. Tests run that example
 through schema, static, fixed-sample, and empty-probe validation.
 
 A limited AST redundancy check rejects direct scalar copies such as
@@ -130,11 +134,10 @@ full control-flow data-flow analysis. Numeric equality found only on the fixed
 samples remains a diagnostic warning rather than an automatic rejection;
 derived features may still use the original state.
 
-For straight-line outputs that can be resolved reliably, source-field errors
-identify the feature index, JSON path, field, and candidate-code locations,
-including dependencies used by masks and conditions. For path-dependent
-control flow, the report lists the certain field locations but explicitly does
-not invent an output index. Failed candidates also receive a semantic
+Allowed literal field accesses are retained as host diagnostics. They are not
+model declarations and unresolved per-feature data flow does not fail a
+candidate. Access to a field outside the supplied current-only interface still
+fails static validation. Failed candidates also receive a semantic
 fingerprint over feature metadata, source fields, weights, and normalized code
 AST. Changing only `candidate_name`, comments, or formatting is reported as a
 repeat of the earlier failed attempt; this is deliberately not a claim of
@@ -171,21 +174,36 @@ Dry-run against the current formal fixed baseline (no API request):
 ```powershell
 & 'C:\Users\user\anaconda3\envs\LLM_HRL\python.exe' run_llm_design.py `
   --fixed-sample results/llm_baselines/baseline-20260927T130708Z-ba4bf287 `
-  --model qwen/qwen3.5-9b `
+  --model qwen/qwen3.8-27b `
   --context-length 40000 --max-output-tokens 4096 --dry-run
 ```
 
-Qwen:
+Qwen3.8-27B (use the exact ID returned by the current LM Studio inventory):
 
 ```powershell
 & 'C:\Users\user\anaconda3\envs\LLM_HRL\python.exe' run_llm_design.py `
   --fixed-sample results/llm_baselines/baseline-20260927T130708Z-ba4bf287 `
   --base-url http://127.0.0.1:1234/v1 `
-  --model qwen/qwen3.5-9b `
+  --model qwen/qwen3.8-27b `
   --context-length 40000 --max-output-tokens 4096 `
   --temperature 0.3 --seed 20260927 --max-attempts 5 `
   --beta 1.0 --batch-size 128 `
   --timeout 600 --worker-timeout 120
+```
+
+GPT-OSS uses the same non-agent workflow (reasoning settings remain provider
+capabilities rather than a hard-coded Qwen/Gemma option):
+
+```powershell
+& 'C:\Users\user\anaconda3\envs\LLM_HRL\python.exe' run_llm_design.py `
+  --fixed-sample results/llm_baselines/baseline-20260927T130708Z-ba4bf287 `
+  --base-url http://127.0.0.1:1234/v1 `
+  --model openai/gpt-oss-20b `
+  --context-length 40000 --max-output-tokens 4096 `
+  --temperature 0.3 --seed 20260927 --max-attempts 5 `
+  --beta 1.0 --batch-size 128 `
+  --connect-timeout 30 --timeout 600 --total-timeout 1800 `
+  --worker-timeout 120
 ```
 
 OpenAI GPT-4o dry-run (no API key or network request required):
@@ -259,9 +277,10 @@ with its source and intended next-attempt provenance. Full validation reports
 remain on disk. If parsed
 candidate feedback is too large for the fixed context budget, a stable summary
 keeps independently actionable roots and records original, included, omitted,
-and repeated-occurrence counts in `prompt_feedback.json`. Structured source
-declaration errors are keyed by feature index and source field, so two missing
-fields on one feature and the same missing field on two features remain separate.
+and repeated-occurrence counts in `prompt_feedback.json`. Legacy full-metadata
+candidates retain structured source-declaration diagnostics, keyed by feature
+index and source field; simplified submissions do not ask the model to declare
+those fields.
 Repeated occurrences of the same root retain representative locations. A
 semantically repeated failed candidate carries the original concrete issues as
 a flat list alongside the immediately preceding feedback attempt, duplicate
@@ -277,14 +296,15 @@ deduplicates maximum-ratio pairs and samples across lambdas and records each
 feature value, signed `i-j` difference, `w*f` contribution (before beta), base/
 extra/combined rewards, original/augmented distances, the ratio on that exact
 pair, and the separate global baseline/candidate estimates. Current-only input
-fields are selected from statically validated `source_fields`; validity masks,
+fields are selected from host-recorded literal field accesses in the validated
+code (with explicit dependency-analysis limitations); validity masks,
 movement mask, constants, axis/ID semantics, and any dependency limitation are
 kept separate from post-action reward outcomes. Large input arrays may be
 represented relationally: Boolean masks use lossless true coordinates, while
 values governed by an authoritative validity mask retain all valid values at
 their original coordinates, including valid zeros. Empty valid sets remain
 distinct from unavailable fields. SR/RoI/task/link diagnostics add only the
-observable ID maps and validity fields needed to interpret the declared data;
+observable ID maps and validity fields needed to interpret the accessed data;
 S2U coordinates retain their `[compact_sr_row, receiver_uav]` axis meaning.
 State values are not projected through a UAV mask or partially selected unless
 their exact dependency indices are known. The complete diagnostic stays

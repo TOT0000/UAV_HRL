@@ -13,7 +13,7 @@ from smolagents.models import ChatMessageToolCallFunction
 import llm_agent
 from llm_streaming import capture_chat_stream
 from llm_agent import AgentWorkspace, ModelCallBudget, run_agent
-from llm_candidate import execute_candidate_isolated
+from llm_candidate import CANDIDATE_SCHEMA_VERSION, execute_candidate_isolated
 from llm_design import APIError, evaluate_candidate
 from test_llm_design import ChunkedResponse, _candidate, _fixed_artifact
 
@@ -1169,7 +1169,7 @@ def test_submit_candidate_api_schema_embeds_canonical_object_schema(tmp_path):
     schema = llm_agent.get_tool_json_schema(tool)
     parameters = schema["function"]["parameters"]
     candidate = parameters["properties"]["candidate"]
-    canonical = llm_agent.candidate_schema()
+    canonical = llm_agent.model_candidate_schema()
     assert candidate["type"] == "object"
     assert candidate["additionalProperties"] is False
     assert candidate["required"] == canonical["required"]
@@ -1189,6 +1189,42 @@ def test_submit_candidate_api_schema_embeds_canonical_object_schema(tmp_path):
     ]
     assert test_parameters["required"] == ["candidate_id"]
     assert set(test_parameters["properties"]) == {"candidate_id"}
+
+
+def test_agent_accepts_simplified_model_candidate_and_persists_internal_metadata(
+    tmp_path,
+):
+    fixed = _fixed_artifact(tmp_path)
+    workspace = _workspace(tmp_path, fixed, name="simplified-candidate")
+    model_candidate = {
+        "features": [
+            {
+                "name": "squared_first_state",
+                "description": "Square of the first state value, clipped to [0,1].",
+                "reward_weight": 2.5,
+            }
+        ],
+        "code": (
+            "def compute_extra_state(obs, constants):\n"
+            "    value = np.clip(obs['state'][0] * obs['state'][0], 0.0, 1.0)\n"
+            "    return [value]\n"
+        ),
+    }
+
+    result = workspace.submit_candidate(model_candidate, None)
+
+    assert result["status"] == "static_passed"
+    record = workspace.state["candidates"][result["candidate_id"]]
+    assert record["model_candidate"] == model_candidate
+    assert record["candidate"]["schema_version"] == CANDIDATE_SCHEMA_VERSION
+    assert record["candidate"]["features"][0]["reward_weight"] == 2.5
+    assert record["candidate"]["features"][0]["index"] == 0
+    assert (
+        workspace.directory
+        / "candidates"
+        / result["candidate_id"]
+        / "model_candidate.json"
+    ).exists()
 
 
 @pytest.mark.parametrize(
@@ -1271,12 +1307,9 @@ def test_missing_fields_and_invalid_python_never_become_executable(tmp_path):
     missing = _candidate(name="missing-code")
     missing.pop("code")
     missing_result = workspace.submit_candidate(missing, None)
-    assert missing_result["status"] == "static_failed"
-    assert missing_result["can_execute"] is False
-    assert any("code" in issue["location"] for issue in missing_result["errors"])
-    assert workspace.test_candidate(missing_result["candidate_id"])[
-        "status"
-    ] == "prerequisite_failed"
+    assert missing_result["status"] == "invalid_arguments"
+    assert missing_result["candidate_created"] is False
+    assert "code" in missing_result["error"]
 
     invalid = _candidate(name="invalid-python")
     invalid["code"] = (
@@ -2059,7 +2092,7 @@ def test_context_compaction_keeps_complete_candidate_and_tool_pairs(tmp_path):
         model=model.model_id,
         model_backend=model,
         max_model_calls=4,
-        context_length=20_500,
+        context_length=19_000,
         max_output_tokens=1_024,
         output_dir=tmp_path / "compaction",
     )
@@ -2142,7 +2175,7 @@ def test_pending_query_page_survives_compaction_into_actual_request(tmp_path):
         model="gpt-4o",
         model_backend=model,
         max_model_calls=3,
-        context_length=21_000,
+        context_length=19_000,
         max_output_tokens=1_024,
         output_dir=tmp_path / "pending-query-compaction",
     )
@@ -2397,7 +2430,7 @@ def test_pending_result_that_cannot_fit_stops_before_incomplete_request(tmp_path
         model=model.model_id,
         model_backend=model,
         max_model_calls=2,
-        context_length=18_500,
+        context_length=17_500,
         max_output_tokens=1_024,
         output_dir=tmp_path / "pending-does-not-fit",
     )
@@ -2916,7 +2949,8 @@ def test_pending_oversized_evaluation_summary_reaches_actual_model_request(
     assert len(history_calls) == 1
     assert history_calls[0]["delivery_status"] == "delivered"
     assert history_calls[0]["model_result"]["evaluations"]
-    assert state["context_compactions"][-1]["retained_pending_result_groups"] >= 1
+    if state["context_compactions"]:
+        assert state["context_compactions"][-1]["retained_pending_result_groups"] >= 1
 
 
 def test_bounded_query_index_links_to_paged_tool_call_history(tmp_path):

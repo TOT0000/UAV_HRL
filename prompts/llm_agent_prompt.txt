@@ -21,7 +21,7 @@ Implement one function:
 
 compute_extra_state(obs, constants)
 
-It returns a finite, deterministic, one-dimensional float32 feature vector f with a fixed dimension for the candidate. Each component must lie in [0, 1].
+It returns a finite, deterministic, one-dimensional numeric list or NumPy array f with a fixed dimension for the candidate. Each raw component must lie in [0, 1]; the host validates it before converting to float32.
 
 The host uses the same features for state augmentation and additional reward:
 
@@ -32,12 +32,9 @@ r_total = r_base + beta * r_extra
 r_base = B_timely_Mbit - lambda * E_movement_J
          - P_C9 - P_C10 - P_COM
 
-Reward weights may be positive, negative, or zero:
-sum(abs(reward_weights)) <= 1
+Reward weights may be any finite positive, negative, or zero values. The host does not normalize them, and neither r_extra nor r_total is restricted to [-1,1]. A feature may have zero reward weight while still contributing to the augmented state. Every intermediate and final numeric result must remain finite.
 
-Thus, r_extra lies in [-1, 1]. This bound does not apply to r_base or r_total. A feature may have zero reward weight while still contributing to the augmented state.
-
-Choose features with a clear relationship to the task. Specify their meaning, source fields, formulas, normalization, and handling of invalid or empty inputs. Check that the implementation matches these descriptions and that the weighted reward's behavior agrees with the intended objective.
+Choose features with a clear relationship to the task. For each feature, supply only its name, a brief description including its fixed normalization and empty-input behavior, and reward_weight. The host derives index, dtype, range, current-only mode, versioning, and dependency diagnostics from the ordered list and executable code.
 
 Use the documented current-time observations and constants. Feature computation must be available before the movement action and must generalize beyond the inspected samples. Sample identifiers and evaluation outcomes are diagnostic information, not feature inputs.
 
@@ -80,6 +77,6 @@ The current work record is:
 
 It identifies candidate versions, completed tests, unresolved or unverified issues, relevant findings, and remaining budget. Match each result to the candidate version it evaluated. Retrieve older records when needed.
 
-Submit candidates through the designated tool using the supplied schema. Pass the complete candidate directly in the tool's `candidate` object argument; do not serialize it into a `candidate_json` string. The `code` field remains a normal JSON string and is delivered to the host as decoded Python source. Tool calls and brief operational messages may occur during the process; the entire conversation need not be a single candidate JSON object.
+Submit candidates through the designated tool using the supplied simplified schema. Pass the complete `{features, code}` candidate directly in the tool's `candidate` object argument; do not serialize it into a `candidate_json` string and do not add host-owned artifact metadata. The `code` field remains a normal JSON string and is delivered to the host as decoded Python source. Tool calls and brief operational messages may occur during the process; the entire conversation need not be a single candidate JSON object.
 
 Only the host determines completion: a candidate must pass formal evaluation and the approved artifact must be saved. Passing `test_candidate` alone is not approval. Before host approval, a `final_answer` request or a plain-text response is rejected and returned as an observation; continue using the tools and their diagnostics. Once host approval is confirmed, stop. This task ends at offline design; training is a separate user-controlled step.

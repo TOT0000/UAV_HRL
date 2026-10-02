@@ -54,7 +54,7 @@ def _approved_fixture(root: Path, *, name="integration-fixture-only"):
             "source_fields": ["obs.state"],
             "formula": "clip(abs(state[1]),0,1)",
             "missing_data_rule": "state is required",
-            "reward_weight": 0.25,
+            "reward_weight": 2.5,
         }],
         "code": (
             "def compute_extra_state(obs, constants):\n"
@@ -147,7 +147,7 @@ def test_persistent_runtime_matches_offline_adapter_and_dynamic_constants(tmp_pa
         {name: value[None, ...] for name, value in obs.items()}, timeout=10
     )
     assert extra.tolist() == pytest.approx([0.4])
-    assert reward == pytest.approx(0.1)
+    assert reward == pytest.approx(1.0)
     assert extra == pytest.approx(offline_extra[0])
     assert reward == pytest.approx(offline_reward[0])
     assert metadata["environment_width_m"]["value"] == 1500.0

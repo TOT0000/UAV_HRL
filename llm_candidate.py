@@ -27,6 +27,7 @@ from llm_design_contract import (
     allowed_source_fields,
     build_obs_arrays,
     candidate_schema,
+    model_candidate_schema,
     runtime_constants,
 )
 
@@ -50,6 +51,8 @@ ITEM_FIELDS = {
     "missing_data_rule",
     "reward_weight",
 }
+MODEL_TOP_FIELDS = {"features", "code"}
+MODEL_ITEM_FIELDS = {"name", "description", "reward_weight"}
 SAFE_BUILTIN_CALLS = {
     "abs",
     "bool",
@@ -217,6 +220,140 @@ def parse_candidate_json(text: str) -> dict[str, Any]:
     return value
 
 
+def validate_model_candidate_schema(candidate: dict[str, Any]) -> None:
+    """Validate the deliberately small object emitted by an LLM."""
+
+    if not isinstance(candidate, dict) or set(candidate) != MODEL_TOP_FIELDS:
+        raise CandidateError(
+            f"model candidate fields must be exactly {sorted(MODEL_TOP_FIELDS)}"
+        )
+    if not isinstance(candidate["code"], str) or not candidate["code"].strip():
+        raise CandidateError("code must be a non-empty string")
+    items = candidate["features"]
+    if not isinstance(items, list) or not items:
+        raise CandidateError("features must contain at least one item")
+    names = []
+    for index, item in enumerate(items):
+        if not isinstance(item, dict) or set(item) != MODEL_ITEM_FIELDS:
+            raise CandidateError(
+                f"features[{index}] fields must be exactly {sorted(MODEL_ITEM_FIELDS)}"
+            )
+        for name in ("name", "description"):
+            if not isinstance(item[name], str) or not item[name].strip():
+                raise CandidateError(f"features[{index}].{name} must be non-empty")
+        _finite_number(item["reward_weight"], f"features[{index}].reward_weight")
+        names.append(item["name"])
+    if len(set(names)) != len(names):
+        raise CandidateError("feature names must be unique")
+
+
+def enrich_model_candidate(
+    submitted: dict[str, Any], constants_metadata: dict[str, Any]
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Deterministically add host-owned metadata required by the v2 artifact.
+
+    Dependencies are diagnostic only. Literal obs/constants subscriptions are
+    recorded when they can be read without executing candidate code; no claim
+    is made that the list maps precisely to one output feature.
+    """
+
+    validate_model_candidate_schema(submitted)
+    canonical = json.dumps(
+        submitted,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    )
+    digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    dependencies: set[str] = set()
+    dependency_status = "literal_subscripts_only"
+    try:
+        tree = ast.parse(submitted["code"], mode="exec")
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Subscript) or not isinstance(node.value, ast.Name):
+                continue
+            if node.value.id not in {"obs", "constants"}:
+                continue
+            key_node = node.slice
+            if isinstance(key_node, ast.Constant) and isinstance(key_node.value, str):
+                dependencies.add(f"{node.value.id}.{key_node.value}")
+    except SyntaxError:
+        dependency_status = "unavailable_due_to_python_syntax_error"
+    allowed = allowed_source_fields(constants_metadata)
+    recorded = sorted(dependencies.intersection(allowed))
+    candidate = {
+        "schema_version": CANDIDATE_SCHEMA_VERSION,
+        "candidate_name": f"model-candidate-{digest[:12]}",
+        "reward_input_mode": "current_only",
+        "features": [
+            {
+                "index": index,
+                "name": item["name"],
+                "dtype": "float32",
+                "description": item["description"],
+                "range": {"minimum": 0.0, "maximum": 1.0},
+                "source_fields": list(recorded),
+                "formula": (
+                    f"Host-managed executable definition: compute_extra_state output index {index}."
+                ),
+                "missing_data_rule": (
+                    "Defined by the executable function and checked with fixed samples and the empty probe."
+                ),
+                "reward_weight": float(item["reward_weight"]),
+            }
+            for index, item in enumerate(submitted["features"])
+        ],
+        "code": submitted["code"],
+    }
+    metadata = {
+        "model_candidate_schema_id": model_candidate_schema()["$id"],
+        "internal_candidate_schema_version": CANDIDATE_SCHEMA_VERSION,
+        "model_candidate_sha256": digest,
+        "host_added_fields": sorted((TOP_FIELDS - MODEL_TOP_FIELDS) | (ITEM_FIELDS - MODEL_ITEM_FIELDS)),
+        "dependency_analysis_status": dependency_status,
+        "aggregate_accessed_source_fields": recorded,
+        "dependency_mapping_precision": (
+            "aggregate literal subscriptions; not asserted as exact per-feature dependencies"
+        ),
+    }
+    return candidate, metadata
+
+
+def normalize_candidate_submission(
+    submitted: dict[str, Any], constants_metadata: dict[str, Any]
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+    """Return (model form, internal form, transformation metadata).
+
+    The verbose branch exists only for persisted response/test compatibility;
+    the current prompt and agent tool schema expose the simplified branch.
+    """
+
+    if isinstance(submitted, dict) and set(submitted) == MODEL_TOP_FIELDS:
+        internal, metadata = enrich_model_candidate(submitted, constants_metadata)
+        return copy.deepcopy(submitted), internal, metadata
+    if isinstance(submitted, dict) and set(submitted) == TOP_FIELDS:
+        model_form = {
+            "features": [
+                {
+                    "name": item.get("name"),
+                    "description": item.get("description"),
+                    "reward_weight": item.get("reward_weight"),
+                }
+                for item in submitted.get("features", [])
+                if isinstance(item, dict)
+            ],
+            "code": submitted.get("code"),
+        }
+        return model_form, copy.deepcopy(submitted), {
+            "mode": "legacy_internal_candidate_passthrough",
+            "note": "accepted for persisted response compatibility; not exposed in the v6 prompt",
+        }
+    raise CandidateError(
+        f"model candidate fields must be exactly {sorted(MODEL_TOP_FIELDS)}"
+    )
+
+
 def _finite_number(value, label):
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise CandidateError(f"{label} must be a number")
@@ -269,7 +406,6 @@ def _validate_items(
         source_fields = item["source_fields"]
         if (
             not isinstance(source_fields, list)
-            or not source_fields
             or any(not isinstance(value, str) for value in source_fields)
             or len(set(source_fields)) != len(source_fields)
         ):
@@ -284,13 +420,13 @@ def _validate_items(
         )
     if len(set(names)) != len(names):
         raise CandidateError(f"{label} names must be unique")
-    duplicate_formulas = sorted(
-        formula for formula in set(formulas) if formulas.count(formula) > 1
-    )
-    if duplicate_formulas:
-        raise CandidateError(f"{label} contains duplicate formulas")
-    if math.fsum(abs(value) for value in weights) > 1.0 + 1e-12:
-        raise CandidateError("sum(abs(feature reward weights)) must be <= 1")
+    host_managed = all(value.startswith("host-managedexecutabl") for value in formulas)
+    if not host_managed:
+        duplicate_formulas = sorted(
+            formula for formula in set(formulas) if formulas.count(formula) > 1
+        )
+        if duplicate_formulas:
+            raise CandidateError(f"{label} contains duplicate formulas")
 
 
 def validate_candidate_schema(
@@ -1112,30 +1248,33 @@ def validate_candidate_code(
     extra_function = next(
         function for function in top_functions if function.name == "compute_extra_state"
     )
-    declared = {
-        value for item in candidate["features"] for value in item["source_fields"]
-    }
-    expressions = _returned_feature_expressions(extra_function)
-    if expressions is not None and len(expressions) == len(candidate["features"]):
-        for index, expression in enumerate(expressions):
-            expression_visitor = _CandidateVisitor()
-            expression_visitor.visit(expression)
-            missing = sorted(
-                expression_visitor.accessed_fields.difference(
-                    candidate["features"][index]["source_fields"]
+    declared = {value for item in candidate["features"] for value in item["source_fields"]}
+    host_managed = all(
+        str(item.get("formula", "")).startswith("Host-managed executable definition:")
+        for item in candidate["features"]
+    )
+    if not host_managed:
+        expressions = _returned_feature_expressions(extra_function)
+        if expressions is not None and len(expressions) == len(candidate["features"]):
+            for index, expression in enumerate(expressions):
+                expression_visitor = _CandidateVisitor()
+                expression_visitor.visit(expression)
+                missing = sorted(
+                    expression_visitor.accessed_fields.difference(
+                        candidate["features"][index]["source_fields"]
+                    )
                 )
-            )
-            if missing:
+                if missing:
+                    raise CandidateError(
+                        f"feature[{index}] uses source fields absent from its metadata: {missing}"
+                    )
+        else:
+            undeclared = sorted(visitor.accessed_fields.difference(declared))
+            if undeclared:
                 raise CandidateError(
-                    f"feature[{index}] uses source fields absent from its metadata: {missing}"
+                    "code uses source fields absent from metadata and output indices "
+                    f"cannot be reliably resolved: {undeclared}"
                 )
-    else:
-        undeclared = sorted(visitor.accessed_fields.difference(declared))
-        if undeclared:
-            raise CandidateError(
-                "code uses source fields absent from metadata and output indices "
-                f"cannot be reliably resolved: {undeclared}"
-            )
     redundancy = _validate_explicit_feature_redundancy(
         extra_function, len(candidate["features"])
     )
@@ -1162,8 +1301,6 @@ def candidate_reward_weights(candidate: dict[str, Any]) -> np.ndarray:
     )
     if weights.ndim != 1 or not np.all(np.isfinite(weights)):
         raise CandidateError("feature reward weights must be a finite vector")
-    if float(np.sum(np.abs(weights), dtype=np.float64)) > 1.0 + 1e-12:
-        raise CandidateError("sum(abs(feature reward weights)) must be <= 1")
     return weights
 
 
@@ -1174,13 +1311,10 @@ def feature_reward(extra_state: np.ndarray, candidate: dict[str, Any]) -> np.nda
     weights = candidate_reward_weights(candidate)
     if values.ndim not in (1, 2) or values.shape[-1] != weights.size:
         raise CandidateError("extra-state values and feature reward weights do not align")
-    reward = values @ weights
+    with np.errstate(over="ignore", invalid="ignore"):
+        reward = values @ weights
     if not np.all(np.isfinite(reward)):
         raise CandidateError("weighted extra reward is non-finite")
-    if np.any(reward < -1.0 - NUMERIC_TOLERANCE) or np.any(
-        reward > 1.0 + NUMERIC_TOLERANCE
-    ):
-        raise CandidateError("weighted extra reward is outside [-1,1]")
     return np.asarray(reward, dtype=np.float64)
 
 
@@ -1416,14 +1550,14 @@ def _schema_validation_issues(
                             "Feature ranges must lie within [0,1].",
                         )
             sources = item.get("source_fields")
-            if not isinstance(sources, list) or not sources or any(
+            if not isinstance(sources, list) or any(
                 not isinstance(value, str) for value in sources
             ) or len(set(sources)) != len(sources):
                 add(
                     "SCHEMA_SOURCE_FIELDS",
                     f"{location}.source_fields",
-                    "source_fields is not a unique non-empty string array",
-                    "List the actual allowed obs/constants fields used by this item.",
+                    "source_fields is not a unique string array",
+                    "Host dependency diagnostics must be a unique string array.",
                 )
             else:
                 unknown = sorted(set(sources).difference(allowed))
@@ -1452,23 +1586,9 @@ def _schema_validation_issues(
                 f"name {value!r} is repeated",
                 "Names must be unique within the group.",
             )
-        duplicate_formulas = sorted(
-            {value for value in formulas if formulas.count(value) > 1}
-        )
-        for value in duplicate_formulas:
-            add(
-                "SCHEMA_DUPLICATE_FORMULA",
-                f"$.{group_name}",
-                f"normalized formula {value!r} is repeated",
-                "Do not declare duplicate formulas.",
-            )
-    if math.fsum(abs(value) for value in all_weights) > 1.0 + 1e-12:
-        add(
-            "SCHEMA_WEIGHT_L1",
-            "$.features",
-            f"sum(abs(weight)) is {math.fsum(abs(value) for value in all_weights):.17g}",
-            "Keep sum(abs(reward_weight)) <= 1.",
-        )
+        # Formula/source metadata is host-generated for model submissions. The
+        # executable AST and numeric outputs, not repeated prose, determine
+        # redundancy.
     return issues
 
 
@@ -1755,6 +1875,11 @@ def _static_validation_issues(
             )
         )
     features = candidate.get("features")
+    host_managed_sources = bool(features) and all(
+        isinstance(item, dict)
+        and str(item.get("formula", "")).startswith("Host-managed executable definition:")
+        for item in features
+    )
     declared: set[str] = set()
     if isinstance(features, list):
         for item in features:
@@ -1766,47 +1891,43 @@ def _static_validation_issues(
     )
     if extra_function is not None and isinstance(features, list) and features:
         expressions = _returned_feature_expressions(extra_function)
-        if expressions is not None and len(expressions) == len(features):
+        if host_managed_sources:
             subchecks["feature_sources"].update(
-                {"status": "passed", "completed": True}
+                {
+                    "status": "diagnostic_only",
+                    "completed": True,
+                    "accessed_source_fields": sorted(visitor.accessed_fields),
+                    "mapping_precision": "aggregate; per-feature data flow may be unresolved",
+                }
             )
+        elif expressions is not None and len(expressions) == len(features):
+            subchecks["feature_sources"].update({"status": "passed", "completed": True})
             for index, expression in enumerate(expressions):
                 expression_visitor = _CollectingCandidateVisitor(code, identities)
                 expression_visitor.visit(expression)
-                item = features[index]
-                item_fields = set(item.get("source_fields", [])) if isinstance(item, dict) else set()
+                item_fields = set(features[index].get("source_fields", []))
                 for field in sorted(expression_visitor.accessed_fields.difference(item_fields)):
                     locations = expression_visitor.field_locations.get(field) or visitor.field_locations.get(field) or []
-                    issues.append(
-                        _validation_issue(
-                            "STATIC_UNDECLARED_FEATURE_SOURCE",
-                            "static",
-                            f"$.features[{index}].source_fields",
-                            f"feature[{index}] uses {field!r} at {locations or ['unknown code location']} but does not declare it",
-                            f"Add {field!r} to features[{index}].source_fields; include fields used by masks, conditions, normalization, and missing-data handling.",
-                            feature_index=int(index),
-                            source_field=str(field),
-                            source_locations=list(locations),
-                            feature_mapping="resolved",
-                            validation_check="static.feature_sources",
-                        )
-                    )
+                    issues.append(_validation_issue(
+                        "STATIC_UNDECLARED_FEATURE_SOURCE", "static",
+                        f"$.features[{index}].source_fields",
+                        f"feature[{index}] uses {field!r} at {locations or ['unknown code location']} but does not declare it",
+                        f"Add {field!r} to features[{index}].source_fields.",
+                        feature_index=int(index), source_field=str(field),
+                        source_locations=list(locations), feature_mapping="resolved",
+                        validation_check="static.feature_sources",
+                    ))
         else:
             for field in sorted(visitor.accessed_fields.difference(declared)):
                 locations = visitor.field_locations.get(field, [])
-                issues.append(
-                    _validation_issue(
-                        "STATIC_UNDECLARED_FIELD_UNRESOLVED_FEATURE",
-                        "static",
-                        f"$.code field {field}",
-                        f"code uses {field!r} at {locations}; control/data flow prevents reliable mapping to one feature",
-                        f"Declare {field!r} in every feature whose computation, mask, condition, normalization, or missing-data path uses it. No feature index is inferred here.",
-                        source_field=str(field),
-                        source_locations=list(locations),
-                        feature_mapping="unresolved",
-                        validation_check="static.feature_sources",
-                    )
-                )
+                issues.append(_validation_issue(
+                    "STATIC_UNDECLARED_FIELD_UNRESOLVED_FEATURE", "static",
+                    f"$.code field {field}",
+                    f"code uses {field!r} at {locations}; control/data flow prevents reliable mapping to one feature",
+                    f"Declare {field!r} in every feature that uses it.",
+                    source_field=str(field), source_locations=list(locations),
+                    feature_mapping="unresolved", validation_check="static.feature_sources",
+                ))
         try:
             redundancy = _validate_explicit_feature_redundancy(
                 extra_function, len(features)

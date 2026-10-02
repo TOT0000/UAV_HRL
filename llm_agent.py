@@ -47,6 +47,7 @@ from llm_candidate import (
     CandidateExecutionError,
     candidate_numeric_diagnostics,
     execute_candidate_isolated,
+    enrich_model_candidate,
     feature_reward,
     save_approved_artifact,
     validate_candidate,
@@ -90,10 +91,10 @@ from llm_design_contract import (
     SUPPORTED_OPERATIONS,
     baseline_lines,
     build_obs_arrays,
-    candidate_schema,
     estimate_token_budget,
     format_schema_and_example,
     load_design_inputs,
+    model_candidate_schema,
     render_environment_interface,
     runtime_diagnostic_contract,
 )
@@ -105,8 +106,8 @@ from llm_streaming import (
 
 
 AGENT_RUN_SCHEMA_VERSION = "uav-hrl-llm-feature-agent-run-v1"
-AGENT_PROMPT_VERSION = "uav-hrl-llm-feature-agent-prompt-v4"
-AGENT_TOOL_CONTRACT_VERSION = "uav-hrl-llm-feature-agent-tools-v7"
+AGENT_PROMPT_VERSION = "uav-hrl-llm-feature-agent-prompt-v5"
+AGENT_TOOL_CONTRACT_VERSION = "uav-hrl-llm-feature-agent-tools-v8"
 DEFAULT_MAX_MODEL_CALLS = 20
 DEFAULT_AGENT_OUTPUT_ROOT = Path("results") / "llm_agents"
 DEFAULT_AGENT_PREVIEW_ROOT = Path("results") / "llm_agent_previews"
@@ -589,7 +590,7 @@ def _candidate_tool_input_schema() -> dict[str, Any]:
     ``candidate`` property. This avoids maintaining a second schema.
     """
 
-    schema = candidate_schema()
+    schema = model_candidate_schema()
     definitions = schema.get("$defs", {})
 
     def resolve(value: Any) -> Any:
@@ -627,7 +628,7 @@ def _candidate_tool_input_schema() -> dict[str, Any]:
 
     resolved = resolve(schema)
     resolved["description"] = (
-        "Complete shared-feature v2 candidate as a JSON object. Pass the object "
+        "Complete simplified feature candidate as a JSON object. Pass the object "
         "directly; do not serialize it into a JSON string."
     )
     return resolved
@@ -700,7 +701,7 @@ def _render_agent_prompt(
 ) -> str:
     template = AGENT_PROMPT_TEMPLATE_PATH.read_text(encoding="utf-8")
     candidate_contract = (
-        format_schema_and_example(candidate_schema())
+        format_schema_and_example(model_candidate_schema())
         + "\n\nSubmission interface:\n"
         + "- Call submit_candidate with the complete example-shaped object in the candidate argument.\n"
         + "- Do not serialize that object into a candidate_json string. The host receives candidate.code as decoded Python source and handles persistence serialization.\n"
@@ -2062,7 +2063,7 @@ class AgentWorkspace:
             value = render_environment_interface(self.fixed_metadata, self.constants)
         elif section == "candidate":
             value = {
-                "schema": candidate_schema(),
+                "schema": model_candidate_schema(),
                 "submit_candidate_arguments": {
                     "candidate": "direct object matching schema",
                     "parent_candidate_id": "optional immutable candidate id or null",
@@ -2335,7 +2336,39 @@ class AgentWorkspace:
                 allow_nan=False,
                 separators=(",", ":"),
             )
-            candidate = json.loads(serialized)
+            submitted_candidate = json.loads(serialized)
+            if set(submitted_candidate) == {"features", "code"}:
+                model_candidate = submitted_candidate
+                candidate, transformation = enrich_model_candidate(
+                    model_candidate, self.constants
+                )
+            elif {
+                "schema_version", "candidate_name", "reward_input_mode", "features", "code"
+            } == set(submitted_candidate):
+                # Programmatic/backward compatibility for saved pre-v6 agent
+                # candidates. The model-facing tool schema no longer exposes
+                # this verbose form.
+                candidate = submitted_candidate
+                model_candidate = {
+                    "features": [
+                        {
+                            "name": item.get("name"),
+                            "description": item.get("description"),
+                            "reward_weight": item.get("reward_weight"),
+                        }
+                        for item in candidate.get("features", [])
+                        if isinstance(item, dict)
+                    ],
+                    "code": candidate.get("code"),
+                }
+                transformation = {
+                    "mode": "legacy_internal_candidate_passthrough",
+                    "note": "accepted for persisted/programmatic compatibility only",
+                }
+            else:
+                raise ValueError(
+                    "candidate must contain exactly features and code; host-owned metadata is not accepted in the model submission"
+                )
         except (TypeError, ValueError) as exc:
             report = {
                 "status": "invalid_arguments",
@@ -2350,7 +2383,11 @@ class AgentWorkspace:
             path.mkdir(parents=True, exist_ok=True)
             _write_json(path / "submission_report.json", report)
             return report
-        envelope = {"format": "direct_tool_object", "host_serialized": True}
+        envelope = {
+            "format": "direct_tool_object",
+            "host_serialized": True,
+            "host_transformation": transformation,
+        }
         digest = _content_hash(candidate)
         candidate_id = f"candidate-{digest[:12]}"
         existing = self.state["candidates"].get(candidate_id)
@@ -2406,6 +2443,7 @@ class AgentWorkspace:
             "content_sha256": digest,
             "parent_candidate_id": parent_candidate_id,
             "candidate": candidate,
+            "model_candidate": model_candidate,
             "envelope": envelope,
             "created_at_utc": datetime.now(timezone.utc).isoformat(),
             "validation_status": "static_passed" if staged["can_execute"] else "static_failed",
@@ -2421,6 +2459,7 @@ class AgentWorkspace:
         self.state["current_candidate_id"] = candidate_id
         candidate_dir = self.directory / "candidates" / candidate_id
         candidate_dir.mkdir(parents=True, exist_ok=True)
+        _write_json(candidate_dir / "model_candidate.json", model_candidate)
         _write_json(candidate_dir / "candidate.json", candidate)
         if isinstance(candidate.get("code"), str):
             (candidate_dir / "candidate.py").write_text(
@@ -3146,7 +3185,7 @@ class QuerySamplesTool(_WorkspaceTool):
 
 class SubmitCandidateTool(_WorkspaceTool):
     name = "submit_candidate"
-    description = "Submit one complete shared-feature candidate object. Pass the object directly, never a JSON-encoded string. Every distinct content hash creates an immutable version; the host never repairs it."
+    description = "Submit one simplified feature candidate object containing only features(name, description, reward_weight) and code. Pass the object directly, never a JSON-encoded string. The host adds artifact metadata deterministically and never repairs code."
     inputs = {
         "candidate": _candidate_tool_input_schema(),
         "parent_candidate_id": {"type": "string", "description": "optional candidate id this revision derives from", "nullable": True},

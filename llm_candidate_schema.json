@@ -54,7 +54,6 @@
         "range": {"$ref": "#/$defs/range"},
         "source_fields": {
           "type": "array",
-          "minItems": 1,
           "uniqueItems": true,
           "items": {"type": "string", "minLength": 1}
         },

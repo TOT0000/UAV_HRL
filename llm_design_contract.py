@@ -23,8 +23,8 @@ from replay_auxiliary import SNAPSHOT_FIELD_SPECS
 
 CANDIDATE_SCHEMA_VERSION = "uav-hrl-llm-shared-feature-candidate-v2"
 OBS_INTERFACE_VERSION = "uav-hrl-llm-current-observation-v1"
-PROMPT_VERSION = "uav-hrl-llm-design-prompt-v5"
-DESIGN_RUN_SCHEMA_VERSION = "uav-hrl-llm-design-run-v2"
+PROMPT_VERSION = "uav-hrl-llm-design-prompt-v6"
+DESIGN_RUN_SCHEMA_VERSION = "uav-hrl-llm-design-run-v3"
 APPROVED_ARTIFACT_SCHEMA_VERSION = "uav-hrl-approved-shared-feature-design-v2"
 ROOT = Path(__file__).resolve().parent
 SCHEMA_PATH = ROOT / "llm_candidate_schema.json"
@@ -34,6 +34,35 @@ OBS_KEYS = ("state", "movement_mask") + tuple(SNAPSHOT_FIELD_SPECS)
 
 def candidate_schema() -> dict[str, Any]:
     return json.loads(SCHEMA_PATH.read_text(encoding="utf-8"))
+
+
+def model_candidate_schema() -> dict[str, Any]:
+    """Schema exposed to models; host-only artifact metadata is deliberately absent."""
+
+    return {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$id": "uav-hrl-llm-model-candidate-v1",
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["features", "code"],
+        "properties": {
+            "features": {
+                "type": "array",
+                "minItems": 1,
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "required": ["name", "description", "reward_weight"],
+                    "properties": {
+                        "name": {"type": "string", "minLength": 1},
+                        "description": {"type": "string", "minLength": 1},
+                        "reward_weight": {"type": "number"},
+                    },
+                },
+            },
+            "code": {"type": "string", "minLength": 1},
+        },
+    }
 
 
 def allowed_source_fields(constants: dict[str, Any]) -> set[str]:
@@ -450,52 +479,44 @@ def render_environment_interface(
     return "\n".join(lines)
 
 
-def format_schema_and_example(schema: dict[str, Any]) -> str:
-    example = {
-        "schema_version": CANDIDATE_SCHEMA_VERSION,
-        "candidate_name": "format_only_observed_queue_fraction_example",
-        "reward_input_mode": "current_only",
+def minimal_model_candidate_example() -> dict[str, Any]:
+    """Short executable interface example, not a recommended feature design."""
+
+    return {
         "features": [
             {
-                "index": 0,
                 "name": "controlled_uav_nonempty_queue_fraction",
-                "dtype": "float32",
-                "description": "Formatting example of selecting controlled UAVs whose queue summaries are valid, then measuring the fraction with a nonempty queue. Its zero reward weight makes this interface guidance, not a recommended reward design.",
-                "range": {"minimum": 0.0, "maximum": 1.0},
-                "source_fields": [
-                    "obs.movement_mask",
-                    "obs.uav_queue_valid",
-                    "obs.uav_queue_empty",
-                ],
-                "formula": "Among movement-controlled UAVs with valid queue summaries, count_nonzero(not queue_empty) / applicable_count; this fixed bounded fraction is clipped to [0,1].",
-                "missing_data_rule": "Ignore UAVs without valid queue summaries. If no controlled UAV has a valid summary, return 0; an observed empty queue remains a valid zero contribution.",
+                "description": (
+                    "Fraction of controlled UAVs with valid queue summaries that are "
+                    "nonempty; fixed [0,1] normalization, with 0 for an empty valid set."
+                ),
                 "reward_weight": 0.0,
             }
         ],
         "code": (
             "def compute_extra_state(obs, constants):\n"
             "    applicable = obs[\"movement_mask\"] & obs[\"uav_queue_valid\"]\n"
-            "    applicable_count = int(np.count_nonzero(applicable))\n"
+            "    count = int(np.count_nonzero(applicable))\n"
             "    value = 0.0\n"
-            "    if applicable_count > 0:\n"
-            "        nonempty = applicable & (~obs[\"uav_queue_empty\"])\n"
-            "        value = np.clip(\n"
-            "            float(np.count_nonzero(nonempty)) / float(applicable_count),\n"
-            "            0.0,\n"
-            "            1.0,\n"
-            "        )\n"
-            "    return np.asarray([value], dtype=np.float32)\n"
+            "    if count > 0:\n"
+            "        value = float(np.count_nonzero(applicable & (~obs[\"uav_queue_empty\"]))) / float(count)\n"
+            "    return [value]\n"
         ),
     }
+
+
+def format_schema_and_example(schema: dict[str, Any] | None = None) -> str:
+    schema = model_candidate_schema() if schema is None else schema
+    example = minimal_model_candidate_example()
     return (
-        "JSON Schema (Draft 2020-12; no additional fields):\n"
+        "Model submission schema (Draft 2020-12; no additional fields):\n"
         + json.dumps(
             schema,
             ensure_ascii=False,
             allow_nan=False,
             separators=(",", ":"),
         )
-        + "\n\nParseable interface example (reward_weight=0 makes it formatting guidance, not a suggested reward design):\n"
+        + "\n\nParseable executable example (reward_weight=0 makes it interface guidance, not a suggested reward design):\n"
         + json.dumps(example, indent=2, ensure_ascii=False, allow_nan=False)
     )
 
@@ -526,6 +547,68 @@ def baseline_lines(baseline_report: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def movement_and_energy_spec(constants_metadata: dict[str, Any]) -> str:
+    width = constants_metadata["environment_width_m"]["value"]
+    height = constants_metadata["environment_height_m"]["value"]
+    return (
+        "The actor emits one [speed_scalar, heading_scalar, vertical_scalar] block "
+        "per UAV. Speed and vertical scalars are clamped to [-1,1]; heading wraps "
+        "periodically to [-1,1). They decode as v_xy=5*(speed_scalar+1) m/s, "
+        "theta=pi*heading_scalar rad, and v_z=2*vertical_scalar m/s, with "
+        "[v_x,v_y]=v_xy*[cos(theta),sin(theta)]. Blocks outside movement_mask are "
+        "replaced by hover [-1,0,0]; Search control may then replace its UAV commands. "
+        "The command is held over four 0.25 s substeps. Each proposal uses p'=p+v*dt, "
+        f"clips x to [0,{width:g}] m and y to [0,{height:g}] m and altitude to the "
+        "UAV's configured AGL bounds; UAV 0 is additionally projected inside the "
+        "configured hard 3-D GS gateway sphere. Energy is charged from actual projected "
+        "displacement: E=P(v)*dt. For speed V=||v||, direction q=v/V (zero when "
+        "V=0), climb sine s=v_z/V (zero when V=0), and per-rotor thrust "
+        "T=||m*(0,0,-g)-0.5*rho*V^2*S_FP*q||/n_r, the canonical power is "
+        "P=n_r*(P_profile+P_induced+P_climb+P_parasite), where "
+        "P_profile=(delta/8)*(T/(c_T*rho*A)+3*V^2)*sqrt(T*rho*c_s^2*A/c_T), "
+        "P_induced=(1+c_f)*T*sqrt(sqrt(T^2/(4*rho^2*A^2)+V^4/4)-V^2/2), "
+        "P_climb=m*g*V*s/n_r, and P_parasite=0.5*d_0*V^3*rho*c_s*A. It uses "
+        "n_r=4, rho=1.293 kg/m^3, "
+        "S_FP=0.01 m^2, g=9.8 m/s^2, m=2 kg, delta=0.012, c_T=0.302, "
+        "c_s=0.0955, c_f=0.131, rotor area A=0.0314 m^2, and d_0=0.834."
+    )
+
+
+def visual_sensing_spec(constants_metadata: dict[str, Any]) -> str:
+    return (
+        "Camera b1=2*f/image_width and b2=2*f/image_length use the constants below. "
+        "C9 proximity is G=clip(b1*h/(d+epsilon),0,1); model-range validity requires "
+        "finite positive geometry and d<=b1*h. C9 penalty is mean(1-G) over assigned "
+        "VS pairs. For C9-valid pairs, d_L=(h^2+d^2)/(b1*h+d) and "
+        "d_R=(h^2+d^2)/sqrt(b2^2*h^2+(1+b2^2)*d^2); C10 penalty is "
+        "mean(1-clip(min(d_L,d_R)/(RoI_radius+epsilon),0,1)) over finite eligible "
+        "pairs. Capture validity is a distinct polygon/corner-ray geometry check; C10 "
+        "incomplete coverage is not an additional packet-generation gate. Coverage is "
+        "the camera-footprint/RoI intersection area divided by pi*radius^2. Image "
+        "quantity is the canonical geometry's normalized image quantity. A valid capture "
+        "creates physical_bits=packet_max_bits*clip(image_quantity,0,1), including partial "
+        "coverage. Timely useful VS bits at GS equal the frozen physical bits times the "
+        "frozen capture coverage. geometry-valid, C10-valid, and capture-valid flags in "
+        "obs are intentionally distinct."
+    )
+
+
+def communication_spec(constants_metadata: dict[str, Any]) -> str:
+    distance = constants_metadata["communication_range_m"]["value"]
+    return (
+        f"S2U, U2U, and U2G links use inclusive finite 3-D distance <= {distance:g} m. "
+        "A2G (S2U/U2G) path loss is free-space loss plus the currently sampled LoS or "
+        "NLoS excess loss; U2U uses the directed altitude-dependent A2A loss. Expected "
+        "capacities are E[B*log2(1+SNR*G)]/1e6 Mbit/s, with Rician fading for LoS/U2U "
+        "and Rayleigh fading for NLoS. Runtime service uses 50 fading blocks per 0.25 s "
+        "slot and equal FDMA across active S2U/U2U/U2G links in one shared 10 MHz pool. "
+        "The obs reference capacities are current expected physical capacities at their "
+        "documented reference bandwidth; they are not the allocated-bandwidth block "
+        "service or delivered bits. COM range penalty is mean(1-clip(R_com/(d_3D+epsilon),"
+        "0,1)) over every assigned COM UAV-SR pair, whether or not upload traffic is active."
+    )
+
+
 def render_prompt(
     *,
     fixed_metadata: dict[str, Any],
@@ -538,21 +621,26 @@ def render_prompt(
 ) -> str:
     template = PROMPT_TEMPLATE_PATH.read_text(encoding="utf-8")
     replacements = {
-        "{{ENVIRONMENT_INTERFACE}}": render_environment_interface(
+        "{{MOVEMENT_AND_ENERGY_SPEC}}": movement_and_energy_spec(constants_metadata),
+        "{{VISUAL_SENSING_SPEC}}": visual_sensing_spec(constants_metadata),
+        "{{COMMUNICATION_SPEC}}": communication_spec(constants_metadata),
+        "{{INPUT_FIELD_TABLE}}": render_environment_interface(
             fixed_metadata, constants_metadata
         ),
         "{{BETA}}": format(float(beta), ".17g"),
         "{{SUPPORTED_OPERATIONS}}": SUPPORTED_OPERATIONS,
-        "{{BASELINE_RESULTS_BY_LAMBDA}}": baseline_lines(baseline_report),
-        "{{IMPROVEMENT_TOLERANCE}}": (
+        "{{MINIMAL_EXECUTABLE_EXAMPLE}}": json.dumps(
+            minimal_model_candidate_example(), indent=2, ensure_ascii=False, allow_nan=False
+        ),
+        "{{BASELINE_AND_ACCEPTANCE_RULE}}": (
+            "Evaluated baseline estimates:\n"
+            + baseline_lines(baseline_report)
+            + "\nAcceptance: "
             f"margin(lambda)=max({absolute_tolerance:.17g}, "
             f"{relative_tolerance:.17g}*abs(L_baseline(lambda))); require "
             "L_candidate < L_baseline - margin for every lambda."
         ),
-        "{{OUTPUT_JSON_SPEC_AND_EXAMPLE}}": format_schema_and_example(
-            candidate_schema()
-        ),
-        "{{ROUND_REQUEST}}": round_request,
+        "{{ROUND_CONTEXT}}": round_request,
     }
     for placeholder, value in replacements.items():
         template = template.replace(placeholder, value)
