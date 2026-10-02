@@ -1810,9 +1810,9 @@ def _json_failure_report(exc: CandidateError) -> dict[str, Any]:
         "location": location,
         "problem": str(exc),
         "requirement": (
-            "Return one complete valid JSON object, either plain or as the entire body "
-            "of one `json`/unlabelled Markdown fence; include no surrounding text or "
-            "additional fence."
+            "Return one complete valid JSON object, either plain or inside exactly one "
+            "complete `json`/unlabelled Markdown fence. Explanatory text may surround "
+            "that unique fence, but do not provide additional fences or candidate objects."
         ),
         **details,
     }

@@ -1549,7 +1549,7 @@ def test_forbidden_json_and_code_are_rejected(design_fixture):
         validate_candidate(forbidden, constants)
 
 
-def test_candidate_parser_accepts_only_plain_or_single_json_fence():
+def test_candidate_parser_accepts_plain_or_unique_json_fence():
     candidate = _candidate()
     raw = json.dumps(candidate)
     plain, plain_meta = parse_candidate_json_envelope(f"  {raw}\n")
@@ -1557,22 +1557,56 @@ def test_candidate_parser_accepts_only_plain_or_single_json_fence():
     unlabelled, unlabelled_meta = parse_candidate_json_envelope(f"```\n{raw}\n```")
     assert plain == fenced == unlabelled == candidate
     assert plain_meta["markdown_envelope_removed"] is False
+    assert plain_meta["parse_method"] == "strict_plain_json"
+    assert plain_meta["outside_text_ignored"] is False
     assert fenced_meta["markdown_envelope_removed"] is True
     assert unlabelled_meta["markdown_envelope_removed"] is True
+    assert fenced_meta["parse_method"] == "unique_markdown_json_fence"
+    assert fenced_meta["outside_text_ignored"] is False
+    assert fenced_meta["extraction"]["fence_label"] == "json"
+    assert unlabelled_meta["extraction"]["fence_label"] is None
     assert fenced["code"] == candidate["code"]
     assert fenced["features"][0]["reward_weight"] == candidate["features"][0][
         "reward_weight"
     ]
 
 
+def test_candidate_parser_extracts_one_fence_without_rewriting_content():
+    candidate = _candidate(
+        code=(
+            "def compute_extra_state(obs, constants):\n"
+            "    marker = '{braces} \\\\ path ```ticks```'\n"
+            "    return np.asarray([float(len(marker) > 0)], dtype=np.float32)\n"
+        ),
+        name="escaped-fenced-candidate",
+    )
+    candidate["features"][0]["description"] = (
+        "Contains braces {like this}, a quoted \"value\", and `backticks`."
+    )
+    raw = json.dumps(candidate, ensure_ascii=False)
+    prefix = "Here is the requested candidate.\n\n"
+    suffix = "\nThis block contains the complete candidate; validation is still required."
+    parsed, metadata = parse_candidate_json_envelope(
+        prefix + "```json\n" + raw + "\n```" + suffix
+    )
+    assert parsed == candidate
+    assert parsed["code"] == candidate["code"]
+    assert metadata["outside_text_ignored"] is True
+    assert metadata["extraction"]["ignored_prefix_character_count"] == len(prefix)
+    assert metadata["extraction"]["ignored_suffix_character_count"] == len(suffix)
+    span = metadata["extraction"]["json_span"]
+    full = prefix + "```json\n" + raw + "\n```" + suffix
+    assert full[span["start"] : span["end"]] == raw
+
+
 @pytest.mark.parametrize(
     "text, message",
     [
-        ("before\n```json\n{}\n```", "outside"),
         ("```json\n{}\n```\n```json\n{}\n```", "multiple"),
         ("```json\n{}", "incomplete"),
         ("```python\n{}\n```", "unsupported"),
         ("```json\n{bad}\n```", "invalid JSON inside"),
+        ('{"first": 1}\n```json\n{"second": 2}\n```', "another JSON object"),
     ],
 )
 def test_candidate_parser_rejects_ambiguous_or_invalid_fences(text, message):
@@ -3833,7 +3867,11 @@ def test_single_json_fence_is_recorded_then_fully_validated(tmp_path):
     fixed = _fixed_artifact(tmp_path)
     candidate = _candidate(name="fenced-candidate")
     response = _response(candidate)
-    response["content"] = "```json\n" + json.dumps(candidate) + "\n```"
+    response["content"] = (
+        "Candidate follows.\n```json\n"
+        + json.dumps(candidate)
+        + "\n```\nValidation remains the host's responsibility."
+    )
     result = run_design(
         fixed_sample=fixed,
         model="qwen/qwen3.5-9b",
@@ -3848,8 +3886,11 @@ def test_single_json_fence_is_recorded_then_fully_validated(tmp_path):
     )
     assert metadata["markdown_envelope_removed"] is True
     assert metadata["accepted_envelope"] == "single_json_fence"
+    assert metadata["parse_method"] == "unique_markdown_json_fence"
+    assert metadata["outside_text_ignored"] is True
+    assert metadata["extraction"]["json_span"]["start"] > 0
     assert (tmp_path / "fenced-run" / "attempt_01" / "response_content.txt").read_text().startswith(
-        "```json"
+        "Candidate follows."
     )
 
     invalid = _candidate(name="fenced-but-invalid")
@@ -3868,9 +3909,9 @@ def test_single_json_fence_is_recorded_then_fully_validated(tmp_path):
     assert not (tmp_path / "fenced-invalid-run" / "approved").exists()
 
 
-def test_ambiguous_fence_feedback_is_specific_and_reaches_next_prompt(tmp_path):
+def test_multiple_fence_feedback_is_specific_and_reaches_next_prompt(tmp_path):
     fixed = _fixed_artifact(tmp_path)
-    invalid_text = "Explanation\n```json\n{}\n```"
+    invalid_text = "```json\n{}\n```\nAlternative:\n```json\n{}\n```"
     client = MockClient(
         [
             {**_response(_candidate()), "content": invalid_text},
@@ -3888,8 +3929,45 @@ def test_ambiguous_fence_feedback_is_specific_and_reaches_next_prompt(tmp_path):
     assert result["status"] == "approved"
     prompt = (tmp_path / "outer-text-revision" / "attempt_02" / "prompt.txt").read_text()
     assert invalid_text in prompt
-    assert "explanatory text outside" in prompt
-    assert "one `json`/unlabelled Markdown fence" in prompt
+    assert "multiple Markdown code fences" in prompt
+    assert "exactly one complete `json`/unlabelled Markdown fence" in prompt
+
+
+def test_extracted_fenced_runtime_failure_reaches_non_agent_revision_prompt(tmp_path):
+    fixed = _fixed_artifact(tmp_path)
+    invalid = _uav_slice_runtime_candidate(name="fenced-runtime-failure")
+    raw_content = (
+        "I used the requested interface.\n```json\n"
+        + json.dumps(invalid)
+        + "\n```\nThe host should validate this candidate."
+    )
+    first = {**_response(invalid), "content": raw_content}
+    client = MockClient([first, _response(_candidate(name="fixed-after-runtime"))])
+    result = run_design(
+        fixed_sample=fixed,
+        model=client.model,
+        client=client,
+        max_attempts=2,
+        output_dir=tmp_path / "fenced-runtime-revision",
+        worker_timeout=10,
+    )
+    assert result["status"] == "approved"
+    first_attempt = tmp_path / "fenced-runtime-revision" / "attempt_01"
+    assert (first_attempt / "response_content.txt").read_text() == raw_content
+    metadata = json.loads(
+        (first_attempt / "candidate_parse_metadata.json").read_text()
+    )
+    assert metadata["outside_text_ignored"] is True
+    validation = json.loads((first_attempt / "validation_report.json").read_text())
+    assert any(
+        issue.get("exception_type") == "IndexError"
+        for issue in validation["errors"]
+    )
+    prompt = (
+        tmp_path / "fenced-runtime-revision" / "attempt_02" / "prompt.txt"
+    ).read_text()
+    assert "IndexError" in prompt
+    assert "JSON_PARSE_ERROR" not in prompt
 
 
 def test_openai_refusal_stops_without_revision_or_approved_artifact(tmp_path):

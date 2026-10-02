@@ -157,9 +157,11 @@ def _reject_duplicate_key(pairs):
 
 
 def parse_candidate_json_envelope(text: str) -> tuple[Any, dict[str, Any]]:
-    """Parse strict JSON, optionally inside one whole-response JSON fence.
+    """Parse strict JSON, optionally from one complete JSON Markdown fence.
 
     Root-object validation belongs to the separately reported model-schema stage.
+    Explanatory text surrounding one unambiguous fence is retained only in the
+    caller's raw response record and is never executed as candidate content.
     """
 
     if not isinstance(text, str) or not text.strip():
@@ -167,6 +169,8 @@ def parse_candidate_json_envelope(text: str) -> tuple[Any, dict[str, Any]]:
     stripped = text.strip()
     candidate_text = stripped
     envelope_removed = False
+    outside_text_ignored = False
+    extraction: dict[str, Any] | None = None
 
     def strict_loads(source: str) -> Any:
         return json.loads(
@@ -182,38 +186,81 @@ def parse_candidate_json_envelope(text: str) -> tuple[Any, dict[str, Any]]:
     except CandidateError:
         raise
     except json.JSONDecodeError as plain_error:
-        if "```" not in stripped:
-            raise CandidateError(f"invalid JSON: {plain_error}") from plain_error
-        match = re.fullmatch(
-            r"```(?P<label>json)?[ \t]*\r?\n(?P<body>[\s\S]*?)\r?\n```",
-            stripped,
+        fence_lines = list(
+            re.finditer(
+                r"(?m)^[ \t]*```(?P<suffix>[^\r\n]*)[ \t]*\r?$",
+                text,
+            )
         )
-        if match is None:
-            fence_count = stripped.count("```")
-            opening = re.match(r"```([^\r\n]*)", stripped)
-            if fence_count > 2:
-                reason = "candidate response contains multiple Markdown code fences"
-            elif stripped.startswith("```") and fence_count < 2:
-                reason = "candidate response contains an incomplete Markdown code fence"
-            elif opening is not None and opening.group(1).strip() not in {"", "json"}:
-                reason = (
-                    "candidate response uses unsupported Markdown code-fence label "
-                    f"{opening.group(1).strip()!r}; only 'json' or no label is allowed"
-                )
-            elif not stripped.startswith("```") or not stripped.endswith("```"):
-                reason = (
-                    "candidate response contains explanatory text outside the single "
-                    "JSON Markdown code fence"
-                )
-            else:
-                reason = "candidate response has an invalid Markdown code-fence envelope"
-            raise CandidateError(reason)
-        candidate_text = match.group("body").strip()
+        if not fence_lines:
+            if "```" in text:
+                raise CandidateError(
+                    "candidate response contains backticks but no complete "
+                    "line-delimited Markdown code fence"
+                ) from plain_error
+            raise CandidateError(f"invalid JSON: {plain_error}") from plain_error
+        if len(fence_lines) % 2:
+            raise CandidateError(
+                "candidate response contains an incomplete Markdown code fence"
+            ) from plain_error
+        if len(fence_lines) > 2:
+            raise CandidateError(
+                "candidate response contains multiple Markdown code fences; "
+                "candidate selection is ambiguous"
+            ) from plain_error
+        opening, closing = fence_lines
+        label = opening.group("suffix").strip()
+        closing_suffix = closing.group("suffix").strip()
+        if closing_suffix:
+            raise CandidateError(
+                "candidate response contains malformed or multiple Markdown code fences"
+            ) from plain_error
+        if label not in {"", "json"}:
+            raise CandidateError(
+                "candidate response uses unsupported Markdown code-fence label "
+                f"{label!r}; only 'json' or no label is allowed"
+            ) from plain_error
+        body = text[opening.end() : closing.start()]
+        leading = len(body) - len(body.lstrip())
+        trailing = len(body) - len(body.rstrip())
+        candidate_start = opening.end() + leading
+        candidate_end = closing.start() - trailing
+        candidate_text = text[candidate_start:candidate_end]
         envelope_removed = True
         if not candidate_text:
             raise CandidateError("candidate Markdown code fence is empty")
-        if "```" in candidate_text:
-            raise CandidateError("candidate response contains multiple Markdown code fences")
+        prefix = text[: opening.start()]
+        suffix = text[closing.end() :]
+
+        def is_separate_json_object(source: str) -> bool:
+            if not source.strip():
+                return False
+            try:
+                return isinstance(strict_loads(source.strip()), dict)
+            except (CandidateError, json.JSONDecodeError):
+                return False
+
+        if is_separate_json_object(prefix) or is_separate_json_object(suffix):
+            raise CandidateError(
+                "candidate response contains another JSON object outside the Markdown "
+                "code fence; candidate selection is ambiguous"
+            ) from plain_error
+        outside_text_ignored = bool(prefix.strip() or suffix.strip())
+        extraction = {
+            "fence_label": label or None,
+            "fence_span": {
+                "start": int(opening.start()),
+                "end": int(closing.end()),
+                "end_exclusive": True,
+            },
+            "json_span": {
+                "start": int(candidate_start),
+                "end": int(candidate_end),
+                "end_exclusive": True,
+            },
+            "ignored_prefix_character_count": len(prefix),
+            "ignored_suffix_character_count": len(suffix),
+        }
         try:
             value = strict_loads(candidate_text)
         except CandidateError:
@@ -221,8 +268,13 @@ def parse_candidate_json_envelope(text: str) -> tuple[Any, dict[str, Any]]:
         except json.JSONDecodeError as exc:
             raise CandidateError(f"invalid JSON inside Markdown code fence: {exc}") from exc
     return value, {
+        "parse_method": (
+            "unique_markdown_json_fence" if envelope_removed else "strict_plain_json"
+        ),
         "markdown_envelope_removed": bool(envelope_removed),
         "accepted_envelope": "single_json_fence" if envelope_removed else "plain_json",
+        "outside_text_ignored": bool(outside_text_ignored),
+        "extraction": extraction,
         "raw_character_count": len(text),
         "parsed_character_count": len(candidate_text),
     }
