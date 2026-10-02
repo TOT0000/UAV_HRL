@@ -14,7 +14,10 @@ import traceback
 import numpy as np
 
 from llm_candidate import feature_reward, validate_candidate
-from llm_design_contract import OBS_KEYS
+from llm_design_contract import (
+    LEGACY_OBS_KEYS,
+    OBS_KEYS,
+)
 
 
 SAFE_BUILTINS = {
@@ -855,9 +858,14 @@ def main(argv=None):
         }
         validate_candidate(candidate, constants_metadata)
         with np.load(args.input, allow_pickle=False) as archive:
-            if set(archive.files) != set(OBS_KEYS):
+            field_set = set(archive.files)
+            if field_set == set(OBS_KEYS):
+                observation_keys = OBS_KEYS
+            elif field_set == set(LEGACY_OBS_KEYS):
+                observation_keys = LEGACY_OBS_KEYS
+            else:
                 raise ValueError("worker input exposes an unexpected observation field set")
-            arrays = {key: np.asarray(archive[key]) for key in OBS_KEYS}
+            arrays = {key: np.asarray(archive[key]) for key in observation_keys}
         rows = arrays["state"].shape[0]
         if rows <= 0 or any(value.shape[0] != rows for value in arrays.values()):
             raise ValueError("worker observation batch has inconsistent rows")

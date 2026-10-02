@@ -47,12 +47,17 @@ from llm_streaming import (
     capture_chat_stream,
     open_http_stream,
 )
+from llm_runtime import build_online_obs
 from llm_design_contract import (
+    NAMED_STATE_FIELD_SPECS,
+    OBS_KEYS,
+    OBS_INTERFACE_VERSION,
     PROMPT_TEMPLATE_PATH,
     PROMPT_VERSION,
     SUPPORTED_OPERATIONS,
     build_constants,
     build_obs_arrays,
+    derive_named_state_fields,
     candidate_schema,
     format_schema_and_example,
     load_design_inputs,
@@ -61,13 +66,109 @@ from llm_design_contract import (
     render_prompt,
     runtime_diagnostic_contract,
 )
-from replay_auxiliary import empty_snapshot, replay_auxiliary_metadata
+from replay_auxiliary import SNAPSHOT_FIELD_SPECS, empty_snapshot, replay_auxiliary_metadata
 from scenario_manifest import generate_manifest
 from utils_update_v2 import ReplayBufferJoint
 
 
 def _write_json(path, value):
     path.write_text(json.dumps(value, allow_nan=False), encoding="utf-8")
+
+
+def test_named_state_fields_follow_authoritative_layout_and_online_values(design_fixture):
+    _, arrays, _metadata, _baseline, _constants = design_fixture
+    state = np.asarray(arrays["state"]).copy()
+    schema = movement_state_feature_schema()
+    indices = {item["name"]: int(item["index"]) for item in schema["features"]}
+    state[0, indices["uav_3.task_fov"]] = 1.0
+    state[0, indices["uav_3.task_com"]] = 1.0
+    state[0, indices["uav_3.position_x"]] = 0.31
+    state[0, indices["uav_3.position_y"]] = 0.32
+    state[0, indices["uav_3.position_z"]] = 0.33
+    state[0, indices["uav_3.energy"]] = 0.34
+    state[0, indices["uav_3.backlog"]] = 0.35
+    state[0, indices["uav_3.fov_error"]] = -0.25
+    state[0, indices["uav_3.fov_target_x"]] = 0.41
+    state[0, indices["uav_3.fov_target_y"]] = 0.42
+    state[0, indices["uav_3.fov_target_z"]] = 0.43
+    state[0, indices["uav_3.com_target_x"]] = 0.51
+    state[0, indices["uav_3.com_target_y"]] = 0.52
+    state[0, indices["uav_3.com_target_z"]] = 0.53
+    state[0, indices["uav_3.com_capacity"]] = 0.54
+    state[0, indices["coverage_macro[15,15]"]] = 0.61
+    state[0, indices["global_coverage"]] = 0.71
+    state[0, indices["found_gt_ratio"]] = 0.25
+    state[0, indices["remaining_time"]] = 0.8
+    fixed = dict(arrays)
+    fixed["state"] = state
+    before = state.copy()
+    obs = build_obs_arrays(fixed)
+    assert OBS_INTERFACE_VERSION.endswith("v2")
+    assert set(NAMED_STATE_FIELD_SPECS).issubset(obs)
+    assert obs["uav_task_vs"][0, 3]
+    assert obs["uav_task_com"][0, 3]
+    assert obs["uav_horizontal_position_normalized"][0, 3].tolist() == pytest.approx([0.31, 0.32])
+    assert obs["uav_altitude_normalized"][0, 3] == pytest.approx(0.33)
+    assert obs["uav_remaining_energy_fraction"][0, 3] == pytest.approx(0.34)
+    assert obs["uav_backlog_normalized"][0, 3] == pytest.approx(0.35)
+    assert obs["uav_vs_image_error_normalized"][0, 3] == pytest.approx(-0.25)
+    assert obs["uav_vs_target_horizontal_normalized"][0, 3].tolist() == pytest.approx([0.41, 0.42])
+    assert obs["uav_vs_target_altitude_normalized"][0, 3] == pytest.approx(0.43)
+    assert obs["uav_com_target_horizontal_normalized"][0, 3].tolist() == pytest.approx([0.51, 0.52])
+    assert obs["uav_com_target_altitude_normalized"][0, 3] == pytest.approx(0.53)
+    assert obs["uav_com_reference_capacity_fraction"][0, 3] == pytest.approx(0.54)
+    assert obs["coverage_macro_fraction"][0, 15, 15] == pytest.approx(0.61)
+    assert obs["global_coverage_fraction"][0] == pytest.approx(0.71)
+    assert obs["discovered_roi_fraction"][0] == pytest.approx(0.25)
+    assert obs["remaining_episode_fraction"][0] == pytest.approx(0.8)
+    assert np.array_equal(state, before)
+
+    derived = derive_named_state_fields(state[0])
+    for name in NAMED_STATE_FIELD_SPECS:
+        assert np.array_equal(derived[name], obs[name][0])
+    snapshot = {
+        name: np.asarray(fixed[f"current_{name}"])[0].copy()
+        for name in SNAPSHOT_FIELD_SPECS
+    }
+    snapshot_before = {name: value.copy() for name, value in snapshot.items()}
+    movement_mask = np.zeros_like(np.asarray(fixed["current_movement_mask"])[0])
+    assert not movement_mask.any()
+    online = build_online_obs(
+        state[0], movement_mask, snapshot
+    )
+    for name in NAMED_STATE_FIELD_SPECS:
+        assert np.array_equal(online[name], obs[name][0])
+    assert np.array_equal(state, before)
+    for name in SNAPSHOT_FIELD_SPECS:
+        assert np.array_equal(snapshot[name], snapshot_before[name])
+
+
+def test_named_state_direct_copy_is_rejected_but_aggregation_is_allowed(design_fixture):
+    _, _arrays, _metadata, _baseline, constants = design_fixture
+    direct, _ = enrich_model_candidate(
+        {
+            "features": [{"name": "copy", "description": "test", "reward_weight": 0.0}],
+            "code": (
+                "def compute_extra_state(obs, constants):\n"
+                "    return [obs['uav_remaining_energy_fraction'][0]]\n"
+            ),
+        },
+        constants,
+    )
+    with pytest.raises(CandidateError, match="explicit direct copy"):
+        validate_candidate(direct, constants)
+
+    aggregate, _ = enrich_model_candidate(
+        {
+            "features": [{"name": "mean_energy", "description": "test", "reward_weight": 0.0}],
+            "code": (
+                "def compute_extra_state(obs, constants):\n"
+                "    return [np.mean(obs['uav_remaining_energy_fraction'])]\n"
+            ),
+        },
+        constants,
+    )
+    validate_candidate(aggregate, constants)
 
 
 def _fixed_artifact(tmp_path, *, duplicate_first_state=False):
@@ -427,12 +528,18 @@ def test_prompt_is_complete_current_only_and_example_parses(design_fixture):
         )
     )
     assert "Current observable information available before the TD3 movement action" in prompt
-    assert "Features are computed before action" in prompt
+    assert "f and r_extra use pre-action information" in prompt
     assert "useful data delivered to the GS within deadline" in prompt
-    assert "Use documented validity flags" in prompt
-    assert "Return only the candidate JSON object" in prompt
+    assert "Select data using validity flags" in prompt
+    assert "Return only one JSON object" in prompt
     assert "d_R=(h^2+d^2)/sqrt" in prompt
+    assert "valid VS captures create packets directly in their sensing-UAV queues" in prompt
+    assert "activated COM sessions create packets in their SR queues" in prompt
+    assert "initial t=0 observation is therefore before any slot injection" in prompt
+    assert "unfinished packets whose deadline is at or before slot end are removed" in prompt
     assert "never use an object ID as a compact row" in prompt
+    for name in OBS_KEYS:
+        assert name in prompt
     block = format_schema_and_example(model_candidate_schema())
     submitted = json.loads(block.split("Parseable executable example", 1)[1].split(":\n", 1)[1])
     example, _ = enrich_model_candidate(submitted, constants)
@@ -451,6 +558,8 @@ def test_prompt_is_complete_current_only_and_example_parses(design_fixture):
     populated["uav_queue_valid"][:, :2] = True
     populated["uav_queue_empty"][:, 0] = True
     populated["uav_queue_empty"][:, 1] = False
+    populated["uav_remaining_energy_fraction"][:, 0] = 0.0
+    populated["uav_remaining_energy_fraction"][:, 1] = 1.0
     populated_features, populated_reward, _ = execute_candidate_isolated(
         example, populated, constants, timeout=10
     )
@@ -460,14 +569,15 @@ def test_prompt_is_complete_current_only_and_example_parses(design_fixture):
 
 def test_master_prompt_has_exact_placeholder_contract_and_supported_operations_match():
     template = PROMPT_TEMPLATE_PATH.read_text(encoding="utf-8")
-    assert PROMPT_VERSION == "uav-hrl-llm-design-prompt-v7"
+    assert PROMPT_VERSION == "uav-hrl-llm-design-prompt-v8"
     assert {
         token
         for token in (
-            "{{MOVEMENT_AND_ENERGY_SPEC}}",
+            "{{MOVEMENT_AND_ENERGY_SUMMARY}}",
             "{{VISUAL_SENSING_SPEC}}",
             "{{COMMUNICATION_SPEC}}",
-            "{{INPUT_FIELD_TABLE}}",
+            "{{PACKET_LIFECYCLE_AND_OBSERVATION_TIMING}}",
+            "{{NAMED_INPUT_FIELD_TABLE}}",
             "{{SUPPORTED_OPERATIONS}}",
             "{{MINIMAL_EXECUTABLE_EXAMPLE}}",
             "{{BASELINE_AND_ACCEPTANCE_RULE}}",
@@ -476,17 +586,18 @@ def test_master_prompt_has_exact_placeholder_contract_and_supported_operations_m
         )
         if token in template
     } == {
-        "{{MOVEMENT_AND_ENERGY_SPEC}}",
+        "{{MOVEMENT_AND_ENERGY_SUMMARY}}",
         "{{VISUAL_SENSING_SPEC}}",
         "{{COMMUNICATION_SPEC}}",
-        "{{INPUT_FIELD_TABLE}}",
+        "{{PACKET_LIFECYCLE_AND_OBSERVATION_TIMING}}",
+        "{{NAMED_INPUT_FIELD_TABLE}}",
         "{{SUPPORTED_OPERATIONS}}",
         "{{MINIMAL_EXECUTABLE_EXAMPLE}}",
         "{{BASELINE_AND_ACCEPTANCE_RULE}}",
         "{{BETA}}",
         "{{ROUND_CONTEXT}}",
     }
-    assert template.count("{{") == 9
+    assert template.count("{{") == 10
     for name in llm_candidate.SAFE_BUILTIN_CALLS:
         assert name in SUPPORTED_OPERATIONS
     for name in llm_candidate.SAFE_NUMPY_CALLS:
@@ -513,10 +624,8 @@ def test_state_interface_is_derived_from_saved_authoritative_schema(design_fixtu
     schema["dimension"] += 1
     interface = render_environment_interface(modified, constants)
     assert f"shape ({schema['dimension']},)" in interface
-    assert (
-        f"Index {schema['dimension'] - 1}: fixture_additional_global; "
-        "fixture authoritative normalization."
-    ) in interface
+    assert "original TD3 state is retained unchanged for compatibility" in interface
+    assert "uav_remaining_energy_fraction" in interface
 
 
 def test_all_providers_save_the_same_fully_rendered_first_prompt(tmp_path):
@@ -539,8 +648,8 @@ def test_all_providers_save_the_same_fully_rendered_first_prompt(tmp_path):
         assert result["status"] == "dry_run_complete"
         prompt = (output / "prompt_attempt_01.txt").read_text(encoding="utf-8")
         assert "{{ROUND_REQUEST}}" not in prompt
-        assert "1. System operation and objective" in prompt
-        assert "6. Offline evaluation and revision" in prompt
+        assert "1. System, workflow, and objective" in prompt
+        assert "6. Evaluation and revision" in prompt
         prompts.append(prompt)
     assert prompts[0] == prompts[1] == prompts[2]
 
@@ -3569,8 +3678,8 @@ def test_revision_then_pass_and_max_attempt_exhaustion(tmp_path):
     assert "global_baseline_l_hat_over_all_primary_pairs" in second_prompt
     assert "weighted_contribution_excludes_beta_i" in second_prompt
     assert "{{ROUND_REQUEST}}" not in second_prompt
-    assert "1. System operation and objective" in second_prompt
-    assert "6. Offline evaluation and revision" in second_prompt
+    assert "1. System, workflow, and objective" in second_prompt
+    assert "6. Evaluation and revision" in second_prompt
     full_feedback = json.loads(
         (tmp_path / "revision" / "attempt_01" / "feedback.json").read_text()
     )
@@ -4282,6 +4391,17 @@ def test_relational_compaction_preserves_sr_roi_ids_and_s2u_axes():
         "obs.roi_id",
         "obs.roi_observable",
     ):
+        assert field in supporting
+        assert reasons[field]
+
+    candidate["features"][0]["source_fields"] = [
+        "obs.uav_vs_target_horizontal_normalized",
+        "obs.uav_com_reference_capacity_fraction",
+    ]
+    _, _, supporting, reasons = llm_design._candidate_diagnostic_dependencies(
+        candidate
+    )
+    for field in ("obs.uav_task_vs", "obs.uav_task_com"):
         assert field in supporting
         assert reasons[field]
 

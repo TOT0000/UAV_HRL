@@ -37,7 +37,7 @@ preference for the parser-error location. The environment interface, schema,
 evaluation rules, and output reservation are never silently removed.
 
 Qwen, Gemma, GPT-OSS, and GPT-4o use the same provider-neutral English master prompt
-(`uav-hrl-llm-design-prompt-v7`). Provider adapters change only transport and
+(`uav-hrl-llm-design-prompt-v8`). Provider adapters change only transport and
 provider-specific request fields; they do not maintain separate task prompts.
 The saved prompt for each attempt is the exact fully assembled request content.
 Its environment interface is generated from the fixed artifact's authoritative
@@ -70,8 +70,17 @@ compute_extra_state(obs, constants)
 
 `obs` contains the original state in the dimension and order declared by the
 fixed artifact's authoritative movement-state feature schema, the current
-movement mask, and the named current auxiliary snapshot fields. For the current
-formal contract these are 531 and 16 dimensions, respectively. It excludes
+movement mask, named deterministic views of the original state, and the named
+current auxiliary snapshot fields. For the current formal contract the original
+state and movement mask are 531 and 16 dimensions, respectively. The v2 named
+views include per-UAV task flags, normalized horizontal position and altitude,
+remaining-energy fraction, normalized backlog and service targets, VS image
+error, COM reference-capacity fraction, the coverage macro grid, global
+coverage, discovered-RoI fraction, and remaining-episode fraction. Their UAV
+axis is UAV ID; VS and COM flags remain independently true when both assignments
+exist. They are constructed by one read-only adapter from the authoritative
+17-column UAV blocks, coverage block, and global fields; no fixed sample is
+rewritten. It excludes
 action, all `next_` fields, delivered data, movement energy, C9/C10/COM reward components,
 Dinkelbach lambda, and episode/scenario/checkpoint/source trace identifiers.
 The prompt generated for each run is the authoritative field/shape/dtype/unit,
@@ -134,11 +143,40 @@ validation, isolated execution, and approved-artifact loading; the worker's
 read-only arrays and before/after comparison remain independent defenses.
 
 The prompt's parseable example is deliberately a zero-weight interface
-example, not an approved design recommendation. It selects movement-controlled
-UAV rows only when their queue summaries are valid, distinguishes observed
-empty queues from missing summaries, defines the empty applicable set as zero,
-uses a fixed bounded fraction, and returns a numeric list. Tests run that example
+example, not an approved design recommendation. It averages the named
+remaining-energy fraction over movement-controlled UAVs, defines the empty
+control set as zero, and returns a numeric list. Tests run that example
 through schema, static, fixed-sample, and empty-probe validation.
+
+### Packet boundary represented by current observations
+
+The movement loop captures the current observation before its TD3 action and
+before the first packet injection of that one-second interval. At `t=0` this is
+also before any routing-slot generation. Each 0.25-second routing slot updates
+movement/link geometry, injects VS and activated COM source packets, removes
+packets whose absolute deadline is at or before the slot start, freezes HOL
+routing decisions, serves S2U/UAV links, classifies physical GS completion, and
+then removes unfinished packets whose deadline is at or before slot end. Relay
+arrivals keep the scheduler's next-slot causality. The next movement observation
+is captured after the fourth slot's service and inclusive expiry and before the
+next interval's injection.
+
+Consequently, snapshot queues contain packets still present at that boundary;
+HOL fields describe only the FIFO head. Empty queues have a false HOL-valid flag
+and zero padding. Inclusive boundary expiry means a retained packet normally has
+a positive remaining deadline (apart from the packet epsilon); violation counts
+are historical outcomes and do not imply an expired packet remains in the
+snapshot. This trace follows `_run_routing_slot()` and the interval observation
+sites in `HRL_task_aware.py`, `PacketEngine.inject_packets()`,
+`PacketEngine.serve_active_links()`/`expire_packets()` in
+`Packet_scheduler_v1.py`, and `capture_replay_snapshot()` in
+`replay_auxiliary.py`.
+
+Observation interface v1 remains loadable for already approved artifacts and
+receives exactly its original field set. Newly approved artifacts record v2 and
+receive the named views. Runtime, resume, and evaluation build the field set from
+the artifact's recorded interface version; unknown versions fail before candidate
+execution instead of silently changing semantics.
 
 A limited AST redundancy check rejects direct scalar copies such as
 `obs["state"][i]`, including simple straight-line local aliases, and rejects

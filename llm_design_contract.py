@@ -17,19 +17,237 @@ from experiment_config import (
     S2U_COMMUNICATION_RANGE_M,
     TASK_POTENTIAL_NORMALIZATION_EPSILON,
 )
+from centralized_movement import COVERAGE_GRID_SIZE, MOVEMENT_STATE_DIM
 from llm_baseline import load_fixed_samples
+from movement_feature_schema import LOCAL_MOVEMENT_DIM, LOCAL_MOVEMENT_FEATURES
 from replay_auxiliary import SNAPSHOT_FIELD_SPECS
 
 
 CANDIDATE_SCHEMA_VERSION = "uav-hrl-llm-shared-feature-candidate-v2"
-OBS_INTERFACE_VERSION = "uav-hrl-llm-current-observation-v1"
-PROMPT_VERSION = "uav-hrl-llm-design-prompt-v7"
+LEGACY_OBS_INTERFACE_VERSION = "uav-hrl-llm-current-observation-v1"
+OBS_INTERFACE_VERSION = "uav-hrl-llm-current-observation-v2"
+SUPPORTED_OBS_INTERFACE_VERSIONS = (
+    LEGACY_OBS_INTERFACE_VERSION,
+    OBS_INTERFACE_VERSION,
+)
+PROMPT_VERSION = "uav-hrl-llm-design-prompt-v8"
 DESIGN_RUN_SCHEMA_VERSION = "uav-hrl-llm-design-run-v4"
 APPROVED_ARTIFACT_SCHEMA_VERSION = "uav-hrl-approved-shared-feature-design-v2"
 ROOT = Path(__file__).resolve().parent
 SCHEMA_PATH = ROOT / "llm_candidate_schema.json"
 PROMPT_TEMPLATE_PATH = ROOT / "prompts" / "llm_design_prompt.txt"
-OBS_KEYS = ("state", "movement_mask") + tuple(SNAPSHOT_FIELD_SPECS)
+LEGACY_OBS_KEYS = ("state", "movement_mask") + tuple(SNAPSHOT_FIELD_SPECS)
+
+
+_LOCAL_MOVEMENT_OFFSETS = {
+    item[0]: index for index, item in enumerate(LOCAL_MOVEMENT_FEATURES)
+}
+if len(_LOCAL_MOVEMENT_OFFSETS) != len(LOCAL_MOVEMENT_FEATURES):
+    raise RuntimeError("movement feature schema contains duplicate field names")
+
+
+def _local_offset(name: str) -> int:
+    try:
+        return _LOCAL_MOVEMENT_OFFSETS[name]
+    except KeyError as exc:
+        raise RuntimeError(
+            f"movement feature schema has no unique {name!r} field"
+        ) from exc
+
+
+# These are deterministic named projections of the authoritative original TD3
+# state.  They add no observations and intentionally retain the original scales.
+NAMED_STATE_FIELD_SPECS = {
+    "uav_task_search": {
+        "shape": (NUM_UAV,), "dtype": np.bool_, "unit": None,
+        "semantics": "Search task flag for each UAV; task flags are not mutually exclusive",
+        "normalization": "binary state flag != 0", "columns": ("task_search",),
+    },
+    "uav_task_vs": {
+        "shape": (NUM_UAV,), "dtype": np.bool_, "unit": None,
+        "semantics": "VS/FOV task flag for each UAV; may coexist with COM",
+        "normalization": "binary state flag != 0", "columns": ("task_fov",),
+    },
+    "uav_task_com": {
+        "shape": (NUM_UAV,), "dtype": np.bool_, "unit": None,
+        "semantics": "COM task flag for each UAV; may coexist with VS",
+        "normalization": "binary state flag != 0", "columns": ("task_com",),
+    },
+    "uav_task_hover": {
+        "shape": (NUM_UAV,), "dtype": np.bool_, "unit": None,
+        "semantics": "Hover task flag for each UAV",
+        "normalization": "binary state flag != 0", "columns": ("task_hovering",),
+    },
+    "uav_horizontal_position_normalized": {
+        "shape": (NUM_UAV, 2), "dtype": np.float32, "unit": "fraction",
+        "semantics": "current UAV horizontal position, axes [uav_id,(x,y)]",
+        "normalization": "x/environment_width and y/environment_height",
+        "columns": ("position_x", "position_y"),
+    },
+    "uav_altitude_normalized": {
+        "shape": (NUM_UAV,), "dtype": np.float32, "unit": "fraction",
+        "semantics": "current UAV altitude within configured AGL bounds",
+        "normalization": "(z-min_AGL)/(max_AGL-min_AGL)", "columns": ("position_z",),
+    },
+    "uav_remaining_energy_fraction": {
+        "shape": (NUM_UAV,), "dtype": np.float32, "unit": "fraction",
+        "semantics": "remaining UAV energy fraction",
+        "normalization": "remaining_energy/E_max", "columns": ("energy",),
+    },
+    "uav_backlog_normalized": {
+        "shape": (NUM_UAV,), "dtype": np.float32, "unit": "fraction",
+        "semantics": "aggregate UAV queue backlog in the original TD3 state",
+        "normalization": "log1p(backlog_bits)/log1p(5e7 bits)", "columns": ("backlog",),
+    },
+    "uav_vs_image_error_normalized": {
+        "shape": (NUM_UAV,), "dtype": np.float32, "unit": "normalized score",
+        "semantics": "VS image-score error; zero without a VS task",
+        "normalization": "clip((image_score-1)/3,-1,1)", "columns": ("fov_error",),
+    },
+    "uav_vs_target_horizontal_normalized": {
+        "shape": (NUM_UAV, 2), "dtype": np.float32, "unit": "fraction",
+        "semantics": "assigned VS target horizontal position, axes [uav_id,(x,y)]",
+        "normalization": "target x/width and y/height; validity follows uav_task_vs",
+        "columns": ("fov_target_x", "fov_target_y"),
+    },
+    "uav_vs_target_altitude_normalized": {
+        "shape": (NUM_UAV,), "dtype": np.float32, "unit": "fraction",
+        "semantics": "assigned VS target altitude value in the original state",
+        "normalization": "target z/UAV max AGL; validity follows uav_task_vs",
+        "columns": ("fov_target_z",),
+    },
+    "uav_com_target_horizontal_normalized": {
+        "shape": (NUM_UAV, 2), "dtype": np.float32, "unit": "fraction",
+        "semantics": "assigned COM target horizontal position, axes [uav_id,(x,y)]",
+        "normalization": "target x/width and y/height; validity follows uav_task_com",
+        "columns": ("com_target_x", "com_target_y"),
+    },
+    "uav_com_target_altitude_normalized": {
+        "shape": (NUM_UAV,), "dtype": np.float32, "unit": "fraction",
+        "semantics": "assigned COM target altitude value in the original state",
+        "normalization": "target z/UAV max AGL; validity follows uav_task_com",
+        "columns": ("com_target_z",),
+    },
+    "uav_com_reference_capacity_fraction": {
+        "shape": (NUM_UAV,), "dtype": np.float32, "unit": "fraction",
+        "semantics": "expected S2U reference-capacity ratio, not realized service or utilization",
+        "normalization": "reference S2U capacity/fixed best-feasible S2U capacity",
+        "columns": ("com_capacity",),
+    },
+    "coverage_macro_fraction": {
+        "shape": (COVERAGE_GRID_SIZE, COVERAGE_GRID_SIZE), "dtype": np.float32,
+        "unit": "fraction", "semantics": "row-major visited-cell fraction macro grid",
+        "normalization": "mean visited bitmap value in each macro cell", "coverage": True,
+    },
+    "global_coverage_fraction": {
+        "shape": (), "dtype": np.float32, "unit": "fraction",
+        "semantics": "global fraction of visited search-grid cells",
+        "normalization": "mean of the boolean visited bitmap", "global_offset": 0,
+    },
+    "discovered_roi_fraction": {
+        "shape": (), "dtype": np.float32, "unit": "fraction",
+        "semantics": "discovered RoI count divided by the configured maximum",
+        "normalization": f"discovered RoI count/{ROI_COUNT_MAX}", "global_offset": 1,
+    },
+    "remaining_episode_fraction": {
+        "shape": (), "dtype": np.float32, "unit": "fraction",
+        "semantics": "remaining movement intervals divided by episode duration",
+        "normalization": "remaining movement intervals/episode duration", "global_offset": 2,
+    },
+}
+
+for _field_name, _field_spec in NAMED_STATE_FIELD_SPECS.items():
+    if _field_name.startswith("uav_vs_target_"):
+        _field_spec["validity"] = "uav_task_vs"
+        _field_spec["missing"] = "zero when that UAV has no VS assignment"
+    elif _field_name == "uav_vs_image_error_normalized":
+        _field_spec["validity"] = "uav_task_vs"
+        _field_spec["missing"] = "zero when that UAV has no VS assignment"
+    elif _field_name.startswith("uav_com_target_"):
+        _field_spec["validity"] = "uav_task_com"
+        _field_spec["missing"] = "zero when that UAV has no COM assignment"
+    elif _field_name == "uav_com_reference_capacity_fraction":
+        _field_spec["validity"] = "uav_task_com"
+        _field_spec["missing"] = "zero when that UAV has no COM assignment"
+    else:
+        _field_spec["validity"] = "always"
+        _field_spec["missing"] = "not padded; zero is an observed normalized value"
+
+NAMED_STATE_KEYS = tuple(NAMED_STATE_FIELD_SPECS)
+OBS_KEYS = LEGACY_OBS_KEYS + NAMED_STATE_KEYS
+
+
+def obs_keys_for_interface(version: str) -> tuple[str, ...]:
+    if version == LEGACY_OBS_INTERFACE_VERSION:
+        return LEGACY_OBS_KEYS
+    if version == OBS_INTERFACE_VERSION:
+        return OBS_KEYS
+    raise ValueError(f"unsupported LLM observation interface version: {version!r}")
+
+
+def derive_named_state_fields(state: np.ndarray) -> dict[str, np.ndarray]:
+    """Derive v2 named values without mutating or re-scaling the state."""
+
+    values = np.asarray(state)
+    if values.shape[-1] != MOVEMENT_STATE_DIM:
+        raise ValueError(
+            f"movement state must end in {MOVEMENT_STATE_DIM} values, got {values.shape}"
+        )
+    uav = values[..., : NUM_UAV * LOCAL_MOVEMENT_DIM].reshape(
+        values.shape[:-1] + (NUM_UAV, LOCAL_MOVEMENT_DIM)
+    )
+    coverage_start = NUM_UAV * LOCAL_MOVEMENT_DIM
+    coverage_stop = coverage_start + COVERAGE_GRID_SIZE**2
+    result: dict[str, np.ndarray] = {}
+    for name, spec in NAMED_STATE_FIELD_SPECS.items():
+        if "columns" in spec:
+            offsets = [_local_offset(column) for column in spec["columns"]]
+            selected = uav[..., offsets]
+            if len(offsets) == 1:
+                selected = selected[..., 0]
+            if np.dtype(spec["dtype"]) == np.dtype(np.bool_):
+                selected = selected != 0.0
+            result[name] = np.asarray(selected, dtype=spec["dtype"]).copy()
+        elif spec.get("coverage"):
+            result[name] = np.asarray(
+                values[..., coverage_start:coverage_stop].reshape(
+                    values.shape[:-1] + (COVERAGE_GRID_SIZE, COVERAGE_GRID_SIZE)
+                ), dtype=spec["dtype"]
+            ).copy()
+        else:
+            index = coverage_stop + int(spec["global_offset"])
+            result[name] = np.asarray(values[..., index], dtype=spec["dtype"]).copy()
+    return result
+
+
+def named_state_scalar_index(field: str, indices: tuple[int, ...]) -> int | None:
+    """Map a scalar named-field access to its exact original-state index."""
+
+    spec = NAMED_STATE_FIELD_SPECS.get(field)
+    if spec is None:
+        return None
+    if "columns" in spec:
+        if len(spec["columns"]) == 1 and len(indices) == 1:
+            uav_id, column = indices[0], spec["columns"][0]
+        elif len(spec["columns"]) > 1 and len(indices) == 2:
+            uav_id, component = indices
+            if not 0 <= component < len(spec["columns"]):
+                return None
+            column = spec["columns"][component]
+        else:
+            return None
+        if not 0 <= uav_id < NUM_UAV:
+            return None
+        return uav_id * LOCAL_MOVEMENT_DIM + _local_offset(column)
+    coverage_start = NUM_UAV * LOCAL_MOVEMENT_DIM
+    if spec.get("coverage") and len(indices) == 2:
+        row, column = indices
+        if 0 <= row < COVERAGE_GRID_SIZE and 0 <= column < COVERAGE_GRID_SIZE:
+            return coverage_start + row * COVERAGE_GRID_SIZE + column
+        return None
+    if "global_offset" in spec and not indices:
+        return coverage_start + COVERAGE_GRID_SIZE**2 + int(spec["global_offset"])
+    return None
 
 
 def candidate_schema() -> dict[str, Any]:
@@ -71,7 +289,11 @@ def allowed_source_fields(constants: dict[str, Any]) -> set[str]:
     }
 
 
-def build_obs_arrays(fixed_arrays: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
+def build_obs_arrays(
+    fixed_arrays: dict[str, np.ndarray],
+    *,
+    interface_version: str = OBS_INTERFACE_VERSION,
+) -> dict[str, np.ndarray]:
     """Expose only action-preceding policy information to candidate code."""
     result = {
         "state": np.asarray(fixed_arrays["state"]),
@@ -79,6 +301,10 @@ def build_obs_arrays(fixed_arrays: dict[str, np.ndarray]) -> dict[str, np.ndarra
     }
     for name in SNAPSHOT_FIELD_SPECS:
         result[name] = np.asarray(fixed_arrays[f"current_{name}"])
+    if interface_version == OBS_INTERFACE_VERSION:
+        result.update(derive_named_state_fields(result["state"]))
+    if set(result) != set(obs_keys_for_interface(interface_version)):
+        raise ValueError("offline observation field set is incompatible")
     return result
 
 
@@ -341,6 +567,19 @@ def runtime_diagnostic_contract(
                 "true exactly where centralized movement control owns the UAV"
             ),
         },
+        "named_state_fields": {
+            name: {
+                "shape": list(spec["shape"]),
+                "dtype": np.dtype(spec["dtype"]).name,
+                "unit": spec["unit"],
+                "semantics": spec["semantics"],
+                "normalization": spec["normalization"],
+                "validity": spec["validity"],
+                "missing": spec["missing"],
+                "source": "deterministic projection of authoritative obs.state",
+            }
+            for name, spec in NAMED_STATE_FIELD_SPECS.items()
+        },
     }
 
 
@@ -438,20 +677,51 @@ def render_environment_interface(
     include_system_semantics: bool = True,
 ) -> str:
     num_uav = int(constants_metadata["num_uav"]["value"])
+    saved_state_schema = fixed_metadata["compatibility_contract"][
+        "source_checkpoint_contract"
+    ].get("movement_state_feature_schema") or {}
+    saved_state_dimension = int(saved_state_schema.get("dimension", MOVEMENT_STATE_DIM))
     max_task_slots = int(SNAPSHOT_FIELD_SPECS["task_type"]["shape"][1])
     lines = [
         f"Interface version: {OBS_INTERFACE_VERSION}",
+        "Current observable information available before the TD3 movement action:",
         "Timing: every obs value is current-only and available before the movement action. No action, next-state, post-action delivery/energy/penalty, lambda, checkpoint, episode, scenario, or source identity is exposed.",
         "",
-        *_state_schema_lines(fixed_metadata),
+        (
+            f"obs['state']: shape ({saved_state_dimension},), dtype float32; the original "
+            "TD3 state is retained unchanged for compatibility. Prefer the named "
+            "deterministic views below instead of reconstructing its indices."
+        ),
         f"obs['movement_mask']: shape ({num_uav},), bool; true exactly where centralized movement control owns the UAV. An all-false mask is legal.",
         "",
-        "Current auxiliary fields (all arrays are per one observation):",
+        "Named deterministic views of the original TD3 state:",
+        "Format: obs key (shape) dtype unit; valid=condition; missing=value/rule; meaning; norm=formula.",
     ]
-    for name, spec in SNAPSHOT_FIELD_SPECS.items():
+    for name, spec in NAMED_STATE_FIELD_SPECS.items():
         lines.append(
-            f"- obs['{name}']: shape {tuple(spec['shape'])}, dtype {np.dtype(spec['dtype']).name}, "
-            f"unit {spec['unit'] or 'none'}, validity {spec['mask'] or 'always/own valid flag'}; {spec['semantics']}."
+            f"- {name} {tuple(spec['shape'])} {np.dtype(spec['dtype']).name} "
+            f"{spec['unit'] or 'none'}; valid={spec['validity']}; "
+            f"missing={spec['missing']}; {spec['semantics']}; norm={spec['normalization']}"
+        )
+    lines.extend([
+        "",
+        "Current auxiliary fields (all arrays are per one observation):",
+        "Format: obs key (shape) dtype unit; valid=condition; invalid=padding; meaning.",
+    ])
+    for name, spec in SNAPSHOT_FIELD_SPECS.items():
+        dtype = np.dtype(spec["dtype"])
+        if name.endswith("_id"):
+            padding = "-1"
+        elif name in {"task_type", "uav_hol_type"}:
+            padding = "documented NONE code"
+        elif dtype == np.dtype(np.bool_):
+            padding = "false"
+        else:
+            padding = "zero"
+        lines.append(
+            f"- {name} {tuple(spec['shape'])} {dtype.name} {spec['unit'] or 'none'}; "
+            f"valid={spec['mask'] or 'own/always'}; invalid={padding}; "
+            f"{spec['semantics']}"
         )
     lines.extend(
         (
@@ -481,12 +751,13 @@ def render_environment_interface(
     lines.extend(
         (
             "",
-            "constants contains these verified fixed entries (candidate code accesses constants[name] to get the value):",
+            "constants contains verified fixed entries; rows are key dtype unit = value; meaning; source:",
         )
     )
     for name, item in constants_metadata.items():
         lines.append(
-            f"- constants['{name}']: {item['dtype']}, unit {item['unit'] or 'none'}, value={json.dumps(item['value'], separators=(',', ':'))}; {item['meaning']}; source={item['source']}."
+            f"- {name} {item['dtype']} {item['unit'] or 'none'} = "
+            f"{json.dumps(item['value'], separators=(',', ':'))}; {item['meaning']}; {item['source']}"
         )
     return "\n".join(lines)
 
@@ -497,21 +768,21 @@ def minimal_model_candidate_example() -> dict[str, Any]:
     return {
         "features": [
             {
-                "name": "controlled_uav_nonempty_queue_fraction",
+                "name": "controlled_uav_mean_energy_fraction",
                 "description": (
-                    "Fraction of controlled UAVs with valid queue summaries that are "
-                    "nonempty; fixed [0,1] normalization, with 0 for an empty valid set."
+                    "Mean remaining-energy fraction of TD3-controlled UAVs, or 0 for "
+                    "an empty movement mask; zero weight demonstrates the interface."
                 ),
                 "reward_weight": 0.0,
             }
         ],
         "code": (
             "def compute_extra_state(obs, constants):\n"
-            "    applicable = obs[\"movement_mask\"] & obs[\"uav_queue_valid\"]\n"
-            "    count = int(np.count_nonzero(applicable))\n"
+            "    controlled = obs[\"movement_mask\"]\n"
+            "    count = int(np.count_nonzero(controlled))\n"
             "    value = 0.0\n"
             "    if count > 0:\n"
-            "        value = float(np.count_nonzero(applicable & (~obs[\"uav_queue_empty\"]))) / float(count)\n"
+            "        value = float(np.mean(obs[\"uav_remaining_energy_fraction\"][controlled]))\n"
             "    return [value]\n"
         ),
     }
@@ -559,7 +830,7 @@ def baseline_lines(baseline_report: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def movement_and_energy_spec(constants_metadata: dict[str, Any]) -> str:
+def movement_and_energy_summary(constants_metadata: dict[str, Any]) -> str:
     width = constants_metadata["environment_width_m"]["value"]
     height = constants_metadata["environment_height_m"]["value"]
     return (
@@ -573,16 +844,36 @@ def movement_and_energy_spec(constants_metadata: dict[str, Any]) -> str:
         f"clips x to [0,{width:g}] m and y to [0,{height:g}] m and altitude to the "
         "UAV's configured AGL bounds; UAV 0 is additionally projected inside the "
         "configured hard 3-D GS gateway sphere. Energy is charged from actual projected "
-        "displacement: E=P(v)*dt. For speed V=||v||, direction q=v/V (zero when "
-        "V=0), climb sine s=v_z/V (zero when V=0), and per-rotor thrust "
-        "T=||m*(0,0,-g)-0.5*rho*V^2*S_FP*q||/n_r, the canonical power is "
-        "P=n_r*(P_profile+P_induced+P_climb+P_parasite), where "
-        "P_profile=(delta/8)*(T/(c_T*rho*A)+3*V^2)*sqrt(T*rho*c_s^2*A/c_T), "
-        "P_induced=(1+c_f)*T*sqrt(sqrt(T^2/(4*rho^2*A^2)+V^4/4)-V^2/2), "
-        "P_climb=m*g*V*s/n_r, and P_parasite=0.5*d_0*V^3*rho*c_s*A. It uses "
-        "n_r=4, rho=1.293 kg/m^3, "
-        "S_FP=0.01 m^2, g=9.8 m/s^2, m=2 kg, delta=0.012, c_T=0.302, "
-        "c_s=0.0955, c_f=0.131, rotor area A=0.0314 m^2, and d_0=0.834."
+        "displacement, not the unclipped command: E=P(v_actual)*dt. The canonical rotor "
+        "model sums profile, induced, climb, and cubic parasite power using actual 3-D "
+        "speed and climb direction. Its speed-power relation is not assumed monotonic; "
+        "do not replace it with a 'faster always costs more' rule."
+    )
+
+
+def movement_and_energy_spec(constants_metadata: dict[str, Any]) -> str:
+    return movement_and_energy_summary(constants_metadata)
+
+
+def packet_lifecycle_and_observation_timing() -> str:
+    return (
+        "At each movement boundary, current obs and its replay snapshot are captured "
+        "before the TD3 action and before that interval's first packet generation. The "
+        "initial t=0 observation is therefore before any slot injection. In every 0.25 s "
+        "slot, movement and link geometry are updated; valid VS captures create packets "
+        "directly in their sensing-UAV queues and activated COM sessions create packets "
+        "in their SR queues at slot start; packets with absolute deadline at or before "
+        "that time are "
+        "removed; frozen HOL routing decisions and S2U/UAV service then run; relay "
+        "arrivals follow existing next-slot queue causality; GS delivery is classified "
+        "at physical completion time; and unfinished packets whose deadline is at or "
+        "before slot end are removed. After the fourth slot, the next observation is "
+        "captured at the integer-second boundary, after service and slot-end expiry and "
+        "before the next interval's injection. Queue fields contain only packets still "
+        "present at that boundary. HOL fields describe only the FIFO head; empty queues "
+        "have false HOL-valid flags and zero padding. Inclusive expiry means active HOL "
+        "remaining deadlines are positive apart from the documented numerical tolerance; "
+        "historical violations are outcome counters, not retained expired queue entries."
     )
 
 
@@ -634,10 +925,11 @@ def render_prompt(
 ) -> str:
     template = PROMPT_TEMPLATE_PATH.read_text(encoding="utf-8")
     replacements = {
-        "{{MOVEMENT_AND_ENERGY_SPEC}}": movement_and_energy_spec(constants_metadata),
+        "{{MOVEMENT_AND_ENERGY_SUMMARY}}": movement_and_energy_summary(constants_metadata),
         "{{VISUAL_SENSING_SPEC}}": visual_sensing_spec(constants_metadata),
         "{{COMMUNICATION_SPEC}}": communication_spec(constants_metadata),
-        "{{INPUT_FIELD_TABLE}}": render_environment_interface(
+        "{{PACKET_LIFECYCLE_AND_OBSERVATION_TIMING}}": packet_lifecycle_and_observation_timing(),
+        "{{NAMED_INPUT_FIELD_TABLE}}": render_environment_interface(
             fixed_metadata, constants_metadata, include_system_semantics=False
         ),
         "{{BETA}}": format(float(beta), ".17g"),

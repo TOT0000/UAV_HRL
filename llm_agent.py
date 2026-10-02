@@ -96,6 +96,8 @@ from llm_design_contract import (
     format_schema_and_example,
     load_design_inputs,
     model_candidate_schema,
+    movement_and_energy_summary,
+    packet_lifecycle_and_observation_timing,
     render_environment_interface,
     runtime_diagnostic_contract,
 )
@@ -107,7 +109,7 @@ from llm_streaming import (
 
 
 AGENT_RUN_SCHEMA_VERSION = "uav-hrl-llm-feature-agent-run-v1"
-AGENT_PROMPT_VERSION = "uav-hrl-llm-feature-agent-prompt-v6"
+AGENT_PROMPT_VERSION = "uav-hrl-llm-feature-agent-prompt-v7"
 AGENT_TOOL_CONTRACT_VERSION = "uav-hrl-llm-feature-agent-tools-v8"
 DEFAULT_MAX_MODEL_CALLS = 20
 DEFAULT_AGENT_OUTPUT_ROOT = Path("results") / "llm_agents"
@@ -741,8 +743,13 @@ def _render_agent_prompt(
         + baseline_lines(baseline)
     )
     replacements = {
-        "{{ENVIRONMENT_AND_INPUT_CONTRACT}}": render_environment_interface(
-            fixed_metadata, constants_metadata
+        "{{ENVIRONMENT_AND_INPUT_CONTRACT}}": (
+            "Movement and energy:\n"
+            + movement_and_energy_summary(constants_metadata)
+            + "\n\nPacket lifecycle and observation timing:\n"
+            + packet_lifecycle_and_observation_timing()
+            + "\n\nNamed current-only input contract:\n"
+            + render_environment_interface(fixed_metadata, constants_metadata)
         ),
         "{{CANDIDATE_CONTRACT_AND_EXAMPLE}}": candidate_contract,
         "{{EVALUATION_SETTINGS_AND_BASELINE}}": evaluation,

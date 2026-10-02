@@ -2155,7 +2155,7 @@ def test_context_compaction_keeps_complete_candidate_and_tool_pairs(tmp_path):
         model=model.model_id,
         model_backend=model,
         max_model_calls=4,
-        context_length=19_000,
+        context_length=20_250,
         max_output_tokens=1_024,
         output_dir=tmp_path / "compaction",
     )
@@ -2239,7 +2239,7 @@ def test_pending_query_page_survives_compaction_into_actual_request(tmp_path):
         model="gpt-4o",
         model_backend=model,
         max_model_calls=3,
-        context_length=19_000,
+        context_length=21_500,
         max_output_tokens=1_024,
         output_dir=tmp_path / "pending-query-compaction",
     )
@@ -2494,7 +2494,7 @@ def test_pending_result_that_cannot_fit_stops_before_incomplete_request(tmp_path
         model=model.model_id,
         model_backend=model,
         max_model_calls=2,
-        context_length=17_500,
+        context_length=19_500,
         max_output_tokens=1_024,
         output_dir=tmp_path / "pending-does-not-fit",
     )
@@ -2973,7 +2973,7 @@ def test_pending_oversized_evaluation_summary_reaches_actual_model_request(
         workspace, candidate_id
     )
     workspace.state["current_candidate_id"] = None
-    workspace.state["request_settings"] = _request_settings(context_length=20_000)
+    workspace.state["request_settings"] = _request_settings(context_length=25_000)
     workspace.state["status"] = "paused_budget_exhausted"
     workspace._save()
 

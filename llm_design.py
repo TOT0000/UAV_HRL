@@ -36,6 +36,8 @@ from llm_candidate import (
 )
 from llm_design_contract import (
     DESIGN_RUN_SCHEMA_VERSION,
+    OBS_INTERFACE_VERSION,
+    NAMED_STATE_FIELD_SPECS,
     PROMPT_VERSION,
     build_obs_arrays,
     candidate_schema,
@@ -788,6 +790,22 @@ def _source_field_contract(
         }
     if source_field.startswith("obs."):
         name = source_field[4:]
+        named = NAMED_STATE_FIELD_SPECS.get(name)
+        if named is not None:
+            return {
+                "timing": "current-only; deterministic view of obs.state",
+                "shape": list(named["shape"]),
+                "dtype": np.dtype(named["dtype"]).name,
+                "unit": named["unit"],
+                "semantics": named["semantics"],
+                "normalization": named["normalization"],
+                "validity_field": (
+                    None
+                    if named["validity"] == "always"
+                    else f"obs.{named['validity']}"
+                ),
+                "missing_data_rule": named["missing"],
+            }
         spec = SNAPSHOT_FIELD_SPECS.get(name)
         if spec is None:
             return {"limitation": "field is not in the current observation contract"}
@@ -841,6 +859,13 @@ def _candidate_diagnostic_dependencies(
         if not field.startswith("obs."):
             continue
         name = field[4:]
+        named = NAMED_STATE_FIELD_SPECS.get(name)
+        if named is not None and named["validity"] != "always":
+            validity_field = f"obs.{named['validity']}"
+            add_support(
+                validity_field,
+                f"is the authoritative validity flag for {field}",
+            )
         spec = SNAPSHOT_FIELD_SPECS.get(name)
         if spec is not None:
             if field != "obs.snapshot_valid":
@@ -3085,7 +3110,7 @@ def run_design(
             "all_lambdas_must_pass": True,
             "candidate_pair_reselection": False,
         },
-        "observation_interface_version": "uav-hrl-llm-current-observation-v1",
+        "observation_interface_version": OBS_INTERFACE_VERSION,
         "dry_run": bool(dry_run),
     }
     _write_json(output / "constants.json", constants_metadata)

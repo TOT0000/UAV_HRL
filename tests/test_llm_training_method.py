@@ -9,6 +9,7 @@ from types import SimpleNamespace
 from experiment_config import MethodSpec, effective_training_config
 from HRL_task_aware import TrainingConfig, _evaluate_llm_observation, train
 from llm_candidate import CandidateError, load_approved_design, save_approved_artifact
+from llm_design_contract import LEGACY_OBS_INTERFACE_VERSION
 from llm_runtime import (
     ApprovedDesignRuntime,
     artifact_identity,
@@ -21,10 +22,16 @@ from replay_auxiliary import empty_snapshot
 from run_experiment import build_parser, run as run_experiment_training
 from paper_evaluation import run_paper_evaluation
 from scenario_manifest import generate_manifest
+from centralized_movement import MOVEMENT_STATE_DIM, movement_state_feature_schema
 from utils_update_v2 import ReplayBufferJoint
 
 
-def _approved_fixture(root: Path, *, name="integration-fixture-only"):
+def _approved_fixture(
+    root: Path,
+    *,
+    name="integration-fixture-only",
+    observation_interface_version=None,
+):
     constants = {
         name: {
             "value": value,
@@ -41,6 +48,24 @@ def _approved_fixture(root: Path, *, name="integration-fixture-only"):
             "com_deadline_seconds": 2.0,
         }.items()
     }
+    legacy = observation_interface_version == LEGACY_OBS_INTERFACE_VERSION
+    source_field = "obs.state" if legacy else "obs.uav_remaining_energy_fraction"
+    formula = (
+        "clip(abs(state[1]),0,1)"
+        if legacy
+        else "mean(uav_remaining_energy_fraction)"
+    )
+    code = (
+        "def compute_extra_state(obs, constants):\n"
+        '    x = np.clip(np.abs(obs["state"][1]), 0.0, 1.0)\n'
+        "    return np.asarray([x], dtype=np.float32)\n\n"
+        if legacy
+        else (
+            "def compute_extra_state(obs, constants):\n"
+            '    x = np.mean(obs["uav_remaining_energy_fraction"])\n'
+            "    return np.asarray([x], dtype=np.float32)\n\n"
+        )
+    )
     candidate = {
         "schema_version": "uav-hrl-llm-shared-feature-candidate-v2",
         "candidate_name": name,
@@ -51,19 +76,18 @@ def _approved_fixture(root: Path, *, name="integration-fixture-only"):
             "dtype": "float32",
             "description": "Test-only derived state feature.",
             "range": {"minimum": 0.0, "maximum": 1.0},
-            "source_fields": ["obs.state"],
-            "formula": "clip(abs(state[1]),0,1)",
+            "source_fields": [source_field],
+            "formula": formula,
             "missing_data_rule": "state is required",
             "reward_weight": 2.5,
         }],
-        "code": (
-            "def compute_extra_state(obs, constants):\n"
-            '    x = np.clip(np.abs(obs["state"][1]), 0.0, 1.0)\n'
-            "    return np.asarray([x], dtype=np.float32)\n\n"
-        ),
+        "code": code,
     }
     run = root / f"design-run-{name}"
     run.mkdir(parents=True)
+    kwargs = {}
+    if observation_interface_version is not None:
+        kwargs["observation_interface_version"] = observation_interface_version
     return save_approved_artifact(
         run,
         candidate=candidate,
@@ -76,7 +100,32 @@ def _approved_fixture(root: Path, *, name="integration-fixture-only"):
             "model_actual": "fixture/model",
             "fixture_only": True,
         },
+        **kwargs,
     )
+
+
+def test_legacy_v1_artifact_keeps_original_observation_field_set(tmp_path):
+    approved = _approved_fixture(
+        tmp_path,
+        name="legacy-v1-fixture",
+        observation_interface_version=LEGACY_OBS_INTERFACE_VERSION,
+    )
+    design = load_approved_design(approved)
+    state = np.asarray([0.5, -0.4, 0.0], dtype=np.float32)
+    obs = build_online_obs(
+        state,
+        np.zeros(16, dtype=bool),
+        empty_snapshot(),
+        interface_version=LEGACY_OBS_INTERFACE_VERSION,
+    )
+    assert "uav_remaining_energy_fraction" not in obs
+    runtime = ApprovedDesignRuntime(design, design.constants_metadata, timeout=10)
+    try:
+        extra, reward = runtime.evaluate(obs)
+    finally:
+        runtime.close()
+    assert extra.tolist() == pytest.approx([0.4])
+    assert reward == pytest.approx(1.0)
 
 
 def test_method_registry_and_cli_contract_are_isolated():
@@ -136,7 +185,13 @@ def test_persistent_runtime_matches_offline_adapter_and_dynamic_constants(tmp_pa
         episode_seconds=3,
         task_deadlines_seconds={"FOV": 2.5, "COM": 2.0},
     )
-    state = np.asarray([0.5, -0.4, 0.0], dtype=np.float32)
+    state = np.zeros(MOVEMENT_STATE_DIM, dtype=np.float32)
+    energy_indices = [
+        item["index"]
+        for item in movement_state_feature_schema()["features"]
+        if item["name"].endswith(".energy")
+    ]
+    state[energy_indices] = 0.4
     obs = build_online_obs(state, np.zeros(16, dtype=bool), empty_snapshot())
     runtime = ApprovedDesignRuntime(design, metadata, timeout=10)
     try:

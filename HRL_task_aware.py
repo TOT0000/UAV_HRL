@@ -2774,6 +2774,7 @@ def train(
                         original_state,
                         current_movement_mask,
                         current_auxiliary_snapshot,
+                        interface_version=llm_runtime.observation_interface_version,
                     )
                     current_extra, llm_extra_reward = (
                         _evaluate_llm_observation(
@@ -3076,6 +3077,7 @@ def train(
                     original_next_state,
                     next_movement_mask,
                     next_auxiliary_snapshot,
+                    interface_version=llm_runtime.observation_interface_version,
                 )
                 next_extra = _evaluate_llm_observation(
                     llm_runtime,

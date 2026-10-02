@@ -24,10 +24,12 @@ from llm_design_contract import (
     APPROVED_ARTIFACT_SCHEMA_VERSION,
     CANDIDATE_SCHEMA_VERSION,
     OBS_INTERFACE_VERSION,
+    SUPPORTED_OBS_INTERFACE_VERSIONS,
     allowed_source_fields,
     build_obs_arrays,
     candidate_schema,
     model_candidate_schema,
+    named_state_scalar_index,
     runtime_constants,
 )
 
@@ -1320,6 +1322,39 @@ def _direct_original_state_index(node: ast.AST) -> int | None:
         "np.asarray",
     } and len(node.args) == 1:
         node = node.args[0]
+    # A scalar v2 named view is still a direct original-state scalar.  Parse
+    # literal one- or two-dimensional indexing without treating aggregations as
+    # copies.
+    named_indices: tuple[int, ...] = ()
+    named_source = node
+    if isinstance(node, ast.Subscript):
+        raw = node.slice
+        if isinstance(raw, ast.Tuple):
+            parts = raw.elts
+        else:
+            parts = [raw]
+        parsed = []
+        for part in parts:
+            value = part.value if isinstance(part, ast.Constant) else None
+            if not isinstance(value, int) or isinstance(value, bool):
+                break
+            parsed.append(int(value))
+        else:
+            named_indices = tuple(parsed)
+            named_source = node.value
+    if (
+        isinstance(named_source, ast.Subscript)
+        and isinstance(named_source.value, ast.Name)
+        and named_source.value.id == "obs"
+        and isinstance(named_source.slice, ast.Constant)
+        and isinstance(named_source.slice.value, str)
+    ):
+        mapped = named_state_scalar_index(
+            named_source.slice.value, named_indices
+        )
+        if mapped is not None:
+            return mapped
+
     if not isinstance(node, ast.Subscript):
         return None
     index = node.slice.value if isinstance(node.slice, ast.Constant) else None
@@ -2359,7 +2394,12 @@ def save_approved_artifact(
     validation_report: dict[str, Any],
     evaluation_report: dict[str, Any],
     provenance: dict[str, Any],
+    observation_interface_version: str = OBS_INTERFACE_VERSION,
 ) -> Path:
+    if observation_interface_version not in SUPPORTED_OBS_INTERFACE_VERSIONS:
+        raise CandidateError(
+            f"unsupported approved-artifact observation interface: {observation_interface_version!r}"
+        )
     approved = Path(run_directory) / "approved"
     approved.mkdir()
     candidate_path = approved / "candidate.json"
@@ -2386,7 +2426,7 @@ def save_approved_artifact(
         "schema_version": APPROVED_ARTIFACT_SCHEMA_VERSION,
         "status": "approved",
         "candidate_schema_version": CANDIDATE_SCHEMA_VERSION,
-        "observation_interface_version": OBS_INTERFACE_VERSION,
+        "observation_interface_version": observation_interface_version,
         "candidate_name": candidate["candidate_name"],
         "feature_count": len(candidate["features"]),
         "feature_order": [item["name"] for item in candidate["features"]],
@@ -2434,7 +2474,13 @@ class ApprovedDesign:
     def evaluate_fixed_samples(
         self, fixed_arrays: dict[str, np.ndarray], *, timeout: float = 60.0
     ) -> tuple[np.ndarray, np.ndarray]:
-        return self.evaluate_obs_arrays(build_obs_arrays(fixed_arrays), timeout=timeout)
+        return self.evaluate_obs_arrays(
+            build_obs_arrays(
+                fixed_arrays,
+                interface_version=self.artifact["observation_interface_version"],
+            ),
+            timeout=timeout,
+        )
 
 
 def load_approved_design(directory: str | Path) -> ApprovedDesign:
@@ -2452,6 +2498,13 @@ def load_approved_design(directory: str | Path) -> ApprovedDesign:
         )
     if artifact.get("status") != "approved":
         raise CandidateError("artifact status is not approved")
+    interface_version = artifact.get("observation_interface_version")
+    if interface_version not in SUPPORTED_OBS_INTERFACE_VERSIONS:
+        raise CandidateError(
+            "approved artifact observation interface is incompatible: "
+            f"received {interface_version!r}; supported versions are "
+            f"{SUPPORTED_OBS_INTERFACE_VERSIONS!r}"
+        )
     content_hash = artifact.pop("content_sha256", None)
     expected = hashlib.sha256(
         json.dumps(

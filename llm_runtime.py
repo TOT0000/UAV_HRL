@@ -19,7 +19,12 @@ from llm_candidate_worker import (
     _run_function,
     _validate_output_ranges,
 )
-from llm_design_contract import OBS_KEYS, runtime_constants
+from llm_design_contract import (
+    OBS_INTERFACE_VERSION,
+    derive_named_state_fields,
+    obs_keys_for_interface,
+    runtime_constants,
+)
 from replay_auxiliary import SNAPSHOT_FIELD_SPECS
 
 
@@ -115,7 +120,13 @@ def runtime_constants_metadata(
     return metadata
 
 
-def build_online_obs(state, movement_mask, snapshot) -> dict[str, np.ndarray]:
+def build_online_obs(
+    state,
+    movement_mask,
+    snapshot,
+    *,
+    interface_version: str = OBS_INTERFACE_VERSION,
+) -> dict[str, np.ndarray]:
     if set(snapshot) != set(SNAPSHOT_FIELD_SPECS):
         raise LLMRuntimeError("online snapshot field set is incompatible")
     obs = {
@@ -131,12 +142,14 @@ def build_online_obs(state, movement_mask, snapshot) -> dict[str, np.ndarray]:
                 f"online snapshot {name} has incompatible shape or dtype"
             )
         obs[name] = value.copy()
-    if set(obs) != set(OBS_KEYS):
+    if interface_version == OBS_INTERFACE_VERSION:
+        obs.update(derive_named_state_fields(obs["state"]))
+    if set(obs) != set(obs_keys_for_interface(interface_version)):
         raise LLMRuntimeError("online observation field set is incompatible")
     return obs
 
 
-def _worker_main(connection, candidate, constants):
+def _worker_main(connection, candidate, constants, observation_interface_version):
     try:
         namespace = {"__builtins__": SAFE_BUILTINS, "np": np}
         exec(
@@ -152,7 +165,7 @@ def _worker_main(connection, candidate, constants):
             if request is None:
                 return
             obs = request["obs"]
-            if set(obs) != set(OBS_KEYS):
+            if set(obs) != set(obs_keys_for_interface(observation_interface_version)):
                 raise ValueError("runtime exposes an unexpected observation field set")
             for value in obs.values():
                 value.setflags(write=False)
@@ -190,6 +203,9 @@ class ApprovedDesignRuntime:
         if not math.isfinite(float(self.timeout)) or float(self.timeout) <= 0.0:
             raise ValueError("LLM worker timeout must be finite positive")
         self.identity = artifact_identity(self.design)
+        self.observation_interface_version = self.identity[
+            "observation_interface_version"
+        ]
         self.beta = float(self.identity["beta"])
         self.constants = runtime_constants(self.constants_metadata)
         context = mp.get_context("spawn")
@@ -197,7 +213,12 @@ class ApprovedDesignRuntime:
         self._connection = parent
         self._process = context.Process(
             target=_worker_main,
-            args=(child, self.design.candidate, self.constants),
+            args=(
+                child,
+                self.design.candidate,
+                self.constants,
+                self.observation_interface_version,
+            ),
             daemon=True,
         )
         self._process.start()
