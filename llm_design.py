@@ -86,12 +86,17 @@ DEFAULT_OUTPUT_ROOT = Path("results") / "llm_designs"
 DEFAULT_FAILED_CONTENT_LIMIT = 12_000
 EVALUATION_DIAGNOSTICS_VERSION = "uav-hrl-lipschitz-evaluation-diagnostics-v2"
 EVALUATION_FINDING_ABSOLUTE_TOLERANCE = 1e-6
+PAIRWISE_DIAGNOSTICS_VERSION = "uav-hrl-single-feature-pairwise-diagnostics-v1"
+PAIRWISE_CLASSIFICATION_ABSOLUTE_TOLERANCE = 1e-12
+PAIRWISE_CLASSIFICATION_RELATIVE_TOLERANCE = 1e-6
 
 EVALUATION_REVISION_INSTRUCTION = """Your candidate passed the implementation checks but did not meet
 the Lipschitz improvement criterion.
 
 Evaluation diagnostics:
 {evaluation_diagnostics}
+
+{single_feature_pairwise_feedback}
 
 Review the diagnostics before revising:
 
@@ -112,6 +117,18 @@ Review the diagnostics before revising:
 Perform this review internally. Briefly explain the reasons for your
 changes in the existing feature descriptions, and return the complete
 revised candidate JSON under the unchanged interface and evaluation rules."""
+
+SINGLE_FEATURE_PAIRWISE_GUIDANCE = """The table evaluates each feature separately: it adds only that feature to the original state and adds its weighted contribution to the baseline reward. The percentages report pairwise ratios that improve, remain unchanged, or worsen relative to the baseline. The full-candidate row uses all proposed features and their current weights.
+
+Use the task objective, single-feature results, and critical-pair diagnostics to revise the design:
+
+- Features with higher improvement percentages may be retained or considered for increased weight.
+- For features with higher worsening percentages, review the formula, data selection, normalization, and the sign and magnitude of the weight.
+- Features unsuitable for directly contributing to the reward may be removed.
+
+Check that the behavior encouraged by each formula and weight matches its description and the task objective.
+
+These results apply to the current weights. Increasing a weight or combining features still requires re-evaluating the complete candidate. The existing maximum pairwise-ratio acceptance criterion remains unchanged."""
 
 
 class APIError(RuntimeError):
@@ -622,6 +639,133 @@ def _numeric_distribution(values: np.ndarray) -> dict[str, Any]:
         "p95": float(np.quantile(values, 0.95)),
         "maximum": float(np.max(values)),
         "mean": float(np.mean(values)),
+    }
+
+
+def _pairwise_classification_counts(
+    baseline_ratios: np.ndarray,
+    candidate_ratios: np.ndarray,
+) -> np.ndarray:
+    """Count improved/unchanged/worsened pairs for one or more candidates."""
+
+    baseline = np.asarray(baseline_ratios, dtype=np.float64).reshape(-1)
+    candidate = np.asarray(candidate_ratios, dtype=np.float64)
+    if candidate.ndim == 1:
+        candidate = candidate[:, np.newaxis]
+    if candidate.ndim != 2 or candidate.shape[0] != baseline.size:
+        raise ValueError("pairwise ratio arrays have incompatible shapes")
+    tolerance = np.maximum(
+        PAIRWISE_CLASSIFICATION_ABSOLUTE_TOLERANCE,
+        PAIRWISE_CLASSIFICATION_RELATIVE_TOLERANCE * np.abs(baseline),
+    )[:, np.newaxis]
+    reference = baseline[:, np.newaxis]
+    improved = candidate < reference - tolerance
+    worsened = candidate > reference + tolerance
+    unchanged = ~(improved | worsened)
+    return np.stack(
+        (
+            np.count_nonzero(improved, axis=0),
+            np.count_nonzero(unchanged, axis=0),
+            np.count_nonzero(worsened, axis=0),
+        ),
+        axis=1,
+    ).astype(np.int64, copy=False)
+
+
+def _pairwise_percentage(count: int, total: int) -> float | None:
+    return None if total == 0 else float(count) * 100.0 / float(total)
+
+
+def _single_feature_pairwise_report(
+    *,
+    context: "EvaluationContext",
+    candidate: dict[str, Any],
+    counts_by_lambda: dict[str, dict[str, np.ndarray]],
+    beta: float,
+) -> dict[str, Any]:
+    pair_count = int(np.count_nonzero(context.primary_mask))
+    result_by_lambda: dict[str, Any] = {}
+    for lambda_value in context.lambdas:
+        key = format(lambda_value, ".17g")
+        counts = counts_by_lambda[key]
+        rows = []
+        for feature_index, definition in enumerate(candidate["features"]):
+            improved, unchanged, worsened = map(
+                int, counts["features"][feature_index]
+            )
+            if improved + unchanged + worsened != pair_count:
+                raise RuntimeError("single-feature pair classification is incomplete")
+            rows.append(
+                {
+                    "row_kind": "single_feature",
+                    "feature_index": int(feature_index),
+                    "feature_name": str(definition["name"]),
+                    "current_reward_weight": float(definition["reward_weight"]),
+                    "pair_count": pair_count,
+                    "improved_count": improved,
+                    "unchanged_count": unchanged,
+                    "worsened_count": worsened,
+                    "improved_percent": _pairwise_percentage(improved, pair_count),
+                    "unchanged_percent": _pairwise_percentage(unchanged, pair_count),
+                    "worsened_percent": _pairwise_percentage(worsened, pair_count),
+                }
+            )
+        improved, unchanged, worsened = map(int, counts["full_candidate"])
+        if improved + unchanged + worsened != pair_count:
+            raise RuntimeError("full-candidate pair classification is incomplete")
+        rows.append(
+            {
+                "row_kind": "full_candidate",
+                "feature_index": None,
+                "feature_name": "full candidate",
+                "current_reward_weight": "all current weights",
+                "pair_count": pair_count,
+                "improved_count": improved,
+                "unchanged_count": unchanged,
+                "worsened_count": worsened,
+                "improved_percent": _pairwise_percentage(improved, pair_count),
+                "unchanged_percent": _pairwise_percentage(unchanged, pair_count),
+                "worsened_percent": _pairwise_percentage(worsened, pair_count),
+            }
+        )
+        result_by_lambda[key] = {
+            "lambda_mbit_per_joule": float(lambda_value),
+            "primary_pair_count": pair_count,
+            "rows": rows,
+        }
+    return {
+        "schema_version": PAIRWISE_DIAGNOSTICS_VERSION,
+        "scope": (
+            "each single-feature row independently augments the original state with "
+            "only that feature and augments baseline reward with beta times its current "
+            "weight and value; the full-candidate row uses all current features and weights"
+        ),
+        "comparison_baseline": (
+            "original state and reconstructed baseline reward on the unchanged fixed "
+            "primary pair set"
+        ),
+        "primary_pair_set_sha256": context.pair_hash,
+        "primary_pair_count": pair_count,
+        "beta": float(beta),
+        "formulas": {
+            "baseline_ratio": "abs(r_base_i-r_base_j)/norm(s_i-s_j,2)",
+            "single_feature_state": "concat(s_i,[f_i_k])",
+            "single_feature_reward": "r_base_i + beta*w_k*f_i_k",
+            "full_candidate": "all proposed features and all current reward weights",
+            "pair_tolerance": "max(1e-12,1e-6*abs(baseline_pair_ratio))",
+        },
+        "classification": {
+            "improved": "candidate_ratio < baseline_ratio - pair_tolerance",
+            "unchanged": "otherwise within the inclusive tolerance band",
+            "worsened": "candidate_ratio > baseline_ratio + pair_tolerance",
+            "absolute_tolerance": PAIRWISE_CLASSIFICATION_ABSOLUTE_TOLERANCE,
+            "relative_tolerance": PAIRWISE_CLASSIFICATION_RELATIVE_TOLERANCE,
+            "formal_acceptance_criterion_changed": False,
+        },
+        "percent_scale": "0-100",
+        "percentages_are_unrounded_in_report": True,
+        "candidate_pair_reselection": False,
+        "by_lambda": result_by_lambda,
     }
 
 
@@ -1426,6 +1570,17 @@ def evaluate_candidate(
         key: {"ratio": -math.inf, "rank": None, "pair": None}
         for key in candidate_rewards
     }
+    feature_weights = np.asarray(
+        [float(item["reward_weight"]) for item in candidate["features"]],
+        dtype=np.float64,
+    )
+    pairwise_counts = {
+        key: {
+            "features": np.zeros((extra.shape[1], 3), dtype=np.int64),
+            "full_candidate": np.zeros(3, dtype=np.int64),
+        }
+        for key in candidate_rewards
+    }
     excluded_trackers = {
         key: {
             "zero_max_delta": -math.inf,
@@ -1451,6 +1606,13 @@ def evaluate_candidate(
                 amplification_offset : amplification_offset + values.size
             ] = values
             amplification_offset += values.size
+            primary_extra_difference = extra_difference[primary]
+            single_feature_distances = np.sqrt(
+                original_distance[primary, np.newaxis] ** 2
+                + primary_extra_difference**2
+            )
+            primary_pair_i = pair_i[primary]
+            primary_pair_j = pair_j[primary]
         zero = context.zero_mask[ranks]
         if np.any(zero):
             zero_values = distance[zero]
@@ -1508,6 +1670,29 @@ def evaluate_candidate(
             ratios = (
                 np.abs(reward[pair_i[primary]] - reward[pair_j[primary]])
                 / distance[primary]
+            )
+            base_reward = context.base_rewards[key]
+            signed_base_difference = (
+                base_reward[primary_pair_i] - base_reward[primary_pair_j]
+            )
+            baseline_ratios = (
+                np.abs(signed_base_difference) / original_distance[primary]
+            )
+            single_feature_reward_differences = (
+                signed_base_difference[:, np.newaxis]
+                + float(beta)
+                * feature_weights[np.newaxis, :]
+                * primary_extra_difference
+            )
+            single_feature_ratios = (
+                np.abs(single_feature_reward_differences)
+                / single_feature_distances
+            )
+            pairwise_counts[key]["features"] += _pairwise_classification_counts(
+                baseline_ratios, single_feature_ratios
+            )
+            pairwise_counts[key]["full_candidate"] += (
+                _pairwise_classification_counts(baseline_ratios, ratios)[0]
             )
             local = int(np.argmax(ratios))
             position = int(primary_positions[local])
@@ -1613,6 +1798,12 @@ def evaluate_candidate(
         obs_arrays=obs_arrays,
         constants_metadata=constants_metadata,
     )
+    single_feature_pairwise = _single_feature_pairwise_report(
+        context=context,
+        candidate=candidate,
+        counts_by_lambda=pairwise_counts,
+        beta=beta,
+    )
     return {
         "status": "passed" if all_pass else "not_improved_for_all_lambdas",
         "passed": bool(all_pass),
@@ -1624,6 +1815,7 @@ def evaluate_candidate(
         "absolute_tolerance": float(absolute_tolerance),
         "relative_tolerance": float(relative_tolerance),
         "by_lambda": by_lambda,
+        "single_feature_pairwise_comparison": single_feature_pairwise,
         "evaluation_diagnostics": evaluation_diagnostics,
         "extra_reward_distribution": _numeric_distribution(reward_extra),
         "original_primary_distance_distribution": _numeric_distribution(
@@ -1649,6 +1841,55 @@ def evaluate_candidate(
             "included_in_primary_candidate_estimate": False,
         },
     }
+
+
+def _format_pairwise_percentage(value: Any) -> str:
+    return "n/a" if value is None else f"{float(value):.3f}"
+
+
+def _single_feature_pairwise_feedback_table(comparison: Any) -> str:
+    if not isinstance(comparison, dict):
+        return ""
+    by_lambda = comparison.get("by_lambda")
+    if not isinstance(by_lambda, dict) or not by_lambda:
+        return ""
+    sections = ["Single-feature pairwise comparison:"]
+    for key, record in by_lambda.items():
+        if not isinstance(record, dict):
+            continue
+        sections.extend(
+            [
+                "",
+                f"lambda = {key}",
+                "| feature | current weight | improved (%) | unchanged (%) | worsened (%) |",
+                "|---|---:|---:|---:|---:|",
+            ]
+        )
+        for row in record.get("rows") or []:
+            if not isinstance(row, dict):
+                continue
+            if row.get("row_kind") == "full_candidate":
+                label = "full candidate"
+                weight = "all current weights"
+            else:
+                name = str(row.get("feature_name", "")).replace("|", "\\|")
+                label = f"{row.get('feature_index')}: {name}"
+                weight = format(float(row.get("current_reward_weight", 0.0)), ".17g")
+            sections.append(
+                "| "
+                + " | ".join(
+                    (
+                        label,
+                        weight,
+                        _format_pairwise_percentage(row.get("improved_percent")),
+                        _format_pairwise_percentage(row.get("unchanged_percent")),
+                        _format_pairwise_percentage(row.get("worsened_percent")),
+                    )
+                )
+                + " |"
+            )
+    sections.extend(["", SINGLE_FEATURE_PAIRWISE_GUIDANCE])
+    return "\n".join(sections)
 
 
 def _round_request(
@@ -1701,7 +1942,12 @@ def _round_request(
                 ensure_ascii=False,
                 allow_nan=False,
                 separators=(",", ":"),
-            )
+            ),
+            single_feature_pairwise_feedback=(
+                _single_feature_pairwise_feedback_table(
+                    feedback.get("single_feature_pairwise_comparison")
+                )
+            ),
         )
         historical = feedback.get("historical_unverified_errors")
         if isinstance(historical, list) and historical:
@@ -1775,6 +2021,9 @@ def _feedback_from_evaluation(report: dict[str, Any]) -> dict[str, Any]:
         "feedback_contract_version": EVALUATION_DIAGNOSTICS_VERSION,
         "status": report["status"],
         "by_lambda": report["by_lambda"],
+        "single_feature_pairwise_comparison": report[
+            "single_feature_pairwise_comparison"
+        ],
         "evaluation_diagnostics": report["evaluation_diagnostics"],
         "instruction": (
             "Review the supplied evaluation diagnostics internally, briefly explain "
@@ -2849,6 +3098,36 @@ def _compact_evaluation_diagnostics(
             included += len(kept)
             omitted += len(features) - len(kept)
             summarized_fields += int(len(features) > len(kept))
+    if int(maximum_array_items) == 0:
+        for sample in (compact.get("samples") or {}).values():
+            if isinstance(sample, dict) and "current_only_inputs" in sample:
+                sample["current_only_inputs"] = {
+                    "details_omitted_from_prompt": True,
+                    "contract_reference": (
+                        "the named current-only input interface in this same prompt"
+                    ),
+                    "full_values_location": (
+                        "the preceding attempt's evaluation_report.json and feedback.json"
+                    ),
+                }
+        if "constants" in compact:
+            compact["constants"] = {
+                "details_omitted_from_prompt": True,
+                "contract_reference": (
+                    "the constants table in the current-only interface in this same prompt"
+                ),
+                "full_values_location": (
+                    "the preceding attempt's evaluation_report.json and feedback.json"
+                ),
+            }
+        if "source_field_contracts" in compact:
+            compact["source_field_contracts"] = {
+                "details_omitted_from_prompt": True,
+                "contract_reference": (
+                    "the named current-only input interface in this same prompt"
+                ),
+            }
+        compact.pop("axis_and_id_mapping", None)
     summary = {
         "summary_applied": True,
         "array_item_limit_per_field": int(maximum_array_items),

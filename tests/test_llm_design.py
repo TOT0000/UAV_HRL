@@ -3711,6 +3711,15 @@ def test_revision_then_pass_and_max_attempt_exhaustion(tmp_path):
     assert second_prompt.count("Evaluation diagnostics:") == 1
     assert "global_baseline_l_hat_over_all_primary_pairs" in second_prompt
     assert "weighted_contribution_excludes_beta_i" in second_prompt
+    assert "Single-feature pairwise comparison:" in second_prompt
+    assert "| feature | current weight | improved (%) | unchanged (%) | worsened (%) |" in second_prompt
+    assert "0: state_distance_helper" in second_prompt
+    assert "full candidate" in second_prompt
+    assert "all current weights" in second_prompt
+    assert "The table evaluates each feature separately" in second_prompt
+    assert "Features with higher improvement percentages may be retained" in second_prompt
+    assert "Features unsuitable for directly contributing to the reward may be removed" in second_prompt
+    assert "The existing maximum pairwise-ratio acceptance criterion remains unchanged" in second_prompt
     assert "{{ROUND_REQUEST}}" not in second_prompt
     assert "1. System, workflow, and objective" in second_prompt
     assert "6. Evaluation and revision" in second_prompt
@@ -3721,6 +3730,10 @@ def test_revision_then_pass_and_max_attempt_exhaustion(tmp_path):
         (tmp_path / "revision" / "attempt_02" / "prompt_feedback.json").read_text()
     )
     assert full_feedback["evaluation_diagnostics"]["samples"]
+    pairwise = full_feedback["single_feature_pairwise_comparison"]
+    assert pairwise["schema_version"] == llm_design.PAIRWISE_DIAGNOSTICS_VERSION
+    assert pairwise["candidate_pair_reselection"] is False
+    assert pairwise["classification"]["formal_acceptance_criterion_changed"] is False
     assert prompt_feedback["source_attempt"] == 1
     assert prompt_feedback["target_attempt"] == 2
     assert prompt_feedback["source_candidate_identity"]["candidate_name"] == "first"
@@ -3841,6 +3854,7 @@ def test_parse_failure_revision_includes_latest_raw_content_and_error(tmp_path):
     assert invalid_text in prompt
     assert "invalid JSON" in prompt
     assert "Previous failed raw final content" in prompt
+    assert "Single-feature pairwise comparison:" not in prompt
     first_incoming = json.loads(
         (tmp_path / "parse-revision" / "attempt_01" / "prompt_feedback.json").read_text()
     )
@@ -3856,6 +3870,7 @@ def test_parse_failure_revision_includes_latest_raw_content_and_error(tmp_path):
         "source_attempt": 1,
         "intended_next_attempt": 2,
     }
+    assert "single_feature_pairwise_comparison" not in generated
     second_incoming = json.loads(
         (tmp_path / "parse-revision" / "attempt_02" / "prompt_feedback.json").read_text()
     )
@@ -4161,6 +4176,88 @@ def test_candidate_uses_fixed_pair_set_and_zero_pair_remains_excluded():
     assert report["baseline_excluded_pairs"]["zero_pairs_with_nonzero_augmented_distance"] == 1
     assert report["baseline_excluded_pairs"]["included_in_primary_candidate_estimate"] is False
     assert report["direct_concat_distance_check"]["passed"] is True
+    comparison = report["single_feature_pairwise_comparison"]
+    assert comparison["primary_pair_count"] == 2
+    for row in comparison["by_lambda"]["0"]["rows"]:
+        assert row["pair_count"] == 2
+        assert (
+            row["improved_count"]
+            + row["unchanged_count"]
+            + row["worsened_count"]
+        ) == 2
+
+
+def test_single_feature_pairwise_diagnostics_isolate_each_denominator():
+    state = np.asarray([[0.0], [1.0]], dtype=np.float64)
+    context = EvaluationContext(
+        original_state=state,
+        original_distances=np.asarray([1.0], dtype=np.float64),
+        primary_mask=np.asarray([True]),
+        zero_mask=np.asarray([False]),
+        near_mask=np.asarray([False]),
+        base_rewards={
+            "0": np.asarray([0.0, 1.0], dtype=np.float64),
+            "1": np.asarray([0.0, -1.0], dtype=np.float64),
+        },
+        lambdas=(0.0, 1.0),
+        baseline_values={"0": 1.0, "1": 1.0},
+        distance_epsilon=1e-8,
+        reward_epsilon=1e-12,
+        fixed_metadata={"selection": [{"fixed_index": 0}, {"fixed_index": 1}]},
+        fixed_arrays={},
+        pair_hash="one-primary-pair",
+    )
+    candidate = _candidate(name="isolated-denominator")
+    candidate["features"] = [
+        {
+            **candidate["features"][0],
+            "index": 0,
+            "name": "constant_feature",
+            "reward_weight": 0.0,
+        },
+        {
+            **candidate["features"][0],
+            "index": 1,
+            "name": "separating_feature",
+            "reward_weight": 0.0,
+        },
+    ]
+    extra = np.asarray([[0.0, 0.0], [0.0, 1.0]], dtype=np.float32)
+    report = evaluate_candidate(
+        context,
+        candidate,
+        extra,
+        beta=1.0,
+        batch_size=1,
+        absolute_tolerance=1e-12,
+        relative_tolerance=1e-6,
+    )
+    comparison = report["single_feature_pairwise_comparison"]
+    for lambda_record in comparison["by_lambda"].values():
+        constant, separating, full = lambda_record["rows"]
+        assert constant["unchanged_count"] == 1
+        assert constant["improved_count"] == 0
+        assert separating["improved_count"] == 1
+        assert full["improved_count"] == 1
+        assert separating["improved_percent"] == 100.0
+        assert constant["unchanged_percent"] == 100.0
+
+
+def test_pairwise_diagnostic_tolerance_boundaries_are_inclusive():
+    baseline = np.asarray([1.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0])
+    candidate = np.asarray(
+        [
+            1.0 - 2e-6,
+            1.0 - 1e-6,
+            1.0,
+            1.0 + 1e-6,
+            1.0 + 2e-6,
+            1e-12,
+            2e-12,
+        ]
+    )
+    counts = llm_design._pairwise_classification_counts(baseline, candidate)[0]
+    assert counts.tolist() == [1, 4, 2]
 
 
 def test_lipschitz_failure_diagnostics_match_manual_pair_calculations():
@@ -4279,6 +4376,38 @@ def test_lipschitz_failure_diagnostics_match_manual_pair_calculations():
     assert sample_zero["obs.uav_queue_valid"]["value"] == [True, False]
     assert sample_zero["obs.snapshot_valid"]["value"] == [True]
     assert "next" not in json.dumps(diagnostics).lower()
+
+    comparison = report["single_feature_pairwise_comparison"]
+    assert set(comparison["by_lambda"]) == {"0", "1"}
+    for lambda_record in comparison["by_lambda"].values():
+        rows = lambda_record["rows"]
+        assert rows[0]["current_reward_weight"] == 0.5
+        assert rows[1]["current_reward_weight"] == -0.25
+        assert rows[-1]["current_reward_weight"] == "all current weights"
+        for row in rows:
+            assert (
+                row["improved_count"]
+                + row["unchanged_count"]
+                + row["worsened_count"]
+            ) == 3
+            assert (
+                row["improved_percent"]
+                + row["unchanged_percent"]
+                + row["worsened_percent"]
+            ) == pytest.approx(100.0)
+    batch_one = evaluate_candidate(
+        context,
+        candidate,
+        extra,
+        beta=2.0,
+        batch_size=1,
+        absolute_tolerance=1e-12,
+        relative_tolerance=1e-6,
+        obs_arrays=obs,
+        constants_metadata=constants,
+    )
+    assert batch_one["single_feature_pairwise_comparison"] == comparison
+    assert batch_one["by_lambda"] == report["by_lambda"]
 
     shared_context = EvaluationContext(
         **{
