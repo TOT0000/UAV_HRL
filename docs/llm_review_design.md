@@ -14,6 +14,14 @@ valid `needs_revision=false` response. The approved artifact records
 runtime and can later be passed explicitly to `td3_dinkelbach_llm`; model review
 does not establish that training performance will improve.
 
+Candidate identity uses two separate values. The existing semantic fingerprint
+continues to detect meaning-equivalent submissions while ignoring supported
+formatting details. A stable full-content SHA-256 covers every candidate JSON
+field and binds the saved candidate, validation report, reviewer request,
+review record, and approved artifact. If `candidate.json` changes after
+validation or while review is in progress, the run pauses without issuing an
+unnecessary review or writing an approved artifact.
+
 ## Limits and resume
 
 `--max-code-repairs 5` means one initial proposer output plus at most five
@@ -97,3 +105,8 @@ Resume while explicitly increasing either allowance:
 The resume contract requires the same Git revision and fixed-sample content.
 It restores the saved provider, model, endpoint, beta, candidate, reviewer
 suggestions, phase, and counters rather than accepting silent replacements.
+Version-1 review runs are migrated only when the saved original proposer
+submission can reconstruct the exact saved candidate and the legacy semantic
+fingerprint agrees. A run without that evidence is rejected as incompatible;
+the current candidate is never used to manufacture a replacement hash for an
+older validation result.

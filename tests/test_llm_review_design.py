@@ -54,6 +54,8 @@ class ReviewMockClient:
         response = self.responses.pop(0)
         if isinstance(response, BaseException):
             raise response
+        if callable(response):
+            response = response(**kwargs)
         return response
 
 
@@ -119,6 +121,40 @@ def _run_kwargs(fixed, output, proposer, reviewer, **overrides):
     return values
 
 
+def test_template_replacement_only_interprets_original_placeholders():
+    template = "prefix {{COMMON_CONTEXT}} middle {{ROUND_CONTEXT}} suffix"
+    common = 'code comment: }} and literal "{{BETA}}"'
+    round_context = "feedback contains {{COMMON_CONTEXT}} and {{"
+    rendered = llm_review_design._replace_all(
+        template,
+        {
+            "{{COMMON_CONTEXT}}": common,
+            "ROUND_CONTEXT": round_context,
+            "BETA": "must-not-replace-in-inserted-data",
+        },
+    )
+    assert rendered == f"prefix {common} middle {round_context} suffix"
+    reviewer_prompt = llm_review_design.render_reviewer_prompt(
+        common_context="common literal {{BETA}}",
+        candidate={"code": "# comment containing }}\n", "features": []},
+        validation_report={
+            "status": "failed",
+            "errors": [{"problem": "literal {{COMMON_CONTEXT}} feedback"}],
+        },
+        review_history=[],
+    )
+    assert "common literal {{BETA}}" in reviewer_prompt
+    assert "# comment containing }}" in reviewer_prompt
+    assert "literal {{COMMON_CONTEXT}} feedback" in reviewer_prompt
+
+    with pytest.raises(llm_review_design.ReviewDesignError) as exc_info:
+        llm_review_design._replace_all(
+            template,
+            {"COMMON_CONTEXT": common},
+        )
+    assert "ROUND_CONTEXT" in str(exc_info.value)
+
+
 def test_repair_then_review_uses_complete_context_and_approves(tmp_path, monkeypatch):
     monkeypatch.setattr(
         llm_design,
@@ -171,6 +207,16 @@ def test_repair_then_review_uses_complete_context_and_approves(tmp_path, monkeyp
         (Path(result["approved_artifact"]) / "evaluation_report.json").read_text()
     )
     assert evaluation["lipschitz_evaluation_performed"] is False
+    state = json.loads(
+        (Path(result["output_directory"]) / "state.json").read_text(encoding="utf-8")
+    )
+    candidate_id = state["current_candidate_id"]
+    full_hash = state["current_candidate_full_content_sha256"]
+    assert len(full_hash) == 64
+    assert state["current_validation"]["candidate_full_content_sha256"] == full_hash
+    assert state["candidates"][candidate_id]["full_content_sha256"] == full_hash
+    assert state["review_history"][-1]["candidate_full_content_sha256"] == full_hash
+    assert evaluation["candidate_full_content_sha256"] == full_hash
     no_proposer = ReviewMockClient([], model="qwen/proposer")
     no_reviewer = ReviewMockClient([], model="gpt-4o")
     already_approved = llm_review_design.run_review_design(
@@ -180,6 +226,177 @@ def test_repair_then_review_uses_complete_context_and_approves(tmp_path, monkeyp
     )
     assert already_approved["status"] == "approved"
     assert not no_proposer.calls and not no_reviewer.calls
+
+    _downgrade_run_state_to_v1(Path(result["output_directory"]))
+    monkeypatch.setattr(llm_review_design, "_git_sha", lambda: "new-compatible-revision")
+    migrated_approved = llm_review_design.run_review_design(
+        resume=result["output_directory"],
+        proposer_client=no_proposer,
+        reviewer_client=no_reviewer,
+    )
+    assert migrated_approved["status"] == "approved"
+    migrated_state = json.loads(
+        (Path(result["output_directory"]) / "state.json").read_text(encoding="utf-8")
+    )
+    assert migrated_state["review_history"][-1]["candidate_binding_status"] == (
+        "legacy_reviewer_prompt_verified"
+    )
+    assert migrated_state["counters"]["proposer_calls"] == 2
+    assert migrated_state["counters"]["reviewer_calls"] == 1
+
+
+def _pause_after_validation(tmp_path, name):
+    fixed_root = tmp_path / f"fixed-{name}"
+    fixed_root.mkdir()
+    fixed = _fixed_artifact(fixed_root)
+    proposer = ReviewMockClient(
+        [_provider_response(json.dumps(_submission()), model="qwen/p")],
+        model="qwen/p",
+    )
+    reviewer = ReviewMockClient([], model="gpt/r")
+    output = tmp_path / f"run-{name}"
+    result = llm_review_design.run_review_design(
+        **_run_kwargs(
+            fixed,
+            output,
+            proposer,
+            reviewer,
+            reviewer_context_length=3000,
+            reviewer_max_output_tokens=2048,
+        )
+    )
+    assert result["status"] == "paused_context_budget"
+    assert result["reviewer_calls"] == 0
+    state = json.loads((output / "state.json").read_text(encoding="utf-8"))
+    return fixed, output, state
+
+
+@pytest.mark.parametrize("mutation", ["code", "reward_weight", "description"])
+def test_resume_rejects_candidate_file_changed_after_validation(tmp_path, mutation):
+    _, output, state = _pause_after_validation(tmp_path, mutation)
+    candidate_id = state["current_candidate_id"]
+    candidate_path = output / "candidates" / candidate_id / "candidate.json"
+    candidate = json.loads(candidate_path.read_text(encoding="utf-8"))
+    if mutation == "code":
+        candidate["code"] += "\n# changed while paused\n"
+    elif mutation == "reward_weight":
+        candidate["features"][0]["reward_weight"] = -0.25
+    else:
+        candidate["features"][0]["description"] = "Changed after validation."
+    candidate_path.write_text(json.dumps(candidate, indent=2), encoding="utf-8")
+
+    proposer = ReviewMockClient([], model="qwen/p")
+    reviewer = ReviewMockClient([], model="gpt/r")
+    result = llm_review_design.run_review_design(
+        resume=output,
+        proposer_client=proposer,
+        reviewer_client=reviewer,
+    )
+    assert result["status"] == "paused_candidate_version_mismatch"
+    assert result["stop_reason"]["phase"] == "before_reviewer_request"
+    assert not proposer.calls and not reviewer.calls
+    assert not (output / "approved").exists()
+    assert json.loads(candidate_path.read_text(encoding="utf-8")) == candidate
+
+
+def test_candidate_change_during_review_cannot_be_approved(tmp_path):
+    fixed_root = tmp_path / "fixed"
+    fixed_root.mkdir()
+    fixed = _fixed_artifact(fixed_root)
+    output = tmp_path / "run"
+    proposer = ReviewMockClient(
+        [_provider_response(json.dumps(_submission()), model="qwen/p")],
+        model="qwen/p",
+    )
+
+    def mutate_candidate_before_response(**_kwargs):
+        state = json.loads((output / "state.json").read_text(encoding="utf-8"))
+        path = output / "candidates" / state["current_candidate_id"] / "candidate.json"
+        candidate = json.loads(path.read_text(encoding="utf-8"))
+        candidate["features"][0]["description"] = "Changed during review."
+        path.write_text(json.dumps(candidate, indent=2), encoding="utf-8")
+        return _provider_response(_review(needs_revision=False), model="gpt/r")
+
+    reviewer = ReviewMockClient([mutate_candidate_before_response], model="gpt/r")
+    result = llm_review_design.run_review_design(
+        **_run_kwargs(fixed, output, proposer, reviewer)
+    )
+    assert result["status"] == "paused_candidate_version_mismatch"
+    assert result["stop_reason"]["phase"] == "after_reviewer_response"
+    assert result["reviewer_calls"] == 1
+    assert result["review_rounds_completed"] == 0
+    assert not (output / "approved").exists()
+    binding = json.loads(
+        (output / "reviewer_call_001" / "candidate_binding.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert binding["status"] == "candidate_version_mismatch"
+
+
+def _downgrade_run_state_to_v1(output):
+    state_path = output / "state.json"
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    candidate_id = state["current_candidate_id"]
+    record = state["candidates"][candidate_id]
+    semantic = record.pop("semantic_fingerprint")
+    record["content_sha256"] = semantic
+    record.pop("full_content_sha256")
+    state["schema_version"] = llm_review_design.LEGACY_REVIEW_RUN_SCHEMA_VERSION
+    state.pop("current_candidate_full_content_sha256")
+    validation = state["current_validation"]
+    validation["candidate_content_sha256"] = semantic
+    validation.pop("candidate_semantic_fingerprint")
+    validation.pop("candidate_full_content_sha256")
+    for review in state.get("review_history", []):
+        review.pop("candidate_binding_status", None)
+        review.pop("candidate_full_content_sha256", None)
+    state_path.write_text(json.dumps(state, indent=2), encoding="utf-8")
+    proposer_call = record["submission_attempts"][-1]["proposer_call"]
+    for path in (
+        output / "candidates" / candidate_id / "validation_report.json",
+        output / f"proposer_call_{proposer_call:03d}" / "validation_report.json",
+    ):
+        report = json.loads(path.read_text(encoding="utf-8"))
+        report["candidate_content_sha256"] = semantic
+        report.pop("candidate_semantic_fingerprint")
+        report.pop("candidate_full_content_sha256")
+        path.write_text(json.dumps(report, indent=2), encoding="utf-8")
+    return candidate_id
+
+
+def test_legacy_run_migrates_only_from_matching_saved_submission(tmp_path, monkeypatch):
+    _, output, _ = _pause_after_validation(tmp_path, "legacy-safe")
+    candidate_id = _downgrade_run_state_to_v1(output)
+    monkeypatch.setattr(llm_review_design, "_git_sha", lambda: "new-compatible-revision")
+    result = llm_review_design.run_review_design(
+        resume=output,
+        proposer_client=ReviewMockClient([], model="qwen/p"),
+        reviewer_client=ReviewMockClient([], model="gpt/r"),
+    )
+    assert result["status"] == "paused_context_budget"
+    migrated = json.loads((output / "state.json").read_text(encoding="utf-8"))
+    assert migrated["schema_version"] == llm_review_design.REVIEW_RUN_SCHEMA_VERSION
+    full_hash = migrated["candidates"][candidate_id]["full_content_sha256"]
+    assert migrated["current_candidate_full_content_sha256"] == full_hash
+    assert migrated["current_validation"]["candidate_full_content_sha256"] == full_hash
+    assert migrated["migration"]["from_schema_version"].endswith("-v1")
+    assert migrated["migration"]["from_git_sha"] in (
+        llm_review_design.LEGACY_REVIEW_COMPATIBLE_GIT_REVISIONS
+    )
+    assert migrated["git_sha"] == "new-compatible-revision"
+
+
+def test_legacy_run_without_original_submission_is_incompatible(tmp_path):
+    _, output, _ = _pause_after_validation(tmp_path, "legacy-unsafe")
+    _downgrade_run_state_to_v1(output)
+    (output / "proposer_call_001" / "submitted_candidate.json").unlink()
+    with pytest.raises(llm_review_design.ReviewDesignError, match="cannot be safely migrated"):
+        llm_review_design.run_review_design(
+            resume=output,
+            proposer_client=ReviewMockClient([], model="qwen/p"),
+            reviewer_client=ReviewMockClient([], model="gpt/r"),
+        )
 
 
 def test_review_revision_resets_repairs_without_consuming_extra_review(tmp_path):

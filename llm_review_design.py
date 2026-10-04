@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import copy
 from datetime import datetime, timezone
+import hashlib
 import json
 from pathlib import Path
+import re
 from typing import Any
 
 import numpy as np
@@ -64,7 +66,11 @@ from llm_design_contract import (
 )
 
 
-REVIEW_RUN_SCHEMA_VERSION = "uav-hrl-llm-review-design-run-v1"
+REVIEW_RUN_SCHEMA_VERSION = "uav-hrl-llm-review-design-run-v2"
+LEGACY_REVIEW_RUN_SCHEMA_VERSION = "uav-hrl-llm-review-design-run-v1"
+LEGACY_REVIEW_COMPATIBLE_GIT_REVISIONS = {
+    "a7aa991078f63e4ee039fed1e05709d10bf46595",
+}
 REVIEW_PROMPT_VERSION = "uav-hrl-llm-review-design-prompt-v1"
 REVIEW_APPROVAL_VERSION = "uav-hrl-model-review-approval-v1"
 DEFAULT_REVIEW_OUTPUT_ROOT = Path("results") / "llm_review_designs"
@@ -80,6 +86,10 @@ class ReviewDesignError(RuntimeError):
     pass
 
 
+class CandidateVersionMismatch(ReviewDesignError):
+    pass
+
+
 def _load_review_inputs(fixed_directory: str | Path):
     """Load fixed observations without loading or evaluating the baseline report."""
 
@@ -91,13 +101,40 @@ def _read_template(path: Path) -> str:
     return path.read_text(encoding="utf-8")
 
 
+_TEMPLATE_PLACEHOLDER = re.compile(r"\{\{([A-Z][A-Z0-9_]*)\}\}")
+
+
 def _replace_all(template: str, replacements: dict[str, str]) -> str:
-    rendered = template
-    for name, value in replacements.items():
-        rendered = rendered.replace(name, value)
-    if "{{" in rendered or "}}" in rendered:
-        raise ReviewDesignError("review-design prompt contains an unfilled placeholder")
-    return rendered
+    """Replace placeholders found in the template, never in inserted values."""
+
+    supplied = {}
+    for key, value in replacements.items():
+        name = key[2:-2] if key.startswith("{{") and key.endswith("}}") else key
+        supplied[name] = str(value)
+    required = list(dict.fromkeys(_TEMPLATE_PLACEHOLDER.findall(template)))
+    missing = [name for name in required if name not in supplied]
+    if missing:
+        raise ReviewDesignError(
+            "review-design prompt is missing replacements for: "
+            + ", ".join(missing)
+        )
+    return _TEMPLATE_PLACEHOLDER.sub(
+        lambda match: supplied[match.group(1)],
+        template,
+    )
+
+
+def candidate_full_content_sha256(candidate: dict[str, Any]) -> str:
+    """Hash every candidate JSON value using one stable serialization."""
+
+    encoded = json.dumps(
+        candidate,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def render_common_context(
@@ -287,6 +324,15 @@ def _strict_review(content: str) -> tuple[dict[str, Any], dict[str, Any]]:
 
 def _candidate_id(candidate: dict[str, Any]) -> str:
     return "candidate-" + candidate_semantic_fingerprint(candidate)[:12]
+
+
+def _candidate_id_matches_full_content(
+    candidate_id: str,
+    candidate: dict[str, Any],
+    full_content_sha256: str,
+) -> bool:
+    base = _candidate_id(candidate)
+    return candidate_id in {base, f"{base}-{full_content_sha256[:12]}"}
 
 
 def _failure_report(stage: str, exc: BaseException) -> dict[str, Any]:
@@ -608,6 +654,7 @@ def _new_state(
         },
         "proposal_cycle": 1,
         "current_candidate_id": None,
+        "current_candidate_full_content_sha256": None,
         "current_submission": None,
         "current_validation": None,
         "revision_parent_candidate_id": None,
@@ -623,6 +670,309 @@ def _new_state(
     }
 
 
+def _read_candidate_json(path: Path) -> dict[str, Any]:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise CandidateVersionMismatch(
+            f"candidate file cannot be read as JSON: {path}: {exc}"
+        ) from exc
+    if not isinstance(value, dict):
+        raise CandidateVersionMismatch(f"candidate file is not a JSON object: {path}")
+    return value
+
+
+def _bind_validation_hashes(
+    report: dict[str, Any],
+    *,
+    candidate_id: str,
+    semantic_fingerprint: str,
+    full_content_sha256: str,
+    legacy: bool,
+) -> None:
+    if report.get("candidate_id") not in (None, candidate_id):
+        raise CandidateVersionMismatch(
+            f"validation report candidate ID differs from {candidate_id}"
+        )
+    if legacy:
+        legacy_value = report.get("candidate_content_sha256")
+        if legacy_value not in (None, semantic_fingerprint):
+            raise CandidateVersionMismatch(
+                "legacy validation semantic fingerprint does not match the saved candidate"
+            )
+        if legacy_value is not None:
+            report["legacy_candidate_semantic_fingerprint"] = legacy_value
+        report.pop("candidate_content_sha256", None)
+    report["candidate_id"] = candidate_id
+    report["candidate_semantic_fingerprint"] = semantic_fingerprint
+    report["candidate_full_content_sha256"] = full_content_sha256
+
+
+def _migrate_legacy_state(
+    output: Path,
+    state: dict[str, Any],
+    constants_metadata: dict[str, Any],
+    *,
+    persist: bool,
+) -> None:
+    if state.pop("_legacy_schema_version", None) is None:
+        return
+    source_git_sha = state.get("git_sha")
+    updated_reports: list[tuple[Path, dict[str, Any]]] = []
+    for candidate_id in state.get("candidate_order", []):
+        record = state.get("candidates", {}).get(candidate_id)
+        if not isinstance(record, dict):
+            raise ReviewDesignError(
+                f"legacy run cannot be safely migrated: missing record for {candidate_id}"
+            )
+        attempts = record.get("submission_attempts")
+        if not isinstance(attempts, list) or not attempts:
+            raise ReviewDesignError(
+                f"legacy run cannot be safely migrated: {candidate_id} has no saved submission attempt"
+            )
+        proposer_call = attempts[-1].get("proposer_call")
+        if not isinstance(proposer_call, int) or proposer_call <= 0:
+            raise ReviewDesignError(
+                "legacy run cannot be safely migrated: "
+                f"{candidate_id} has no valid saved proposer call"
+            )
+        submitted_path = (
+            output
+            / f"proposer_call_{int(proposer_call):03d}"
+            / "submitted_candidate.json"
+        )
+        if not submitted_path.is_file():
+            raise ReviewDesignError(
+                "legacy run cannot be safely migrated because the original submitted "
+                f"candidate is missing: {submitted_path}"
+            )
+        submitted = _read_candidate_json(submitted_path)
+        try:
+            reconstructed = normalize_candidate_submission(
+                submitted, constants_metadata
+            )[1]
+        except CandidateError as exc:
+            raise ReviewDesignError(
+                f"legacy run candidate cannot be reconstructed safely: {candidate_id}: {exc}"
+            ) from exc
+        candidate_path = output / "candidates" / candidate_id / "candidate.json"
+        saved = _read_candidate_json(candidate_path)
+        reconstructed_hash = candidate_full_content_sha256(reconstructed)
+        saved_hash = candidate_full_content_sha256(saved)
+        if saved_hash != reconstructed_hash:
+            raise ReviewDesignError(
+                "legacy run cannot be safely migrated because candidate.json differs "
+                f"from the original submitted candidate: {candidate_path}"
+            )
+        semantic = candidate_semantic_fingerprint(saved)
+        legacy_semantic = record.get("content_sha256")
+        if legacy_semantic not in (None, semantic):
+            raise ReviewDesignError(
+                f"legacy run semantic fingerprint is inconsistent for {candidate_id}"
+            )
+        if _candidate_id(saved) != candidate_id:
+            raise ReviewDesignError(
+                f"legacy run candidate ID is inconsistent for {candidate_path}"
+            )
+        code_path = candidate_path.with_name("candidate.py")
+        if (
+            not code_path.is_file()
+            or code_path.read_text(encoding="utf-8") != saved["code"]
+        ):
+            raise ReviewDesignError(
+                f"legacy run candidate.py differs from candidate.json: {code_path}"
+            )
+        record["legacy_semantic_content_sha256"] = legacy_semantic
+        record.pop("content_sha256", None)
+        record["semantic_fingerprint"] = semantic
+        record["full_content_sha256"] = saved_hash
+        validation_path = candidate_path.with_name("validation_report.json")
+        if not validation_path.is_file():
+            raise ReviewDesignError(
+                "legacy run cannot be safely migrated because its candidate validation "
+                f"report is missing: {validation_path}"
+            )
+        validation = json.loads(validation_path.read_text(encoding="utf-8"))
+        _bind_validation_hashes(
+            validation,
+            candidate_id=candidate_id,
+            semantic_fingerprint=semantic,
+            full_content_sha256=saved_hash,
+            legacy=True,
+        )
+        updated_reports.append((validation_path, validation))
+        call_validation_path = submitted_path.with_name("validation_report.json")
+        if not call_validation_path.is_file():
+            raise ReviewDesignError(
+                "legacy run cannot be safely migrated because its proposer-call validation "
+                f"report is missing: {call_validation_path}"
+            )
+        call_validation = json.loads(
+            call_validation_path.read_text(encoding="utf-8")
+        )
+        _bind_validation_hashes(
+            call_validation,
+            candidate_id=candidate_id,
+            semantic_fingerprint=semantic,
+            full_content_sha256=saved_hash,
+            legacy=True,
+        )
+        updated_reports.append((call_validation_path, call_validation))
+
+    current_id = state.get("current_candidate_id")
+    if current_id is not None:
+        record = state["candidates"].get(current_id)
+        if not isinstance(record, dict):
+            raise ReviewDesignError(
+                "legacy run cannot be safely migrated: current candidate record is missing"
+            )
+        current_validation = state.get("current_validation")
+        if not isinstance(current_validation, dict):
+            raise ReviewDesignError(
+                "legacy run cannot be safely migrated: current validation report is missing"
+            )
+        _bind_validation_hashes(
+            current_validation,
+            candidate_id=current_id,
+            semantic_fingerprint=record["semantic_fingerprint"],
+            full_content_sha256=record["full_content_sha256"],
+            legacy=True,
+        )
+        state["current_candidate_full_content_sha256"] = record[
+            "full_content_sha256"
+        ]
+    else:
+        state["current_candidate_full_content_sha256"] = None
+    for review in state.get("review_history", []):
+        review_candidate_id = review.get("candidate_id")
+        review_record = state.get("candidates", {}).get(review_candidate_id)
+        reviewer_call = review.get("reviewer_call")
+        if not isinstance(review_record, dict) or not isinstance(reviewer_call, int):
+            raise ReviewDesignError(
+                "legacy run cannot be safely migrated because a review lacks candidate provenance"
+            )
+        review_candidate_path = (
+            output / "candidates" / review_candidate_id / "candidate.json"
+        )
+        review_candidate = _read_candidate_json(review_candidate_path)
+        prompt_path = output / f"reviewer_call_{reviewer_call:03d}" / "prompt.txt"
+        if not prompt_path.is_file():
+            raise ReviewDesignError(
+                "legacy run cannot be safely migrated because its saved reviewer prompt "
+                f"is missing: {prompt_path}"
+            )
+        candidate_text = json.dumps(
+            review_candidate, indent=2, ensure_ascii=False, allow_nan=False
+        )
+        if candidate_text not in prompt_path.read_text(encoding="utf-8"):
+            raise ReviewDesignError(
+                "legacy run cannot be safely migrated because the reviewer prompt does "
+                f"not contain the saved candidate: {prompt_path}"
+            )
+        review["candidate_binding_status"] = "legacy_reviewer_prompt_verified"
+        review["candidate_full_content_sha256"] = review_record[
+            "full_content_sha256"
+        ]
+    if state.get("status") == "approved":
+        approved_path = Path(state.get("approved_artifact") or output / "approved")
+        approved_candidate_path = approved_path / "candidate.json"
+        approved_candidate = _read_candidate_json(approved_candidate_path)
+        if (
+            current_id is None
+            or candidate_full_content_sha256(approved_candidate)
+            != state["candidates"][current_id]["full_content_sha256"]
+        ):
+            raise ReviewDesignError(
+                "legacy run cannot be safely migrated because its approved artifact does "
+                "not match the validated current candidate"
+            )
+    state["schema_version"] = REVIEW_RUN_SCHEMA_VERSION
+    state["git_sha"] = _git_sha()
+    state["migration"] = {
+        "from_schema_version": LEGACY_REVIEW_RUN_SCHEMA_VERSION,
+        "to_schema_version": REVIEW_RUN_SCHEMA_VERSION,
+        "basis": "candidate reconstructed from the saved proposer submission and matched to candidate.json",
+        "from_git_sha": source_git_sha,
+        "to_git_sha": state["git_sha"],
+        "migrated_at_utc": datetime.now(timezone.utc).isoformat(),
+    }
+    if persist:
+        for path, report in updated_reports:
+            _write_json(path, report)
+        _write_json(output / "state.json", state)
+
+
+def _verified_candidate_for_review(
+    output: Path,
+    state: dict[str, Any],
+    candidate_id: str,
+) -> tuple[dict[str, Any], str]:
+    record = state.get("candidates", {}).get(candidate_id)
+    validation = state.get("current_validation")
+    expected = state.get("current_candidate_full_content_sha256")
+    if not isinstance(record, dict) or not isinstance(validation, dict) or not expected:
+        raise CandidateVersionMismatch(
+            "candidate state lacks the full-content binding required for review"
+        )
+    record_hash = record.get("full_content_sha256")
+    validation_hash = validation.get("candidate_full_content_sha256")
+    if record_hash != expected or validation_hash != expected:
+        raise CandidateVersionMismatch(
+            "candidate state, candidate record, and validation report have different full-content hashes"
+        )
+    if validation.get("candidate_id") != candidate_id:
+        raise CandidateVersionMismatch(
+            "validation report is bound to a different candidate ID"
+        )
+    candidate_path = output / "candidates" / candidate_id / "candidate.json"
+    candidate = _read_candidate_json(candidate_path)
+    actual_hash = candidate_full_content_sha256(candidate)
+    if actual_hash != expected:
+        raise CandidateVersionMismatch(
+            f"candidate file changed after validation: {candidate_path}; "
+            f"expected {expected}, found {actual_hash}"
+        )
+    semantic = candidate_semantic_fingerprint(candidate)
+    if semantic != record.get(
+        "semantic_fingerprint"
+    ) or not _candidate_id_matches_full_content(candidate_id, candidate, actual_hash):
+        raise CandidateVersionMismatch(
+            f"candidate semantic identity changed after validation: {candidate_path}"
+        )
+    code_path = candidate_path.with_name("candidate.py")
+    if (
+        not code_path.is_file()
+        or code_path.read_text(encoding="utf-8") != candidate["code"]
+    ):
+        raise CandidateVersionMismatch(
+            f"candidate.py differs from the validated candidate JSON: {code_path}"
+        )
+    validation_path = candidate_path.with_name("validation_report.json")
+    try:
+        saved_validation = json.loads(validation_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise CandidateVersionMismatch(
+            f"saved validation report cannot be read: {validation_path}: {exc}"
+        ) from exc
+    for field, expected_value in (
+        ("candidate_id", candidate_id),
+        ("candidate_semantic_fingerprint", semantic),
+        ("candidate_full_content_sha256", expected),
+        ("status", "passed"),
+    ):
+        if saved_validation.get(field) != expected_value:
+            raise CandidateVersionMismatch(
+                f"saved validation report has inconsistent {field}: {validation_path}"
+            )
+    if saved_validation != validation:
+        raise CandidateVersionMismatch(
+            f"saved validation report differs from current state: {validation_path}"
+        )
+    if validation.get("status") != "passed":
+        raise CandidateVersionMismatch("candidate validation is not passing")
+    return candidate, actual_hash
+
+
 def _restore_state(
     resume: str | Path,
     *,
@@ -635,10 +985,20 @@ def _restore_state(
     if not state_path.is_file():
         raise FileNotFoundError(f"review-design state is missing: {state_path}")
     state = json.loads(state_path.read_text(encoding="utf-8"))
-    if state.get("schema_version") != REVIEW_RUN_SCHEMA_VERSION:
+    schema_version = state.get("schema_version")
+    if schema_version not in {
+        REVIEW_RUN_SCHEMA_VERSION,
+        LEGACY_REVIEW_RUN_SCHEMA_VERSION,
+    }:
         raise ReviewDesignError("review-design resume contract is incompatible")
+    if schema_version == LEGACY_REVIEW_RUN_SCHEMA_VERSION:
+        state["_legacy_schema_version"] = schema_version
     if state.get("git_sha") != _git_sha():
-        raise ReviewDesignError("review-design resume git revision is incompatible")
+        if not (
+            schema_version == LEGACY_REVIEW_RUN_SCHEMA_VERSION
+            and state.get("git_sha") in LEGACY_REVIEW_COMPATIBLE_GIT_REVISIONS
+        ):
+            raise ReviewDesignError("review-design resume git revision is incompatible")
     settings = state["settings"]
     requested_review = (
         settings["max_review_rounds"]
@@ -808,6 +1168,12 @@ def run_review_design(
         "sample_content_sha256"
     ]:
         raise ReviewDesignError("resume fixed-sample content hash is incompatible")
+    _migrate_legacy_state(
+        output,
+        state,
+        constants_metadata,
+        persist=resume is not None and not dry_run,
+    )
     if state["status"] == "approved":
         return _result(state)
     if resume is not None and not dry_run:
@@ -981,13 +1347,23 @@ def run_review_design(
             state["current_submission"] = details.get("submitted_candidate", content)
             state["current_validation"] = validation
             state["current_candidate_id"] = None
+            state["current_candidate_full_content_sha256"] = None
             if candidate is not None:
+                semantic_fingerprint = candidate_semantic_fingerprint(candidate)
+                full_content_sha256 = candidate_full_content_sha256(candidate)
                 identifier = _candidate_id(candidate)
-                fingerprint = candidate_semantic_fingerprint(candidate)
+                existing = state["candidates"].get(identifier)
+                if (
+                    isinstance(existing, dict)
+                    and existing.get("full_content_sha256") != full_content_sha256
+                ):
+                    identifier = f"{identifier}-{full_content_sha256[:12]}"
                 validation["candidate_id"] = identifier
-                validation["candidate_content_sha256"] = fingerprint
+                validation["candidate_semantic_fingerprint"] = semantic_fingerprint
+                validation["candidate_full_content_sha256"] = full_content_sha256
                 _write_json(call_dir / "validation_report.json", validation)
                 state["current_candidate_id"] = identifier
+                state["current_candidate_full_content_sha256"] = full_content_sha256
                 candidate_dir = output / "candidates" / identifier
                 candidate_dir.mkdir(parents=True, exist_ok=True)
                 _write_json(candidate_dir / "candidate.json", candidate)
@@ -1005,7 +1381,8 @@ def run_review_design(
                     state["candidate_order"].append(identifier)
                     state["candidates"][identifier] = {
                         "candidate_id": identifier,
-                        "content_sha256": fingerprint,
+                        "semantic_fingerprint": semantic_fingerprint,
+                        "full_content_sha256": full_content_sha256,
                         "parent_candidate_id": state.get(
                             "revision_parent_candidate_id"
                         ),
@@ -1025,11 +1402,21 @@ def run_review_design(
         identifier = state["current_candidate_id"]
         if not identifier or state["current_validation"].get("status") != "passed":
             raise ReviewDesignError("reviewer phase lacks a validated candidate")
-        candidate = json.loads(
-            (output / "candidates" / identifier / "candidate.json").read_text(
-                encoding="utf-8"
+        try:
+            candidate, reviewed_candidate_hash = _verified_candidate_for_review(
+                output, state, identifier
             )
-        )
+        except CandidateVersionMismatch as exc:
+            state["status"] = "paused_candidate_version_mismatch"
+            state["stop_reason"] = {
+                "status": state["status"],
+                "phase": "before_reviewer_request",
+                "candidate_id": identifier,
+                "error_type": type(exc).__name__,
+                "error": str(exc),
+            }
+            _write_json(output / "state.json", state)
+            return _result(state)
         prompt = render_reviewer_prompt(
             common_context=common,
             candidate=candidate,
@@ -1064,12 +1451,49 @@ def run_review_design(
         call_dir = Path(call_status["directory"])
         _write_json(call_dir / "review.json", review)
         _write_json(call_dir / "review_parse_metadata.json", parse_metadata)
+        review_binding = {
+            "candidate_id": identifier,
+            "candidate_full_content_sha256": reviewed_candidate_hash,
+            "status": "response_received_pending_integrity_check",
+        }
+        _write_json(call_dir / "candidate_binding.json", review_binding)
+        try:
+            current_candidate, current_candidate_hash = _verified_candidate_for_review(
+                output, state, identifier
+            )
+            if (
+                current_candidate_hash != reviewed_candidate_hash
+                or candidate_full_content_sha256(candidate) != reviewed_candidate_hash
+                or current_candidate != candidate
+            ):
+                raise CandidateVersionMismatch(
+                    "candidate content changed while the reviewer request was in progress"
+                )
+        except CandidateVersionMismatch as exc:
+            review_binding["status"] = "candidate_version_mismatch"
+            review_binding["error"] = str(exc)
+            _write_json(call_dir / "candidate_binding.json", review_binding)
+            state["status"] = "paused_candidate_version_mismatch"
+            state["stop_reason"] = {
+                "status": state["status"],
+                "phase": "after_reviewer_response",
+                "candidate_id": identifier,
+                "reviewer_call": state["counters"]["reviewer_calls"],
+                "error_type": type(exc).__name__,
+                "error": str(exc),
+            }
+            _write_json(output / "state.json", state)
+            return _result(state)
+        review_binding["status"] = "verified"
+        _write_json(call_dir / "candidate_binding.json", review_binding)
         state["counters"]["review_rounds_completed"] += 1
         review_record = {
             "review_round": state["counters"]["review_rounds_completed"],
             "candidate_id": identifier,
             "reviewer_call": state["counters"]["reviewer_calls"],
             "actual_model": response.get("actual_model") or reviewer["model"],
+            "candidate_full_content_sha256": reviewed_candidate_hash,
+            "candidate_binding_status": "verified",
             "review": review,
         }
         state["review_history"].append(review_record)
@@ -1103,6 +1527,31 @@ def run_review_design(
             raise ReviewDesignError(
                 "review approval candidate does not match the validated candidate"
             )
+        try:
+            approval_candidate, approval_candidate_hash = _verified_candidate_for_review(
+                output, state, identifier
+            )
+            if (
+                approval_candidate_hash != reviewed_candidate_hash
+                or review_record["candidate_full_content_sha256"]
+                != approval_candidate_hash
+                or approval_candidate != candidate
+            ):
+                raise CandidateVersionMismatch(
+                    "validation, reviewer input, review result, and approval candidate do not match"
+                )
+        except CandidateVersionMismatch as exc:
+            state["status"] = "paused_candidate_version_mismatch"
+            state["stop_reason"] = {
+                "status": state["status"],
+                "phase": "before_approval",
+                "candidate_id": identifier,
+                "reviewer_call": state["counters"]["reviewer_calls"],
+                "error_type": type(exc).__name__,
+                "error": str(exc),
+            }
+            _write_json(output / "state.json", state)
+            return _result(state)
         candidate_attempt = state["candidates"][identifier]["submission_attempts"][-1]
         approval = {
             "schema_version": REVIEW_APPROVAL_VERSION,
@@ -1110,6 +1559,10 @@ def run_review_design(
             "passed": True,
             "approval_method": "model_review",
             "candidate_id": identifier,
+            "candidate_semantic_fingerprint": state["candidates"][identifier][
+                "semantic_fingerprint"
+            ],
+            "candidate_full_content_sha256": approval_candidate_hash,
             "validation_status": state["current_validation"]["status"],
             "review_round": state["counters"]["review_rounds_completed"],
             "review": review,
@@ -1118,7 +1571,7 @@ def run_review_design(
         }
         approved = save_approved_artifact(
             output,
-            candidate=candidate,
+            candidate=approval_candidate,
             constants_metadata=constants_metadata,
             validation_report=state["current_validation"],
             evaluation_report=approval,
@@ -1139,6 +1592,10 @@ def run_review_design(
                     "actual_model": review_record["actual_model"],
                 },
                 "candidate_id": identifier,
+                "candidate_semantic_fingerprint": state["candidates"][identifier][
+                    "semantic_fingerprint"
+                ],
+                "candidate_full_content_sha256": approval_candidate_hash,
                 "review_round": state["counters"]["review_rounds_completed"],
             },
             observation_interface_version=OBS_INTERFACE_VERSION,
