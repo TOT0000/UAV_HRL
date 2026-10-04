@@ -247,10 +247,11 @@ def test_prompt_uses_simplified_contract_and_no_weight_sum_rule(tmp_path):
     assert prompt.count("physical_bits=packet_max_bits*clip(image_quantity,0,1)") == 1
 
 
-def test_arbitrary_qwen_inventory_id_uses_common_cli_path(tmp_path):
+@pytest.mark.parametrize("model", ["qwen/qwen3.6-27b", "qwen/qwen3.8-27b"])
+def test_arbitrary_qwen_inventory_id_uses_common_cli_path(tmp_path, model):
     baseline = _fixed_artifact(tmp_path)
     args = build_parser().parse_args(
-        ["--fixed-sample", str(baseline), "--model", "qwen/qwen3.8-27b", "--dry-run"]
+        ["--fixed-sample", str(baseline), "--model", model, "--dry-run"]
     )
     assert args.provider == "lmstudio"
-    assert args.model == "qwen/qwen3.8-27b"
+    assert args.model == model

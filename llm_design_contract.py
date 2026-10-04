@@ -30,7 +30,7 @@ SUPPORTED_OBS_INTERFACE_VERSIONS = (
     LEGACY_OBS_INTERFACE_VERSION,
     OBS_INTERFACE_VERSION,
 )
-PROMPT_VERSION = "uav-hrl-llm-design-prompt-v8"
+PROMPT_VERSION = "uav-hrl-llm-design-prompt-v9"
 DESIGN_RUN_SCHEMA_VERSION = "uav-hrl-llm-design-run-v4"
 APPROVED_ARTIFACT_SCHEMA_VERSION = "uav-hrl-approved-shared-feature-design-v2"
 ROOT = Path(__file__).resolve().parent
@@ -675,6 +675,7 @@ def render_environment_interface(
     constants_metadata: dict[str, Any],
     *,
     include_system_semantics: bool = True,
+    include_constants: bool = True,
 ) -> str:
     num_uav = int(constants_metadata["num_uav"]["value"])
     saved_state_schema = fixed_metadata["compatibility_contract"][
@@ -748,12 +749,17 @@ def render_environment_interface(
                 "- The three stored baseline penalties are per-task-type means and each has weight 1; they are post-action reward components and therefore are not present in obs.",
             )
         )
-    lines.extend(
-        (
-            "",
-            "constants contains verified fixed entries; rows are key dtype unit = value; meaning; source:",
-        )
-    )
+    if include_constants:
+        lines.extend(("", render_constants_table(constants_metadata)))
+    return "\n".join(lines)
+
+
+def render_constants_table(constants_metadata: dict[str, Any]) -> str:
+    """Render the authoritative constants table independently of obs fields."""
+
+    lines = [
+        "constants contains verified fixed entries; rows are key dtype unit = value; meaning; source:"
+    ]
     for name, item in constants_metadata.items():
         lines.append(
             f"- {name} {item['dtype']} {item['unit'] or 'none'} = "
@@ -925,13 +931,17 @@ def render_prompt(
 ) -> str:
     template = PROMPT_TEMPLATE_PATH.read_text(encoding="utf-8")
     replacements = {
-        "{{MOVEMENT_AND_ENERGY_SUMMARY}}": movement_and_energy_summary(constants_metadata),
+        "{{MOVEMENT_AND_ENERGY_SPEC}}": movement_and_energy_spec(constants_metadata),
         "{{VISUAL_SENSING_SPEC}}": visual_sensing_spec(constants_metadata),
         "{{COMMUNICATION_SPEC}}": communication_spec(constants_metadata),
-        "{{PACKET_LIFECYCLE_AND_OBSERVATION_TIMING}}": packet_lifecycle_and_observation_timing(),
-        "{{NAMED_INPUT_FIELD_TABLE}}": render_environment_interface(
-            fixed_metadata, constants_metadata, include_system_semantics=False
+        "{{PACKET_AND_OBSERVATION_TIMING_SPEC}}": packet_lifecycle_and_observation_timing(),
+        "{{INPUT_FIELD_TABLE}}": render_environment_interface(
+            fixed_metadata,
+            constants_metadata,
+            include_system_semantics=False,
+            include_constants=False,
         ),
+        "{{CONSTANTS_TABLE}}": render_constants_table(constants_metadata),
         "{{BETA}}": format(float(beta), ".17g"),
         "{{SUPPORTED_OPERATIONS}}": SUPPORTED_OPERATIONS,
         "{{MINIMAL_EXECUTABLE_EXAMPLE}}": json.dumps(

@@ -361,9 +361,12 @@ def _response(candidate, *, finish_reason="stop", model="qwen/qwen3.5-9b"):
 
 
 class MockClient:
-    def __init__(self, responses, model="qwen/qwen3.5-9b"):
+    def __init__(
+        self, responses, model="qwen/qwen3.5-9b", loaded_context=20000
+    ):
         self.responses = list(responses)
         self.model = model
+        self.loaded_context = int(loaded_context)
         self.calls = []
 
     def list_models(self):
@@ -377,7 +380,10 @@ class MockClient:
                         "quantization": {"name": "Q4_K_M"},
                         "max_context_length": 32768,
                         "loaded_instances": [
-                            {"id": self.model, "config": {"context_length": 20000}}
+                            {
+                                "id": self.model,
+                                "config": {"context_length": self.loaded_context},
+                            }
                         ],
                     }
                 ]
@@ -569,15 +575,16 @@ def test_prompt_is_complete_current_only_and_example_parses(design_fixture):
 
 def test_master_prompt_has_exact_placeholder_contract_and_supported_operations_match():
     template = PROMPT_TEMPLATE_PATH.read_text(encoding="utf-8")
-    assert PROMPT_VERSION == "uav-hrl-llm-design-prompt-v8"
+    assert PROMPT_VERSION == "uav-hrl-llm-design-prompt-v9"
     assert {
         token
         for token in (
-            "{{MOVEMENT_AND_ENERGY_SUMMARY}}",
+            "{{MOVEMENT_AND_ENERGY_SPEC}}",
             "{{VISUAL_SENSING_SPEC}}",
             "{{COMMUNICATION_SPEC}}",
-            "{{PACKET_LIFECYCLE_AND_OBSERVATION_TIMING}}",
-            "{{NAMED_INPUT_FIELD_TABLE}}",
+            "{{PACKET_AND_OBSERVATION_TIMING_SPEC}}",
+            "{{INPUT_FIELD_TABLE}}",
+            "{{CONSTANTS_TABLE}}",
             "{{SUPPORTED_OPERATIONS}}",
             "{{MINIMAL_EXECUTABLE_EXAMPLE}}",
             "{{BASELINE_AND_ACCEPTANCE_RULE}}",
@@ -586,18 +593,24 @@ def test_master_prompt_has_exact_placeholder_contract_and_supported_operations_m
         )
         if token in template
     } == {
-        "{{MOVEMENT_AND_ENERGY_SUMMARY}}",
+        "{{MOVEMENT_AND_ENERGY_SPEC}}",
         "{{VISUAL_SENSING_SPEC}}",
         "{{COMMUNICATION_SPEC}}",
-        "{{PACKET_LIFECYCLE_AND_OBSERVATION_TIMING}}",
-        "{{NAMED_INPUT_FIELD_TABLE}}",
+        "{{PACKET_AND_OBSERVATION_TIMING_SPEC}}",
+        "{{INPUT_FIELD_TABLE}}",
+        "{{CONSTANTS_TABLE}}",
         "{{SUPPORTED_OPERATIONS}}",
         "{{MINIMAL_EXECUTABLE_EXAMPLE}}",
         "{{BASELINE_AND_ACCEPTANCE_RULE}}",
         "{{BETA}}",
         "{{ROUND_CONTEXT}}",
     }
-    assert template.count("{{") == 10
+    assert template.count("{{") == 11
+    assert "5. Design procedure" in template
+    assert "(1) Understand the available information." in template
+    assert "(2) Connect task requirements to features." in template
+    assert "(3) Verify formulas and reward direction." in template
+    assert "Features should describe task-relevant states or relationships." not in template
     for name in llm_candidate.SAFE_BUILTIN_CALLS:
         assert name in SUPPORTED_OPERATIONS
     for name in llm_candidate.SAFE_NUMPY_CALLS:
@@ -632,6 +645,7 @@ def test_all_providers_save_the_same_fully_rendered_first_prompt(tmp_path):
     fixed = _fixed_artifact(tmp_path)
     cases = (
         ("lmstudio", "qwen/qwen3.5-9b"),
+        ("lmstudio", "qwen/qwen3.6-27b"),
         ("lmstudio", "google/gemma-4-e4b"),
         ("openai", "gpt-4o"),
     )
@@ -649,7 +663,8 @@ def test_all_providers_save_the_same_fully_rendered_first_prompt(tmp_path):
         prompt = (output / "prompt_attempt_01.txt").read_text(encoding="utf-8")
         assert "{{ROUND_REQUEST}}" not in prompt
         assert "1. System, workflow, and objective" in prompt
-        assert "6. Evaluation and revision" in prompt
+        assert "5. Design procedure" in prompt
+        assert "7. Evaluation and revision" in prompt
         prompts.append(prompt)
     assert prompts[0] == prompts[1] == prompts[2]
 
@@ -826,7 +841,10 @@ def test_cli_redacts_provider_credentials_from_errors(monkeypatch, capsys):
     assert "[REDACTED]" in error
 
 
-@pytest.mark.parametrize("model", ["qwen/qwen3.5-9b", "google/gemma-4-e4b"])
+@pytest.mark.parametrize(
+    "model",
+    ["qwen/qwen3.5-9b", "qwen/qwen3.6-27b", "google/gemma-4-e4b"],
+)
 def test_dry_run_saves_streaming_unstructured_request(tmp_path, model):
     fixed = _fixed_artifact(tmp_path)
     result = run_design(
@@ -842,10 +860,18 @@ def test_dry_run_saves_streaming_unstructured_request(tmp_path, model):
     assert request["model"] == model
     assert request["stream"] is True
     assert "response_format" not in request
+    assert result["metadata"]["model"]["provider"] == "lmstudio"
+    assert result["metadata"]["model"]["requested_api_identifier"] == model
+    assert result["metadata"]["model"]["adapter"] == (
+        "qwen" if "qwen" in model else "gemma"
+    )
     assert result["metadata"]["generation_requests_sent"] == 0
 
 
-@pytest.mark.parametrize("model", ["qwen/qwen3.5-9b", "google/gemma-4-e4b"])
+@pytest.mark.parametrize(
+    "model",
+    ["qwen/qwen3.5-9b", "qwen/qwen3.6-27b", "google/gemma-4-e4b"],
+)
 def test_lm_studio_request_streams_without_response_format(tmp_path, model):
     chunks = [
         (
@@ -3694,7 +3720,7 @@ def test_revision_then_pass_and_max_attempt_exhaustion(tmp_path):
     fixed = _fixed_artifact(tmp_path)
     failing = _response(_candidate(passing=False, name="first"))
     passing = _response(_candidate(passing=True, name="second"))
-    client = MockClient([failing, passing])
+    client = MockClient([failing, passing], loaded_context=32768)
     result = run_design(
         fixed_sample=fixed,
         model=client.model,
@@ -3722,7 +3748,8 @@ def test_revision_then_pass_and_max_attempt_exhaustion(tmp_path):
     assert "The existing maximum pairwise-ratio acceptance criterion remains unchanged" in second_prompt
     assert "{{ROUND_REQUEST}}" not in second_prompt
     assert "1. System, workflow, and objective" in second_prompt
-    assert "6. Evaluation and revision" in second_prompt
+    assert "5. Design procedure" in second_prompt
+    assert "7. Evaluation and revision" in second_prompt
     full_feedback = json.loads(
         (tmp_path / "revision" / "attempt_01" / "feedback.json").read_text()
     )
@@ -3742,7 +3769,7 @@ def test_revision_then_pass_and_max_attempt_exhaustion(tmp_path):
         assert summary["omitted_array_or_schema_elements"] > 0
         assert summary["candidate_code_truncated_or_rewritten"] is False
 
-    exhausted_client = MockClient([failing, failing])
+    exhausted_client = MockClient([failing, failing], loaded_context=32768)
     exhausted = run_design(
         fixed_sample=fixed,
         model=exhausted_client.model,
@@ -3773,6 +3800,7 @@ def test_evaluation_revision_feedback_is_shared_by_all_mock_providers(design_fix
                 _response(_candidate(passing=True, name="second"), model=model),
             ],
             model=model,
+            loaded_context=32768,
         )
         output = fixed.parent / f"shared-evaluation-feedback-{provider}-{model.split('/')[-1]}"
         result = run_design(

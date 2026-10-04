@@ -54,8 +54,8 @@ p_u = [x_u, y_u, z_u], measured in metres.
 p_next = project_to_constraints(p + v * delta_t)
 E = P(v) * delta_t
 
-Action ranges, position constraints, and relevant power characteristics:
-{{MOVEMENT_AND_ENERGY_SUMMARY}}
+Action ranges, position constraints, and power model:
+{{MOVEMENT_AND_ENERGY_SPEC}}
 
 Visual sensing:
 
@@ -90,10 +90,11 @@ remaining_deadline_p =
 deadline_p - (current_time - generation_time_p)
 
 Q is queued bits and C is positive capacity in bit/s. Q/C is a reference clearance time under constant capacity and continuous service.
+
 HOL is the head-of-line packet; its remaining deadline describes that packet's time budget.
 
 The actual ordering of packet generation, service, delivery, expiration removal, and observation capture:
-{{PACKET_LIFECYCLE_AND_OBSERVATION_TIMING}}
+{{PACKET_AND_OBSERVATION_TIMING_SPEC}}
 
 3. Available inputs
 
@@ -101,15 +102,18 @@ obs contains current observable information before the TD3 action.
 constants contains fixed environment parameters.
 
 Use the following named fields:
-{{NAMED_INPUT_FIELD_TABLE}}
+{{INPUT_FIELD_TABLE}}
+{{CONSTANTS_TABLE}}
 
-The table defines names, meanings, shapes, entity IDs and axes, units, normalization, and validity conditions.
+The tables define names, meanings, shapes, entity IDs and axes, units, normalization, and validity conditions.
 
 Select data using validity flags and handle empty valid sets.
+
 movement_mask identifies TD3 control ownership; features may use other observable nodes where relevant.
+
 Function inputs are limited to the documented current-time information.
 
-4. Feature and reward design
+4. Feature and reward structure
 
 Choose the number of features K. Return an unweighted one-dimensional numeric list or NumPy array:
 
@@ -140,17 +144,32 @@ B_timely_Mbit, E_movement_J, and penalties are subsequent-interval outcomes.
 lambda is managed by training.
 beta = {{BETA}}
 
-f and r_extra use pre-action information. r_extra and r_total may exceed [-1,1]; all results must remain finite.
+f and r_extra use pre-action information.
+r_extra and r_total may exceed [-1,1]; all results must remain finite.
 
-Features should describe task-relevant states or relationships.
-For each nonzero weight, briefly explain in its description how the rewarded direction supports timely delivery, energy efficiency, or lower deadline risk. Incorporate the conditions needed for that rationale into the computation.
+5. Design procedure
 
-5. Code and output interface
+Complete the following checks before submitting a candidate:
+
+(1) Understand the available information.
+Identify the UAV, target, queue, or link represented by each input you use, together with its units, validity conditions, and entity relationships. Establish how TD3 movement can affect these quantities through the system workflow.
+
+(2) Connect task requirements to features.
+Use timely delivery, movement energy, and end-to-end deadline requirements to select observations and computations that help distinguish conditions relevant to movement decisions. Consider relationships and trade-offs among sensing, uploading, and subsequent delivery to the GS.
+
+(3) Verify formulas and reward direction.
+For each feature, confirm that the implemented formula measures what its description states. For each nonzero weight, check how w_k * f_k changes as relevant inputs vary and what behavior that change encourages. Incorporate the conditions needed for its task benefit into the computation.
+
+Check these properties for typical inputs, boundary cases, and empty valid sets.
+Summarize the conclusions in each feature's description; use the JSON format below for the final output.
+
+6. Code and output interface
 
 The execution environment provides np. Supported operations:
 {{SUPPORTED_OPERATIONS}}
 
 Identical inputs must produce identical outputs, and inputs must remain unchanged.
+
 The host checks output shape, finite values, and the [0,1] range before converting to float32. Features and weights are used as submitted.
 
 Return only one JSON object:
@@ -159,7 +178,7 @@ Return only one JSON object:
   "features": [
     {
       "name": "feature_name",
-      "description": "Measured quantity, fixed normalization, empty-set behavior, and weight rationale.",
+      "description": "Briefly state the measured quantity, fixed normalization, empty-set behavior, and its purpose for movement decisions or reward design.",
       "reward_weight": 0.0
     }
   ],
@@ -171,7 +190,7 @@ The features list must match the returned vector in length and order.
 Interface example:
 {{MINIMAL_EXECUTABLE_EXAMPLE}}
 
-6. Evaluation and revision
+7. Evaluation and revision
 
 All candidates use the same fixed samples and eligible pair set P.
 
@@ -194,9 +213,7 @@ Baseline values and acceptance conditions:
 
 L_hat is an offline screening criterion; training performance is evaluated separately.
 
-Before submission, check that computations match their descriptions, units, and validity conditions across typical, boundary, and empty-input cases.
-
 This round's task and feedback:
 {{ROUND_CONTEXT}}
 
-When revising, use errors and critical-pair feature differences, reward contributions, and distances to adjust the relevant computations or weights. Retain useful parts and return the complete candidate JSON.
+When revising, use errors and evaluation diagnostics to identify the observation selection, feature computation, or weight that needs adjustment. Recheck its task purpose and reward direction. Retain useful parts and return the complete candidate JSON.

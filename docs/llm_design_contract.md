@@ -37,7 +37,7 @@ preference for the parser-error location. The environment interface, schema,
 evaluation rules, and output reservation are never silently removed.
 
 Qwen, Gemma, GPT-OSS, and GPT-4o use the same provider-neutral English master prompt
-(`uav-hrl-llm-design-prompt-v8`). Provider adapters change only transport and
+(`uav-hrl-llm-design-prompt-v9`). Provider adapters change only transport and
 provider-specific request fields; they do not maintain separate task prompts.
 The saved prompt for each attempt is the exact fully assembled request content.
 Its environment interface is generated from the fixed artifact's authoritative
@@ -225,23 +225,30 @@ Dry-run against the current formal fixed baseline (no API request):
 
 ```powershell
 & 'C:\Users\user\anaconda3\envs\LLM_HRL\python.exe' run_llm_design.py `
+  --provider lmstudio `
   --fixed-sample results/llm_baselines/baseline-20260927T130708Z-ba4bf287 `
-  --model qwen/qwen3.8-27b `
-  --context-length 40000 --max-output-tokens 4096 --dry-run
+  --model qwen/qwen3.6-27b `
+  --context-length 30000 --max-output-tokens 4096 --dry-run
 ```
 
-Qwen3.8-27B (use the exact ID returned by the current LM Studio inventory):
+Qwen3.6-27B (use this exact ID only when it is visible in the current LM Studio inventory):
 
 ```powershell
 & 'C:\Users\user\anaconda3\envs\LLM_HRL\python.exe' run_llm_design.py `
+  --provider lmstudio `
   --fixed-sample results/llm_baselines/baseline-20260927T130708Z-ba4bf287 `
   --base-url http://127.0.0.1:1234/v1 `
-  --model qwen/qwen3.8-27b `
-  --context-length 40000 --max-output-tokens 4096 `
+  --model qwen/qwen3.6-27b `
+  --context-length 30000 --max-output-tokens 4096 `
   --temperature 0.3 --seed 20260927 --max-attempts 5 `
   --beta 1.0 --batch-size 128 `
   --timeout 600 --worker-timeout 120
 ```
+
+The `30000` values above match the loaded instance observed during the
+Qwen3.6-27B dry-run verification on 2026-10-04. Recheck the current LM Studio
+inventory and change `--context-length` if the instance is reloaded differently;
+the client never changes the server loading configuration.
 
 GPT-OSS uses the same non-agent workflow (reasoning settings remain provider
 capabilities rather than a hard-coded Qwen/Gemma option):
