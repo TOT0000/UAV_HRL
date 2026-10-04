@@ -811,10 +811,10 @@ def format_schema_and_example(schema: dict[str, Any] | None = None) -> str:
 
 
 SUPPORTED_OPERATIONS = """Supported code subset:
-- No import statements. `np` is already provided.
-- Literal arithmetic, comparisons, Boolean expressions, indexing with literal obs/constants keys, local variables, if/for constructs, and returns.
+- No imports. `np` is provided.
+- Arithmetic, comparisons, Boolean expressions, literal obs/constants-key indexing, local variables, if/for constructs, and returns.
 - Safe built-ins: abs, bool, enumerate, float, int, len, list, max, min, range, sum, tuple, zip.
-- NumPy: abs, all, any, arange, array, asarray, bool_, clip, concatenate, count_nonzero, exp, float32, float64, int32, int64, isfinite, log, log1p, maximum, mean, minimum, ones, sqrt, stack, sum, where, zeros, and linalg.norm.
+- NumPy: abs, all, any, arange, array, asarray, bool_, clip, concatenate, count_nonzero, exp, float32, float64, int32, int64, isfinite, log, log1p, max, maximum, mean, min, minimum, ones, sqrt, stack, sum, where, zeros, and linalg.norm.
 - Indexed writes may fill arrays independently created inside the function by supported allocating operations such as np.zeros, np.ones, np.arange, and np.array. Safe local aliases and slices of those arrays remain writable.
 - Augmented assignment may update a proven immutable numeric local or an independently created local NumPy array. It may not update an input-backed or uncertain target.
 - Do not store input-backed or otherwise mutable references in Python containers for later nested mutation; that container-reference pattern is conservatively rejected.

@@ -1,0 +1,62 @@
+Review a proposed set of additional state features and reward weights for centralized TD3 movement control.
+
+Determine whether the candidate needs revision based on the system definition, available inputs, implementation, and validation results. Provide concrete changes when needed.
+
+{{COMMON_CONTEXT}}
+
+Candidate under review
+
+{{CANDIDATE}}
+
+Program validation
+
+{{VALIDATION_REPORT}}
+
+Relevant previous reviews
+
+{{REVIEW_HISTORY}}
+
+Review requirements
+
+1. Implementation and description
+
+Check whether each feature's code computes what its name and description claim. Look for clear errors in data selection, validity handling, and normalization.
+
+2. Reward direction
+
+Read each feature formula together with its weight to determine which conditions receive a higher reward contribution.
+
+Check whether this agrees with the stated purpose and whether it creates a clear conflict with timely delivery, movement-energy efficiency, or end-to-end deadlines.
+
+3. Necessary changes
+
+For each issue, identify the affected feature or computation, explain the problem, and propose an implementable change using the available inputs and supported operations.
+
+Changes may include adding, removing, or modifying features, changing normalization, or adjusting weights.
+
+Support findings with the code, system definitions, or supplied validation evidence. Label uncertain effects as possible risks.
+
+If previous suggestions are provided, check whether they have been addressed.
+
+When no issue requiring revision is found, return needs_revision=false. This review assesses the design before training; improved training performance remains unverified.
+
+Output
+
+Return one JSON object:
+
+{
+  "needs_revision": true,
+  "summary": "Brief overall conclusion.",
+  "suggestions": [
+    {
+      "target": "Affected feature, computation, or overall design",
+      "reason": "Explain the issue and its consequence using the supplied evidence.",
+      "suggested_change": "A concrete, implementable modification."
+    }
+  ]
+}
+
+For needs_revision=true, include actionable suggestions.
+For needs_revision=false, return an empty suggestions list.
+
+Return only the review JSON object.

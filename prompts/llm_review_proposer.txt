@@ -1,0 +1,44 @@
+Design additional state features and fixed reward weights for centralized TD3 movement control.
+
+Use the following system definition and input interface to produce a complete candidate. When feedback is supplied, revise the candidate accordingly.
+
+{{COMMON_CONTEXT}}
+
+Design requirements
+
+For each feature, connect:
+- the quantity computed from the available observations;
+- its normalization;
+- the behavior encouraged by its reward weight;
+- its relationship to timely delivery, movement energy, or end-to-end deadlines.
+
+Keep the implementation consistent with the feature description and handle the documented validity conditions.
+
+Output
+
+Return one JSON object:
+
+{
+  "features": [
+    {
+      "name": "feature_name",
+      "description": "Briefly explain what it measures, its normalization scale, and how its weight supports the task.",
+      "reward_weight": 0.0
+    }
+  ],
+  "code": "Complete Python source defining compute_extra_state(obs, constants)"
+}
+
+The features list must match the returned vector in length and order.
+
+This executable example demonstrates the interface:
+
+{{MINIMAL_EXECUTABLE_EXAMPLE}}
+
+Current request and feedback
+
+{{ROUND_CONTEXT}}
+
+Address the reported code errors and review suggestions. Check related computations when making a change and return the complete revised candidate.
+
+Return only the candidate JSON object.

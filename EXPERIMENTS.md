@@ -107,8 +107,15 @@ marks a non-formal evaluation and may be combined with
 
 ## Approved LLM state/reward comparison
 
+The optional two-model offline comparison (`run_llm_review_design.py`) uses a
+proposer, complete fixed-sample program validation, and an independent model
+review without running the Lipschitz evaluator. Its limits, resume behavior,
+and PowerShell examples are documented in
+[`docs/llm_review_design.md`](docs/llm_review_design.md).
+
 `td3_dinkelbach_llm` is an independent method and requires an explicit approved
-artifact produced by `run_llm_design.py`. It copies the complete artifact into
+artifact produced by `run_llm_design.py` or `run_llm_review_design.py`. It
+copies the complete artifact into
 the new run, records its content hash and beta, appends the artifact-defined
 features to the unchanged 531-dimensional state, and stores the current-only
 extra reward separately in replay. The existing reward is reconstructed at the

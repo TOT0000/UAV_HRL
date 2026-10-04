@@ -1,0 +1,177 @@
+System and task
+
+The system contains 16 UAVs, one ground station (GS), and 2-8 regions of interest (RoIs) in a standard 1000 x 1000 m disaster area.
+
+UAV tasks are:
+- Search: discover previously unknown RoIs.
+- Visual sensing (VS): capture data from an assigned RoI.
+- Communication collection (COM): receive data from an assigned ground source (SR).
+- Hover: remain hovering.
+
+A UAV may serve VS and COM simultaneously with different targets.
+
+The system has three control functions:
+- Task allocation assigns UAV roles and service targets.
+- Centralized TD3 controls the movement of UAVs identified by movement_mask.
+- Routing selects packet next hops during communication slots.
+
+Each TD3-controlled UAV has three action components: speed, horizontal heading, and vertical speed. Existing controllers handle Search and Hover behavior.
+
+A movement decision occurs every 1 s. Each interval contains four communication slots of 0.25 s. An episode lasts 60 s.
+
+The execution sequence is:
+
+current observations and task assignments
+-> TD3 movement action
+-> position and sensing/link updates
+-> data acquisition, queueing, uploads, and relay transmissions
+-> interval delivery, energy, and penalty calculation
+-> next movement decision
+
+Task allocation updates when its existing rules trigger.
+
+TD3 controls UAV positions. Task assignments, packet next hops, and communication scheduling are managed by the other controllers.
+
+Data delivery and objective
+
+VS data follows:
+capturing UAV -> zero or more relay UAVs -> GS
+
+COM data follows:
+SR queue -> serving UAV -> zero or more relay UAVs -> GS
+
+Packet deadlines are measured from generation until GS delivery:
+- VS: 2.5 s.
+- COM: 2.0 s.
+
+The deadline continues across queue changes and relay hops.
+
+The task seeks higher energy efficiency and fewer end-to-end deadline violations:
+
+EE = sum_t B_timely,t / sum_t E_movement,t
+
+B_timely,t is useful data delivered to the GS within its deadline during interval t.
+E_movement,t is movement energy of all UAVs during interval t.
+
+EE uses totals over the entire episode. Data acquisition and intermediate forwarding contribute to the delivery process; only timely GS delivery contributes to B_timely.
+
+Assess energy use and deadline violations together with useful delivery volume. Reduced service can lower energy consumption or traffic load while also reducing task achievement.
+
+Quantitative relationships
+
+UAV positions are p_u = [x_u, y_u, z_u], measured in metres.
+
+The action ranges, position update, movement constraints, and energy calculation are:
+
+{{MOVEMENT_AND_ENERGY_SPEC}}
+
+For UAV u and RoI j:
+
+d_horizontal(u,j) =
+sqrt((x_u-x_j)^2 + (y_u-y_j)^2)
+
+Sensing geometry describes how UAV position, altitude, and camera footprint determine valid capture, RoI coverage, and image quality.
+
+The capture conditions, coverage/image-quality calculations, VS data-volume calculation, and sensing penalties are:
+
+{{VISUAL_SENSING_SPEC}}
+
+VS packets are generated when capture is valid and subsequently require timely delivery to the GS.
+
+For communication nodes a and b:
+
+d_ab = norm(p_a-p_b, 2)
+
+Link availability, capacity, bandwidth conditions, and the COM penalty are:
+
+{{COMMUNICATION_SPEC}}
+
+For constant capacity C_ab in bits/s during a 0.25 s slot:
+
+B_ab <= C_ab * 0.25
+
+Actual service also depends on scheduling, allocated bandwidth, and queued data. Reference capacity describes link potential under its documented assumptions.
+
+A relay path is a sequence of valid directed links from a packet's current node to the GS. For example, A -> B -> GS requires both links. Delivery time also depends on service capacity and waiting along the path.
+
+Movement changes the links incident to the moved UAV and may affect its VS and COM targets differently.
+
+For backlog Q in bits and positive capacity C in bits/s:
+
+reference_clearance_time = Q / C
+
+This estimate assumes constant capacity and continuous service.
+
+For packet p:
+
+remaining_deadline_p =
+deadline_p - (current_time - generation_time_p)
+
+End-to-end delay includes source waiting, upload, UAV queueing, scheduling, and subsequent transmissions.
+
+Available inputs
+
+compute_extra_state(obs, constants) receives:
+- obs: current observable information before the TD3 movement action.
+- constants: fixed environment parameters.
+
+{{INPUT_FIELD_TABLE}}
+
+The table defines field names, meanings, shapes, axis/ID mappings, units, and validity conditions.
+
+Use the documented validity flags and handle empty valid sets. Missing information differs from an observed zero or empty queue.
+
+movement_mask identifies control ownership. Observation validity is defined by the corresponding field rules. Observable UAVs outside movement_mask can still participate in data forwarding.
+
+Feature inputs are limited to documented current-time observations. Future outcomes and undiscovered target locations are unavailable.
+
+Shared features and reward
+
+The candidate defines:
+
+compute_extra_state(obs, constants)
+
+It returns an unweighted one-dimensional numeric list or NumPy array:
+
+f = [f_0, ..., f_(K-1)]
+0 <= f_k <= 1
+
+The number, order, definitions, and normalization of features remain fixed across samples and episodes.
+
+Each feature has a fixed finite reward_weight w_k:
+- Positive: a larger feature value gives a larger reward contribution.
+- Negative: a larger feature value gives a smaller reward contribution.
+- Zero: the feature contributes to state only.
+
+There is no restriction on the sum or absolute sum of weights. The host preserves the supplied weights.
+
+The host computes:
+
+s_aug = concat(s_original, f)
+r_extra = sum_k w_k * f_k
+r_total = r_base + beta * r_extra
+
+The original state is preserved.
+
+r_base =
+B_timely_Mbit
+- lambda * E_movement_J
+- P_C9 - P_C10 - P_COM
+
+B_timely_Mbit and E_movement_J are outcomes over the subsequent movement interval, measured in Mbit and J. Penalties follow the definitions above. The training procedure manages lambda.
+
+beta = {{BETA}}
+
+Features and r_extra use pre-action information. r_base reflects subsequent interval outcomes.
+
+r_extra and r_total may lie outside [-1,1]. All computed values must remain finite.
+
+Code interface
+
+Use the provided np and the supported operations below:
+
+{{SUPPORTED_OPERATIONS}}
+
+The function must be deterministic and leave its inputs unchanged.
+
+The host checks the output shape, numeric values, and [0,1] range, then converts features to float32. It does not clip features or normalize weights.

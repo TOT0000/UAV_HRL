@@ -250,10 +250,16 @@ class LMStudioClient:
         return _redact_text(value, (self.token,) if self.token else ())
 
     def _payload(
-        self, *, model: str, prompt: str, temperature: float,
-        max_output_tokens: int, seed: int
+        self,
+        *,
+        model: str,
+        prompt: str,
+        temperature: float,
+        max_output_tokens: int,
+        seed: int,
+        reasoning_effort: str | None = None,
     ) -> dict[str, Any]:
-        return {
+        payload = {
             "model": model,
             "messages": [{"role": "user", "content": prompt}],
             "temperature": float(temperature),
@@ -262,6 +268,9 @@ class LMStudioClient:
             "stream": True,
             "stream_options": {"include_usage": True},
         }
+        if reasoning_effort is not None:
+            payload["reasoning_effort"] = str(reasoning_effort)
+        return payload
 
     def _http_error_category(self, status: int) -> str:
         return "http_error"
@@ -332,6 +341,7 @@ class LMStudioClient:
         max_output_tokens: int,
         seed: int,
         attempt_directory: str | Path,
+        reasoning_effort: str | None = None,
     ) -> dict[str, Any]:
         self.validate_configuration()
         payload = self._payload(
@@ -340,6 +350,7 @@ class LMStudioClient:
             temperature=temperature,
             max_output_tokens=max_output_tokens,
             seed=seed,
+            reasoning_effort=reasoning_effort,
         )
         attempt_directory = Path(attempt_directory)
         _write_json(attempt_directory / "request.json", payload)
@@ -504,10 +515,16 @@ class OpenAIClient(LMStudioClient):
         raise RuntimeError("OpenAI provider does not use model inventory discovery")
 
     def _payload(
-        self, *, model: str, prompt: str, temperature: float,
-        max_output_tokens: int, seed: int
+        self,
+        *,
+        model: str,
+        prompt: str,
+        temperature: float,
+        max_output_tokens: int,
+        seed: int,
+        reasoning_effort: str | None = None,
     ) -> dict[str, Any]:
-        return {
+        payload = {
             "model": model,
             "messages": [{"role": "user", "content": prompt}],
             "temperature": float(temperature),
@@ -516,6 +533,9 @@ class OpenAIClient(LMStudioClient):
             "stream": True,
             "stream_options": {"include_usage": True},
         }
+        if reasoning_effort is not None:
+            payload["reasoning_effort"] = str(reasoning_effort)
+        return payload
 
     def _http_error_category(self, status: int) -> str:
         if status in {401, 403}:
@@ -607,9 +627,10 @@ def planned_chat_request(
     temperature: float,
     max_output_tokens: int,
     seed: int,
+    reasoning_effort: str | None = None,
 ) -> dict[str, Any]:
     token_field = "max_completion_tokens" if provider == "openai" else "max_tokens"
-    return {
+    request = {
         "model": model,
         "messages": [{"role": "user", "content": prompt}],
         "temperature": float(temperature),
@@ -618,6 +639,9 @@ def planned_chat_request(
         "stream": True,
         "stream_options": {"include_usage": True},
     }
+    if reasoning_effort is not None:
+        request["reasoning_effort"] = str(reasoning_effort)
+    return request
 
 
 def response_model_matches(provider: str, requested: str, returned: str) -> bool:

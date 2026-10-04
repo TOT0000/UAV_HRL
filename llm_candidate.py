@@ -89,8 +89,10 @@ SAFE_NUMPY_CALLS = {
     "np.isfinite",
     "np.log",
     "np.log1p",
+    "np.max",
     "np.maximum",
     "np.mean",
+    "np.min",
     "np.minimum",
     "np.ones",
     "np.sqrt",
@@ -2488,6 +2490,8 @@ def save_approved_artifact(
         "files_sha256": files,
         "provenance": provenance,
     }
+    if provenance.get("approval_method") is not None:
+        artifact["approval_method"] = provenance["approval_method"]
     artifact["content_sha256"] = hashlib.sha256(
         json.dumps(
             artifact,
