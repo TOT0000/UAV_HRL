@@ -9,6 +9,9 @@ import llm_episode_search as search
 import llm_episode_training as episode_training
 import run_experiment
 from experiment_config import MethodSpec
+from experiment_paths import write_run_status
+from llm_candidate import save_approved_artifact
+from llm_runtime import artifact_identity, copy_approved_artifact
 from training_checkpoint import CHECKPOINT_PROVENANCE_FIELDS
 from training_history import (
     build_training_history_row,
@@ -85,6 +88,37 @@ def _patch_preflight(monkeypatch):
         episode_training,
         "validate_baseline_preflight",
         lambda **_kwargs: _preflight_fixture(),
+    )
+
+
+def _approved_artifact(root: Path, *, provenance=None) -> Path:
+    root.mkdir(parents=True, exist_ok=True)
+    candidate = {
+        "schema_version": "uav-hrl-llm-shared-feature-candidate-v2",
+        "candidate_name": "candidate_1",
+        "reward_input_mode": "current_only",
+        "features": [
+            {
+                "index": 0,
+                "name": "fixture_zero",
+                "dtype": "float32",
+                "description": "Fixture-only constant feature.",
+                "range": {"minimum": 0.0, "maximum": 1.0},
+                "source_fields": [],
+                "formula": "0",
+                "missing_data_rule": "always zero",
+                "reward_weight": 0.0,
+            }
+        ],
+        "code": "def compute_extra_state(obs, constants):\n    return np.asarray([0.0], dtype=np.float32)",
+    }
+    return save_approved_artifact(
+        root,
+        candidate=candidate,
+        constants_metadata={},
+        validation_report={"status": "passed", "fixture": True},
+        evaluation_report={"status": "passed", "fixture": True},
+        provenance={"beta": 1.0, "fixture": True, **(provenance or {})},
     )
 
 
@@ -804,6 +838,11 @@ def test_numeric_rule_revalidation_preserves_versions_usage_and_resumes_at_preev
     monkeypatch.setattr(search, "build_constants", lambda _metadata: {})
     monkeypatch.setattr(search, "render_common_prompt", lambda **_kwargs: "common")
     _patch_preflight(monkeypatch)
+    monkeypatch.setattr(
+        search,
+        "_git_sha",
+        lambda: next(iter(search.REVALIDATABLE_NUMERIC_RULE_SOURCE_REVISIONS)),
+    )
     new_rules = {"enabled": False}
 
     def validate(submission, **_kwargs):
@@ -961,6 +1000,353 @@ def test_revalidation_incompatibility_does_not_modify_saved_run(tmp_path, monkey
         search.run_episode_search(resume=output, revalidate_only=True)
     assert (output / "state.json").read_bytes() == before
     assert not (output / "revalidations").exists()
+
+
+def test_short_training_root_copies_deep_artifact_with_identity_preserved(tmp_path):
+    deep = tmp_path
+    while len(str(deep.resolve())) < 185:
+        deep = deep / "deep-approved-artifact-source"
+    source = _approved_artifact(deep)
+    search_output = tmp_path / "search" / "design-fixture"
+    short_root = search._short_training_output_root(search_output, 1)
+    # Redirect the repository-owned base for this filesystem fixture while
+    # retaining the production path shape.
+    short_root = tmp_path / "results" / "llm_train" / short_root.parent.name / short_root.name
+    run_directory = short_root / "td3_dinkelbach_llm_search" / "run-fixture"
+    run_directory.mkdir(parents=True)
+    copied = copy_approved_artifact(source, run_directory)
+    assert artifact_identity(copied) == artifact_identity(
+        episode_training.load_approved_design(source)
+    )
+    assert (copied.directory / "artifact.json").is_file()
+    assert len(str(copied.directory / "validation_report.json")) < 260
+
+
+def test_training_adapter_abandons_initialization_shell_and_starts_fresh(
+    tmp_path, monkeypatch
+):
+    artifact = _approved_artifact(tmp_path / "artifact")
+    short_root = tmp_path / "short"
+    legacy_root = tmp_path / "legacy"
+    shell = legacy_root / search.SEARCH_METHOD_ID / "old-initialization-shell"
+    (shell / "llm_artifact").mkdir(parents=True)
+    (shell / "llm_artifact" / "candidate.py").write_text("partial", encoding="utf-8")
+    write_run_status(shell, "PREPARING")
+    design = episode_training.load_approved_design(artifact)
+    recovery_state = episode_training._new_training_state(
+        method_id=search.SEARCH_METHOD_ID,
+        artifact_identity_record=artifact_identity(design),
+        episodes=1500,
+        seed=20260817,
+        output=short_root.resolve(),
+    )
+    recovery_state["active_run_directory"] = str(shell.resolve())
+    episode_training._write_json_atomic(
+        short_root / episode_training.SEARCH_TRAINING_STATE_FILENAME,
+        recovery_state,
+    )
+    calls = []
+
+    def fail_new(command, *, cwd):
+        calls.append(command)
+        assert command[2] == search.SEARCH_METHOD_ID
+        assert "resume" not in command
+        raise episode_training.EpisodeTrainingError("fixture initialization failure")
+
+    monkeypatch.setattr(episode_training, "_run", fail_new)
+    result = episode_training.run_candidate_training(
+        method_id=search.SEARCH_METHOD_ID,
+        artifact=artifact,
+        episodes=1500,
+        seed=20260817,
+        output_directory=short_root,
+        legacy_output_directory=legacy_root,
+        resume_record=None,
+    )
+    assert result["status"] == "incomplete"
+    assert result["recovery_action"] == "fresh_initialization_failed"
+    assert len(calls) == 1
+    state = json.loads(
+        (short_root / episode_training.SEARCH_TRAINING_STATE_FILENAME).read_text(
+            encoding="utf-8"
+        )
+    )
+    legacy_attempt = next(
+        item for item in state["attempts"] if item.get("run_directory") == str(shell.resolve())
+    )
+    assert legacy_attempt["result"] == "abandoned_initialization_failure"
+    assert legacy_attempt["evidence"]["partial_artifact_present"] is True
+
+
+def test_training_adapter_resumes_checkpoint_but_blocks_progress_without_one(
+    tmp_path, monkeypatch
+):
+    artifact = _approved_artifact(tmp_path / "artifact")
+    output = tmp_path / "short"
+    resumable = output / search.SEARCH_METHOD_ID / "resumable"
+    checkpoint = resumable / "checkpoints" / "full" / "ep_0001"
+    checkpoint.mkdir(parents=True)
+    write_run_status(resumable, "PREPARING")
+    copied = copy_approved_artifact(artifact, resumable)
+    (resumable / "resolved_config.json").write_text(
+        json.dumps(
+            {
+                "status": "FAILED",
+                "episodes": 1500,
+                "llm_artifact_identity": artifact_identity(copied),
+            }
+        ),
+        encoding="utf-8",
+    )
+    write_run_status(resumable, "RUNNING")
+    commands = []
+
+    def complete_resume(command, *, cwd):
+        commands.append(command)
+        assert command[2] == "resume"
+        (resumable / "resolved_config.json").write_text(
+            json.dumps({"status": "COMPLETED", "episodes": 1500}),
+            encoding="utf-8",
+        )
+        write_run_status(resumable, "COMPLETED")
+        return {"run_directory": str(resumable), "status": "COMPLETED"}
+
+    monkeypatch.setattr(episode_training, "_run", complete_resume)
+    monkeypatch.setattr(
+        episode_training,
+        "_training_summaries",
+        lambda *_args, **_kwargs: [{"episode_range": [1, 1500]}],
+    )
+    result = episode_training.run_candidate_training(
+        method_id=search.SEARCH_METHOD_ID,
+        artifact=artifact,
+        episodes=1500,
+        seed=20260817,
+        output_directory=output,
+        resume_record={"run_directory": str(resumable)},
+    )
+    assert result["status"] == "complete"
+    assert len(commands) == 1
+
+    blocked_root = tmp_path / "blocked"
+    blocked = blocked_root / search.SEARCH_METHOD_ID / "started-without-checkpoint"
+    blocked.mkdir(parents=True)
+    write_run_status(blocked, "PREPARING")
+    copy_approved_artifact(artifact, blocked)
+    write_run_status(blocked, "RUNNING")
+    monkeypatch.setattr(
+        episode_training,
+        "_run",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("must not silently restart")
+        ),
+    )
+    with pytest.raises(
+        episode_training.EpisodeTrainingError,
+        match="progress exists but no resumable checkpoint",
+    ):
+        episode_training.run_candidate_training(
+            method_id=search.SEARCH_METHOD_ID,
+            artifact=artifact,
+            episodes=1500,
+            seed=20260817,
+            output_directory=blocked_root,
+            resume_record={"run_directory": str(blocked)},
+        )
+
+
+def test_training_adapter_does_not_retrain_when_checkpoint_resume_fails(
+    tmp_path, monkeypatch
+):
+    artifact = _approved_artifact(tmp_path / "artifact")
+    output = tmp_path / "short"
+    damaged = output / search.SEARCH_METHOD_ID / "damaged-checkpoint"
+    (damaged / "checkpoints" / "full" / "ep_0001").mkdir(parents=True)
+    write_run_status(damaged, "PREPARING")
+    copied = copy_approved_artifact(artifact, damaged)
+    (damaged / "resolved_config.json").write_text(
+        json.dumps(
+            {
+                "status": "FAILED",
+                "episodes": 1500,
+                "llm_artifact_identity": artifact_identity(copied),
+            }
+        ),
+        encoding="utf-8",
+    )
+    write_run_status(damaged, "RUNNING")
+    commands = []
+
+    def reject_resume(command, *, cwd):
+        commands.append(command)
+        assert command[2] == "resume"
+        raise episode_training.EpisodeTrainingError("checkpoint is damaged")
+
+    monkeypatch.setattr(episode_training, "_run", reject_resume)
+    result = episode_training.run_candidate_training(
+        method_id=search.SEARCH_METHOD_ID,
+        artifact=artifact,
+        episodes=1500,
+        seed=20260817,
+        output_directory=output,
+        resume_record={"run_directory": str(damaged)},
+    )
+    assert result["status"] == "incomplete"
+    assert result["recovery_action"] == "resume_failed_no_retraining"
+    assert result["run_directory"] == str(damaged.resolve())
+    assert len(commands) == 1
+
+    state = json.loads(
+        (output / episode_training.SEARCH_TRAINING_STATE_FILENAME).read_text(
+            encoding="utf-8"
+        )
+    )
+    assert state["active_run_directory"] == str(damaged.resolve())
+    assert state["attempts"][-1]["result"] == "resume_failed_no_retraining"
+    assert "checkpoint is damaged" in state["attempts"][-1]["error"]
+
+
+def test_bounded_training_recovery_preserves_selection_and_skips_model_and_ranking(
+    tmp_path, monkeypatch
+):
+    output = (tmp_path / "saved-search").resolve()
+    output.mkdir()
+    dataset = _dataset()
+    constants = {}
+    preflight = _preflight_fixture()
+    evaluation = {
+        "baseline": {"score": 0.5},
+        "candidates": {
+            slot: {"score": 0.75 if slot == "candidate_1" else 0.25}
+            for slot in search.EXPECTED_CANDIDATE_IDS
+        },
+        "selected_candidate_id": "candidate_1",
+    }
+    round_dir = output / "round_01"
+    round_dir.mkdir()
+    (round_dir / "pretraining_evaluation.json").write_text(
+        json.dumps(evaluation, indent=2), encoding="utf-8"
+    )
+    artifact = _approved_artifact(
+        round_dir / "artifact-root",
+        provenance={
+            "search_run": str(output),
+            "search_round": 1,
+            "candidate_slot": "candidate_1",
+            "dataset": dataset.provenance,
+        },
+    )
+    design = episode_training.load_approved_design(artifact)
+    slots = {
+        slot: {
+            "status": "validated",
+            "version": index,
+            "candidate": design.candidate if slot == "candidate_1" else {"candidate_name": slot},
+            "submission": {"candidate_id": slot},
+            "directory": str(round_dir / slot),
+        }
+        for index, slot in enumerate(search.EXPECTED_CANDIDATE_IDS, start=1)
+    }
+    config = search._role_config(
+        provider="openai",
+        model="fixture-model",
+        base_url=None,
+        context_length=50000,
+        max_output_tokens=4096,
+        temperature=0.3,
+        seed=20260817,
+        reasoning_effort=None,
+        timeout=10,
+        connect_timeout=10,
+        total_timeout=20,
+        progress_interval=1,
+    )
+    state = {
+        "schema_version": search.SEARCH_RUN_SCHEMA_VERSION,
+        "prompt_version": search.SEARCH_PROMPT_VERSION,
+        "status": "running",
+        "git_sha": next(iter(search.RECOVERABLE_TRAINING_INITIALIZATION_SOURCE_REVISIONS)),
+        "output_directory": str(output),
+        "search_round": 1,
+        "model_calls": 3,
+        "rounds": [],
+        "current_round": {
+            "round": 1,
+            "phase": "train",
+            "repair_calls": 2,
+            "slots": slots,
+            "evaluation": evaluation,
+            "selected_candidate_id": "candidate_1",
+            "approved_artifact": str(artifact),
+            "training": None,
+            "evaluation_result": None,
+        },
+        "stop_reason": None,
+        "settings": {
+            "episode_sources": ["fixture-source"],
+            "model": config,
+            "beta": 1.0,
+            "worker_timeout": 10.0,
+            "evaluation_lambda": {"value": 0.0},
+            "max_search_rounds": 1,
+            "max_repairs_per_round": 5,
+            "ee_tolerance": 1e-12,
+            "reward_tolerance": 1e-12,
+            "baseline_run": "fixture-baseline",
+            "baseline_evaluation": "fixture-evaluation",
+            "evaluation_manifest": "fixture-manifest",
+            "train_episodes": 1500,
+            "evaluation_episodes": 100,
+            "evaluation_roi_count": 8,
+            "evaluation_area_m": [1000.0, 1000.0],
+        },
+        "dataset_provenance": dataset.provenance,
+        "baseline_preflight": preflight,
+    }
+    (output / "state.json").write_text(json.dumps(state, indent=2), encoding="utf-8")
+    (output / "dataset.json").write_text(json.dumps(dataset.provenance), encoding="utf-8")
+    (output / "constants.json").write_text(json.dumps(constants), encoding="utf-8")
+    (output / "baseline_preflight.json").write_text(json.dumps(preflight), encoding="utf-8")
+    monkeypatch.setattr(search, "_git_sha", lambda: "fixed-training-recovery-revision")
+    monkeypatch.setattr(search, "load_complete_episode_dataset", lambda _paths: dataset)
+    monkeypatch.setattr(search, "build_constants", lambda _metadata: constants)
+    monkeypatch.setattr(search, "render_common_prompt", lambda **_kwargs: "common")
+    _patch_preflight(monkeypatch)
+    monkeypatch.setattr(
+        search,
+        "evaluate_candidates",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("pretraining ranking must not rerun")
+        ),
+    )
+    calls = []
+
+    def training_runner(**kwargs):
+        calls.append(kwargs)
+        return {"status": "incomplete", "reason": "fixture stop before formal training"}
+
+    result = search.run_episode_search(
+        resume=output,
+        recover_training_initialization=True,
+        client=SimpleNamespace(
+            chat=lambda **_kwargs: (_ for _ in ()).throw(
+                AssertionError("model must not be called")
+            )
+        ),
+        training_runner=training_runner,
+    )
+    assert result["status"] == "paused_training"
+    assert result["model_calls"] == 3
+    assert len(calls) == 1
+    assert calls[0]["artifact"] == str(artifact)
+    assert "llm_train" in Path(calls[0]["output_directory"]).parts
+    saved = json.loads((output / "state.json").read_text(encoding="utf-8"))
+    assert saved["current_round"]["selected_candidate_id"] == "candidate_1"
+    assert saved["current_round"]["repair_calls"] == 2
+    transition = saved["training_initialization_recovery_transition"]
+    assert transition["source_git_sha"] == state["git_sha"]
+    assert transition["target_git_sha"] == "fixed-training-recovery-revision"
+    assert transition["approved_artifact_identity"] == artifact_identity(design)
 
 
 def test_completed_search_extends_from_saved_preevaluation_without_repeating_round(tmp_path, monkeypatch):

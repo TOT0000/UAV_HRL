@@ -31,6 +31,7 @@ from llm_candidate import (
     normalize_candidate_submission,
     parse_candidate_json_envelope,
     save_approved_artifact,
+    load_approved_design,
     validate_candidate,
     validate_candidate_staged,
 )
@@ -70,6 +71,7 @@ from llm_design_contract import (
     visual_sensing_spec,
 )
 from llm_numeric_operations import NUMERIC_OPERATION_RULES_VERSION
+from llm_runtime import artifact_identity
 from training_history import read_committed_training_history, training_history_identity
 
 
@@ -87,6 +89,9 @@ DEFAULT_REWARD_TOLERANCE = 1e-12
 EXPECTED_CANDIDATE_IDS = tuple(f"candidate_{index}" for index in range(1, 5))
 REVALIDATABLE_NUMERIC_RULE_SOURCE_REVISIONS = frozenset(
     {"1460effee1d9ddb1eed31dbc110ce89f36e296d9"}
+)
+RECOVERABLE_TRAINING_INITIALIZATION_SOURCE_REVISIONS = frozenset(
+    {"ef10fa3d5396e236bba3d63b2e152b29339e4226"}
 )
 
 ROOT = Path(__file__).resolve().parent
@@ -1135,13 +1140,139 @@ def _revision_transition_allows_resume(
     if state.get("git_sha") == current_git_sha:
         return True
     transition = state.get("numeric_operation_rules_transition") or {}
-    return bool(
+    numeric_transition = bool(
         transition.get("source_git_sha") == state.get("git_sha")
         and transition.get("target_git_sha") == current_git_sha
         and transition.get("target_rules_version")
         == NUMERIC_OPERATION_RULES_VERSION
         and transition.get("status") in {"passed", "completed_with_failures"}
     )
+    training_transition = state.get("training_initialization_recovery_transition") or {}
+    return numeric_transition or bool(
+        training_transition.get("source_git_sha") == state.get("git_sha")
+        and training_transition.get("target_git_sha") == current_git_sha
+        and training_transition.get("status") == "compatible"
+        and training_transition.get("reason")
+        == "short_training_path_and_initialization_recovery"
+    )
+
+
+def _short_training_output_root(search_output: Path, round_number: int) -> Path:
+    """Return a collision-resistant root with headroom for Windows checkpoints."""
+
+    digest = hashlib.sha256(
+        str(Path(search_output).resolve()).encode("utf-8")
+    ).hexdigest()[:12]
+    return (ROOT / "results" / "llm_train" / f"s-{digest}" / f"r{int(round_number):02d}").resolve()
+
+
+def _training_recovery_eligibility(
+    state: dict[str, Any], *, current_git_sha: str
+) -> None:
+    if state.get("git_sha") not in RECOVERABLE_TRAINING_INITIALIZATION_SOURCE_REVISIONS:
+        raise EpisodeSearchError(
+            "saved Git revision is not eligible for the bounded training-initialization recovery"
+        )
+    if state.get("git_sha") == current_git_sha:
+        raise EpisodeSearchError(
+            "training-initialization recovery is unnecessary at the current Git revision"
+        )
+    current = state.get("current_round")
+    if (
+        not isinstance(current, dict)
+        or current.get("phase") != "train"
+        or current.get("training") is not None
+        or current.get("evaluation_result") is not None
+        or state.get("rounds")
+    ):
+        raise EpisodeSearchError(
+            "bounded recovery requires an untrained first-round candidate at the train phase"
+        )
+    selected = current.get("selected_candidate_id")
+    evaluation = current.get("evaluation") or {}
+    if (
+        selected not in EXPECTED_CANDIDATE_IDS
+        or evaluation.get("selected_candidate_id") != selected
+        or selected not in (current.get("slots") or {})
+        or not current.get("approved_artifact")
+    ):
+        raise EpisodeSearchError(
+            "training recovery selection or approved artifact record is incomplete"
+        )
+
+
+def _record_training_recovery_transition(
+    state: dict[str, Any],
+    *,
+    output: Path,
+    dataset: EpisodeDataset,
+    constants: dict[str, Any],
+    baseline_preflight: dict[str, Any],
+    target_git_sha: str,
+) -> dict[str, Any]:
+    """Bind one ef10fa3 training-stage run to the path/recovery update."""
+
+    current = state["current_round"]
+    selected = current["selected_candidate_id"]
+    slot = current["slots"][selected]
+    evaluation = current["evaluation"]
+    evaluation_path = output / f"round_{int(current['round']):02d}" / "pretraining_evaluation.json"
+    if not evaluation_path.is_file():
+        raise EpisodeSearchError("saved pretraining evaluation report is missing")
+    saved_evaluation = json.loads(evaluation_path.read_text(encoding="utf-8"))
+    if saved_evaluation != evaluation:
+        raise EpisodeSearchError("saved pretraining evaluation report changed")
+    design = load_approved_design(current["approved_artifact"])
+    if design.candidate != slot.get("candidate"):
+        raise EpisodeSearchError(
+            "approved artifact candidate differs from the selected saved candidate"
+        )
+    if design.constants_metadata != constants:
+        raise EpisodeSearchError(
+            "approved artifact observation/constants interface changed"
+        )
+    provenance = design.artifact.get("provenance") or {}
+    if (
+        Path(provenance.get("search_run", "")).resolve() != output
+        or int(provenance.get("search_round", -1)) != int(current["round"])
+        or provenance.get("candidate_slot") != selected
+        or (provenance.get("dataset") or {}) != dataset.provenance
+    ):
+        raise EpisodeSearchError("approved artifact search provenance is incompatible")
+    if state.get("baseline_preflight") != baseline_preflight:
+        raise EpisodeSearchError("baseline/pre-evaluation comparison contract changed")
+    source_git_sha = str(state["git_sha"])
+    training_root = _short_training_output_root(output, int(current["round"]))
+    record = {
+        "schema_version": "uav-hrl-llm-episode-search-training-recovery-v1",
+        "status": "compatible",
+        "reason": "short_training_path_and_initialization_recovery",
+        "recorded_at_utc": datetime.now(timezone.utc).isoformat(),
+        "source_git_sha": source_git_sha,
+        "target_git_sha": target_git_sha,
+        "search_run": str(output),
+        "round": int(current["round"]),
+        "selected_candidate_id": selected,
+        "candidate_version": int(slot["version"]),
+        "approved_artifact_identity": artifact_identity(design),
+        "approved_artifact": str(design.directory),
+        "dataset_content_sha256": dataset.provenance.get("dataset_content_sha256"),
+        "pretraining_evaluation_sha256": _sha256_json(evaluation),
+        "baseline_preflight_sha256": _sha256_json(baseline_preflight),
+        "training_output_root": str(training_root),
+        "legacy_training_output_root": str(
+            output / f"round_{int(current['round']):02d}" / "training"
+        ),
+        "model_calls": int(state.get("model_calls", 0)),
+        "repair_calls": int(current.get("repair_calls", 0)),
+    }
+    current["training_output_root"] = str(training_root)
+    current["legacy_training_output_root"] = record[
+        "legacy_training_output_root"
+    ]
+    state["training_initialization_recovery_transition"] = record
+    state.setdefault("training_initialization_recoveries", []).append(record)
+    return record
 
 
 def _next_revalidation_directory(output: Path) -> tuple[int, Path]:
@@ -1383,6 +1514,7 @@ def run_episode_search(
     output_dir: str | Path | None = None,
     resume: str | Path | None = None,
     revalidate_only: bool = False,
+    recover_training_initialization: bool = False,
     dry_run: bool = False,
     client: Any | None = None,
     training_runner: Callable[..., dict[str, Any]] | None = None,
@@ -1394,6 +1526,10 @@ def run_episode_search(
     subprocess wrappers in ``llm_episode_training.py``.
     """
 
+    if revalidate_only and recover_training_initialization:
+        raise ValueError(
+            "training-initialization recovery cannot be combined with revalidation"
+        )
     if revalidate_only:
         if resume is None:
             raise ValueError("--revalidate-only requires --resume")
@@ -1403,7 +1539,15 @@ def run_episode_search(
             )
         return revalidate_episode_search(resume)
 
+    if recover_training_initialization and resume is None:
+        raise ValueError("--recover-training-initialization requires --resume")
+    if recover_training_initialization and dry_run:
+        raise ValueError(
+            "training-initialization recovery cannot be combined with dry-run"
+        )
+
     resume_terminal_no_extension = False
+    pending_training_recovery = False
     if resume is not None:
         output = Path(resume).resolve()
         state_path = output / "state.json"
@@ -1412,8 +1556,19 @@ def run_episode_search(
             raise EpisodeSearchError(
                 "resume contract is incompatible; reviewer-design runs cannot be resumed as episode searches"
             )
-        if not _revision_transition_allows_resume(state, _git_sha()):
-            raise EpisodeSearchError("resume git revision is incompatible")
+        current_git_sha = _git_sha()
+        if not _revision_transition_allows_resume(state, current_git_sha):
+            if recover_training_initialization:
+                _training_recovery_eligibility(
+                    state, current_git_sha=current_git_sha
+                )
+                pending_training_recovery = True
+            else:
+                raise EpisodeSearchError("resume git revision is incompatible")
+        elif recover_training_initialization:
+            raise EpisodeSearchError(
+                "bounded training-initialization recovery is not applicable to this run"
+            )
         settings = state["settings"]
         episode_sources = settings["episode_sources"]
         config = settings["model"]
@@ -1616,6 +1771,16 @@ def run_episode_search(
             "status": "not_run_dry_run",
             "reason": "formal baseline inputs are optional during prompt-only dry-run",
         }
+    if pending_training_recovery:
+        _record_training_recovery_transition(
+            state,
+            output=output,
+            dataset=dataset,
+            constants=constants,
+            baseline_preflight=baseline_preflight,
+            target_git_sha=_git_sha(),
+        )
+        _write_json(output / "state.json", state)
     model_client = None if dry_run else (client or _make_client(config))
     inventory = (
         None
@@ -1895,14 +2060,41 @@ def run_episode_search(
             continue
 
         if current["phase"] == "train":
-            training = training_runner(
-                method_id=SEARCH_METHOD_ID,
-                artifact=current["approved_artifact"],
-                episodes=train_episodes,
-                seed=config["seed"],
-                output_directory=round_dir / "training",
-                resume_record=current.get("training"),
-            )
+            if not current.get("training_output_root"):
+                current["training_output_root"] = str(
+                    _short_training_output_root(output, round_number)
+                )
+            if not current.get("legacy_training_output_root"):
+                current["legacy_training_output_root"] = str(
+                    round_dir / "training"
+                )
+            # Persist the selected root before entering the subprocess so a
+            # failed initialization is never rediscovered by directory order.
+            _write_json(output / "state.json", state)
+            try:
+                training = training_runner(
+                    method_id=SEARCH_METHOD_ID,
+                    artifact=current["approved_artifact"],
+                    episodes=train_episodes,
+                    seed=config["seed"],
+                    output_directory=current["training_output_root"],
+                    legacy_output_directory=current["legacy_training_output_root"],
+                    resume_record=current.get("training"),
+                )
+            except Exception as exc:
+                current["training"] = {
+                    "status": "blocked",
+                    "reason": f"{type(exc).__name__}: {exc}",
+                    "run_directory": (
+                        (current.get("training") or {}).get("run_directory")
+                    ),
+                    "output_root": current["training_output_root"],
+                    "legacy_output_root": current["legacy_training_output_root"],
+                }
+                state["status"] = "paused_training_failure"
+                state["stop_reason"] = current["training"]["reason"]
+                _write_json(output / "state.json", state)
+                return _result(state)
             current["training"] = training
             if training.get("status") != "complete":
                 state["status"] = "paused_training"

@@ -89,6 +89,26 @@ the old/new Git revisions and operation-rule versions. A normal `--resume`
 continues only after that bounded transition has been recorded. Incompatible
 dataset, interface, baseline, evaluation, or already-trained state is rejected.
 
+Search-selected training runs use the short, collision-resistant repository
+root `results/llm_train/s-<search-hash>/r<round>/`; the search state records this
+root and the actual training run directory. A run stopped at the `ef10fa3`
+first-round training initialization failure can perform the one bounded
+compatibility migration and continue without regenerating candidates or
+rerunning pretraining ordering:
+
+```powershell
+& 'C:\Users\user\anaconda3\envs\LLM_HRL\python.exe' .\run_llm_episode_search.py `
+  --resume '<RESULTS_LLM_EPISODE_SEARCH_RUN>' `
+  --recover-training-initialization
+```
+
+The migration verifies the saved dataset, constants, baseline contract,
+selected candidate, pretraining report, and approved-artifact identity. The old
+nested `PREPARING` directory remains as an initialization-failure record. A
+directory is resumed only when it contains training progress and a full-resume
+checkpoint; progress without a checkpoint is reported and never silently
+retrained.
+
 Omitting the two limits on resume keeps their saved values. To add budget
 without resetting the already-used rounds or repairs, pass larger totals:
 

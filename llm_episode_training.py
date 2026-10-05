@@ -4,20 +4,31 @@ from __future__ import annotations
 
 import json
 import hashlib
+from datetime import datetime, timezone
 from pathlib import Path
 import subprocess
 import sys
 from typing import Any
+import uuid
 
 import numpy as np
 
 from evaluation_selection import resolve_training_run_checkpoint
+from experiment_paths import read_run_status
+from llm_candidate import load_approved_design
+from llm_runtime import artifact_identity, load_run_artifact
 from scenario_manifest import ScenarioManifest
 from training_checkpoint import CHECKPOINT_PROVENANCE_FIELDS
 
 
 class EpisodeTrainingError(RuntimeError):
     pass
+
+
+SEARCH_TRAINING_STATE_SCHEMA_VERSION = (
+    "uav-hrl-llm-episode-search-training-state-v1"
+)
+SEARCH_TRAINING_STATE_FILENAME = "episode_search_training_state.json"
 
 
 def _file_sha256(path: Path) -> str:
@@ -151,6 +162,220 @@ def _run(command: list[str], *, cwd: Path) -> dict[str, Any]:
     return _last_json_object(output)
 
 
+def _write_json_atomic(path: Path, value: dict[str, Any]) -> None:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.parent / f".{path.name}.tmp-{uuid.uuid4().hex}"
+    try:
+        temporary.write_text(
+            json.dumps(value, indent=2, ensure_ascii=False, allow_nan=False) + "\n",
+            encoding="utf-8",
+        )
+        temporary.replace(path)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+
+
+def _training_run_directories(root: Path, method_id: str) -> list[Path]:
+    method_root = Path(root) / str(method_id)
+    if not method_root.is_dir():
+        return []
+    return sorted(path.resolve() for path in method_root.iterdir() if path.is_dir())
+
+
+def _nonempty_jsonl(path: Path) -> bool:
+    if not path.is_file():
+        return False
+    try:
+        return any(line.strip() for line in path.read_text(encoding="utf-8").splitlines())
+    except OSError:
+        return True
+
+
+def _full_checkpoint_directories(run_directory: Path) -> list[Path]:
+    root = Path(run_directory) / "checkpoints" / "full"
+    if not root.is_dir():
+        return []
+    return sorted(path.resolve() for path in root.iterdir() if path.is_dir())
+
+
+def _training_run_evidence(run_directory: Path) -> dict[str, Any]:
+    """Classify persisted lifecycle evidence without treating existence as resume."""
+
+    run_directory = Path(run_directory).resolve()
+    try:
+        status = read_run_status(run_directory)
+    except (OSError, ValueError, RuntimeError, json.JSONDecodeError) as exc:
+        return {
+            "classification": "invalid_lifecycle",
+            "run_directory": str(run_directory),
+            "error": f"{type(exc).__name__}: {exc}",
+            "has_training_progress": True,
+            "full_checkpoint_directories": [],
+        }
+    transitions = [item.get("state") for item in (status or {}).get("transitions", [])]
+    checkpoint_directories = _full_checkpoint_directories(run_directory)
+    progress_files = [
+        name
+        for name in ("training_history.jsonl", "llm_training_episode_metrics.jsonl")
+        if _nonempty_jsonl(run_directory / name)
+    ]
+    has_running_transition = any(
+        value in {"RUNNING", "RESUMING", "COMPLETED"} for value in transitions
+    )
+    has_progress = bool(has_running_transition or progress_files or checkpoint_directories)
+    resolved_path = run_directory / "resolved_config.json"
+    resolved = None
+    resolved_error = None
+    if resolved_path.is_file():
+        try:
+            resolved = json.loads(resolved_path.read_text(encoding="utf-8"))
+            if not isinstance(resolved, dict):
+                raise ValueError("resolved_config.json is not an object")
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            resolved_error = f"{type(exc).__name__}: {exc}"
+    if (
+        status is not None
+        and status.get("state") == "COMPLETED"
+        and isinstance(resolved, dict)
+        and resolved.get("status") == "COMPLETED"
+    ):
+        classification = "completed"
+    elif checkpoint_directories:
+        # run_experiment resume performs the authoritative compatibility and
+        # payload validation.  If that rejects the checkpoint, this adapter
+        # records the failure and never falls back to fresh training.
+        classification = "resume_checkpoint_present"
+    elif has_progress:
+        classification = "progress_without_checkpoint"
+    elif status is None or status.get("state") in {"PREPARING", "FAILED", "INTERRUPTED"}:
+        classification = "initialization_incomplete"
+    else:
+        classification = "empty_shell"
+    return {
+        "classification": classification,
+        "run_directory": str(run_directory),
+        "lifecycle_state": (status or {}).get("state"),
+        "lifecycle_transitions": transitions,
+        "has_training_progress": has_progress,
+        "progress_files": progress_files,
+        "full_checkpoint_directories": [str(path) for path in checkpoint_directories],
+        "resolved_config_present": resolved_path.is_file(),
+        "resolved_config_status": (
+            resolved.get("status") if isinstance(resolved, dict) else None
+        ),
+        "resolved_config_episodes": (
+            resolved.get("episodes") if isinstance(resolved, dict) else None
+        ),
+        "resolved_config_error": resolved_error,
+        "partial_artifact_present": (run_directory / "llm_artifact").exists(),
+    }
+
+
+def _new_training_state(
+    *,
+    method_id: str,
+    artifact_identity_record: dict[str, Any],
+    episodes: int,
+    seed: int,
+    output: Path,
+) -> dict[str, Any]:
+    now = datetime.now(timezone.utc).isoformat()
+    return {
+        "schema_version": SEARCH_TRAINING_STATE_SCHEMA_VERSION,
+        "status": "ready",
+        "created_at_utc": now,
+        "updated_at_utc": now,
+        "method_id": str(method_id),
+        "artifact_identity": artifact_identity_record,
+        "episodes": int(episodes),
+        "seed": int(seed),
+        "output_root": str(output),
+        "active_run_directory": None,
+        "attempts": [],
+    }
+
+
+def _load_training_state(
+    path: Path,
+    *,
+    method_id: str,
+    artifact_identity_record: dict[str, Any],
+    episodes: int,
+    seed: int,
+    output: Path,
+) -> dict[str, Any]:
+    if not path.is_file():
+        return _new_training_state(
+            method_id=method_id,
+            artifact_identity_record=artifact_identity_record,
+            episodes=episodes,
+            seed=seed,
+            output=output,
+        )
+    try:
+        state = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise EpisodeTrainingError("training recovery state is unreadable") from exc
+    expected = {
+        "schema_version": SEARCH_TRAINING_STATE_SCHEMA_VERSION,
+        "method_id": str(method_id),
+        "artifact_identity": artifact_identity_record,
+        "episodes": int(episodes),
+        "seed": int(seed),
+        "output_root": str(output),
+    }
+    mismatches = {
+        key: {"saved": state.get(key), "expected": value}
+        for key, value in expected.items()
+        if state.get(key) != value
+    }
+    if mismatches:
+        raise EpisodeTrainingError(
+            f"training recovery state is incompatible: {mismatches}"
+        )
+    if not isinstance(state.get("attempts"), list):
+        raise EpisodeTrainingError("training recovery attempt history is invalid")
+    return state
+
+
+def _record_attempt(
+    state: dict[str, Any],
+    *,
+    origin: str,
+    evidence: dict[str, Any],
+    result: str,
+    error: str | None = None,
+) -> dict[str, Any]:
+    run_directory = evidence.get("run_directory")
+    existing = next(
+        (
+            item
+            for item in state["attempts"]
+            if item.get("run_directory") == run_directory and run_directory is not None
+        ),
+        None,
+    )
+    record = existing if existing is not None else {}
+    if existing is None:
+        state["attempts"].append(record)
+    record.update(
+        {
+            "attempt": state["attempts"].index(record) + 1,
+            "origin": origin,
+            "run_directory": run_directory,
+            "classification": evidence.get("classification"),
+            "result": result,
+            "evidence": evidence,
+            "updated_at_utc": datetime.now(timezone.utc).isoformat(),
+        }
+    )
+    if error is not None:
+        record["error"] = error
+    return record
+
+
 def run_candidate_training(
     *,
     method_id: str,
@@ -159,69 +384,249 @@ def run_candidate_training(
     seed: int,
     output_directory: str | Path,
     resume_record: dict[str, Any] | None,
+    legacy_output_directory: str | Path | None = None,
 ) -> dict[str, Any]:
     root = Path(__file__).resolve().parent
     output = Path(output_directory).resolve()
     output.mkdir(parents=True, exist_ok=True)
-    discovered = []
-    method_root = output / str(method_id)
-    if method_root.is_dir():
-        discovered = sorted(path for path in method_root.iterdir() if path.is_dir())
-    resume_directory = (
-        Path(resume_record["run_directory"])
-        if resume_record and resume_record.get("run_directory")
-        else discovered[0]
-        if len(discovered) == 1
-        else None
+    source_design = load_approved_design(artifact)
+    identity = artifact_identity(source_design)
+    state_path = output / SEARCH_TRAINING_STATE_FILENAME
+    state = _load_training_state(
+        state_path,
+        method_id=method_id,
+        artifact_identity_record=identity,
+        episodes=episodes,
+        seed=seed,
+        output=output,
     )
-    if len(discovered) > 1 and resume_directory is None:
-        raise EpisodeTrainingError("multiple incomplete training runs require explicit resume state")
-    if resume_directory is not None:
-        resolved_path = resume_directory / "resolved_config.json"
-        resolved = (
-            json.loads(resolved_path.read_text(encoding="utf-8"))
-            if resolved_path.is_file()
-            else {}
+
+    known_directories: list[tuple[str, Path]] = [
+        ("short_output", path)
+        for path in _training_run_directories(output, method_id)
+    ]
+    if legacy_output_directory is not None:
+        legacy = Path(legacy_output_directory).resolve()
+        if legacy != output:
+            known_directories.extend(
+                ("legacy_nested_output", path)
+                for path in _training_run_directories(legacy, method_id)
+            )
+    explicit_directory = None
+    if resume_record and resume_record.get("run_directory"):
+        explicit_directory = Path(resume_record["run_directory"]).resolve()
+        if all(path != explicit_directory for _, path in known_directories):
+            known_directories.append(("saved_search_state", explicit_directory))
+    elif state.get("active_run_directory"):
+        explicit_directory = Path(state["active_run_directory"]).resolve()
+
+    evidence_by_directory: dict[Path, tuple[str, dict[str, Any]]] = {}
+    for origin, directory in known_directories:
+        evidence = _training_run_evidence(directory)
+        if evidence["has_training_progress"] or evidence["classification"] == "completed":
+            try:
+                load_run_artifact(directory, identity)
+            except Exception as exc:
+                evidence["classification"] = "incompatible_or_incomplete_run_artifact"
+                evidence["artifact_error"] = f"{type(exc).__name__}: {exc}"
+        if (
+            evidence["classification"] == "completed"
+            and int(evidence.get("resolved_config_episodes", -1)) != int(episodes)
+        ):
+            evidence["classification"] = "incompatible_completed_horizon"
+        evidence_by_directory[directory] = (origin, evidence)
+    resumable = [
+        (origin, evidence)
+        for origin, evidence in evidence_by_directory.values()
+        if evidence["classification"]
+        in {
+            "completed",
+            "resume_checkpoint_present",
+            "progress_without_checkpoint",
+            "invalid_lifecycle",
+            "incompatible_or_incomplete_run_artifact",
+            "incompatible_completed_horizon",
+        }
+    ]
+    if explicit_directory is not None:
+        selected = evidence_by_directory.get(explicit_directory)
+        if selected is None:
+            raise EpisodeTrainingError(
+                f"saved training directory is missing: {explicit_directory}"
+            )
+    elif len(resumable) == 1:
+        selected = resumable[0]
+    elif len(resumable) > 1:
+        raise EpisodeTrainingError(
+            "multiple training runs contain progress; saved state must identify one"
         )
-        if resolved.get("status") == "COMPLETED" and int(
-            resolved.get("episodes", -1)
-        ) == int(episodes):
+    else:
+        selected = None
+    if selected is not None and selected[1]["classification"] in {
+        "initialization_incomplete",
+        "empty_shell",
+    }:
+        # The persisted directory remains evidence of the failed attempt, but
+        # has no state from which run_experiment can safely resume.
+        selected = None
+
+    for origin, evidence in evidence_by_directory.values():
+        if evidence["classification"] in {"initialization_incomplete", "empty_shell"}:
+            _record_attempt(
+                state,
+                origin=origin,
+                evidence=evidence,
+                result="abandoned_initialization_failure",
+            )
+
+    state["updated_at_utc"] = datetime.now(timezone.utc).isoformat()
+    _write_json_atomic(state_path, state)
+
+    if selected is not None:
+        origin, evidence = selected
+        resume_directory = Path(evidence["run_directory"])
+        state["active_run_directory"] = str(resume_directory)
+        classification = evidence["classification"]
+        if classification == "completed":
             result = {"run_directory": str(resume_directory), "status": "COMPLETED"}
+        elif classification == "resume_checkpoint_present":
+            state["status"] = "resuming"
+            _record_attempt(
+                state, origin=origin, evidence=evidence, result="resume_requested"
+            )
+            _write_json_atomic(state_path, state)
+            try:
+                result = _run(
+                    [
+                        sys.executable,
+                        str(root / "run_experiment.py"),
+                        "resume",
+                        str(resume_directory),
+                        "--target-episodes",
+                        str(int(episodes)),
+                    ],
+                    cwd=root,
+                )
+            except EpisodeTrainingError as exc:
+                state["status"] = "resume_failed"
+                state["updated_at_utc"] = datetime.now(timezone.utc).isoformat()
+                _record_attempt(
+                    state,
+                    origin=origin,
+                    evidence=_training_run_evidence(resume_directory),
+                    result="resume_failed_no_retraining",
+                    error=f"{type(exc).__name__}: {exc}",
+                )
+                _write_json_atomic(state_path, state)
+                return {
+                    "status": "incomplete",
+                    "reason": str(exc),
+                    "run_directory": str(resume_directory),
+                    "episodes": int(episodes),
+                    "method_id": method_id,
+                    "training_state_record": str(state_path),
+                    "recovery_action": "resume_failed_no_retraining",
+                    "summaries": [],
+                }
         else:
+            state["status"] = "blocked_progress_without_valid_checkpoint"
+            _record_attempt(
+                state,
+                origin=origin,
+                evidence=evidence,
+                result="blocked_no_safe_restart",
+            )
+            _write_json_atomic(state_path, state)
+            raise EpisodeTrainingError(
+                "training progress exists but no resumable checkpoint was found; "
+                f"refusing to restart: {resume_directory}"
+            )
+    else:
+        before = set(_training_run_directories(output, method_id))
+        state["status"] = "starting_fresh"
+        state["active_run_directory"] = None
+        state["updated_at_utc"] = datetime.now(timezone.utc).isoformat()
+        _write_json_atomic(state_path, state)
+        try:
             result = _run(
                 [
                     sys.executable,
                     str(root / "run_experiment.py"),
-                    "resume",
-                    str(resume_directory),
-                    "--target-episodes",
+                    str(method_id),
+                    "--llm-artifact",
+                    str(source_design.directory),
+                    "--episodes",
                     str(int(episodes)),
+                    "--seed",
+                    str(int(seed)),
+                    "--output-root",
+                    str(output),
                 ],
                 cwd=root,
             )
-    else:
-        result = _run(
-            [
-                sys.executable,
-                str(root / "run_experiment.py"),
-                str(method_id),
-                "--llm-artifact",
-                str(Path(artifact).resolve()),
-                "--episodes",
-                str(int(episodes)),
-                "--seed",
-                str(int(seed)),
-                "--output-root",
-                str(output),
-            ],
-            cwd=root,
-        )
+        except EpisodeTrainingError as exc:
+            after = set(_training_run_directories(output, method_id))
+            created = sorted(after.difference(before))
+            run_directory = created[0] if len(created) == 1 else None
+            evidence = (
+                _training_run_evidence(run_directory)
+                if run_directory is not None
+                else {
+                    "classification": "failed_before_run_directory",
+                    "run_directory": None,
+                    "has_training_progress": False,
+                    "full_checkpoint_directories": [],
+                }
+            )
+            state["status"] = "initialization_failed"
+            state["active_run_directory"] = (
+                str(run_directory) if run_directory is not None else None
+            )
+            state["updated_at_utc"] = datetime.now(timezone.utc).isoformat()
+            _record_attempt(
+                state,
+                origin="short_output",
+                evidence=evidence,
+                result="failed",
+                error=f"{type(exc).__name__}: {exc}",
+            )
+            _write_json_atomic(state_path, state)
+            return {
+                "status": "incomplete",
+                "reason": str(exc),
+                "run_directory": (
+                    str(run_directory) if run_directory is not None else None
+                ),
+                "episodes": int(episodes),
+                "method_id": method_id,
+                "training_state_record": str(state_path),
+                "recovery_action": "fresh_initialization_failed",
+                "summaries": [],
+            }
     run_directory = result.get("run_directory")
+    if not run_directory:
+        raise EpisodeTrainingError("training subprocess did not identify its run directory")
+    final_evidence = _training_run_evidence(Path(run_directory))
+    if result.get("status") != "COMPLETED" or final_evidence["classification"] != "completed":
+        raise EpisodeTrainingError("training subprocess did not produce a validated completed run")
+    load_run_artifact(Path(run_directory), identity)
+    state["status"] = "completed"
+    state["active_run_directory"] = str(Path(run_directory).resolve())
+    state["updated_at_utc"] = datetime.now(timezone.utc).isoformat()
+    _record_attempt(
+        state,
+        origin=(selected[0] if selected is not None else "short_output"),
+        evidence=final_evidence,
+        result="completed",
+    )
+    _write_json_atomic(state_path, state)
     return {
-        "status": "complete" if result.get("status") == "COMPLETED" else "incomplete",
-        "run_directory": run_directory,
+        "status": "complete",
+        "run_directory": str(Path(run_directory).resolve()),
         "episodes": int(episodes),
         "method_id": method_id,
+        "training_state_record": str(state_path),
+        "output_root": str(output),
         "summaries": (
             _training_summaries(Path(run_directory), expected_episodes=int(episodes))
             if run_directory

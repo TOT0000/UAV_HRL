@@ -73,6 +73,14 @@ def build_parser() -> argparse.ArgumentParser:
             "operation rules and stop before model calls, pre-evaluation, or training"
         ),
     )
+    parser.add_argument(
+        "--recover-training-initialization",
+        action="store_true",
+        help=(
+            "perform the bounded ef10fa3 train-stage compatibility migration, "
+            "preserve saved selection, and continue through the short training root"
+        ),
+    )
     parser.add_argument("--dry-run", action="store_true")
     return parser
 
@@ -81,6 +89,15 @@ def main(argv=None) -> int:
     args = build_parser().parse_args(argv)
     if args.revalidate_only and args.resume is None:
         print("--revalidate-only requires --resume", file=sys.stderr)
+        return 2
+    if args.recover_training_initialization and args.resume is None:
+        print("--recover-training-initialization requires --resume", file=sys.stderr)
+        return 2
+    if args.revalidate_only and args.recover_training_initialization:
+        print(
+            "--revalidate-only and --recover-training-initialization are mutually exclusive",
+            file=sys.stderr,
+        )
         return 2
     if args.resume is None:
         missing = [
