@@ -258,6 +258,7 @@ def _training_run_evidence(run_directory: Path) -> dict[str, Any]:
         "run_directory": str(run_directory),
         "lifecycle_state": (status or {}).get("state"),
         "lifecycle_transitions": transitions,
+        "lifecycle_exception": (status or {}).get("exception"),
         "has_training_progress": has_progress,
         "progress_files": progress_files,
         "full_checkpoint_directories": [str(path) for path in checkpoint_directories],
@@ -385,6 +386,8 @@ def run_candidate_training(
     output_directory: str | Path,
     resume_record: dict[str, Any] | None,
     legacy_output_directory: str | Path | None = None,
+    prior_output_directories: list[str | Path] | tuple[str | Path, ...] = (),
+    restart_from_scratch: bool = False,
 ) -> dict[str, Any]:
     root = Path(__file__).resolve().parent
     output = Path(output_directory).resolve()
@@ -401,27 +404,36 @@ def run_candidate_training(
         output=output,
     )
 
-    known_directories: list[tuple[str, Path]] = [
-        ("short_output", path)
-        for path in _training_run_directories(output, method_id)
-    ]
-    if legacy_output_directory is not None:
-        legacy = Path(legacy_output_directory).resolve()
-        if legacy != output:
-            known_directories.extend(
-                ("legacy_nested_output", path)
-                for path in _training_run_directories(legacy, method_id)
-            )
-    explicit_directory = None
-    if resume_record and resume_record.get("run_directory"):
-        explicit_directory = Path(resume_record["run_directory"]).resolve()
-        if all(path != explicit_directory for _, path in known_directories):
-            known_directories.append(("saved_search_state", explicit_directory))
-    elif state.get("active_run_directory"):
-        explicit_directory = Path(state["active_run_directory"]).resolve()
+    known_by_directory: dict[Path, str] = {}
+
+    def discover(origin: str, root_directory: str | Path | None) -> None:
+        if root_directory is None:
+            return
+        root_path = Path(root_directory).resolve()
+        for path in _training_run_directories(root_path, method_id):
+            known_by_directory.setdefault(path, origin)
+
+    discover("short_output", output)
+    discover("legacy_nested_output", legacy_output_directory)
+    for prior in prior_output_directories:
+        discover("prior_training_output", prior)
+    for origin, value in (
+        (
+            "saved_search_state",
+            (resume_record or {}).get("run_directory"),
+        ),
+        ("training_recovery_state", state.get("active_run_directory")),
+    ):
+        if value:
+            path = Path(value).resolve()
+            known_by_directory.setdefault(path, origin)
 
     evidence_by_directory: dict[Path, tuple[str, dict[str, Any]]] = {}
-    for origin, directory in known_directories:
+    for directory, origin in known_by_directory.items():
+        if not directory.is_dir():
+            raise EpisodeTrainingError(
+                f"recorded training directory is missing: {directory}"
+            )
         evidence = _training_run_evidence(directory)
         if evidence["has_training_progress"] or evidence["classification"] == "completed":
             try:
@@ -435,40 +447,6 @@ def run_candidate_training(
         ):
             evidence["classification"] = "incompatible_completed_horizon"
         evidence_by_directory[directory] = (origin, evidence)
-    resumable = [
-        (origin, evidence)
-        for origin, evidence in evidence_by_directory.values()
-        if evidence["classification"]
-        in {
-            "completed",
-            "resume_checkpoint_present",
-            "progress_without_checkpoint",
-            "invalid_lifecycle",
-            "incompatible_or_incomplete_run_artifact",
-            "incompatible_completed_horizon",
-        }
-    ]
-    if explicit_directory is not None:
-        selected = evidence_by_directory.get(explicit_directory)
-        if selected is None:
-            raise EpisodeTrainingError(
-                f"saved training directory is missing: {explicit_directory}"
-            )
-    elif len(resumable) == 1:
-        selected = resumable[0]
-    elif len(resumable) > 1:
-        raise EpisodeTrainingError(
-            "multiple training runs contain progress; saved state must identify one"
-        )
-    else:
-        selected = None
-    if selected is not None and selected[1]["classification"] in {
-        "initialization_incomplete",
-        "empty_shell",
-    }:
-        # The persisted directory remains evidence of the failed attempt, but
-        # has no state from which run_experiment can safely resume.
-        selected = None
 
     for origin, evidence in evidence_by_directory.values():
         if evidence["classification"] in {"initialization_incomplete", "empty_shell"}:
@@ -478,6 +456,77 @@ def run_candidate_training(
                 evidence=evidence,
                 result="abandoned_initialization_failure",
             )
+
+    abandoned = {
+        Path(item["run_directory"]).resolve()
+        for item in state["attempts"]
+        if item.get("run_directory")
+        and item.get("result")
+        in {
+            "abandoned_initialization_failure",
+            "abandoned_for_explicit_restart",
+        }
+    }
+    candidates = [
+        (directory, origin, evidence)
+        for directory, (origin, evidence) in evidence_by_directory.items()
+        if directory not in abandoned
+        and evidence["classification"]
+        in {
+            "completed",
+            "resume_checkpoint_present",
+            "progress_without_checkpoint",
+            "invalid_lifecycle",
+            "incompatible_or_incomplete_run_artifact",
+            "incompatible_completed_horizon",
+        }
+    ]
+    safely_resumable = [
+        item
+        for item in candidates
+        if item[2]["classification"] in {"completed", "resume_checkpoint_present"}
+    ]
+    unsafe = [item for item in candidates if item not in safely_resumable]
+    if len(safely_resumable) > 1 or (safely_resumable and unsafe):
+        raise EpisodeTrainingError(
+            "multiple training runs contain conflicting progress; refusing to guess"
+        )
+    if safely_resumable:
+        _, origin, evidence = safely_resumable[0]
+        selected = (origin, evidence)
+    elif restart_from_scratch:
+        if (
+            len(unsafe) != 1
+            or unsafe[0][2]["classification"] != "progress_without_checkpoint"
+        ):
+            raise EpisodeTrainingError(
+                "explicit restart requires exactly one compatible progress-without-checkpoint run"
+            )
+        _, origin, evidence = unsafe[0]
+        _record_attempt(
+            state,
+            origin=origin,
+            evidence=evidence,
+            result="abandoned_for_explicit_restart",
+        )
+        state.setdefault("explicit_restart_history", []).append(
+            {
+                "recorded_at_utc": datetime.now(timezone.utc).isoformat(),
+                "run_directory": evidence["run_directory"],
+                "reason": "checkpoint_path_failure_without_full_resume_checkpoint",
+                "restart_episode": 1,
+            }
+        )
+        selected = None
+    elif len(unsafe) == 1:
+        _, origin, evidence = unsafe[0]
+        selected = (origin, evidence)
+    elif len(unsafe) > 1:
+        raise EpisodeTrainingError(
+            "multiple training runs contain conflicting progress; refusing to guess"
+        )
+    else:
+        selected = None
 
     state["updated_at_utc"] = datetime.now(timezone.utc).isoformat()
     _write_json_atomic(state_path, state)

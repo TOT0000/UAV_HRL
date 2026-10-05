@@ -81,6 +81,14 @@ def build_parser() -> argparse.ArgumentParser:
             "preserve saved selection, and continue through the short training root"
         ),
     )
+    parser.add_argument(
+        "--restart-failed-training",
+        action="store_true",
+        help=(
+            "perform the bounded fa948f1 checkpoint-path migration and restart "
+            "the already selected candidate from episode 1 without new model calls"
+        ),
+    )
     parser.add_argument("--dry-run", action="store_true")
     return parser
 
@@ -93,9 +101,19 @@ def main(argv=None) -> int:
     if args.recover_training_initialization and args.resume is None:
         print("--recover-training-initialization requires --resume", file=sys.stderr)
         return 2
-    if args.revalidate_only and args.recover_training_initialization:
+    if args.restart_failed_training and args.resume is None:
+        print("--restart-failed-training requires --resume", file=sys.stderr)
+        return 2
+    if sum(
+        bool(value)
+        for value in (
+            args.revalidate_only,
+            args.recover_training_initialization,
+            args.restart_failed_training,
+        )
+    ) > 1:
         print(
-            "--revalidate-only and --recover-training-initialization are mutually exclusive",
+            "revalidation and training recovery options are mutually exclusive",
             file=sys.stderr,
         )
         return 2

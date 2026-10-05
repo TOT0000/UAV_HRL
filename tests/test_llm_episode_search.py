@@ -11,7 +11,12 @@ import run_experiment
 from experiment_config import MethodSpec
 from experiment_paths import write_run_status
 from llm_candidate import save_approved_artifact
-from llm_runtime import artifact_identity, copy_approved_artifact
+from llm_runtime import (
+    LLMRuntimeError,
+    artifact_identity,
+    copy_approved_artifact,
+    llm_checkpoint_path_preflight,
+)
 from training_checkpoint import CHECKPOINT_PROVENANCE_FIELDS
 from training_history import (
     build_training_history_row,
@@ -1002,24 +1007,65 @@ def test_revalidation_incompatibility_does_not_modify_saved_run(tmp_path, monkey
     assert not (output / "revalidations").exists()
 
 
-def test_short_training_root_copies_deep_artifact_with_identity_preserved(tmp_path):
+def test_short_training_root_preflights_formal_windows_checkpoint_paths(tmp_path):
     deep = tmp_path
     while len(str(deep.resolve())) < 185:
         deep = deep / "deep-approved-artifact-source"
     source = _approved_artifact(deep)
-    search_output = tmp_path / "search" / "design-fixture"
+    search_output = (
+        search.ROOT
+        / "results"
+        / "llm_episode_searches"
+        / "gpt-4o"
+        / "design-20261005T190924Z-2405a2d6"
+    )
     short_root = search._short_training_output_root(search_output, 1)
-    # Redirect the repository-owned base for this filesystem fixture while
-    # retaining the production path shape.
-    short_root = tmp_path / "results" / "llm_train" / short_root.parent.name / short_root.name
-    run_directory = short_root / "td3_dinkelbach_llm_search" / "run-fixture"
-    run_directory.mkdir(parents=True)
-    copied = copy_approved_artifact(source, run_directory)
+    run_directory = (
+        short_root
+        / search.SEARCH_METHOD_ID
+        / "run-seed20260817-abcdef0-20261005T194457449086Z-321de4c0"
+    )
+    report = llm_checkpoint_path_preflight(
+        run_directory,
+        source,
+        maximum_episode=1500,
+        enforce_windows_limit=True,
+    )
+    by_scope = {item["scope"]: item for item in report["paths"]}
+    assert report["passed"] is True
+    assert report["longest_path"]["scope"] == "model_checkpoint_temporary"
+    assert report["longest_path"]["artifact_relative_path"] in {
+        "evaluation_report.json",
+        "validation_report.json",
+    }
+    assert by_scope["model_checkpoint_temporary"]["path_length"] < 260
+    assert by_scope["full_checkpoint_temporary"]["path_length"] < 260
+    assert by_scope["run_artifact"]["path_length"] < 260
+
+    previous_run = (
+        search.ROOT
+        / "results"
+        / "llm_train"
+        / "s-ba69f367a822"
+        / "r01"
+        / search.SEARCH_METHOD_ID
+        / "run-seed20260817-fa948f1-20261005T194457449086Z-321de4c0"
+    )
+    with pytest.raises(LLMRuntimeError, match="Windows legacy path limit"):
+        llm_checkpoint_path_preflight(
+            previous_run,
+            source,
+            maximum_episode=1500,
+            enforce_windows_limit=True,
+        )
+
+    copied_run = tmp_path / "copy-target" / run_directory.name
+    copied_run.mkdir(parents=True)
+    copied = copy_approved_artifact(source, copied_run)
     assert artifact_identity(copied) == artifact_identity(
         episode_training.load_approved_design(source)
     )
     assert (copied.directory / "artifact.json").is_file()
-    assert len(str(copied.directory / "validation_report.json")) < 260
 
 
 def test_training_adapter_abandons_initialization_shell_and_starts_fresh(
@@ -1206,6 +1252,182 @@ def test_training_adapter_does_not_retrain_when_checkpoint_resume_fails(
     assert "checkpoint is damaged" in state["attempts"][-1]["error"]
 
 
+def test_explicit_restart_preserves_progress_run_and_starts_once(
+    tmp_path, monkeypatch
+):
+    artifact = _approved_artifact(tmp_path / "artifact")
+    previous_root = tmp_path / "previous"
+    failed = previous_root / search.SEARCH_METHOD_ID / "failed-after-episode-50"
+    failed.mkdir(parents=True)
+    write_run_status(failed, "PREPARING")
+    copied = copy_approved_artifact(artifact, failed)
+    (failed / "resolved_config.json").write_text(
+        json.dumps(
+            {
+                "status": "FAILED",
+                "episodes": 1500,
+                "llm_artifact_identity": artifact_identity(copied),
+            }
+        ),
+        encoding="utf-8",
+    )
+    (failed / "training_history.jsonl").write_text(
+        json.dumps({"episode": 50}) + "\n", encoding="utf-8"
+    )
+    write_run_status(failed, "RUNNING")
+    write_run_status(
+        failed,
+        "FAILED",
+        exception=RuntimeError("[WinError 3] checkpoints\\models path"),
+    )
+
+    monkeypatch.setattr(
+        episode_training,
+        "_run",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("ordinary resume must not restart")
+        ),
+    )
+    with pytest.raises(
+        episode_training.EpisodeTrainingError,
+        match="progress exists but no resumable checkpoint",
+    ):
+        episode_training.run_candidate_training(
+            method_id=search.SEARCH_METHOD_ID,
+            artifact=artifact,
+            episodes=1500,
+            seed=20260817,
+            output_directory=tmp_path / "normal-resume",
+            prior_output_directories=[previous_root],
+            resume_record={"run_directory": str(failed)},
+        )
+
+    replacement_root = tmp_path / "replacement"
+    calls = []
+
+    def complete_fresh(command, *, cwd):
+        calls.append(command)
+        assert command[2] == search.SEARCH_METHOD_ID
+        assert "resume" not in command
+        replacement = (
+            replacement_root
+            / search.SEARCH_METHOD_ID
+            / "run-seed20260817-new-replacement"
+        )
+        replacement.mkdir(parents=True)
+        write_run_status(replacement, "PREPARING")
+        copy_approved_artifact(artifact, replacement)
+        (replacement / "resolved_config.json").write_text(
+            json.dumps({"status": "COMPLETED", "episodes": 1500}),
+            encoding="utf-8",
+        )
+        write_run_status(replacement, "RUNNING")
+        write_run_status(replacement, "COMPLETED")
+        return {"run_directory": str(replacement), "status": "COMPLETED"}
+
+    monkeypatch.setattr(episode_training, "_run", complete_fresh)
+    monkeypatch.setattr(
+        episode_training,
+        "_training_summaries",
+        lambda *_args, **_kwargs: [{"episode_range": [1, 1500]}],
+    )
+    result = episode_training.run_candidate_training(
+        method_id=search.SEARCH_METHOD_ID,
+        artifact=artifact,
+        episodes=1500,
+        seed=20260817,
+        output_directory=replacement_root,
+        prior_output_directories=[previous_root],
+        resume_record={"run_directory": str(failed)},
+        restart_from_scratch=True,
+    )
+    assert result["status"] == "complete"
+    assert len(calls) == 1
+    assert failed.is_dir()
+    assert (failed / "training_history.jsonl").is_file()
+    state = json.loads(
+        (
+            replacement_root
+            / episode_training.SEARCH_TRAINING_STATE_FILENAME
+        ).read_text(encoding="utf-8")
+    )
+    failed_attempt = next(
+        item
+        for item in state["attempts"]
+        if item.get("run_directory") == str(failed.resolve())
+    )
+    assert failed_attempt["result"] == "abandoned_for_explicit_restart"
+    assert state["explicit_restart_history"][0]["restart_episode"] == 1
+
+
+def test_stale_search_shell_does_not_override_recorded_checkpoint_run(
+    tmp_path, monkeypatch
+):
+    artifact = _approved_artifact(tmp_path / "artifact")
+    output = tmp_path / "output"
+    stale = output / search.SEARCH_METHOD_ID / "stale-shell"
+    stale.mkdir(parents=True)
+    write_run_status(stale, "PREPARING")
+    replacement = output / search.SEARCH_METHOD_ID / "replacement-with-checkpoint"
+    (replacement / "checkpoints" / "full" / "ep_0050").mkdir(parents=True)
+    write_run_status(replacement, "PREPARING")
+    copied = copy_approved_artifact(artifact, replacement)
+    (replacement / "resolved_config.json").write_text(
+        json.dumps(
+            {
+                "status": "FAILED",
+                "episodes": 1500,
+                "llm_artifact_identity": artifact_identity(copied),
+            }
+        ),
+        encoding="utf-8",
+    )
+    write_run_status(replacement, "RUNNING")
+    state = episode_training._new_training_state(
+        method_id=search.SEARCH_METHOD_ID,
+        artifact_identity_record=artifact_identity(
+            episode_training.load_approved_design(artifact)
+        ),
+        episodes=1500,
+        seed=20260817,
+        output=output.resolve(),
+    )
+    state["active_run_directory"] = str(replacement.resolve())
+    episode_training._write_json_atomic(
+        output / episode_training.SEARCH_TRAINING_STATE_FILENAME, state
+    )
+    commands = []
+
+    def complete_resume(command, *, cwd):
+        commands.append(command)
+        assert command[2] == "resume"
+        assert Path(command[3]).resolve() == replacement.resolve()
+        (replacement / "resolved_config.json").write_text(
+            json.dumps({"status": "COMPLETED", "episodes": 1500}),
+            encoding="utf-8",
+        )
+        write_run_status(replacement, "COMPLETED")
+        return {"run_directory": str(replacement), "status": "COMPLETED"}
+
+    monkeypatch.setattr(episode_training, "_run", complete_resume)
+    monkeypatch.setattr(
+        episode_training,
+        "_training_summaries",
+        lambda *_args, **_kwargs: [{"episode_range": [1, 1500]}],
+    )
+    result = episode_training.run_candidate_training(
+        method_id=search.SEARCH_METHOD_ID,
+        artifact=artifact,
+        episodes=1500,
+        seed=20260817,
+        output_directory=output,
+        resume_record={"run_directory": str(stale)},
+    )
+    assert result["status"] == "complete"
+    assert len(commands) == 1
+    assert result["run_directory"] == str(replacement.resolve())
+
+
 def test_bounded_training_recovery_preserves_selection_and_skips_model_and_ranking(
     tmp_path, monkeypatch
 ):
@@ -1307,7 +1529,6 @@ def test_bounded_training_recovery_preserves_selection_and_skips_model_and_ranki
     (output / "dataset.json").write_text(json.dumps(dataset.provenance), encoding="utf-8")
     (output / "constants.json").write_text(json.dumps(constants), encoding="utf-8")
     (output / "baseline_preflight.json").write_text(json.dumps(preflight), encoding="utf-8")
-    monkeypatch.setattr(search, "_git_sha", lambda: "fixed-training-recovery-revision")
     monkeypatch.setattr(search, "load_complete_episode_dataset", lambda _paths: dataset)
     monkeypatch.setattr(search, "build_constants", lambda _metadata: constants)
     monkeypatch.setattr(search, "render_common_prompt", lambda **_kwargs: "common")
@@ -1319,11 +1540,53 @@ def test_bounded_training_recovery_preserves_selection_and_skips_model_and_ranki
             AssertionError("pretraining ranking must not rerun")
         ),
     )
+    old_training_root = (tmp_path / "fa948f1-training").resolve()
+    replacement_root = (tmp_path / "checkpoint-path-fix-training").resolve()
+    failed_run = (
+        old_training_root
+        / search.SEARCH_METHOD_ID
+        / "run-seed20260817-fa948f1-formal-name"
+    )
+    failed_run.mkdir(parents=True)
+    write_run_status(failed_run, "PREPARING")
+    copy_approved_artifact(artifact, failed_run)
+    (failed_run / "resolved_config.json").write_text(
+        json.dumps({"status": "FAILED", "episodes": 1500}), encoding="utf-8"
+    )
+    (failed_run / "training_history.jsonl").write_text(
+        json.dumps({"episode": 50}) + "\n", encoding="utf-8"
+    )
+    (failed_run / "llm_training_episode_metrics.jsonl").write_text(
+        json.dumps({"episode": 50}) + "\n", encoding="utf-8"
+    )
+    write_run_status(failed_run, "RUNNING")
+    write_run_status(
+        failed_run,
+        "FAILED",
+        exception=RuntimeError("[WinError 3] checkpoints\\models path failure"),
+    )
+    current_revision = {"value": search.RESTARTABLE_CHECKPOINT_PATH_RECOVERY_REVISION}
+    monkeypatch.setattr(search, "_git_sha", lambda: current_revision["value"])
+    monkeypatch.setattr(
+        search,
+        "_short_training_output_root",
+        lambda _output, _round: (
+            old_training_root
+            if current_revision["value"]
+            == search.RESTARTABLE_CHECKPOINT_PATH_RECOVERY_REVISION
+            else replacement_root
+        ),
+    )
     calls = []
 
     def training_runner(**kwargs):
         calls.append(kwargs)
-        return {"status": "incomplete", "reason": "fixture stop before formal training"}
+        return {
+            "status": "incomplete",
+            "reason": "fixture stop before formal training",
+            "run_directory": str(failed_run),
+            "episodes": 1500,
+        }
 
     result = search.run_episode_search(
         resume=output,
@@ -1339,14 +1602,45 @@ def test_bounded_training_recovery_preserves_selection_and_skips_model_and_ranki
     assert result["model_calls"] == 3
     assert len(calls) == 1
     assert calls[0]["artifact"] == str(artifact)
-    assert "llm_train" in Path(calls[0]["output_directory"]).parts
+    assert Path(calls[0]["output_directory"]) == old_training_root
     saved = json.loads((output / "state.json").read_text(encoding="utf-8"))
     assert saved["current_round"]["selected_candidate_id"] == "candidate_1"
     assert saved["current_round"]["repair_calls"] == 2
     transition = saved["training_initialization_recovery_transition"]
     assert transition["source_git_sha"] == state["git_sha"]
-    assert transition["target_git_sha"] == "fixed-training-recovery-revision"
+    assert (
+        transition["target_git_sha"]
+        == search.RESTARTABLE_CHECKPOINT_PATH_RECOVERY_REVISION
+    )
     assert transition["approved_artifact_identity"] == artifact_identity(design)
+
+    current_revision["value"] = "checkpoint-path-fix-revision"
+    restarted = search.run_episode_search(
+        resume=output,
+        restart_failed_training=True,
+        client=SimpleNamespace(
+            chat=lambda **_kwargs: (_ for _ in ()).throw(
+                AssertionError("model must not be called")
+            )
+        ),
+        training_runner=training_runner,
+    )
+    assert restarted["status"] == "paused_training"
+    assert restarted["model_calls"] == 3
+    assert len(calls) == 2
+    assert calls[1]["restart_from_scratch"] is True
+    assert str(old_training_root) in calls[1]["prior_output_directories"]
+    assert Path(calls[1]["output_directory"]) == replacement_root
+    saved = json.loads((output / "state.json").read_text(encoding="utf-8"))
+    assert saved["current_round"]["selected_candidate_id"] == "candidate_1"
+    assert saved["current_round"]["repair_calls"] == 2
+    restart = saved["checkpoint_path_restart_transition"]
+    assert restart["source_git_sha"] == search.RESTARTABLE_CHECKPOINT_PATH_RECOVERY_REVISION
+    assert restart["target_git_sha"] == "checkpoint-path-fix-revision"
+    assert restart["failed_run_directory"] == str(failed_run.resolve())
+    assert restart["completed_episode_evidence"]["training_history.jsonl"][
+        "maximum_episode"
+    ] == 50
 
 
 def test_completed_search_extends_from_saved_preevaluation_without_repeating_round(tmp_path, monkeypatch):

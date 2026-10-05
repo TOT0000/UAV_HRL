@@ -7,6 +7,7 @@ from dataclasses import dataclass
 import json
 import math
 import multiprocessing as mp
+import os
 from pathlib import Path
 import shutil
 from typing import Any
@@ -30,6 +31,7 @@ from replay_auxiliary import SNAPSHOT_FIELD_SPECS
 
 LLM_RUNTIME_CONTRACT_VERSION = "uav-hrl-llm-shared-feature-runtime-v2"
 RUN_ARTIFACT_DIRECTORY_NAME = "llm_artifact"
+WINDOWS_LEGACY_MAX_PATH_CHARACTERS = 259
 
 
 class LLMRuntimeError(RuntimeError):
@@ -87,6 +89,100 @@ def load_run_artifact(
             "run LLM artifact differs from the recorded approved design"
         )
     return design
+
+
+def llm_checkpoint_path_preflight(
+    run_directory: str | Path,
+    source: str | Path,
+    *,
+    maximum_episode: int,
+    enforce_windows_limit: bool | None = None,
+) -> dict[str, Any]:
+    """Validate every artifact-copy destination before expensive training starts."""
+
+    run_directory = Path(run_directory).resolve()
+    design = load_approved_design(source)
+    source_files = sorted(
+        path.relative_to(design.directory)
+        for path in design.directory.rglob("*")
+        if path.is_file()
+    )
+    if not source_files:
+        raise LLMRuntimeError("approved artifact contains no files")
+    episode_name = f"ep_{int(maximum_episode):04d}"
+    temporary_name = f".{episode_name}.tmp-00000000"
+    destinations = {
+        "run_artifact": run_directory / RUN_ARTIFACT_DIRECTORY_NAME,
+        "model_checkpoint": (
+            run_directory
+            / "checkpoints"
+            / "models"
+            / episode_name
+            / RUN_ARTIFACT_DIRECTORY_NAME
+        ),
+        "model_checkpoint_temporary": (
+            run_directory
+            / "checkpoints"
+            / "models"
+            / temporary_name
+            / RUN_ARTIFACT_DIRECTORY_NAME
+        ),
+        "full_checkpoint": (
+            run_directory
+            / "checkpoints"
+            / "full"
+            / episode_name
+            / RUN_ARTIFACT_DIRECTORY_NAME
+        ),
+        "full_checkpoint_temporary": (
+            run_directory
+            / "checkpoints"
+            / "full"
+            / temporary_name
+            / RUN_ARTIFACT_DIRECTORY_NAME
+        ),
+    }
+    records = []
+    for scope, destination in destinations.items():
+        longest = max(
+            (destination / relative for relative in source_files),
+            key=lambda path: len(str(path)),
+        )
+        records.append(
+            {
+                "scope": scope,
+                "path": str(longest),
+                "path_length": len(str(longest)),
+                "artifact_relative_path": str(longest.relative_to(destination)),
+            }
+        )
+    longest_record = max(records, key=lambda item: item["path_length"])
+    enforce = os.name == "nt" if enforce_windows_limit is None else bool(
+        enforce_windows_limit
+    )
+    report = {
+        "schema_version": "uav-hrl-llm-checkpoint-path-preflight-v1",
+        "run_directory": str(run_directory),
+        "maximum_episode": int(maximum_episode),
+        "artifact_identity": artifact_identity(design),
+        "artifact_file_count": len(source_files),
+        "windows_legacy_path_limit_characters": WINDOWS_LEGACY_MAX_PATH_CHARACTERS,
+        "windows_limit_enforced": enforce,
+        "paths": records,
+        "longest_path": longest_record,
+        "passed": (
+            not enforce
+            or int(longest_record["path_length"])
+            <= WINDOWS_LEGACY_MAX_PATH_CHARACTERS
+        ),
+    }
+    if not report["passed"]:
+        raise LLMRuntimeError(
+            "LLM checkpoint path is not usable with the Windows legacy path limit: "
+            f"{longest_record['path_length']} characters exceeds "
+            f"{WINDOWS_LEGACY_MAX_PATH_CHARACTERS} at {longest_record['path']}"
+        )
+    return report
 
 
 def runtime_constants_metadata(

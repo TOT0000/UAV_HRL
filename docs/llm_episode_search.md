@@ -90,11 +90,13 @@ continues only after that bounded transition has been recorded. Incompatible
 dataset, interface, baseline, evaluation, or already-trained state is rejected.
 
 Search-selected training runs use the short, collision-resistant repository
-root `results/llm_train/s-<search-hash>/r<round>/`; the search state records this
-root and the actual training run directory. A run stopped at the `ef10fa3`
-first-round training initialization failure can perform the one bounded
-compatibility migration and continue without regenerating candidates or
-rerunning pretraining ordering:
+root `results/t/<search-and-round-hash>/`; the search state records this root
+and the actual training run directory. Before training starts, the runner checks
+the run artifact plus the final and atomic-temporary `models` and `full`
+checkpoint artifact paths against the Windows legacy path limit. A run stopped
+at the `ef10fa3` first-round training initialization failure can perform the one
+bounded compatibility migration and continue without regenerating candidates
+or rerunning pretraining ordering:
 
 ```powershell
 & 'C:\Users\user\anaconda3\envs\LLM_HRL\python.exe' .\run_llm_episode_search.py `
@@ -108,6 +110,21 @@ nested `PREPARING` directory remains as an initialization-failure record. A
 directory is resumed only when it contains training progress and a full-resume
 checkpoint; progress without a checkpoint is reported and never silently
 retrained.
+
+The `fa948f1` run that completed episode 50 but failed before producing any
+checkpoint cannot resume from episode 50. Its one bounded recovery explicitly
+preserves that failed run and starts the already selected candidate again at
+episode 1 under the shorter root, without model calls or pretraining reranking:
+
+```powershell
+& 'C:\Users\user\anaconda3\envs\LLM_HRL\python.exe' .\run_llm_episode_search.py `
+  --resume '<RESULTS_LLM_EPISODE_SEARCH_RUN>' `
+  --restart-failed-training
+```
+
+Ordinary `--resume` still refuses to discard progress without a valid full
+checkpoint. If a compatible replacement run has a full checkpoint, it is
+resumed even when the older search record still names an abandoned shell.
 
 Omitting the two limits on resume keeps their saved values. To add budget
 without resetting the already-used rounds or repairs, pass larger totals:

@@ -394,6 +394,29 @@ def test_registered_runner_and_paper_evaluation_entry_use_run_artifact(
     )
     assert run_experiment_training(args) == 0
     run_dir = next((output_root / method_id).iterdir())
+    path_preflight = json.loads(
+        (run_dir / "llm_checkpoint_path_preflight.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert path_preflight["passed"] is True
+    assert {
+        item["scope"] for item in path_preflight["paths"]
+    } == {
+        "run_artifact",
+        "model_checkpoint",
+        "model_checkpoint_temporary",
+        "full_checkpoint",
+        "full_checkpoint_temporary",
+    }
+    run_design = load_approved_design(run_dir / "llm_artifact")
+    assert path_preflight["artifact_identity"] == artifact_identity(run_design)
+    assert artifact_identity(
+        load_approved_design(run_dir / "checkpoints" / "models" / "ep_0001" / "llm_artifact")
+    ) == artifact_identity(run_design)
+    assert artifact_identity(
+        load_approved_design(run_dir / "checkpoints" / "full" / "ep_0001" / "llm_artifact")
+    ) == artifact_identity(run_design)
     llm_rows = [
         json.loads(line)
         for line in (run_dir / "llm_training_episode_metrics.jsonl")

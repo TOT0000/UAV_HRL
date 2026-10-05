@@ -67,6 +67,7 @@ from training_history import (
 from llm_runtime import (
     artifact_identity,
     copy_approved_artifact,
+    llm_checkpoint_path_preflight,
     load_run_artifact,
 )
 
@@ -565,11 +566,22 @@ def run(args):
         values["output_root"], method.method_key, values["seed"], git_sha
     )
     write_run_status(run_dir, "PREPARING")
-    llm_design = (
-        copy_approved_artifact(args.llm_artifact, run_dir)
-        if method.llm_enabled
-        else None
-    )
+    if method.llm_enabled:
+        try:
+            path_preflight = llm_checkpoint_path_preflight(
+                run_dir,
+                args.llm_artifact,
+                maximum_episode=values["episodes"],
+            )
+            _write_json_atomic(
+                run_dir / "llm_checkpoint_path_preflight.json", path_preflight
+            )
+            llm_design = copy_approved_artifact(args.llm_artifact, run_dir)
+        except BaseException as exc:
+            write_run_status(run_dir, run_state_for_exception(exc), exception=exc)
+            raise
+    else:
+        llm_design = None
     checkpoints_enabled = not args.smoke
     config = formal_training_config(
         values["episodes"],

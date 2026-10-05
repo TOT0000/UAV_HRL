@@ -71,7 +71,7 @@ from llm_design_contract import (
     visual_sensing_spec,
 )
 from llm_numeric_operations import NUMERIC_OPERATION_RULES_VERSION
-from llm_runtime import artifact_identity
+from llm_runtime import artifact_identity, load_run_artifact
 from training_history import read_committed_training_history, training_history_identity
 
 
@@ -92,6 +92,9 @@ REVALIDATABLE_NUMERIC_RULE_SOURCE_REVISIONS = frozenset(
 )
 RECOVERABLE_TRAINING_INITIALIZATION_SOURCE_REVISIONS = frozenset(
     {"ef10fa3d5396e236bba3d63b2e152b29339e4226"}
+)
+RESTARTABLE_CHECKPOINT_PATH_RECOVERY_REVISION = (
+    "fa948f14938795b45ded56100af523375481a3db"
 )
 
 ROOT = Path(__file__).resolve().parent
@@ -115,6 +118,14 @@ def _canonical_json(value: Any) -> str:
 
 def _sha256_json(value: Any) -> str:
     return hashlib.sha256(_canonical_json(value).encode("utf-8")).hexdigest()
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def candidate_computation_fingerprint(candidate: dict[str, Any]) -> str:
@@ -1148,12 +1159,21 @@ def _revision_transition_allows_resume(
         and transition.get("status") in {"passed", "completed_with_failures"}
     )
     training_transition = state.get("training_initialization_recovery_transition") or {}
-    return numeric_transition or bool(
+    initialization_transition = bool(
         training_transition.get("source_git_sha") == state.get("git_sha")
         and training_transition.get("target_git_sha") == current_git_sha
         and training_transition.get("status") == "compatible"
         and training_transition.get("reason")
         == "short_training_path_and_initialization_recovery"
+    )
+    restart_transition = state.get("checkpoint_path_restart_transition") or {}
+    return numeric_transition or initialization_transition or bool(
+        restart_transition.get("source_git_sha")
+        == RESTARTABLE_CHECKPOINT_PATH_RECOVERY_REVISION
+        and restart_transition.get("target_git_sha") == current_git_sha
+        and restart_transition.get("status") == "compatible"
+        and restart_transition.get("reason")
+        == "checkpoint_path_shortening_restart_from_episode_1"
     )
 
 
@@ -1161,9 +1181,11 @@ def _short_training_output_root(search_output: Path, round_number: int) -> Path:
     """Return a collision-resistant root with headroom for Windows checkpoints."""
 
     digest = hashlib.sha256(
-        str(Path(search_output).resolve()).encode("utf-8")
+        (
+            f"{Path(search_output).resolve()}|round={int(round_number)}"
+        ).encode("utf-8")
     ).hexdigest()[:12]
-    return (ROOT / "results" / "llm_train" / f"s-{digest}" / f"r{int(round_number):02d}").resolve()
+    return (ROOT / "results" / "t" / digest).resolve()
 
 
 def _training_recovery_eligibility(
@@ -1272,6 +1294,181 @@ def _record_training_recovery_transition(
     ]
     state["training_initialization_recovery_transition"] = record
     state.setdefault("training_initialization_recoveries", []).append(record)
+    return record
+
+
+def _checkpoint_path_restart_eligibility(
+    state: dict[str, Any], *, current_git_sha: str
+) -> None:
+    previous = state.get("training_initialization_recovery_transition") or {}
+    current = state.get("current_round")
+    training = (current or {}).get("training") or {}
+    if (
+        previous.get("source_git_sha") != state.get("git_sha")
+        or previous.get("target_git_sha")
+        != RESTARTABLE_CHECKPOINT_PATH_RECOVERY_REVISION
+        or previous.get("status") != "compatible"
+    ):
+        raise EpisodeSearchError(
+            "checkpoint-path restart requires the recorded fa948f1 initialization recovery"
+        )
+    if current_git_sha == RESTARTABLE_CHECKPOINT_PATH_RECOVERY_REVISION:
+        raise EpisodeSearchError(
+            "checkpoint-path restart requires the path-preflight fix revision"
+        )
+    if state.get("checkpoint_path_restart_transition") is not None:
+        raise EpisodeSearchError("checkpoint-path restart was already recorded")
+    if (
+        not isinstance(current, dict)
+        or current.get("phase") != "train"
+        or current.get("evaluation_result") is not None
+        or state.get("rounds")
+        or current.get("selected_candidate_id") != "candidate_1"
+        or training.get("status") != "incomplete"
+        or not training.get("run_directory")
+    ):
+        raise EpisodeSearchError(
+            "checkpoint-path restart requires the saved first-round failed training state"
+        )
+
+
+def _completed_episode_evidence(run_directory: Path) -> dict[str, Any]:
+    evidence = {}
+    for filename in (
+        "training_history.jsonl",
+        "llm_training_episode_metrics.jsonl",
+    ):
+        path = run_directory / filename
+        rows = []
+        if path.is_file():
+            try:
+                rows = [
+                    json.loads(line)
+                    for line in path.read_text(encoding="utf-8").splitlines()
+                    if line.strip()
+                ]
+            except (OSError, json.JSONDecodeError) as exc:
+                raise EpisodeSearchError(
+                    f"failed training evidence is unreadable: {path}: {exc}"
+                ) from exc
+        episodes = [int(row["episode"]) for row in rows if "episode" in row]
+        evidence[filename] = {
+            "row_count": len(rows),
+            "maximum_episode": max(episodes) if episodes else None,
+            "sha256": _sha256_file(path) if path.is_file() else None,
+        }
+    return evidence
+
+
+def _record_checkpoint_path_restart_transition(
+    state: dict[str, Any],
+    *,
+    output: Path,
+    dataset: EpisodeDataset,
+    constants: dict[str, Any],
+    baseline_preflight: dict[str, Any],
+    target_git_sha: str,
+) -> dict[str, Any]:
+    """Authorize one explicit episode-1 restart for the fa948f1 path failure."""
+
+    from llm_episode_training import _training_run_evidence
+
+    current = state["current_round"]
+    selected = current["selected_candidate_id"]
+    slot = current["slots"][selected]
+    evaluation = current["evaluation"]
+    evaluation_path = (
+        output
+        / f"round_{int(current['round']):02d}"
+        / "pretraining_evaluation.json"
+    )
+    if not evaluation_path.is_file() or json.loads(
+        evaluation_path.read_text(encoding="utf-8")
+    ) != evaluation:
+        raise EpisodeSearchError("saved pretraining evaluation report changed")
+    design = load_approved_design(current["approved_artifact"])
+    if design.candidate != slot.get("candidate"):
+        raise EpisodeSearchError(
+            "approved artifact candidate differs from the selected saved candidate"
+        )
+    if design.constants_metadata != constants:
+        raise EpisodeSearchError(
+            "approved artifact observation/constants interface changed"
+        )
+    provenance = design.artifact.get("provenance") or {}
+    if (
+        Path(provenance.get("search_run", "")).resolve() != output
+        or int(provenance.get("search_round", -1)) != int(current["round"])
+        or provenance.get("candidate_slot") != selected
+        or (provenance.get("dataset") or {}) != dataset.provenance
+    ):
+        raise EpisodeSearchError("approved artifact search provenance is incompatible")
+    if state.get("baseline_preflight") != baseline_preflight:
+        raise EpisodeSearchError("baseline/pre-evaluation comparison contract changed")
+
+    failed_run = Path(current["training"]["run_directory"]).resolve()
+    failed_evidence = _training_run_evidence(failed_run)
+    load_run_artifact(failed_run, artifact_identity(design))
+    failure_text = _canonical_json(
+        failed_evidence.get("lifecycle_exception") or {}
+    )
+    if (
+        failed_evidence.get("classification") != "progress_without_checkpoint"
+        or not failed_evidence.get("has_training_progress")
+        or failed_evidence.get("full_checkpoint_directories")
+        or "WinError 3" not in failure_text
+        or "checkpoints" not in failure_text
+    ):
+        raise EpisodeSearchError(
+            "failed run is not the eligible checkpoint-path progress-without-checkpoint failure"
+        )
+    previous = state["training_initialization_recovery_transition"]
+    previous_root = Path(previous["training_output_root"]).resolve()
+    if failed_run.parent.parent != previous_root:
+        raise EpisodeSearchError(
+            "failed run is outside the recorded fa948f1 training root"
+        )
+
+    new_root = _short_training_output_root(output, int(current["round"]))
+    prior_roots = []
+    for value in (
+        current.get("training_output_root"),
+        current.get("legacy_training_output_root"),
+    ):
+        if value and str(Path(value).resolve()) not in prior_roots:
+            prior_roots.append(str(Path(value).resolve()))
+    record = {
+        "schema_version": "uav-hrl-llm-episode-search-checkpoint-path-restart-v1",
+        "status": "compatible",
+        "reason": "checkpoint_path_shortening_restart_from_episode_1",
+        "recorded_at_utc": datetime.now(timezone.utc).isoformat(),
+        "original_search_git_sha": str(state["git_sha"]),
+        "source_git_sha": RESTARTABLE_CHECKPOINT_PATH_RECOVERY_REVISION,
+        "target_git_sha": target_git_sha,
+        "previous_recovery": previous,
+        "search_run": str(output),
+        "round": int(current["round"]),
+        "selected_candidate_id": selected,
+        "candidate_version": int(slot["version"]),
+        "approved_artifact_identity": artifact_identity(design),
+        "dataset_content_sha256": dataset.provenance.get(
+            "dataset_content_sha256"
+        ),
+        "pretraining_evaluation_sha256": _sha256_json(evaluation),
+        "baseline_preflight_sha256": _sha256_json(baseline_preflight),
+        "failed_run_directory": str(failed_run),
+        "failed_run_evidence": failed_evidence,
+        "completed_episode_evidence": _completed_episode_evidence(failed_run),
+        "prior_training_output_roots": prior_roots,
+        "replacement_training_output_root": str(new_root),
+        "restart_episode": 1,
+        "model_calls": int(state.get("model_calls", 0)),
+        "repair_calls": int(current.get("repair_calls", 0)),
+    }
+    current["prior_training_output_roots"] = prior_roots
+    current["training_output_root"] = str(new_root)
+    state["checkpoint_path_restart_transition"] = record
+    state.setdefault("checkpoint_path_restart_transitions", []).append(record)
     return record
 
 
@@ -1515,6 +1712,7 @@ def run_episode_search(
     resume: str | Path | None = None,
     revalidate_only: bool = False,
     recover_training_initialization: bool = False,
+    restart_failed_training: bool = False,
     dry_run: bool = False,
     client: Any | None = None,
     training_runner: Callable[..., dict[str, Any]] | None = None,
@@ -1526,9 +1724,16 @@ def run_episode_search(
     subprocess wrappers in ``llm_episode_training.py``.
     """
 
-    if revalidate_only and recover_training_initialization:
+    if sum(
+        bool(value)
+        for value in (
+            revalidate_only,
+            recover_training_initialization,
+            restart_failed_training,
+        )
+    ) > 1:
         raise ValueError(
-            "training-initialization recovery cannot be combined with revalidation"
+            "revalidation and training recovery modes are mutually exclusive"
         )
     if revalidate_only:
         if resume is None:
@@ -1545,9 +1750,14 @@ def run_episode_search(
         raise ValueError(
             "training-initialization recovery cannot be combined with dry-run"
         )
+    if restart_failed_training and resume is None:
+        raise ValueError("--restart-failed-training requires --resume")
+    if restart_failed_training and dry_run:
+        raise ValueError("failed-training restart cannot be combined with dry-run")
 
     resume_terminal_no_extension = False
     pending_training_recovery = False
+    pending_checkpoint_path_restart = False
     if resume is not None:
         output = Path(resume).resolve()
         state_path = output / "state.json"
@@ -1558,16 +1768,21 @@ def run_episode_search(
             )
         current_git_sha = _git_sha()
         if not _revision_transition_allows_resume(state, current_git_sha):
-            if recover_training_initialization:
+            if restart_failed_training:
+                _checkpoint_path_restart_eligibility(
+                    state, current_git_sha=current_git_sha
+                )
+                pending_checkpoint_path_restart = True
+            elif recover_training_initialization:
                 _training_recovery_eligibility(
                     state, current_git_sha=current_git_sha
                 )
                 pending_training_recovery = True
             else:
                 raise EpisodeSearchError("resume git revision is incompatible")
-        elif recover_training_initialization:
+        elif recover_training_initialization or restart_failed_training:
             raise EpisodeSearchError(
-                "bounded training-initialization recovery is not applicable to this run"
+                "the requested bounded training recovery is not applicable to this run"
             )
         settings = state["settings"]
         episode_sources = settings["episode_sources"]
@@ -1773,6 +1988,16 @@ def run_episode_search(
         }
     if pending_training_recovery:
         _record_training_recovery_transition(
+            state,
+            output=output,
+            dataset=dataset,
+            constants=constants,
+            baseline_preflight=baseline_preflight,
+            target_git_sha=_git_sha(),
+        )
+        _write_json(output / "state.json", state)
+    if pending_checkpoint_path_restart:
+        _record_checkpoint_path_restart_transition(
             state,
             output=output,
             dataset=dataset,
@@ -2079,7 +2304,11 @@ def run_episode_search(
                     seed=config["seed"],
                     output_directory=current["training_output_root"],
                     legacy_output_directory=current["legacy_training_output_root"],
+                    prior_output_directories=current.get(
+                        "prior_training_output_roots", []
+                    ),
                     resume_record=current.get("training"),
+                    restart_from_scratch=pending_checkpoint_path_restart,
                 )
             except Exception as exc:
                 current["training"] = {
