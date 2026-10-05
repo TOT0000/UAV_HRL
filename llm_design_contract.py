@@ -811,16 +811,14 @@ def format_schema_and_example(schema: dict[str, Any] | None = None) -> str:
 
 
 SUPPORTED_OPERATIONS = """Supported code subset:
-- No imports. `np` is provided.
-- Arithmetic, comparisons, Boolean expressions, literal obs/constants-key indexing, local variables, if/for constructs, and returns.
+- No import statements. `np` is provided. Arithmetic, comparisons, Boolean expressions, literal obs/constants-key indexing, locals, if/for, and returns are supported.
 - Safe built-ins: abs, bool, enumerate, float, int, len, list, max, min, range, sum, tuple, zip.
-- NumPy: abs, all, any, arange, array, asarray, bool_, clip, concatenate, count_nonzero, exp, float32, float64, int32, int64, isfinite, log, log1p, max, maximum, mean, min, minimum, ones, sqrt, stack, sum, where, zeros, and linalg.norm.
-- Indexed writes may fill arrays independently created inside the function by supported allocating operations such as np.zeros, np.ones, np.arange, and np.array. Safe local aliases and slices of those arrays remain writable.
-- Augmented assignment may update a proven immutable numeric local or an independently created local NumPy array. It may not update an input-backed or uncertain target.
-- Do not store input-backed or otherwise mutable references in Python containers for later nested mutation; that container-reference pattern is conservatively rejected.
-- obs, constants, and aliases, slices, or np.asarray views that may share their data must remain unchanged. If ownership cannot be confirmed across every control-flow path, indexed writes are rejected.
+- NumPy functions: abs, all, any, arange, array, asarray, bool_, clip, concatenate, copy, count_nonzero, exp, float32, float64, int32, int64, isfinite, log, log1p, max, maximum, mean, median, min, minimum, ones, ravel, reshape, sqrt, stack, std, sum, transpose, var, where, zeros, and linalg.norm.
+- Array methods: astype, sum, mean, min, max, std, var, all, any, clip, reshape, flatten, ravel, transpose, copy; shape, size, ndim are read-only. Local numeric lists may append proven scalar values.
+- Dtypes: float, int, bool, np.float32/64, np.int32/64, np.bool_, and equivalent plain strings; object/structured dtypes are prohibited.
+- Only independently allocated/copied local arrays may be modified. obs/constants, aliases, slices, np.asarray, reshape/ravel/transpose views, and astype(copy=False) remain read-only. out/like and overwrite_input=True are prohibited. Uncertain ownership or container references are rejected.
 - A feature that directly copies one original-state scalar, or two features with the same statically resolved output expression, is rejected. Derived quantities such as relative distances, normalized deadlines, and queue loads remain allowed.
-- The same operation whitelist still applies: do not use array/object methods, imports, file/network/process access, eval/exec, reflection, globals, randomness, or time."""
+- Only listed numeric methods are supported; no arbitrary methods, file/network/process access, eval/exec, reflection, globals, randomness, or time."""
 
 
 def baseline_lines(baseline_report: dict[str, Any]) -> str:

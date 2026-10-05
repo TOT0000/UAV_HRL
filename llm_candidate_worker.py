@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import builtins
 import hashlib
 import json
 from pathlib import Path
@@ -14,6 +15,7 @@ import traceback
 import numpy as np
 
 from llm_candidate import feature_reward, validate_candidate
+from llm_numeric_operations import SAFE_BUILTIN_CALLS
 from llm_design_contract import (
     LEGACY_OBS_KEYS,
     OBS_KEYS,
@@ -21,20 +23,13 @@ from llm_design_contract import (
 
 
 SAFE_BUILTINS = {
-    "abs": abs,
-    "bool": bool,
-    "enumerate": enumerate,
-    "float": float,
-    "int": int,
-    "len": len,
-    "list": list,
-    "max": max,
-    "min": min,
-    "range": range,
-    "sum": sum,
-    "tuple": tuple,
-    "zip": zip,
+    name: getattr(builtins, name) for name in sorted(SAFE_BUILTIN_CALLS)
 }
+# Several ndarray methods lazily import NumPy's own implementation helpers from
+# the caller frame.  Static validation still rejects Import/ImportFrom and every
+# direct or indirect candidate call outside the explicit allow-list; exposing
+# the interpreter hook here only lets already-approved NumPy methods finish.
+SAFE_BUILTINS["__import__"] = builtins.__import__
 
 
 class CandidateOutputValidationError(ValueError):

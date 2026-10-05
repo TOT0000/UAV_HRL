@@ -65,12 +65,23 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-root", default=str(DEFAULT_OUTPUT_ROOT))
     parser.add_argument("--output-dir")
     parser.add_argument("--resume")
+    parser.add_argument(
+        "--revalidate-only",
+        action="store_true",
+        help=(
+            "revalidate saved generation-stage candidates under the current numeric "
+            "operation rules and stop before model calls, pre-evaluation, or training"
+        ),
+    )
     parser.add_argument("--dry-run", action="store_true")
     return parser
 
 
 def main(argv=None) -> int:
     args = build_parser().parse_args(argv)
+    if args.revalidate_only and args.resume is None:
+        print("--revalidate-only requires --resume", file=sys.stderr)
+        return 2
     if args.resume is None:
         missing = [
             option for option, value in (
@@ -104,6 +115,8 @@ def main(argv=None) -> int:
         print(f"Best candidate: {result['best_trained_candidate']['candidate_id']}")
     if result.get("stop_reason"):
         print(f"Stop reason: {result['stop_reason']}")
+    if args.revalidate_only:
+        return 0
     return 0 if result["status"] in {"complete", "dry_run_complete"} else 2
 
 

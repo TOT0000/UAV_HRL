@@ -20,6 +20,23 @@ from typing import Any
 
 import numpy as np
 
+from llm_numeric_operations import (
+    ALLOWED_DTYPE_NAMES,
+    ALLOWED_DTYPE_STRINGS,
+    ARRAY_COPY_METHODS,
+    ARRAY_REDUCTION_METHODS,
+    ARRAY_VIEW_METHODS,
+    NUMPY_COPY_CALLS,
+    NUMPY_VIEW_CALLS,
+    SAFE_ARRAY_METHODS,
+    SAFE_ARRAY_READ_ATTRIBUTES,
+    SAFE_BUILTIN_CALLS,
+    SAFE_LOCAL_CONTAINER_METHODS,
+    SAFE_NUMPY_ATTRIBUTES,
+    SAFE_NUMPY_CALLS,
+    UNSAFE_ARRAY_KEYWORDS,
+)
+
 from llm_design_contract import (
     APPROVED_ARTIFACT_SCHEMA_VERSION,
     CANDIDATE_SCHEMA_VERSION,
@@ -55,60 +72,6 @@ ITEM_FIELDS = {
 }
 MODEL_TOP_FIELDS = {"features", "code"}
 MODEL_ITEM_FIELDS = {"name", "description", "reward_weight"}
-SAFE_BUILTIN_CALLS = {
-    "abs",
-    "bool",
-    "enumerate",
-    "float",
-    "int",
-    "len",
-    "list",
-    "max",
-    "min",
-    "range",
-    "sum",
-    "tuple",
-    "zip",
-}
-SAFE_NUMPY_CALLS = {
-    "np.abs",
-    "np.all",
-    "np.any",
-    "np.arange",
-    "np.array",
-    "np.asarray",
-    "np.bool_",
-    "np.clip",
-    "np.concatenate",
-    "np.count_nonzero",
-    "np.exp",
-    "np.float32",
-    "np.float64",
-    "np.int32",
-    "np.int64",
-    "np.isfinite",
-    "np.log",
-    "np.log1p",
-    "np.max",
-    "np.maximum",
-    "np.mean",
-    "np.min",
-    "np.minimum",
-    "np.ones",
-    "np.sqrt",
-    "np.stack",
-    "np.sum",
-    "np.where",
-    "np.zeros",
-    "np.linalg.norm",
-}
-SAFE_NUMPY_ATTRIBUTES = {
-    "np.float32",
-    "np.float64",
-    "np.int32",
-    "np.int64",
-    "np.bool_",
-}
 DISALLOWED_NODES = (
     ast.Import,
     ast.ImportFrom,
@@ -686,6 +649,182 @@ def _root_name(node: ast.AST) -> str | None:
     return current.id if isinstance(current, ast.Name) else None
 
 
+def _is_allowed_dtype_expression(node: ast.AST) -> bool:
+    if isinstance(node, ast.Name):
+        return node.id in ALLOWED_DTYPE_NAMES
+    if isinstance(node, ast.Attribute):
+        return _dotted_name(node) in SAFE_NUMPY_ATTRIBUTES
+    return isinstance(node, ast.Constant) and node.value in ALLOWED_DTYPE_STRINGS
+
+
+_POSITIONAL_DTYPE_ARGUMENT = {
+    "np.array": 1,
+    "np.asarray": 1,
+    "np.zeros": 1,
+    "np.ones": 1,
+    "np.arange": 3,
+    "np.sum": 2,
+    "np.mean": 2,
+    "np.std": 2,
+    "np.var": 2,
+}
+_METHOD_POSITIONAL_DTYPE_ARGUMENT = {
+    "astype": 0,
+    "sum": 1,
+    "mean": 1,
+    "std": 1,
+    "var": 1,
+}
+_POSITIONAL_OUT_ARGUMENT = {
+    "np.all": 2,
+    "np.any": 2,
+    "np.clip": 3,
+    "np.max": 2,
+    "np.mean": 3,
+    "np.median": 2,
+    "np.min": 2,
+    "np.std": 3,
+    "np.sum": 3,
+    "np.var": 3,
+}
+_METHOD_POSITIONAL_OUT_ARGUMENT = {
+    "all": 1,
+    "any": 1,
+    "clip": 2,
+    "max": 1,
+    "mean": 2,
+    "min": 1,
+    "std": 2,
+    "sum": 2,
+    "var": 2,
+}
+
+
+def _call_policy_issues(node: ast.Call) -> list[tuple[str, ast.AST, str, str]]:
+    """Return bounded, syntax-only safety issues for an otherwise allowed call."""
+
+    dotted = _dotted_name(node.func)
+    method = node.func.attr if isinstance(node.func, ast.Attribute) else None
+    issues: list[tuple[str, ast.AST, str, str]] = []
+    for keyword in node.keywords:
+        if keyword.arg is None:
+            issues.append(
+                (
+                    "STATIC_DYNAMIC_KEYWORDS",
+                    keyword,
+                    "expanded **keyword arguments are not allowed",
+                    "Pass documented keyword arguments explicitly.",
+                )
+            )
+        elif keyword.arg in UNSAFE_ARRAY_KEYWORDS:
+            issues.append(
+                (
+                    "STATIC_NUMPY_KEYWORD",
+                    keyword,
+                    f"NumPy keyword {keyword.arg!r} is not allowed",
+                    "Do not use output-buffer or like= mutation hooks.",
+                )
+            )
+        elif keyword.arg == "overwrite_input" and not (
+            isinstance(keyword.value, ast.Constant) and keyword.value.value is False
+        ):
+            issues.append(
+                (
+                    "STATIC_NUMPY_KEYWORD",
+                    keyword,
+                    "overwrite_input must be the literal False",
+                    "Keep input arrays unchanged; omit overwrite_input or set it to False.",
+                )
+            )
+        elif keyword.arg == "dtype" and not _is_allowed_dtype_expression(keyword.value):
+            issues.append(
+                (
+                    "STATIC_NUMPY_DTYPE",
+                    keyword,
+                    "dtype must be a supported plain numeric dtype",
+                    "Use float, int, bool, np.float32, np.float64, np.int32, np.int64, np.bool_, or the equivalent supported dtype string.",
+                )
+            )
+        elif keyword.arg == "copy" and method == "astype" and not (
+            isinstance(keyword.value, ast.Constant)
+            and isinstance(keyword.value.value, bool)
+        ):
+            issues.append(
+                (
+                    "STATIC_NUMPY_COPY_MODE",
+                    keyword,
+                    "astype copy= must be a literal Boolean",
+                    "Use the default copy behavior, copy=True, or copy=False explicitly.",
+                )
+            )
+    dtype_index = (
+        _METHOD_POSITIONAL_DTYPE_ARGUMENT.get(method)
+        if method is not None and dotted not in SAFE_NUMPY_CALLS
+        else _POSITIONAL_DTYPE_ARGUMENT.get(dotted)
+    )
+    if dtype_index is not None and len(node.args) > dtype_index:
+        dtype_node = node.args[dtype_index]
+        if not _is_allowed_dtype_expression(dtype_node):
+            issues.append(
+                (
+                    "STATIC_NUMPY_DTYPE",
+                    dtype_node,
+                    "positional dtype must be a supported plain numeric dtype",
+                    "Use float, int, bool, a supported NumPy numeric dtype, or the equivalent supported dtype string.",
+                )
+            )
+    out_index = (
+        _METHOD_POSITIONAL_OUT_ARGUMENT.get(method)
+        if method is not None and dotted not in SAFE_NUMPY_CALLS
+        else _POSITIONAL_OUT_ARGUMENT.get(dotted)
+    )
+    if out_index is not None and len(node.args) > out_index:
+        out_node = node.args[out_index]
+        if not (isinstance(out_node, ast.Constant) and out_node.value is None):
+            issues.append(
+                (
+                    "STATIC_NUMPY_KEYWORD",
+                    out_node,
+                    "positional output-buffer arguments are not allowed",
+                    "Omit the output buffer; candidate operations must not mutate external arrays.",
+                )
+            )
+    if dotted == "np.median" and len(node.args) > 3:
+        overwrite_node = node.args[3]
+        if not (
+            isinstance(overwrite_node, ast.Constant)
+            and overwrite_node.value is False
+        ):
+            issues.append(
+                (
+                    "STATIC_NUMPY_KEYWORD",
+                    overwrite_node,
+                    "positional overwrite_input must be the literal False",
+                    "Keep input arrays unchanged; omit overwrite_input or set it to False.",
+                )
+            )
+    return issues
+
+
+def _reduction_returns_scalar(node: ast.Call, *, method: bool) -> bool:
+    axis_position = 0 if method else 1
+    axis_node = next(
+        (keyword.value for keyword in node.keywords if keyword.arg == "axis"),
+        node.args[axis_position] if len(node.args) > axis_position else None,
+    )
+    keepdims_node = next(
+        (keyword.value for keyword in node.keywords if keyword.arg == "keepdims"),
+        None,
+    )
+    axis_is_none = axis_node is None or (
+        isinstance(axis_node, ast.Constant) and axis_node.value is None
+    )
+    keepdims_is_false = keepdims_node is None or (
+        isinstance(keepdims_node, ast.Constant) and keepdims_node.value is False
+    )
+    return axis_is_none and keepdims_is_false
+
+
 _SOURCE_INPUT = "input_shared"
 _SOURCE_OWNED = "local_owned"
 _SOURCE_IMMUTABLE = "immutable_value"
@@ -715,6 +854,7 @@ _LOCAL_ALLOCATING_NUMPY_CALLS = {
     "np.stack",
     "np.where",
     "np.zeros",
+    *NUMPY_COPY_CALLS,
 }
 _LOCAL_NUMPY_VALUE_OR_ARRAY_CALLS = {
     "np.all",
@@ -728,7 +868,12 @@ _LOCAL_NUMPY_VALUE_OR_ARRAY_CALLS = {
     "np.isfinite",
     "np.linalg.norm",
     "np.mean",
+    "np.median",
+    "np.max",
+    "np.min",
+    "np.std",
     "np.sum",
+    "np.var",
 }
 
 
@@ -824,6 +969,8 @@ class _MutationSourceAnalyzer:
         if isinstance(node, ast.Subscript):
             return self.expression_sources(node.value, environment)
         if isinstance(node, ast.Attribute):
+            if node.attr in SAFE_ARRAY_READ_ATTRIBUTES:
+                return _IMMUTABLE_SOURCES
             return self.expression_sources(node.value, environment)
         if isinstance(node, ast.IfExp):
             return frozenset(
@@ -879,6 +1026,43 @@ class _MutationSourceAnalyzer:
             return _IMMUTABLE_SOURCES
         if isinstance(node, ast.Call):
             dotted = _dotted_name(node.func)
+            if isinstance(node.func, ast.Attribute) and dotted not in SAFE_NUMPY_CALLS:
+                method = node.func.attr
+                receiver_sources = self.expression_sources(
+                    node.func.value, environment
+                )
+                if method in ARRAY_VIEW_METHODS:
+                    return receiver_sources
+                if method in ARRAY_COPY_METHODS:
+                    return _OWNED_SOURCES
+                if method in ARRAY_REDUCTION_METHODS:
+                    return (
+                        _IMMUTABLE_SOURCES
+                        if _reduction_returns_scalar(node, method=True)
+                        else _OWNED_SOURCES
+                    )
+                if method == "astype":
+                    copy_keyword = next(
+                        (
+                            keyword.value
+                            for keyword in node.keywords
+                            if keyword.arg == "copy"
+                        ),
+                        None,
+                    )
+                    if (
+                        isinstance(copy_keyword, ast.Constant)
+                        and copy_keyword.value is False
+                    ):
+                        return receiver_sources
+                    if copy_keyword is not None and not (
+                        isinstance(copy_keyword, ast.Constant)
+                        and copy_keyword.value is True
+                    ):
+                        return _UNKNOWN_SOURCES
+                    return _OWNED_SOURCES
+                if method == "append":
+                    return _IMMUTABLE_SOURCES
             if dotted == "np.asarray":
                 return (
                     self.expression_sources(node.args[0], environment)
@@ -902,9 +1086,31 @@ class _MutationSourceAnalyzer:
                 ):
                     return _UNKNOWN_SOURCES
                 return _OWNED_SOURCES
+            if dotted in NUMPY_VIEW_CALLS:
+                return (
+                    self.expression_sources(node.args[0], environment)
+                    if node.args
+                    else _UNKNOWN_SOURCES
+                )
             if dotted in _LOCAL_ALLOCATING_NUMPY_CALLS:
                 return _OWNED_SOURCES
             if dotted in _LOCAL_NUMPY_VALUE_OR_ARRAY_CALLS:
+                if dotted in {
+                    "np.all",
+                    "np.any",
+                    "np.max",
+                    "np.mean",
+                    "np.median",
+                    "np.min",
+                    "np.std",
+                    "np.sum",
+                    "np.var",
+                }:
+                    return (
+                        _IMMUTABLE_SOURCES
+                        if _reduction_returns_scalar(node, method=False)
+                        else _OWNED_SOURCES
+                    )
                 return frozenset({_SOURCE_IMMUTABLE, _SOURCE_OWNED})
             if isinstance(node.func, ast.Name) and node.func.id == "list":
                 return _CONTAINER_SOURCES
@@ -944,6 +1150,38 @@ class _MutationSourceAnalyzer:
                 return _IMMUTABLE_SOURCES
             return _UNKNOWN_SOURCES
         return _UNKNOWN_SOURCES
+
+    def _validate_append(
+        self, call: ast.Call, environment: dict[str, frozenset[str]]
+    ) -> None:
+        receiver = call.func.value
+        receiver_sources = self.expression_sources(receiver, environment)
+        argument_sources = (
+            self.expression_sources(call.args[0], environment)
+            if len(call.args) == 1 and not call.keywords
+            else _UNKNOWN_SOURCES
+        )
+        if (
+            receiver_sources == _CONTAINER_SOURCES
+            and argument_sources
+            and argument_sources <= {_SOURCE_IMMUTABLE, _SOURCE_OWNED}
+        ):
+            return
+        self._issue(
+            receiver,
+            receiver_sources,
+            augmented=False,
+            code_override="STATIC_UNCONFIRMED_CONTAINER_APPEND",
+            problem_override=(
+                "list.append is allowed only for one proven local numeric value "
+                "on a function-local list"
+            ),
+            requirement_override=(
+                "Create the list inside the function and append only numeric values "
+                "that are immutable or independently computed. Do not append "
+                "obs/constants arrays, views, or uncertain values."
+            ),
+        )
 
     def _issue(
         self,
@@ -1216,6 +1454,13 @@ class _MutationSourceAnalyzer:
                     environment[statement.target.id] = self._augmented_result_sources(
                         left_sources, right_sources
                     )
+            elif (
+                isinstance(statement, ast.Expr)
+                and isinstance(statement.value, ast.Call)
+                and isinstance(statement.value.func, ast.Attribute)
+                and statement.value.func.attr == "append"
+            ):
+                self._validate_append(statement.value, environment)
             elif isinstance(statement, ast.If):
                 body = self.analyze_statements(statement.body, dict(environment))
                 orelse = self.analyze_statements(statement.orelse, dict(environment))
@@ -1250,7 +1495,14 @@ class _CandidateVisitor(ast.NodeVisitor):
 
     def visit_Attribute(self, node):
         dotted = _dotted_name(node)
-        if dotted not in SAFE_NUMPY_CALLS and dotted not in SAFE_NUMPY_ATTRIBUTES and dotted != "np.linalg":
+        if (
+            dotted not in SAFE_NUMPY_CALLS
+            and dotted not in SAFE_NUMPY_ATTRIBUTES
+            and dotted != "np.linalg"
+            and node.attr not in SAFE_ARRAY_METHODS
+            and node.attr not in SAFE_ARRAY_READ_ATTRIBUTES
+            and node.attr not in SAFE_LOCAL_CONTAINER_METHODS
+        ):
             raise CandidateError(f"attribute access is not allowed: {dotted or ast.dump(node)}")
         self.generic_visit(node)
 
@@ -1260,11 +1512,16 @@ class _CandidateVisitor(ast.NodeVisitor):
                 raise CandidateError(f"function call is not allowed: {node.func.id}")
         else:
             dotted = _dotted_name(node.func)
-            if dotted not in SAFE_NUMPY_CALLS:
+            method = node.func.attr if isinstance(node.func, ast.Attribute) else None
+            if (
+                dotted not in SAFE_NUMPY_CALLS
+                and method not in SAFE_ARRAY_METHODS
+                and method not in SAFE_LOCAL_CONTAINER_METHODS
+            ):
                 raise CandidateError(f"function call is not allowed: {dotted}")
-        for keyword in node.keywords:
-            if keyword.arg in {"out", "like"}:
-                raise CandidateError(f"NumPy keyword {keyword.arg!r} is not allowed")
+        policy_issues = _call_policy_issues(node)
+        if policy_issues:
+            raise CandidateError(policy_issues[0][2])
         self.generic_visit(node)
 
     def visit_Subscript(self, node):
@@ -1911,7 +2168,14 @@ class _CollectingCandidateVisitor(ast.NodeVisitor):
 
     def visit_Attribute(self, node):
         dotted = _dotted_name(node)
-        if dotted not in SAFE_NUMPY_CALLS and dotted not in SAFE_NUMPY_ATTRIBUTES and dotted != "np.linalg":
+        if (
+            dotted not in SAFE_NUMPY_CALLS
+            and dotted not in SAFE_NUMPY_ATTRIBUTES
+            and dotted != "np.linalg"
+            and node.attr not in SAFE_ARRAY_METHODS
+            and node.attr not in SAFE_ARRAY_READ_ATTRIBUTES
+            and node.attr not in SAFE_LOCAL_CONTAINER_METHODS
+        ):
             self.add(
                 "STATIC_ATTRIBUTE",
                 node,
@@ -1931,31 +2195,20 @@ class _CollectingCandidateVisitor(ast.NodeVisitor):
                 )
         else:
             dotted = _dotted_name(node.func)
-            if dotted not in SAFE_NUMPY_CALLS:
-                if dotted and dotted.endswith(".append"):
-                    requirement = (
-                        "Array/list append methods are outside the candidate operation "
-                        "whitelist. Preallocate an independently owned local NumPy array "
-                        "with np.zeros, np.ones, np.arange, or np.array, then fill it by "
-                        "indexed assignment. Do not write through obs, constants, or their "
-                        "aliases/views."
-                    )
-                else:
-                    requirement = "Use only documented builtins and np operations."
+            method = node.func.attr if isinstance(node.func, ast.Attribute) else None
+            if (
+                dotted not in SAFE_NUMPY_CALLS
+                and method not in SAFE_ARRAY_METHODS
+                and method not in SAFE_LOCAL_CONTAINER_METHODS
+            ):
                 self.add(
                     "STATIC_NUMPY_CALL",
                     node,
                     f"function call {dotted!r} is not allowed",
-                    requirement,
+                    "Use only documented builtins, NumPy functions, array methods, and local-list append.",
                 )
-        for keyword in node.keywords:
-            if keyword.arg in {"out", "like"}:
-                self.add(
-                    "STATIC_NUMPY_KEYWORD",
-                    keyword,
-                    f"NumPy keyword {keyword.arg!r} is not allowed",
-                    "Do not use output-buffer or like= mutation hooks.",
-                )
+        for code, issue_node, problem, requirement in _call_policy_issues(node):
+            self.add(code, issue_node, problem, requirement)
         # The callable attribute is already classified above. Visit only its
         # arguments so one unsupported np call does not become a second,
         # derivative attribute error.

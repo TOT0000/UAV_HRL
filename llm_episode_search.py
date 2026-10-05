@@ -69,6 +69,7 @@ from llm_design_contract import (
     runtime_diagnostic_contract,
     visual_sensing_spec,
 )
+from llm_numeric_operations import NUMERIC_OPERATION_RULES_VERSION
 from training_history import read_committed_training_history, training_history_identity
 
 
@@ -84,6 +85,9 @@ DEFAULT_EVALUATION_ROI_COUNT = 8
 DEFAULT_EE_TOLERANCE = 1e-12
 DEFAULT_REWARD_TOLERANCE = 1e-12
 EXPECTED_CANDIDATE_IDS = tuple(f"candidate_{index}" for index in range(1, 5))
+REVALIDATABLE_NUMERIC_RULE_SOURCE_REVISIONS = frozenset(
+    {"1460effee1d9ddb1eed31dbc110ce89f36e296d9"}
+)
 
 ROOT = Path(__file__).resolve().parent
 COMMON_TEMPLATE = ROOT / "prompts" / "llm_episode_search_common.txt"
@@ -1125,6 +1129,228 @@ def _progress(message: str) -> None:
     print(f"[llm-episode-search] {message}", flush=True)
 
 
+def _revision_transition_allows_resume(
+    state: dict[str, Any], current_git_sha: str
+) -> bool:
+    if state.get("git_sha") == current_git_sha:
+        return True
+    transition = state.get("numeric_operation_rules_transition") or {}
+    return bool(
+        transition.get("source_git_sha") == state.get("git_sha")
+        and transition.get("target_git_sha") == current_git_sha
+        and transition.get("target_rules_version")
+        == NUMERIC_OPERATION_RULES_VERSION
+        and transition.get("status") in {"passed", "completed_with_failures"}
+    )
+
+
+def _next_revalidation_directory(output: Path) -> tuple[int, Path]:
+    root = output / "revalidations"
+    index = 1
+    while (root / f"revalidation_{index:02d}").exists():
+        index += 1
+    return index, root / f"revalidation_{index:02d}"
+
+
+def revalidate_episode_search(
+    resume: str | Path,
+    *,
+    reason: str = "numeric_operation_rules_update",
+) -> dict[str, Any]:
+    """Revalidate saved generation-stage candidates without model/training work."""
+
+    output = Path(resume).resolve()
+    state_path = output / "state.json"
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    if state.get("schema_version") != SEARCH_RUN_SCHEMA_VERSION:
+        raise EpisodeSearchError("revalidation requires a compatible episode-search run")
+    current = state.get("current_round")
+    if (
+        not isinstance(current, dict)
+        or current.get("phase") not in {"generate", "repair"}
+        or state.get("rounds")
+        or current.get("evaluation") is not None
+        or current.get("training") is not None
+        or current.get("evaluation_result") is not None
+    ):
+        raise EpisodeSearchError(
+            "revalidation is limited to an untrained generation/repair-stage search"
+        )
+    source_git_sha = str(state.get("git_sha") or "")
+    target_git_sha = _git_sha()
+    prior_transition = state.get("numeric_operation_rules_transition") or {}
+    source_is_supported = (
+        source_git_sha == target_git_sha
+        or source_git_sha in REVALIDATABLE_NUMERIC_RULE_SOURCE_REVISIONS
+        or (
+            prior_transition.get("source_git_sha") == source_git_sha
+            and prior_transition.get("target_git_sha") == target_git_sha
+            and prior_transition.get("target_rules_version")
+            == NUMERIC_OPERATION_RULES_VERSION
+        )
+    )
+    if not source_is_supported:
+        raise EpisodeSearchError(
+            "saved Git revision is not eligible for the bounded numeric-operation-rules revalidation"
+        )
+    if set(current.get("slots") or {}) != set(EXPECTED_CANDIDATE_IDS):
+        raise EpisodeSearchError("revalidation requires all four saved candidate slots")
+
+    settings = state.get("settings") or {}
+    dataset = load_complete_episode_dataset(settings.get("episode_sources") or [])
+    if state.get("dataset_provenance") != dataset.provenance:
+        raise EpisodeSearchError("revalidation episode dataset content is incompatible")
+    saved_dataset = json.loads((output / "dataset.json").read_text(encoding="utf-8"))
+    if saved_dataset != dataset.provenance:
+        raise EpisodeSearchError("saved dataset provenance file is incompatible")
+    constants = build_constants(dataset.fixed_metadata)
+    saved_constants = json.loads((output / "constants.json").read_text(encoding="utf-8"))
+    if saved_constants != constants:
+        raise EpisodeSearchError("saved observation/constants interface is incompatible")
+
+    from llm_episode_training import validate_baseline_preflight
+
+    baseline_preflight = validate_baseline_preflight(
+        baseline_run=settings.get("baseline_run"),
+        baseline_evaluation=settings.get("baseline_evaluation"),
+        manifest=settings.get("evaluation_manifest"),
+        checkpoint_episode=1500,
+        episodes=int(settings.get("evaluation_episodes", 0)),
+        roi_count=int(settings.get("evaluation_roi_count", 0)),
+        environment_size_m=tuple(settings.get("evaluation_area_m") or ()),
+        episode_seconds=60,
+    )
+    saved_preflight = json.loads(
+        (output / "baseline_preflight.json").read_text(encoding="utf-8")
+    )
+    if state.get("baseline_preflight") != baseline_preflight or saved_preflight != baseline_preflight:
+        raise EpisodeSearchError("baseline/pre-evaluation comparison contract changed")
+
+    worker_timeout = float(settings["worker_timeout"])
+    validated: dict[str, dict[str, Any]] = {}
+    accepted_fingerprints: set[str] = set()
+    for slot in EXPECTED_CANDIDATE_IDS:
+        old = current["slots"][slot]
+        submission = copy.deepcopy(old.get("submission"))
+        if not isinstance(submission, dict):
+            raise EpisodeSearchError(f"{slot} has no saved candidate submission")
+        candidate, validation, extra = validate_search_candidate(
+            submission,
+            dataset=dataset,
+            constants_metadata=constants,
+            worker_timeout=worker_timeout,
+        )
+        if not isinstance(old.get("candidate"), dict) or candidate != old["candidate"]:
+            raise EpisodeSearchError(
+                f"{slot} normalized candidate content changed; this bounded operation-rules migration cannot continue"
+            )
+        fingerprint = candidate_computation_fingerprint(candidate) if candidate else None
+        if extra is not None and fingerprint in accepted_fingerprints:
+            validation = {
+                "status": "failed",
+                "stage": "diversity",
+                "error": "candidate is semantically identical to another accepted slot",
+            }
+            extra = None
+        if extra is not None and fingerprint is not None:
+            accepted_fingerprints.add(fingerprint)
+        validated[slot] = {
+            "old": old,
+            "submission": submission,
+            "candidate": candidate,
+            "validation": validation,
+            "features": extra,
+            "computation_fingerprint": fingerprint,
+        }
+
+    revalidation_index, revalidation_dir = _next_revalidation_directory(output)
+    slot_records: dict[str, Any] = {}
+    for slot, record in validated.items():
+        slot_dir = revalidation_dir / "slots" / slot
+        _save_candidate(
+            slot_dir,
+            submission=record["submission"],
+            candidate=record["candidate"],
+            validation=record["validation"],
+        )
+        if record["features"] is not None:
+            np.save(slot_dir / "features.npy", record["features"], allow_pickle=False)
+        old = record["old"]
+        slot_records[slot] = {
+            "candidate_version": int(old.get("version", 0)),
+            "source_directory": old.get("directory"),
+            "source_status": old.get("status"),
+            "revalidated_status": (
+                "validated" if record["features"] is not None else "failed"
+            ),
+            "directory": str(slot_dir),
+        }
+        current["slots"][slot] = {
+            **old,
+            "status": "validated" if record["features"] is not None else "failed",
+            "submission": record["submission"],
+            "candidate": record["candidate"],
+            "validation": record["validation"],
+            "computation_fingerprint": record["computation_fingerprint"],
+            "directory": str(slot_dir),
+            "revalidation": {
+                "record": str(revalidation_dir / "revalidation.json"),
+                "source_directory": old.get("directory"),
+                "candidate_version_unchanged": True,
+            },
+        }
+
+    all_passed = all(
+        current["slots"][slot]["status"] == "validated"
+        for slot in EXPECTED_CANDIDATE_IDS
+    )
+    report = {
+        "schema_version": "uav-hrl-llm-episode-search-revalidation-v1",
+        "status": "passed" if all_passed else "completed_with_failures",
+        "reason": reason,
+        "source_git_sha": source_git_sha,
+        "target_git_sha": target_git_sha,
+        "source_rules_version": state.get("numeric_operation_rules_version", "legacy-v1"),
+        "target_rules_version": NUMERIC_OPERATION_RULES_VERSION,
+        "dataset_content_sha256": dataset.provenance.get("dataset_content_sha256"),
+        "baseline_preflight": baseline_preflight,
+        "model_calls_before": int(state.get("model_calls", 0)),
+        "model_calls_after": int(state.get("model_calls", 0)),
+        "repair_calls_before": int(current.get("repair_calls", 0)),
+        "repair_calls_after": int(current.get("repair_calls", 0)),
+        "slots": slot_records,
+    }
+    _write_json(revalidation_dir / "revalidation.json", report)
+    transition = {
+        "status": report["status"],
+        "reason": reason,
+        "source_git_sha": source_git_sha,
+        "target_git_sha": target_git_sha,
+        "source_rules_version": report["source_rules_version"],
+        "target_rules_version": NUMERIC_OPERATION_RULES_VERSION,
+        "record": str(revalidation_dir / "revalidation.json"),
+    }
+    state["numeric_operation_rules_version"] = NUMERIC_OPERATION_RULES_VERSION
+    state["numeric_operation_rules_transition"] = transition
+    state.setdefault("revalidations", []).append(transition)
+    if all_passed:
+        current["phase"] = "preevaluate"
+        state["status"] = "paused_revalidated_ready"
+        state["stop_reason"] = "all saved candidates passed; resume to enter pre-evaluation"
+    else:
+        current["phase"] = "repair"
+        exhausted = int(current.get("repair_calls", 0)) >= int(
+            settings.get("max_repairs_per_round", 0)
+        )
+        state["status"] = (
+            "paused_repairs_exhausted" if exhausted else "paused_revalidation_failed"
+        )
+        state["stop_reason"] = "one or more saved candidates still fail validation"
+    state["updated_at_utc"] = datetime.now(timezone.utc).isoformat()
+    _write_json(state_path, state)
+    return _result(state)
+
+
 def run_episode_search(
     *,
     episode_sources: Iterable[str | Path] | None = None,
@@ -1156,6 +1382,7 @@ def run_episode_search(
     output_root: str | Path = DEFAULT_OUTPUT_ROOT,
     output_dir: str | Path | None = None,
     resume: str | Path | None = None,
+    revalidate_only: bool = False,
     dry_run: bool = False,
     client: Any | None = None,
     training_runner: Callable[..., dict[str, Any]] | None = None,
@@ -1167,6 +1394,15 @@ def run_episode_search(
     subprocess wrappers in ``llm_episode_training.py``.
     """
 
+    if revalidate_only:
+        if resume is None:
+            raise ValueError("--revalidate-only requires --resume")
+        if max_search_rounds is not None or max_repairs_per_round is not None:
+            raise ValueError(
+                "revalidate-only does not change search or repair budgets; change them on a later resume"
+            )
+        return revalidate_episode_search(resume)
+
     resume_terminal_no_extension = False
     if resume is not None:
         output = Path(resume).resolve()
@@ -1176,7 +1412,7 @@ def run_episode_search(
             raise EpisodeSearchError(
                 "resume contract is incompatible; reviewer-design runs cannot be resumed as episode searches"
             )
-        if state.get("git_sha") != _git_sha():
+        if not _revision_transition_allows_resume(state, _git_sha()):
             raise EpisodeSearchError("resume git revision is incompatible")
         settings = state["settings"]
         episode_sources = settings["episode_sources"]
@@ -1292,6 +1528,7 @@ def run_episode_search(
             "created_at_utc": now,
             "updated_at_utc": now,
             "git_sha": _git_sha(),
+            "numeric_operation_rules_version": NUMERIC_OPERATION_RULES_VERSION,
             "output_directory": str(output),
             "search_round": 1,
             "model_calls": 0,

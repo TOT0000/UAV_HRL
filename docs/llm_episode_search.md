@@ -72,6 +72,23 @@ Resume:
   --resume '<RESULTS_LLM_EPISODE_SEARCH_RUN>'
 ```
 
+Runs paused in generation/repair at the recorded `1460eff` numeric-operation
+contract can be migrated explicitly after the validator update. This rechecks
+the latest saved version in all four slots on the original complete-episode
+dataset and then stops; it performs no model call, pre-evaluation, or training:
+
+```powershell
+& 'C:\Users\user\anaconda3\envs\LLM_HRL\python.exe' .\run_llm_episode_search.py `
+  --resume '<RESULTS_LLM_EPISODE_SEARCH_RUN>' `
+  --revalidate-only
+```
+
+The command preserves candidate version numbers, model/repair counts, and prior
+reports. It writes a separate `revalidations/revalidation_NN` record containing
+the old/new Git revisions and operation-rule versions. A normal `--resume`
+continues only after that bounded transition has been recorded. Incompatible
+dataset, interface, baseline, evaluation, or already-trained state is rejected.
+
 Omitting the two limits on resume keeps their saved values. To add budget
 without resetting the already-used rounds or repairs, pass larger totals:
 

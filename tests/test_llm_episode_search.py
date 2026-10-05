@@ -796,6 +796,173 @@ def test_resume_can_increase_repair_budget_without_resetting_usage(tmp_path, mon
         )
 
 
+def test_numeric_rule_revalidation_preserves_versions_usage_and_resumes_at_preevaluation(
+    tmp_path, monkeypatch
+):
+    dataset = _dataset()
+    monkeypatch.setattr(search, "load_complete_episode_dataset", lambda _paths: dataset)
+    monkeypatch.setattr(search, "build_constants", lambda _metadata: {})
+    monkeypatch.setattr(search, "render_common_prompt", lambda **_kwargs: "common")
+    _patch_preflight(monkeypatch)
+    new_rules = {"enabled": False}
+
+    def validate(submission, **_kwargs):
+        candidate = {
+            "candidate_name": submission["candidate_id"],
+            "features": submission["features"],
+            "code": submission["code"],
+        }
+        failed = submission["candidate_id"] == "candidate_1" and not new_rules["enabled"]
+        return (
+            candidate,
+            {"status": "failed", "error": "astype is not allowed"}
+            if failed
+            else {"status": "passed"},
+            None if failed else np.zeros((3, 1), dtype=np.float32),
+        )
+
+    monkeypatch.setattr(search, "validate_search_candidate", validate)
+
+    def batch():
+        return json.dumps(
+            {
+                "candidates": [
+                    {
+                        "candidate_id": slot,
+                        "design_summary": "saved fixture",
+                        "features": [
+                            {
+                                "name": slot,
+                                "description": "fixture",
+                                "reward_weight": 0.0,
+                            }
+                        ],
+                        "code": (
+                            "def compute_extra_state(obs, constants):\n"
+                            '    mask = obs["movement_mask"]\n'
+                            "    return [np.mean(mask.astype(float))]\n"
+                            if slot == "candidate_1"
+                            else f"def compute_extra_state(obs, constants):\n    return [{int(slot[-1]) / 10.0}]"
+                        ),
+                    }
+                    for slot in search.EXPECTED_CANDIDATE_IDS
+                ]
+            }
+        )
+
+    output = tmp_path / "revalidation-run"
+    first = search.run_episode_search(
+        episode_sources=[tmp_path / "source"],
+        provider="openai",
+        model="fixture/model",
+        evaluation_lambda=0.0,
+        max_search_rounds=1,
+        max_repairs_per_round=0,
+        baseline_run=tmp_path / "baseline-run",
+        baseline_evaluation=tmp_path / "baseline-evaluation",
+        evaluation_manifest=tmp_path / "manifest.json",
+        output_dir=output,
+        client=_MockClient([batch()]),
+    )
+    assert first["status"] == "paused_repairs_exhausted"
+    before_state = json.loads((output / "state.json").read_text(encoding="utf-8"))
+    before_versions = {
+        slot: value["version"]
+        for slot, value in before_state["current_round"]["slots"].items()
+    }
+    before_directories = {
+        slot: value["directory"]
+        for slot, value in before_state["current_round"]["slots"].items()
+    }
+
+    monkeypatch.setattr(search, "_git_sha", lambda: "new-validator-revision")
+    new_rules["enabled"] = True
+    revalidated = search.run_episode_search(resume=output, revalidate_only=True)
+    assert revalidated["status"] == "paused_revalidated_ready"
+    state = json.loads((output / "state.json").read_text(encoding="utf-8"))
+    assert state["model_calls"] == before_state["model_calls"] == 1
+    assert state["current_round"]["repair_calls"] == 0
+    assert state["current_round"]["phase"] == "preevaluate"
+    assert {
+        slot: value["version"]
+        for slot, value in state["current_round"]["slots"].items()
+    } == before_versions
+    assert all(
+        Path(before_directories[slot], "validation_report.json").is_file()
+        for slot in search.EXPECTED_CANDIDATE_IDS
+    )
+    transition = state["numeric_operation_rules_transition"]
+    assert transition["source_git_sha"] == next(
+        iter(search.REVALIDATABLE_NUMERIC_RULE_SOURCE_REVISIONS)
+    )
+    assert transition["target_git_sha"] == "new-validator-revision"
+    assert transition["target_rules_version"] == search.NUMERIC_OPERATION_RULES_VERSION
+    record = json.loads(Path(transition["record"]).read_text(encoding="utf-8"))
+    assert record["model_calls_before"] == record["model_calls_after"] == 1
+    assert all(
+        value["revalidated_status"] == "validated"
+        for value in record["slots"].values()
+    )
+
+    monkeypatch.setattr(
+        search,
+        "evaluate_candidates",
+        lambda *_args, **_kwargs: {
+            "report": {
+                "baseline": {"score": 1.0},
+                "candidates": {
+                    slot: {"score": 1.0, "examples": []}
+                    for slot in search.EXPECTED_CANDIDATE_IDS
+                },
+                "selected_candidate_id": None,
+                "selection_rule": "fixture",
+            },
+            "components": {},
+            "selected_candidate_id": None,
+        },
+    )
+    resumed = search.run_episode_search(resume=output, client=_MockClient([]))
+    assert resumed["status"] == "completed_search_rounds_exhausted"
+    assert resumed["model_calls"] == 1
+
+
+def test_revalidation_incompatibility_does_not_modify_saved_run(tmp_path, monkeypatch):
+    output = tmp_path / "incompatible-revalidation"
+    output.mkdir()
+    state = {
+        "schema_version": search.SEARCH_RUN_SCHEMA_VERSION,
+        "status": "paused_repairs_exhausted",
+        "git_sha": next(iter(search.REVALIDATABLE_NUMERIC_RULE_SOURCE_REVISIONS)),
+        "model_calls": 6,
+        "rounds": [],
+        "current_round": {
+            "round": 1,
+            "phase": "repair",
+            "repair_calls": 5,
+            "slots": {slot: {} for slot in search.EXPECTED_CANDIDATE_IDS},
+            "evaluation": None,
+            "training": None,
+            "evaluation_result": None,
+        },
+        "settings": {"episode_sources": ["fixture"]},
+        "dataset_provenance": {"dataset_content_sha256": "saved"},
+    }
+    (output / "state.json").write_text(json.dumps(state, indent=2), encoding="utf-8")
+    before = (output / "state.json").read_bytes()
+    monkeypatch.setattr(search, "_git_sha", lambda: "new-validator-revision")
+    monkeypatch.setattr(
+        search,
+        "load_complete_episode_dataset",
+        lambda _paths: search.EpisodeDataset(
+            arrays={}, episodes=(), fixed_metadata={}, provenance={"dataset_content_sha256": "changed"}
+        ),
+    )
+    with pytest.raises(search.EpisodeSearchError, match="dataset content"):
+        search.run_episode_search(resume=output, revalidate_only=True)
+    assert (output / "state.json").read_bytes() == before
+    assert not (output / "revalidations").exists()
+
+
 def test_completed_search_extends_from_saved_preevaluation_without_repeating_round(tmp_path, monkeypatch):
     dataset = _dataset()
     monkeypatch.setattr(search, "load_complete_episode_dataset", lambda _paths: dataset)

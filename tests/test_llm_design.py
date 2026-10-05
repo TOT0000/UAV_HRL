@@ -28,9 +28,11 @@ from llm_candidate import (
     load_approved_design,
     parse_candidate_json,
     parse_candidate_json_envelope,
+    save_approved_artifact,
     validate_candidate,
     validate_candidate_staged,
 )
+from llm_runtime import ApprovedDesignRuntime
 from llm_design import (
     APIError,
     EvaluationContext,
@@ -3147,6 +3149,162 @@ def test_local_owned_alias_and_slice_writes_are_allowed(design_fixture, alias_li
     assert report["input_mutation_check"].startswith("passed")
 
 
+def test_array_astype_boolean_fraction_passes_static_worker_and_runtime(
+    design_fixture, tmp_path
+):
+    _, arrays, _, _, constants = design_fixture
+    candidate = _candidate(
+        name="astype-boolean-fraction",
+        code=(
+            "def compute_extra_state(obs, constants):\n"
+            '    com_range_mask = obs["movement_mask"]\n'
+            "    uav_within_com_range = np.mean(com_range_mask.astype(float))\n"
+            "    method_value = com_range_mask.astype(float).mean()\n"
+            "    return np.asarray([uav_within_com_range, method_value], dtype=np.float32)\n"
+        ),
+    )
+    candidate["features"][0].update(
+        {
+            "source_fields": ["obs.movement_mask"],
+            "formula": "mean(movement_mask.astype(float))",
+        }
+    )
+    second = copy.deepcopy(candidate["features"][0])
+    second.update(
+        {
+            "index": 1,
+            "name": "uav_within_com_range_method",
+            "formula": "movement_mask.astype(float).mean()",
+        }
+    )
+    candidate["features"].append(second)
+    staged = validate_candidate_staged(candidate, constants)
+    assert staged["status"] == "passed"
+    obs_arrays = build_obs_arrays(arrays)
+    extra, reward, report = execute_candidate_isolated(
+        candidate, obs_arrays, constants, timeout=10
+    )
+    expected = np.mean(np.asarray(obs_arrays["movement_mask"], dtype=float), axis=1)
+    assert extra[:, 0].tolist() == pytest.approx(expected.tolist())
+    assert extra[:, 1].tolist() == pytest.approx(expected.tolist())
+    assert reward.tolist() == pytest.approx([0.0] * extra.shape[0])
+    assert report["input_mutation_check"].startswith("passed")
+
+    artifact_run = tmp_path / "astype-runtime-artifact"
+    artifact_run.mkdir()
+    approved = save_approved_artifact(
+        artifact_run,
+        candidate=candidate,
+        constants_metadata=constants,
+        validation_report={"status": "passed", "fixture": True},
+        evaluation_report={"status": "passed", "fixture": True},
+        provenance={"beta": 1.0, "fixture_only": True},
+    )
+    design = load_approved_design(approved)
+    runtime = ApprovedDesignRuntime(design, constants, timeout=10)
+    try:
+        online_obs = {name: np.asarray(value[0]).copy() for name, value in obs_arrays.items()}
+        online_extra, online_reward = runtime.evaluate(online_obs)
+    finally:
+        runtime.close()
+    assert online_extra.tolist() == pytest.approx(extra[0].tolist())
+    assert online_reward == pytest.approx(float(reward[0]))
+
+
+def test_supported_numeric_methods_properties_functions_and_local_append(
+    design_fixture,
+):
+    _, arrays, _, _, constants = design_fixture
+    candidate = _candidate(
+        name="numeric-operation-surface",
+        code=(
+            "def compute_extra_state(obs, constants):\n"
+            '    x = obs["state"].astype(np.float64).copy()\n'
+            "    shaped = x.reshape((x.shape[0],)).ravel().transpose().flatten()\n"
+            "    copied = np.copy(np.transpose(np.ravel(np.reshape(shaped, (-1,)))))\n"
+            "    stats = []\n"
+            "    stats.append(float(copied.sum()))\n"
+            "    stats.append(float(copied.mean()))\n"
+            "    stats.append(float(copied.min()))\n"
+            "    stats.append(float(copied.max()))\n"
+            "    stats.append(float(copied.std()))\n"
+            "    stats.append(float(copied.var()))\n"
+            "    stats.append(float(copied.all()))\n"
+            "    stats.append(float(copied.any()))\n"
+            "    size_info = copied.size + copied.ndim + copied.shape[0]\n"
+            "    value = np.std(copied) + np.var(copied) + np.median(copied) * 0.0\n"
+            "    value = value + size_info * 0.0 + sum(stats) * 0.0\n"
+            "    value = copied.clip(0.0, 1.0).mean() * 0.0 + value\n"
+            "    return np.asarray([np.clip(value, 0.0, 1.0)], dtype=np.float32)\n"
+        ),
+    )
+    validate_candidate(candidate, constants)
+    extra, _, execution = execute_candidate_isolated(
+        candidate, build_obs_arrays(arrays), constants, timeout=10
+    )
+    assert extra.shape == (6, 1)
+    assert np.all(np.isfinite(extra))
+    assert execution["input_mutation_check"].startswith("passed")
+
+
+@pytest.mark.parametrize(
+    "code,expected_code",
+    [
+        (
+            '    target = obs["state"].reshape((-1,))\n    target[0] = 0.0\n',
+            "STATIC_INPUT_MUTATION",
+        ),
+        (
+            '    target = obs["state"].ravel()\n    target[0] = 0.0\n',
+            "STATIC_INPUT_MUTATION",
+        ),
+        (
+            '    target = obs["state"].transpose()\n    target[0] = 0.0\n',
+            "STATIC_INPUT_MUTATION",
+        ),
+        (
+            '    target = obs["state"].astype(float, copy=False)\n    target[0] = 0.0\n',
+            "STATIC_INPUT_MUTATION",
+        ),
+        ('    target = obs["state"].astype("object")\n', "STATIC_NUMPY_DTYPE"),
+        ('    target = np.sum(obs["state"], out=np.zeros(1))\n', "STATIC_NUMPY_KEYWORD"),
+        ('    target = np.sum(obs["state"], None, None, np.zeros(1))\n', "STATIC_NUMPY_KEYWORD"),
+        ('    target = np.median(obs["state"], overwrite_input=True)\n', "STATIC_NUMPY_KEYWORD"),
+        ('    target = obs["state"].tolist()\n', "STATIC_NUMPY_CALL"),
+    ],
+)
+def test_new_numeric_operations_keep_mutation_dtype_and_method_limits(
+    design_fixture, code, expected_code
+):
+    _, _, _, _, constants = design_fixture
+    candidate = _candidate(
+        code=(
+            "def compute_extra_state(obs, constants):\n"
+            f"{code}"
+            "    return np.asarray([0.0], dtype=np.float32)\n"
+        )
+    )
+    staged = validate_candidate_staged(candidate, constants)
+    assert any(item["code"] == expected_code for item in staged["errors"])
+
+
+def test_local_list_append_rejects_input_backed_arrays(design_fixture):
+    _, _, _, _, constants = design_fixture
+    candidate = _candidate(
+        code=(
+            "def compute_extra_state(obs, constants):\n"
+            "    values = []\n"
+            '    values.append(obs["state"])\n'
+            "    return np.asarray([0.0], dtype=np.float32)\n"
+        )
+    )
+    staged = validate_candidate_staged(candidate, constants)
+    assert any(
+        item["code"] == "STATIC_UNCONFIRMED_CONTAINER_APPEND"
+        for item in staged["errors"]
+    )
+
+
 @pytest.mark.parametrize(
     "setup,target",
     [
@@ -3221,7 +3379,7 @@ def _append_static_failure_candidate(*, name, leading_comment=False):
             "def compute_extra_state(obs, constants):\n"
             f"{comment}"
             "    values = list()\n"
-            "    values.append(0.0)\n"
+            "    values.sort()\n"
             "    return np.asarray([0.0], dtype=np.float32)\n"
         ),
     )
@@ -3317,9 +3475,9 @@ def test_static_issue_identity_ignores_comment_line_shift_but_not_distinct_posit
         code=(
             "def compute_extra_state(obs, constants):\n"
             "    first = list()\n"
-            "    first.append(0.0)\n"
+            "    first.sort()\n"
             "    second = list()\n"
-            "    second.append(1.0)\n"
+            "    second.sort()\n"
             "    return np.asarray([0.0], dtype=np.float32)\n"
         ),
     )
