@@ -1323,6 +1323,39 @@ def test_explicit_restart_preserves_progress_run_and_starts_once(
         )
 
     replacement_root = tmp_path / "replacement"
+    legacy_root = tmp_path / "legacy-initialization"
+    historical_initialization = (
+        legacy_root / search.SEARCH_METHOD_ID / "older-artifact-copy-failure"
+    )
+    historical_initialization.mkdir(parents=True)
+    write_run_status(historical_initialization, "PREPARING")
+    recovery_state = episode_training._new_training_state(
+        method_id=search.SEARCH_METHOD_ID,
+        artifact_identity_record=artifact_identity(
+            episode_training.load_approved_design(artifact)
+        ),
+        episodes=1500,
+        seed=20260817,
+        output=replacement_root.resolve(),
+    )
+    recovery_state["attempts"].append(
+        {
+            "attempt": 1,
+            "origin": "legacy_nested_output",
+            "run_directory": str(historical_initialization.resolve()),
+            "classification": "initialization_incomplete",
+            "result": "blocked_replacement_initialization_incomplete",
+            "evidence": {"classification": "initialization_incomplete"},
+        }
+    )
+    recovery_state["checkpoint_restart_authorization"] = {
+        "operation_id": "fixture-restart-operation",
+        "failed_run_directory": str(failed.resolve()),
+    }
+    episode_training._write_json_atomic(
+        replacement_root / episode_training.SEARCH_TRAINING_STATE_FILENAME,
+        recovery_state,
+    )
     calls = []
 
     def complete_fresh(command, *, cwd):
@@ -1357,6 +1390,7 @@ def test_explicit_restart_preserves_progress_run_and_starts_once(
         episodes=1500,
         seed=20260817,
         output_directory=replacement_root,
+        legacy_output_directory=legacy_root,
         prior_output_directories=[previous_root],
         resume_record={"run_directory": str(failed)},
         restart_from_scratch=True,
@@ -1379,6 +1413,12 @@ def test_explicit_restart_preserves_progress_run_and_starts_once(
         if item.get("run_directory") == str(failed.resolve())
     )
     assert failed_attempt["result"] == "abandoned_for_explicit_restart"
+    historical_attempt = next(
+        item
+        for item in state["attempts"]
+        if item.get("run_directory") == str(historical_initialization.resolve())
+    )
+    assert historical_attempt["result"] == "abandoned_initialization_failure"
     assert state["explicit_restart_history"][0]["restart_episode"] == 1
     assert (
         state["explicit_restart_history"][0]["operation_id"]
@@ -1468,6 +1508,80 @@ def test_stale_search_shell_does_not_override_recorded_checkpoint_run(
     assert result["status"] == "complete"
     assert len(commands) == 1
     assert result["run_directory"] == str(replacement.resolve())
+
+
+def test_saved_launch_pending_without_replacement_completes_once(tmp_path, monkeypatch):
+    artifact = _approved_artifact(tmp_path / "artifact")
+    output = tmp_path / "output"
+    failed = tmp_path / "prior" / search.SEARCH_METHOD_ID / "failed-episode-50"
+    failed.mkdir(parents=True)
+    write_run_status(failed, "PREPARING")
+    copy_approved_artifact(artifact, failed)
+    (failed / "training_history.jsonl").write_text(
+        json.dumps({"episode": 50}) + "\n", encoding="utf-8"
+    )
+    write_run_status(failed, "RUNNING")
+    write_run_status(failed, "FAILED", exception=RuntimeError("fixture"))
+    state = episode_training._new_training_state(
+        method_id=search.SEARCH_METHOD_ID,
+        artifact_identity_record=artifact_identity(
+            episode_training.load_approved_design(artifact)
+        ),
+        episodes=1500,
+        seed=20260817,
+        output=output.resolve(),
+    )
+    state["attempts"].append(
+        {
+            "attempt": 1,
+            "run_directory": str(failed.resolve()),
+            "result": "abandoned_for_explicit_restart",
+        }
+    )
+    state["checkpoint_restart_authorization"] = {
+        "operation_id": "fixture-launch-pending",
+        "failed_run_directory": str(failed.resolve()),
+        "launch_status": "authorized_launch_pending",
+    }
+    episode_training._write_json_atomic(
+        output / episode_training.SEARCH_TRAINING_STATE_FILENAME, state
+    )
+    calls = []
+
+    def complete_fresh(command, *, cwd):
+        calls.append(command)
+        replacement = output / search.SEARCH_METHOD_ID / "replacement"
+        replacement.mkdir(parents=True)
+        write_run_status(replacement, "PREPARING")
+        copy_approved_artifact(artifact, replacement)
+        (replacement / "resolved_config.json").write_text(
+            json.dumps({"status": "COMPLETED", "episodes": 1500}),
+            encoding="utf-8",
+        )
+        write_run_status(replacement, "RUNNING")
+        write_run_status(replacement, "COMPLETED")
+        return {"run_directory": str(replacement), "status": "COMPLETED"}
+
+    monkeypatch.setattr(episode_training, "_run", complete_fresh)
+    monkeypatch.setattr(
+        episode_training,
+        "_training_summaries",
+        lambda *_args, **_kwargs: [{"episode_range": [1, 1500]}],
+    )
+    result = episode_training.run_candidate_training(
+        method_id=search.SEARCH_METHOD_ID,
+        artifact=artifact,
+        episodes=1500,
+        seed=20260817,
+        output_directory=output,
+        prior_output_directories=[failed.parent.parent],
+        resume_record={"run_directory": str(failed)},
+        restart_from_scratch=True,
+        restart_authorization_id="fixture-launch-pending",
+        restart_failed_run_directory=failed,
+    )
+    assert result["status"] == "complete"
+    assert len(calls) == 1
 
 
 def test_created_restart_with_progress_but_no_checkpoint_is_not_restarted_again(
@@ -1608,6 +1722,29 @@ def test_checkpoint_restart_state_revision_migration_is_bounded_to_fix_revision(
     }
     assert search._revision_transition_allows_resume(state, "state-management-fix")
     assert not search._revision_transition_allows_resume(state, "unrelated-later-revision")
+
+
+def test_checkpoint_restart_recovery_fix_revision_migration_is_bounded():
+    state = {
+        "git_sha": "original-search-revision",
+        "checkpoint_path_restart_transition": {
+            "source_git_sha": search.RESTARTABLE_CHECKPOINT_PATH_RECOVERY_REVISION,
+            "target_git_sha": search.CHECKPOINT_RESTART_RECOVERY_FIX_SOURCE_REVISION,
+            "status": "compatible",
+            "reason": "checkpoint_path_shortening_restart_from_episode_1",
+        },
+    }
+    assert search._revision_transition_allows_resume(state, "recovery-fix")
+    state["checkpoint_restart_training_recovery_transition"] = {
+        "source_git_sha": search.CHECKPOINT_RESTART_RECOVERY_FIX_SOURCE_REVISION,
+        "target_git_sha": "recovery-fix",
+        "status": "compatible",
+        "reason": "distinguish_historical_initialization_failures",
+    }
+    assert search._revision_transition_allows_resume(state, "recovery-fix")
+    assert not search._revision_transition_allows_resume(
+        state, "unrelated-later-revision"
+    )
 
 
 def test_bounded_training_recovery_preserves_selection_and_skips_model_and_ranking(

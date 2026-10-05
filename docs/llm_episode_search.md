@@ -131,6 +131,10 @@ that authorization, ordinary `--resume` finishes that one operation; it never
 applies the authorization to candidates in later search rounds. Once a
 replacement run exists, subsequent resumes follow only that run and will not
 discard replacement progress that lacks a full checkpoint.
+Older initialization-only directories under prior or legacy output roots remain
+in the recovery diagnostics but are not mistaken for the authorized replacement.
+If the authorized failed run was already marked abandoned while launch was still
+pending, ordinary resume may complete that pending launch exactly once.
 
 Omitting the two limits on resume keeps their saved values. To add budget
 without resetting the already-used rounds or repairs, pass larger totals:

@@ -494,6 +494,7 @@ def run_candidate_training(
             for directory, (origin, evidence) in evidence_by_directory.items()
             if directory != authorized_failed
             and directory not in previously_abandoned
+            and origin in {"short_output", "training_recovery_state"}
             and evidence["classification"] in {"initialization_incomplete", "empty_shell"}
         ]
         if replacement_shells:
@@ -559,31 +560,43 @@ def run_candidate_training(
         _, origin, evidence = safely_resumable[0]
         selected = (origin, evidence)
     elif restart_from_scratch:
-        if (
-            len(unsafe) != 1
-            or unsafe[0][2]["classification"] != "progress_without_checkpoint"
-            or str(Path(unsafe[0][2]["run_directory"]).resolve())
-            != str(Path(restart_failed_run_directory).resolve())
-        ):
+        authorized_failed = Path(restart_failed_run_directory).resolve()
+        pending_saved_launch = bool(
+            not unsafe
+            and authorized_failed in abandoned
+            and (state.get("checkpoint_restart_authorization") or {}).get(
+                "launch_status"
+            )
+            == "authorized_launch_pending"
+        )
+        authorized_failed_is_current = bool(
+            len(unsafe) == 1
+            and unsafe[0][2]["classification"]
+            == "progress_without_checkpoint"
+            and Path(unsafe[0][2]["run_directory"]).resolve()
+            == authorized_failed
+        )
+        if not authorized_failed_is_current and not pending_saved_launch:
             raise EpisodeTrainingError(
                 "explicit restart requires exactly its authorized progress-without-checkpoint run"
             )
-        _, origin, evidence = unsafe[0]
-        _record_attempt(
-            state,
-            origin=origin,
-            evidence=evidence,
-            result="abandoned_for_explicit_restart",
-        )
-        state.setdefault("explicit_restart_history", []).append(
-            {
-                "recorded_at_utc": datetime.now(timezone.utc).isoformat(),
-                "run_directory": evidence["run_directory"],
-                "reason": "checkpoint_path_failure_without_full_resume_checkpoint",
-                "restart_episode": 1,
-                "operation_id": str(restart_authorization_id),
-            }
-        )
+        if authorized_failed_is_current:
+            _, origin, evidence = unsafe[0]
+            _record_attempt(
+                state,
+                origin=origin,
+                evidence=evidence,
+                result="abandoned_for_explicit_restart",
+            )
+            state.setdefault("explicit_restart_history", []).append(
+                {
+                    "recorded_at_utc": datetime.now(timezone.utc).isoformat(),
+                    "run_directory": evidence["run_directory"],
+                    "reason": "checkpoint_path_failure_without_full_resume_checkpoint",
+                    "restart_episode": 1,
+                    "operation_id": str(restart_authorization_id),
+                }
+            )
         selected = None
     elif len(unsafe) == 1:
         _, origin, evidence = unsafe[0]

@@ -99,6 +99,9 @@ RESTARTABLE_CHECKPOINT_PATH_RECOVERY_REVISION = (
 CHECKPOINT_RESTART_STATE_SOURCE_REVISION = (
     "2dd8f8f653e1b3e593e1e635b2128332b005554b"
 )
+CHECKPOINT_RESTART_RECOVERY_FIX_SOURCE_REVISION = (
+    "4015da2e7bcb1b565452e092552725fca546bd7e"
+)
 
 ROOT = Path(__file__).resolve().parent
 COMMON_TEMPLATE = ROOT / "prompts" / "llm_episode_search_common.txt"
@@ -1192,13 +1195,47 @@ def _revision_transition_allows_resume(
         == "checkpoint_path_shortening_restart_from_episode_1"
         and current_git_sha != CHECKPOINT_RESTART_STATE_SOURCE_REVISION
     )
-    return numeric_transition or initialization_transition or managed_restart_transition or legacy_restart_transition or bool(
-        restart_transition.get("source_git_sha")
+    recovery_fix_transition = state.get(
+        "checkpoint_restart_training_recovery_transition"
+    ) or {}
+    managed_recovery_fix = bool(
+        recovery_fix_transition.get("source_git_sha")
+        == CHECKPOINT_RESTART_RECOVERY_FIX_SOURCE_REVISION
+        and recovery_fix_transition.get("target_git_sha") == current_git_sha
+        and recovery_fix_transition.get("status") == "compatible"
+        and recovery_fix_transition.get("reason")
+        == "distinguish_historical_initialization_failures"
+    )
+    bounded_recovery_fix = bool(
+        not recovery_fix_transition
+        and current_git_sha != CHECKPOINT_RESTART_RECOVERY_FIX_SOURCE_REVISION
+        and (
+            restart_transition.get("target_git_sha")
+            == CHECKPOINT_RESTART_RECOVERY_FIX_SOURCE_REVISION
+            or restart_state_transition.get("target_git_sha")
+            == CHECKPOINT_RESTART_RECOVERY_FIX_SOURCE_REVISION
+        )
+        and restart_transition.get("source_git_sha")
         == RESTARTABLE_CHECKPOINT_PATH_RECOVERY_REVISION
-        and restart_transition.get("target_git_sha") == current_git_sha
         and restart_transition.get("status") == "compatible"
         and restart_transition.get("reason")
         == "checkpoint_path_shortening_restart_from_episode_1"
+    )
+    return (
+        numeric_transition
+        or initialization_transition
+        or managed_restart_transition
+        or legacy_restart_transition
+        or managed_recovery_fix
+        or bounded_recovery_fix
+        or bool(
+            restart_transition.get("source_git_sha")
+            == RESTARTABLE_CHECKPOINT_PATH_RECOVERY_REVISION
+            and restart_transition.get("target_git_sha") == current_git_sha
+            and restart_transition.get("status") == "compatible"
+            and restart_transition.get("reason")
+            == "checkpoint_path_shortening_restart_from_episode_1"
+        )
     )
 
 
@@ -1862,6 +1899,7 @@ def run_episode_search(
     pending_training_recovery = False
     pending_checkpoint_path_restart = False
     pending_restart_state_migration = False
+    pending_restart_recovery_fix_migration = False
     if resume is not None:
         output = Path(resume).resolve()
         state_path = output / "state.json"
@@ -1896,6 +1934,21 @@ def run_episode_search(
             and current_git_sha != CHECKPOINT_RESTART_STATE_SOURCE_REVISION
         ):
             pending_restart_state_migration = True
+        restart_state_transition = state.get(
+            "checkpoint_restart_state_management_transition"
+        ) or {}
+        if (
+            not state.get("checkpoint_restart_training_recovery_transition")
+            and current_git_sha
+            != CHECKPOINT_RESTART_RECOVERY_FIX_SOURCE_REVISION
+            and (
+                restart_transition.get("target_git_sha")
+                == CHECKPOINT_RESTART_RECOVERY_FIX_SOURCE_REVISION
+                or restart_state_transition.get("target_git_sha")
+                == CHECKPOINT_RESTART_RECOVERY_FIX_SOURCE_REVISION
+            )
+        ):
+            pending_restart_recovery_fix_migration = True
         settings = state["settings"]
         episode_sources = settings["episode_sources"]
         config = settings["model"]
@@ -2135,6 +2188,28 @@ def run_episode_search(
             "reason": "persist_checkpoint_restart_operation_state",
             "recorded_at_utc": datetime.now(timezone.utc).isoformat(),
             "source_git_sha": CHECKPOINT_RESTART_STATE_SOURCE_REVISION,
+            "target_git_sha": _git_sha(),
+            "operation_id": restart_record["operation_id"],
+            "restart_status": restart_record["restart_status"],
+        }
+        _write_json(output / "state.json", state)
+    if pending_restart_recovery_fix_migration:
+        current = state.get("current_round")
+        if not isinstance(current, dict):
+            raise EpisodeSearchError(
+                "checkpoint restart recovery migration requires an active search round"
+            )
+        restart_record = _checkpoint_restart_for_current_round(state, current)
+        if restart_record is None:
+            raise EpisodeSearchError(
+                "checkpoint restart recovery migration lacks an active authorization"
+            )
+        state["checkpoint_restart_training_recovery_transition"] = {
+            "schema_version": "uav-hrl-checkpoint-restart-recovery-fix-v1",
+            "status": "compatible",
+            "reason": "distinguish_historical_initialization_failures",
+            "recorded_at_utc": datetime.now(timezone.utc).isoformat(),
+            "source_git_sha": CHECKPOINT_RESTART_RECOVERY_FIX_SOURCE_REVISION,
             "target_git_sha": _git_sha(),
             "operation_id": restart_record["operation_id"],
             "restart_status": restart_record["restart_status"],
