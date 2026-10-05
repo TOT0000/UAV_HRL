@@ -1971,9 +1971,9 @@ def train(
     })
     formal_config = effective_training_config(config, method_spec)
     if method_spec.llm_enabled and llm_artifact_dir is None:
-        raise ValueError("td3_dinkelbach_llm requires an explicit approved artifact")
+        raise ValueError(f"{method_spec.method_id} requires an explicit approved artifact")
     if not method_spec.llm_enabled and llm_artifact_dir is not None:
-        raise ValueError("only td3_dinkelbach_llm may load an approved artifact")
+        raise ValueError("only an LLM-enabled method may load an approved artifact")
     llm_design = (
         load_approved_design(llm_artifact_dir)
         if method_spec.llm_enabled
@@ -2701,6 +2701,13 @@ def train(
         episode_reward = 0.0
         episode_existing_movement_reward = 0.0
         episode_llm_extra_reward = 0.0
+        episode_llm_feature_contributions = (
+            np.zeros(llm_runtime.feature_count, dtype=np.float64)
+            if llm_runtime is not None
+            else None
+        )
+        episode_warmup_random_action_intervals = 0
+        episode_behavior_noise_values = []
         episode_routing_reward = 0.0
         episode_c9_penalty_sum = 0.0
         episode_c9_penalty_samples = 0
@@ -2831,6 +2838,7 @@ def train(
             elif _uses_warmup_random_action(
                 total_joint_transitions, config.warmup_joint_transitions
             ):
+                episode_warmup_random_action_intervals += 1
                 raw_joint_action = rng_streams.numpy(
                     "movement_exploration"
                 ).uniform(-1.0, 1.0, size=JOINT_ACTION_DIM).astype(np.float32)
@@ -2843,6 +2851,7 @@ def train(
                     state, add_noise=True, noise_std=behavior_noise
                 )
                 td3_noise_log.append(behavior_noise)
+                episode_behavior_noise_values.append(float(behavior_noise))
                 environment_actor_calls += 1
             projected_action = project_joint_action(
                 raw_joint_action, movement_mask=current_movement_mask
@@ -3168,6 +3177,12 @@ def train(
             episode_reward += combined_movement_reward
             episode_existing_movement_reward += interval_reward
             episode_llm_extra_reward += llm_extra_reward
+            if llm_runtime is not None:
+                episode_llm_feature_contributions += (
+                    float(llm_runtime.beta)
+                    * np.asarray(llm_runtime.design.weights, dtype=np.float64)
+                    * np.asarray(llm_features, dtype=np.float64)
+                )
             episode_base_movement_reward += base_movement_reward
             episode_final_movement_reward += combined_movement_reward
             episode_c9_penalty_sum += constraint_penalties["c9_penalty_sum"]
@@ -3471,6 +3486,58 @@ def train(
                     episode_existing_movement_reward
                 ),
                 "llm_extra_reward": float(episode_llm_extra_reward),
+                **(
+                    {
+                        "episode": int(episode + 1),
+                        "llm_feature_names": [
+                            str(item["name"])
+                            for item in llm_runtime.design.candidate["features"]
+                        ],
+                        "llm_feature_reward_weights": [
+                            float(value) for value in llm_runtime.design.weights
+                        ],
+                        "llm_feature_contribution_sums": [
+                            float(value)
+                            for value in episode_llm_feature_contributions
+                        ],
+                        "llm_base_reward_sum": float(
+                            episode_existing_movement_reward
+                        ),
+                        "llm_weighted_extra_reward_sum": float(
+                            llm_runtime.beta * episode_llm_extra_reward
+                        ),
+                        "llm_combined_reward_sum": float(episode_reward),
+                        "dinkelbach_lambda_used": (
+                            float(episode_lambda)
+                            if method_spec.uses_dinkelbach
+                            else None
+                        ),
+                        "movement_exploration": {
+                            "warmup_random_action_intervals": int(
+                                episode_warmup_random_action_intervals
+                            ),
+                            "behavior_noise_min": (
+                                float(min(episode_behavior_noise_values))
+                                if episode_behavior_noise_values
+                                else None
+                            ),
+                            "behavior_noise_max": (
+                                float(max(episode_behavior_noise_values))
+                                if episode_behavior_noise_values
+                                else None
+                            ),
+                            "sampling_noise_std": (
+                                float(sampling_noise_std)
+                                if sampling_mode
+                                and sampling_noise_std is not None
+                                else None
+                            ),
+                            "evaluation": bool(evaluation),
+                        },
+                    }
+                    if llm_runtime is not None
+                    else {}
+                ),
                 "llm_reward_beta": (
                     float(llm_runtime.beta) if llm_runtime is not None else None
                 ),

@@ -372,12 +372,17 @@ def test_runtime_failure_saves_input_and_stops_worker(tmp_path):
         assert saved["state"].tolist() == [0.0]
 
 
-def test_registered_runner_and_paper_evaluation_entry_use_run_artifact(tmp_path):
+@pytest.mark.parametrize(
+    "method_id", ("td3_dinkelbach_llm", "td3_dinkelbach_llm_search")
+)
+def test_registered_runner_and_paper_evaluation_entry_use_run_artifact(
+    tmp_path, method_id
+):
     approved = _approved_fixture(tmp_path)
     output_root = tmp_path / "results"
     args = build_parser().parse_args(
         [
-            "td3_dinkelbach_llm",
+            method_id,
             "--llm-artifact", str(approved),
             "--episodes", "1",
             "--episode-seconds", "1",
@@ -388,9 +393,24 @@ def test_registered_runner_and_paper_evaluation_entry_use_run_artifact(tmp_path)
         ]
     )
     assert run_experiment_training(args) == 0
-    run_dir = next((output_root / "td3_dinkelbach_llm").iterdir())
+    run_dir = next((output_root / method_id).iterdir())
+    llm_rows = [
+        json.loads(line)
+        for line in (run_dir / "llm_training_episode_metrics.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+        if line.strip()
+    ]
+    assert len(llm_rows) == 1
+    assert sum(llm_rows[0]["feature_contribution_sums"]) == pytest.approx(
+        llm_rows[0]["extra_reward_sum"]
+    )
+    assert llm_rows[0]["combined_reward_sum"] == pytest.approx(
+        llm_rows[0]["base_reward_sum"] + llm_rows[0]["extra_reward_sum"]
+    )
+    assert llm_rows[0]["dinkelbach_lambda_used"] is not None
     evaluation = run_paper_evaluation(
-        "td3_dinkelbach_llm",
+        method_id,
         run_directory=run_dir,
         suite="fixed_roi",
         checkpoint_episode=1,

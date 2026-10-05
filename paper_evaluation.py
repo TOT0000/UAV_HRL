@@ -131,7 +131,7 @@ PAPER_EVALUATION_SUITES = {
         "methods": tuple(
             method_id
             for method_id in METHOD_REGISTRY
-            if method_id != "td3_dinkelbach_llm"
+            if method_id not in {"td3_dinkelbach_llm", "td3_dinkelbach_llm_search"}
         ),
         "kind": "environment_size",
     },
@@ -142,6 +142,7 @@ PAPER_EVALUATION_SUITES = {
 _EVALUATION_METHOD_BASELINES = {
     "td3_dinkelbach_ddqn": "td3_dinkelbach_dqn",
     "td3_dinkelbach_llm": "td3_dinkelbach",
+    "td3_dinkelbach_llm_search": "td3_dinkelbach",
 }
 
 

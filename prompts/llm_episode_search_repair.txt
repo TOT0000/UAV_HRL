@@ -1,0 +1,16 @@
+Repair the candidates listed below using the program-validation feedback.
+
+Candidates already accepted by program validation are retained by the host.
+
+Candidate IDs requiring correction:
+{{FAILED_CANDIDATE_IDS}}
+
+Complete failed submissions:
+{{FAILED_CANDIDATES}}
+
+Validation results:
+{{VALIDATION_FEEDBACK}}
+
+For each failed candidate, correct the reported errors and check related computations, preserve its intended design where compatible, and keep descriptions, feature order, weights, and implementation consistent. Checks marked not run have not established correctness.
+
+Return one JSON object with a candidates array containing complete replacements for exactly the requested candidate IDs. Retain each candidate_id and return complete code and metadata, including unchanged parts. Return only the JSON object.

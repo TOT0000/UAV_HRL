@@ -13,6 +13,7 @@ from run_llm_sampling import (
     collect_samples,
 )
 from scenario_manifest import ScenarioManifest, generate_manifest
+from llm_episode_search import load_complete_episode_dataset
 
 
 def test_cli_accepts_arbitrary_positive_episode_and_noise_values():
@@ -115,6 +116,10 @@ def test_model_checkpoint_sampling_smoke_writes_reloadable_enriched_replay(tmp_p
     assert summary["sampling_critic_updates"] == 0
     assert summary["sampling_routing_updates"] == 0
     assert all(summary["evaluation_invariants"].values())
+    episodes = load_complete_episode_dataset([summary["output_directory"]])
+    assert len(episodes.episodes) == 1
+    assert episodes.transition_count == 1
+    assert episodes.provenance["steps_per_episode"] == 1
     with np.load(summary["joint_replay"], allow_pickle=False) as replay:
         assert replay["state"].shape[0] == 1
         assert replay["current_sr_backlog_bits"].shape[0] == 1

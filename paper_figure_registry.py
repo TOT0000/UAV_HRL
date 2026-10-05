@@ -129,6 +129,7 @@ METHOD_DISPLAY_NAMES = MappingProxyType(
     {
         "td3_dinkelbach": "Our method w/ task-aware",
         "td3_dinkelbach_llm": "TD3-Dinkelbach + LLM",
+        "td3_dinkelbach_llm_search": "TD3-Dinkelbach + episode-ranked LLM",
         "td3_dinkelbach_wo_ta": "Our method w/o task-aware",
         "ddpg_dinkelbach": "DDPG with Dinkelbach",
         "km_td3_dinkelbach": "KM+TD3-Dinkelbach",

@@ -1,0 +1,39 @@
+Generate four distinct, complete candidates in one response.
+
+First establish the environment-to-design connections:
+1. Identify the relevant UAVs, targets, sources, queues, and links.
+2. Determine which quantities movement can change and how those changes affect sensing, uploads, relaying, waiting, and energy.
+3. Select documented observations with suitable units and validity conditions.
+
+Then decompose the task requirements:
+1. State the final task objective and its measurement.
+2. Identify the explicit requirements concerning useful delivery, movement energy and energy efficiency, packet deadlines, sensing and communication service conditions, and any other stated constraints. Treat unspecified requirements as unspecified.
+3. Identify relevant trade-offs and choose how each candidate addresses them.
+
+Use this analysis to design the candidates. A requirement category does not require a separate reward term.
+
+Summarize the resulting design decisions in design_summary and the feature descriptions. Keep the implementation consistent with these descriptions.
+
+The four candidates should explore different formulas, feature combinations, or task trade-offs. Give each candidate an independently executable implementation.
+
+Return one JSON object with a candidates array containing exactly four candidates, identified as candidate_1 through candidate_4:
+
+{
+  "candidates": [
+    {
+      "candidate_id": "candidate_1",
+      "design_summary": "Brief task priorities, design rationale, and relevant trade-offs.",
+      "features": [
+        {
+          "name": "feature_name",
+          "description": "Meaning, normalization, and the role of its reward weight.",
+          "reward_weight": 0.0
+        }
+      ],
+      "code": "Complete Python source defining compute_extra_state(obs, constants)"
+    }
+  ]
+}
+
+The example shows one array element; your response must contain all four candidates.
+Return only the JSON object.

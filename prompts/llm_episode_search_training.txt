@@ -1,0 +1,40 @@
+A selected candidate has completed training and evaluation.
+
+Latest trained candidate:
+{{LATEST_TRAINED_CANDIDATE}}
+
+Training summaries:
+{{TRAINING_SUMMARIES}}
+
+Each training block covers 100 episodes. Reports include:
+- mean and standard deviation of episode EE;
+- mean and standard deviation of each episode-summed weighted feature contribution, including beta;
+- accumulated base and extra reward summaries;
+- relevant scene and exploration settings.
+
+Training reward summaries use the lambda values actually used during training.
+
+Evaluation results and baseline comparison:
+{{EVALUATION_RESULTS}}
+
+Best trained candidate so far:
+{{BEST_TRAINED_CANDIDATE}}
+
+Relevant search history:
+{{SEARCH_HISTORY_SUMMARY}}
+
+Interpret reward-component changes together with EE, useful delivery, energy, and deadline performance.
+A component increasing or decreasing alone does not establish an improvement. Consider reported changes in scene composition and exploration when interpreting training trends.
+
+Use the best trained candidate as the reference for four new candidates:
+1. Add a feature or reward component.
+2. Remove or simplify components.
+3. Adjust reward weights while retaining the reference feature computations.
+4. Explore a different feature and reward design.
+
+Use the latest results as evidence even when the latest candidate is not the best one.
+
+For each candidate, briefly explain in design_summary which reported results motivated the changes and what problem the changes aim to address.
+Keep the feature descriptions and implementation aligned.
+
+Return the same four-candidate JSON structure with candidate_1 through candidate_4. Return only the JSON object.

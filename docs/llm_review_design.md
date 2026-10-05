@@ -1,4 +1,8 @@
-# Proposer/reviewer offline LLM design
+# Deprecated proposer/reviewer offline LLM design
+
+This workflow is retained only for historical run inspection. New non-Lipschitz
+searches use `run_llm_episode_search.py` and `docs/llm_episode_search.md`. A
+proposer/reviewer run cannot be resumed as a complete-episode search run.
 
 `run_llm_review_design.py` is an additional offline comparison workflow. A
 proposer model writes a complete shared-feature candidate, the host validates

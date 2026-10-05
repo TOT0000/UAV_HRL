@@ -206,7 +206,7 @@ def _training_preflight(args):
     method = args.method
     if method.llm_enabled:
         raise ValueError(
-            "td3_dinkelbach_llm training uses run_experiment.py so its approved "
+            "LLM-enabled training uses run_experiment.py so its approved "
             "artifact is copied into the isolated run"
         )
     MethodSpec(**{

@@ -371,6 +371,14 @@ _METHOD_DEFINITIONS = {
         "llm_enabled": True,
         "label": "TD3 + Dinkelbach + LLM state/reward",
     },
+    "td3_dinkelbach_llm_search": {
+        **_COMMON_METHOD,
+        "agent": "td3",
+        "movement": "centralized_td3",
+        "reward_mode": "dinkelbach",
+        "llm_enabled": True,
+        "label": "TD3 + Dinkelbach + episode-ranked LLM state/reward",
+    },
     "ddpg_dinkelbach": {
         **_COMMON_METHOD,
         "agent": "ddpg",

@@ -1,0 +1,21 @@
+All four candidates passed program validation. None exceeded the baseline episode-ordering score, so none was selected for training.
+
+Evaluation rules and scores:
+{{PRETRAINING_SCORE_REPORT}}
+
+Complete candidates:
+{{EVALUATED_CANDIDATES}}
+
+Representative incorrectly ordered episode pairs:
+{{MISORDERED_EPISODE_PAIRS}}
+
+Each case reports episode EE, accumulated base reward, accumulated total reward, and the accumulated weighted contribution of each feature, including beta.
+
+Best previously trained candidate and relevant results, when available:
+{{BEST_TRAINED_CONTEXT}}
+
+Use the score report and cases to identify which computations or weighted contributions conflict with observed EE ordering. The cases illustrate specific ordering errors; assess changes against the complete-data score. They do not establish a causal effect on a newly trained policy.
+
+Generate four distinct complete candidates that address the evidence. You may change formulas, add or remove features, adjust weights, or redesign the candidate. In each design_summary, briefly identify the evidence informing the revision and intended improvement.
+
+Return the same four-candidate JSON structure with candidate_1 through candidate_4. Return only the JSON object.
