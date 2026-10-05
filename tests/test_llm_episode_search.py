@@ -554,6 +554,18 @@ def test_mock_training_evaluation_use_formal_counts_and_preserve_historical_best
     client = _MockClient([batch(1), batch(2)])
     training_calls = []
     evaluation_calls = []
+    restart_record = {
+        "restart_status": "authorized_not_started",
+        "operation_id": "round-one-restart",
+        "failed_run_directory": str(tmp_path / "failed-round-one"),
+    }
+    monkeypatch.setattr(
+        search,
+        "_checkpoint_restart_for_current_round",
+        lambda _state, current: restart_record
+        if int(current["round"]) == 1
+        else None,
+    )
 
     def train_runner(**kwargs):
         training_calls.append(kwargs)
@@ -612,6 +624,14 @@ def test_mock_training_evaluation_use_formal_counts_and_preserve_historical_best
     )
     assert result["status"] == "complete"
     assert len(training_calls) == len(evaluation_calls) == 2
+    assert training_calls[0]["restart_from_scratch"] is True
+    assert training_calls[0]["restart_authorization_id"] == "round-one-restart"
+    assert training_calls[1]["restart_from_scratch"] is False
+    assert training_calls[1]["restart_authorization_id"] is None
+    assert restart_record["restart_status"] == "completed"
+    assert restart_record["replacement_run_directory"] == str(
+        (tmp_path / "trained-1").resolve()
+    )
     assert all(call["episodes"] == 1500 for call in training_calls)
     assert all(call["episodes"] == 100 for call in evaluation_calls)
     assert all(call["roi_count"] == 8 for call in evaluation_calls)
@@ -1340,6 +1360,8 @@ def test_explicit_restart_preserves_progress_run_and_starts_once(
         prior_output_directories=[previous_root],
         resume_record={"run_directory": str(failed)},
         restart_from_scratch=True,
+        restart_authorization_id="fixture-restart-operation",
+        restart_failed_run_directory=failed,
     )
     assert result["status"] == "complete"
     assert len(calls) == 1
@@ -1358,6 +1380,10 @@ def test_explicit_restart_preserves_progress_run_and_starts_once(
     )
     assert failed_attempt["result"] == "abandoned_for_explicit_restart"
     assert state["explicit_restart_history"][0]["restart_episode"] == 1
+    assert (
+        state["explicit_restart_history"][0]["operation_id"]
+        == "fixture-restart-operation"
+    )
 
 
 def test_stale_search_shell_does_not_override_recorded_checkpoint_run(
@@ -1393,6 +1419,19 @@ def test_stale_search_shell_does_not_override_recorded_checkpoint_run(
         output=output.resolve(),
     )
     state["active_run_directory"] = str(replacement.resolve())
+    state["attempts"].append(
+        {
+            "attempt": 1,
+            "run_directory": str(stale.resolve()),
+            "result": "abandoned_for_explicit_restart",
+        }
+    )
+    state["checkpoint_restart_authorization"] = {
+        "operation_id": "fixture-parent-not-updated",
+        "failed_run_directory": str(stale.resolve()),
+        "launch_status": "replacement_run_created",
+        "replacement_run_directory": str(replacement.resolve()),
+    }
     episode_training._write_json_atomic(
         output / episode_training.SEARCH_TRAINING_STATE_FILENAME, state
     )
@@ -1422,10 +1461,153 @@ def test_stale_search_shell_does_not_override_recorded_checkpoint_run(
         seed=20260817,
         output_directory=output,
         resume_record={"run_directory": str(stale)},
+        restart_from_scratch=True,
+        restart_authorization_id="fixture-parent-not-updated",
+        restart_failed_run_directory=stale,
     )
     assert result["status"] == "complete"
     assert len(commands) == 1
     assert result["run_directory"] == str(replacement.resolve())
+
+
+def test_created_restart_with_progress_but_no_checkpoint_is_not_restarted_again(
+    tmp_path, monkeypatch
+):
+    artifact = _approved_artifact(tmp_path / "artifact")
+    output = tmp_path / "output"
+    failed = output / search.SEARCH_METHOD_ID / "authorized-failed-run"
+    replacement = output / search.SEARCH_METHOD_ID / "replacement-with-progress"
+    for directory in (failed, replacement):
+        directory.mkdir(parents=True)
+        write_run_status(directory, "PREPARING")
+        copy_approved_artifact(artifact, directory)
+        (directory / "resolved_config.json").write_text(
+            json.dumps({"status": "FAILED", "episodes": 1500}),
+            encoding="utf-8",
+        )
+        (directory / "training_history.jsonl").write_text(
+            json.dumps({"episode": 1}) + "\n", encoding="utf-8"
+        )
+        write_run_status(directory, "RUNNING")
+        write_run_status(directory, "FAILED", exception=RuntimeError("fixture"))
+
+    state = episode_training._new_training_state(
+        method_id=search.SEARCH_METHOD_ID,
+        artifact_identity_record=artifact_identity(
+            episode_training.load_approved_design(artifact)
+        ),
+        episodes=1500,
+        seed=20260817,
+        output=output.resolve(),
+    )
+    state["active_run_directory"] = str(replacement.resolve())
+    state["attempts"].append(
+        {
+            "attempt": 1,
+            "run_directory": str(failed.resolve()),
+            "result": "abandoned_for_explicit_restart",
+        }
+    )
+    episode_training._write_json_atomic(
+        output / episode_training.SEARCH_TRAINING_STATE_FILENAME, state
+    )
+    monkeypatch.setattr(
+        episode_training,
+        "_run",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("replacement training must not be launched again")
+        ),
+    )
+
+    with pytest.raises(
+        episode_training.EpisodeTrainingError,
+        match="exactly its authorized progress-without-checkpoint run",
+    ):
+        episode_training.run_candidate_training(
+            method_id=search.SEARCH_METHOD_ID,
+            artifact=artifact,
+            episodes=1500,
+            seed=20260817,
+            output_directory=output,
+            resume_record={"run_directory": str(replacement)},
+            restart_from_scratch=True,
+            restart_authorization_id="fixture-restart-operation",
+            restart_failed_run_directory=failed,
+        )
+    assert failed.is_dir()
+    assert replacement.is_dir()
+
+
+def test_created_restart_initialization_shell_is_not_duplicated(tmp_path, monkeypatch):
+    artifact = _approved_artifact(tmp_path / "artifact")
+    output = tmp_path / "output"
+    failed = output / search.SEARCH_METHOD_ID / "authorized-failed-run"
+    failed.mkdir(parents=True)
+    write_run_status(failed, "PREPARING")
+    copy_approved_artifact(artifact, failed)
+    (failed / "training_history.jsonl").write_text(
+        json.dumps({"episode": 50}) + "\n", encoding="utf-8"
+    )
+    write_run_status(failed, "RUNNING")
+    write_run_status(failed, "FAILED", exception=RuntimeError("fixture"))
+    replacement = output / search.SEARCH_METHOD_ID / "replacement-shell"
+    replacement.mkdir(parents=True)
+    write_run_status(replacement, "PREPARING")
+    monkeypatch.setattr(
+        episode_training,
+        "_run",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("a second replacement must not be launched")
+        ),
+    )
+
+    with pytest.raises(
+        episode_training.EpisodeTrainingError,
+        match="replacement run was already created",
+    ):
+        episode_training.run_candidate_training(
+            method_id=search.SEARCH_METHOD_ID,
+            artifact=artifact,
+            episodes=1500,
+            seed=20260817,
+            output_directory=output,
+            resume_record={"run_directory": str(failed)},
+            restart_from_scratch=True,
+            restart_authorization_id="fixture-restart-operation",
+            restart_failed_run_directory=failed,
+        )
+    recovery = json.loads(
+        (output / episode_training.SEARCH_TRAINING_STATE_FILENAME).read_text(
+            encoding="utf-8"
+        )
+    )
+    assert recovery["status"] == "blocked_replacement_initialization_incomplete"
+    assert any(
+        item.get("run_directory") == str(replacement.resolve())
+        and item.get("result") == "blocked_replacement_initialization_incomplete"
+        for item in recovery["attempts"]
+    )
+
+
+def test_checkpoint_restart_state_revision_migration_is_bounded_to_fix_revision():
+    state = {
+        "git_sha": "original-search-revision",
+        "checkpoint_path_restart_transition": {
+            "source_git_sha": search.RESTARTABLE_CHECKPOINT_PATH_RECOVERY_REVISION,
+            "target_git_sha": search.CHECKPOINT_RESTART_STATE_SOURCE_REVISION,
+            "status": "compatible",
+            "reason": "checkpoint_path_shortening_restart_from_episode_1",
+        },
+    }
+    assert search._revision_transition_allows_resume(state, "state-management-fix")
+    state["checkpoint_restart_state_management_transition"] = {
+        "source_git_sha": search.CHECKPOINT_RESTART_STATE_SOURCE_REVISION,
+        "target_git_sha": "state-management-fix",
+        "status": "compatible",
+        "reason": "persist_checkpoint_restart_operation_state",
+    }
+    assert search._revision_transition_allows_resume(state, "state-management-fix")
+    assert not search._revision_transition_allows_resume(state, "unrelated-later-revision")
 
 
 def test_bounded_training_recovery_preserves_selection_and_skips_model_and_ranking(
@@ -1579,8 +1761,13 @@ def test_bounded_training_recovery_preserves_selection_and_skips_model_and_ranki
     )
     calls = []
 
+    interrupt_restart = {"enabled": False}
+
     def training_runner(**kwargs):
         calls.append(kwargs)
+        if interrupt_restart["enabled"] and kwargs["restart_from_scratch"]:
+            interrupt_restart["enabled"] = False
+            raise KeyboardInterrupt("fixture interruption before subprocess launch")
         return {
             "status": "incomplete",
             "reason": "fixture stop before formal training",
@@ -1615,9 +1802,30 @@ def test_bounded_training_recovery_preserves_selection_and_skips_model_and_ranki
     assert transition["approved_artifact_identity"] == artifact_identity(design)
 
     current_revision["value"] = "checkpoint-path-fix-revision"
+    interrupt_restart["enabled"] = True
+    with pytest.raises(KeyboardInterrupt, match="before subprocess launch"):
+        search.run_episode_search(
+            resume=output,
+            restart_failed_training=True,
+            client=SimpleNamespace(
+                chat=lambda **_kwargs: (_ for _ in ()).throw(
+                    AssertionError("model must not be called")
+                )
+            ),
+            training_runner=training_runner,
+        )
+    saved_after_authorization = json.loads(
+        (output / "state.json").read_text(encoding="utf-8")
+    )
+    assert (
+        saved_after_authorization["checkpoint_path_restart_transition"][
+            "restart_status"
+        ]
+        == "authorized_not_started"
+    )
+
     restarted = search.run_episode_search(
         resume=output,
-        restart_failed_training=True,
         client=SimpleNamespace(
             chat=lambda **_kwargs: (_ for _ in ()).throw(
                 AssertionError("model must not be called")
@@ -1627,16 +1835,21 @@ def test_bounded_training_recovery_preserves_selection_and_skips_model_and_ranki
     )
     assert restarted["status"] == "paused_training"
     assert restarted["model_calls"] == 3
-    assert len(calls) == 2
+    assert len(calls) == 3
     assert calls[1]["restart_from_scratch"] is True
-    assert str(old_training_root) in calls[1]["prior_output_directories"]
-    assert Path(calls[1]["output_directory"]) == replacement_root
+    assert calls[2]["restart_from_scratch"] is True
+    assert calls[1]["restart_authorization_id"] == calls[2][
+        "restart_authorization_id"
+    ]
+    assert str(old_training_root) in calls[2]["prior_output_directories"]
+    assert Path(calls[2]["output_directory"]) == replacement_root
     saved = json.loads((output / "state.json").read_text(encoding="utf-8"))
     assert saved["current_round"]["selected_candidate_id"] == "candidate_1"
     assert saved["current_round"]["repair_calls"] == 2
     restart = saved["checkpoint_path_restart_transition"]
     assert restart["source_git_sha"] == search.RESTARTABLE_CHECKPOINT_PATH_RECOVERY_REVISION
     assert restart["target_git_sha"] == "checkpoint-path-fix-revision"
+    assert restart["restart_status"] == "authorized_not_started"
     assert restart["failed_run_directory"] == str(failed_run.resolve())
     assert restart["completed_episode_evidence"]["training_history.jsonl"][
         "maximum_episode"

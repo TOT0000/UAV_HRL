@@ -124,7 +124,13 @@ episode 1 under the shorter root, without model calls or pretraining reranking:
 
 Ordinary `--resume` still refuses to discard progress without a valid full
 checkpoint. If a compatible replacement run has a full checkpoint, it is
-resumed even when the older search record still names an abandoned shell.
+resumed even when the older search record still names an abandoned shell. The
+explicit restart authorization is persisted and bound to its search run, round,
+candidate artifact, and failed training run. If execution stops after recording
+that authorization, ordinary `--resume` finishes that one operation; it never
+applies the authorization to candidates in later search rounds. Once a
+replacement run exists, subsequent resumes follow only that run and will not
+discard replacement progress that lacks a full checkpoint.
 
 Omitting the two limits on resume keeps their saved values. To add budget
 without resetting the already-used rounds or repairs, pass larger totals:

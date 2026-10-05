@@ -388,6 +388,8 @@ def run_candidate_training(
     legacy_output_directory: str | Path | None = None,
     prior_output_directories: list[str | Path] | tuple[str | Path, ...] = (),
     restart_from_scratch: bool = False,
+    restart_authorization_id: str | None = None,
+    restart_failed_run_directory: str | Path | None = None,
 ) -> dict[str, Any]:
     root = Path(__file__).resolve().parent
     output = Path(output_directory).resolve()
@@ -403,6 +405,33 @@ def run_candidate_training(
         seed=seed,
         output=output,
     )
+    if restart_from_scratch and (
+        not restart_authorization_id or restart_failed_run_directory is None
+    ):
+        raise EpisodeTrainingError(
+            "explicit restart requires its persisted authorization identity and failed run"
+        )
+    if bool(restart_authorization_id) != bool(restart_failed_run_directory):
+        raise EpisodeTrainingError(
+            "checkpoint restart authorization identity and failed run must be provided together"
+        )
+    if restart_authorization_id:
+        restart_binding = {
+            "operation_id": str(restart_authorization_id),
+            "failed_run_directory": str(
+                Path(restart_failed_run_directory).resolve()
+            ),
+        }
+        saved_binding = state.get("checkpoint_restart_authorization")
+        if saved_binding is not None and any(
+            saved_binding.get(key) != value
+            for key, value in restart_binding.items()
+        ):
+            raise EpisodeTrainingError(
+                "training recovery state belongs to a different checkpoint restart authorization"
+            )
+        if saved_binding is None:
+            state["checkpoint_restart_authorization"] = restart_binding
 
     known_by_directory: dict[Path, str] = {}
 
@@ -447,6 +476,41 @@ def run_candidate_training(
         ):
             evidence["classification"] = "incompatible_completed_horizon"
         evidence_by_directory[directory] = (origin, evidence)
+
+    previously_abandoned = {
+        Path(item["run_directory"]).resolve()
+        for item in state["attempts"]
+        if item.get("run_directory")
+        and item.get("result")
+        in {
+            "abandoned_initialization_failure",
+            "abandoned_for_explicit_restart",
+        }
+    }
+    if restart_authorization_id:
+        authorized_failed = Path(restart_failed_run_directory).resolve()
+        replacement_shells = [
+            (directory, origin, evidence)
+            for directory, (origin, evidence) in evidence_by_directory.items()
+            if directory != authorized_failed
+            and directory not in previously_abandoned
+            and evidence["classification"] in {"initialization_incomplete", "empty_shell"}
+        ]
+        if replacement_shells:
+            for _, origin, evidence in replacement_shells:
+                _record_attempt(
+                    state,
+                    origin=origin,
+                    evidence=evidence,
+                    result="blocked_replacement_initialization_incomplete",
+                )
+            state["status"] = "blocked_replacement_initialization_incomplete"
+            state["updated_at_utc"] = datetime.now(timezone.utc).isoformat()
+            _write_json_atomic(state_path, state)
+            raise EpisodeTrainingError(
+                "checkpoint restart replacement run was already created but has no "
+                "resumable checkpoint; refusing to create another run"
+            )
 
     for origin, evidence in evidence_by_directory.values():
         if evidence["classification"] in {"initialization_incomplete", "empty_shell"}:
@@ -498,9 +562,11 @@ def run_candidate_training(
         if (
             len(unsafe) != 1
             or unsafe[0][2]["classification"] != "progress_without_checkpoint"
+            or str(Path(unsafe[0][2]["run_directory"]).resolve())
+            != str(Path(restart_failed_run_directory).resolve())
         ):
             raise EpisodeTrainingError(
-                "explicit restart requires exactly one compatible progress-without-checkpoint run"
+                "explicit restart requires exactly its authorized progress-without-checkpoint run"
             )
         _, origin, evidence = unsafe[0]
         _record_attempt(
@@ -515,6 +581,7 @@ def run_candidate_training(
                 "run_directory": evidence["run_directory"],
                 "reason": "checkpoint_path_failure_without_full_resume_checkpoint",
                 "restart_episode": 1,
+                "operation_id": str(restart_authorization_id),
             }
         )
         selected = None
@@ -535,6 +602,10 @@ def run_candidate_training(
         origin, evidence = selected
         resume_directory = Path(evidence["run_directory"])
         state["active_run_directory"] = str(resume_directory)
+        if restart_authorization_id:
+            state["checkpoint_restart_authorization"][
+                "replacement_run_directory"
+            ] = str(resume_directory.resolve())
         classification = evidence["classification"]
         if classification == "completed":
             result = {"run_directory": str(resume_directory), "status": "COMPLETED"}
@@ -594,6 +665,10 @@ def run_candidate_training(
         before = set(_training_run_directories(output, method_id))
         state["status"] = "starting_fresh"
         state["active_run_directory"] = None
+        if restart_authorization_id:
+            state["checkpoint_restart_authorization"]["launch_status"] = (
+                "authorized_launch_pending"
+            )
         state["updated_at_utc"] = datetime.now(timezone.utc).isoformat()
         _write_json_atomic(state_path, state)
         try:
@@ -631,6 +706,13 @@ def run_candidate_training(
             state["active_run_directory"] = (
                 str(run_directory) if run_directory is not None else None
             )
+            if restart_authorization_id and run_directory is not None:
+                state["checkpoint_restart_authorization"][
+                    "replacement_run_directory"
+                ] = str(run_directory.resolve())
+                state["checkpoint_restart_authorization"]["launch_status"] = (
+                    "replacement_run_created"
+                )
             state["updated_at_utc"] = datetime.now(timezone.utc).isoformat()
             _record_attempt(
                 state,
@@ -661,6 +743,11 @@ def run_candidate_training(
     load_run_artifact(Path(run_directory), identity)
     state["status"] = "completed"
     state["active_run_directory"] = str(Path(run_directory).resolve())
+    if restart_authorization_id:
+        state["checkpoint_restart_authorization"]["replacement_run_directory"] = str(
+            Path(run_directory).resolve()
+        )
+        state["checkpoint_restart_authorization"]["launch_status"] = "completed"
     state["updated_at_utc"] = datetime.now(timezone.utc).isoformat()
     _record_attempt(
         state,

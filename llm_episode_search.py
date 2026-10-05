@@ -96,6 +96,9 @@ RECOVERABLE_TRAINING_INITIALIZATION_SOURCE_REVISIONS = frozenset(
 RESTARTABLE_CHECKPOINT_PATH_RECOVERY_REVISION = (
     "fa948f14938795b45ded56100af523375481a3db"
 )
+CHECKPOINT_RESTART_STATE_SOURCE_REVISION = (
+    "2dd8f8f653e1b3e593e1e635b2128332b005554b"
+)
 
 ROOT = Path(__file__).resolve().parent
 COMMON_TEMPLATE = ROOT / "prompts" / "llm_episode_search_common.txt"
@@ -1167,7 +1170,29 @@ def _revision_transition_allows_resume(
         == "short_training_path_and_initialization_recovery"
     )
     restart_transition = state.get("checkpoint_path_restart_transition") or {}
-    return numeric_transition or initialization_transition or bool(
+    restart_state_transition = state.get(
+        "checkpoint_restart_state_management_transition"
+    ) or {}
+    managed_restart_transition = bool(
+        restart_state_transition.get("source_git_sha")
+        == CHECKPOINT_RESTART_STATE_SOURCE_REVISION
+        and restart_state_transition.get("target_git_sha") == current_git_sha
+        and restart_state_transition.get("status") == "compatible"
+        and restart_state_transition.get("reason")
+        == "persist_checkpoint_restart_operation_state"
+    )
+    legacy_restart_transition = bool(
+        not restart_state_transition
+        and restart_transition.get("target_git_sha")
+        == CHECKPOINT_RESTART_STATE_SOURCE_REVISION
+        and restart_transition.get("source_git_sha")
+        == RESTARTABLE_CHECKPOINT_PATH_RECOVERY_REVISION
+        and restart_transition.get("status") == "compatible"
+        and restart_transition.get("reason")
+        == "checkpoint_path_shortening_restart_from_episode_1"
+        and current_git_sha != CHECKPOINT_RESTART_STATE_SOURCE_REVISION
+    )
+    return numeric_transition or initialization_transition or managed_restart_transition or legacy_restart_transition or bool(
         restart_transition.get("source_git_sha")
         == RESTARTABLE_CHECKPOINT_PATH_RECOVERY_REVISION
         and restart_transition.get("target_git_sha") == current_git_sha
@@ -1175,6 +1200,81 @@ def _revision_transition_allows_resume(
         and restart_transition.get("reason")
         == "checkpoint_path_shortening_restart_from_episode_1"
     )
+
+
+def _checkpoint_restart_operation_id(record: dict[str, Any]) -> str:
+    binding = {
+        "search_run": record["search_run"],
+        "round": int(record["round"]),
+        "selected_candidate_id": record["selected_candidate_id"],
+        "candidate_version": int(record["candidate_version"]),
+        "approved_artifact_identity": record["approved_artifact_identity"],
+        "failed_run_directory": record["failed_run_directory"],
+    }
+    return "checkpoint-restart-" + hashlib.sha256(
+        _canonical_json(binding).encode("utf-8")
+    ).hexdigest()[:16]
+
+
+def _checkpoint_restart_for_current_round(
+    state: dict[str, Any], current: dict[str, Any]
+) -> dict[str, Any] | None:
+    """Return the one persisted restart authorization bound to this round."""
+
+    record = state.get("checkpoint_path_restart_transition")
+    if not isinstance(record, dict):
+        return None
+    if int(record.get("round", -1)) != int(current.get("round", -2)):
+        return None
+    if record.get("search_run") != state.get("output_directory"):
+        raise EpisodeSearchError("checkpoint restart authorization search run changed")
+    if record.get("selected_candidate_id") != current.get("selected_candidate_id"):
+        raise EpisodeSearchError("checkpoint restart authorization candidate changed")
+    slot = (current.get("slots") or {}).get(current.get("selected_candidate_id")) or {}
+    if int(record.get("candidate_version", -1)) != int(slot.get("version", -2)):
+        raise EpisodeSearchError("checkpoint restart authorization candidate version changed")
+    design = load_approved_design(current.get("approved_artifact"))
+    if record.get("approved_artifact_identity") != artifact_identity(design):
+        raise EpisodeSearchError("checkpoint restart authorization artifact changed")
+    expected_operation_id = _checkpoint_restart_operation_id(record)
+    operation_id = record.get("operation_id")
+    if operation_id is None:
+        # Migrate the v1 transition only after rechecking all binding fields.
+        record["operation_id"] = expected_operation_id
+        record["restart_status"] = "authorized_not_started"
+        record["replacement_run_directory"] = None
+    elif operation_id != expected_operation_id:
+        raise EpisodeSearchError("checkpoint restart authorization identity changed")
+    if record.get("restart_status") in {
+        "authorized_not_started",
+        "replacement_run_created",
+    }:
+        return record
+    return None
+
+
+def _update_checkpoint_restart_after_training(
+    record: dict[str, Any], training: dict[str, Any]
+) -> None:
+    run_directory = training.get("run_directory")
+    if run_directory:
+        resolved = str(Path(run_directory).resolve())
+        if resolved != str(Path(record["failed_run_directory"]).resolve()):
+            existing = record.get("replacement_run_directory")
+            if existing and str(Path(existing).resolve()) != resolved:
+                raise EpisodeSearchError(
+                    "checkpoint restart produced conflicting replacement training runs"
+                )
+            record["replacement_run_directory"] = resolved
+            record["restart_status"] = "replacement_run_created"
+            record.setdefault("replacement_created_at_utc", datetime.now(timezone.utc).isoformat())
+    if training.get("status") == "complete":
+        if not record.get("replacement_run_directory"):
+            raise EpisodeSearchError(
+                "checkpoint restart completed without a replacement training run"
+            )
+        record["restart_status"] = "completed"
+        record["completed_at_utc"] = datetime.now(timezone.utc).isoformat()
 
 
 def _short_training_output_root(search_output: Path, round_number: int) -> Path:
@@ -1438,7 +1538,7 @@ def _record_checkpoint_path_restart_transition(
         if value and str(Path(value).resolve()) not in prior_roots:
             prior_roots.append(str(Path(value).resolve()))
     record = {
-        "schema_version": "uav-hrl-llm-episode-search-checkpoint-path-restart-v1",
+        "schema_version": "uav-hrl-llm-episode-search-checkpoint-path-restart-v2",
         "status": "compatible",
         "reason": "checkpoint_path_shortening_restart_from_episode_1",
         "recorded_at_utc": datetime.now(timezone.utc).isoformat(),
@@ -1464,7 +1564,10 @@ def _record_checkpoint_path_restart_transition(
         "restart_episode": 1,
         "model_calls": int(state.get("model_calls", 0)),
         "repair_calls": int(current.get("repair_calls", 0)),
+        "restart_status": "authorized_not_started",
+        "replacement_run_directory": None,
     }
+    record["operation_id"] = _checkpoint_restart_operation_id(record)
     current["prior_training_output_roots"] = prior_roots
     current["training_output_root"] = str(new_root)
     state["checkpoint_path_restart_transition"] = record
@@ -1758,6 +1861,7 @@ def run_episode_search(
     resume_terminal_no_extension = False
     pending_training_recovery = False
     pending_checkpoint_path_restart = False
+    pending_restart_state_migration = False
     if resume is not None:
         output = Path(resume).resolve()
         state_path = output / "state.json"
@@ -1784,6 +1888,14 @@ def run_episode_search(
             raise EpisodeSearchError(
                 "the requested bounded training recovery is not applicable to this run"
             )
+        restart_transition = state.get("checkpoint_path_restart_transition") or {}
+        if (
+            not state.get("checkpoint_restart_state_management_transition")
+            and restart_transition.get("target_git_sha")
+            == CHECKPOINT_RESTART_STATE_SOURCE_REVISION
+            and current_git_sha != CHECKPOINT_RESTART_STATE_SOURCE_REVISION
+        ):
+            pending_restart_state_migration = True
         settings = state["settings"]
         episode_sources = settings["episode_sources"]
         config = settings["model"]
@@ -2005,6 +2117,28 @@ def run_episode_search(
             baseline_preflight=baseline_preflight,
             target_git_sha=_git_sha(),
         )
+        _write_json(output / "state.json", state)
+    if pending_restart_state_migration:
+        current = state.get("current_round")
+        if not isinstance(current, dict):
+            raise EpisodeSearchError(
+                "checkpoint restart state migration requires an active search round"
+            )
+        restart_record = _checkpoint_restart_for_current_round(state, current)
+        if restart_record is None:
+            raise EpisodeSearchError(
+                "checkpoint restart state migration lacks an active authorization"
+            )
+        state["checkpoint_restart_state_management_transition"] = {
+            "schema_version": "uav-hrl-checkpoint-restart-state-management-v1",
+            "status": "compatible",
+            "reason": "persist_checkpoint_restart_operation_state",
+            "recorded_at_utc": datetime.now(timezone.utc).isoformat(),
+            "source_git_sha": CHECKPOINT_RESTART_STATE_SOURCE_REVISION,
+            "target_git_sha": _git_sha(),
+            "operation_id": restart_record["operation_id"],
+            "restart_status": restart_record["restart_status"],
+        }
         _write_json(output / "state.json", state)
     model_client = None if dry_run else (client or _make_client(config))
     inventory = (
@@ -2285,6 +2419,12 @@ def run_episode_search(
             continue
 
         if current["phase"] == "train":
+            restart_record = _checkpoint_restart_for_current_round(state, current)
+            restart_from_scratch = bool(
+                restart_record
+                and restart_record.get("restart_status")
+                == "authorized_not_started"
+            )
             if not current.get("training_output_root"):
                 current["training_output_root"] = str(
                     _short_training_output_root(output, round_number)
@@ -2308,7 +2448,15 @@ def run_episode_search(
                         "prior_training_output_roots", []
                     ),
                     resume_record=current.get("training"),
-                    restart_from_scratch=pending_checkpoint_path_restart,
+                    restart_from_scratch=restart_from_scratch,
+                    restart_authorization_id=(
+                        restart_record.get("operation_id") if restart_record else None
+                    ),
+                    restart_failed_run_directory=(
+                        restart_record.get("failed_run_directory")
+                        if restart_record
+                        else None
+                    ),
                 )
             except Exception as exc:
                 current["training"] = {
@@ -2325,6 +2473,9 @@ def run_episode_search(
                 _write_json(output / "state.json", state)
                 return _result(state)
             current["training"] = training
+            if restart_record is not None:
+                _update_checkpoint_restart_after_training(restart_record, training)
+                _write_json(output / "state.json", state)
             if training.get("status") != "complete":
                 state["status"] = "paused_training"
                 state["stop_reason"] = training.get("reason", "training incomplete")
