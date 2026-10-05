@@ -18,8 +18,6 @@ from llm_design import (
     redact_provider_secrets,
 )
 from llm_episode_search import (
-    DEFAULT_MAX_REPAIRS_PER_ROUND,
-    DEFAULT_MAX_SEARCH_ROUNDS,
     DEFAULT_OUTPUT_ROOT,
     run_episode_search,
 )
@@ -47,8 +45,18 @@ def build_parser() -> argparse.ArgumentParser:
     lambda_group = parser.add_mutually_exclusive_group()
     lambda_group.add_argument("--evaluation-lambda", type=float)
     lambda_group.add_argument("--lambda-training-run")
-    parser.add_argument("--max-search-rounds", type=int, default=DEFAULT_MAX_SEARCH_ROUNDS)
-    parser.add_argument("--max-repairs-per-round", type=int, default=DEFAULT_MAX_REPAIRS_PER_ROUND)
+    parser.add_argument(
+        "--max-search-rounds",
+        type=int,
+        default=None,
+        help="new-run default is 5; on resume, omit to retain the saved limit",
+    )
+    parser.add_argument(
+        "--max-repairs-per-round",
+        type=int,
+        default=None,
+        help="new-run default is 5; on resume, an explicit larger value adds budget",
+    )
     parser.add_argument("--ee-tolerance", type=float, default=1e-12)
     parser.add_argument("--reward-tolerance", type=float, default=1e-12)
     parser.add_argument("--baseline-run")

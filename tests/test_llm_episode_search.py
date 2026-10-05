@@ -1,11 +1,15 @@
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
 
 import llm_episode_search as search
+import llm_episode_training as episode_training
+import run_experiment
 from experiment_config import MethodSpec
+from training_checkpoint import CHECKPOINT_PROVENANCE_FIELDS
 from training_history import (
     build_training_history_row,
     training_history_identity,
@@ -47,6 +51,41 @@ def _candidate(name, weight):
         "candidate_name": name,
         "features": [{"name": name, "reward_weight": float(weight)}],
     }
+
+
+def _preflight_fixture():
+    return {
+        "schema_version": "uav-hrl-episode-search-baseline-preflight-v1",
+        "status": "passed",
+        "baseline_run": "fixture-baseline-run",
+        "baseline_training_run_id": "fixture-baseline-run",
+        "checkpoint_episode": 1500,
+        "checkpoint_path": "fixture-checkpoint",
+        "checkpoint_provenance": {},
+        "baseline_evaluation_metadata": "fixture-evaluation.json",
+        "baseline_evaluation_metadata_sha256": "fixture-metadata-sha",
+        "per_episode_jsonl": "fixture-episodes.jsonl",
+        "per_episode_jsonl_sha256": "fixture-rows-sha",
+        "manifest_path": "fixture-manifest.json",
+        "manifest_file_sha256": "fixture-manifest-file-sha",
+        "manifest_content_hash": "fixture-manifest",
+        "scenario_ids": ["scenario-0", "scenario-1", "scenario-2"],
+        "evaluation_contract": {
+            "episodes": 100,
+            "roi_count": 8,
+            "environment_size_m": [1000.0, 1000.0],
+            "episode_seconds": 60,
+        },
+        "metrics": {},
+    }
+
+
+def _patch_preflight(monkeypatch):
+    monkeypatch.setattr(
+        episode_training,
+        "validate_baseline_preflight",
+        lambda **_kwargs: _preflight_fixture(),
+    )
 
 
 def test_episode_reward_components_and_ordering_tie_rules_are_hand_checkable():
@@ -149,7 +188,7 @@ def test_lambda_can_be_explicit_or_derived_from_last_100_used_values(tmp_path):
 
 def test_training_block_summaries_preserve_component_addition_and_actual_lambda():
     rows = []
-    for episode in range(1, 201):
+    for episode in range(1, 1501):
         rows.append(
             {
                 "episode": episode,
@@ -164,9 +203,10 @@ def test_training_block_summaries_preserve_component_addition_and_actual_lambda(
                 "dinkelbach_lambda_used": episode / 1000,
             }
         )
-    summary = search.summarize_training_blocks(rows)
-    assert len(summary) == 2
+    summary = search.summarize_training_blocks(rows, expected_episodes=1500)
+    assert len(summary) == 15
     assert summary[0]["episode_range"] == [1, 100]
+    assert summary[-1]["episode_range"] == [1401, 1500]
     assert summary[0]["feature_contributions"]["a"]["mean"] == 1.0
     assert summary[0]["feature_contributions"]["b"]["mean"] == -0.25
     assert summary[0]["extra_reward_sum"]["mean"] == 0.75
@@ -185,7 +225,8 @@ def test_batch_parser_and_prompt_contract_have_four_slots_without_reviewer_or_li
             }
         )
     parsed = search.parse_candidate_batch(json.dumps({"candidates": values}), expected_ids=search.EXPECTED_CANDIDATE_IDS)
-    assert tuple(parsed) == search.EXPECTED_CANDIDATE_IDS
+    assert tuple(parsed["slots"]) == search.EXPECTED_CANDIDATE_IDS
+    assert all(item["error"] is None for item in parsed["slots"].values())
     stage = search.render_stage_prompt("common", search.INITIAL_TEMPLATE, {})
     assert "candidate_1 through candidate_4" in stage
     assert "reviewer" not in stage.lower()
@@ -241,6 +282,7 @@ def test_model_call_failure_pauses_with_persisted_call_and_resume_uses_new_call(
     monkeypatch.setattr(search, "load_complete_episode_dataset", lambda _paths: dataset)
     monkeypatch.setattr(search, "build_constants", lambda _metadata: {})
     monkeypatch.setattr(search, "render_common_prompt", lambda **_kwargs: "common")
+    _patch_preflight(monkeypatch)
 
     class FailingClient:
         def chat(self, **_kwargs):
@@ -255,6 +297,9 @@ def test_model_call_failure_pauses_with_persisted_call_and_resume_uses_new_call(
         max_output_tokens=4096,
         evaluation_lambda=0.0,
         max_search_rounds=1,
+        baseline_run=tmp_path / "baseline-run",
+        baseline_evaluation=tmp_path / "baseline-evaluation",
+        evaluation_manifest=tmp_path / "manifest.json",
         output_dir=output,
         client=FailingClient(),
     )
@@ -334,6 +379,7 @@ def test_partial_repair_locks_passing_slots_and_uses_one_shared_repair_call(tmp_
     monkeypatch.setattr(search, "load_complete_episode_dataset", lambda _paths: dataset)
     monkeypatch.setattr(search, "build_constants", lambda _metadata: {})
     monkeypatch.setattr(search, "render_common_prompt", lambda **_kwargs: "common")
+    _patch_preflight(monkeypatch)
 
     def validate(submission, **_kwargs):
         failed = submission["design_summary"] == "invalid"
@@ -375,7 +421,9 @@ def test_partial_repair_locks_passing_slots_and_uses_one_shared_repair_call(tmp_
             }
         )
 
-    initial = batch({"candidate_2", "candidate_4"})
+    initial_value = json.loads(batch({"candidate_4"}))
+    initial_value["candidates"][1].pop("design_summary")
+    initial = json.dumps(initial_value)
     repaired_all = json.loads(batch(set()))["candidates"]
     repaired = json.dumps({"candidates": [repaired_all[1], repaired_all[3]]})
     client = _MockClient([initial, repaired])
@@ -388,6 +436,9 @@ def test_partial_repair_locks_passing_slots_and_uses_one_shared_repair_call(tmp_
         evaluation_lambda=0.0,
         max_search_rounds=1,
         max_repairs_per_round=1,
+        baseline_run=tmp_path / "baseline-run",
+        baseline_evaluation=tmp_path / "baseline-evaluation",
+        evaluation_manifest=tmp_path / "manifest.json",
         output_dir=tmp_path / "run",
         client=client,
         training_runner=lambda **_kwargs: (_ for _ in ()).throw(AssertionError("must not train")),
@@ -412,6 +463,7 @@ def test_mock_training_evaluation_use_formal_counts_and_preserve_historical_best
     monkeypatch.setattr(search, "load_complete_episode_dataset", lambda _paths: dataset)
     monkeypatch.setattr(search, "build_constants", lambda _metadata: {})
     monkeypatch.setattr(search, "render_common_prompt", lambda **_kwargs: "common")
+    _patch_preflight(monkeypatch)
 
     def validate(submission, **_kwargs):
         candidate = {
@@ -474,9 +526,33 @@ def test_mock_training_evaluation_use_formal_counts_and_preserve_historical_best
 
     def evaluation_runner(**kwargs):
         evaluation_calls.append(kwargs)
+        mean_ee = 2.0 if len(evaluation_calls) == 1 else 1.0
         return {
             "status": "complete",
-            "mean_episode_energy_efficiency_mbit_per_j": 2.0 if len(evaluation_calls) == 1 else 1.0,
+            "episode_count": 100,
+            "roi_count": 8,
+            "environment_size_m": [1000.0, 1000.0],
+            "scenario_manifest_hash": "fixture-manifest",
+            "mean_episode_energy_efficiency_mbit_per_j": mean_ee,
+            "std_episode_energy_efficiency_mbit_per_j": 0.25,
+            "baseline_mean_episode_energy_efficiency_mbit_per_j": 0.75,
+            "improves_over_baseline_mean_episode_ee": mean_ee > 0.75,
+            "candidate_metrics": {
+                "timely_useful_delivery_mbit": {"total": 321.0},
+                "movement_energy_j": {"total": 654.0},
+                "end_to_end_delay_violation_probability": {
+                    "VS": {"value": 0.125},
+                    "COM": {"value": 0.25},
+                },
+            },
+            "baseline_metrics": {
+                "timely_useful_delivery_mbit": {"total": 111.0},
+                "movement_energy_j": {"total": 222.0},
+                "end_to_end_delay_violation_probability": {
+                    "VS": {"value": 0.5},
+                    "COM": {"value": None},
+                },
+            },
         }
 
     result = search.run_episode_search(
@@ -505,3 +581,420 @@ def test_mock_training_evaluation_use_formal_counts_and_preserve_historical_best
     assert state["best_trained_candidate"]["round"] == 1
     assert state["best_trained_candidate"]["mean_episode_energy_efficiency_mbit_per_j"] == 2.0
     assert "Best trained candidate so far" in client.prompts[1]
+    assert '"total": 321.0' in client.prompts[1]
+    assert '"value": 0.125' in client.prompts[1]
+
+
+def test_partial_batch_schema_failure_preserves_other_slots_and_safe_fences():
+    entries = [
+        {
+            "candidate_id": slot,
+            "design_summary": f"summary-{slot}",
+            "features": [{"name": slot, "description": "fixture", "reward_weight": 0.0}],
+            "code": "def compute_extra_state(obs, constants):\n    return [0.0]",
+        }
+        for slot in search.EXPECTED_CANDIDATE_IDS
+    ]
+    entries[1].pop("design_summary")
+    fenced = "explanation\n```json\n" + json.dumps({"candidates": entries}) + "\n```\nfooter"
+    parsed = search.parse_candidate_batch(
+        fenced, expected_ids=search.EXPECTED_CANDIDATE_IDS
+    )
+    assert parsed["parse_metadata"]["parse_method"] == "unique_markdown_json_fence"
+    assert parsed["slots"]["candidate_2"]["error"].startswith(
+        "candidate fields must be exactly"
+    )
+    assert all(
+        parsed["slots"][slot]["error"] is None
+        for slot in ("candidate_1", "candidate_3", "candidate_4")
+    )
+
+    duplicated = entries + [dict(entries[0])]
+    duplicate_result = search.parse_candidate_batch(
+        json.dumps({"candidates": duplicated}),
+        expected_ids=search.EXPECTED_CANDIDATE_IDS,
+    )
+    assert "appears 2 times" in duplicate_result["slots"]["candidate_1"]["error"]
+    assert duplicate_result["slots"]["candidate_3"]["error"] is None
+    with pytest.raises(Exception, match="multiple|fence|ambiguous"):
+        search.parse_candidate_batch(
+            "```json\n{}\n```\n```json\n{}\n```",
+            expected_ids=search.EXPECTED_CANDIDATE_IDS,
+        )
+
+
+def _raw_training_metric(episode):
+    return {
+        "episode": int(episode),
+        "method_id": "td3_dinkelbach_llm_search",
+        "llm_artifact_id": "artifact-fixture",
+        "llm_feature_names": ["a", "b"],
+        "llm_feature_reward_weights": [0.25, -0.5],
+        "llm_feature_contribution_sums": [1.0, -0.25],
+        "llm_reward_beta": 1.0,
+        "llm_base_reward_sum": 2.0,
+        "llm_weighted_extra_reward_sum": 0.75,
+        "llm_combined_reward_sum": 2.75,
+        "total_timely_useful_mbits": 3.0,
+        "total_mobility_energy_j": 4.0,
+        "energy_efficiency_mbit_per_j": 0.75,
+        "num_GT": 8,
+        "dinkelbach_lambda_used": 0.125,
+        "movement_exploration": {"std": 0.1},
+    }
+
+
+def test_episode_observer_persists_and_resume_reconciles_checkpoint_tail(tmp_path):
+    method = MethodSpec.parse("td3_dinkelbach_llm_search")
+    observer = run_experiment._llm_episode_observer(tmp_path, method)
+    assert observer is not None
+    for episode in range(1, 6):
+        observer(_raw_training_metric(episode))
+    path = tmp_path / "llm_training_episode_metrics.jsonl"
+    assert [row["episode"] for row in run_experiment._read_llm_training_episode_metrics(path)] == [1, 2, 3, 4, 5]
+
+    # An interrupted non-atomic legacy tail is ignored rather than counted.
+    with path.open("a", encoding="utf-8") as stream:
+        stream.write('{"episode": 6')
+    assert [row["episode"] for row in run_experiment._read_llm_training_episode_metrics(path)] == [1, 2, 3, 4, 5]
+
+    # Resume from checkpoint 3 removes rows that will be executed again.
+    run_experiment._write_llm_training_episode_metrics(
+        tmp_path, method, [], completed_episode_limit=3
+    )
+    for episode in range(4, 7):
+        observer(_raw_training_metric(episode))
+    rows = run_experiment._read_llm_training_episode_metrics(path)
+    assert [row["episode"] for row in rows] == list(range(1, 7))
+    summaries = search.summarize_training_blocks(
+        rows, block_size=3, expected_episodes=6
+    )
+    assert [item["episode_range"] for item in summaries] == [[1, 3], [4, 6]]
+
+    with pytest.raises(search.EpisodeSearchError, match="missing, duplicated, or out of order"):
+        search.summarize_training_blocks(
+            rows[:2] + rows[3:], block_size=1, expected_episodes=5
+        )
+    changed = [dict(row) for row in rows]
+    changed[-1]["candidate_artifact_id"] = "different-artifact"
+    with pytest.raises(search.EpisodeSearchError, match="mix candidate identities"):
+        search.summarize_training_blocks(changed, block_size=3, expected_episodes=6)
+
+
+def test_evaluation_metrics_use_pooled_task_denominators_and_report_missing():
+    rows = [
+        {
+            "scenario_id": "a",
+            "energy_efficiency_mbit_per_j": 1.0,
+            "total_timely_useful_mbits": 10.0,
+            "total_mobility_energy_j": 2.0,
+            "fov_eligible_packets": 2,
+            "fov_violation_packets": 1,
+            "com_eligible_packets": 0,
+            "com_violation_packets": 0,
+        },
+        {
+            "scenario_id": "b",
+            "energy_efficiency_mbit_per_j": 3.0,
+            "total_timely_useful_mbits": 20.0,
+            "total_mobility_energy_j": 6.0,
+            "fov_eligible_packets": 8,
+            "fov_violation_packets": 1,
+            "com_eligible_packets": 0,
+            "com_violation_packets": 0,
+        },
+    ]
+    metrics = episode_training._evaluation_metrics_summary(rows)
+    assert metrics["episode_energy_efficiency_mbit_per_j"] == {
+        "mean": 2.0,
+        "std": 1.0,
+        "aggregation": "arithmetic mean and population standard deviation across episodes",
+    }
+    assert metrics["timely_useful_delivery_mbit"]["total"] == 30.0
+    assert metrics["movement_energy_j"]["total"] == 8.0
+    vs = metrics["end_to_end_delay_violation_probability"]["VS"]
+    assert (vs["violated_packets"], vs["eligible_packets"], vs["value"]) == (2, 10, 0.2)
+    com = metrics["end_to_end_delay_violation_probability"]["COM"]
+    assert com["value"] is None and com["missing"] is True
+
+
+def test_resume_can_increase_repair_budget_without_resetting_usage(tmp_path, monkeypatch):
+    dataset = _dataset()
+    monkeypatch.setattr(search, "load_complete_episode_dataset", lambda _paths: dataset)
+    monkeypatch.setattr(search, "build_constants", lambda _metadata: {})
+    monkeypatch.setattr(search, "render_common_prompt", lambda **_kwargs: "common")
+    _patch_preflight(monkeypatch)
+
+    def validate(submission, **_kwargs):
+        passed = submission.get("design_summary") == "valid"
+        candidate = {
+            "candidate_name": submission["candidate_id"],
+            "features": submission.get("features", []),
+            "code": submission.get("code", ""),
+        }
+        return candidate, {"status": "passed" if passed else "failed"}, (np.zeros((3, 1)) if passed else None)
+
+    monkeypatch.setattr(search, "validate_search_candidate", validate)
+    monkeypatch.setattr(
+        search,
+        "evaluate_candidates",
+        lambda *_args, **_kwargs: {
+            "report": {
+                "baseline": {"score": 1.0},
+                "candidates": {slot: {"score": 1.0, "examples": []} for slot in search.EXPECTED_CANDIDATE_IDS},
+                "selected_candidate_id": None,
+                "selection_rule": "fixture",
+            },
+            "components": {},
+            "selected_candidate_id": None,
+        },
+    )
+
+    def batch(summary):
+        return json.dumps({"candidates": [
+            {
+                "candidate_id": slot,
+                "design_summary": summary,
+                "features": [{"name": slot, "description": "fixture", "reward_weight": 0.0}],
+                "code": f"def compute_extra_state(obs, constants):\n    return [{index / 10.0}]",
+            }
+            for index, slot in enumerate(search.EXPECTED_CANDIDATE_IDS)
+        ]})
+
+    output = tmp_path / "repair-budget"
+    first = search.run_episode_search(
+        episode_sources=[tmp_path / "source"],
+        provider="openai",
+        model="fixture/model",
+        evaluation_lambda=0.0,
+        max_search_rounds=1,
+        max_repairs_per_round=0,
+        baseline_run=tmp_path / "baseline-run",
+        baseline_evaluation=tmp_path / "baseline-evaluation",
+        evaluation_manifest=tmp_path / "manifest.json",
+        output_dir=output,
+        client=_MockClient([batch("invalid")]),
+    )
+    assert first["status"] == "paused_repairs_exhausted"
+    state = json.loads((output / "state.json").read_text(encoding="utf-8"))
+    assert state["current_round"]["repair_calls"] == 0
+
+    resumed = search.run_episode_search(
+        resume=output,
+        max_repairs_per_round=1,
+        client=_MockClient([batch("valid")]),
+    )
+    assert resumed["status"] == "completed_search_rounds_exhausted"
+    state = json.loads((output / "state.json").read_text(encoding="utf-8"))
+    assert state["settings"]["max_repairs_per_round"] == 1
+    assert state["rounds"][0]["repair_calls"] == 1
+    with pytest.raises(search.EpisodeSearchError, match="cannot lower"):
+        search.run_episode_search(
+            resume=output,
+            max_repairs_per_round=0,
+            client=_MockClient([]),
+        )
+
+
+def test_completed_search_extends_from_saved_preevaluation_without_repeating_round(tmp_path, monkeypatch):
+    dataset = _dataset()
+    monkeypatch.setattr(search, "load_complete_episode_dataset", lambda _paths: dataset)
+    monkeypatch.setattr(search, "build_constants", lambda _metadata: {})
+    monkeypatch.setattr(search, "render_common_prompt", lambda **_kwargs: "common")
+    _patch_preflight(monkeypatch)
+    monkeypatch.setattr(
+        search,
+        "validate_search_candidate",
+        lambda submission, **_kwargs: (
+            {"candidate_name": submission["candidate_id"], "features": submission["features"], "code": submission["code"]},
+            {"status": "passed"},
+            np.zeros((3, 1)),
+        ),
+    )
+    monkeypatch.setattr(
+        search,
+        "evaluate_candidates",
+        lambda *_args, **_kwargs: {
+            "report": {
+                "baseline": {"score": 1.0},
+                "candidates": {slot: {"score": 1.0, "examples": []} for slot in search.EXPECTED_CANDIDATE_IDS},
+                "selected_candidate_id": None,
+                "selection_rule": "fixture",
+            },
+            "components": {},
+            "selected_candidate_id": None,
+        },
+    )
+
+    def batch(round_number):
+        return json.dumps({"candidates": [
+            {
+                "candidate_id": slot,
+                "design_summary": f"round-{round_number}",
+                "features": [{"name": f"{slot}-{round_number}", "description": "fixture", "reward_weight": 0.0}],
+                "code": f"def compute_extra_state(obs, constants):\n    return [{round_number + index / 10.0}]",
+            }
+            for index, slot in enumerate(search.EXPECTED_CANDIDATE_IDS)
+        ]})
+
+    output = tmp_path / "extend-rounds"
+    first_client = _MockClient([batch(1)])
+    first = search.run_episode_search(
+        episode_sources=[tmp_path / "source"], provider="openai", model="fixture/model",
+        evaluation_lambda=0.0, max_search_rounds=1,
+        baseline_run=tmp_path / "baseline-run",
+        baseline_evaluation=tmp_path / "baseline-evaluation",
+        evaluation_manifest=tmp_path / "manifest.json",
+        output_dir=output, client=first_client,
+    )
+    assert first["status"] == "completed_search_rounds_exhausted"
+    second_client = _MockClient([batch(2)])
+    second = search.run_episode_search(
+        resume=output, max_search_rounds=2, client=second_client
+    )
+    assert second["status"] == "completed_search_rounds_exhausted"
+    state = json.loads((output / "state.json").read_text(encoding="utf-8"))
+    assert [item["round"] for item in state["rounds"]] == [1, 2]
+    assert state["model_calls"] == 2
+    assert "Evaluation rules and scores" in second_client.prompts[0]
+    assert "candidate_1" in second_client.prompts[0]
+
+
+def test_baseline_preflight_binds_run_checkpoint_manifest_and_episode_rows(tmp_path, monkeypatch):
+    scenario_ids = [f"scenario-{index:03d}" for index in range(100)]
+    manifest_path = tmp_path / "manifest.json"
+    manifest_path.write_text('{"fixture": true}', encoding="utf-8")
+    manifest = SimpleNamespace(
+        split="test",
+        episode_count=100,
+        generation_profile={"fixed_num_gt": 8},
+        environment_width_m=1000,
+        environment_height_m=1000,
+        environment_size_m=None,
+        content_hash="manifest-content-hash",
+        episodes=tuple({"scenario_id": value} for value in scenario_ids),
+    )
+    monkeypatch.setattr(episode_training.ScenarioManifest, "load", lambda _path: manifest)
+
+    baseline_run = tmp_path / "baseline-run"
+    checkpoint = baseline_run / "checkpoints" / "models" / "ep_1500"
+    checkpoint.mkdir(parents=True)
+    provenance = {field: f"fixture-{field}" for field in CHECKPOINT_PROVENANCE_FIELDS}
+    calls = []
+
+    def resolve(run, checkpoint_episode, *, expected_method):
+        calls.append((Path(run), checkpoint_episode, expected_method))
+        return {
+            "run_dir": baseline_run.resolve(),
+            "training_run_id": baseline_run.name,
+            "checkpoint": checkpoint.resolve(),
+            "checkpoint_artifact_provenance": provenance,
+        }
+
+    monkeypatch.setattr(episode_training, "resolve_training_run_checkpoint", resolve)
+    rows_path = tmp_path / "baseline-episodes.jsonl"
+    rows = [
+        {
+            "scenario_id": scenario_id,
+            "energy_efficiency_mbit_per_j": float(index + 1),
+            "total_timely_useful_mbits": 10.0,
+            "total_mobility_energy_j": 2.0,
+            "fov_eligible_packets": 2,
+            "fov_violation_packets": 1,
+            "com_eligible_packets": 4,
+            "com_violation_packets": 1,
+        }
+        for index, scenario_id in enumerate(scenario_ids)
+    ]
+    rows_path.write_text(
+        "".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8"
+    )
+    point = {
+        "training_run_id": baseline_run.name,
+        "checkpoint_episode": 1500,
+        **provenance,
+        "evaluation_episode_count": 100,
+        "fixed_num_gt": 8,
+        "evaluation_environment_width_m": 1000.0,
+        "evaluation_environment_height_m": 1000.0,
+        "evaluation_episode_horizon_s": 60,
+        "scenario_manifest_hash": manifest.content_hash,
+        "scenario_ids": scenario_ids,
+        "outputs": {"per_episode_jsonl": str(rows_path)},
+    }
+    metadata_path = tmp_path / "paper_evaluation_metadata.json"
+
+    def write_metadata(**changes):
+        value = {
+            "semantic_suite": "fixed_roi",
+            "method_id": "td3_dinkelbach",
+            "points": [{**point, **changes}],
+        }
+        metadata_path.write_text(json.dumps(value), encoding="utf-8")
+
+    write_metadata()
+    preflight = episode_training.validate_baseline_preflight(
+        baseline_run=baseline_run,
+        baseline_evaluation=metadata_path,
+        manifest=manifest_path,
+    )
+    assert calls == [(baseline_run, 1500, "td3_dinkelbach")]
+    assert preflight["status"] == "passed"
+    assert preflight["scenario_ids"] == scenario_ids
+    assert preflight["metrics"]["end_to_end_delay_violation_probability"]["COM"]["value"] == 0.25
+
+    write_metadata(training_run_id="other-run")
+    with pytest.raises(episode_training.EpisodeTrainingError, match="different training run"):
+        episode_training.validate_baseline_preflight(
+            baseline_run=baseline_run,
+            baseline_evaluation=metadata_path,
+            manifest=manifest_path,
+        )
+    write_metadata(checkpoint_episode=1499)
+    with pytest.raises(episode_training.EpisodeTrainingError, match="checkpoint episode 1500"):
+        episode_training.validate_baseline_preflight(
+            baseline_run=baseline_run,
+            baseline_evaluation=metadata_path,
+            manifest=manifest_path,
+        )
+    write_metadata(scenario_manifest_hash="wrong-manifest")
+    with pytest.raises(episode_training.EpisodeTrainingError, match="manifest hash"):
+        episode_training.validate_baseline_preflight(
+            baseline_run=baseline_run,
+            baseline_evaluation=metadata_path,
+            manifest=manifest_path,
+        )
+
+
+def test_baseline_preflight_failure_happens_before_model_call(tmp_path, monkeypatch):
+    dataset = _dataset()
+    monkeypatch.setattr(search, "load_complete_episode_dataset", lambda _paths: dataset)
+    monkeypatch.setattr(search, "build_constants", lambda _metadata: {})
+    monkeypatch.setattr(search, "render_common_prompt", lambda **_kwargs: "common")
+    monkeypatch.setattr(
+        episode_training,
+        "validate_baseline_preflight",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            episode_training.EpisodeTrainingError("preflight fixture failure")
+        ),
+    )
+    client = _MockClient([])
+    with pytest.raises(search.EpisodeSearchError, match="preflight fixture failure"):
+        search.run_episode_search(
+            episode_sources=[tmp_path / "source"],
+            provider="openai",
+            model="fixture/model",
+            evaluation_lambda=0.0,
+            baseline_run=tmp_path / "baseline-run",
+            baseline_evaluation=tmp_path / "baseline-evaluation",
+            evaluation_manifest=tmp_path / "manifest.json",
+            output_dir=tmp_path / "preflight-fails",
+            client=client,
+        )
+    assert client.prompts == []
+    failure = json.loads(
+        (tmp_path / "preflight-fails" / "baseline_preflight.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert failure["status"] == "failed"

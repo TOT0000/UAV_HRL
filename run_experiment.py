@@ -104,52 +104,108 @@ def _create_unique_leaf(parent, prefix):
     raise FileExistsError(f"could not allocate a unique directory below {parent}")
 
 
-def _write_llm_training_episode_metrics(run_dir, method, episode_metrics):
-    """Persist LLM reward decomposition without changing canonical history."""
+def _llm_training_episode_row(row):
+    feature_names = list(row.get("llm_feature_names") or ())
+    feature_weights = [
+        float(value) for value in row.get("llm_feature_reward_weights", ())
+    ]
+    contributions = [
+        float(value) for value in row.get("llm_feature_contribution_sums", [])
+    ]
+    if len(contributions) != len(feature_names) or len(feature_weights) != len(
+        feature_names
+    ):
+        raise RuntimeError("LLM episode feature metadata lengths are inconsistent")
+    extra = float(row.get("llm_weighted_extra_reward_sum", 0.0))
+    if not np.isclose(
+        sum(contributions), extra, rtol=1e-12, atol=1e-8
+    ):
+        raise RuntimeError("LLM per-feature contributions do not sum to extra reward")
+    base = float(row.get("llm_base_reward_sum", 0.0))
+    combined = float(row.get("llm_combined_reward_sum", 0.0))
+    beta = float(row["llm_reward_beta"])
+    dinkelbach_lambda_used = float(row["dinkelbach_lambda_used"])
+    numeric_values = contributions + feature_weights + [
+        extra,
+        base,
+        combined,
+        beta,
+        dinkelbach_lambda_used,
+    ]
+    if not all(np.isfinite(value) for value in numeric_values):
+        raise RuntimeError("LLM episode reward decomposition contains non-finite values")
+    if not np.isclose(base + extra, combined, rtol=1e-12, atol=1e-8):
+        raise RuntimeError("LLM base and extra reward do not sum to combined reward")
+    return {
+        "schema_version": "uav-hrl-llm-training-episode-metrics-v1",
+        "episode": int(row["episode"]),
+        "method_id": str(row["method_id"]),
+        "candidate_artifact_id": row.get("llm_artifact_id"),
+        "feature_names": feature_names,
+        "feature_reward_weights": feature_weights,
+        "feature_contribution_sums": contributions,
+        "beta": beta,
+        "base_reward_sum": base,
+        "extra_reward_sum": extra,
+        "combined_reward_sum": combined,
+        "timely_mbits": float(row["total_timely_useful_mbits"]),
+        "movement_energy_j": float(row["total_mobility_energy_j"]),
+        "energy_efficiency_mbit_per_j": float(
+            row["energy_efficiency_mbit_per_j"]
+        ),
+        "roi_count": int(row["num_GT"]),
+        "dinkelbach_lambda_used": dinkelbach_lambda_used,
+        "exploration": row.get("movement_exploration"),
+    }
+
+
+def _read_llm_training_episode_metrics(path):
+    if not Path(path).is_file():
+        return []
+    lines = Path(path).read_text(encoding="utf-8").splitlines()
+    rows = []
+    for index, line in enumerate(lines):
+        if not line.strip():
+            continue
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError as exc:
+            if index == len(lines) - 1:
+                break
+            raise RuntimeError(
+                f"LLM episode metrics contain an invalid non-tail row at line {index + 1}"
+            ) from exc
+        if not isinstance(row, dict) or not isinstance(row.get("episode"), int):
+            raise RuntimeError("LLM episode metrics contain an invalid row")
+        rows.append(row)
+    return rows
+
+
+def _write_llm_training_episode_metrics(
+    run_dir, method, episode_metrics, *, completed_episode_limit=None
+):
+    """Atomically persist complete LLM episodes and reconcile resume tails."""
 
     if not method.llm_enabled:
         return
     path = Path(run_dir) / "llm_training_episode_metrics.jsonl"
+    existing_rows = _read_llm_training_episode_metrics(path)
     rows_by_episode = {}
-    if path.is_file():
-        for line in path.read_text(encoding="utf-8").splitlines():
-            if line.strip():
-                existing = json.loads(line)
-                rows_by_episode[int(existing["episode"])] = existing
+    for existing in existing_rows:
+        episode = int(existing["episode"])
+        if episode in rows_by_episode:
+            raise RuntimeError(f"duplicate LLM episode metric row: {episode}")
+        if completed_episode_limit is None or episode <= int(completed_episode_limit):
+            rows_by_episode[episode] = existing
     for row in episode_metrics:
-        contributions = [
-            float(value) for value in row.get("llm_feature_contribution_sums", [])
-        ]
-        extra = float(row.get("llm_weighted_extra_reward_sum", 0.0))
-        if contributions and not np.isclose(
-            sum(contributions), extra, rtol=0.0, atol=1e-8
-        ):
-            raise RuntimeError("LLM per-feature contributions do not sum to extra reward")
-        rows_by_episode[int(row["episode"])] = {
-            "schema_version": "uav-hrl-llm-training-episode-metrics-v1",
-            "episode": int(row["episode"]),
-            "method_id": str(row["method_id"]),
-            "candidate_artifact_id": row.get("llm_artifact_id"),
-            "feature_names": list(row.get("llm_feature_names") or ()),
-            "feature_reward_weights": list(
-                row.get("llm_feature_reward_weights") or ()
-            ),
-            "feature_contribution_sums": contributions,
-            "beta": row.get("llm_reward_beta"),
-            "base_reward_sum": float(row.get("llm_base_reward_sum", 0.0)),
-            "extra_reward_sum": extra,
-            "combined_reward_sum": float(
-                row.get("llm_combined_reward_sum", 0.0)
-            ),
-            "timely_mbits": float(row["total_timely_useful_mbits"]),
-            "movement_energy_j": float(row["total_mobility_energy_j"]),
-            "energy_efficiency_mbit_per_j": float(
-                row["energy_efficiency_mbit_per_j"]
-            ),
-            "roi_count": int(row["num_GT"]),
-            "dinkelbach_lambda_used": row.get("dinkelbach_lambda_used"),
-            "exploration": row.get("movement_exploration"),
-        }
+        converted = _llm_training_episode_row(row)
+        episode = int(converted["episode"])
+        if completed_episode_limit is not None and episode > int(completed_episode_limit):
+            raise RuntimeError("new LLM episode metric exceeds the checkpoint boundary")
+        previous = rows_by_episode.get(episode)
+        if previous is not None and previous != converted:
+            raise RuntimeError(f"LLM episode metric changed for episode {episode}")
+        rows_by_episode[episode] = converted
     rows = [rows_by_episode[key] for key in sorted(rows_by_episode)]
     temporary = path.with_suffix(".jsonl.tmp")
     temporary.write_text(
@@ -157,6 +213,16 @@ def _write_llm_training_episode_metrics(run_dir, method, episode_metrics):
         encoding="utf-8",
     )
     temporary.replace(path)
+
+
+def _llm_episode_observer(run_dir, method):
+    if not method.llm_enabled:
+        return None
+
+    def persist(row):
+        _write_llm_training_episode_metrics(run_dir, method, [row])
+
+    return persist
 
 
 def create_unique_run_directory(output_root, method_key, seed, git_sha=None):
@@ -549,9 +615,7 @@ def run(args):
             training_run_provenance=_training_run_provenance(resolved),
             llm_artifact_dir=(llm_design.directory if llm_design is not None else None),
             llm_worker_timeout=getattr(args, "llm_worker_timeout", 60.0),
-        )
-        _write_llm_training_episode_metrics(
-            run_dir, method, result["episode_metrics"]
+            episode_observer=_llm_episode_observer(run_dir, method),
         )
         resolved.update(
             status="COMPLETED",
@@ -764,6 +828,12 @@ def run_resume(args):
             "training_history_rows", ()
         ),
     )
+    _write_llm_training_episode_metrics(
+        run_dir,
+        method,
+        [],
+        completed_episode_limit=plan.resume_episode,
+    )
     reconciliation = execute_resume_reconciliation(plan)
     if extension_provenance is not None:
         if not active_manifest_path.exists():
@@ -833,9 +903,7 @@ def run_resume(args):
             llm_worker_timeout=float(
                 resolved.get("llm_worker_timeout_seconds", 60.0)
             ),
-        )
-        _write_llm_training_episode_metrics(
-            run_dir, method, result["episode_metrics"]
+            episode_observer=_llm_episode_observer(run_dir, method),
         )
         resolved.update(
             status="COMPLETED",

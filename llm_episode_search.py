@@ -29,6 +29,7 @@ from llm_candidate import (
     execute_candidate_isolated,
     feature_reward,
     normalize_candidate_submission,
+    parse_candidate_json_envelope,
     save_approved_artifact,
     validate_candidate,
     validate_candidate_staged,
@@ -591,17 +592,48 @@ def evaluate_candidates(
 
 
 def summarize_training_blocks(
-    episode_rows: list[dict[str, Any]], *, block_size: int = 100
+    episode_rows: list[dict[str, Any]],
+    *,
+    block_size: int = 100,
+    expected_episodes: int | None = None,
 ) -> list[dict[str, Any]]:
     """Summarize non-overlapping episode blocks without changing training metrics."""
 
     if block_size <= 0:
         raise ValueError("block_size must be positive")
+    episode_numbers = [int(row["episode"]) for row in episode_rows]
+    expected_numbers = list(range(1, len(episode_rows) + 1))
+    if episode_numbers != expected_numbers:
+        raise EpisodeSearchError(
+            "LLM training episode metrics are missing, duplicated, or out of order"
+        )
+    if expected_episodes is not None and len(episode_rows) != int(expected_episodes):
+        raise EpisodeSearchError(
+            "LLM training episode metrics are incomplete: "
+            f"expected 1-{int(expected_episodes)}, received "
+            f"{episode_numbers[0] if episode_numbers else 'none'}-"
+            f"{episode_numbers[-1] if episode_numbers else 'none'}"
+        )
+    identities = {
+        _canonical_json(
+            {
+                "candidate_artifact_id": row.get("candidate_artifact_id"),
+                "feature_names": row.get("feature_names"),
+                "feature_reward_weights": row.get("feature_reward_weights"),
+                "beta": row.get("beta"),
+            }
+        )
+        for row in episode_rows
+    }
+    if len(identities) > 1:
+        raise EpisodeSearchError("LLM training episode metrics mix candidate identities")
+    if expected_episodes is not None and int(expected_episodes) % block_size:
+        raise EpisodeSearchError("expected training horizon is not divisible by block size")
     summaries = []
     for start in range(0, len(episode_rows), block_size):
         block = episode_rows[start : start + block_size]
         if len(block) != block_size:
-            break
+            raise EpisodeSearchError("LLM training metrics end with an incomplete block")
         feature_names = list(block[0].get("feature_names") or [])
         contributions = np.asarray(
             [row["feature_contribution_sums"] for row in block], dtype=np.float64
@@ -641,33 +673,80 @@ def summarize_training_blocks(
     return summaries
 
 
-def parse_candidate_batch(content: str, *, expected_ids: Iterable[str]) -> dict[str, dict[str, Any]]:
-    try:
-        value = json.loads(content)
-    except json.JSONDecodeError as exc:
-        raise CandidateError(f"four-candidate response is invalid JSON: {exc}") from exc
+def parse_candidate_batch(content: str, *, expected_ids: Iterable[str]) -> dict[str, Any]:
+    """Parse one envelope, then report each reliably identified slot separately."""
+
+    value, parse_metadata = parse_candidate_json_envelope(content)
     if not isinstance(value, dict) or set(value) != {"candidates"}:
         raise CandidateError("response must be one object containing only 'candidates'")
     candidates = value["candidates"]
+    if not isinstance(candidates, list):
+        raise CandidateError("candidates must be an array")
     expected = tuple(expected_ids)
-    if not isinstance(candidates, list) or len(candidates) != len(expected):
-        raise CandidateError(f"candidates must contain exactly {len(expected)} entries")
-    result = {}
-    for item in candidates:
+    grouped: dict[str, list[dict[str, Any]]] = {slot: [] for slot in expected}
+    batch_errors = []
+    for index, item in enumerate(candidates):
         if not isinstance(item, dict):
-            raise CandidateError("each candidate must be an object")
-        required = {"candidate_id", "design_summary", "features", "code"}
+            batch_errors.append(
+                {"location": f"$.candidates[{index}]", "error": "candidate must be an object"}
+            )
+            continue
+        slot = item.get("candidate_id")
+        if not isinstance(slot, str):
+            batch_errors.append(
+                {"location": f"$.candidates[{index}].candidate_id", "error": "candidate_id must be a string"}
+            )
+            continue
+        if slot not in expected:
+            batch_errors.append(
+                {"location": f"$.candidates[{index}].candidate_id", "error": f"unexpected candidate_id {slot!r}"}
+            )
+            continue
+        grouped[slot].append(copy.deepcopy(item))
+
+    slots: dict[str, dict[str, Any]] = {}
+    required = {"candidate_id", "design_summary", "features", "code"}
+    for slot in expected:
+        items = grouped[slot]
+        if not items:
+            slots[slot] = {
+                "submission": {"candidate_id": slot},
+                "error": f"required candidate {slot!r} is missing",
+            }
+            continue
+        if len(items) > 1:
+            slots[slot] = {
+                "submission": {
+                    "candidate_id": slot,
+                    "duplicate_submissions": items,
+                },
+                "error": f"candidate_id {slot!r} appears {len(items)} times",
+            }
+            continue
+        item = items[0]
         if set(item) != required:
-            raise CandidateError(f"candidate fields must be exactly {sorted(required)}")
-        slot = item["candidate_id"]
-        if slot not in expected or slot in result:
-            raise CandidateError("candidate IDs are missing, duplicated, or unexpected")
+            missing = sorted(required.difference(item))
+            extra = sorted(set(item).difference(required))
+            slots[slot] = {
+                "submission": item,
+                "error": (
+                    f"candidate fields must be exactly {sorted(required)}; "
+                    f"missing={missing}, extra={extra}"
+                ),
+            }
+            continue
         if not isinstance(item["design_summary"], str) or not item["design_summary"].strip():
-            raise CandidateError(f"{slot}.design_summary must be non-empty")
-        result[slot] = copy.deepcopy(item)
-    if tuple(sorted(result, key=expected.index)) != expected:
-        raise CandidateError("candidate IDs do not match the requested slots")
-    return result
+            slots[slot] = {
+                "submission": item,
+                "error": f"{slot}.design_summary must be non-empty",
+            }
+            continue
+        slots[slot] = {"submission": item, "error": None}
+    return {
+        "slots": slots,
+        "batch_errors": batch_errors,
+        "parse_metadata": parse_metadata,
+    }
 
 
 def validate_search_candidate(
@@ -858,6 +937,41 @@ def _public_score_report(report: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _evaluation_feedback(result: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not result:
+        return None
+    return {
+        key: result.get(key)
+        for key in (
+            "status",
+            "episode_count",
+            "roi_count",
+            "environment_size_m",
+            "scenario_manifest_hash",
+            "mean_episode_energy_efficiency_mbit_per_j",
+            "std_episode_energy_efficiency_mbit_per_j",
+            "baseline_mean_episode_energy_efficiency_mbit_per_j",
+            "improves_over_baseline_mean_episode_ee",
+            "candidate_metrics",
+            "baseline_metrics",
+        )
+    }
+
+
+def _best_trained_feedback(best: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not best:
+        return None
+    return {
+        "round": best.get("round"),
+        "candidate_id": best.get("candidate_id"),
+        "candidate_submission": best.get("candidate_submission"),
+        "mean_episode_energy_efficiency_mbit_per_j": best.get(
+            "mean_episode_energy_efficiency_mbit_per_j"
+        ),
+        "evaluation": _evaluation_feedback(best.get("evaluation")),
+    }
+
+
 def _save_candidate(
     directory: Path,
     *,
@@ -891,9 +1005,10 @@ def _record_batch_parse_failure(
     }
     for slot in expected_slots:
         previous = current["slots"].get(slot) or {}
-        submission = previous.get("submission") or {
+        submission = {
             "candidate_id": slot,
             "raw_unparsed_response": raw_content,
+            "previous_submission": previous.get("submission"),
         }
         version = int(previous.get("version", 0)) + 1
         directory = round_directory / "candidates" / slot / f"version_{version:02d}"
@@ -912,6 +1027,87 @@ def _record_batch_parse_failure(
             "computation_fingerprint": None,
             "directory": str(directory),
         }
+
+
+def _apply_candidate_batch(
+    current: dict[str, Any],
+    *,
+    content: str,
+    expected_slots: Iterable[str],
+    round_directory: Path,
+    dataset: EpisodeDataset,
+    constants: dict[str, Any],
+    worker_timeout: float,
+) -> None:
+    expected = tuple(expected_slots)
+    parsed = parse_candidate_batch(content, expected_ids=expected)
+    _write_json(
+        round_directory / f"batch_parse_{int(current.get('batch_parse_count', 0)) + 1:02d}.json",
+        parsed,
+    )
+    current["batch_parse_count"] = int(current.get("batch_parse_count", 0)) + 1
+    accepted_fingerprints = {
+        record["computation_fingerprint"]
+        for slot, record in current["slots"].items()
+        if slot not in expected and record.get("status") == "validated"
+    }
+    for slot in expected:
+        parsed_slot = parsed["slots"][slot]
+        submission = parsed_slot["submission"]
+        if parsed_slot["error"] is not None:
+            candidate = None
+            validation = {
+                "status": "failed",
+                "stage": "candidate_schema",
+                "error": parsed_slot["error"],
+                "batch_errors": parsed["batch_errors"],
+                "parse_metadata": parsed["parse_metadata"],
+            }
+            extra = None
+        else:
+            candidate, validation, extra = validate_search_candidate(
+                submission,
+                dataset=dataset,
+                constants_metadata=constants,
+                worker_timeout=worker_timeout,
+            )
+            validation = {
+                **validation,
+                "batch_errors": parsed["batch_errors"],
+                "parse_metadata": parsed["parse_metadata"],
+            }
+        fingerprint = candidate_computation_fingerprint(candidate) if candidate else None
+        if fingerprint is not None and fingerprint in accepted_fingerprints:
+            validation = {
+                "status": "failed",
+                "stage": "diversity",
+                "error": "candidate is semantically identical to another accepted slot",
+                "batch_errors": parsed["batch_errors"],
+                "parse_metadata": parsed["parse_metadata"],
+            }
+            extra = None
+        if extra is not None:
+            accepted_fingerprints.add(fingerprint)
+        version = int(current["slots"].get(slot, {}).get("version", 0)) + 1
+        candidate_dir = round_directory / "candidates" / slot / f"version_{version:02d}"
+        _save_candidate(
+            candidate_dir,
+            submission=submission,
+            candidate=candidate,
+            validation=validation,
+        )
+        if extra is not None:
+            np.save(candidate_dir / "features.npy", extra, allow_pickle=False)
+        current["slots"][slot] = {
+            "status": "validated" if extra is not None else "failed",
+            "version": version,
+            "submission": submission,
+            "candidate": candidate,
+            "validation": validation,
+            "computation_fingerprint": fingerprint,
+            "directory": str(candidate_dir),
+        }
+        _progress(f"{slot}: {current['slots'][slot]['status']} (version {version})")
 
 
 def _result(state: dict[str, Any]) -> dict[str, Any]:
@@ -948,8 +1144,8 @@ def run_episode_search(
     beta: float = DEFAULT_BETA,
     evaluation_lambda: float | None = None,
     lambda_training_run: str | Path | None = None,
-    max_search_rounds: int = DEFAULT_MAX_SEARCH_ROUNDS,
-    max_repairs_per_round: int = DEFAULT_MAX_REPAIRS_PER_ROUND,
+    max_search_rounds: int | None = None,
+    max_repairs_per_round: int | None = None,
     ee_tolerance: float = DEFAULT_EE_TOLERANCE,
     reward_tolerance: float = DEFAULT_REWARD_TOLERANCE,
     baseline_run: str | Path | None = None,
@@ -971,6 +1167,7 @@ def run_episode_search(
     subprocess wrappers in ``llm_episode_training.py``.
     """
 
+    resume_terminal_no_extension = False
     if resume is not None:
         output = Path(resume).resolve()
         state_path = output / "state.json"
@@ -987,8 +1184,26 @@ def run_episode_search(
         beta = float(settings["beta"])
         worker_timeout = float(settings["worker_timeout"])
         lambda_record = settings["evaluation_lambda"]
-        max_search_rounds = int(settings["max_search_rounds"])
-        max_repairs_per_round = int(settings["max_repairs_per_round"])
+        saved_search_rounds = int(settings["max_search_rounds"])
+        saved_repairs = int(settings["max_repairs_per_round"])
+        requested_search_rounds = (
+            saved_search_rounds
+            if max_search_rounds is None
+            else int(max_search_rounds)
+        )
+        requested_repairs = (
+            saved_repairs
+            if max_repairs_per_round is None
+            else int(max_repairs_per_round)
+        )
+        if requested_search_rounds < saved_search_rounds:
+            raise EpisodeSearchError("resume cannot lower max_search_rounds")
+        if requested_repairs < saved_repairs:
+            raise EpisodeSearchError("resume cannot lower max_repairs_per_round")
+        max_search_rounds = requested_search_rounds
+        max_repairs_per_round = requested_repairs
+        settings["max_search_rounds"] = max_search_rounds
+        settings["max_repairs_per_round"] = max_repairs_per_round
         ee_tolerance = float(settings["ee_tolerance"])
         reward_tolerance = float(settings["reward_tolerance"])
         baseline_run = settings.get("baseline_run")
@@ -996,11 +1211,54 @@ def run_episode_search(
         evaluation_manifest = settings.get("evaluation_manifest")
         train_episodes = int(settings["train_episodes"])
         evaluation_episodes = int(settings["evaluation_episodes"])
-        state["status"] = "running"
-        state["stop_reason"] = None
+        if (
+            max_search_rounds > saved_search_rounds
+            and state.get("current_round") is None
+            and state.get("rounds")
+        ):
+            previous = state["rounds"][-1]
+            next_round = int(previous["round"]) + 1
+            state["search_round"] = next_round
+            if previous.get("phase") == "completed_trained":
+                next_phase = "generate_from_training"
+                extra_round_state = {}
+            elif previous.get("phase") == "completed_no_training":
+                next_phase = "generate_from_preevaluation"
+                extra_round_state = {
+                    "previous_preevaluation": previous["evaluation"]
+                }
+            else:
+                raise EpisodeSearchError(
+                    "completed search cannot be extended from its saved phase"
+                )
+            state["current_round"] = {
+                "round": next_round,
+                "phase": next_phase,
+                "repair_calls": 0,
+                "slots": {},
+                "evaluation": None,
+                "training": None,
+                "evaluation_result": None,
+                **extra_round_state,
+            }
+        elif state.get("current_round") is None and state.get("rounds"):
+            resume_terminal_no_extension = True
+        if not resume_terminal_no_extension:
+            state["status"] = "running"
+            state["stop_reason"] = None
     else:
         if not episode_sources or not provider or not model:
             raise ValueError("new episode searches require sources, provider, and model")
+        max_search_rounds = (
+            DEFAULT_MAX_SEARCH_ROUNDS
+            if max_search_rounds is None
+            else int(max_search_rounds)
+        )
+        max_repairs_per_round = (
+            DEFAULT_MAX_REPAIRS_PER_ROUND
+            if max_repairs_per_round is None
+            else int(max_repairs_per_round)
+        )
         if max_search_rounds <= 0 or max_repairs_per_round < 0:
             raise ValueError("search rounds must be positive and repairs non-negative")
         if int(train_episodes) != 1500 or int(evaluation_episodes) != 100:
@@ -1062,6 +1320,9 @@ def run_episode_search(
         }
         _write_json(output / "state.json", state)
 
+    if resume_terminal_no_extension:
+        return _result(state)
+
     dataset = load_complete_episode_dataset(episode_sources)
     if state.get("dataset_provenance") not in (None, dataset.provenance):
         raise EpisodeSearchError("resume episode dataset content is incompatible")
@@ -1075,9 +1336,54 @@ def run_episode_search(
     common = render_common_prompt(
         dataset=dataset, constants_metadata=constants, beta=beta, ranking_spec=ranking_spec
     )
-    model_client = client or _make_client(config)
-    inventory = None if dry_run or config["provider"] == "openai" else model_inventory_summary(
-        model_client.list_models(), config["model"]
+    baseline_preflight = None
+    if not dry_run:
+        if not evaluation_manifest or not baseline_run or not baseline_evaluation:
+            raise EpisodeSearchError(
+                "formal search requires explicit baseline run, evaluation, and manifest"
+            )
+        from llm_episode_training import validate_baseline_preflight
+
+        try:
+            baseline_preflight = validate_baseline_preflight(
+                baseline_run=baseline_run,
+                baseline_evaluation=baseline_evaluation,
+                manifest=evaluation_manifest,
+                checkpoint_episode=1500,
+                episodes=evaluation_episodes,
+                roi_count=8,
+                environment_size_m=(1000.0, 1000.0),
+                episode_seconds=60,
+            )
+        except Exception as exc:
+            failure = {
+                "schema_version": "uav-hrl-episode-search-baseline-preflight-v1",
+                "status": "failed",
+                "error_type": type(exc).__name__,
+                "error": str(exc),
+            }
+            state["status"] = "failed_baseline_preflight"
+            state["stop_reason"] = f"{type(exc).__name__}: {exc}"
+            state["baseline_preflight_failure"] = failure
+            _write_json(output / "baseline_preflight.json", failure)
+            _write_json(output / "state.json", state)
+            raise EpisodeSearchError(
+                f"baseline preflight failed: {type(exc).__name__}: {exc}"
+            ) from exc
+        if state.get("baseline_preflight") not in (None, baseline_preflight):
+            raise EpisodeSearchError("baseline comparison inputs changed since preflight")
+        state["baseline_preflight"] = baseline_preflight
+        _write_json(output / "baseline_preflight.json", baseline_preflight)
+    else:
+        state["baseline_preflight"] = {
+            "status": "not_run_dry_run",
+            "reason": "formal baseline inputs are optional during prompt-only dry-run",
+        }
+    model_client = None if dry_run else (client or _make_client(config))
+    inventory = (
+        None
+        if dry_run or config["provider"] == "openai"
+        else model_inventory_summary(model_client.list_models(), config["model"])
     )
     effective_context, context_record = _effective_context_budget(
         config["context_length"], inventory
@@ -1129,7 +1435,8 @@ def run_episode_search(
 
         _progress(
             f"round {round_number}/{max_search_rounds}; phase={current['phase']}; "
-            f"repairs={current['repair_calls']}/{max_repairs_per_round}"
+            f"repairs={current['repair_calls']}/{max_repairs_per_round}; "
+            f"remaining={max(0, max_repairs_per_round - current['repair_calls'])}"
         )
 
         if current["phase"] in {"generate", "repair"}:
@@ -1180,8 +1487,14 @@ def run_episode_search(
                 _write_json(output / "state.json", state)
                 return _result(state)
             try:
-                submissions = parse_candidate_batch(
-                    response["content"], expected_ids=expected
+                _apply_candidate_batch(
+                    current,
+                    content=response["content"],
+                    expected_slots=expected,
+                    round_directory=round_dir,
+                    dataset=dataset,
+                    constants=constants,
+                    worker_timeout=worker_timeout,
                 )
             except CandidateError as exc:
                 _record_batch_parse_failure(
@@ -1194,52 +1507,6 @@ def run_episode_search(
                 current["phase"] = "repair"
                 _write_json(output / "state.json", state)
                 continue
-            accepted_fingerprints = {
-                record["computation_fingerprint"]
-                for record in current["slots"].values()
-                if record.get("status") == "validated"
-            }
-            for slot in expected:
-                submission = submissions[slot]
-                candidate, validation, extra = validate_search_candidate(
-                    submission,
-                    dataset=dataset,
-                    constants_metadata=constants,
-                    worker_timeout=worker_timeout,
-                )
-                fingerprint = candidate_computation_fingerprint(candidate) if candidate else None
-                if fingerprint in accepted_fingerprints:
-                    validation = {
-                        "status": "failed",
-                        "stage": "diversity",
-                        "error": "candidate is semantically identical to another accepted slot",
-                    }
-                    extra = None
-                if validation.get("status") == "passed":
-                    accepted_fingerprints.add(fingerprint)
-                version = int(current["slots"].get(slot, {}).get("version", 0)) + 1
-                candidate_dir = round_dir / "candidates" / slot / f"version_{version:02d}"
-                _save_candidate(
-                    candidate_dir,
-                    submission=submission,
-                    candidate=candidate,
-                    validation=validation,
-                )
-                if extra is not None:
-                    np.save(candidate_dir / "features.npy", extra, allow_pickle=False)
-                current["slots"][slot] = {
-                    "status": "validated" if extra is not None else "failed",
-                    "version": version,
-                    "submission": submission,
-                    "candidate": candidate,
-                    "validation": validation,
-                    "computation_fingerprint": fingerprint,
-                    "directory": str(candidate_dir),
-                }
-                _progress(
-                    f"{slot}: {current['slots'][slot]['status']} "
-                    f"(version {version})"
-                )
             failed = [slot for slot in EXPECTED_CANDIDATE_IDS if current["slots"][slot]["status"] != "validated"]
             current["phase"] = "repair" if failed else "preevaluate"
             _write_json(output / "state.json", state)
@@ -1345,7 +1612,10 @@ def run_episode_search(
                     "MISORDERED_EPISODE_PAIRS": json.dumps(
                         {slot: current["previous_preevaluation"]["candidates"][slot]["examples"] for slot in EXPECTED_CANDIDATE_IDS}, indent=2
                     ),
-                    "BEST_TRAINED_CONTEXT": json.dumps(state.get("best_trained_candidate"), indent=2),
+                    "BEST_TRAINED_CONTEXT": json.dumps(
+                        _best_trained_feedback(state.get("best_trained_candidate")),
+                        indent=2,
+                    ),
                 },
             )
             call_number = state["model_calls"] + 1
@@ -1363,8 +1633,14 @@ def run_episode_search(
                 _write_json(output / "state.json", state)
                 return _result(state)
             try:
-                submissions = parse_candidate_batch(
-                    response["content"], expected_ids=EXPECTED_CANDIDATE_IDS
+                _apply_candidate_batch(
+                    current,
+                    content=response["content"],
+                    expected_slots=EXPECTED_CANDIDATE_IDS,
+                    round_directory=round_dir,
+                    dataset=dataset,
+                    constants=constants,
+                    worker_timeout=worker_timeout,
                 )
             except CandidateError as exc:
                 _record_batch_parse_failure(
@@ -1377,33 +1653,6 @@ def run_episode_search(
                 current["phase"] = "repair"
                 _write_json(output / "state.json", state)
                 continue
-            current["phase"] = "repair"
-            seen_fingerprints: set[str] = set()
-            for slot, submission in submissions.items():
-                candidate, validation, extra = validate_search_candidate(
-                    submission, dataset=dataset, constants_metadata=constants, worker_timeout=worker_timeout
-                )
-                fingerprint = candidate_computation_fingerprint(candidate) if candidate else None
-                if fingerprint is not None and fingerprint in seen_fingerprints:
-                    validation = {
-                        "status": "failed",
-                        "stage": "diversity",
-                        "error": "candidate is semantically identical to another slot",
-                    }
-                    extra = None
-                if extra is not None:
-                    seen_fingerprints.add(fingerprint)
-                version_dir = round_dir / "candidates" / slot / "version_01"
-                _save_candidate(version_dir, submission=submission, candidate=candidate, validation=validation)
-                if extra is not None:
-                    np.save(version_dir / "features.npy", extra, allow_pickle=False)
-                current["slots"][slot] = {
-                    "status": "validated" if extra is not None else "failed",
-                    "version": 1, "submission": submission, "candidate": candidate,
-                    "validation": validation,
-                    "computation_fingerprint": fingerprint,
-                    "directory": str(version_dir),
-                }
             current["phase"] = "preevaluate" if all(v["status"] == "validated" for v in current["slots"].values()) else "repair"
             _write_json(output / "state.json", state)
             continue
@@ -1443,6 +1692,7 @@ def run_episode_search(
                 manifest=evaluation_manifest,
                 baseline_run=baseline_run,
                 baseline_evaluation=baseline_evaluation,
+                baseline_preflight=baseline_preflight,
                 output_directory=round_dir / "evaluation",
             )
             current["evaluation_result"] = result
@@ -1508,8 +1758,14 @@ def run_episode_search(
                         indent=2,
                     ),
                     "TRAINING_SUMMARIES": json.dumps(latest["training"].get("summaries"), indent=2),
-                    "EVALUATION_RESULTS": json.dumps(latest["evaluation_result"], indent=2),
-                    "BEST_TRAINED_CANDIDATE": json.dumps(state["best_trained_candidate"], indent=2, default=str),
+                    "EVALUATION_RESULTS": json.dumps(
+                        _evaluation_feedback(latest["evaluation_result"]), indent=2
+                    ),
+                    "BEST_TRAINED_CANDIDATE": json.dumps(
+                        _best_trained_feedback(state["best_trained_candidate"]),
+                        indent=2,
+                        default=str,
+                    ),
                     "SEARCH_HISTORY_SUMMARY": json.dumps([
                         {"round": item["round"], "selected": item.get("selected_candidate_id"), "updated_best": item.get("updated_best")}
                         for item in state["rounds"]
@@ -1531,8 +1787,14 @@ def run_episode_search(
                 _write_json(output / "state.json", state)
                 return _result(state)
             try:
-                submissions = parse_candidate_batch(
-                    response["content"], expected_ids=EXPECTED_CANDIDATE_IDS
+                _apply_candidate_batch(
+                    current,
+                    content=response["content"],
+                    expected_slots=EXPECTED_CANDIDATE_IDS,
+                    round_directory=round_dir,
+                    dataset=dataset,
+                    constants=constants,
+                    worker_timeout=worker_timeout,
                 )
             except CandidateError as exc:
                 _record_batch_parse_failure(
@@ -1545,33 +1807,6 @@ def run_episode_search(
                 current["phase"] = "repair"
                 _write_json(output / "state.json", state)
                 continue
-            current["phase"] = "repair"
-            seen_fingerprints: set[str] = set()
-            for slot, submission in submissions.items():
-                candidate, validation, extra = validate_search_candidate(
-                    submission, dataset=dataset, constants_metadata=constants, worker_timeout=worker_timeout
-                )
-                fingerprint = candidate_computation_fingerprint(candidate) if candidate else None
-                if fingerprint is not None and fingerprint in seen_fingerprints:
-                    validation = {
-                        "status": "failed",
-                        "stage": "diversity",
-                        "error": "candidate is semantically identical to another slot",
-                    }
-                    extra = None
-                if extra is not None:
-                    seen_fingerprints.add(fingerprint)
-                version_dir = round_dir / "candidates" / slot / "version_01"
-                _save_candidate(version_dir, submission=submission, candidate=candidate, validation=validation)
-                if extra is not None:
-                    np.save(version_dir / "features.npy", extra, allow_pickle=False)
-                current["slots"][slot] = {
-                    "status": "validated" if extra is not None else "failed",
-                    "version": 1, "submission": submission, "candidate": candidate,
-                    "validation": validation,
-                    "computation_fingerprint": fingerprint,
-                    "directory": str(version_dir),
-                }
             current["phase"] = "preevaluate" if all(v["status"] == "validated" for v in current["slots"].values()) else "repair"
             _write_json(output / "state.json", state)
             continue

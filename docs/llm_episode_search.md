@@ -72,6 +72,20 @@ Resume:
   --resume '<RESULTS_LLM_EPISODE_SEARCH_RUN>'
 ```
 
+Omitting the two limits on resume keeps their saved values. To add budget
+without resetting the already-used rounds or repairs, pass larger totals:
+
+```powershell
+& 'C:\Users\user\anaconda3\envs\LLM_HRL\python.exe' .\run_llm_episode_search.py `
+  --resume '<RESULTS_LLM_EPISODE_SEARCH_RUN>' `
+  --max-search-rounds 8 `
+  --max-repairs-per-round 10
+```
+
+Saved limits cannot be reduced. Extending a completed search starts the next
+round from the saved pre-evaluation or training/evaluation feedback and does not
+repeat an earlier round.
+
 The four complete stage templates are under `prompts/llm_episode_search_*.txt`;
 the common background is added to every request. Each call saves its expanded
 prompt, request plan, token budget, and raw response. State distinguishes
@@ -81,4 +95,14 @@ historical-best states.
 Training retains the formal Dinkelbach update; the fixed screening lambda is not
 imposed on training. LLM training runs additionally write
 `llm_training_episode_metrics.jsonl` with base/extra/combined reward and
-beta-weighted per-feature episode sums. This does not replace canonical history.
+beta-weighted per-feature episode sums after every completed episode. Resume
+reconciles this file to the selected checkpoint before continuing, so rows after
+that checkpoint are re-created exactly once. A legacy interrupted run that never
+saved its earlier episode rows cannot fabricate them: complete 100-episode block
+summaries stop with an explicit missing-range error. This does not replace
+canonical history.
+
+Before a formal model request, the search binds the explicit baseline run,
+episode-1500 checkpoint provenance, 100-row fixed-8-RoI evaluation, and shared
+manifest/scenario order. Dry-run remains prompt-only and records that this
+preflight was not performed.
