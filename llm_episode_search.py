@@ -102,6 +102,12 @@ CHECKPOINT_RESTART_STATE_SOURCE_REVISION = (
 CHECKPOINT_RESTART_RECOVERY_FIX_SOURCE_REVISION = (
     "4015da2e7bcb1b565452e092552725fca546bd7e"
 )
+EPISODE_EVALUATION_RECOVERY_SOURCE_REVISION = (
+    "6bd4675a43fea09e745b806bd7517068314bcebb"
+)
+PRETRAINING_SELECTION_RULE_VERSION = (
+    "uav-hrl-episode-search-historical-training-threshold-v2"
+)
 
 ROOT = Path(__file__).resolve().parent
 COMMON_TEMPLATE = ROOT / "prompts" / "llm_episode_search_common.txt"
@@ -479,6 +485,9 @@ def evaluate_candidates(
     beta: float,
     ee_tolerance: float = DEFAULT_EE_TOLERANCE,
     reward_tolerance: float = DEFAULT_REWARD_TOLERANCE,
+    threshold_score: float | None = None,
+    threshold_source: dict[str, Any] | None = None,
+    training_history: Iterable[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     baseline_components = episode_reward_components(
         dataset, evaluation_lambda=evaluation_lambda, beta=beta
@@ -490,6 +499,27 @@ def evaluate_candidates(
         ee_tolerance=ee_tolerance,
         reward_tolerance=reward_tolerance,
     )
+    if threshold_score is None and threshold_source is None:
+        threshold_context = _pretraining_threshold_context(
+            {"pretraining_training_history": list(training_history or [])},
+            float(baseline_score["score"]),
+        )
+        threshold = float(threshold_context["score"])
+        source = threshold_context["source"]
+    else:
+        threshold = (
+            float(baseline_score["score"])
+            if threshold_score is None
+            else float(threshold_score)
+        )
+        source = copy.deepcopy(threshold_source) if threshold_source else {
+            "kind": "baseline",
+            "candidate_id": None,
+            "round": None,
+            "score": float(baseline_score["score"]),
+        }
+    if not math.isfinite(threshold) or threshold < float(baseline_score["score"]):
+        raise EpisodeSearchError("pretraining threshold is below the baseline score")
     reports: dict[str, Any] = {}
     for slot in EXPECTED_CANDIDATE_IDS:
         candidate = candidates[slot]
@@ -510,6 +540,8 @@ def evaluate_candidates(
             reward_tolerance=reward_tolerance,
         )
         score["strictly_exceeds_baseline"] = bool(score["score"] > baseline_score["score"])
+        score["threshold_difference"] = float(score["score"] - threshold)
+        score["strictly_exceeds_threshold"] = bool(score["score"] > threshold)
         prioritized_examples: list[list[dict[str, Any]]] = [[], []]
         candidate_reward = components["combined_reward"]
         baseline_reward = baseline_components["base_reward"]
@@ -587,7 +619,8 @@ def evaluate_candidates(
         score["feature_weights"] = weights.tolist()
         reports[slot] = {"ordering": score, "episode_components": components}
     eligible = [
-        slot for slot in EXPECTED_CANDIDATE_IDS if reports[slot]["ordering"]["strictly_exceeds_baseline"]
+        slot for slot in EXPECTED_CANDIDATE_IDS
+        if reports[slot]["ordering"]["strictly_exceeds_threshold"]
     ]
     selected = max(
         eligible,
@@ -607,11 +640,22 @@ def evaluate_candidates(
             "reward_tolerance": float(reward_tolerance),
         },
         "baseline": baseline_score,
+        "pretraining_threshold": {
+            "score": threshold,
+            "source": source,
+            "strict_comparison": True,
+            "comparison_tolerance": 0.0,
+            "history_includes_only_candidates_sent_to_training": True,
+        },
         "candidates": {
             slot: reports[slot]["ordering"] for slot in EXPECTED_CANDIDATE_IDS
         },
         "selected_candidate_id": selected,
-        "selection_rule": "highest unrounded score strictly above baseline; stable slot order breaks ties",
+        "selection_rule": (
+            "highest unrounded score strictly above the pre-batch maximum of "
+            "baseline and candidates previously sent to training; stable slot "
+            "order breaks ties"
+        ),
         "lipschitz_evaluation_performed": False,
     }
     return {"report": serializable, "components": reports, "selected_candidate_id": selected}
@@ -957,10 +1001,144 @@ def _call_model(
 def _public_score_report(report: dict[str, Any]) -> dict[str, Any]:
     return {
         "baseline": report["baseline"],
+        "pretraining_threshold": report.get("pretraining_threshold"),
         "candidates": report["candidates"],
         "selected_candidate_id": report["selected_candidate_id"],
         "selection_rule": report["selection_rule"],
     }
+
+
+def _pretraining_threshold_context(
+    state: dict[str, Any], baseline_score: float
+) -> dict[str, Any]:
+    baseline = float(baseline_score)
+    if not math.isfinite(baseline):
+        raise EpisodeSearchError("baseline pretraining score is non-finite")
+    history = state.get("pretraining_training_history") or []
+    seen = set()
+    best = {
+        "kind": "baseline",
+        "candidate_id": None,
+        "round": None,
+        "score": baseline,
+    }
+    for event in history:
+        event_id = event.get("event_id")
+        if not event_id or event_id in seen:
+            raise EpisodeSearchError("pretraining training history is duplicated or incomplete")
+        seen.add(event_id)
+        score = float(event.get("score"))
+        if not math.isfinite(score):
+            raise EpisodeSearchError("pretraining training history contains a non-finite score")
+        if score > float(best["score"]):
+            best = {
+                "kind": "trained_candidate",
+                "candidate_id": event["candidate_id"],
+                "round": int(event["round"]),
+                "candidate_version": int(event["candidate_version"]),
+                "candidate_hash": event["candidate_hash"],
+                "score": score,
+                "event_id": event_id,
+            }
+    return {"score": float(best["score"]), "source": best}
+
+
+def _record_candidate_sent_to_training(
+    state: dict[str, Any], current: dict[str, Any]
+) -> dict[str, Any]:
+    selected = current["selected_candidate_id"]
+    slot = current["slots"][selected]
+    evaluation = current["evaluation"]
+    score = float(evaluation["candidates"][selected]["score"])
+    identity = {
+        "round": int(current["round"]),
+        "candidate_id": selected,
+        "candidate_version": int(slot["version"]),
+        "candidate_hash": _sha256_json(slot["candidate"]),
+        "score": score,
+    }
+    event_id = "training-selection-" + _sha256_json(identity)[:16]
+    event = {
+        "schema_version": "uav-hrl-episode-search-training-selection-v1",
+        "event_id": event_id,
+        **identity,
+        "recorded_at_utc": datetime.now(timezone.utc).isoformat(),
+    }
+    history = state.setdefault("pretraining_training_history", [])
+    matches = [item for item in history if item.get("event_id") == event_id]
+    if matches:
+        if any(
+            {key: item.get(key) for key in identity} != identity
+            for item in matches
+        ):
+            raise EpisodeSearchError("training selection history identity changed")
+        return matches[0]
+    history.append(event)
+    return event
+
+
+def _format_threshold_source(source: dict[str, Any]) -> str:
+    if source.get("kind") == "baseline":
+        return "original reward baseline"
+    return (
+        f"{source.get('candidate_id')} from round {source.get('round')} "
+        f"(score={float(source.get('score')):.12g})"
+    )
+
+
+def _candidate_score_table(report: dict[str, Any]) -> str:
+    threshold = float(report["pretraining_threshold"]["score"])
+    rows = []
+    for slot in EXPECTED_CANDIDATE_IDS:
+        score = float(report["candidates"][slot]["score"])
+        rows.append(
+            f"- {slot}: {100.0 * score:.6f}% "
+            f"({100.0 * (score - threshold):+.6f} percentage points; "
+            f"passed={str(score > threshold).lower()})"
+        )
+    return "\n".join(rows)
+
+
+def _apply_pretraining_threshold_to_report(
+    report: dict[str, Any], state: dict[str, Any]
+) -> str | None:
+    context = _pretraining_threshold_context(
+        state, float(report["baseline"]["score"])
+    )
+    threshold = float(context["score"])
+    report["pretraining_threshold"] = {
+        "score": threshold,
+        "source": context["source"],
+        "strict_comparison": True,
+        "comparison_tolerance": 0.0,
+        "history_includes_only_candidates_sent_to_training": True,
+    }
+    eligible = []
+    for slot in EXPECTED_CANDIDATE_IDS:
+        candidate = report["candidates"][slot]
+        score = float(candidate["score"])
+        candidate.setdefault(
+            "strictly_exceeds_baseline",
+            score > float(report["baseline"]["score"]),
+        )
+        candidate["threshold_difference"] = float(score - threshold)
+        candidate["strictly_exceeds_threshold"] = bool(score > threshold)
+        if score > threshold:
+            eligible.append(slot)
+    selected = max(
+        eligible,
+        key=lambda slot: (
+            float(report["candidates"][slot]["score"]),
+            -EXPECTED_CANDIDATE_IDS.index(slot),
+        ),
+        default=None,
+    )
+    report["selected_candidate_id"] = selected
+    report["selection_rule"] = (
+        "highest unrounded score strictly above the pre-batch maximum of baseline "
+        "and candidates previously sent to training; stable slot order breaks ties"
+    )
+    return selected
 
 
 def _evaluation_feedback(result: dict[str, Any] | None) -> dict[str, Any] | None:
@@ -1221,6 +1399,24 @@ def _revision_transition_allows_resume(
         and restart_transition.get("reason")
         == "checkpoint_path_shortening_restart_from_episode_1"
     )
+    evaluation_transition = state.get(
+        "episode_evaluation_threshold_recovery_transition"
+    ) or {}
+    managed_evaluation_recovery = bool(
+        evaluation_transition.get("source_git_sha")
+        == EPISODE_EVALUATION_RECOVERY_SOURCE_REVISION
+        and evaluation_transition.get("target_git_sha") == current_git_sha
+        and evaluation_transition.get("status") == "compatible"
+        and evaluation_transition.get("reason")
+        == "short_evaluation_paths_and_historical_pretraining_threshold"
+    )
+    bounded_evaluation_recovery = bool(
+        not evaluation_transition
+        and current_git_sha != EPISODE_EVALUATION_RECOVERY_SOURCE_REVISION
+        and recovery_fix_transition.get("target_git_sha")
+        == EPISODE_EVALUATION_RECOVERY_SOURCE_REVISION
+        and recovery_fix_transition.get("status") == "compatible"
+    )
     return (
         numeric_transition
         or initialization_transition
@@ -1228,6 +1424,8 @@ def _revision_transition_allows_resume(
         or legacy_restart_transition
         or managed_recovery_fix
         or bounded_recovery_fix
+        or managed_evaluation_recovery
+        or bounded_evaluation_recovery
         or bool(
             restart_transition.get("source_git_sha")
             == RESTARTABLE_CHECKPOINT_PATH_RECOVERY_REVISION
@@ -1237,6 +1435,108 @@ def _revision_transition_allows_resume(
             == "checkpoint_path_shortening_restart_from_episode_1"
         )
     )
+
+
+def _ensure_pretraining_selection_state(
+    state: dict[str, Any], *, output: Path, target_git_sha: str,
+    backup_state: dict[str, Any] | None = None,
+) -> None:
+    """Initialize or migrate the threshold history without changing old reports."""
+
+    if state.get("pretraining_selection_rule_version") == PRETRAINING_SELECTION_RULE_VERSION:
+        _pretraining_threshold_context(state, 0.0)
+        return
+    if state.get("pretraining_selection_rule_version") is not None:
+        raise EpisodeSearchError("pretraining selection rule version is incompatible")
+
+    backup_dir = output / "migrations" / "pretraining_threshold_v2"
+    backup = backup_dir / "state.before.json"
+    if not backup.exists():
+        backup_dir.mkdir(parents=True, exist_ok=True)
+        _write_json(backup, state if backup_state is None else backup_state)
+
+    candidates = list(state.get("rounds") or [])
+    current = state.get("current_round")
+    if isinstance(current, dict) and (
+        current.get("training") is not None
+        or current.get("phase") in {"train", "evaluate", "completed_trained"}
+    ):
+        candidates.append(current)
+    history_before = len(state.get("pretraining_training_history") or [])
+    for item in candidates:
+        selected = item.get("selected_candidate_id")
+        if selected is None:
+            continue
+        round_number = int(item["round"])
+        saved_path = output / f"round_{round_number:02d}" / "pretraining_evaluation.json"
+        if not saved_path.is_file():
+            raise EpisodeSearchError(
+                "cannot migrate pretraining threshold: saved evaluation report is missing"
+            )
+        saved = json.loads(saved_path.read_text(encoding="utf-8"))
+        if saved != item.get("evaluation") or saved.get("selected_candidate_id") != selected:
+            raise EpisodeSearchError(
+                "cannot migrate pretraining threshold: saved evaluation report changed"
+            )
+        item["pretraining_training_event"] = _record_candidate_sent_to_training(
+            state, item
+        )
+
+    effective_round = (
+        int(current["round"]) + 1
+        if isinstance(current, dict)
+        and current.get("phase") in {"train", "evaluate", "completed_trained"}
+        else int(state.get("search_round", 1))
+    )
+    if isinstance(current, dict) and current.get("phase") == "evaluate":
+        legacy_evaluation = output / f"round_{int(current['round']):02d}" / "evaluation"
+        if legacy_evaluation.exists():
+            legacy_value = str(legacy_evaluation.resolve())
+            legacy_outputs = current.setdefault(
+                "legacy_evaluation_output_directories", []
+            )
+            if legacy_value not in legacy_outputs:
+                legacy_outputs.append(legacy_value)
+            metadata_files = list(
+                legacy_evaluation.glob("**/paper_evaluation_metadata.json")
+            )
+            current.setdefault("legacy_evaluation_attempts", []).append(
+                {
+                    "status": (
+                        "complete_report_present"
+                        if metadata_files
+                        else "incomplete_report"
+                    ),
+                    "output_directory": legacy_value,
+                    "paper_evaluation_metadata": [
+                        str(path.resolve()) for path in metadata_files
+                    ],
+                    "reason": (
+                        None
+                        if metadata_files
+                        else "required paper evaluation metadata was not produced"
+                    ),
+                }
+            )
+        current.setdefault(
+            "evaluation_output_root",
+            str(_short_evaluation_output_root(output, int(current["round"]))),
+        )
+    state["pretraining_selection_rule_version"] = PRETRAINING_SELECTION_RULE_VERSION
+    state["pretraining_selection_effective_round"] = effective_round
+    state["episode_evaluation_threshold_recovery_transition"] = {
+        "schema_version": "uav-hrl-episode-evaluation-threshold-recovery-v1",
+        "status": "compatible",
+        "reason": "short_evaluation_paths_and_historical_pretraining_threshold",
+        "recorded_at_utc": datetime.now(timezone.utc).isoformat(),
+        "source_git_sha": EPISODE_EVALUATION_RECOVERY_SOURCE_REVISION,
+        "target_git_sha": target_git_sha,
+        "backup_state": str(backup),
+        "effective_round": effective_round,
+        "recovered_training_event_count": len(
+            state.get("pretraining_training_history") or []
+        ) - history_before,
+    }
 
 
 def _checkpoint_restart_operation_id(record: dict[str, Any]) -> str:
@@ -1323,6 +1623,33 @@ def _short_training_output_root(search_output: Path, round_number: int) -> Path:
         ).encode("utf-8")
     ).hexdigest()[:12]
     return (ROOT / "results" / "t" / digest).resolve()
+
+
+def _short_evaluation_output_root(search_output: Path, round_number: int) -> Path:
+    digest = hashlib.sha256(
+        f"{Path(search_output).resolve()}|evaluation".encode("utf-8")
+    ).hexdigest()[:12]
+    return (ROOT / "results" / "e" / digest / f"r{int(round_number):02d}").resolve()
+
+
+def _allocate_evaluation_attempt(current: dict[str, Any], root: Path) -> dict[str, Any]:
+    attempts = current.setdefault("evaluation_attempts", [])
+    attempt_number = len(attempts) + 1
+    directory = root / f"a{attempt_number:03d}"
+    if directory.exists():
+        raise EpisodeSearchError(
+            f"evaluation attempt directory already exists without a saved attempt: {directory}"
+        )
+    record = {
+        "attempt": attempt_number,
+        "status": "planned",
+        "output_directory": str(directory),
+        "created_at_utc": datetime.now(timezone.utc).isoformat(),
+    }
+    attempts.append(record)
+    current["evaluation_output_root"] = str(root)
+    current["evaluation_active_attempt"] = attempt_number
+    return record
 
 
 def _training_recovery_eligibility(
@@ -1900,10 +2227,12 @@ def run_episode_search(
     pending_checkpoint_path_restart = False
     pending_restart_state_migration = False
     pending_restart_recovery_fix_migration = False
+    pre_selection_migration_state = None
     if resume is not None:
         output = Path(resume).resolve()
         state_path = output / "state.json"
         state = json.loads(state_path.read_text(encoding="utf-8"))
+        pre_selection_migration_state = copy.deepcopy(state)
         if state.get("schema_version") != SEARCH_RUN_SCHEMA_VERSION:
             raise EpisodeSearchError(
                 "resume contract is incompatible; reviewer-design runs cannot be resumed as episode searches"
@@ -2070,6 +2399,9 @@ def run_episode_search(
             "rounds": [],
             "current_round": None,
             "best_trained_candidate": None,
+            "pretraining_selection_rule_version": PRETRAINING_SELECTION_RULE_VERSION,
+            "pretraining_selection_effective_round": 1,
+            "pretraining_training_history": [],
             "stop_reason": None,
             "settings": {
                 "episode_sources": [str(Path(value).resolve()) for value in episode_sources],
@@ -2151,6 +2483,14 @@ def run_episode_search(
             "status": "not_run_dry_run",
             "reason": "formal baseline inputs are optional during prompt-only dry-run",
         }
+    if state.get("pretraining_selection_rule_version") != PRETRAINING_SELECTION_RULE_VERSION:
+        _ensure_pretraining_selection_state(
+            state,
+            output=output,
+            target_git_sha=_git_sha(),
+            backup_state=pre_selection_migration_state,
+        )
+        _write_json(output / "state.json", state)
     if pending_training_recovery:
         _record_training_recovery_transition(
             state,
@@ -2362,24 +2702,37 @@ def run_episode_search(
                 beta=beta,
                 ee_tolerance=ee_tolerance,
                 reward_tolerance=reward_tolerance,
+                training_history=state.get("pretraining_training_history") or [],
+            )
+            evaluated["selected_candidate_id"] = _apply_pretraining_threshold_to_report(
+                evaluated["report"], state
             )
             current["evaluation"] = evaluated["report"]
             _write_json(round_dir / "pretraining_evaluation.json", evaluated["report"])
             _progress(
                 "pretraining scores: baseline="
-                f"{evaluated['report']['baseline']['score']:.6f}; "
+                f"{100.0 * evaluated['report']['baseline']['score']:.6f}%; "
+                "threshold="
+                f"{100.0 * evaluated['report']['pretraining_threshold']['score']:.6f}% "
+                f"from {_format_threshold_source(evaluated['report']['pretraining_threshold']['source'])}; "
                 + ", ".join(
-                    f"{slot}={evaluated['report']['candidates'][slot]['score']:.6f}"
+                    f"{slot}={100.0 * evaluated['report']['candidates'][slot]['score']:.6f}% "
+                    f"({100.0 * evaluated['report']['candidates'][slot]['threshold_difference']:+.6f} pp; "
+                    f"passed={evaluated['report']['candidates'][slot]['strictly_exceeds_threshold']})"
                     for slot in EXPECTED_CANDIDATE_IDS
                 )
             )
             selected = evaluated["selected_candidate_id"]
             if selected is None:
+                _progress(
+                    "no candidate strictly exceeded the current pretraining "
+                    "threshold; continuing with revision or pausing at the saved budget"
+                )
                 current["phase"] = "completed_no_training"
                 state["rounds"].append(copy.deepcopy(current))
                 if round_number >= max_search_rounds:
                     state["status"] = "completed_search_rounds_exhausted"
-                    state["stop_reason"] = "no candidate exceeded baseline pretraining score"
+                    state["stop_reason"] = "no candidate exceeded the historical pretraining threshold"
                     state["current_round"] = None
                     _write_json(output / "state.json", state)
                     return _result(state)
@@ -2428,11 +2781,17 @@ def run_episode_search(
                 },
             )
             current["approved_artifact"] = str(approved)
+            current["pretraining_training_event"] = _record_candidate_sent_to_training(
+                state, current
+            )
             current["phase"] = "train"
             _write_json(output / "state.json", state)
             continue
 
         if current["phase"] == "generate_from_preevaluation":
+            threshold_record = current["previous_preevaluation"][
+                "pretraining_threshold"
+            ]
             prompt = render_stage_prompt(
                 common,
                 PREEVALUATION_TEMPLATE,
@@ -2449,6 +2808,17 @@ def run_episode_search(
                         {slot: current["previous_preevaluation"]["candidates"][slot]["examples"] for slot in EXPECTED_CANDIDATE_IDS}, indent=2
                     ),
                     "BEST_TRAINED_CONTEXT": json.dumps(
+                        _best_trained_feedback(state.get("best_trained_candidate")),
+                        indent=2,
+                    ),
+                    "THRESHOLD": format(float(threshold_record["score"]), ".17g"),
+                    "THRESHOLD_SOURCE": _format_threshold_source(
+                        threshold_record["source"]
+                    ),
+                    "CANDIDATE_SCORE_TABLE": _candidate_score_table(
+                        current["previous_preevaluation"]
+                    ),
+                    "BEST_EE_DESIGN_REFERENCE": json.dumps(
                         _best_trained_feedback(state.get("best_trained_candidate")),
                         indent=2,
                     ),
@@ -2562,29 +2932,122 @@ def run_episode_search(
             continue
 
         if current["phase"] == "evaluate":
+            _progress(
+                "evaluation phase; using completed training run "
+                f"{current['training']['run_directory']}"
+            )
             if not evaluation_manifest or not baseline_run or not baseline_evaluation:
                 raise EpisodeSearchError(
                     "formal evaluation requires explicit baseline run, baseline results, and shared manifest"
                 )
-            result = evaluation_runner(
-                method_id=SEARCH_METHOD_ID,
-                run_directory=current["training"]["run_directory"],
-                checkpoint_episode=1500,
-                episodes=evaluation_episodes,
-                roi_count=8,
-                environment_size_m=(1000.0, 1000.0),
-                manifest=evaluation_manifest,
-                baseline_run=baseline_run,
-                baseline_evaluation=baseline_evaluation,
-                baseline_preflight=baseline_preflight,
-                output_directory=round_dir / "evaluation",
-            )
-            current["evaluation_result"] = result
+            from llm_episode_training import validate_saved_candidate_evaluation
+
+            result = current.get("evaluation_result")
+            reused = False
+            if isinstance(result, dict) and result.get("status") == "complete":
+                try:
+                    validate_saved_candidate_evaluation(
+                        result,
+                        method_id=SEARCH_METHOD_ID,
+                        run_directory=current["training"]["run_directory"],
+                        checkpoint_episode=1500,
+                        episodes=evaluation_episodes,
+                        roi_count=8,
+                        baseline_preflight=baseline_preflight,
+                    )
+                except Exception as exc:
+                    current.setdefault("evaluation_reuse_rejections", []).append(
+                        {
+                            "recorded_at_utc": datetime.now(timezone.utc).isoformat(),
+                            "evaluation_directory": result.get(
+                                "evaluation_directory"
+                            ),
+                            "reason": f"{type(exc).__name__}: {exc}",
+                        }
+                    )
+                    _progress(
+                        "saved evaluation is incomplete or incompatible; "
+                        "running a new evaluation attempt"
+                    )
+                    result = None
+                else:
+                    reused = True
+                    _progress(
+                        "reusing validated evaluation output at "
+                        f"{result['evaluation_directory']}"
+                    )
+            if not reused:
+                evaluation_root = Path(
+                    current.get("evaluation_output_root")
+                    or _short_evaluation_output_root(output, round_number)
+                ).resolve()
+                attempt = _allocate_evaluation_attempt(current, evaluation_root)
+                attempt["status"] = "running"
+                _write_json(output / "state.json", state)
+                _progress(
+                    "running evaluation attempt "
+                    f"{attempt['attempt']} at {attempt['output_directory']}"
+                )
+                try:
+                    result = evaluation_runner(
+                        method_id=SEARCH_METHOD_ID,
+                        run_directory=current["training"]["run_directory"],
+                        checkpoint_episode=1500,
+                        episodes=evaluation_episodes,
+                        roi_count=8,
+                        environment_size_m=(1000.0, 1000.0),
+                        manifest=evaluation_manifest,
+                        baseline_run=baseline_run,
+                        baseline_evaluation=baseline_evaluation,
+                        baseline_preflight=baseline_preflight,
+                        output_directory=attempt["output_directory"],
+                    )
+                except Exception as exc:
+                    attempt.update(
+                        {
+                            "status": "failed",
+                            "failed_at_utc": datetime.now(timezone.utc).isoformat(),
+                            "error_type": type(exc).__name__,
+                            "error": str(exc),
+                            "command": getattr(exc, "command", None),
+                            "combined_output": getattr(exc, "output", None),
+                            "path_preflight": getattr(
+                                exc, "path_preflight", None
+                            ),
+                        }
+                    )
+                    current["evaluation_result"] = {
+                        "status": "failed",
+                        "reason": f"{type(exc).__name__}: {exc}",
+                        "attempt": int(attempt["attempt"]),
+                        "output_directory": attempt["output_directory"],
+                        "command": attempt.get("command"),
+                    }
+                    state["status"] = "paused_evaluation"
+                    state["stop_reason"] = current["evaluation_result"]["reason"]
+                    _write_json(output / "state.json", state)
+                    return _result(state)
+                current["evaluation_result"] = result
+                attempt.update(
+                    {
+                        "status": result.get("status", "unknown"),
+                        "completed_at_utc": datetime.now(timezone.utc).isoformat(),
+                        "actual_output_directory": result.get(
+                            "evaluation_directory", attempt["output_directory"]
+                        ),
+                        "command": result.get("command"),
+                    }
+                )
             if result.get("status") != "complete":
                 state["status"] = "paused_evaluation"
                 state["stop_reason"] = result.get("reason", "evaluation incomplete")
                 _write_json(output / "state.json", state)
                 return _result(state)
+            if not reused:
+                _progress(
+                    "evaluation output validated at "
+                    f"{result.get('evaluation_directory', attempt['output_directory'])}"
+                )
             _progress(
                 "evaluation mean episode EE="
                 f"{float(result['mean_episode_energy_efficiency_mbit_per_j']):.9g}"
@@ -2627,6 +3090,24 @@ def run_episode_search(
 
         if current["phase"] == "generate_from_training":
             latest = state["rounds"][-1]
+            latest_pretraining_feedback = copy.deepcopy(latest["evaluation"])
+            if not latest_pretraining_feedback.get("pretraining_threshold"):
+                _apply_pretraining_threshold_to_report(
+                    latest_pretraining_feedback,
+                    {
+                        "pretraining_training_history": [
+                            event
+                            for event in state.get(
+                                "pretraining_training_history", []
+                            )
+                            if int(event["round"]) < int(latest["round"])
+                        ]
+                    },
+                )
+            threshold_context = _pretraining_threshold_context(
+                state,
+                float(latest_pretraining_feedback["baseline"]["score"]),
+            )
             prompt = render_stage_prompt(
                 common,
                 TRAINING_TEMPLATE,
@@ -2654,6 +3135,23 @@ def run_episode_search(
                         {"round": item["round"], "selected": item.get("selected_candidate_id"), "updated_best": item.get("updated_best")}
                         for item in state["rounds"]
                     ], indent=2),
+                    "PRETRAINING_THRESHOLD_CONTEXT": json.dumps(
+                        {
+                            "baseline_score": float(
+                                latest_pretraining_feedback["baseline"]["score"]
+                            ),
+                            "score": threshold_context["score"],
+                            "source": threshold_context["source"],
+                        },
+                        indent=2,
+                    ),
+                    "LATEST_PRETRAINING_SCORE_REPORT": json.dumps(
+                        _public_score_report(latest_pretraining_feedback), indent=2
+                    ),
+                    "BEST_EE_DESIGN_REFERENCE": json.dumps(
+                        _best_trained_feedback(state["best_trained_candidate"]),
+                        indent=2,
+                    ),
                 },
             )
             call_number = state["model_calls"] + 1

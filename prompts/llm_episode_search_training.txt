@@ -1,5 +1,14 @@
 A selected candidate has completed training and evaluation.
 
+Current pretraining threshold and source:
+{{PRETRAINING_THRESHOLD_CONTEXT}}
+
+Latest baseline and four-candidate pretraining scores, threshold differences, and pass states:
+{{LATEST_PRETRAINING_SCORE_REPORT}}
+
+Design reference with the best historical mean evaluation EE:
+{{BEST_EE_DESIGN_REFERENCE}}
+
 Latest trained candidate:
 {{LATEST_TRAINED_CANDIDATE}}
 

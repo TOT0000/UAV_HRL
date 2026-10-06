@@ -1,4 +1,15 @@
-All four candidates passed program validation. None exceeded the baseline episode-ordering score, so none was selected for training.
+All four candidates passed program validation. None exceeded the current pretraining threshold, so none was selected for training.
+
+None of the four candidates exceeded the current pretraining threshold.
+Current threshold: {{THRESHOLD}}
+Threshold source: {{THRESHOLD_SOURCE}}
+Candidate scores and differences from the threshold:
+{{CANDIDATE_SCORE_TABLE}}
+
+Design reference with the best historical mean evaluation EE (or absent):
+{{BEST_EE_DESIGN_REFERENCE}}
+
+Revise the candidates using the supplied evidence. The next batch must contain four executable candidates; only a candidate that strictly exceeds the threshold can proceed to training.
 
 Evaluation rules and scores:
 {{PRETRAINING_SCORE_REPORT}}

@@ -59,6 +59,13 @@ def build_parser():
         help="explicit target UAV for uav_trajectory_snapshots",
     )
     parser.add_argument("--output-root", default="results/paper_evaluations")
+    parser.add_argument(
+        "--output-directory",
+        help=(
+            "explicit directory for a single flattened evaluation point; "
+            "ordinary evaluations should continue to use --output-root"
+        ),
+    )
     return parser
 
 
@@ -140,6 +147,8 @@ def main(argv=None):
     ):
         raise ValueError("a pure-random method has no checkpoint episode selector")
     if len(checkpoint_episodes) > 1:
+        if args.output_directory is not None:
+            raise ValueError("--output-directory requires a single checkpoint")
         if args.suite != "fixed_roi":
             raise ValueError(
                 "multi-checkpoint paper evaluation is available only for fixed_roi"
@@ -192,6 +201,8 @@ def main(argv=None):
         episode_seconds=args.episode_seconds,
         target_uav_id=args.target_uav_id,
         output_root=args.output_root,
+        output_directory=args.output_directory,
+        flatten_single_point=args.output_directory is not None,
         checkpoint_episode=checkpoint_episodes[0],
         roi_counts=roi_counts,
         environment_sizes_m=environment_sizes_m,

@@ -135,7 +135,11 @@ G_i is undiscounted. The pre-training score measures whether higher-EE episodes 
 
 All candidates and the baseline use the same episodes and fixed evaluation lambda. Actual training retains the original lambda update procedure.
 
-A candidate must exceed the baseline pre-training score to be selected for training. Among eligible candidates, the highest-scoring candidate is trained.
+Pretraining selection:
+All candidates are evaluated using the same episode dataset and scoring settings. The acceptance threshold is the highest ranking consistency achieved by the original reward or any candidate previously sent for training in this search. A new candidate must strictly exceed this threshold to be eligible for training. Among eligible candidates in the current batch, the host selects the one with the highest ranking consistency.
+
+Revision reference:
+The candidate used as the design reference is the one with the best historical mean evaluation EE. This candidate may differ from the candidate defining the pretraining threshold. Use the supplied training and evaluation feedback to revise the design while aiming to exceed the current pretraining threshold.
 
 Selected candidates are trained for 1500 episodes and evaluated on 100 shared scenarios with 8 RoIs in a 1000 × 1000 m area. Mean episode EE determines the best trained candidate.
 

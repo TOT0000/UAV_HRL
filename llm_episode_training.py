@@ -22,7 +22,19 @@ from training_checkpoint import CHECKPOINT_PROVENANCE_FIELDS
 
 
 class EpisodeTrainingError(RuntimeError):
-    pass
+    def __init__(
+        self, message, *, command=None, output=None, output_directory=None,
+        path_preflight=None,
+    ):
+        super().__init__(message)
+        self.command = list(command) if command is not None else None
+        self.output = output
+        self.output_directory = (
+            str(Path(output_directory).resolve())
+            if output_directory is not None
+            else None
+        )
+        self.path_preflight = path_preflight
 
 
 SEARCH_TRAINING_STATE_SCHEMA_VERSION = (
@@ -157,9 +169,64 @@ def _run(command: list[str], *, cwd: Path) -> dict[str, Any]:
     if returncode:
         raise EpisodeTrainingError(
             f"command failed ({returncode}): {' '.join(command)}\n"
-            f"combined output:\n{output[-8000:]}"
+            f"combined output:\n{output[-8000:]}",
+            command=command,
+            output=output,
         )
     return _last_json_object(output)
+
+
+WINDOWS_PORTABLE_PATH_LIMIT = 240
+EVALUATION_OUTPUT_FILENAMES = (
+    "scenario_manifest.json",
+    "packet_outcomes.jsonl",
+    "packet_routing_diagnostics.json",
+    "packet_routing_diagnostics.csv",
+    "terminal_uav_distribution.csv",
+    "per_episode.csv",
+    "per_episode.jsonl",
+    "per_training_seed_summary.csv",
+    "per_training_seed_summary.json",
+    "canonical_per_seed_aggregation.json",
+    "canonical_cross_seed_aggregation.json",
+    "run_metadata.json",
+    "aggregated_plot_data.json",
+    "aggregated_plot_data.csv",
+    "paper_evaluation_metadata.json",
+)
+
+
+def preflight_candidate_evaluation_output(
+    output_directory: str | Path,
+    *,
+    portable_path_limit: int = WINDOWS_PORTABLE_PATH_LIMIT,
+) -> dict[str, Any]:
+    """Validate the flattened fixed-RoI output paths before simulation."""
+
+    output = Path(output_directory).resolve()
+    paths = [output / name for name in EVALUATION_OUTPUT_FILENAMES]
+    longest = max(paths, key=lambda item: len(str(item)))
+    result = {
+        "schema_version": "uav-hrl-episode-search-evaluation-path-preflight-v1",
+        "status": "passed",
+        "output_directory": str(output),
+        "portable_path_limit": int(portable_path_limit),
+        "paths": [str(path) for path in paths],
+        # The fixed-RoI evaluator's writers are direct writes, not atomic temp writes.
+        "temporary_paths": [],
+        "longest_path": str(longest),
+        "longest_path_length": len(str(longest)),
+    }
+    if result["longest_path_length"] > int(portable_path_limit):
+        result["status"] = "failed"
+        raise EpisodeTrainingError(
+            "candidate evaluation output exceeds the portable Windows path "
+            f"limit before simulation: {result['longest_path_length']} > "
+            f"{int(portable_path_limit)}: {longest}",
+            output_directory=output,
+            path_preflight=result,
+        )
+    return result
 
 
 def _write_json_atomic(path: Path, value: dict[str, Any]) -> None:
@@ -943,28 +1010,36 @@ def run_candidate_evaluation(
         raise EpisodeTrainingError("formal search evaluation requires a 1000x1000 m environment")
     root = Path(__file__).resolve().parent
     output = Path(output_directory).resolve()
-    result = _run(
-        [
-            sys.executable,
-            str(root / "run_paper_evaluation.py"),
-            method_id,
-            "--run-dir",
-            str(Path(run_directory).resolve()),
-            "--suite",
-            "fixed_roi",
-            "--roi-count",
-            str(int(roi_count)),
-            "--episodes",
-            str(int(episodes)),
-            "--checkpoint-episode",
-            str(int(checkpoint_episode)),
-            "--manifest",
-            str(Path(manifest).resolve()),
-            "--output-root",
-            str(output),
-        ],
-        cwd=root,
-    )
+    path_preflight = preflight_candidate_evaluation_output(output)
+    command = [
+        sys.executable,
+        str(root / "run_paper_evaluation.py"),
+        method_id,
+        "--run-dir",
+        str(Path(run_directory).resolve()),
+        "--suite",
+        "fixed_roi",
+        "--roi-count",
+        str(int(roi_count)),
+        "--episodes",
+        str(int(episodes)),
+        "--checkpoint-episode",
+        str(int(checkpoint_episode)),
+        "--manifest",
+        str(Path(manifest).resolve()),
+        "--output-directory",
+        str(output),
+    ]
+    try:
+        result = _run(command, cwd=root)
+    except EpisodeTrainingError as exc:
+        if exc.output_directory is None:
+            exc.output_directory = str(output)
+        if exc.command is None:
+            exc.command = command
+        if exc.path_preflight is None:
+            exc.path_preflight = path_preflight
+        raise
     point = result["points"][0]
     if int(point.get("checkpoint_episode", -1)) != int(checkpoint_episode):
         raise EpisodeTrainingError("candidate evaluation used the wrong checkpoint")
@@ -1062,6 +1137,8 @@ def run_candidate_evaluation(
     return {
         "status": "complete",
         "method_id": method_id,
+        "run_directory": str(Path(run_directory).resolve()),
+        "checkpoint_episode": int(checkpoint_episode),
         "evaluation_directory": result["output_directory"],
         "scenario_manifest_hash": point["scenario_manifest_hash"],
         "scenario_manifest_path": point["scenario_manifest_path"],
@@ -1080,5 +1157,55 @@ def run_candidate_evaluation(
         ),
         "candidate_metrics": candidate_metrics,
         "baseline_metrics": baseline_metrics,
+        "path_preflight": path_preflight,
+        "command": command,
         "raw_result": result,
     }
+
+
+def validate_saved_candidate_evaluation(
+    result: dict[str, Any],
+    *,
+    method_id: str,
+    run_directory: str | Path,
+    checkpoint_episode: int,
+    episodes: int,
+    roi_count: int,
+    baseline_preflight: dict[str, Any],
+) -> None:
+    """Reject incomplete or mismatched saved evaluation results before reuse."""
+
+    if not isinstance(result, dict) or result.get("status") != "complete":
+        raise EpisodeTrainingError("saved candidate evaluation is not complete")
+    if result.get("method_id") != method_id:
+        raise EpisodeTrainingError("saved candidate evaluation method changed")
+    if Path(result.get("run_directory", "")).resolve() != Path(run_directory).resolve():
+        raise EpisodeTrainingError("saved candidate evaluation training run changed")
+    if int(result.get("checkpoint_episode", -1)) != int(checkpoint_episode):
+        raise EpisodeTrainingError("saved candidate evaluation checkpoint changed")
+    if int(result.get("episode_count", -1)) != int(episodes):
+        raise EpisodeTrainingError("saved candidate evaluation episode count changed")
+    if int(result.get("roi_count", -1)) != int(roi_count):
+        raise EpisodeTrainingError("saved candidate evaluation RoI count changed")
+    if result.get("scenario_manifest_hash") != baseline_preflight.get(
+        "manifest_content_hash"
+    ):
+        raise EpisodeTrainingError("saved candidate evaluation manifest changed")
+    raw = result.get("raw_result") or {}
+    points = raw.get("points") or []
+    if len(points) != 1:
+        raise EpisodeTrainingError("saved candidate evaluation lacks one complete point")
+    rows = _episode_rows(
+        (points[0].get("outputs") or {}).get("per_episode_jsonl"),
+        expected_count=episodes,
+    )
+    if [row["scenario_id"] for row in rows] != baseline_preflight.get("scenario_ids"):
+        raise EpisodeTrainingError("saved candidate evaluation scenario order changed")
+    directory = Path(result.get("evaluation_directory", ""))
+    required = [directory / name for name in EVALUATION_OUTPUT_FILENAMES]
+    missing = [str(path) for path in required if not path.is_file()]
+    if missing:
+        raise EpisodeTrainingError(
+            "saved candidate evaluation is missing required outputs: "
+            + ", ".join(missing[:3])
+        )

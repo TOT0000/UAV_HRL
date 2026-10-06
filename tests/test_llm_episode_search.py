@@ -515,10 +515,17 @@ def test_mock_training_evaluation_use_formal_counts_and_preserve_historical_best
     monkeypatch.setattr(search, "validate_search_candidate", validate)
 
     def evaluated(_dataset, _candidates, _features, **_kwargs):
+        historical = bool(_kwargs.get("training_history"))
         candidate_rows = {
             slot: {
-                "score": 0.75 if slot == "candidate_2" else 0.5,
-                "strictly_exceeds_baseline": slot == "candidate_2",
+                "score": (
+                    0.80 if historical and slot == "candidate_1"
+                    else 0.75 if not historical and slot == "candidate_2"
+                    else 0.5
+                ),
+                "strictly_exceeds_baseline": slot in {
+                    "candidate_1", "candidate_2"
+                },
                 "examples": [],
             }
             for slot in search.EXPECTED_CANDIDATE_IDS
@@ -2055,6 +2062,9 @@ def test_completed_search_extends_from_saved_preevaluation_without_repeating_rou
     assert state["model_calls"] == 2
     assert "Evaluation rules and scores" in second_client.prompts[0]
     assert "candidate_1" in second_client.prompts[0]
+    assert "None of the four candidates exceeded the current pretraining threshold" in second_client.prompts[0]
+    assert "Threshold source: original reward baseline" in second_client.prompts[0]
+    assert "percentage points; passed=false" in second_client.prompts[0]
 
 
 def test_baseline_preflight_binds_run_checkpoint_manifest_and_episode_rows(tmp_path, monkeypatch):
@@ -2195,3 +2205,262 @@ def test_baseline_preflight_failure_happens_before_model_call(tmp_path, monkeypa
         )
     )
     assert failure["status"] == "failed"
+
+
+def test_historical_pretraining_threshold_is_strict_and_keeps_ee_best_separate():
+    state = {
+        "pretraining_training_history": [
+            {
+                "event_id": "training-selection-a",
+                "candidate_id": "candidate_1",
+                "candidate_version": 2,
+                "candidate_hash": "hash-a",
+                "round": 1,
+                "score": 0.80,
+            }
+        ],
+        "best_trained_candidate": {
+            "candidate_id": "candidate_4",
+            "round": 3,
+            "mean_episode_energy_efficiency_mbit_per_j": 1.25,
+        },
+    }
+    report = {
+        "baseline": {"score": 0.70},
+        "candidates": {
+            "candidate_1": {"score": 0.79, "examples": []},
+            "candidate_2": {"score": 0.80, "examples": []},
+            "candidate_3": {"score": 0.81, "examples": []},
+            "candidate_4": {"score": 0.72, "examples": []},
+        },
+    }
+    selected = search._apply_pretraining_threshold_to_report(report, state)
+    assert selected == "candidate_3"
+    assert report["pretraining_threshold"]["score"] == 0.80
+    assert report["pretraining_threshold"]["source"]["candidate_id"] == "candidate_1"
+    assert report["candidates"]["candidate_2"]["strictly_exceeds_threshold"] is False
+    assert report["candidates"]["candidate_3"]["strictly_exceeds_threshold"] is True
+    assert search._best_trained_feedback(state["best_trained_candidate"])[
+        "candidate_id"
+    ] == "candidate_4"
+
+    baseline_only = {"pretraining_training_history": []}
+    assert search._pretraining_threshold_context(baseline_only, 0.70) == {
+        "score": 0.70,
+        "source": {
+            "kind": "baseline",
+            "candidate_id": None,
+            "round": None,
+            "score": 0.70,
+        },
+    }
+
+
+def test_candidate_evaluation_path_preflight_covers_real_filenames():
+    root = Path(
+        r"C:\Users\user\Desktop\project\YM_Post_Disaster_Training\UAV_HRL"
+    ) / "results" / "e" / "2405a2d6abcd" / "r01" / "a001"
+    report = episode_training.preflight_candidate_evaluation_output(root)
+    assert report["status"] == "passed"
+    assert report["longest_path_length"] <= 240
+    assert any(
+        path.endswith("packet_routing_diagnostics.json")
+        for path in report["paths"]
+    )
+    assert any(path.endswith("paper_evaluation_metadata.json") for path in report["paths"])
+    with pytest.raises(episode_training.EpisodeTrainingError, match="before simulation"):
+        episode_training.preflight_candidate_evaluation_output(
+            root / ("x" * 120), portable_path_limit=240
+        )
+
+
+def test_evaluation_failure_is_persisted_and_resume_only_retries_evaluation(
+    tmp_path, monkeypatch
+):
+    output = (tmp_path / "evaluate-resume").resolve()
+    output.mkdir()
+    dataset = _dataset()
+    preflight = _preflight_fixture()
+    config = search._role_config(
+        provider="openai",
+        model="fixture/model",
+        base_url=None,
+        context_length=50000,
+        max_output_tokens=4096,
+        temperature=0.3,
+        seed=20260817,
+        reasoning_effort=None,
+        timeout=10,
+        connect_timeout=10,
+        total_timeout=20,
+        progress_interval=1,
+    )
+    evaluation = {
+        "baseline": {"score": 0.5},
+        "candidates": {
+            slot: {"score": 0.75 if slot == "candidate_1" else 0.25}
+            for slot in search.EXPECTED_CANDIDATE_IDS
+        },
+        "selected_candidate_id": "candidate_1",
+    }
+    state = {
+        "schema_version": search.SEARCH_RUN_SCHEMA_VERSION,
+        "prompt_version": search.SEARCH_PROMPT_VERSION,
+        "status": "running",
+        "git_sha": "fixture-revision",
+        "output_directory": str(output),
+        "search_round": 1,
+        "model_calls": 3,
+        "rounds": [],
+        "best_trained_candidate": None,
+        "pretraining_selection_rule_version": search.PRETRAINING_SELECTION_RULE_VERSION,
+        "pretraining_selection_effective_round": 1,
+        "pretraining_training_history": [],
+        "current_round": {
+            "round": 1,
+            "phase": "evaluate",
+            "repair_calls": 2,
+            "selected_candidate_id": "candidate_1",
+            "slots": {
+                "candidate_1": {
+                    "candidate": {"candidate_name": "fixture"},
+                    "submission": {"candidate_id": "candidate_1"},
+                }
+            },
+            "evaluation": evaluation,
+            "approved_artifact": str(tmp_path / "fixture-artifact"),
+            "training": {
+                "status": "complete",
+                "run_directory": str(tmp_path / "trained"),
+            },
+            "evaluation_result": None,
+        },
+        "settings": {
+            "episode_sources": ["fixture-source"],
+            "model": config,
+            "beta": 1.0,
+            "worker_timeout": 10.0,
+            "evaluation_lambda": {"value": 0.0},
+            "max_search_rounds": 1,
+            "max_repairs_per_round": 5,
+            "ee_tolerance": 1e-12,
+            "reward_tolerance": 1e-12,
+            "baseline_run": "fixture-baseline",
+            "baseline_evaluation": "fixture-evaluation",
+            "evaluation_manifest": "fixture-manifest",
+            "train_episodes": 1500,
+            "evaluation_episodes": 100,
+        },
+        "dataset_provenance": dataset.provenance,
+        "baseline_preflight": preflight,
+    }
+    (output / "state.json").write_text(json.dumps(state), encoding="utf-8")
+    monkeypatch.setattr(search, "_git_sha", lambda: "fixture-revision")
+    monkeypatch.setattr(search, "load_complete_episode_dataset", lambda _paths: dataset)
+    monkeypatch.setattr(search, "build_constants", lambda _metadata: {})
+    monkeypatch.setattr(search, "render_common_prompt", lambda **_kwargs: "common")
+    _patch_preflight(monkeypatch)
+    forbidden = lambda **_kwargs: (_ for _ in ()).throw(
+        AssertionError("generation/training must not run")
+    )
+    calls = []
+
+    def fail_evaluation(**kwargs):
+        calls.append(kwargs)
+        raise episode_training.EpisodeTrainingError(
+            "fixture evaluation failure",
+            command=["python", "run_paper_evaluation.py"],
+            output="fixture combined output",
+        )
+
+    failed = search.run_episode_search(
+        resume=output,
+        client=SimpleNamespace(chat=forbidden),
+        training_runner=forbidden,
+        evaluation_runner=fail_evaluation,
+    )
+    assert failed["status"] == "paused_evaluation"
+    saved = json.loads((output / "state.json").read_text(encoding="utf-8"))
+    assert saved["current_round"]["phase"] == "evaluate"
+    assert saved["current_round"]["evaluation_attempts"][0]["status"] == "failed"
+    assert saved["current_round"]["evaluation_attempts"][0]["command"]
+
+    def complete_evaluation(**kwargs):
+        calls.append(kwargs)
+        return {
+            "status": "complete",
+            "episode_count": 100,
+            "roi_count": 8,
+            "scenario_manifest_hash": "fixture-manifest",
+            "mean_episode_energy_efficiency_mbit_per_j": 1.0,
+            "std_episode_energy_efficiency_mbit_per_j": 0.1,
+            "baseline_mean_episode_energy_efficiency_mbit_per_j": 0.5,
+        }
+
+    completed = search.run_episode_search(
+        resume=output,
+        client=SimpleNamespace(chat=forbidden),
+        training_runner=forbidden,
+        evaluation_runner=complete_evaluation,
+    )
+    assert completed["status"] == "complete"
+    assert len(calls) == 2
+    assert calls[0]["run_directory"] == calls[1]["run_directory"]
+    assert calls[0]["output_directory"] != calls[1]["output_directory"]
+
+
+def test_existing_first_round_selection_migrates_exact_score_once(tmp_path):
+    output = tmp_path / "legacy-search"
+    round_dir = output / "round_01"
+    round_dir.mkdir(parents=True)
+    report = {
+        "baseline": {"score": 0.796906180536212},
+        "candidates": {
+            "candidate_1": {"score": 0.829731227059},
+            "candidate_2": {"score": 0.800508183872635},
+            "candidate_3": {"score": 0.795394846145912},
+            "candidate_4": {"score": 0.666001893645787},
+        },
+        "selected_candidate_id": "candidate_1",
+    }
+    (round_dir / "pretraining_evaluation.json").write_text(
+        json.dumps(report), encoding="utf-8"
+    )
+    current = {
+        "round": 1,
+        "phase": "evaluate",
+        "selected_candidate_id": "candidate_1",
+        "evaluation": report,
+        "training": {"status": "complete"},
+        "slots": {
+            "candidate_1": {
+                "version": 6,
+                "candidate": {"candidate_name": "candidate_1", "code": "fixture"},
+            }
+        },
+    }
+    state = {
+        "git_sha": search.EPISODE_EVALUATION_RECOVERY_SOURCE_REVISION,
+        "output_directory": str(output.resolve()),
+        "search_round": 1,
+        "rounds": [],
+        "current_round": current,
+    }
+    original = json.loads(json.dumps(state))
+    search._ensure_pretraining_selection_state(
+        state,
+        output=output.resolve(),
+        target_git_sha="target-revision",
+        backup_state=original,
+    )
+    search._ensure_pretraining_selection_state(
+        state, output=output.resolve(), target_git_sha="target-revision"
+    )
+    assert state["pretraining_selection_effective_round"] == 2
+    assert len(state["pretraining_training_history"]) == 1
+    assert state["pretraining_training_history"][0]["score"] == 0.829731227059
+    assert current["pretraining_training_event"]["event_id"].startswith(
+        "training-selection-"
+    )
+    backup = output / "migrations" / "pretraining_threshold_v2" / "state.before.json"
+    assert json.loads(backup.read_text(encoding="utf-8")) == original
