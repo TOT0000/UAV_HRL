@@ -720,6 +720,8 @@ def summarize_training_blocks(
                 "episode_range": [int(block[0]["episode"]), int(block[-1]["episode"])],
                 "episode_count": block_size,
                 "energy_efficiency_mbit_per_j": stats("energy_efficiency_mbit_per_j"),
+                "timely_useful_delivery_mbit": stats("timely_mbits"),
+                "movement_energy_j": stats("movement_energy_j"),
                 "base_reward_sum": stats("base_reward_sum"),
                 "extra_reward_sum": stats("extra_reward_sum"),
                 "combined_reward_sum": stats("combined_reward_sum"),

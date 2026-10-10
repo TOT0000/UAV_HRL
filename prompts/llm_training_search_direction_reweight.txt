@@ -1,0 +1,10 @@
+========== DIRECTION_REWEIGHT ==========
+
+Requested direction: adjust weights.
+
+Keep the reference feature computations, feature order, and normalization unchanged. Modify at least one reward_weight.
+
+You may change weight magnitudes, signs, or set weights to zero.
+Explain the adjustment using the training and evaluation evidence and update affected descriptions.
+
+Return the complete candidate JSON object.

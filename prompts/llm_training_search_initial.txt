@@ -1,0 +1,15 @@
+========== INITIAL_GENERATION ==========
+
+This is the first search round.
+Produce one complete candidate with the requested ID.
+
+Previously generated candidate summaries in this round:
+{{CURRENT_ROUND_CANDIDATE_SUMMARIES}}
+
+If no candidate exists yet, propose an initial design.
+Otherwise, explore a different formula, feature combination, or task trade-off to produce a substantively different candidate.
+
+These candidates have not yet been trained. Their summaries support design diversity and do not indicate better performance.
+
+Briefly explain the focus of this design in design_summary.
+Return one complete candidate JSON object using the shared interface.

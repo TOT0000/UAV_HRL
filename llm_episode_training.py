@@ -457,6 +457,7 @@ def run_candidate_training(
     restart_from_scratch: bool = False,
     restart_authorization_id: str | None = None,
     restart_failed_run_directory: str | Path | None = None,
+    summary_block_size: int = 100,
 ) -> dict[str, Any]:
     root = Path(__file__).resolve().parent
     output = Path(output_directory).resolve()
@@ -844,7 +845,11 @@ def run_candidate_training(
         "training_state_record": str(state_path),
         "output_root": str(output),
         "summaries": (
-            _training_summaries(Path(run_directory), expected_episodes=int(episodes))
+            _training_summaries(
+                Path(run_directory),
+                expected_episodes=int(episodes),
+                block_size=int(summary_block_size),
+            )
             if run_directory
             else []
         ),
@@ -853,7 +858,7 @@ def run_candidate_training(
 
 
 def _training_summaries(
-    run_directory: Path, *, expected_episodes: int
+    run_directory: Path, *, expected_episodes: int, block_size: int = 100
 ) -> list[dict[str, Any]]:
     path = run_directory / "llm_training_episode_metrics.jsonl"
     if not path.is_file():
@@ -870,7 +875,7 @@ def _training_summaries(
             if line.strip()
         ]
         return summarize_training_blocks(
-            rows, block_size=100, expected_episodes=expected_episodes
+            rows, block_size=int(block_size), expected_episodes=expected_episodes
         )
     except (json.JSONDecodeError, KeyError, TypeError, ValueError, RuntimeError) as exc:
         raise EpisodeTrainingError(
@@ -897,12 +902,21 @@ def validate_baseline_preflight(
         int(checkpoint_episode),
         expected_method="td3_dinkelbach",
     )
+    baseline_resolved = json.loads(
+        (Path(context["run_dir"]) / "resolved_config.json").read_text(
+            encoding="utf-8"
+        )
+    )
     manifest_path = Path(manifest).resolve()
     scenario_manifest = ScenarioManifest.load(manifest_path)
     if scenario_manifest.split != "test":
         raise EpisodeTrainingError("baseline comparison manifest must use the test split")
     if scenario_manifest.episode_count != int(episodes):
         raise EpisodeTrainingError("baseline comparison manifest episode count is incompatible")
+    if int(scenario_manifest.manifest_seed) != int(baseline_resolved["seed"]):
+        raise EpisodeTrainingError(
+            "baseline evaluation manifest seed differs from the baseline training seed"
+        )
     if scenario_manifest.generation_profile.get("fixed_num_gt") != int(roi_count):
         raise EpisodeTrainingError("baseline comparison manifest is not fixed at 8 RoIs")
     if tuple(map(float, environment_size_m)) != (1000.0, 1000.0):
@@ -935,7 +949,9 @@ def validate_baseline_preflight(
     if point.get("training_run_id") != context["training_run_id"]:
         raise EpisodeTrainingError("baseline evaluation belongs to a different training run")
     if int(point.get("checkpoint_episode", -1)) != int(checkpoint_episode):
-        raise EpisodeTrainingError("baseline evaluation did not use checkpoint episode 1500")
+        raise EpisodeTrainingError(
+            f"baseline evaluation did not use checkpoint episode {int(checkpoint_episode)}"
+        )
     for field in CHECKPOINT_PROVENANCE_FIELDS:
         expected = context["checkpoint_artifact_provenance"][field]
         if point.get(field) != expected:
@@ -953,6 +969,21 @@ def validate_baseline_preflight(
         raise EpisodeTrainingError("baseline evaluation environment size is incompatible")
     if int(point.get("evaluation_episode_horizon_s", -1)) != int(episode_seconds):
         raise EpisodeTrainingError("baseline evaluation episode horizon is incompatible")
+    runtime = point.get("evaluation_runtime_provenance") or {}
+    resolved_evaluation = runtime.get("resolved_evaluation_config") or {}
+    if resolved_evaluation.get("learning_state_frozen") is not True:
+        raise EpisodeTrainingError("baseline evaluation did not freeze learning state")
+    if resolved_evaluation.get("new_training_started") is not False:
+        raise EpisodeTrainingError("baseline evaluation started new training")
+    if runtime.get("lambda_cost_source") != "checkpoint_frozen":
+        raise EpisodeTrainingError("baseline evaluation did not keep checkpoint lambda fixed")
+    if (
+        baseline_resolved.get("exploration_schedule_configuration", {}).get(
+            "evaluation_exploration_mode"
+        )
+        != "disabled"
+    ):
+        raise EpisodeTrainingError("baseline evaluation exploration contract is not disabled")
     if point.get("scenario_manifest_hash") != scenario_manifest.content_hash:
         raise EpisodeTrainingError("baseline evaluation manifest hash is incompatible")
     if list(point.get("scenario_ids") or ()) != [
@@ -987,6 +1018,9 @@ def validate_baseline_preflight(
             "roi_count": int(roi_count),
             "environment_size_m": [1000.0, 1000.0],
             "episode_seconds": int(episode_seconds),
+            "exploration": "disabled",
+            "learning_updates": "disabled",
+            "lambda": "checkpoint_frozen",
         },
         "metrics": metrics,
     }
@@ -1108,8 +1142,12 @@ def run_candidate_evaluation(
     if len(baseline_points) != 1:
         raise EpisodeTrainingError("baseline evaluation must contain one matching fixed-RoI point")
     baseline_point = baseline_points[0]
-    if int(baseline_point.get("checkpoint_episode", -1)) != 1500:
-        raise EpisodeTrainingError("baseline evaluation must use the episode-1500 checkpoint")
+    if int(baseline_point.get("checkpoint_episode", -1)) != int(
+        baseline_preflight["checkpoint_episode"]
+    ):
+        raise EpisodeTrainingError(
+            "baseline evaluation checkpoint differs from the preflight binding"
+        )
     if _file_sha256(baseline_metadata_path) != baseline_preflight.get(
         "baseline_evaluation_metadata_sha256"
     ):
@@ -1134,6 +1172,14 @@ def run_candidate_evaluation(
     baseline_metrics = _evaluation_metrics_summary(baseline_rows)
     if baseline_metrics != baseline_preflight.get("metrics"):
         raise EpisodeTrainingError("baseline metrics changed after preflight")
+    candidate_mean = float(np.mean(ee))
+    baseline_mean = float(np.mean(baseline_ee))
+    absolute_gap = candidate_mean - baseline_mean
+    percent_gap = (
+        100.0 * absolute_gap / baseline_mean
+        if baseline_mean != 0.0
+        else None
+    )
     return {
         "status": "complete",
         "method_id": method_id,
@@ -1145,15 +1191,15 @@ def run_candidate_evaluation(
         "episode_count": len(rows),
         "roi_count": int(roi_count),
         "environment_size_m": [1000.0, 1000.0],
-        "mean_episode_energy_efficiency_mbit_per_j": float(np.mean(ee)),
+        "mean_episode_energy_efficiency_mbit_per_j": candidate_mean,
         "std_episode_energy_efficiency_mbit_per_j": float(np.std(ee)),
         "baseline_run": str(baseline_run_path),
         "baseline_evaluation": str(baseline_path),
-        "baseline_mean_episode_energy_efficiency_mbit_per_j": float(
-            np.mean(baseline_ee)
-        ),
+        "baseline_mean_episode_energy_efficiency_mbit_per_j": baseline_mean,
+        "baseline_absolute_gap_mbit_per_j": absolute_gap,
+        "baseline_percent_gap": percent_gap,
         "improves_over_baseline_mean_episode_ee": bool(
-            float(np.mean(ee)) > float(np.mean(baseline_ee))
+            candidate_mean > baseline_mean
         ),
         "candidate_metrics": candidate_metrics,
         "baseline_metrics": baseline_metrics,

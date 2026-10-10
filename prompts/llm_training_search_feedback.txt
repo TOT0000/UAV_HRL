@@ -1,0 +1,43 @@
+========== TRAINING_FEEDBACK ==========
+
+Use the completed training and evaluation results to propose the next candidate.
+
+Shared reference for this round:
+{{BEST_CANDIDATE}}
+
+This candidate has the highest historical mean evaluation EE.
+Every generation request in this round uses this same reference.
+
+Original-method evaluation at the same training budget:
+{{BASELINE_EVALUATION_RESULTS}}
+
+Designs and evaluation results for all candidates from the previous round:
+{{LATEST_ROUND_CANDIDATE_RESULTS}}
+
+Training changes for those candidates:
+{{LATEST_ROUND_TRAINING_SUMMARIES}}
+
+Training blocks:
+{{TRAINING_BLOCK_DEFINITION}}
+
+Each block reports:
+- mean episode EE, timely useful delivery, and movement energy;
+- mean and standard deviation of each reward component's episode-summed weighted contribution;
+- mean episode-summed base reward and extra reward contribution;
+- relevant scenario and exploration settings.
+
+For feature k in episode i:
+
+C_i,k = sum_t beta * w_k * f_k(obs_i,t)
+
+Base-reward summaries use the lambda values actually used during training.
+
+Design and result summaries for earlier candidates:
+{{HISTORICAL_CANDIDATE_SUMMARIES}}
+
+Interpret reward-component changes together with EE, timely delivery, energy, and deadline results to identify useful changes.
+
+These are observed training outcomes. A change in one component alone does not establish that it caused a performance improvement or decline.
+
+Produce one candidate following the requested direction below.
+Briefly explain the evidence and intended effect in design_summary, keeping formulas, weights, and descriptions consistent.

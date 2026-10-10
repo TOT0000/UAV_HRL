@@ -1,0 +1,11 @@
+========== DIRECTION_REDESIGN ==========
+
+Requested direction: redesign.
+
+Use the task objective and historical results to propose a different feature and reward design.
+
+You may reconsider observations, feature formulas, normalization, component count, and weights.
+
+Explain the new design approach and the limitation it aims to address in design_summary.
+
+Return the complete candidate JSON object.

@@ -1,0 +1,20 @@
+========== VALIDATION_REPAIR ==========
+
+The candidate failed program validation. Correct it using the report below.
+
+Original generation or revision request:
+{{GENERATION_REQUEST}}
+
+Complete failed candidate:
+{{FAILED_CANDIDATE}}
+
+Validation results:
+{{VALIDATION_FEEDBACK}}
+
+Correct the reported errors and inspect related computations.
+Maintain the requested design direction and keep descriptions, feature order, weights, and code consistent.
+
+Checks marked as not run have not established correctness.
+
+Retain the requested candidate_id.
+Return the complete corrected candidate JSON object, including unchanged parts.

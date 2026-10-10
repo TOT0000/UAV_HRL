@@ -1,0 +1,11 @@
+========== DIRECTION_REMOVE ==========
+
+Requested direction: remove components.
+
+Starting from the reference candidate, remove at least one feature and its corresponding reward component. Retain the computations and weights of the remaining features.
+
+Use task relationships and historical results to explain why these components were selected for removal.
+
+If the reference contains only one feature, provide a simpler replacement feature instead and explain this adjustment in design_summary.
+
+Return the complete candidate JSON object.

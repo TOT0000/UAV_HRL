@@ -1,0 +1,10 @@
+========== DIRECTION_ADD ==========
+
+Requested direction: add components.
+
+Starting from the reference candidate, retain existing feature computations and weights, and add at least one feature with its reward weight.
+
+Use the addition to represent a task relationship that the existing design does not adequately express.
+Explain the added role and its rationale in design_summary.
+
+Return the complete candidate, including retained and added components.

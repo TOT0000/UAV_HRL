@@ -1,0 +1,18 @@
+========== DUPLICATE_REPAIR ==========
+
+The program identified this candidate as a duplicate of an existing candidate.
+
+Generation or revision request:
+{{GENERATION_REQUEST}}
+
+Complete submitted candidate:
+{{DUPLICATE_CANDIDATE}}
+
+Matching candidate and duplicate-detection evidence:
+{{DUPLICATE_DIAGNOSTICS}}
+
+Produce a different candidate following the requested direction, with a substantive change to feature computation or reward weights.
+
+Changes only to names, descriptions, comments, or formatting do not constitute a new design.
+
+Retain the requested candidate_id and return the complete candidate JSON object.

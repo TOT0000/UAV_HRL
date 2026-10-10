@@ -143,6 +143,20 @@ def test_method_registry_and_cli_contract_are_isolated():
         ["td3_dinkelbach_llm", "--llm-artifact", "approved", "--smoke"]
     )
     assert llm_args.llm_artifact == "approved"
+    trained_search = MethodSpec.parse("td3_dinkelbach_llm_train_search")
+    assert trained_search.llm_enabled is True
+    assert trained_search.agent == baseline.agent
+    assert trained_search.routing == baseline.routing
+    assert trained_search.reward_mode == baseline.reward_mode
+    trained_search_args = build_parser().parse_args(
+        [
+            "td3_dinkelbach_llm_train_search",
+            "--llm-artifact",
+            "approved",
+            "--smoke",
+        ]
+    )
+    assert trained_search_args.llm_artifact == "approved"
 
 
 def test_old_llm_artifact_contract_is_rejected_with_retraining_message(tmp_path):
@@ -208,7 +222,12 @@ def test_persistent_runtime_matches_offline_adapter_and_dynamic_constants(tmp_pa
     assert metadata["environment_width_m"]["value"] == 1500.0
 
 
-def test_llm_training_smoke_performs_td3_update_and_embeds_artifact(tmp_path):
+@pytest.mark.parametrize(
+    "method_id", ("td3_dinkelbach_llm", "td3_dinkelbach_llm_train_search")
+)
+def test_llm_training_smoke_performs_td3_update_and_embeds_artifact(
+    tmp_path, method_id
+):
     source = _approved_fixture(tmp_path)
     run_dir = tmp_path / "training-run"
     run_dir.mkdir()
@@ -239,7 +258,7 @@ def test_llm_training_smoke_performs_td3_update_and_embeds_artifact(tmp_path):
     result = train(
         config,
         scenario_manifest=manifest,
-        method_spec=MethodSpec.parse("td3_dinkelbach_llm"),
+        method_spec=MethodSpec.parse(method_id),
         llm_artifact_dir=design.directory,
     )
     assert result["movement_state_dim"] == result["original_movement_state_dim"] + 1
@@ -263,7 +282,7 @@ def test_llm_training_smoke_performs_td3_update_and_embeds_artifact(tmp_path):
             enable_full_resume=False,
         ),
         scenario_manifest=manifest,
-        method_spec=MethodSpec.parse("td3_dinkelbach_llm"),
+        method_spec=MethodSpec.parse(method_id),
         llm_artifact_dir=design.directory,
     )
     assert resumed["episodes_run"] == 0
@@ -288,12 +307,12 @@ def test_llm_training_smoke_performs_td3_update_and_embeds_artifact(tmp_path):
             random_seed=20260927,
         ),
         scenario_manifest=evaluation_manifest,
-        method_spec=MethodSpec.parse("td3_dinkelbach_llm"),
+        method_spec=MethodSpec.parse(method_id),
         evaluation=True,
         checkpoint_dir=model_checkpoint,
         expected_checkpoint_episodes=1,
         expected_checkpoint_formal_config=effective_training_config(
-            config, MethodSpec.parse("td3_dinkelbach_llm")
+            config, MethodSpec.parse(method_id)
         ),
         expected_checkpoint_training_manifest=manifest,
         evaluation_overrides={
@@ -320,12 +339,12 @@ def test_llm_training_smoke_performs_td3_update_and_embeds_artifact(tmp_path):
                 random_seed=20260927,
             ),
             scenario_manifest=evaluation_manifest,
-            method_spec=MethodSpec.parse("td3_dinkelbach_llm"),
+            method_spec=MethodSpec.parse(method_id),
             evaluation=True,
             checkpoint_dir=model_checkpoint,
             expected_checkpoint_episodes=1,
             expected_checkpoint_formal_config=effective_training_config(
-                config, MethodSpec.parse("td3_dinkelbach_llm")
+                config, MethodSpec.parse(method_id)
             ),
             expected_checkpoint_training_manifest=manifest,
             evaluation_overrides={
@@ -373,7 +392,11 @@ def test_runtime_failure_saves_input_and_stops_worker(tmp_path):
 
 
 @pytest.mark.parametrize(
-    "method_id", ("td3_dinkelbach_llm", "td3_dinkelbach_llm_search")
+    "method_id",
+    (
+        "td3_dinkelbach_llm",
+        "td3_dinkelbach_llm_search",
+    ),
 )
 def test_registered_runner_and_paper_evaluation_entry_use_run_artifact(
     tmp_path, method_id

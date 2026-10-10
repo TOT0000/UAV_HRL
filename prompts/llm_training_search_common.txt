@@ -1,0 +1,243 @@
+========== COMMON ==========
+
+You design additional state features and fixed reward weights for centralized TD3 movement control in the UAV data-collection system below.
+
+1. System operation and objective
+
+The system contains 16 UAVs, one ground station (GS), and 2–8 regions of interest (RoIs) in a standard 1000 × 1000 m disaster area.
+
+UAV tasks are:
+- Search: discover previously unknown RoIs.
+- Visual sensing (VS): capture data from an assigned RoI.
+- Communication collection (COM): receive data from an assigned ground source (SR).
+- Hover: remain hovering.
+
+A UAV may serve VS and COM simultaneously with different targets.
+
+The system has three control functions:
+- Task allocation assigns UAV roles and service targets.
+- TD3 controls movement for UAVs identified by movement_mask. Each controlled UAV has speed, horizontal-heading, and vertical-speed action components. Existing controllers handle search and hovering.
+- After movement updates positions and links, the routing controller selects packet next hops during communication slots.
+
+A movement decision occurs every 1 s. Each interval contains four communication slots of 0.25 s. An episode lasts 60 s.
+
+The sequence is:
+current observations and task assignments
+→ TD3 movement action
+→ position and sensing/link updates
+→ data acquisition, queueing, uploads, and relay transmissions
+→ interval delivery, energy, and penalty calculation
+→ next movement decision.
+
+Task allocation changes when its existing update rules trigger. TD3 changes positions; task assignments, next hops, and scheduling are controlled by existing mechanisms.
+
+Data paths:
+VS: capturing UAV → zero or more relay UAVs → GS.
+COM: SR queue → serving UAV → zero or more relay UAVs → GS.
+
+Packet deadlines are measured from generation until GS delivery:
+- VS: 2.5 s.
+- COM: 2.0 s.
+
+Moving a packet to another UAV does not restart its deadline.
+
+The primary objective is episode energy efficiency:
+
+EE = sum_t B_timely,t / sum_t E_movement,t
+
+B_timely,t is useful data delivered to the GS within its deadline.
+E_movement,t is movement energy of all UAVs.
+
+Acquisition and intermediate forwarding contribute to the task when the data subsequently reaches the GS on time.
+
+The system also tracks end-to-end deadline violations. Interpret these together with useful delivery volume and energy use.
+
+2. Quantitative relationships and environment code
+
+UAV positions are p_u = [x_u, y_u, z_u] in metres.
+
+Movement, action constraints, position updates, and energy:
+{{MOVEMENT_AND_ENERGY_SPEC}}
+
+{{MOVEMENT_AND_ENERGY_CODE}}
+
+For UAV u and RoI j:
+
+d_horizontal(u,j) = sqrt((x_u-x_j)^2 + (y_u-y_j)^2)
+
+Sensing geometry determines whether position, altitude, and camera footprint permit capture and how much of the RoI is covered.
+
+Capture conditions, coverage, data generation, and penalties:
+{{VISUAL_SENSING_SPEC}}
+
+{{VISUAL_SENSING_CODE}}
+
+VS packets are generated when capture is valid and must subsequently reach the GS within their deadline.
+
+For communication nodes a and b:
+
+d_ab = norm(p_a-p_b, 2)
+
+Link availability, capacity, uploads, and relay service:
+{{COMMUNICATION_SPEC}}
+
+{{COMMUNICATION_AND_SERVICE_CODE}}
+
+For capacity C_ab in bits/s and a 0.25 s slot, constant-capacity service satisfies:
+
+B_ab <= C_ab * 0.25
+
+Actual service also depends on scheduling, bandwidth allocation, and queued data.
+
+Relay connectivity requires a sequence of valid directed links to the GS. Path service also depends on capacity and waiting time.
+
+For backlog Q in bits and positive capacity C in bits/s, Q/C is a reference clearance time under continuous constant-capacity service.
+
+remaining_deadline_p =
+deadline_p - (current_time - generation_time_p)
+
+End-to-end delay includes source waiting, UAV queueing, scheduling, and subsequent transmissions.
+
+The code excerpts show the actual environment calculations. Internal variables appearing in these excerpts are available to your function only when explicitly exposed by the input interface below.
+
+3. Available information
+
+compute_extra_state(obs, constants) receives:
+- current observable information before the TD3 movement action;
+- verified fixed environment parameters.
+
+{{INPUT_FIELD_TABLE}}
+
+Relevant observation and validity calculations:
+{{OBSERVATION_CODE}}
+
+The interface specifies field meanings, shapes, axis/ID mappings, units, and validity conditions.
+
+Use validity flags and handle empty valid sets. Missing information differs from an observed zero or empty queue.
+
+movement_mask identifies control ownership; it is not a universal observation-validity flag.
+
+Use documented current-time inputs. Subsequent outcomes are used by the host for training and evaluation.
+
+4. Feature and reward construction
+
+Choose K and return an unweighted one-dimensional numeric list or NumPy array:
+
+f = [f_0, ..., f_(K-1)]
+0 <= f_k <= 1
+
+Keep feature order and normalization fixed.
+
+Assign each feature a fixed finite reward_weight w_k:
+- Positive weights reward larger feature values.
+- Negative weights penalize larger feature values.
+- Zero adds a state feature without direct reward.
+
+There is no restriction on the sum or absolute sum of weights. The host does not normalize them.
+
+s_aug = concat(s_original, f)
+r_extra = sum_k w_k * f_k
+r_total = r_base + beta * r_extra
+
+r_base =
+B_timely_Mbit
+- lambda * E_movement_J
+- P_C9 - P_C10 - P_COM
+
+{{BASE_REWARD_SPEC}}
+
+{{DELIVERY_AND_BASE_REWARD_CODE}}
+
+beta = {{BETA}}
+
+Features are computed before the action. The base reward measures subsequent interval outcomes.
+
+The original state is preserved.
+r_extra and r_total have no [-1,1] restriction.
+All computed values must remain finite.
+
+5. Implementation and output interface
+
+Use the provided np and supported operations:
+
+{{SUPPORTED_OPERATIONS}}
+
+Implement compute_extra_state(obs, constants).
+For identical inputs, return identical values and leave inputs unchanged.
+
+The host checks shape, finite numeric values, and the [0,1] feature range, then converts features to float32.
+
+Requested candidate ID:
+{{CANDIDATE_ID}}
+
+Return one complete candidate using this structure:
+
+{
+  "candidate_id": "{{CANDIDATE_ID}}",
+  "design_summary": "Brief design objective, relevant trade-offs, and evidence informing this design or revision.",
+  "features": [
+    {
+      "name": "feature_name",
+      "description": "Meaning, normalization, and the behavior encouraged by the formula and reward weight.",
+      "reward_weight": 0.0
+    }
+  ],
+  "code": "Complete Python source defining compute_extra_state(obs, constants)"
+}
+
+The features list must match the returned vector in length and order.
+
+Executable interface example:
+{{MINIMAL_EXECUTABLE_EXAMPLE}}
+
+Return only the candidate JSON object.
+
+6. Training and evaluation
+
+The host checks the candidate interface, executable behavior, and numeric validity.
+
+Each valid, nonduplicate candidate is trained independently from scratch for {{TRAIN_EPISODES}} episodes using consistent training settings and the same training scenario sequence.
+
+Training retains the existing lambda update procedure.
+
+The checkpoint at episode {{TRAIN_EPISODES}} is evaluated on the same {{EVALUATION_EPISODES}} fixed scenarios:
+- {{EVALUATION_ROI_COUNT}} RoIs.
+- {{EVALUATION_AREA_SPEC}}.
+- {{EPISODE_SECONDS}} seconds per episode.
+- Exploration and learning updates disabled during evaluation.
+
+For evaluation episode i:
+
+EE_i = sum_t B_timely_i,t / sum_t E_movement_i,t
+
+The candidate score is:
+
+mean_EE = (1/N) * sum_i EE_i
+
+N is the number of evaluation episodes. This is the arithmetic mean of the
+per-episode EE values; it is not total delivery across all episodes divided by
+total energy across all episodes.
+
+Candidates are compared by mean evaluation EE, including comparison with the original method at the same training budget.
+
+Timely useful delivery, movement energy, and deadline violations help interpret the results.
+
+The candidate with the highest historical mean evaluation EE is the reference for the next round. Completed candidates are represented in the feedback through recent detailed results or historical summaries.
+
+7. Design guidance
+
+Connect the task to the environment:
+- Identify relevant UAVs, service targets, queues, and links.
+- Determine how TD3 movement affects data acquisition, timely delivery, and movement energy.
+- Select corresponding observations with appropriate units and validity conditions.
+
+Translate the objective into design considerations:
+- Deliver useful data to the GS within its deadline.
+- Balance movement energy against useful delivery.
+- Coordinate sensing and source uploads with subsequent relay service.
+
+Use these relationships to choose feature formulas and weights.
+
+Each feature description should make its meaning, normalization, and reward direction checkable against the implementation.
+
+Summarize the necessary design rationale in design_summary and feature descriptions. Keep the code consistent with those descriptions.

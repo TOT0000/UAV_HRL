@@ -55,7 +55,11 @@ EXISTING_METHODS = (
     "td3_dinkelbach_no_task_potential",
     "ddpg_dinkelbach_no_task_potential",
 )
-LLM_METHODS = ("td3_dinkelbach_llm",)
+LLM_METHODS = (
+    "td3_dinkelbach_llm",
+    "td3_dinkelbach_llm_search",
+    "td3_dinkelbach_llm_train_search",
+)
 NEW_METHODS = (
     "td3_dinkelbach_wo_ta",
     "td3_dinkelbach_dqn",

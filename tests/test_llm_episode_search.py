@@ -234,6 +234,8 @@ def test_training_block_summaries_preserve_component_addition_and_actual_lambda(
                 "feature_names": ["a", "b"],
                 "feature_contribution_sums": [1.0, -0.25],
                 "energy_efficiency_mbit_per_j": float(episode),
+                "timely_mbits": 10.0,
+                "movement_energy_j": 5.0,
                 "base_reward_sum": 2.0,
                 "extra_reward_sum": 0.75,
                 "combined_reward_sum": 2.75,
@@ -2078,6 +2080,7 @@ def test_baseline_preflight_binds_run_checkpoint_manifest_and_episode_rows(tmp_p
         environment_width_m=1000,
         environment_height_m=1000,
         environment_size_m=None,
+        manifest_seed=20260817,
         content_hash="manifest-content-hash",
         episodes=tuple({"scenario_id": value} for value in scenario_ids),
     )
@@ -2086,6 +2089,17 @@ def test_baseline_preflight_binds_run_checkpoint_manifest_and_episode_rows(tmp_p
     baseline_run = tmp_path / "baseline-run"
     checkpoint = baseline_run / "checkpoints" / "models" / "ep_1500"
     checkpoint.mkdir(parents=True)
+    (baseline_run / "resolved_config.json").write_text(
+        json.dumps(
+            {
+                "seed": 20260817,
+                "exploration_schedule_configuration": {
+                    "evaluation_exploration_mode": "disabled"
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
     provenance = {field: f"fixture-{field}" for field in CHECKPOINT_PROVENANCE_FIELDS}
     calls = []
 
@@ -2127,6 +2141,13 @@ def test_baseline_preflight_binds_run_checkpoint_manifest_and_episode_rows(tmp_p
         "evaluation_episode_horizon_s": 60,
         "scenario_manifest_hash": manifest.content_hash,
         "scenario_ids": scenario_ids,
+        "evaluation_runtime_provenance": {
+            "lambda_cost_source": "checkpoint_frozen",
+            "resolved_evaluation_config": {
+                "learning_state_frozen": True,
+                "new_training_started": False,
+            },
+        },
         "outputs": {"per_episode_jsonl": str(rows_path)},
     }
     metadata_path = tmp_path / "paper_evaluation_metadata.json"
