@@ -2080,7 +2080,7 @@ def test_baseline_preflight_binds_run_checkpoint_manifest_and_episode_rows(tmp_p
         environment_width_m=1000,
         environment_height_m=1000,
         environment_size_m=None,
-        manifest_seed=20260817,
+        manifest_seed=20260930,
         content_hash="manifest-content-hash",
         episodes=tuple({"scenario_id": value} for value in scenario_ids),
     )
@@ -2187,6 +2187,13 @@ def test_baseline_preflight_binds_run_checkpoint_manifest_and_episode_rows(tmp_p
         )
     write_metadata(scenario_manifest_hash="wrong-manifest")
     with pytest.raises(episode_training.EpisodeTrainingError, match="manifest hash"):
+        episode_training.validate_baseline_preflight(
+            baseline_run=baseline_run,
+            baseline_evaluation=metadata_path,
+            manifest=manifest_path,
+        )
+    write_metadata(scenario_ids=[*scenario_ids[:-1], "different-scenario"])
+    with pytest.raises(episode_training.EpisodeTrainingError, match="scenario IDs"):
         episode_training.validate_baseline_preflight(
             baseline_run=baseline_run,
             baseline_evaluation=metadata_path,

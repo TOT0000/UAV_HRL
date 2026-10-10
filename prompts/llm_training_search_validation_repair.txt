@@ -5,8 +5,11 @@ The candidate failed program validation. Correct it using the report below.
 Original generation or revision request:
 {{GENERATION_REQUEST}}
 
-Complete failed candidate:
-{{FAILED_CANDIDATE}}
+Complete failed response material:
+{{FAILED_RESPONSE_MATERIAL}}
+
+The response_kind explicitly distinguishes a successfully parsed candidate from an
+unparsed raw model response. A raw response has not passed JSON parsing.
 
 Validation results:
 {{VALIDATION_FEEDBACK}}

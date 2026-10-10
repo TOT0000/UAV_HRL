@@ -637,12 +637,13 @@ def _repair_prompt(
             },
         )
     else:
+        failed_response = _load_failed_response_material(record)
         stage = _render_stage(
             VALIDATION_REPAIR_TEMPLATE,
             {
                 "GENERATION_REQUEST": record["generation_stage_request"],
-                "FAILED_CANDIDATE": json.dumps(
-                    record.get("last_submission"), indent=2, ensure_ascii=False
+                "FAILED_RESPONSE_MATERIAL": json.dumps(
+                    failed_response, indent=2, ensure_ascii=False
                 ),
                 "VALIDATION_FEEDBACK": json.dumps(
                     record.get("last_validation"), indent=2, ensure_ascii=False
@@ -650,6 +651,83 @@ def _repair_prompt(
             },
         )
     return common.rstrip() + "\n\n" + stage.strip() + "\n"
+
+
+def _load_failed_response_material(record: dict[str, Any]) -> dict[str, Any]:
+    """Reload the latest failed response from its persisted candidate version."""
+
+    versions = record.get("versions") or []
+    if not versions:
+        raise TrainingSearchError("repair prompt requires a saved failed version")
+    latest = versions[-1]
+    directory = Path(latest["directory"])
+    response_kind = latest.get("response_kind")
+    if response_kind is None:
+        raw_path = directory / "raw_response.txt"
+        try:
+            legacy_raw = raw_path.read_text(encoding="utf-8")
+        except OSError as exc:
+            raise TrainingSearchError(
+                f"saved raw model response is missing: {raw_path}"
+            ) from exc
+        try:
+            legacy_parsed, _metadata = parse_candidate_json_envelope(legacy_raw)
+        except CandidateError:
+            return {
+                "response_kind": "raw_unparsed_model_response",
+                "raw_response": legacy_raw,
+            }
+        return {
+            "response_kind": "parsed_candidate",
+            "parsed_candidate": legacy_parsed,
+        }
+    if response_kind == "parsed_json":
+        path = directory / "submission.json"
+        try:
+            parsed = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise TrainingSearchError(
+                f"saved parsed candidate is missing or invalid: {path}"
+            ) from exc
+        return {
+            "response_kind": "parsed_candidate",
+            "parsed_candidate": parsed,
+        }
+    if response_kind != "raw_unparsed":
+        raise TrainingSearchError(f"unsupported saved response kind: {response_kind!r}")
+    path = directory / "raw_response.txt"
+    try:
+        raw_response = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise TrainingSearchError(
+            f"saved raw model response is missing: {path}"
+        ) from exc
+    return {
+        "response_kind": "raw_unparsed_model_response",
+        "raw_response": raw_response,
+    }
+
+
+def _exception_details(exc: BaseException) -> dict[str, Any]:
+    details: dict[str, Any] = {
+        "type": type(exc).__name__,
+        "message": str(exc),
+    }
+    cause: BaseException | None = exc
+    seen: set[int] = set()
+    while cause is not None and id(cause) not in seen:
+        seen.add(id(cause))
+        location = {
+            name: getattr(cause, name)
+            for name in ("lineno", "colno", "pos")
+            if getattr(cause, name, None) is not None
+        }
+        if location:
+            details["location"] = location
+            details["location_error_type"] = type(cause).__name__
+            break
+        cause = cause.__cause__ or cause.__context__
+    return details
 
 
 def _code_ast(candidate: dict[str, Any]) -> str:
@@ -844,7 +922,7 @@ def _duplicate_diagnostics(
 def _save_candidate_version(
     directory: Path,
     *,
-    submission: dict[str, Any] | None,
+    submission: Any | None,
     normalized: dict[str, Any] | None,
     validation: dict[str, Any],
     raw_content: str,
@@ -1311,6 +1389,16 @@ def run_training_search(
                 f"round {round_number}/{max_rounds}; {candidate_id}; "
                 f"direction={record['requested_direction']}; corrections={record['corrections_used']}"
             )
+            if record["versions"] and int(record["corrections_used"]) >= int(
+                max_repairs_per_candidate
+            ):
+                record["status"] = "repairs_exhausted"
+                state["status"] = "paused_candidate_repairs_exhausted"
+                state["stop_reason"] = (
+                    f"{candidate_id} exhausted {max_repairs_per_candidate} corrections"
+                )
+                _save_state(output, state)
+                return _result(state)
             common = render_common_prompt(
                 candidate_id=candidate_id,
                 dataset=dataset,
@@ -1398,11 +1486,12 @@ def run_training_search(
             call_record["completed_at_utc"] = _now()
             raw = response["content"]
             submission = normalized = None
+            response_kind = "raw_unparsed"
             validation: dict[str, Any]
             try:
-                submission, parse_metadata = parse_single_candidate(
-                    raw, expected_id=candidate_id
-                )
+                submission, parse_metadata = parse_candidate_json_envelope(raw)
+                response_kind = "parsed_json"
+                submission = _substitute_candidate_id(submission, candidate_id)
                 normalized, validation, extra = validate_search_candidate(
                     submission,
                     dataset=dataset,
@@ -1444,6 +1533,7 @@ def run_training_search(
                     "status": "failed",
                     "stage": "parse_or_schema",
                     "error": f"{type(exc).__name__}: {exc}",
+                    "error_details": _exception_details(exc),
                 }
                 extra = None
                 fingerprint = None
@@ -1469,6 +1559,7 @@ def run_training_search(
                     "directory": str(version_dir),
                     "validation": validation,
                     "fingerprint": fingerprint,
+                    "response_kind": response_kind,
                 }
             )
             record["corrections_used"] = max(0, len(record["versions"]) - 1)

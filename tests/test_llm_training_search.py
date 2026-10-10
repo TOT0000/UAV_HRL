@@ -478,11 +478,12 @@ def test_failed_candidate_is_saved_and_increased_repair_budget_resumes(
         lambda *, candidate_id, **_kwargs: f"COMMON candidate={candidate_id}",
     )
     calls = []
+    raw_response = '{"candidate_id": "broken",\nnot-json'
 
     def invalid_response(**kwargs):
         calls.append(kwargs["prompt"])
         return {
-            "content": "not-json",
+            "content": raw_response,
             "transport_completed": True,
             "finish_reason": "stop",
         }
@@ -518,14 +519,116 @@ def test_failed_candidate_is_saved_and_increased_repair_budget_resumes(
 
     second = search.run_training_search(
         resume=output,
-        max_repairs_per_candidate=1,
+        max_repairs_per_candidate=0,
         client=object(),
         baseline_validator=lambda **_kwargs: preflight,
     )
     assert second["status"] == "paused_candidate_repairs_exhausted"
     state = json.loads((output / "state.json").read_text(encoding="utf-8"))
     record = state["current_round"]["candidates"]["r01_c01"]
+    assert record["corrections_used"] == 0
+    assert len(record["versions"]) == 1
+    assert state["model_calls"] == 1
+    assert len(calls) == 1
+
+    third = search.run_training_search(
+        resume=output,
+        max_repairs_per_candidate=1,
+        client=object(),
+        baseline_validator=lambda **_kwargs: preflight,
+    )
+    assert third["status"] == "paused_candidate_repairs_exhausted"
+    state = json.loads((output / "state.json").read_text(encoding="utf-8"))
+    record = state["current_round"]["candidates"]["r01_c01"]
     assert record["corrections_used"] == 1
     assert len(record["versions"]) == 2
     assert state["model_calls"] == 2
     assert len(calls) == 2
+    assert '"response_kind": "raw_unparsed_model_response"' in calls[1]
+    assert '"raw_response": "{\\"candidate_id\\": \\"broken\\",\\nnot-json"' in calls[1]
+    assert '"lineno": 2' in calls[1]
+    assert '"colno": 1' in calls[1]
+    assert '"pos":' in calls[1]
+    assert "Complete failed response material:" in calls[1]
+    assert "Complete failed candidate:\nnull" not in calls[1]
+
+
+def test_parseable_validation_failure_repair_prompt_contains_complete_candidate(
+    tmp_path, monkeypatch
+):
+    dataset = SimpleNamespace(
+        provenance={"fixture": "validation-only"},
+        fixed_metadata={},
+        arrays={"state": np.zeros((1, 1), dtype=np.float32)},
+        episodes=(SimpleNamespace(index=0),),
+    )
+    monkeypatch.setattr(search, "bounded_validation_dataset", lambda *_a, **_k: dataset)
+    monkeypatch.setattr(search, "build_constants", lambda _metadata: {})
+    monkeypatch.setattr(
+        search,
+        "build_environment_source_bundle",
+        lambda: {
+            "bundle_sha256": "source-fixture",
+            "git_sha": "fixture",
+            "call_relationships": [],
+            "excerpts": {},
+            "rendered": {},
+        },
+    )
+    monkeypatch.setattr(
+        search,
+        "render_common_prompt",
+        lambda *, candidate_id, **_kwargs: f"COMMON candidate={candidate_id}",
+    )
+    submission = _submission("r01_c01", [0.4], [2.0])
+    calls = []
+
+    def response(**kwargs):
+        calls.append(kwargs["prompt"])
+        return {
+            "content": json.dumps(submission),
+            "transport_completed": True,
+            "finish_reason": "stop",
+        }
+
+    monkeypatch.setattr(search, "_call_model", response)
+    monkeypatch.setattr(
+        search,
+        "validate_search_candidate",
+        lambda candidate, **_kwargs: (
+            _normalized(candidate),
+            {
+                "status": "failed",
+                "stage": "execution",
+                "error": "fixture runtime validation failure",
+            },
+            None,
+        ),
+    )
+    preflight = {
+        "status": "passed",
+        "manifest_path": str(tmp_path / "baseline" / "scenario_manifest.json"),
+        "manifest_content_hash": "manifest-fixture",
+        "checkpoint_episode": 800,
+        "metrics": {"episode_energy_efficiency_mbit_per_j": {"mean": 0.5}},
+    }
+    result = search.run_training_search(
+        validation_sources=[tmp_path / "validation"],
+        baseline_run=tmp_path / "baseline-run",
+        baseline_evaluation=tmp_path / "baseline",
+        provider="openai",
+        model="fixture",
+        output_dir=tmp_path / "parsed-failure-search",
+        runtime_root=tmp_path / "runtime",
+        max_rounds=1,
+        max_repairs_per_candidate=1,
+        client=object(),
+        baseline_validator=lambda **_kwargs: preflight,
+    )
+    assert result["status"] == "paused_candidate_repairs_exhausted"
+    assert len(calls) == 2
+    assert '"response_kind": "parsed_candidate"' in calls[1]
+    assert '"parsed_candidate": {' in calls[1]
+    assert '"candidate_id": "r01_c01"' in calls[1]
+    assert submission["code"].splitlines()[0] in calls[1]
+    assert '"raw_response"' not in calls[1]

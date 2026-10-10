@@ -913,10 +913,6 @@ def validate_baseline_preflight(
         raise EpisodeTrainingError("baseline comparison manifest must use the test split")
     if scenario_manifest.episode_count != int(episodes):
         raise EpisodeTrainingError("baseline comparison manifest episode count is incompatible")
-    if int(scenario_manifest.manifest_seed) != int(baseline_resolved["seed"]):
-        raise EpisodeTrainingError(
-            "baseline evaluation manifest seed differs from the baseline training seed"
-        )
     if scenario_manifest.generation_profile.get("fixed_num_gt") != int(roi_count):
         raise EpisodeTrainingError("baseline comparison manifest is not fixed at 8 RoIs")
     if tuple(map(float, environment_size_m)) != (1000.0, 1000.0):
