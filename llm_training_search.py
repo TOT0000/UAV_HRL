@@ -64,6 +64,7 @@ from llm_episode_search import (
 )
 from llm_numeric_operations import NUMERIC_OPERATION_RULES_VERSION
 from experiment_config import DEFAULT_TRAINING_SEED
+from llm_episode_training import WINDOWS_PORTABLE_PATH_LIMIT
 from scenario_manifest import ScenarioManifest
 
 
@@ -597,16 +598,28 @@ def _exploration_parameter_summary(
             and np.isfinite(float(value))
         ]
         if numeric:
-            monotonic_up = all(left <= right for left, right in zip(numeric, numeric[1:]))
-            monotonic_down = all(left >= right for left, right in zip(numeric, numeric[1:]))
-            item["monotonic"] = (
-                "nondecreasing"
-                if monotonic_up
-                else "nonincreasing"
-                if monotonic_down
-                else "no"
-            )
-            if not (monotonic_up or monotonic_down) or len(numeric) != len(sequence):
+            if ordered:
+                monotonic_up = all(
+                    left <= right for left, right in zip(numeric, numeric[1:])
+                )
+                monotonic_down = all(
+                    left >= right for left, right in zip(numeric, numeric[1:])
+                )
+                item["monotonic"] = (
+                    "nondecreasing"
+                    if monotonic_up
+                    else "nonincreasing"
+                    if monotonic_down
+                    else "no"
+                )
+            else:
+                item["trend"] = "unknown_without_episode_order"
+                monotonic_up = monotonic_down = False
+            if (
+                not ordered
+                or not (monotonic_up or monotonic_down)
+                or len(numeric) != len(sequence)
+            ):
                 item["min"] = min(numeric)
                 item["max"] = max(numeric)
         else:
@@ -1355,11 +1368,78 @@ def _result(state: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _atomic_write_text(path: Path, text: str) -> None:
+def _atomic_temporary_path(path: Path) -> Path:
+    return path.with_name(f".{path.name}.tmp")
+
+
+def _validate_atomic_write_paths(
+    path: Path, *, portable_path_limit: int
+) -> dict[str, Any]:
+    target = path.resolve()
+    temporary = _atomic_temporary_path(target)
+    lengths = {
+        "target": len(str(target)),
+        "temporary": len(str(temporary)),
+    }
+    longest_name = max(lengths, key=lengths.get)
+    if lengths[longest_name] > int(portable_path_limit):
+        longest = target if longest_name == "target" else temporary
+        raise TrainingSearchError(
+            "atomic output exceeds the portable Windows path limit: "
+            f"{lengths[longest_name]} > {int(portable_path_limit)}: {longest}"
+        )
+    return {
+        "portable_path_limit": int(portable_path_limit),
+        "target_path": str(target),
+        "target_path_length": lengths["target"],
+        "temporary_path": str(temporary),
+        "temporary_path_length": lengths["temporary"],
+    }
+
+
+def _atomic_write_text(
+    path: Path, text: str, *, portable_path_limit: int | None = None
+) -> None:
+    if portable_path_limit is not None:
+        _validate_atomic_write_paths(
+            path, portable_path_limit=portable_path_limit
+        )
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.tmp")
+    temporary = _atomic_temporary_path(path)
     temporary.write_text(text, encoding="utf-8")
     temporary.replace(path)
+
+
+def _archive_cached_prompt(
+    directory: Path, *, kind: str, text: str
+) -> tuple[Path, str]:
+    """Save an immutable, short-path prompt backup and return its full hash."""
+
+    if kind not in {"request", "stage"}:
+        raise TrainingSearchError(f"unsupported cached prompt backup kind: {kind}")
+    digest = _sha256_text(text)
+    stem = "rq" if kind == "request" else "st"
+    for collision_index in range(1000):
+        suffix = "" if collision_index == 0 else f"-{collision_index}"
+        path = directory / f"{stem}-{digest[:16]}{suffix}.txt"
+        _validate_atomic_write_paths(
+            path, portable_path_limit=WINDOWS_PORTABLE_PATH_LIMIT
+        )
+        if path.exists():
+            if path.read_text(encoding="utf-8") == text:
+                return path, digest
+            continue
+        _atomic_write_text(
+            path, text, portable_path_limit=WINDOWS_PORTABLE_PATH_LIMIT
+        )
+        if path.read_text(encoding="utf-8") != text:
+            raise TrainingSearchError(
+                f"cached prompt backup verification failed: {path}"
+            )
+        return path, digest
+    raise TrainingSearchError(
+        f"cached prompt backup name collisions exhausted for {kind}: {directory}"
+    )
 
 
 def _atomic_write_json(path: Path, value: Any) -> None:
@@ -1578,15 +1658,16 @@ def _prepare_generation_request(
 
     if old_request and old_request != request:
         migration = _ensure_migration_backup(output)
-        archive = migration / "cached_prompts" / candidate_id
-        archive.mkdir(parents=True, exist_ok=True)
-        old_hash = _sha256_text(old_request)
-        request_path = archive / f"generation_request.{old_hash}.txt"
-        stage_path = archive / f"generation_stage.{_sha256_text(old_stage or '')}.txt"
-        if not request_path.exists():
-            _atomic_write_text(request_path, old_request)
-        if old_stage is not None and not stage_path.exists():
-            _atomic_write_text(stage_path, old_stage)
+        archive = migration / "p" / candidate_id
+        request_path, old_hash = _archive_cached_prompt(
+            archive, kind="request", text=old_request
+        )
+        stage_path = None
+        old_stage_hash = None
+        if old_stage is not None:
+            stage_path, old_stage_hash = _archive_cached_prompt(
+                archive, kind="stage", text=old_stage
+            )
         migration_record = {
             "migrated_at_utc": _now(),
             "from_prompt_version": old_metadata.get(
@@ -1594,11 +1675,14 @@ def _prepare_generation_request(
             ),
             "to_prompt_version": SEARCH_PROMPT_VERSION,
             "old_generation_request_sha256": old_hash,
+            "old_generation_stage_sha256": old_stage_hash,
             "new_generation_request_sha256": metadata[
                 "generation_request_sha256"
             ],
             "old_request_archive": str(request_path.resolve()),
-            "old_stage_archive": str(stage_path.resolve()),
+            "old_stage_archive": (
+                str(stage_path.resolve()) if stage_path is not None else None
+            ),
             "reason": "unsent cached request rebuilt with compact training feedback",
         }
         migrations = record.setdefault("generation_request_migrations", [])

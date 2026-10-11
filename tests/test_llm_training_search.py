@@ -298,6 +298,88 @@ def test_training_feedback_compacts_ordered_per_episode_exploration(tmp_path):
     assert compact_stat == original_stat
 
 
+def test_exploration_summary_does_not_infer_trend_without_episode_order():
+    unordered = search._exploration_parameter_summary(
+        [{"noise": 0.1}, {"noise": 0.2}], ordered=False
+    )
+    parameter = unordered["parameters"]["noise"]
+    assert parameter["trend"] == "unknown_without_episode_order"
+    assert "monotonic" not in parameter
+    assert parameter["min"] == pytest.approx(0.1)
+    assert parameter["max"] == pytest.approx(0.2)
+    assert parameter["start"] == {"unavailable": "episode order not saved"}
+    assert parameter["end"] == {"unavailable": "episode order not saved"}
+
+    fixed = search._exploration_parameter_summary(
+        [{"noise": 0.1}, {"noise": 0.1}], ordered=False
+    )
+    assert fixed["parameters"]["noise"] == {"value": 0.1}
+
+    ordered = search._exploration_parameter_summary(
+        [{"noise": 0.2}, {"noise": 0.1}], ordered=True
+    )["parameters"]["noise"]
+    assert ordered["start"] == pytest.approx(0.2)
+    assert ordered["end"] == pytest.approx(0.1)
+    assert ordered["monotonic"] == "nonincreasing"
+    assert "trend" not in ordered
+
+
+def test_cached_prompt_backups_use_short_collision_safe_atomic_paths(
+    tmp_path, monkeypatch
+):
+    actual_output = Path(
+        r"C:\Users\user\Desktop\project\YM_Post_Disaster_Training\UAV_HRL"
+        r"\results\llm_training_searches\gpt-4o"
+        r"\design-20261010T052422Z-03609dfd"
+    )
+    actual_archive = (
+        actual_output
+        / "migrations"
+        / search.PROMPT_MIGRATION_ID
+        / "p"
+        / "r02_c01"
+    )
+    actual_path = actual_archive / f"rq-{'a' * 16}.txt"
+    path_report = search._validate_atomic_write_paths(
+        actual_path, portable_path_limit=search.WINDOWS_PORTABLE_PATH_LIMIT
+    )
+    assert path_report["target_path_length"] <= search.WINDOWS_PORTABLE_PATH_LIMIT
+    assert (
+        path_report["temporary_path_length"]
+        <= search.WINDOWS_PORTABLE_PATH_LIMIT
+    )
+    assert path_report["temporary_path"].endswith(
+        f".rq-{'a' * 16}.txt.tmp"
+    )
+
+    archive = tmp_path / "migration" / "p" / "r02_c01"
+    monkeypatch.setattr(search, "_sha256_text", lambda _text: "a" * 64)
+    first, first_hash = search._archive_cached_prompt(
+        archive, kind="request", text="first prompt"
+    )
+    same, same_hash = search._archive_cached_prompt(
+        archive, kind="request", text="first prompt"
+    )
+    second, second_hash = search._archive_cached_prompt(
+        archive, kind="request", text="different prompt"
+    )
+    second_again, _ = search._archive_cached_prompt(
+        archive, kind="request", text="different prompt"
+    )
+    assert first == same
+    assert second == second_again
+    assert first != second
+    assert first.read_text(encoding="utf-8") == "first prompt"
+    assert second.read_text(encoding="utf-8") == "different prompt"
+    assert first_hash == same_hash == second_hash == "a" * 64
+    stage, stage_hash = search._archive_cached_prompt(
+        archive, kind="stage", text="generation stage"
+    )
+    assert stage.name.startswith("st-")
+    assert stage.read_text(encoding="utf-8") == "generation stage"
+    assert stage_hash == "a" * 64
+
+
 def test_resume_source_compatibility_uses_excerpt_content_not_git_revision(tmp_path):
     output = tmp_path / "search"
     source_dir = output / "prompt_source_context"
@@ -650,6 +732,20 @@ def test_search_trains_all_four_then_resumes_with_same_round_reference(
     assert migrated["current_round"]["reference_candidate_id"] == "r01_c04"
     assert len(migrated["compatibility_migrations"]) == 1
     assert len(migrated_pending["generation_request_migrations"]) == 1
+    prompt_migration = migrated_pending["generation_request_migrations"][0]
+    assert len(prompt_migration["old_generation_request_sha256"]) == 64
+    assert len(prompt_migration["old_generation_stage_sha256"]) == 64
+    for archive_key in ("old_request_archive", "old_stage_archive"):
+        archive_path = Path(prompt_migration[archive_key])
+        assert archive_path.is_file()
+        atomic_paths = search._validate_atomic_write_paths(
+            archive_path,
+            portable_path_limit=search.WINDOWS_PORTABLE_PATH_LIMIT,
+        )
+        assert (
+            atomic_paths["temporary_path_length"]
+            <= search.WINDOWS_PORTABLE_PATH_LIMIT
+        )
     assert "OLD OVERSIZED STAGE" not in migrated_pending["generation_request"]
     assert "def compute_extra_state" in migrated_pending["generation_request"]
     diagnostic_path = Path(
