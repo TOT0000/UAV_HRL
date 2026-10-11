@@ -1,3 +1,4 @@
+import copy
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -192,6 +193,207 @@ def test_candidate_score_is_arithmetic_mean_of_episode_ee_not_ratio_of_totals():
     )
 
 
+def test_training_feedback_compacts_ordered_per_episode_exploration(tmp_path):
+    candidates = {}
+    expected_first = None
+    expected_block_end = None
+    for candidate_index in range(1, 5):
+        candidate_id = f"r01_c{candidate_index:02d}"
+        rows = []
+        for episode in range(1, 801):
+            noise = 0.2 - 0.00015 * episode
+            exploration = {
+                "behavior_noise_max": noise,
+                "evaluation": False,
+                "warmup_random_action_intervals": 0,
+            }
+            rows.append(
+                {
+                    "episode": episode,
+                    "candidate_artifact_id": candidate_id,
+                    "feature_names": ["delivery"],
+                    "feature_reward_weights": [0.5],
+                    "beta": 1.0,
+                    "feature_contribution_sums": [episode / 1000.0],
+                    "base_reward_sum": float(episode),
+                    "extra_reward_sum": episode / 1000.0,
+                    "combined_reward_sum": float(episode) + episode / 1000.0,
+                    "timely_mbits": 10.0 + episode,
+                    "movement_energy_j": 1000.0 + episode,
+                    "energy_efficiency_mbit_per_j": episode / 1_000_000.0,
+                    "roi_count": 8,
+                    "exploration": exploration,
+                    "dinkelbach_lambda_used": episode / 10000.0,
+                }
+            )
+        run = tmp_path / candidate_id
+        run.mkdir()
+        (run / "llm_training_episode_metrics.jsonl").write_text(
+            "".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8"
+        )
+        summaries = summarize_training_blocks(
+            rows, block_size=200, expected_episodes=800
+        )
+        submission = _submission(candidate_id, [0.4], [0.5])
+        candidates[candidate_id] = {
+            "candidate_id": candidate_id,
+            "status": "completed",
+            "submission": submission,
+            "training": {
+                "status": "complete",
+                "run_directory": str(run),
+                "summaries": summaries,
+            },
+            "training_fairness": {
+                "status": "passed",
+                "seed": 20260817,
+                "episodes": 800,
+                "fresh_initialization": True,
+                "training_scenario_prefix_matches_baseline": True,
+                "episode_800_is_stop_not_decay_horizon": True,
+                "exploration_schedule_configuration": {
+                    "movement_exploration_decay_episodes": 1000,
+                    "routing_epsilon_decay_episodes": 1000,
+                },
+            },
+            "evaluation": {
+                "status": "complete",
+                "checkpoint_episode": 800,
+                "episode_count": 100,
+                "mean_episode_energy_efficiency_mbit_per_j": 0.001,
+                "std_episode_energy_efficiency_mbit_per_j": 0.0001,
+                "baseline_mean_episode_energy_efficiency_mbit_per_j": 0.002,
+                "baseline_absolute_gap_mbit_per_j": -0.001,
+                "baseline_percent_gap": -50.0,
+                "candidate_metrics": {},
+            },
+        }
+        if candidate_index == 1:
+            expected_first = rows[0]["exploration"]["behavior_noise_max"]
+            expected_block_end = rows[199]["exploration"]["behavior_noise_max"]
+
+    round_record = {
+        "candidate_order": list(candidates),
+        "candidates": candidates,
+    }
+    _results, training = search._latest_round_feedback(
+        round_record, best_candidate_id="r01_c01"
+    )
+    serialized = json.dumps(training, ensure_ascii=False)
+    assert serialized.count('"behavior_noise_max"') == 4
+    assert len(serialized) < 30_000
+    assert training["shared_fairness_and_training_contract"]["training_seed"] == 20260817
+    first_block = training["shared_exploration_by_block"][0]
+    parameter = first_block["summary"]["parameters"]["behavior_noise_max"]
+    assert first_block["source"] == "ordered llm_training_episode_metrics.jsonl"
+    assert parameter["start"] == pytest.approx(expected_first)
+    assert parameter["end"] == pytest.approx(expected_block_end)
+    assert parameter["monotonic"] == "nonincreasing"
+    compact_stat = training["candidates"][0]["blocks"][0][
+        "feature_contributions"
+    ]["delivery"]
+    original_stat = candidates["r01_c01"]["training"]["summaries"][0][
+        "feature_contributions"
+    ]["delivery"]
+    assert compact_stat == original_stat
+
+
+def test_resume_source_compatibility_uses_excerpt_content_not_git_revision(tmp_path):
+    output = tmp_path / "search"
+    source_dir = output / "prompt_source_context"
+    source_dir.mkdir(parents=True)
+    settings = {
+        "train_episodes": 800,
+        "evaluation_episodes": 100,
+        "evaluation_roi_count": 8,
+        "evaluation_area_m": [1000.0, 1000.0],
+        "episode_seconds": 60,
+        "candidate_count_per_round": 4,
+        "candidate_generation_calls_per_request": 1,
+    }
+    old_bundle = {
+        "git_sha": "old-git",
+        "bundle_sha256": "old-bundle",
+        "call_relationships": ["a -> b"],
+        "excerpts": {
+            "observation": [
+                {
+                    "source_file": "env.py",
+                    "symbol": "observe",
+                    "line_start": 1,
+                    "line_end": 2,
+                    "sha256": "legacy",
+                    "code": "def observe():\n    return 1",
+                }
+            ]
+        },
+        "rendered": {},
+    }
+    current_bundle = {
+        **old_bundle,
+        "git_sha": "new-git",
+        "bundle_sha256": "new-bundle",
+        "excerpts": {
+            "observation": [
+                {
+                    **old_bundle["excerpts"]["observation"][0],
+                    "line_start": 50,
+                    "line_end": 51,
+                }
+            ]
+        },
+    }
+    current_bundle["content_sha256"] = search._source_bundle_content_sha256(
+        current_bundle
+    )
+    state = {
+        "prompt_version": search.LEGACY_PROMPT_VERSION,
+        "git_sha": "old-git",
+        "environment_source_bundle_sha256": "old-bundle",
+        "settings": settings,
+    }
+    (output / "state.json").write_text(json.dumps(state), encoding="utf-8")
+    (output / "constants.json").write_text("{}", encoding="utf-8")
+    (source_dir / "environment_source_context.json").write_text(
+        json.dumps(old_bundle), encoding="utf-8"
+    )
+    migration = search._prepare_resume_compatibility(
+        output=output,
+        state=state,
+        source_bundle=current_bundle,
+        constants={},
+    )
+    assert migration is not None
+    assert state["prompt_version"] == search.SEARCH_PROMPT_VERSION
+    assert state["environment_source_bundle_sha256"] == "new-bundle"
+    assert (output / "migrations" / search.PROMPT_MIGRATION_ID / "state.before.json").is_file()
+    assert search._prepare_resume_compatibility(
+        output=output,
+        state=state,
+        source_bundle=current_bundle,
+        constants={},
+    ) is None
+
+    changed_bundle = copy.deepcopy(current_bundle)
+    changed_bundle["bundle_sha256"] = "changed-bundle"
+    changed_bundle["excerpts"]["observation"][0]["code"] = (
+        "def observe():\n    return 2"
+    )
+    changed_bundle["content_sha256"] = search._source_bundle_content_sha256(
+        changed_bundle
+    )
+    (source_dir / "environment_source_context.json").write_text(
+        json.dumps(current_bundle), encoding="utf-8"
+    )
+    with pytest.raises(search.TrainingSearchError, match="source content changed"):
+        search._prepare_resume_compatibility(
+            output=output,
+            state=state,
+            source_bundle=changed_bundle,
+            constants={},
+        )
+
+
 def test_training_fairness_uses_baseline_prefix_and_keeps_1000_episode_decay(tmp_path):
     baseline = tmp_path / "baseline"
     candidate = tmp_path / "candidate"
@@ -247,21 +449,24 @@ def test_search_trains_all_four_then_resumes_with_same_round_reference(
     )
     monkeypatch.setattr(search, "bounded_validation_dataset", lambda *_a, **_k: dataset)
     monkeypatch.setattr(search, "build_constants", lambda _metadata: {})
-    monkeypatch.setattr(
-        search,
-        "build_environment_source_bundle",
-        lambda: {
+    bundle_holder = {
+        "value": {
             "bundle_sha256": "source-fixture",
             "git_sha": "fixture",
             "call_relationships": [],
             "excerpts": {},
             "rendered": {},
-        },
+        }
+    }
+    monkeypatch.setattr(
+        search, "build_environment_source_bundle", lambda: bundle_holder["value"]
     )
     monkeypatch.setattr(
         search,
         "render_common_prompt",
-        lambda *, candidate_id, **_kwargs: f"COMMON candidate={candidate_id}",
+        lambda *, candidate_id, **_kwargs: (
+            f"COMMON candidate={candidate_id}\n" + "E" * 70_000
+        ),
     )
 
     def validate(submission, **_kwargs):
@@ -315,10 +520,29 @@ def test_search_trains_all_four_then_resumes_with_same_round_reference(
         training_calls.append(kwargs)
         run = Path(kwargs["output_directory"]) / search.SEARCH_METHOD_ID / "run"
         run.mkdir(parents=True, exist_ok=True)
+        blocks = [
+            {
+                "episode_range": [start, start + 199],
+                "episode_count": 200,
+                "energy_efficiency_mbit_per_j": {"mean": 0.001, "std": 0.0001},
+                "timely_useful_delivery_mbit": {"mean": 20.0, "std": 2.0},
+                "movement_energy_j": {"mean": 100000.0, "std": 1000.0},
+                "base_reward_sum": {"mean": 1.0, "std": 0.2},
+                "extra_reward_sum": {"mean": 0.5, "std": 0.1},
+                "combined_reward_sum": {"mean": 1.5, "std": 0.25},
+                "feature_contributions": {
+                    "feature_0": {"mean": 0.5, "std": 0.1}
+                },
+                "roi_count_distribution": {"8": 200},
+                "exploration": [],
+                "lambda_semantics": "actual dinkelbach_lambda_used during training",
+            }
+            for start in (1, 201, 401, 601)
+        ]
         return {
             "status": "complete",
             "run_directory": str(run),
-            "summaries": [{"episode_range": [1, 200]}],
+            "summaries": blocks,
         }
 
     evaluation_calls = []
@@ -355,6 +579,7 @@ def test_search_trains_all_four_then_resumes_with_same_round_reference(
         baseline_evaluation=tmp_path / "baseline-eval",
         provider="openai",
         model="fixture-model",
+        context_length=128000,
         output_dir=output,
         runtime_root=tmp_path / "runtime",
         max_rounds=1,
@@ -373,6 +598,90 @@ def test_search_trains_all_four_then_resumes_with_same_round_reference(
     assert all(call["episodes"] == 100 for call in evaluation_calls)
     assert all(call["roi_count"] == 8 for call in evaluation_calls)
     assert all(call["manifest"] == preflight["manifest_path"] for call in evaluation_calls)
+
+    state_path = output / "state.json"
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    state["prompt_version"] = search.LEGACY_PROMPT_VERSION
+    state["status"] = "paused_context_budget_exceeded"
+    state["search_round"] = 2
+    state["current_round"] = search._new_round(state, 2)
+    pending = state["current_round"]["candidates"]["r02_c01"]
+    pending["generation_stage_request"] = "OLD OVERSIZED STAGE"
+    old_common = "COMMON candidate=r02_c01\n" + "E" * 70_000
+    pending["generation_request"] = (
+        old_common.rstrip() + "\n\n" + pending["generation_stage_request"] + "\n"
+    )
+    state_path.write_text(json.dumps(state), encoding="utf-8")
+    bundle_holder["value"] = {
+        "bundle_sha256": "source-fixture-new-git",
+        "git_sha": "fixture-new-git",
+        "call_relationships": [],
+        "excerpts": {},
+        "rendered": {},
+    }
+    original_estimate = search.estimate_token_budget
+
+    def over_budget(prompt, *, context_length, max_output_tokens):
+        return {
+            "method": "fixture estimate",
+            "exact": False,
+            "characters": len(prompt),
+            "reserved_output_tokens": max_output_tokens,
+            "client_context_budget": context_length,
+            "estimated_total_upper": context_length + 1,
+            "fits_client_budget": False,
+        }
+
+    monkeypatch.setattr(search, "estimate_token_budget", over_budget)
+    paused = search.run_training_search(
+        resume=output,
+        max_rounds=2,
+        client=object(),
+        training_runner=train,
+        evaluation_runner=evaluate,
+        baseline_validator=baseline_validator,
+    )
+    assert paused["status"] == "paused_context_budget_exceeded"
+    assert paused["model_calls"] == 4
+    assert len(training_calls) == len(evaluation_calls) == 4
+    migrated = json.loads(state_path.read_text(encoding="utf-8"))
+    migrated_pending = migrated["current_round"]["candidates"]["r02_c01"]
+    assert migrated["prompt_version"] == search.SEARCH_PROMPT_VERSION
+    assert migrated["current_round"]["reference_candidate_id"] == "r01_c04"
+    assert len(migrated["compatibility_migrations"]) == 1
+    assert len(migrated_pending["generation_request_migrations"]) == 1
+    assert "OLD OVERSIZED STAGE" not in migrated_pending["generation_request"]
+    assert "def compute_extra_state" in migrated_pending["generation_request"]
+    diagnostic_path = Path(
+        migrated_pending["last_prompt_budget_report"]["prompt_path"]
+    )
+    assert diagnostic_path.is_file()
+    assert diagnostic_path.read_text(encoding="utf-8") == migrated_pending[
+        "generation_request"
+    ]
+    backup = output / "migrations" / search.PROMPT_MIGRATION_ID / "state.before.json"
+    assert backup.is_file()
+    backup_text = backup.read_text(encoding="utf-8")
+
+    paused_again = search.run_training_search(
+        resume=output,
+        max_rounds=2,
+        client=object(),
+        training_runner=train,
+        evaluation_runner=evaluate,
+        baseline_validator=baseline_validator,
+    )
+    assert paused_again["model_calls"] == 4
+    migrated_again = json.loads(state_path.read_text(encoding="utf-8"))
+    assert len(migrated_again["compatibility_migrations"]) == 1
+    assert len(
+        migrated_again["current_round"]["candidates"]["r02_c01"][
+            "generation_request_migrations"
+        ]
+    ) == 1
+    assert backup.read_text(encoding="utf-8") == backup_text
+
+    monkeypatch.setattr(search, "estimate_token_budget", original_estimate)
 
     second = search.run_training_search(
         resume=output,
@@ -401,6 +710,16 @@ def test_search_trains_all_four_then_resumes_with_same_round_reference(
     assert len(second_round_prompts) == 4
     assert all('"candidate_id": "r01_c04"' in prompt for prompt in second_round_prompts)
     assert all("1–200, 201–400, 401–600, 601–800" in prompt for prompt in second_round_prompts)
+    assert "========== DIRECTION_ADD ==========" in second_round_prompts[0]
+    assert '"feature_contributions"' in second_round_prompts[0]
+    assert '"baseline_percent_gap"' in second_round_prompts[0]
+    assert all(candidate_id in second_round_prompts[0] for candidate_id in state["rounds"][0]["candidate_order"])
+    completed = json.loads(state_path.read_text(encoding="utf-8"))
+    report = completed["rounds"][1]["candidates"]["r02_c01"][
+        "last_prompt_budget_report"
+    ]
+    assert report["full_request_budget"]["fits_client_budget"] is True
+    assert report["sections_characters"]["training_block_summaries"] > 0
 
 
 def test_runtime_roots_are_shallow_unique_and_stable(tmp_path):

@@ -134,3 +134,17 @@ contribution. The writer checks that feature contributions sum to extra reward
 and that base plus extra equals combined reward. Search feedback summarizes
 episodes 1-200, 201-400, 401-600, and 601-800 without recomputing history from a
 later lambda.
+
+Prompt v2 reads those saved episode rows in episode order and represents changing
+exploration parameters by block start/end values (and min/max when needed). Shared
+fairness and exploration settings are emitted once for the four candidates. The
+full source records and provenance remain on disk. Every pending request also has
+a `prompt_diagnostics/<candidate>/pending-*.json` report with per-section character
+counts and the complete-request token estimate, including output reservation.
+
+A paused prompt-v1 run may resume under prompt v2. Before migration, the runner
+atomically preserves `state.json` and the old source context under
+`migrations/compact-training-feedback-v2/`. It permits Git-revision or source-line
+drift only after the saved and current source excerpt contents, validation data,
+constants, and fixed training/evaluation contract match. An unsent cached request
+is archived and rebuilt; requests already sent to a model are never overwritten.

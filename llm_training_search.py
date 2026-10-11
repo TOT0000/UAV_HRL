@@ -68,7 +68,9 @@ from scenario_manifest import ScenarioManifest
 
 
 SEARCH_RUN_SCHEMA_VERSION = "uav-hrl-llm-training-search-run-v1"
-SEARCH_PROMPT_VERSION = "uav-hrl-llm-training-search-prompt-v1"
+SEARCH_PROMPT_VERSION = "uav-hrl-llm-training-search-prompt-v2"
+LEGACY_PROMPT_VERSION = "uav-hrl-llm-training-search-prompt-v1"
+PROMPT_MIGRATION_ID = "compact-training-feedback-v2"
 SEARCH_METHOD_ID = "td3_dinkelbach_llm_train_search"
 DEFAULT_OUTPUT_ROOT = Path("results") / "llm_training_searches"
 DEFAULT_RUNTIME_ROOT = Path.home() / "uav_hrl_rt"
@@ -363,16 +365,52 @@ def build_environment_source_bundle() -> dict[str, Any]:
         }
         for item in all_items
     ]
+    content_identity = {
+        "call_relationships": call_relationships,
+        "excerpts": {
+            category: [
+                {
+                    "source_file": item["source_file"],
+                    "symbol": item["symbol"],
+                    "code_sha256": _sha256_text(item["code"]),
+                }
+                for item in items
+            ]
+            for category, items in categories.items()
+        },
+    }
     return {
         "schema_version": "uav-hrl-llm-training-search-source-context-v1",
         "git_sha": _git_sha(),
         "call_relationships": call_relationships,
         "excerpts": categories,
         "rendered": rendered,
+        "content_sha256": _sha256_json(content_identity),
         "bundle_sha256": _sha256_json(
             {"git_sha": _git_sha(), "call_relationships": call_relationships, "identity": identity}
         ),
     }
+
+
+def _source_bundle_content_sha256(bundle: dict[str, Any]) -> str:
+    """Hash executable excerpt content while ignoring Git SHA and source line drift."""
+
+    excerpts = bundle.get("excerpts") or {}
+    identity = {
+        "call_relationships": list(bundle.get("call_relationships") or []),
+        "excerpts": {
+            category: [
+                {
+                    "source_file": item.get("source_file"),
+                    "symbol": item.get("symbol"),
+                    "code_sha256": _sha256_text(str(item.get("code", ""))),
+                }
+                for item in items
+            ]
+            for category, items in excerpts.items()
+        },
+    }
+    return _sha256_json(identity)
 
 
 def _minimal_example(candidate_id: str) -> str:
@@ -477,7 +515,6 @@ def _evaluation_feedback(result: dict[str, Any] | None) -> dict[str, Any] | None
         "status",
         "checkpoint_episode",
         "episode_count",
-        "scenario_manifest_hash",
         "mean_episode_energy_efficiency_mbit_per_j",
         "std_episode_energy_efficiency_mbit_per_j",
         "baseline_mean_episode_energy_efficiency_mbit_per_j",
@@ -488,29 +525,244 @@ def _evaluation_feedback(result: dict[str, Any] | None) -> dict[str, Any] | None
     return {key: result.get(key) for key in keys}
 
 
-def _latest_round_feedback(round_record: dict[str, Any]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+def _load_ordered_training_rows(record: dict[str, Any]) -> list[dict[str, Any]] | None:
+    run_directory = (record.get("training") or {}).get("run_directory")
+    if not run_directory:
+        return None
+    path = Path(run_directory) / "llm_training_episode_metrics.jsonl"
+    try:
+        rows = [
+            json.loads(line)
+            for line in path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+    except (OSError, json.JSONDecodeError):
+        return None
+    episodes = [int(row.get("episode", -1)) for row in rows]
+    if episodes != list(range(1, len(rows) + 1)):
+        return None
+    return rows
+
+
+def _decode_exploration(value: Any) -> dict[str, Any] | None:
+    if isinstance(value, dict):
+        return copy.deepcopy(value)
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except json.JSONDecodeError:
+            return None
+        return parsed if isinstance(parsed, dict) else None
+    return None
+
+
+def _exploration_parameter_summary(
+    values: list[dict[str, Any] | None], *, ordered: bool
+) -> dict[str, Any]:
+    missing_marker = {"missing": True}
+    keys = sorted(
+        {
+            key
+            for value in values
+            if isinstance(value, dict)
+            for key in value
+        }
+    )
+    if not keys:
+        return {
+            "status": "missing",
+            "reason": "no usable exploration records",
+            "episode_order_available": bool(ordered),
+        }
+    parameters: dict[str, Any] = {}
+    for key in keys:
+        sequence = [
+            value[key] if isinstance(value, dict) and key in value else missing_marker
+            for value in values
+        ]
+        encoded = [_canonical_json(item) for item in sequence]
+        if len(set(encoded)) == 1:
+            parameters[key] = {"value": sequence[0]}
+            continue
+        item: dict[str, Any] = {
+            "start": sequence[0] if ordered else {"unavailable": "episode order not saved"},
+            "end": sequence[-1] if ordered else {"unavailable": "episode order not saved"},
+            "missing_count": sum(value == missing_marker for value in sequence),
+        }
+        numeric = [
+            float(value)
+            for value in sequence
+            if isinstance(value, (int, float))
+            and not isinstance(value, bool)
+            and np.isfinite(float(value))
+        ]
+        if numeric:
+            monotonic_up = all(left <= right for left, right in zip(numeric, numeric[1:]))
+            monotonic_down = all(left >= right for left, right in zip(numeric, numeric[1:]))
+            item["monotonic"] = (
+                "nondecreasing"
+                if monotonic_up
+                else "nonincreasing"
+                if monotonic_down
+                else "no"
+            )
+            if not (monotonic_up or monotonic_down) or len(numeric) != len(sequence):
+                item["min"] = min(numeric)
+                item["max"] = max(numeric)
+        else:
+            distinct = []
+            for value, serialized in zip(sequence, encoded):
+                if serialized not in {_canonical_json(item) for item in distinct}:
+                    distinct.append(value)
+            if len(distinct) <= 6:
+                item["distinct_values"] = distinct
+            else:
+                item["distinct_value_count"] = len(distinct)
+        parameters[key] = item
+    return {
+        "status": "summarized",
+        "episode_order_available": bool(ordered),
+        "parameters": parameters,
+    }
+
+
+def _compact_training_blocks(record: dict[str, Any]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    summaries = (record.get("training") or {}).get("summaries") or []
+    ordered_rows = _load_ordered_training_rows(record)
+    compact_blocks = []
+    exploration_blocks = []
+    retained = (
+        "episode_range",
+        "episode_count",
+        "energy_efficiency_mbit_per_j",
+        "timely_useful_delivery_mbit",
+        "movement_energy_j",
+        "base_reward_sum",
+        "extra_reward_sum",
+        "combined_reward_sum",
+        "feature_contributions",
+        "roi_count_distribution",
+    )
+    for block in summaries:
+        episode_range = list(block.get("episode_range") or [])
+        values: list[dict[str, Any] | None]
+        ordered = False
+        if len(episode_range) == 2 and ordered_rows is not None:
+            start, end = map(int, episode_range)
+            selected = ordered_rows[start - 1 : end]
+            if [int(row.get("episode", -1)) for row in selected] == list(
+                range(start, end + 1)
+            ):
+                values = [_decode_exploration(row.get("exploration")) for row in selected]
+                ordered = True
+            else:
+                values = []
+        else:
+            values = []
+        if not values:
+            values = [_decode_exploration(item) for item in block.get("exploration") or []]
+        compact_blocks.append(
+            {key: copy.deepcopy(block.get(key)) for key in retained if key in block}
+        )
+        exploration_blocks.append(
+            {
+                "episode_range": episode_range,
+                "source": (
+                    "ordered llm_training_episode_metrics.jsonl"
+                    if ordered
+                    else "legacy distinct exploration list; episode order unavailable"
+                ),
+                "summary": _exploration_parameter_summary(values, ordered=ordered),
+            }
+        )
+    return compact_blocks, exploration_blocks
+
+
+def _compact_fairness(record: dict[str, Any]) -> dict[str, Any]:
+    fairness = record.get("training_fairness") or {}
+    schedule = fairness.get("exploration_schedule_configuration")
+    return {
+        "status": fairness.get("status", "missing"),
+        "training_seed": fairness.get("seed"),
+        "training_episodes": fairness.get("episodes"),
+        "fresh_initialization": fairness.get("fresh_initialization"),
+        "training_scenario_prefix_matches_baseline": fairness.get(
+            "training_scenario_prefix_matches_baseline"
+        ),
+        "episode_800_is_stop_not_decay_horizon": fairness.get(
+            "episode_800_is_stop_not_decay_horizon"
+        ),
+        "exploration_schedule_configuration": copy.deepcopy(schedule),
+    }
+
+
+def _latest_round_feedback(
+    round_record: dict[str, Any], *, best_candidate_id: str | None = None
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     results = []
-    training = []
+    training_candidates = []
+    exploration_by_candidate: dict[str, list[dict[str, Any]]] = {}
+    fairness_by_candidate: dict[str, dict[str, Any]] = {}
     for candidate_id in round_record["candidate_order"]:
         record = round_record["candidates"][candidate_id]
+        if candidate_id == best_candidate_id:
+            design = {
+                "candidate_id": candidate_id,
+                "design_reference": "shared historical-best candidate above",
+            }
+        else:
+            design = _short_design(record)
+            design.pop("code_formula_excerpt", None)
         results.append(
             {
-                **_short_design(record),
+                **design,
                 "requested_direction": record.get("requested_direction"),
                 "actual_modification_summary": record.get("actual_modification_summary"),
                 "evaluation": _evaluation_feedback(record.get("evaluation")),
                 "failure": record.get("failure"),
             }
         )
-        training.append(
+        blocks, exploration = _compact_training_blocks(record)
+        training_candidates.append(
             {
                 "candidate_id": candidate_id,
                 "status": (record.get("training") or {}).get("status"),
-                "blocks": (record.get("training") or {}).get("summaries"),
-                "fairness_provenance": record.get("training_fairness"),
+                "blocks": blocks,
                 "failure": record.get("failure"),
             }
         )
+        exploration_by_candidate[candidate_id] = exploration
+        fairness_by_candidate[candidate_id] = _compact_fairness(record)
+
+    exploration_values = list(exploration_by_candidate.values())
+    shared_exploration = (
+        exploration_values[0]
+        if exploration_values
+        and all(value == exploration_values[0] for value in exploration_values[1:])
+        else None
+    )
+    fairness_values = list(fairness_by_candidate.values())
+    shared_fairness = (
+        fairness_values[0]
+        if fairness_values
+        and all(value == fairness_values[0] for value in fairness_values[1:])
+        else None
+    )
+    if shared_exploration is None:
+        for item in training_candidates:
+            item["exploration_by_block"] = exploration_by_candidate[item["candidate_id"]]
+    if shared_fairness is None:
+        for item in training_candidates:
+            item["fairness"] = fairness_by_candidate[item["candidate_id"]]
+    training = {
+        "reward_history_semantics": (
+            "base reward and beta-weighted feature contributions use the lambda and "
+            "values actually recorded during each training episode"
+        ),
+        "shared_fairness_and_training_contract": shared_fairness,
+        "shared_exploration_by_block": shared_exploration,
+        "candidates": training_candidates,
+    }
     return results, training
 
 
@@ -546,6 +798,16 @@ def _generation_stage_prompt(
 ) -> str:
     """Render the non-COMMON part for generation and bounded repair prompts."""
 
+    return _generation_stage_prompt_parts(
+        state=state, current=current, candidate_id=candidate_id
+    )[0]
+
+
+def _generation_stage_prompt_parts(
+    *, state: dict[str, Any], current: dict[str, Any], candidate_id: str
+) -> tuple[str, dict[str, int]]:
+    """Render one stage and report its semantically meaningful section sizes."""
+
     if int(current["round"]) == 1:
         summaries = [
             {
@@ -556,55 +818,79 @@ def _generation_stage_prompt(
             for item in current["candidate_order"]
             if current["candidates"][item].get("status") == "validated"
         ]
-        return _render_stage(
+        summary_text = json.dumps(summaries, indent=2, ensure_ascii=False)
+        stage = _render_stage(
             INITIAL_TEMPLATE,
-            {
-                "CURRENT_ROUND_CANDIDATE_SUMMARIES": json.dumps(
-                    summaries, indent=2, ensure_ascii=False
-                )
-            },
+            {"CURRENT_ROUND_CANDIDATE_SUMMARIES": summary_text},
         ).strip()
+        return stage, {
+            "current_round_untrained_design_summaries": len(summary_text),
+            "generation_direction": 0,
+            "stage_scaffolding": len(stage) - len(summary_text),
+        }
 
     latest = state["rounds"][-1]
-    latest_results, latest_training = _latest_round_feedback(latest)
+    best_id = current["reference_candidate"]["candidate_id"]
+    latest_results, latest_training = _latest_round_feedback(
+        latest, best_candidate_id=best_id
+    )
     best = _best_candidate_feedback(current["reference_candidate"])
+    best_text = json.dumps(best, indent=2, ensure_ascii=False)
+    baseline_text = json.dumps(
+        {
+            "checkpoint_episode": state["baseline_preflight"]["checkpoint_episode"],
+            "metrics": state["baseline_preflight"]["metrics"],
+        },
+        indent=2,
+        ensure_ascii=False,
+    )
+    latest_results_text = json.dumps(latest_results, indent=2, ensure_ascii=False)
+    latest_training_text = json.dumps(latest_training, indent=2, ensure_ascii=False)
+    historical_text = json.dumps(
+        _historical_summaries(state, exclude_round=int(latest["round"])),
+        indent=2,
+        ensure_ascii=False,
+    )
     feedback = _render_stage(
         FEEDBACK_TEMPLATE,
         {
-            "BEST_CANDIDATE": json.dumps(best, indent=2, ensure_ascii=False),
-            "BASELINE_EVALUATION_RESULTS": json.dumps(
-                {
-                    "checkpoint_episode": state["baseline_preflight"][
-                        "checkpoint_episode"
-                    ],
-                    "manifest_content_hash": state["baseline_preflight"][
-                        "manifest_content_hash"
-                    ],
-                    "metrics": state["baseline_preflight"]["metrics"],
-                },
-                indent=2,
-                ensure_ascii=False,
-            ),
-            "LATEST_ROUND_CANDIDATE_RESULTS": json.dumps(
-                latest_results, indent=2, ensure_ascii=False
-            ),
-            "LATEST_ROUND_TRAINING_SUMMARIES": json.dumps(
-                latest_training, indent=2, ensure_ascii=False
-            ),
+            "BEST_CANDIDATE": best_text,
+            "BASELINE_EVALUATION_RESULTS": baseline_text,
+            "LATEST_ROUND_CANDIDATE_RESULTS": latest_results_text,
+            "LATEST_ROUND_TRAINING_SUMMARIES": latest_training_text,
             "TRAINING_BLOCK_DEFINITION": "1–200, 201–400, 401–600, 601–800",
-            "HISTORICAL_CANDIDATE_SUMMARIES": json.dumps(
-                _historical_summaries(state, exclude_round=int(latest["round"])),
-                indent=2,
-                ensure_ascii=False,
-            ),
+            "HISTORICAL_CANDIDATE_SUMMARIES": historical_text,
         },
     )
     direction = current["candidates"][candidate_id]["requested_direction"]
-    return (
+    direction_text = DIRECTION_TEMPLATES[direction].read_text(encoding="utf-8").strip()
+    stage = (
         feedback.strip()
         + "\n\n"
-        + DIRECTION_TEMPLATES[direction].read_text(encoding="utf-8").strip()
+        + direction_text
     )
+    dynamic_total = sum(
+        map(
+            len,
+            (
+                best_text,
+                baseline_text,
+                latest_results_text,
+                latest_training_text,
+                historical_text,
+                direction_text,
+            ),
+        )
+    )
+    return stage, {
+        "historical_best_candidate": len(best_text),
+        "baseline_evaluation": len(baseline_text),
+        "latest_round_candidate_evaluations": len(latest_results_text),
+        "training_block_summaries": len(latest_training_text),
+        "historical_candidate_summaries": len(historical_text),
+        "generation_direction": len(direction_text),
+        "stage_scaffolding": len(stage) - dynamic_total,
+    }
 
 
 def _base_generation_prompt(
@@ -613,21 +899,26 @@ def _base_generation_prompt(
     current: dict[str, Any],
     candidate_id: str,
     common: str,
+    stage: str | None = None,
 ) -> str:
-    stage = _generation_stage_prompt(
-        state=state, current=current, candidate_id=candidate_id
-    )
+    if stage is None:
+        stage = _generation_stage_prompt(
+            state=state, current=current, candidate_id=candidate_id
+        )
     return common.rstrip() + "\n\n" + stage + "\n"
 
 
 def _repair_prompt(
     *, common: str, record: dict[str, Any], duplicate: bool
 ) -> str:
+    generation_stage = record.get(
+        "active_generation_stage_request", record["generation_stage_request"]
+    )
     if duplicate:
         stage = _render_stage(
             DUPLICATE_REPAIR_TEMPLATE,
             {
-                "GENERATION_REQUEST": record["generation_stage_request"],
+                "GENERATION_REQUEST": generation_stage,
                 "DUPLICATE_CANDIDATE": json.dumps(
                     record.get("last_submission"), indent=2, ensure_ascii=False
                 ),
@@ -641,7 +932,7 @@ def _repair_prompt(
         stage = _render_stage(
             VALIDATION_REPAIR_TEMPLATE,
             {
-                "GENERATION_REQUEST": record["generation_stage_request"],
+                "GENERATION_REQUEST": generation_stage,
                 "FAILED_RESPONSE_MATERIAL": json.dumps(
                     failed_response, indent=2, ensure_ascii=False
                 ),
@@ -1064,9 +1355,326 @@ def _result(state: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _atomic_write_text(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.tmp")
+    temporary.write_text(text, encoding="utf-8")
+    temporary.replace(path)
+
+
+def _atomic_write_json(path: Path, value: Any) -> None:
+    _atomic_write_text(
+        path,
+        json.dumps(value, indent=2, ensure_ascii=False, allow_nan=False) + "\n",
+    )
+
+
 def _save_state(output: Path, state: dict[str, Any]) -> None:
     state["updated_at_utc"] = _now()
-    _write_json(output / "state.json", state)
+    _atomic_write_json(output / "state.json", state)
+
+
+def _migration_directory(output: Path) -> Path:
+    return output / "migrations" / PROMPT_MIGRATION_ID
+
+
+def _ensure_migration_backup(output: Path) -> Path:
+    migration = _migration_directory(output)
+    migration.mkdir(parents=True, exist_ok=True)
+    backup = migration / "state.before.json"
+    if not backup.exists():
+        source = output / "state.json"
+        _atomic_write_text(backup, source.read_text(encoding="utf-8"))
+    source_context = output / "prompt_source_context" / "environment_source_context.json"
+    source_backup = migration / "environment_source_context.before.json"
+    if source_context.is_file() and not source_backup.exists():
+        _atomic_write_text(
+            source_backup, source_context.read_text(encoding="utf-8")
+        )
+    return migration
+
+
+def _validate_saved_search_contract(settings: dict[str, Any]) -> None:
+    expected = {
+        "train_episodes": DEFAULT_TRAIN_EPISODES,
+        "evaluation_episodes": DEFAULT_EVALUATION_EPISODES,
+        "evaluation_roi_count": DEFAULT_EVALUATION_ROI_COUNT,
+        "evaluation_area_m": [1000.0, 1000.0],
+        "episode_seconds": DEFAULT_EPISODE_SECONDS,
+        "candidate_count_per_round": 4,
+        "candidate_generation_calls_per_request": 1,
+    }
+    changed = {
+        key: {"saved": settings.get(key), "required": value}
+        for key, value in expected.items()
+        if settings.get(key) != value
+    }
+    if changed:
+        raise TrainingSearchError(
+            f"resume training/evaluation contract changed: {changed}"
+        )
+
+
+def _prepare_resume_compatibility(
+    *,
+    output: Path,
+    state: dict[str, Any],
+    source_bundle: dict[str, Any],
+    constants: dict[str, Any],
+) -> dict[str, Any] | None:
+    """Allow prompt-only revision drift after content-level contract checks."""
+
+    _validate_saved_search_contract(state["settings"])
+    saved_constants_path = output / "constants.json"
+    if not saved_constants_path.is_file():
+        raise TrainingSearchError("resume constants contract record is missing")
+    saved_constants = json.loads(saved_constants_path.read_text(encoding="utf-8"))
+    if saved_constants != constants:
+        raise TrainingSearchError("resume obs/constants contract changed")
+
+    saved_prompt_version = state.get("prompt_version")
+    if saved_prompt_version not in {LEGACY_PROMPT_VERSION, SEARCH_PROMPT_VERSION}:
+        raise TrainingSearchError(
+            f"unsupported saved training-search prompt version: {saved_prompt_version!r}"
+        )
+    reasons = []
+    if saved_prompt_version != SEARCH_PROMPT_VERSION:
+        reasons.append("prompt_feedback_format_changed")
+
+    saved_bundle_hash = state.get("environment_source_bundle_sha256")
+    if not saved_bundle_hash:
+        raise TrainingSearchError("resume source bundle hash is missing")
+    current_bundle_hash = source_bundle["bundle_sha256"]
+    saved_source_path = (
+        output / "prompt_source_context" / "environment_source_context.json"
+    )
+    saved_source = None
+    if saved_bundle_hash not in (None, current_bundle_hash):
+        try:
+            saved_source = json.loads(saved_source_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise TrainingSearchError(
+                "resume source bundle changed and the saved bundle cannot be verified"
+            ) from exc
+        saved_content_hash = _source_bundle_content_sha256(saved_source)
+        current_content_hash = _source_bundle_content_sha256(source_bundle)
+        if saved_content_hash != current_content_hash:
+            raise TrainingSearchError(
+                "resume environment source content changed: "
+                f"saved={saved_content_hash}, current={current_content_hash}"
+            )
+        reasons.append("git_revision_or_source_locations_changed_with_identical_excerpt_content")
+
+    if not reasons:
+        state["environment_source_bundle_sha256"] = current_bundle_hash
+        state["environment_source_bundle_content_sha256"] = (
+            source_bundle.get("content_sha256")
+            or _source_bundle_content_sha256(source_bundle)
+        )
+        return None
+
+    migration = _ensure_migration_backup(output)
+    record = {
+        "migration_id": PROMPT_MIGRATION_ID,
+        "migrated_at_utc": _now(),
+        "reasons": reasons,
+        "from_prompt_version": saved_prompt_version,
+        "to_prompt_version": SEARCH_PROMPT_VERSION,
+        "from_git_sha": (saved_source or {}).get("git_sha", state.get("git_sha")),
+        "to_git_sha": source_bundle.get("git_sha"),
+        "from_source_bundle_sha256": saved_bundle_hash,
+        "to_source_bundle_sha256": current_bundle_hash,
+        "verified_source_content_sha256": _source_bundle_content_sha256(source_bundle),
+        "state_backup": str((migration / "state.before.json").resolve()),
+    }
+    existing = state.setdefault("compatibility_migrations", [])
+    signature = (
+        record["from_prompt_version"],
+        record["to_prompt_version"],
+        record["from_source_bundle_sha256"],
+        record["to_source_bundle_sha256"],
+    )
+    if not any(
+        (
+            item.get("from_prompt_version"),
+            item.get("to_prompt_version"),
+            item.get("from_source_bundle_sha256"),
+            item.get("to_source_bundle_sha256"),
+        )
+        == signature
+        for item in existing
+    ):
+        existing.append(record)
+        _atomic_write_json(migration / "migration.json", record)
+    state["prompt_version"] = SEARCH_PROMPT_VERSION
+    state["environment_source_bundle_sha256"] = current_bundle_hash
+    state["environment_source_bundle_content_sha256"] = (
+        source_bundle.get("content_sha256")
+        or _source_bundle_content_sha256(source_bundle)
+    )
+    return record
+
+
+def _prepare_generation_request(
+    *,
+    output: Path,
+    state: dict[str, Any],
+    current: dict[str, Any],
+    candidate_id: str,
+    common: str,
+) -> tuple[str, dict[str, int]]:
+    record = current["candidates"][candidate_id]
+    stage, stage_sections = _generation_stage_prompt_parts(
+        state=state, current=current, candidate_id=candidate_id
+    )
+    request = _base_generation_prompt(
+        state=state,
+        current=current,
+        candidate_id=candidate_id,
+        common=common,
+        stage=stage,
+    )
+    sections = {"environment_interface_source": len(common), **stage_sections}
+    sections["request_scaffolding"] = len(request) - sum(sections.values())
+    metadata = {
+        "prompt_version": SEARCH_PROMPT_VERSION,
+        "common_contract_sha256": _sha256_text(common.rstrip()),
+        "generation_stage_sha256": _sha256_text(stage),
+        "generation_request_sha256": _sha256_text(request),
+        "sections": sections,
+    }
+    sent = bool(record.get("model_call_records") or record.get("versions"))
+    old_request = record.get("generation_request")
+    old_stage = record.get("generation_stage_request")
+    old_metadata = record.get("generation_prompt_metadata") or {}
+    if old_request and old_stage:
+        suffix = "\n\n" + old_stage + "\n"
+        if not old_request.endswith(suffix):
+            raise TrainingSearchError(
+                "saved generation request cannot be separated into COMMON and stage"
+            )
+        old_common = old_request[: -len(suffix)]
+
+        def normalize_lines(value: str) -> str:
+            return re.sub(
+                r"(?m)^(# Source: [^\r\n]+?):\d+-\d+(; symbol:)",
+                r"\1:<source-lines>\2",
+                value.rstrip(),
+            )
+
+        if normalize_lines(old_common) != normalize_lines(common):
+            raise TrainingSearchError(
+                "resume environment/interface COMMON prompt content changed"
+            )
+    already_current = (
+        old_metadata.get("prompt_version") == SEARCH_PROMPT_VERSION
+        and old_metadata.get("generation_request_sha256")
+        == metadata["generation_request_sha256"]
+    )
+    if already_current:
+        record["active_generation_stage_request"] = old_stage
+        record["active_generation_prompt_metadata"] = old_metadata
+        return old_request, dict(old_metadata.get("sections") or sections)
+
+    if old_request and old_request != request:
+        migration = _ensure_migration_backup(output)
+        archive = migration / "cached_prompts" / candidate_id
+        archive.mkdir(parents=True, exist_ok=True)
+        old_hash = _sha256_text(old_request)
+        request_path = archive / f"generation_request.{old_hash}.txt"
+        stage_path = archive / f"generation_stage.{_sha256_text(old_stage or '')}.txt"
+        if not request_path.exists():
+            _atomic_write_text(request_path, old_request)
+        if old_stage is not None and not stage_path.exists():
+            _atomic_write_text(stage_path, old_stage)
+        migration_record = {
+            "migrated_at_utc": _now(),
+            "from_prompt_version": old_metadata.get(
+                "prompt_version", LEGACY_PROMPT_VERSION
+            ),
+            "to_prompt_version": SEARCH_PROMPT_VERSION,
+            "old_generation_request_sha256": old_hash,
+            "new_generation_request_sha256": metadata[
+                "generation_request_sha256"
+            ],
+            "old_request_archive": str(request_path.resolve()),
+            "old_stage_archive": str(stage_path.resolve()),
+            "reason": "unsent cached request rebuilt with compact training feedback",
+        }
+        migrations = record.setdefault("generation_request_migrations", [])
+        if not any(
+            item.get("old_generation_request_sha256") == old_hash
+            and item.get("new_generation_request_sha256")
+            == metadata["generation_request_sha256"]
+            for item in migrations
+        ):
+            migrations.append(migration_record)
+
+    if sent:
+        record["active_generation_stage_request"] = stage
+        record["active_generation_prompt_metadata"] = metadata
+    else:
+        record["generation_stage_request"] = stage
+        record["generation_request"] = request
+        record["generation_prompt_metadata"] = metadata
+        record["active_generation_stage_request"] = stage
+        record["active_generation_prompt_metadata"] = metadata
+    return request, sections
+
+
+def _repair_prompt_extra_sections(
+    record: dict[str, Any], *, duplicate: bool
+) -> dict[str, int]:
+    if duplicate:
+        response = json.dumps(
+            record.get("last_submission"), indent=2, ensure_ascii=False
+        )
+    else:
+        response = json.dumps(
+            _load_failed_response_material(record), indent=2, ensure_ascii=False
+        )
+    feedback = json.dumps(
+        record.get("last_validation"), indent=2, ensure_ascii=False
+    )
+    return {
+        "repair_failed_response": len(response),
+        "repair_error_feedback": len(feedback),
+    }
+
+
+def _save_prompt_budget_report(
+    *,
+    output: Path,
+    candidate_id: str,
+    record: dict[str, Any],
+    prompt: str,
+    budget: dict[str, Any],
+    sections: dict[str, int],
+    repair: bool,
+) -> dict[str, Any]:
+    prompt_hash = _sha256_text(prompt)
+    directory = output / "prompt_diagnostics" / candidate_id
+    prompt_path = directory / f"pending-{prompt_hash[:16]}.txt"
+    report_path = directory / f"pending-{prompt_hash[:16]}.json"
+    if not prompt_path.exists():
+        _atomic_write_text(prompt_path, prompt)
+    report = {
+        "schema_version": "uav-hrl-llm-training-search-prompt-budget-v1",
+        "prompt_version": SEARCH_PROMPT_VERSION,
+        "candidate_id": candidate_id,
+        "request_kind": "repair" if repair else "generation",
+        "prompt_sha256": prompt_hash,
+        "prompt_path": str(prompt_path.resolve()),
+        "sections_characters": sections,
+        "section_characters_total": sum(sections.values()),
+        "token_counting_or_estimation_method": budget.get("method"),
+        "token_count_exact": budget.get("exact"),
+        "full_request_budget": copy.deepcopy(budget),
+        "includes_full_request_and_output_reservation": True,
+    }
+    _atomic_write_json(report_path, report)
+    record["last_prompt_budget_report"] = report
+    return report
 
 
 def run_training_search(
@@ -1243,15 +1851,22 @@ def run_training_search(
     state["validation_dataset"] = dataset.provenance
     constants = build_constants(dataset.fixed_metadata)
     source_bundle = build_environment_source_bundle()
-    if state.get("environment_source_bundle_sha256") not in (
-        None,
-        source_bundle["bundle_sha256"],
-    ):
-        raise TrainingSearchError("resume source-code prompt bundle changed")
-    state["environment_source_bundle_sha256"] = source_bundle["bundle_sha256"]
+    if resume is not None:
+        _prepare_resume_compatibility(
+            output=output,
+            state=state,
+            source_bundle=source_bundle,
+            constants=constants,
+        )
+    else:
+        state["environment_source_bundle_sha256"] = source_bundle["bundle_sha256"]
+        state["environment_source_bundle_content_sha256"] = (
+            source_bundle.get("content_sha256")
+            or _source_bundle_content_sha256(source_bundle)
+        )
     source_dir = output / "prompt_source_context"
     source_dir.mkdir(exist_ok=True)
-    _write_json(source_dir / "environment_source_context.json", source_bundle)
+    _atomic_write_json(source_dir / "environment_source_context.json", source_bundle)
     _write_json(output / "validation_dataset.json", dataset.provenance)
     _write_json(output / "constants.json", constants)
 
@@ -1406,31 +2021,45 @@ def run_training_search(
                 beta=beta,
                 source_bundle=source_bundle,
             )
-            if not record.get("generation_request"):
-                record["generation_stage_request"] = _generation_stage_prompt(
-                    state=state,
-                    current=current,
-                    candidate_id=candidate_id,
-                )
-                record["generation_request"] = _base_generation_prompt(
-                    state=state,
-                    current=current,
-                    candidate_id=candidate_id,
-                    common=common,
-                )
-            prompt = (
-                _repair_prompt(
+            generation_request, prompt_sections = _prepare_generation_request(
+                output=output,
+                state=state,
+                current=current,
+                candidate_id=candidate_id,
+                common=common,
+            )
+            repair = bool(record["versions"])
+            if repair:
+                prompt = _repair_prompt(
                     common=common,
                     record=record,
                     duplicate=(record.get("last_failure_stage") == "duplicate"),
                 )
-                if record["versions"]
-                else record["generation_request"]
-            )
+                prompt_sections = {
+                    **prompt_sections,
+                    **_repair_prompt_extra_sections(
+                        record,
+                        duplicate=(record.get("last_failure_stage") == "duplicate"),
+                    ),
+                }
+                prompt_sections["repair_scaffolding"] = len(prompt) - sum(
+                    prompt_sections.values()
+                )
+            else:
+                prompt = generation_request
             budget = estimate_token_budget(
                 prompt,
                 context_length=effective_context,
                 max_output_tokens=config["max_output_tokens"],
+            )
+            _save_prompt_budget_report(
+                output=output,
+                candidate_id=candidate_id,
+                record=record,
+                prompt=prompt,
+                budget=budget,
+                sections=prompt_sections,
+                repair=repair,
             )
             if not budget["fits_client_budget"]:
                 state["status"] = "paused_context_budget_exceeded"
@@ -1454,6 +2083,7 @@ def run_training_search(
                 "directory": str(call_dir),
                 "prompt_sha256": _sha256_text(prompt),
                 "token_budget": budget,
+                "prompt_budget_report": record["last_prompt_budget_report"],
                 "started_at_utc": _now(),
             }
             record.setdefault("model_call_records", []).append(call_record)
