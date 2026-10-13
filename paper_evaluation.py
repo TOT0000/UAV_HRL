@@ -711,8 +711,25 @@ def run_paper_evaluation(
         else None
     )
 
+    base_manifest = (
+        ScenarioManifest.load(manifest_path)
+        if suite == "fixed_roi" and manifest_path is not None
+        else None
+    )
+    explicit_fixed_roi_manifest = bool(suite == "fixed_roi" and base_manifest is not None)
+    if (
+        explicit_fixed_roi_manifest
+        and manifest_seed is not None
+        and int(manifest_seed) != int(base_manifest.manifest_seed)
+    ):
+        raise ValueError(
+            "explicit fixed-RoI manifest seed conflicts with --manifest-seed: "
+            f"manifest={int(base_manifest.manifest_seed)}, requested={int(manifest_seed)}"
+        )
     requested_manifest_seed = int(
-        DEFAULT_TRAINING_SEED if manifest_seed is None else manifest_seed
+        base_manifest.manifest_seed
+        if explicit_fixed_roi_manifest and manifest_seed is None
+        else DEFAULT_TRAINING_SEED if manifest_seed is None else manifest_seed
     )
     checkpoint_required = bool(method.learns_movement or method.learns_routing)
     context = (
@@ -794,7 +811,8 @@ def run_paper_evaluation(
         _write_json(output_dir / "paper_evaluation_metadata.json", metadata)
         return {"output_directory": str(output_dir), **metadata}
 
-    base_manifest = ScenarioManifest.load(manifest_path) if manifest_path is not None else None
+    if base_manifest is None and manifest_path is not None:
+        base_manifest = ScenarioManifest.load(manifest_path)
     if definition.get("requires_manifest") and base_manifest is None:
         raise ValueError(f"{suite} requires --manifest for shared scenarios")
     default_episodes = (
@@ -831,6 +849,29 @@ def run_paper_evaluation(
     if flatten_single_point and len(points) != 1:
         raise ValueError("flatten_single_point requires exactly one evaluation point")
     shared_manifests = dict(fixed_roi_manifests or {})
+    if explicit_fixed_roi_manifest:
+        if shared_manifests:
+            raise ValueError(
+                "fixed_roi accepts either manifest_path or fixed_roi_manifests, not both"
+            )
+        if len(points) != 1:
+            raise ValueError(
+                "an explicit fixed-RoI manifest requires exactly one selected RoI count"
+            )
+        if (
+            int(base_manifest.environment_width_m) != int(ENVIRONMENT_WIDTH_M)
+            or int(base_manifest.environment_height_m) != int(ENVIRONMENT_HEIGHT_M)
+            or base_manifest.environment_size_m not in (None, int(ENVIRONMENT_WIDTH_M))
+        ):
+            raise ValueError(
+                "explicit fixed-RoI manifest environment dimensions are incompatible: "
+                f"expected={int(ENVIRONMENT_WIDTH_M)}x{int(ENVIRONMENT_HEIGHT_M)}, "
+                f"actual={int(base_manifest.environment_width_m)}x"
+                f"{int(base_manifest.environment_height_m)}"
+            )
+        shared_manifests = {
+            int(points[0]["fixed_num_gt"]): base_manifest,
+        }
     if shared_manifests:
         expected_keys = {int(point["fixed_num_gt"]) for point in points}
         actual_keys = {int(key) for key in shared_manifests}

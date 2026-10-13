@@ -58,6 +58,141 @@ def _file_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _scenario_sequence_mismatch_message(
+    label: str,
+    *,
+    expected_ids: list[str],
+    actual_ids: list[str],
+    expected_seed: int | None,
+    actual_seed: int | None,
+    expected_manifest: str | Path | None,
+    actual_manifest: str | Path | None,
+) -> str:
+    mismatch_index = next(
+        (
+            index
+            for index, (expected, actual) in enumerate(zip(expected_ids, actual_ids))
+            if expected != actual
+        ),
+        min(len(expected_ids), len(actual_ids))
+        if len(expected_ids) != len(actual_ids)
+        else None,
+    )
+    if mismatch_index is None:
+        mismatch = "first_mismatch=none"
+    else:
+        expected = expected_ids[mismatch_index] if mismatch_index < len(expected_ids) else "<missing>"
+        actual = actual_ids[mismatch_index] if mismatch_index < len(actual_ids) else "<missing>"
+        mismatch = (
+            f"first_mismatch_index={mismatch_index}, "
+            f"expected_scenario_id={expected!r}, actual_scenario_id={actual!r}"
+        )
+    return (
+        f"{label}: expected_count={len(expected_ids)}, actual_count={len(actual_ids)}, "
+        f"expected_seed={expected_seed!r}, actual_seed={actual_seed!r}, {mismatch}, "
+        f"expected_manifest={str(expected_manifest) if expected_manifest is not None else None}, "
+        f"actual_manifest={str(actual_manifest) if actual_manifest is not None else None}"
+    )
+
+
+def _candidate_evaluation_manifest_binding(
+    manifest: str | Path,
+    *,
+    baseline_preflight: dict[str, Any],
+    episodes: int,
+    roi_count: int,
+    environment_size_m: tuple[float, float],
+) -> dict[str, Any]:
+    """Validate the exact baseline scenario artifact before starting a rollout."""
+
+    selected_path = Path(manifest).resolve()
+    baseline_path = Path(baseline_preflight["manifest_path"]).resolve()
+    if selected_path != baseline_path:
+        raise EpisodeTrainingError(
+            "candidate evaluation must use the baseline manifest path exactly: "
+            f"expected={baseline_path}, actual={selected_path}"
+        )
+    selected = ScenarioManifest.load(selected_path)
+    baseline = ScenarioManifest.load(baseline_path)
+    expected_ids = [str(item["scenario_id"]) for item in baseline.episodes]
+    actual_ids = [str(item["scenario_id"]) for item in selected.episodes]
+    saved_ids = [str(value) for value in baseline_preflight.get("scenario_ids") or ()]
+    if saved_ids != expected_ids:
+        raise EpisodeTrainingError(
+            _scenario_sequence_mismatch_message(
+                "baseline manifest scenario order changed after preflight",
+                expected_ids=saved_ids,
+                actual_ids=expected_ids,
+                expected_seed=baseline_preflight.get("manifest_seed"),
+                actual_seed=int(baseline.manifest_seed),
+                expected_manifest=baseline_path,
+                actual_manifest=baseline_path,
+            )
+        )
+    if actual_ids != expected_ids:
+        raise EpisodeTrainingError(
+            _scenario_sequence_mismatch_message(
+                "candidate manifest scenarios differ from the baseline manifest",
+                expected_ids=expected_ids,
+                actual_ids=actual_ids,
+                expected_seed=int(baseline.manifest_seed),
+                actual_seed=int(selected.manifest_seed),
+                expected_manifest=baseline_path,
+                actual_manifest=selected_path,
+            )
+        )
+    if selected.content_hash != baseline_preflight.get("manifest_content_hash"):
+        raise EpisodeTrainingError(
+            "candidate manifest content hash differs from baseline preflight: "
+            f"expected={baseline_preflight.get('manifest_content_hash')!r}, "
+            f"actual={selected.content_hash!r}, manifest={selected_path}"
+        )
+    expected_file_hash = baseline_preflight.get("manifest_file_sha256")
+    actual_file_hash = _file_sha256(selected_path)
+    if expected_file_hash is not None and actual_file_hash != expected_file_hash:
+        raise EpisodeTrainingError(
+            "baseline manifest file changed after preflight: "
+            f"expected_sha256={expected_file_hash}, actual_sha256={actual_file_hash}, "
+            f"manifest={selected_path}"
+        )
+    if selected.split != "test":
+        raise EpisodeTrainingError("candidate evaluation manifest must use the test split")
+    if int(selected.episode_count) != int(episodes):
+        raise EpisodeTrainingError(
+            "candidate evaluation manifest episode count is incompatible: "
+            f"expected={int(episodes)}, actual={int(selected.episode_count)}, "
+            f"manifest={selected_path}"
+        )
+    if selected.generation_profile.get("fixed_num_gt") != int(roi_count):
+        raise EpisodeTrainingError(
+            "candidate evaluation manifest fixed RoI count is incompatible: "
+            f"expected={int(roi_count)}, "
+            f"actual={selected.generation_profile.get('fixed_num_gt')!r}, "
+            f"manifest={selected_path}"
+        )
+    expected_size = tuple(map(float, environment_size_m))
+    actual_size = (
+        float(selected.environment_width_m),
+        float(selected.environment_height_m),
+    )
+    if actual_size != expected_size:
+        raise EpisodeTrainingError(
+            "candidate evaluation manifest environment size is incompatible: "
+            f"expected={expected_size}, actual={actual_size}, manifest={selected_path}"
+        )
+    return {
+        "path": str(selected_path),
+        "file_sha256": actual_file_hash,
+        "content_hash": selected.content_hash,
+        "schema_version": selected.schema_version,
+        "manifest_seed": int(selected.manifest_seed),
+        "episode_count": int(selected.episode_count),
+        "fixed_num_gt": int(roi_count),
+        "environment_size_m": list(actual_size),
+        "scenario_ids": actual_ids,
+    }
+
+
 def _episode_rows(path: str | Path, *, expected_count: int) -> list[dict[str, Any]]:
     if path is None:
         raise EpisodeTrainingError("per-episode evaluation output path is missing")
@@ -1120,6 +1255,8 @@ def validate_baseline_preflight(
         "manifest_path": str(manifest_path),
         "manifest_file_sha256": _file_sha256(manifest_path),
         "manifest_content_hash": scenario_manifest.content_hash,
+        "manifest_schema_version": getattr(scenario_manifest, "schema_version", None),
+        "manifest_seed": int(scenario_manifest.manifest_seed),
         "scenario_ids": [str(item["scenario_id"]) for item in scenario_manifest.episodes],
         "evaluation_contract": {
             "episodes": int(episodes),
@@ -1152,7 +1289,20 @@ def run_candidate_evaluation(
         raise EpisodeTrainingError("formal search evaluation requires a 1000x1000 m environment")
     root = Path(__file__).resolve().parent
     output = Path(output_directory).resolve()
-    path_preflight = preflight_candidate_evaluation_output(output)
+    manifest_binding = _candidate_evaluation_manifest_binding(
+        manifest,
+        baseline_preflight=baseline_preflight,
+        episodes=episodes,
+        roi_count=roi_count,
+        environment_size_m=environment_size_m,
+    )
+    path_preflight = {
+        **preflight_candidate_evaluation_output(output),
+        "scenario_manifest_binding": manifest_binding,
+    }
+    expected_manifest_seed = baseline_preflight.get(
+        "manifest_seed", manifest_binding["manifest_seed"]
+    )
     command = [
         sys.executable,
         str(root / "run_paper_evaluation.py"),
@@ -1200,11 +1350,21 @@ def run_candidate_evaluation(
         raise EpisodeTrainingError("candidate evaluation did not use a 1000x1000 m environment")
     per_episode = Path(point["outputs"]["per_episode_jsonl"])
     rows = _episode_rows(per_episode, expected_count=episodes)
-    if [row["scenario_id"] for row in rows] != baseline_preflight.get(
-        "scenario_ids"
-    ):
+    row_scenario_ids = [row["scenario_id"] for row in rows]
+    expected_scenario_ids = [
+        str(value) for value in baseline_preflight.get("scenario_ids") or ()
+    ]
+    if row_scenario_ids != expected_scenario_ids:
         raise EpisodeTrainingError(
-            "candidate per-episode rows differ from the baseline scenario order"
+            _scenario_sequence_mismatch_message(
+                "candidate per-episode rows differ from the baseline scenario order",
+                expected_ids=expected_scenario_ids,
+                actual_ids=row_scenario_ids,
+                expected_seed=expected_manifest_seed,
+                actual_seed=point.get("manifest_seed"),
+                expected_manifest=baseline_preflight.get("manifest_path"),
+                actual_manifest=point.get("scenario_manifest_path"),
+            )
         )
     ee = np.asarray([row["energy_efficiency_mbit_per_j"] for row in rows], dtype=np.float64)
     if ee.size != int(episodes) or np.any(~np.isfinite(ee)):
@@ -1213,13 +1373,26 @@ def run_candidate_evaluation(
         "manifest_content_hash"
     ):
         raise EpisodeTrainingError(
-            "candidate evaluation manifest differs from baseline preflight"
+            "candidate evaluation manifest differs from baseline preflight: "
+            f"expected_hash={baseline_preflight.get('manifest_content_hash')!r}, "
+            f"actual_hash={point.get('scenario_manifest_hash')!r}, "
+            f"expected_seed={expected_manifest_seed!r}, "
+            f"actual_seed={point.get('manifest_seed')!r}, "
+            f"expected_manifest={baseline_preflight.get('manifest_path')}, "
+            f"actual_manifest={point.get('scenario_manifest_path')}"
         )
-    if result.get("points", [{}])[0].get("scenario_ids") != baseline_preflight.get(
-        "scenario_ids"
-    ):
+    point_scenario_ids = [str(value) for value in point.get("scenario_ids") or ()]
+    if point_scenario_ids != expected_scenario_ids:
         raise EpisodeTrainingError(
-            "candidate evaluation scenarios differ from baseline preflight"
+            _scenario_sequence_mismatch_message(
+                "candidate evaluation scenarios differ from baseline preflight",
+                expected_ids=expected_scenario_ids,
+                actual_ids=point_scenario_ids,
+                expected_seed=expected_manifest_seed,
+                actual_seed=point.get("manifest_seed"),
+                expected_manifest=baseline_preflight.get("manifest_path"),
+                actual_manifest=point.get("scenario_manifest_path"),
+            )
         )
     baseline_path = Path(baseline_evaluation).resolve()
     baseline_run_path = Path(baseline_run).resolve()

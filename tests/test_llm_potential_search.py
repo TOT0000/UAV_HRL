@@ -218,6 +218,69 @@ def test_mock_search_trains_all_candidates_and_extends_three_rounds_to_five(
     assert state["rounds"][3]["reference_candidate_id"] == "r03_c04"
 
 
+def test_evaluation_failure_resume_retries_new_attempt_without_generation_or_training(
+    tmp_path, monkeypatch
+):
+    model_calls, training_calls, evaluation_calls, train, evaluate, baseline = (
+        _install_search_mocks(monkeypatch, tmp_path)
+    )
+    attempts = []
+
+    def fail_first_evaluation(**kwargs):
+        attempts.append(kwargs)
+        if len(attempts) == 1:
+            raise RuntimeError("fixture scenario mismatch")
+        return evaluate(**kwargs)
+
+    output = tmp_path / "evaluation-resume"
+    first = search.run_potential_search(
+        validation_sources=[tmp_path / "validation"],
+        baseline_run=tmp_path / "baseline-run",
+        baseline_evaluation=tmp_path / "baseline-eval",
+        provider="openai",
+        model="fixture-model",
+        context_length=128000,
+        output_dir=output,
+        runtime_root=tmp_path / "runtime",
+        max_rounds=1,
+        client=object(),
+        training_runner=train,
+        evaluation_runner=fail_first_evaluation,
+        baseline_validator=baseline,
+    )
+    assert first["status"] == "paused_evaluation_failure"
+    assert len(model_calls) == 4
+    assert len(training_calls) == len(attempts) == 1
+    paused = json.loads((output / "state.json").read_text(encoding="utf-8"))
+    record = paused["current_round"]["candidates"]["r01_c01"]
+    assert record.get("evaluation") is None
+    assert record["evaluation_failures"][0]["attempt"] == 1
+    assert paused["rounds"] == []
+    assert paused["best_candidate"] is None
+
+    resumed = search.run_potential_search(
+        resume=output,
+        max_rounds=1,
+        client=object(),
+        training_runner=train,
+        evaluation_runner=fail_first_evaluation,
+        baseline_validator=baseline,
+    )
+    assert resumed["status"] == "complete"
+    assert len(model_calls) == 4
+    assert len(training_calls) == 4
+    assert len(attempts) == 5
+    assert len(evaluation_calls) == 4
+    saved = json.loads((output / "state.json").read_text(encoding="utf-8"))
+    record = saved["rounds"][0]["candidates"]["r01_c01"]
+    assert record["evaluation_attempts"] == 2
+    assert len(record["evaluation_failures"]) == 1
+    assert record["evaluation_failures"][0]["output_directory"].endswith("a01")
+    assert record["evaluation_invocations"][1]["output_directory"].endswith("a02")
+    assert record["evaluation"]["status"] == "complete"
+    assert saved["best_candidate"]["candidate_id"] == "r01_c04"
+
+
 def test_actual_prompt_assembly_has_full_best_latest_round_and_no_placeholders(
     monkeypatch
 ):
