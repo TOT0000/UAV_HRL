@@ -75,9 +75,13 @@ from scenario_manifest import ScenarioManifest
 
 
 SEARCH_RUN_SCHEMA_VERSION = "uav-hrl-llm-potential-search-run-v1"
-SEARCH_PROMPT_VERSION = "uav-hrl-llm-potential-search-prompt-v1"
-LEGACY_PROMPT_VERSION = "uav-hrl-llm-potential-search-prompt-v0"
-PROMPT_MIGRATION_ID = "compact-training-feedback-v2"
+SEARCH_PROMPT_VERSION = "uav-hrl-llm-potential-search-prompt-v2"
+LEGACY_PROMPT_VERSION = "uav-hrl-llm-potential-search-prompt-v1"
+SUPPORTED_LEGACY_PROMPT_VERSIONS = {
+    "uav-hrl-llm-potential-search-prompt-v0",
+    LEGACY_PROMPT_VERSION,
+}
+PROMPT_MIGRATION_ID = "complete-candidate-feedback-v3"
 SEARCH_METHOD_ID = "td3_dinkelbach_llm_potential"
 DEFAULT_OUTPUT_ROOT = Path("results") / "llm_potential_searches"
 DEFAULT_RUNTIME_ROOT = Path.home() / "uav_hrl_rt"
@@ -514,32 +518,79 @@ def _render_stage(template: Path, replacements: dict[str, Any]) -> str:
     return _replace_template(template.read_text(encoding="utf-8"), replacements)
 
 
-def _short_design(record: dict[str, Any]) -> dict[str, Any]:
-    submission = record.get("submission") or {}
-    features = submission.get("components") or []
+def _candidate_definition(record: dict[str, Any]) -> dict[str, Any]:
+    """Return the exact validated program and metadata used by one candidate."""
+
+    submission = record.get("candidate") or record.get("submission") or {}
+    versions = record.get("versions") or []
+    selected_version = versions[-1] if versions else {}
+    trained = bool((record.get("training") or {}).get("status") == "complete")
     return {
         "candidate_id": submission.get("candidate_id", record.get("candidate_id")),
-        "design_summary": str(submission.get("design_summary", ""))[:600],
-        "components": [
-            {
-                "name": item.get("name"),
-                "weight": item.get("weight"),
-                "description": str(item.get("description", ""))[:240],
-            }
-            for item in features
-        ],
-        "code_formula_excerpt": str(submission.get("code", ""))[:2400],
+        "validated_version": selected_version.get("version"),
+        "fingerprint": record.get("fingerprint") or selected_version.get("fingerprint"),
+        "definition_source": (
+            "validated_candidate_used_for_training"
+            if trained
+            else "validated_candidate_pending_training"
+        ),
+        "design_summary": submission.get("design_summary", ""),
+        "components": copy.deepcopy(submission.get("components") or []),
+        "code": submission.get("code", ""),
         "status": record.get("status"),
     }
 
 
+def _short_design(record: dict[str, Any]) -> dict[str, Any]:
+    """Backward-compatible name; candidate code is intentionally never shortened."""
+
+    return _candidate_definition(record)
+
+
+def _candidate_definition_registry(
+    state: dict[str, Any], current: dict[str, Any]
+) -> list[dict[str, Any]]:
+    """Serialize every referenced definition once, keyed by the stable candidate ID."""
+
+    records: list[dict[str, Any]] = []
+    for round_record in state.get("rounds", []):
+        for candidate_id in round_record.get("candidate_order", []):
+            record = round_record.get("candidates", {}).get(candidate_id) or {}
+            if record.get("candidate") or record.get("submission"):
+                records.append(record)
+    for candidate_id in current.get("candidate_order", []):
+        record = current.get("candidates", {}).get(candidate_id) or {}
+        if record.get("candidate") or record.get("submission"):
+            records.append(record)
+    best = state.get("best_candidate") or current.get("reference_candidate") or {}
+    if best.get("candidate") or best.get("submission"):
+        records.append(best)
+
+    definitions: dict[str, dict[str, Any]] = {}
+    for record in records:
+        definition = _candidate_definition(record)
+        candidate_id = str(definition.get("candidate_id") or record.get("candidate_id"))
+        if candidate_id in definitions:
+            existing = definitions[candidate_id]
+            if (
+                existing.get("code") != definition.get("code")
+                or existing.get("components") != definition.get("components")
+            ):
+                raise PotentialSearchError(
+                    f"candidate ID {candidate_id!r} resolves to conflicting validated definitions"
+                )
+        elif candidate_id:
+            definitions[candidate_id] = definition
+    return list(definitions.values())
+
+
 def _best_candidate_feedback(best: dict[str, Any]) -> dict[str, Any]:
-    """Serialize one complete design without duplicating bulky run records."""
+    """Reference the one authoritative complete definition serialized elsewhere."""
 
     return {
         "candidate_id": best["candidate_id"],
         "round": best["round"],
-        "complete_candidate": copy.deepcopy(best["submission"]),
+        "candidate_definition_reference": best["candidate_id"],
         "evaluation": _evaluation_feedback(best.get("evaluation")),
         "compact_measured_training_summary": _compact_historical_training(best),
     }
@@ -829,14 +880,12 @@ def _latest_round_feedback(
     fairness_by_candidate: dict[str, dict[str, Any]] = {}
     for candidate_id in round_record["candidate_order"]:
         record = round_record["candidates"][candidate_id]
+        design = {
+            "candidate_id": candidate_id,
+            "candidate_definition_reference": candidate_id,
+        }
         if candidate_id == best_candidate_id:
-            design = {
-                "candidate_id": candidate_id,
-                "design_reference": "shared historical-best candidate above",
-            }
-        else:
-            design = _short_design(record)
-            design.pop("code_formula_excerpt", None)
+            design["also_historical_best"] = True
         results.append(
             {
                 **design,
@@ -905,7 +954,7 @@ def _historical_summaries(state: dict[str, Any], *, exclude_round: int) -> list[
                 {
                     "candidate_id": candidate_id,
                     "round": round_record["round"],
-                    "design": _short_design(record),
+                    "candidate_definition_reference": candidate_id,
                     "mean_episode_ee_mbit_per_j": evaluation.get(
                         "mean_episode_energy_efficiency_mbit_per_j"
                     ),
@@ -965,6 +1014,8 @@ def _generation_stage_prompt_parts(
         latest, best_candidate_id=best_id
     )
     best = _best_candidate_feedback(current["reference_candidate"])
+    definitions = _candidate_definition_registry(state, current)
+    definitions_text = json.dumps(definitions, indent=2, ensure_ascii=False)
     best_text = json.dumps(best, indent=2, ensure_ascii=False)
     baseline_text = json.dumps(
         {
@@ -984,7 +1035,8 @@ def _generation_stage_prompt_parts(
     current_round_text = json.dumps(
         [
             {
-                **_short_design(current["candidates"][item]),
+                "candidate_id": item,
+                "candidate_definition_reference": item,
                 "training_status": "not_trained",
             }
             for item in current["candidate_order"]
@@ -1004,6 +1056,7 @@ def _generation_stage_prompt_parts(
         FEEDBACK_TEMPLATE,
         {
             "CANDIDATE_ID": candidate_id,
+            "CANDIDATE_DEFINITIONS": definitions_text,
             "BEST_CANDIDATE": best_text,
             "BASELINE_EVALUATION_RESULTS": baseline_text,
             "LATEST_ROUND_CANDIDATE_RESULTS": latest_results_text,
@@ -1024,6 +1077,7 @@ def _generation_stage_prompt_parts(
         map(
             len,
             (
+                definitions_text,
                 best_text,
                 baseline_text,
                 latest_results_text,
@@ -1035,6 +1089,7 @@ def _generation_stage_prompt_parts(
         )
     )
     return stage, {
+        "complete_candidate_definitions": len(definitions_text),
         "historical_best_candidate": len(best_text),
         "baseline_evaluation": len(baseline_text),
         "latest_round_candidate_evaluations": len(latest_results_text),
@@ -1082,6 +1137,9 @@ def _repair_prompt(
         )
     else:
         failed_response = _load_failed_response_material(record)
+        validation_feedback = _repair_validation_feedback(
+            record.get("last_validation")
+        )
         stage = _render_stage(
             VALIDATION_REPAIR_TEMPLATE,
             {
@@ -1091,7 +1149,7 @@ def _repair_prompt(
                     failed_response, indent=2, ensure_ascii=False
                 ),
                 "VALIDATION_FEEDBACK": json.dumps(
-                    record.get("last_validation"), indent=2, ensure_ascii=False
+                    validation_feedback, indent=2, ensure_ascii=False
                 ),
                 "UNRESOLVED_CHECKS": json.dumps(
                     (record.get("last_validation") or {}).get(
@@ -1160,11 +1218,111 @@ def _load_failed_response_material(record: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _exception_details(exc: BaseException) -> dict[str, Any]:
+def _replace_adapter_function_name(value: Any) -> Any:
+    if isinstance(value, str):
+        return value.replace("compute_extra_state", "compute_potential_components")
+    if isinstance(value, list):
+        return [_replace_adapter_function_name(item) for item in value]
+    if isinstance(value, dict):
+        return {
+            key: _replace_adapter_function_name(item) for key, item in value.items()
+        }
+    return value
+
+
+def _source_excerpt(source: str, line: int, radius: int = 4) -> list[dict[str, Any]]:
+    lines = source.splitlines()
+    start = max(1, int(line) - int(radius))
+    stop = min(len(lines), int(line) + int(radius))
+    return [
+        {"line": number, "code": lines[number - 1]}
+        for number in range(start, stop + 1)
+    ]
+
+
+def _map_execution_report_to_submission(
+    report: dict[str, Any], submitted_code: str | None
+) -> dict[str, Any]:
+    """Map line-preserving adapter diagnostics back to the submitted interface."""
+
+    mapped = _replace_adapter_function_name(copy.deepcopy(report))
+    mapping = {
+        "adapter_function": "compute_extra_state",
+        "submitted_function": "compute_potential_components",
+        "status": "unavailable",
+        "line_mapping_provided": False,
+    }
+    lines: list[str] = []
+    if isinstance(submitted_code, str):
+        try:
+            tree = ast.parse(submitted_code, mode="exec")
+            functions = [node for node in tree.body if isinstance(node, ast.FunctionDef)]
+            reliable = (
+                len(functions) == 1
+                and functions[0].name == "compute_potential_components"
+                and all(isinstance(node, ast.FunctionDef) for node in tree.body)
+            )
+        except SyntaxError:
+            reliable = False
+        if reliable:
+            lines = submitted_code.splitlines()
+            mapping.update(
+                status="reliable_line_preserving_function_rename",
+                line_mapping_provided=True,
+            )
+        else:
+            mapping["reason"] = "submitted source could not be matched to the adapter contract"
+    else:
+        mapping["reason"] = "submitted source was unavailable"
+
+    for issue in mapped.get("errors") or []:
+        line = issue.get("candidate_line")
+        if mapping["line_mapping_provided"] and isinstance(line, int) and 1 <= line <= len(lines):
+            issue["candidate_function"] = "compute_potential_components"
+            issue["location"] = (
+                f"compute_potential_components at submitted candidate line {line}"
+            )
+            diagnostics = issue.get("runtime_diagnostics")
+            if isinstance(diagnostics, dict):
+                diagnostics["candidate_source_excerpt"] = _source_excerpt(
+                    submitted_code, line
+                )
+        elif line is not None:
+            issue.pop("candidate_line", None)
+            issue.pop("candidate_function", None)
+            issue["location"] = "submitted candidate source location unavailable"
+            issue["source_mapping_status"] = "unavailable"
+            diagnostics = issue.get("runtime_diagnostics")
+            if isinstance(diagnostics, dict):
+                diagnostics.pop("candidate_source_excerpt", None)
+    mapped["adapter_source_mapping"] = mapping
+    return mapped
+
+
+def _exception_details(
+    exc: BaseException, *, submitted_code: str | None = None
+) -> dict[str, Any]:
     details: dict[str, Any] = {
         "type": type(exc).__name__,
-        "message": str(exc),
+        "message": _replace_adapter_function_name(str(exc)),
     }
+    if isinstance(exc, CandidateExecutionError):
+        if isinstance(exc.report, dict):
+            details["execution_report"] = copy.deepcopy(exc.report)
+            details["candidate_facing_execution_report"] = (
+                _map_execution_report_to_submission(exc.report, submitted_code)
+            )
+            details["full_report_storage"] = {
+                "file": "validation_report.json",
+                "json_path": "$.error_details.execution_report",
+                "complete": True,
+            }
+        else:
+            details["execution_report"] = None
+            details["full_report_storage"] = {
+                "complete": False,
+                "reason": "candidate worker did not produce a structured report",
+            }
     cause: BaseException | None = exc
     seen: set[int] = set()
     while cause is not None and id(cause) not in seen:
@@ -1182,6 +1340,100 @@ def _exception_details(exc: BaseException) -> dict[str, Any]:
     return details
 
 
+def _repair_validation_feedback(validation: dict[str, Any] | None) -> dict[str, Any]:
+    """Bound execution feedback without dropping any distinct reported root cause."""
+
+    validation = validation or {}
+    if validation.get("stage") != "execution":
+        return copy.deepcopy(validation)
+    details = validation.get("error_details") or {}
+    report = (
+        details.get("candidate_facing_execution_report")
+        or details.get("execution_report")
+        or {}
+    )
+    aggregated: dict[tuple[Any, ...], dict[str, Any]] = {}
+    for raw_issue in report.get("errors") or []:
+        key = tuple(
+            _canonical_json(raw_issue.get(field))
+            if isinstance(raw_issue.get(field), (dict, list))
+            else raw_issue.get(field)
+            for field in (
+                "code",
+                "stage",
+                "location",
+                "problem",
+                "requirement",
+                "exception_type",
+                "candidate_function",
+                "candidate_line",
+                "problem_signature",
+                "operation_fingerprint",
+            )
+        )
+        if key not in aggregated:
+            aggregated[key] = copy.deepcopy(raw_issue)
+            aggregated[key]["occurrence_count"] = int(
+                raw_issue.get("occurrence_count", 1)
+            )
+            aggregated[key]["representative_samples"] = copy.deepcopy(
+                raw_issue.get("representative_samples") or []
+            )
+        else:
+            aggregated[key]["occurrence_count"] += int(
+                raw_issue.get("occurrence_count", 1)
+            )
+            aggregated[key]["representative_samples"].extend(
+                copy.deepcopy(raw_issue.get("representative_samples") or [])
+            )
+
+    summary_errors = []
+    omissions = []
+    for index, issue in enumerate(aggregated.values()):
+        samples = issue.get("representative_samples")
+        if isinstance(samples, list) and len(samples) > 2:
+            issue["representative_samples"] = samples[:2]
+            issue["representative_samples_omitted"] = len(samples) - 2
+            omissions.append(
+                {
+                    "error_index": index,
+                    "field": "representative_samples",
+                    "omitted_count": len(samples) - 2,
+                    "status": "still_unresolved_not_assumed_fixed",
+                }
+            )
+        summary_errors.append(issue)
+    return {
+        "status": validation.get("status"),
+        "stage": "execution",
+        "error": validation.get("error"),
+        "worker_error": report.get("error"),
+        "error_type": details.get("type"),
+        "distinct_error_count": len(summary_errors),
+        "source_reported_error_count": len(report.get("errors") or []),
+        "aggregation_semantics": (
+            "Equivalent structured error signatures are combined by summing their "
+            "occurrence counts; distinct roots remain separate."
+        ),
+        "errors": summary_errors,
+        "checks": copy.deepcopy(report.get("checks")),
+        "submitted_source_mapping": {
+            "status": (report.get("adapter_source_mapping") or {}).get("status"),
+            "line_mapping_provided": (
+                report.get("adapter_source_mapping") or {}
+            ).get("line_mapping_provided", False),
+            "feedback_function": "compute_potential_components",
+        },
+        "full_report_storage": copy.deepcopy(details.get("full_report_storage")),
+        "prompt_summary_omissions": omissions,
+        "omission_semantics": (
+            "Only excess representative samples are omitted; every distinct reported "
+            "error remains unresolved and is included in this repair feedback."
+        ),
+        "unresolved_checks": copy.deepcopy(validation.get("unresolved_checks", [])),
+    }
+
+
 def _code_ast(candidate: dict[str, Any]) -> str:
     return ast.dump(
         ast.parse(str(candidate["code"]), mode="exec"),
@@ -1190,25 +1442,92 @@ def _code_ast(candidate: dict[str, Any]) -> str:
     )
 
 
-def _returned_feature_expressions(candidate: dict[str, Any]) -> list[str] | None:
-    """Return exact direct return expressions when statically unambiguous."""
+class _StraightLineNameExpander(ast.NodeTransformer):
+    def __init__(self, bindings: dict[str, ast.AST]):
+        self.bindings = bindings
 
-    tree = ast.parse(str(candidate["code"]), mode="exec")
-    function = next(
-        (
-            node
-            for node in tree.body
-            if isinstance(node, ast.FunctionDef)
-            and node.name == "compute_potential_components"
-        ),
-        None,
-    )
-    if function is None:
-        return None
-    returns = [node for node in ast.walk(function) if isinstance(node, ast.Return)]
-    if len(returns) != 1 or returns[0].value is None:
-        return None
-    value = returns[0].value
+    def visit_Name(self, node: ast.Name) -> ast.AST:
+        if isinstance(node.ctx, ast.Load) and node.id in self.bindings:
+            return copy.deepcopy(self.bindings[node.id])
+        return copy.deepcopy(node)
+
+
+def _expanded_expression(node: ast.AST, bindings: dict[str, ast.AST]) -> ast.AST:
+    expanded = _StraightLineNameExpander(bindings).visit(copy.deepcopy(node))
+    return ast.fix_missing_locations(expanded)
+
+
+def _returned_feature_expressions(candidate: dict[str, Any]) -> dict[str, Any]:
+    """Resolve straight-line locals and return structural component formulas.
+
+    This deliberately does not attempt symbolic equivalence.  Control flow,
+    mutation, destructuring, aliases that require data-flow reasoning, and
+    multiple return paths are reported as unconfirmed rather than rejected.
+    """
+
+    try:
+        tree = ast.parse(str(candidate["code"]), mode="exec")
+    except (SyntaxError, TypeError, KeyError) as exc:
+        return {"status": "unconfirmed", "reason": f"source parse failed: {exc}"}
+    functions = [
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "compute_potential_components"
+    ]
+    if len(functions) != 1:
+        return {
+            "status": "unconfirmed",
+            "reason": "compute_potential_components was not uniquely identifiable",
+        }
+    function = functions[0]
+    bindings: dict[str, ast.AST] = {}
+    return_node: ast.Return | None = None
+    for statement in function.body:
+        if return_node is not None:
+            return {
+                "status": "unconfirmed",
+                "reason": "statements after return make the straight-line path ambiguous",
+            }
+        if (
+            isinstance(statement, ast.Expr)
+            and isinstance(statement.value, ast.Constant)
+            and isinstance(statement.value.value, str)
+        ):
+            continue
+        if isinstance(statement, ast.Assign):
+            if len(statement.targets) != 1 or not isinstance(statement.targets[0], ast.Name):
+                return {
+                    "status": "unconfirmed",
+                    "reason": "assignment target requires alias or mutation analysis",
+                }
+            bindings[statement.targets[0].id] = _expanded_expression(
+                statement.value, bindings
+            )
+            continue
+        if isinstance(statement, ast.AnnAssign):
+            if not isinstance(statement.target, ast.Name) or statement.value is None:
+                return {
+                    "status": "unconfirmed",
+                    "reason": "annotated assignment is not a simple local definition",
+                }
+            bindings[statement.target.id] = _expanded_expression(
+                statement.value, bindings
+            )
+            continue
+        if isinstance(statement, ast.Return) and return_node is None:
+            return_node = statement
+            continue
+        return {
+            "status": "unconfirmed",
+            "reason": (
+                f"{type(statement).__name__} requires control-flow, alias, or mutation "
+                "analysis outside the reliable straight-line subset"
+            ),
+        }
+    if return_node is None or return_node.value is None:
+        return {"status": "unconfirmed", "reason": "single return value was not found"}
+    value = _expanded_expression(return_node.value, bindings)
     if isinstance(value, (ast.List, ast.Tuple)):
         elements = value.elts
     elif (
@@ -1220,11 +1539,49 @@ def _returned_feature_expressions(candidate: dict[str, Any]) -> list[str] | None
     ):
         elements = value.args[0].elts
     else:
-        return None
-    return [
-        ast.dump(item, annotate_fields=True, include_attributes=False)
-        for item in elements
-    ]
+        return {
+            "status": "unconfirmed",
+            "reason": "returned component vector is not a literal list/tuple or np.array wrapper",
+        }
+    if any(isinstance(item, ast.Starred) for item in elements):
+        return {
+            "status": "unconfirmed",
+            "reason": "starred return elements require dynamic sequence analysis",
+        }
+    expanded = [_expanded_expression(item, bindings) for item in elements]
+    unresolved_locals = sorted(
+        {
+            node.id
+            for expression in expanded
+            for node in ast.walk(expression)
+            if isinstance(node, ast.Name)
+            and isinstance(node.ctx, ast.Load)
+            and node.id in bindings
+        }
+    )
+    if unresolved_locals:
+        return {
+            "status": "unconfirmed",
+            "reason": "cyclic or forward local dependencies could not be expanded reliably",
+            "unresolved_local_names": unresolved_locals,
+        }
+    return {
+        "status": "confirmed",
+        "method": "straight_line_local_definition_expansion_and_structural_ast_comparison",
+        "expressions": [
+            ast.dump(item, annotate_fields=True, include_attributes=False)
+            for item in expanded
+        ],
+        "note": "Structural equality only; no claim of general mathematical equivalence.",
+    }
+
+
+def _ordered_subsequence(items: list[Any], reference: list[Any]) -> bool:
+    cursor = 0
+    for reference_item in reference:
+        if cursor < len(items) and items[cursor] == reference_item:
+            cursor += 1
+    return cursor == len(items)
 
 
 def validate_direction(
@@ -1242,23 +1599,45 @@ def validate_direction(
         raise PotentialSearchError("revision direction lacks its fixed reference candidate")
     old_weights = [float(item["weight"]) for item in reference["components"]]
     new_weights = [float(item["weight"]) for item in candidate["components"]]
-    old_expr = _returned_feature_expressions(reference)
-    new_expr = _returned_feature_expressions(candidate)
-    issues = []
+    old_resolution = _returned_feature_expressions(reference)
+    new_resolution = _returned_feature_expressions(candidate)
+    formula_confirmed = (
+        old_resolution["status"] == "confirmed"
+        and new_resolution["status"] == "confirmed"
+    )
+    old_expr = old_resolution.get("expressions") or []
+    new_expr = new_resolution.get("expressions") or []
+    issues: list[str] = []
     checks = []
+    unconfirmed_checks = []
+    formula_check_required = direction in {"add", "reweight"} or (
+        direction == "remove" and len(old_weights) > 1
+    )
+    if formula_check_required and not formula_confirmed:
+        unconfirmed_checks.append(
+            {
+                "check": "component_formula_preservation",
+                "status": "unconfirmed_not_rejected",
+                "reference_resolution": old_resolution,
+                "candidate_resolution": new_resolution,
+            }
+        )
     exception = None
     if direction == "add":
         checks.append("feature_count_increased")
         if len(new_weights) <= len(old_weights):
             issues.append("add direction must increase feature count")
-        if old_expr is not None and new_expr is not None:
+        checks.append("retained_weights_ordered_subsequence")
+        if not _ordered_subsequence(old_weights, new_weights):
+            issues.append("add direction changed one or more retained fixed weights")
+        if formula_confirmed:
             checks.append("retained_formula_and_weight_ordered_subsequence")
-            cursor = 0
-            for expression, weight in zip(new_expr, new_weights):
-                if cursor < len(old_expr) and expression == old_expr[cursor] and weight == old_weights[cursor]:
-                    cursor += 1
-            if cursor != len(old_expr):
-                issues.append("reliably extracted original formulas and weights were not all retained")
+            if not _ordered_subsequence(
+                list(zip(old_expr, old_weights)), list(zip(new_expr, new_weights))
+            ):
+                issues.append(
+                    "reliably extracted original formulas and weights were not all retained"
+                )
     elif direction == "remove":
         if len(old_weights) == 1:
             exception = "single_feature_reference_uses_simpler_replacement"
@@ -1269,17 +1648,20 @@ def validate_direction(
             checks.append("feature_count_decreased")
             if len(new_weights) >= len(old_weights):
                 issues.append("remove direction must decrease feature count")
-            if old_expr is not None and new_expr is not None:
+            checks.append("remaining_weights_ordered_subsequence")
+            if not _ordered_subsequence(new_weights, old_weights):
+                issues.append("remove direction changed one or more remaining fixed weights")
+            if formula_confirmed:
                 checks.append("remaining_formula_and_weight_ordered_subsequence")
-                cursor = 0
-                for expression, weight in zip(old_expr, old_weights):
-                    if cursor < len(new_expr) and expression == new_expr[cursor] and weight == new_weights[cursor]:
-                        cursor += 1
-                if cursor != len(new_expr):
+                if not _ordered_subsequence(
+                    list(zip(new_expr, new_weights)), list(zip(old_expr, old_weights))
+                ):
                     issues.append("reliably extracted remaining formulas or weights changed")
     elif direction == "reweight":
-        checks.extend(("code_ast_unchanged", "feature_count_unchanged", "weight_changed"))
-        if _code_ast(candidate) != _code_ast(reference):
+        checks.extend(("feature_count_unchanged", "weight_changed"))
+        if formula_confirmed:
+            checks.append("component_formulas_structurally_unchanged_after_local_expansion")
+        if formula_confirmed and new_expr != old_expr:
             issues.append("reweight direction changed feature computation")
         if len(new_weights) != len(old_weights):
             issues.append("reweight direction changed feature count")
@@ -1292,11 +1674,24 @@ def validate_direction(
     else:
         raise ValueError(f"unsupported direction: {direction}")
     return {
-        "status": "failed" if issues else "passed",
+        "status": "failed" if issues else ("unconfirmed" if unconfirmed_checks else "passed"),
         "requested_direction": direction,
         "reliable_checks": checks,
-        "formula_comparison_available": old_expr is not None and new_expr is not None,
+        "formula_comparison_status": (
+            "confirmed"
+            if formula_check_required and formula_confirmed
+            else "unconfirmed"
+            if formula_check_required
+            else "not_applicable"
+        ),
+        "formula_comparison_available": formula_check_required and formula_confirmed,
+        "formula_resolution": {
+            "reference": old_resolution,
+            "candidate": new_resolution,
+        },
         "single_feature_remove_exception": exception,
+        "confirmed_violations": issues,
+        "unconfirmed_checks": unconfirmed_checks,
         "issues": issues,
     }
 
@@ -1318,7 +1713,9 @@ def modification_summary(
     new = [float(item["weight"]) for item in candidate["components"]]
     return {
         "requested_direction": direction,
-        "basis_candidate_id": reference.get("candidate_name"),
+        "basis_candidate_id": (
+            reference.get("candidate_id") or reference.get("candidate_name")
+        ),
         "feature_count_before": len(old),
         "feature_count_after": len(new),
         "feature_names_before": [
@@ -1337,6 +1734,15 @@ def modification_summary(
         ],
         "formula_comparison_available": direction_report.get(
             "formula_comparison_available"
+        ),
+        "formula_comparison_status": direction_report.get(
+            "formula_comparison_status"
+        ),
+        "confirmed_direction_violations": copy.deepcopy(
+            direction_report.get("confirmed_violations", [])
+        ),
+        "unconfirmed_direction_checks": copy.deepcopy(
+            direction_report.get("unconfirmed_checks", [])
         ),
         "single_feature_remove_exception": direction_report.get(
             "single_feature_remove_exception"
@@ -1705,7 +2111,10 @@ def _prepare_resume_compatibility(
         raise PotentialSearchError("resume obs/constants contract changed")
 
     saved_prompt_version = state.get("prompt_version")
-    if saved_prompt_version not in {LEGACY_PROMPT_VERSION, SEARCH_PROMPT_VERSION}:
+    if saved_prompt_version not in {
+        *SUPPORTED_LEGACY_PROMPT_VERSIONS,
+        SEARCH_PROMPT_VERSION,
+    }:
         raise PotentialSearchError(
             f"unsupported saved training-search prompt version: {saved_prompt_version!r}"
         )
@@ -1875,7 +2284,10 @@ def _prepare_generation_request(
             "old_stage_archive": (
                 str(stage_path.resolve()) if stage_path is not None else None
             ),
-            "reason": "unsent cached request rebuilt with compact training feedback",
+            "reason": (
+                "unsent cached request rebuilt with complete deduplicated candidate "
+                "definitions and structured feedback"
+            ),
         }
         migrations = record.setdefault("generation_request_migrations", [])
         if not any(
@@ -1910,7 +2322,9 @@ def _repair_prompt_extra_sections(
             _load_failed_response_material(record), indent=2, ensure_ascii=False
         )
     feedback = json.dumps(
-        record.get("last_validation"), indent=2, ensure_ascii=False
+        _repair_validation_feedback(record.get("last_validation")),
+        indent=2,
+        ensure_ascii=False,
     )
     return {
         "repair_failed_response": len(response),
@@ -2438,11 +2852,25 @@ def run_potential_search(
                 repair=repair,
             )
             if not budget["fits_client_budget"]:
+                largest_sections = [
+                    {"section": name, "characters": int(size)}
+                    for name, size in sorted(
+                        prompt_sections.items(), key=lambda item: item[1], reverse=True
+                    )[:5]
+                ]
                 state["status"] = "paused_context_budget_exceeded"
                 state["stop_reason"] = (
-                    f"required prompt for {candidate_id} does not fit the configured context"
+                    f"required complete prompt for {candidate_id} does not fit the configured "
+                    f"context; largest sections: {largest_sections}"
                 )
                 record["last_token_budget"] = budget
+                record["context_budget_stop"] = {
+                    "reason": "complete_candidate_formulas_and_required_feedback_do_not_fit",
+                    "request_was_sent": False,
+                    "candidate_definitions_were_truncated_or_removed": False,
+                    "largest_sections": largest_sections,
+                    "prompt_budget_report": record["last_prompt_budget_report"],
+                }
                 _save_state(output, state)
                 return _result(state)
             state["model_calls"] += 1
@@ -2524,7 +2952,7 @@ def run_potential_search(
                             record["requested_direction"], normalized, reference_candidate
                         )
                         validation["direction"] = direction_report
-                        if direction_report["status"] != "passed":
+                        if direction_report["status"] == "failed":
                             validation = {
                                 "status": "failed",
                                 "stage": "direction",
@@ -2538,11 +2966,18 @@ def run_potential_search(
                         else None
                     )
             except (CandidateExecutionError,) as exc:
+                error_details = _exception_details(
+                    exc,
+                    submitted_code=(submission or {}).get("code"),
+                )
                 validation = {
                     "status": "failed",
                     "stage": "execution",
-                    "error": f"{type(exc).__name__}: {exc}",
-                    "error_details": _exception_details(exc),
+                    "error": (
+                        f"{type(exc).__name__}: "
+                        f"{_replace_adapter_function_name(str(exc))}"
+                    ),
+                    "error_details": error_details,
                 }
                 extra = None
                 fingerprint = None

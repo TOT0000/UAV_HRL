@@ -5,6 +5,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
+import llm_potential
 import llm_potential_search as search
 
 
@@ -351,3 +352,455 @@ def test_repair_prompt_has_complete_error_context_and_no_placeholders(tmp_path):
     assert "invalid JSON" in prompt
     assert "execution was not run" in prompt
     assert "not-json" in prompt
+
+
+def _direction_candidate(candidate_id, code, weights):
+    return {
+        "candidate_id": candidate_id,
+        "design_summary": "direction fixture",
+        "components": [
+            {
+                "name": f"component_{index}",
+                "description": "fixture",
+                "weight": weight,
+            }
+            for index, weight in enumerate(weights)
+        ],
+        "code": code,
+    }
+
+
+def test_execution_report_is_saved_complete_and_repair_feedback_keeps_all_roots(
+    tmp_path,
+):
+    code = (
+        "def compute_potential_components(obs, constants):\n"
+        "    value = obs['distance'][99]\n"
+        "    return [value]\n"
+    )
+    report = {
+        "status": "failed",
+        "error_count": 2,
+        "errors": [
+            {
+                "code": "RUNTIME_FUNCTION_ERROR",
+                "stage": "execution",
+                "location": "compute_extra_state at candidate line 2",
+                "problem": "IndexError: index 99 is out of bounds",
+                "requirement": "Respect the valid distance vector length.",
+                "occurrence_count": 3,
+                "candidate_function": "compute_extra_state",
+                "candidate_line": 2,
+                "representative_samples": [
+                    {"case": "index-a"},
+                    {"case": "index-b"},
+                    {"case": "index-c"},
+                ],
+                "runtime_diagnostics": {"candidate_source_excerpt": []},
+            },
+            {
+                "code": "RUNTIME_NONFINITE",
+                "stage": "execution",
+                "location": "compute_extra_state at candidate line 3",
+                "problem": "component 0 is not finite",
+                "requirement": "Return finite component values.",
+                "occurrence_count": 1,
+                "candidate_function": "compute_extra_state",
+                "candidate_line": 3,
+                "representative_samples": [{"case": "nonfinite"}],
+            },
+        ],
+        "checks": {"execution": {"status": "failed"}},
+    }
+    error = search.CandidateExecutionError("worker failed", report=report)
+    details = search._exception_details(error, submitted_code=code)
+    validation = {
+        "status": "failed",
+        "stage": "execution",
+        "error": "CandidateExecutionError: worker failed",
+        "error_details": details,
+    }
+    submission = _direction_candidate("r01_c01", code, [1.0])
+    version = tmp_path / "v01"
+    search._save_candidate_version(
+        version,
+        submission=submission,
+        normalized=submission,
+        validation=validation,
+        raw_content=json.dumps(submission),
+    )
+    saved = json.loads((version / "validation_report.json").read_text(encoding="utf-8"))
+    saved_report = saved["error_details"]["execution_report"]
+    assert [item["code"] for item in saved_report["errors"]] == [
+        "RUNTIME_FUNCTION_ERROR",
+        "RUNTIME_NONFINITE",
+    ]
+    assert len(saved_report["errors"][0]["representative_samples"]) == 3
+    assert saved_report == report
+    mapped_report = saved["error_details"]["candidate_facing_execution_report"]
+    assert mapped_report["errors"][0]["candidate_function"] == (
+        "compute_potential_components"
+    )
+    assert mapped_report["errors"][0]["runtime_diagnostics"][
+        "candidate_source_excerpt"
+    ][1]["code"] == "    value = obs['distance'][99]"
+
+    record = {
+        "candidate_id": "r01_c01",
+        "generation_stage_request": "Generate the complete candidate.",
+        "versions": [{"directory": str(version), "response_kind": "parsed_json"}],
+        "last_validation": validation,
+    }
+    prompt = search._repair_prompt(common="COMMON", record=record, duplicate=False)
+    assert "RUNTIME_FUNCTION_ERROR" in prompt
+    assert "RUNTIME_NONFINITE" in prompt
+    assert "IndexError: index 99 is out of bounds" in prompt
+    assert "Return finite component values." in prompt
+    assert "index-a" in prompt and "index-b" in prompt
+    assert "index-c" not in prompt
+    assert "representative_samples_omitted" in prompt
+    assert "still_unresolved_not_assumed_fixed" in prompt
+    assert "compute_extra_state" not in prompt
+
+
+def test_potential_adapter_renames_function_without_changing_source_lines():
+    source = (
+        "def compute_potential_components(obs, constants):\n"
+        "    first = obs['distance']\n"
+        "\n"
+        "    return [first]\n"
+    )
+    adapted = llm_potential._rename_candidate_function(
+        source, "compute_potential_components", "compute_extra_state"
+    )
+    assert adapted.splitlines()[0] == "def compute_extra_state(obs, constants):"
+    assert adapted.splitlines()[1:] == source.splitlines()[1:]
+
+
+def test_search_execution_failure_uses_complete_report_in_next_model_request(
+    tmp_path, monkeypatch
+):
+    _calls, _training_calls, _evaluation_calls, train, evaluate, baseline = (
+        _install_search_mocks(monkeypatch, tmp_path)
+    )
+    prompts = []
+
+    def call_model(*, prompt, **_kwargs):
+        prompts.append(prompt)
+        marker = prompt.split("COMMON ", 1)[1].split()[0]
+        return {
+            "content": json.dumps(_submission(marker)),
+            "transport_completed": True,
+            "finish_reason": "stop",
+        }
+
+    first = True
+    full_report = {
+        "status": "failed",
+        "errors": [
+            {
+                "code": "ROOT_A",
+                "location": "fixed sample",
+                "problem": "first independent root",
+                "requirement": "repair root A",
+                "occurrence_count": 2,
+                "representative_samples": [{"sample": 1}],
+            },
+            {
+                "code": "ROOT_B",
+                "location": "empty probe",
+                "problem": "second independent root",
+                "requirement": "repair root B",
+                "occurrence_count": 1,
+                "representative_samples": [{"sample": "empty"}],
+            },
+        ],
+        "error_count": 2,
+    }
+
+    def validate(_submission_value, **_kwargs):
+        nonlocal first
+        if first:
+            first = False
+            raise search.CandidateExecutionError("two roots", report=full_report)
+        return {"status": "passed"}
+
+    monkeypatch.setattr(search, "_call_model", call_model)
+    monkeypatch.setattr(search, "validate_potential_candidate", validate)
+    output = tmp_path / "search-execution-report"
+    result = search.run_potential_search(
+        validation_sources=[tmp_path / "validation"],
+        baseline_run=tmp_path / "baseline-run",
+        baseline_evaluation=tmp_path / "baseline-eval",
+        provider="openai",
+        model="fixture-model",
+        context_length=128000,
+        output_dir=output,
+        runtime_root=tmp_path / "runtime-execution-report",
+        max_rounds=1,
+        client=object(),
+        training_runner=train,
+        evaluation_runner=evaluate,
+        baseline_validator=baseline,
+    )
+    assert result["status"] == "complete"
+    assert "ROOT_A" in prompts[1] and "ROOT_B" in prompts[1]
+    assert "repair root A" in prompts[1] and "repair root B" in prompts[1]
+    state = json.loads((output / "state.json").read_text(encoding="utf-8"))
+    first_version = Path(
+        state["rounds"][0]["candidates"]["r01_c01"]["versions"][0]["directory"]
+    )
+    saved = json.loads(
+        (first_version / "validation_report.json").read_text(encoding="utf-8")
+    )
+    assert saved["error_details"]["execution_report"] == full_report
+
+
+def test_direction_resolution_detects_changed_formula_despite_same_local_name():
+    reference = _direction_candidate(
+        "reference",
+        "def compute_potential_components(obs, constants):\n"
+        "    x = obs['distance'] * 0.5\n"
+        "    return [x]\n",
+        [1.0],
+    )
+    candidate = _direction_candidate(
+        "candidate",
+        "def compute_potential_components(obs, constants):\n"
+        "    x = obs['distance'] * 0.25\n"
+        "    y = obs['queue'] * 0.1\n"
+        "    return [x, y]\n",
+        [1.0, 2.0],
+    )
+    result = search.validate_direction("add", candidate, reference)
+    assert result["status"] == "failed"
+    assert result["formula_comparison_status"] == "confirmed"
+    assert any("formulas" in item for item in result["confirmed_violations"])
+
+
+@pytest.mark.parametrize(
+    ("direction", "reference_code", "candidate_code", "old_weights", "new_weights"),
+    [
+        (
+            "add",
+            "    original = obs['distance'] * 0.5\n    return [original]\n",
+            "    renamed = obs['distance'] * 0.5\n"
+            "    added = obs['queue'] * 0.1\n    return [renamed, added]\n",
+            [1.0],
+            [1.0, 2.0],
+        ),
+        (
+            "remove",
+            "    first = obs['distance'] * 0.5\n"
+            "    second = obs['queue'] * 0.1\n    return [first, second]\n",
+            "    renamed = obs['distance'] * 0.5\n    return [renamed]\n",
+            [1.0, 2.0],
+            [1.0],
+        ),
+        (
+            "reweight",
+            "    first = obs['distance'] * 0.5\n"
+            "    second = obs['queue'] * 0.1\n    return [first, second]\n",
+            "    renamed_a = obs['distance'] * 0.5\n"
+            "    renamed_b = obs['queue'] * 0.1\n"
+            "    return [renamed_a, renamed_b]\n",
+            [1.0, 2.0],
+            [3.0, 4.0],
+        ),
+    ],
+)
+def test_direction_resolution_accepts_local_rename_for_same_formula(
+    direction, reference_code, candidate_code, old_weights, new_weights
+):
+    reference = _direction_candidate(
+        "reference",
+        "def compute_potential_components(obs, constants):\n" + reference_code,
+        old_weights,
+    )
+    candidate = _direction_candidate(
+        "candidate",
+        "def compute_potential_components(obs, constants):\n" + candidate_code,
+        new_weights,
+    )
+    result = search.validate_direction(direction, candidate, reference)
+    assert result["status"] == "passed"
+    assert result["formula_comparison_status"] == "confirmed"
+    assert result["confirmed_violations"] == []
+
+
+def test_direction_resolution_reports_unconfirmed_control_flow_without_rejection():
+    code = (
+        "def compute_potential_components(obs, constants):\n"
+        "    if obs['valid']:\n"
+        "        value = obs['distance']\n"
+        "    else:\n"
+        "        value = 0.0\n"
+        "    return [value]\n"
+    )
+    reference = _direction_candidate("reference", code, [1.0])
+    candidate = _direction_candidate("candidate", code, [2.0])
+    result = search.validate_direction("reweight", candidate, reference)
+    assert result["status"] == "unconfirmed"
+    assert result["formula_comparison_status"] == "unconfirmed"
+    assert result["confirmed_violations"] == []
+    assert result["unconfirmed_checks"][0]["status"] == "unconfirmed_not_rejected"
+
+
+def test_model_adapter_receives_each_complete_long_candidate_definition_once(
+    tmp_path, monkeypatch
+):
+    _model_calls, _training_calls, _evaluation_calls, train, evaluate, baseline = (
+        _install_search_mocks(monkeypatch, tmp_path)
+    )
+    prompts = []
+    submissions = {}
+
+    def long_submission(candidate_id):
+        result = _submission(candidate_id)
+        result["components"][0]["weight"] = float(int(candidate_id[-2:]))
+        padding = f"FULL_FORMULA_{candidate_id}_" + (candidate_id * 520)
+        result["code"] = (
+            "def compute_potential_components(obs, constants):\n"
+            f"    # {padding}\n"
+            f"    return [{int(candidate_id[-2:]) / 10.0 + int(candidate_id[1:3]) / 100.0}]\n"
+        )
+        submissions[candidate_id] = result
+        return result
+
+    def call_model(*, prompt, **_kwargs):
+        prompts.append(prompt)
+        marker = prompt.split("COMMON ", 1)[1].split()[0]
+        return {
+            "content": json.dumps(long_submission(marker)),
+            "transport_completed": True,
+            "finish_reason": "stop",
+        }
+
+    monkeypatch.setattr(search, "_call_model", call_model)
+    result = search.run_potential_search(
+        validation_sources=[tmp_path / "validation"],
+        baseline_run=tmp_path / "baseline-run",
+        baseline_evaluation=tmp_path / "baseline-eval",
+        provider="openai",
+        model="fixture-model",
+        context_length=128000,
+        output_dir=tmp_path / "search-long",
+        runtime_root=tmp_path / "runtime-long",
+        max_rounds=2,
+        client=object(),
+        training_runner=train,
+        evaluation_runner=evaluate,
+        baseline_validator=baseline,
+    )
+    assert result["status"] == "complete"
+    first_revision_prompt = prompts[4]
+    for index in range(1, 5):
+        candidate_id = f"r01_c{index:02d}"
+        code_literal = json.dumps(
+            submissions[candidate_id]["code"], ensure_ascii=False
+        )[1:-1]
+        assert len(submissions[candidate_id]["code"]) > 2400
+        assert first_revision_prompt.count(code_literal) == 1
+        assert f'"weight": {float(index)}' in first_revision_prompt
+        assert f'"candidate_definition_reference": "{candidate_id}"' in (
+            first_revision_prompt
+        )
+    assert '"mean_episode_energy_efficiency_mbit_per_j": 1.0' in (
+        first_revision_prompt
+    )
+
+
+def test_context_budget_pause_saves_full_prompt_and_does_not_call_model(
+    tmp_path, monkeypatch
+):
+    model_calls, _training_calls, _evaluation_calls, train, evaluate, baseline = (
+        _install_search_mocks(monkeypatch, tmp_path)
+    )
+    budget_calls = 0
+
+    def budget(_prompt, **_kwargs):
+        nonlocal budget_calls
+        budget_calls += 1
+        return {
+            "fits_client_budget": budget_calls <= 4,
+            "method": "fixture_exact",
+            "exact": True,
+            "estimated_input_tokens": 1,
+        }
+
+    monkeypatch.setattr(search, "estimate_token_budget", budget)
+    output = tmp_path / "search-budget"
+    result = search.run_potential_search(
+        validation_sources=[tmp_path / "validation"],
+        baseline_run=tmp_path / "baseline-run",
+        baseline_evaluation=tmp_path / "baseline-eval",
+        provider="openai",
+        model="fixture-model",
+        context_length=128000,
+        output_dir=output,
+        runtime_root=tmp_path / "runtime-budget",
+        max_rounds=2,
+        client=object(),
+        training_runner=train,
+        evaluation_runner=evaluate,
+        baseline_validator=baseline,
+    )
+    assert result["status"] == "paused_context_budget_exceeded"
+    assert model_calls == [f"r01_c{index:02d}" for index in range(1, 5)]
+    state = json.loads((output / "state.json").read_text(encoding="utf-8"))
+    record = state["current_round"]["candidates"]["r02_c01"]
+    stop = record["context_budget_stop"]
+    assert stop["request_was_sent"] is False
+    assert stop["candidate_definitions_were_truncated_or_removed"] is False
+    assert any(
+        item["section"] == "complete_candidate_definitions"
+        for item in stop["largest_sections"]
+    )
+    prompt_path = Path(stop["prompt_budget_report"]["prompt_path"])
+    prompt = prompt_path.read_text(encoding="utf-8")
+    assert all(
+        json.dumps(
+            _submission(f"r01_c{index:02d}")["code"], ensure_ascii=False
+        )[1:-1]
+        in prompt
+        for index in range(1, 5)
+    )
+
+
+def test_previous_prompt_version_is_migrated_for_resume(tmp_path):
+    constants = {"fixture": {"value": 1}}
+    source_bundle = {
+        "bundle_sha256": "same-source",
+        "content_sha256": "same-content",
+        "git_sha": "new-git",
+        "excerpts": {},
+        "rendered": {},
+    }
+    state = {
+        "prompt_version": search.LEGACY_PROMPT_VERSION,
+        "environment_source_bundle_sha256": "same-source",
+        "git_sha": "old-git",
+        "settings": {
+            "evaluation_area_m": [1000.0, 1000.0],
+            "episode_seconds": 60,
+            "candidate_count_per_round": 4,
+            "candidate_generation_calls_per_request": 1,
+            "train_episodes": 400,
+            "evaluation_episodes": 100,
+            "evaluation_roi_count": 8,
+            "summary_block_size": 50,
+        },
+    }
+    (tmp_path / "state.json").write_text(json.dumps(state), encoding="utf-8")
+    (tmp_path / "constants.json").write_text(json.dumps(constants), encoding="utf-8")
+    migration = search._prepare_resume_compatibility(
+        output=tmp_path,
+        state=state,
+        source_bundle=source_bundle,
+        constants=constants,
+    )
+    assert migration is not None
+    assert migration["from_prompt_version"] == search.LEGACY_PROMPT_VERSION
+    assert migration["to_prompt_version"] == search.SEARCH_PROMPT_VERSION
+    assert state["prompt_version"] == search.SEARCH_PROMPT_VERSION
+    assert Path(migration["state_backup"]).is_file()

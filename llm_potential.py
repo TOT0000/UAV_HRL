@@ -17,6 +17,7 @@ import math
 import multiprocessing as mp
 import os
 from pathlib import Path
+import re
 import shutil
 from typing import Any
 
@@ -94,8 +95,18 @@ def _rename_candidate_function(code: str, source: str, destination: str) -> str:
     function = functions[0]
     if function.name != source:
         raise CandidateError(f"code function must be exactly {source}")
-    function.name = destination
-    return ast.unparse(ast.fix_missing_locations(tree)) + "\n"
+    # Keep the submitted source layout intact.  Runtime diagnostics report line
+    # numbers in this adapted function, so an AST unparse would make those
+    # locations impossible to map reliably back to the model's source.
+    lines = code.splitlines(keepends=True)
+    line_index = int(function.lineno) - 1
+    definition = lines[line_index]
+    pattern = re.compile(rf"(\bdef\s+){re.escape(source)}(?=\s*\()")
+    replaced, count = pattern.subn(rf"\g<1>{destination}", definition, count=1)
+    if count != 1:
+        raise CandidateError("candidate function name could not be adapted in place")
+    lines[line_index] = replaced
+    return "".join(lines)
 
 
 def validate_submission_schema(submission: Any, *, expected_id: str | None = None) -> None:

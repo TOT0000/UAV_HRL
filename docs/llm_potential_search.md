@@ -49,6 +49,28 @@ not a ratio of totals and not the shaped training return. Increasing
 `--max-rounds` on resume schedules only new rounds. Training/evaluation budgets,
 seeds, manifests, artifacts, and completed phases remain compatibility-checked.
 
+Execution failures retain the worker's complete structured report in the failed
+candidate version's `validation_report.json`. Repair prompts include every
+distinct reported error with its occurrence count, requirement, submitted-source
+location when the line-preserving adapter can map it, and a bounded set of
+representative samples; any omitted samples are recorded as unresolved. The
+ADD/REMOVE/REWEIGHT direction check expands reliable straight-line local
+definitions before structural AST comparison, so local renames do not change a
+formula identity. Control flow or mutation outside that subset is reported as an
+unconfirmed formula check and is not, by itself, a rejection; count, weight,
+runtime safety, numeric, and duplicate checks still apply.
+
+Later-round prompts contain one authoritative complete definition for every
+referenced trained candidate: exact validated code, component order,
+descriptions, fixed weights, candidate/version identity, and references from its
+measured training/evaluation summaries. Definitions are never character-truncated
+or silently removed. If the complete required request exceeds the configured
+context budget, the search saves the pending prompt and a largest-section report,
+pauses before the model call, and can be resumed after an explicit compatible
+configuration change. Existing prompt-v0/v1 search records are migrated with a
+state/source backup; completed generation, training, and evaluation phases are
+not rerun.
+
 The baseline evaluation path may be the directory containing the selected
 `paper_evaluation_metadata.json`, or a higher root only when it resolves to one
 unambiguous result. The saved point supplies the exact `roi_8` manifest path.

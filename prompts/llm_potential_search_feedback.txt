@@ -1,6 +1,9 @@
 Generate candidate {{CANDIDATE_ID}} by revising the historical best candidate according to the requested direction that follows this feedback.
 
-Historical best candidate, including complete code:
+Authoritative candidate definitions. Each candidate ID appears once here with the complete validated code, component order, descriptions, and fixed weights actually used for training:
+{{CANDIDATE_DEFINITIONS}}
+
+Historical best candidate reference and measured results:
 {{BEST_CANDIDATE}}
 
 Baseline evaluation:
