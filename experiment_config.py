@@ -394,6 +394,13 @@ _METHOD_DEFINITIONS = {
         "llm_enabled": True,
         "label": "TD3 + Dinkelbach + multi-candidate trained LLM state/reward",
     },
+    "td3_dinkelbach_llm_potential": {
+        **_COMMON_METHOD,
+        "agent": "td3",
+        "movement": "centralized_td3",
+        "reward_mode": "dinkelbach",
+        "label": "TD3 + Dinkelbach + LLM potential shaping",
+    },
     "ddpg_dinkelbach": {
         **_COMMON_METHOD,
         "agent": "ddpg",
@@ -603,6 +610,12 @@ class MethodSpec:
     @property
     def learns_routing(self) -> bool:
         return self.routing in {"safe_ddqn", "dqn", "ddqn"}
+
+    @property
+    def potential_enabled(self) -> bool:
+        """Keep the new behavior out of legacy MethodSpec fingerprints."""
+
+        return self.method_id == "td3_dinkelbach_llm_potential"
 
     @property
     def fingerprint(self) -> str:

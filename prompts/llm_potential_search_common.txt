@@ -1,0 +1,229 @@
+Design a potential function for potential-based reward shaping to improve the convergence speed of centralized TD3 movement control in the UAV data-collection system below.
+
+Provide Python code defining compute_potential_components(obs, constants), together with each component's name, brief description, and fixed weight.
+
+1. System operation and task objective
+
+The system contains 16 UAVs, one ground station (GS), and 2–8 regions of interest (RoIs) in a standard 1000 × 1000 m disaster area.
+
+UAV tasks are:
+- Search: discover previously unknown RoIs.
+- Visual sensing (VS): capture data from an assigned RoI.
+- Communication collection (COM): receive data from an assigned ground source (SR).
+- Hover: remain hovering.
+
+A UAV may serve VS and COM simultaneously with different targets.
+
+Task allocation assigns roles and service targets according to existing update rules. TD3 controls the UAVs identified by movement_mask. Each controlled UAV has three action components: speed, horizontal heading, and vertical speed. Existing controllers handle search and hovering behavior.
+
+After movement updates positions and link conditions, the routing controller selects packet next hops.
+
+A movement decision occurs every 1 s. Each interval contains four communication slots of 0.25 s. An episode lasts 60 s.
+
+The execution sequence is:
+
+current observations and task assignments
+→ TD3 movement action
+→ position and sensing/link updates
+→ data acquisition, queueing, uploads, and relay transmissions
+→ interval delivery, energy, and penalty calculation
+→ next movement decision
+
+Task allocation is updated when its existing rules trigger.
+
+Data follows these paths:
+
+VS: capturing UAV → zero or more relay UAVs → GS
+
+COM: SR queue → serving UAV → zero or more relay UAVs → GS
+
+Packet deadlines are measured from generation until GS delivery:
+- VS: 2.5 s.
+- COM: 2.0 s.
+
+Changing a packet's current node does not restart its deadline.
+
+The task objective is energy-efficient timely delivery:
+
+EE = sum_t B_timely,t / sum_t E_movement,t
+
+B_timely,t is useful data delivered to the GS within its deadline during interval t.
+E_movement,t is the movement energy of all UAVs during interval t.
+
+Data acquisition and intermediate forwarding contribute to the task through subsequent timely GS delivery. Consider useful delivery, movement energy, and end-to-end deadline violations together.
+
+2. Quantitative relationships and environment implementation
+
+Movement and energy:
+{{MOVEMENT_AND_ENERGY_SPEC}}
+
+{{MOVEMENT_AND_ENERGY_CODE}}
+
+Visual sensing:
+
+d_horizontal(u,j) = sqrt((x_u-x_j)^2 + (y_u-y_j)^2)
+
+Position, altitude, and camera footprint determine valid capture and RoI coverage.
+
+{{VISUAL_SENSING_SPEC}}
+
+{{VISUAL_SENSING_CODE}}
+
+Communication:
+
+d_ab = norm(p_a-p_b, 2)
+
+{{COMMUNICATION_SPEC}}
+
+{{COMMUNICATION_AND_SERVICE_CODE}}
+
+For a constant link capacity C_ab in bits/s over a 0.25 s slot:
+
+B_ab <= C_ab * 0.25
+
+Actual service also depends on scheduling, bandwidth allocation, and queued data.
+
+Relay connectivity requires a sequence of available directed links from the packet's current node to the GS. Capacity and waiting time determine whether delivery can meet the deadline.
+
+For backlog Q in bits and positive capacity C in bits/s, Q/C is a reference clearance time under continuous service.
+
+For packet p:
+
+remaining_deadline_p = deadline_p - (current_time - generation_time_p)
+
+The source excerpts explain environment behavior. The input interface below defines which quantities your function can access.
+
+3. Available observations
+
+obs contains observable information at one state snapshot.
+constants contains fixed environment parameters.
+
+{{INPUT_FIELD_TABLE}}
+
+{{OBSERVATION_CODE}}
+
+Each field specifies its meaning, shape, axis/ID mapping, unit, and validity condition.
+
+Use validity flags and handle empty valid sets. Missing information differs from an observed zero or empty queue.
+
+movement_mask identifies control ownership. Observation validity is specified separately.
+
+The host calls the same function for the current and next snapshots. Each invocation uses information available at that snapshot.
+
+4. Potential and shaping construction
+
+Implement:
+
+compute_potential_components(obs, constants)
+
+Return an unweighted one-dimensional numeric list or NumPy array:
+
+f(s) = [f_0(s), ..., f_(K-1)(s)]
+0 <= f_k(s) <= 1
+
+Keep component order and normalization fixed across samples and episodes. Briefly explain each normalization scale in its description.
+
+Assign a fixed finite weight w_k to each component. Weights may be positive, negative, or zero. Their sum and absolute sum are unrestricted.
+
+The host computes:
+
+Phi(s) = sum_k w_k * f_k(s)
+
+F_t = beta * [gamma * Phi(s_next) - Phi(s_current)]
+
+r_train,t = r_base,t + F_t
+
+gamma = {{GAMMA}}
+beta = {{BETA}}
+
+gamma is the same discount factor used by TD3.
+
+The contribution of component k is:
+
+F_t,k = beta * w_k * [gamma * f_k(s_next) - f_k(s_current)]
+
+For gamma = 1, a component's contribution depends on its change between consecutive states. Positive weights reward increases; negative weights reward decreases.
+
+For other gamma values, use the full discounted expression when interpreting the contribution.
+
+The host applies the following terminal and bootstrap convention:
+
+{{TERMINATION_AND_BOOTSTRAP_SPEC}}
+
+The original reward is:
+
+r_base = B_timely_Mbit - lambda * E_movement_J - P_C9 - P_C10 - P_COM
+
+{{BASE_REWARD_SPEC}}
+
+{{DELIVERY_AND_BASE_REWARD_CODE}}
+
+lambda is managed by the existing training procedure.
+
+All component values, potentials, and rewards must be finite.
+Phi and F are not restricted to [-1,1].
+The host keeps the candidate's code, weights, and normalization fixed throughout each training run.
+
+5. Design guidance
+
+Connect the task requirements to observable quantities and useful intermediate progress:
+
+- Identify the task process each component represents.
+- Choose observations that describe that process.
+- Define its formula and normalization.
+- Explain how the resulting potential change and weight provide a useful learning signal.
+
+Consider how movement affects sensing, source upload, onward delivery, and energy use using the relationships above.
+
+Put the concise design rationale in the component descriptions. Check that the implementation and the actual shaping expression match that rationale.
+
+6. Code and output interface
+
+Use the provided np and supported operations:
+
+{{SUPPORTED_OPERATIONS}}
+
+For identical inputs, return identical values and leave inputs unchanged.
+
+The host validates vector length, numeric values, and the [0,1] component range, then converts the components to the required numeric dtype. It does not clip components or normalize weights.
+
+Return one JSON object:
+
+{
+  "candidate_id": "{{CANDIDATE_ID}}",
+  "design_summary": "A concise description of the design and its intended learning signal.",
+  "components": [
+    {
+      "name": "component_name",
+      "description": "What it measures, its normalization scale, and how its weighted potential change is intended to support learning.",
+      "weight": 0.0
+    }
+  ],
+  "code": "Complete Python source defining compute_potential_components(obs, constants)"
+}
+
+The components list must match the returned vector in length and order.
+
+Executable interface example:
+
+{{MINIMAL_EXECUTABLE_EXAMPLE}}
+
+7. Training and evaluation
+
+Each valid, distinct candidate is trained from scratch under the same settings.
+
+{{TRAINING_AND_EVALUATION_SETTINGS}}
+
+Candidates are compared using mean episode EE on the same fixed evaluation scenarios:
+
+mean_EE = (1/N) * sum_i (B_timely_episode_i / E_movement_episode_i)
+
+The candidate with the highest historical evaluation mean EE is the reference for subsequent revisions.
+
+Training summaries describe learning progress. Component summaries distinguish potential values from actual shaping contributions.
+
+8. Current request
+
+The request-specific generation or repair instructions follow this common contract.
+
+Return only the complete candidate JSON object.

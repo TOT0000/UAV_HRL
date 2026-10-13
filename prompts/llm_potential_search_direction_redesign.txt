@@ -1,0 +1,5 @@
+Requested direction: REDESIGN
+
+Propose an alternative potential design. You may change the components, formulas, normalization, and weights.
+
+Candidates already generated in the current round are included in the saved request context; avoid duplicating them.

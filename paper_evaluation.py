@@ -968,6 +968,11 @@ def run_paper_evaluation(
                     if method.llm_enabled
                     else None
                 ),
+                potential_artifact_dir=(
+                    context["run_dir"] / "potential_artifact"
+                    if method.potential_enabled
+                    else None
+                ),
                 llm_worker_timeout=float(
                     (context.get("resolved") or {}).get(
                         "llm_worker_timeout_seconds", 60.0
@@ -1129,9 +1134,17 @@ def run_paper_evaluation(
             if method.llm_enabled
             else None
         )
+        potential_artifact_id = (
+            result["potential_artifact_identity"]["artifact_content_sha256"]
+            if method.potential_enabled
+            else None
+        )
         if llm_artifact_id is not None:
             for aggregate in aggregates:
                 aggregate["llm_artifact_id"] = llm_artifact_id
+        if potential_artifact_id is not None:
+            for aggregate in aggregates:
+                aggregate["potential_artifact_id"] = potential_artifact_id
         _write_json(point_dir / "aggregated_plot_data.json", aggregates)
         _write_csv(point_dir / "aggregated_plot_data.csv", aggregates)
         all_aggregates.extend(aggregates)
@@ -1152,6 +1165,11 @@ def run_paper_evaluation(
                 **(
                     {"llm_artifact_id": llm_artifact_id}
                     if llm_artifact_id is not None
+                    else {}
+                ),
+                **(
+                    {"potential_artifact_id": potential_artifact_id}
+                    if potential_artifact_id is not None
                     else {}
                 ),
                 **deployment_provenance,

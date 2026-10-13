@@ -1,0 +1,12 @@
+Repair candidate {{CANDIDATE_ID}} because it duplicates an earlier executable design.
+
+Original generation request:
+{{GENERATION_REQUEST}}
+
+Duplicate candidate:
+{{DUPLICATE_CANDIDATE}}
+
+Duplicate comparison:
+{{DUPLICATE_DIAGNOSTICS}}
+
+Return a substantively different complete potential candidate. The comparison covers normalized Python structure, component order/count, and fixed weights; it does not prove all mathematical equivalences.

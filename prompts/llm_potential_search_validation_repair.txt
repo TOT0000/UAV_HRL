@@ -1,0 +1,15 @@
+Repair candidate {{CANDIDATE_ID}}.
+
+Original generation request:
+{{GENERATION_REQUEST}}
+
+Current complete candidate or raw response:
+{{FAILED_RESPONSE_MATERIAL}}
+
+Confirmed validation errors:
+{{VALIDATION_FEEDBACK}}
+
+Earlier unresolved checks, if any:
+{{UNRESOLVED_CHECKS}}
+
+Correct the reported problems and return the complete candidate using the documented interface. Checks that were not executed remain unverified.

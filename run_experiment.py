@@ -71,6 +71,11 @@ from llm_runtime import (
     llm_checkpoint_path_preflight,
     load_run_artifact,
 )
+from llm_potential import (
+    artifact_identity as potential_artifact_identity,
+    copy_potential_artifact,
+    load_run_artifact as load_potential_run_artifact,
+)
 
 
 TRAINING_HISTORY_MANIFEST_HASH_SEMANTICS = (
@@ -281,6 +286,61 @@ def _llm_episode_observer(run_dir, method):
             temporary.replace(path)
 
         return persist_rnd
+    if method.potential_enabled:
+        path = Path(run_dir) / "potential_training_episode_metrics.jsonl"
+
+        def persist_potential(row):
+            metrics = row.get("potential_training")
+            if not isinstance(metrics, dict):
+                raise RuntimeError("potential episode metrics are missing")
+            raw = float(metrics["raw_reward_sum"])
+            shaping = float(metrics["shaping_sum"])
+            training = float(metrics["training_reward_sum"])
+            if not np.isclose(raw + shaping, training, rtol=1e-12, atol=1e-7):
+                raise RuntimeError("potential reward decomposition is inconsistent")
+            components = list(metrics.get("components") or ())
+            component_sum = sum(
+                float(item["ordinary_shaping"]["sum"])
+                + float(item["terminal_shaping"]["sum"])
+                for item in components
+            )
+            if not np.isclose(component_sum, shaping, rtol=1e-12, atol=1e-7):
+                raise RuntimeError("potential component shaping does not sum to shaping")
+            record = {
+                **metrics,
+                "episode": int(row["episode"]),
+                "method_id": str(row["method_id"]),
+                "scenario_id": row.get("scenario_id"),
+                "energy_efficiency_mbit_per_j": float(
+                    row["energy_efficiency_mbit_per_j"]
+                ),
+                "timely_mbits": float(row["total_timely_useful_mbits"]),
+                "movement_energy_j": float(row["total_mobility_energy_j"]),
+                "fov_eligible_packets": int(row.get("fov_eligible_packets", 0)),
+                "fov_violation_packets": int(row.get("fov_violation_packets", 0)),
+                "com_eligible_packets": int(row.get("com_eligible_packets", 0)),
+                "com_violation_packets": int(row.get("com_violation_packets", 0)),
+                "exploration": row.get("movement_exploration"),
+            }
+            existing = _read_llm_training_episode_metrics(path)
+            rows = {int(item["episode"]): item for item in existing}
+            previous = rows.get(record["episode"])
+            if previous is not None and previous != record:
+                raise RuntimeError(
+                    f"potential episode metric changed for episode {record['episode']}"
+                )
+            rows[record["episode"]] = record
+            temporary = path.with_suffix(".jsonl.tmp")
+            temporary.write_text(
+                "".join(
+                    json.dumps(rows[key], ensure_ascii=False, allow_nan=False) + "\n"
+                    for key in sorted(rows)
+                ),
+                encoding="utf-8",
+            )
+            temporary.replace(path)
+
+        return persist_potential
     if not method.llm_enabled:
         return None
 
@@ -310,6 +370,30 @@ def _reconcile_rnd_training_episode_metrics(run_dir, method, completed_episode_l
             ) from exc
         if int(row.get("episode", -1)) <= int(completed_episode_limit):
             rows.append(row)
+    temporary = path.with_suffix(".jsonl.tmp")
+    temporary.write_text(
+        "".join(
+            json.dumps(row, ensure_ascii=False, allow_nan=False) + "\n"
+            for row in rows
+        ),
+        encoding="utf-8",
+    )
+    temporary.replace(path)
+
+
+def _reconcile_potential_training_episode_metrics(
+    run_dir, method, completed_episode_limit
+):
+    if not method.potential_enabled:
+        return
+    path = Path(run_dir) / "potential_training_episode_metrics.jsonl"
+    if not path.is_file():
+        return
+    rows = [
+        row
+        for row in _read_llm_training_episode_metrics(path)
+        if int(row["episode"]) <= int(completed_episode_limit)
+    ]
     temporary = path.with_suffix(".jsonl.tmp")
     temporary.write_text(
         "".join(
@@ -372,6 +456,19 @@ def build_parser():
                 type=float,
                 default=60.0,
                 help="seconds allowed for each isolated candidate computation",
+            )
+        if method.potential_enabled:
+            method_parser.add_argument(
+                "--potential-artifact",
+                required=True,
+                help="explicit compatible approved potential artifact directory",
+            )
+            method_parser.add_argument(
+                "--llm-worker-timeout", type=float, default=60.0
+            )
+            method_parser.add_argument(
+                "--training-manifest",
+                help="optional existing train manifest with exactly --episodes entries",
             )
         if is_rnd_method(method):
             method_parser.add_argument(
@@ -534,6 +631,16 @@ def _llm_run_artifact(run_dir, resolved, method):
     design = load_run_artifact(run_dir, expected)
     identity = artifact_identity(design)
     return design.directory, identity, MOVEMENT_STATE_DIM + int(identity["feature_count"])
+
+
+def _potential_run_artifact(run_dir, resolved, method):
+    if not method.potential_enabled:
+        return None, None
+    expected = resolved.get("potential_artifact_identity")
+    if not isinstance(expected, dict):
+        raise RuntimeError("potential run metadata lacks its artifact identity")
+    design = load_potential_run_artifact(run_dir, expected)
+    return design.directory, potential_artifact_identity(design)
 
 
 def _training_manifest_segments_from_resolved(
@@ -730,6 +837,16 @@ def run(args):
             raise
     else:
         llm_design = None
+    if method.potential_enabled:
+        try:
+            potential_design = copy_potential_artifact(
+                args.potential_artifact, run_dir
+            )
+        except BaseException as exc:
+            write_run_status(run_dir, run_state_for_exception(exc), exception=exc)
+            raise
+    else:
+        potential_design = None
     checkpoints_enabled = not args.smoke
     config = formal_training_config(
         values["episodes"],
@@ -769,6 +886,12 @@ def run(args):
         resolved["llm_artifact_identity"] = artifact_identity(llm_design)
         resolved["llm_artifact_path"] = "llm_artifact"
         resolved["llm_worker_timeout_seconds"] = float(args.llm_worker_timeout)
+    if potential_design is not None:
+        resolved["potential_artifact_identity"] = potential_artifact_identity(
+            potential_design
+        )
+        resolved["potential_artifact_path"] = "potential_artifact"
+        resolved["llm_worker_timeout_seconds"] = float(args.llm_worker_timeout)
     _write_json_atomic(run_dir / "resolved_config.json", resolved)
     write_run_status(run_dir, "RUNNING")
     try:
@@ -778,6 +901,11 @@ def run(args):
             method_spec=method,
             training_run_provenance=_training_run_provenance(resolved),
             llm_artifact_dir=(llm_design.directory if llm_design is not None else None),
+            potential_artifact_dir=(
+                potential_design.directory
+                if potential_design is not None
+                else None
+            ),
             llm_worker_timeout=getattr(args, "llm_worker_timeout", 60.0),
             episode_observer=_llm_episode_observer(run_dir, method),
             rnd_config=resolved.get("rnd_config"),
@@ -816,6 +944,9 @@ def _episode_directories(root):
 def run_resume(args):
     run_dir, resolved, method, manifest = _load_run_context(args.run_directory)
     llm_artifact_dir, llm_identity, movement_state_dim = _llm_run_artifact(
+        run_dir, resolved, method
+    )
+    potential_artifact_dir, potential_identity = _potential_run_artifact(
         run_dir, resolved, method
     )
     invocation_git_sha = _git_short_sha()
@@ -925,6 +1056,11 @@ def run_resume(args):
                 if llm_identity is not None
                 else {}
             ),
+            **(
+                {"potential_artifact_identity": potential_identity}
+                if potential_identity is not None
+                else {}
+            ),
         },
         expected_formal_config=formal_config,
         current_training_manifest=active_manifest,
@@ -947,6 +1083,11 @@ def run_resume(args):
                 if llm_identity is not None
                 else {}
             ),
+            **(
+                {"potential_artifact_identity": potential_identity}
+                if potential_identity is not None
+                else {}
+            ),
         },
         expected_formal_config=formal_config,
         current_training_manifest=active_manifest,
@@ -962,6 +1103,8 @@ def run_resume(args):
             checkpoint_inspection = inspect_full(candidate)
             if llm_identity is not None:
                 load_run_artifact(candidate, llm_identity)
+            if potential_identity is not None:
+                load_potential_run_artifact(candidate, potential_identity)
             checkpoint = candidate
             break
         except RuntimeError as exc:
@@ -1001,6 +1144,9 @@ def run_resume(args):
         completed_episode_limit=plan.resume_episode,
     )
     _reconcile_rnd_training_episode_metrics(
+        run_dir, method, plan.resume_episode
+    )
+    _reconcile_potential_training_episode_metrics(
         run_dir, method, plan.resume_episode
     )
     reconciliation = execute_resume_reconciliation(plan)
@@ -1069,6 +1215,7 @@ def run_resume(args):
             training_history_manifest_hash=history_identity_manifest_hash,
             training_run_provenance=_training_run_provenance(resolved),
             llm_artifact_dir=llm_artifact_dir,
+            potential_artifact_dir=potential_artifact_dir,
             llm_worker_timeout=float(
                 resolved.get("llm_worker_timeout_seconds", 60.0)
             ),
@@ -1129,6 +1276,9 @@ def run_evaluate(args):
     llm_artifact_dir, llm_identity, movement_state_dim = _llm_run_artifact(
         run_dir, resolved, method
     )
+    potential_artifact_dir, potential_identity = _potential_run_artifact(
+        run_dir, resolved, method
+    )
     training_manifest_path, _ = resolve_training_manifest(run_dir, resolved)
     training_manifest_segments = _training_manifest_segments_from_resolved(
         run_dir,
@@ -1185,6 +1335,11 @@ def run_evaluate(args):
                 if llm_identity is not None
                 else {}
             ),
+            **(
+                {"potential_artifact_identity": potential_identity}
+                if potential_identity is not None
+                else {}
+            ),
         },
         expected_completed_episodes=checkpoint_episode,
         expected_formal_config=expected_training_config,
@@ -1196,6 +1351,8 @@ def run_evaluate(args):
     )
     if llm_identity is not None:
         load_run_artifact(checkpoint, llm_identity)
+    if potential_identity is not None:
+        load_potential_run_artifact(checkpoint, potential_identity)
     output_dir = _create_unique_leaf(
         run_dir / "evaluation" / f"ep_{checkpoint_episode}", "eval"
     )
@@ -1223,6 +1380,7 @@ def run_evaluate(args):
         expected_checkpoint_formal_config=expected_training_config,
         expected_checkpoint_training_manifest=training_manifest,
         llm_artifact_dir=llm_artifact_dir,
+        potential_artifact_dir=potential_artifact_dir,
         llm_worker_timeout=float(
             resolved.get("llm_worker_timeout_seconds", 60.0)
         ),

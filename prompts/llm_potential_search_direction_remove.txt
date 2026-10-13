@@ -1,0 +1,5 @@
+Requested direction: REMOVE
+
+Simplify the reference candidate by removing one or more components while preserving the remaining computations and weights. If only one component exists, propose a simpler replacement.
+
+Candidates already generated in the current round are included in the saved request context; avoid duplicating them.

@@ -17,6 +17,13 @@ from evaluation_selection import resolve_training_run_checkpoint
 from experiment_paths import read_run_status
 from llm_candidate import load_approved_design
 from llm_runtime import artifact_identity, load_run_artifact
+from llm_potential import (
+    MergeableMoments,
+    artifact_identity as potential_artifact_identity,
+    load_potential_artifact,
+    load_run_artifact as load_potential_run_artifact,
+    summarize_component_records,
+)
 from scenario_manifest import ScenarioManifest
 from training_checkpoint import CHECKPOINT_PROVENANCE_FIELDS
 
@@ -462,8 +469,20 @@ def run_candidate_training(
     root = Path(__file__).resolve().parent
     output = Path(output_directory).resolve()
     output.mkdir(parents=True, exist_ok=True)
-    source_design = load_approved_design(artifact)
-    identity = artifact_identity(source_design)
+    potential_method = str(method_id) == "td3_dinkelbach_llm_potential"
+    source_design = (
+        load_potential_artifact(artifact)
+        if potential_method
+        else load_approved_design(artifact)
+    )
+    identity = (
+        potential_artifact_identity(source_design)
+        if potential_method
+        else artifact_identity(source_design)
+    )
+    run_artifact_loader = (
+        load_potential_run_artifact if potential_method else load_run_artifact
+    )
     state_path = output / SEARCH_TRAINING_STATE_FILENAME
     state = _load_training_state(
         state_path,
@@ -534,7 +553,7 @@ def run_candidate_training(
         evidence = _training_run_evidence(directory)
         if evidence["has_training_progress"] or evidence["classification"] == "completed":
             try:
-                load_run_artifact(directory, identity)
+                run_artifact_loader(directory, identity)
             except Exception as exc:
                 evidence["classification"] = "incompatible_or_incomplete_run_artifact"
                 evidence["artifact_error"] = f"{type(exc).__name__}: {exc}"
@@ -697,15 +716,17 @@ def run_candidate_training(
             )
             _write_json_atomic(state_path, state)
             try:
+                resume_command = [
+                    sys.executable,
+                    str(root / "run_experiment.py"),
+                    "resume",
+                    str(resume_directory),
+                ]
+                planned = evidence.get("resolved_config_episodes")
+                if planned is not None and int(episodes) > int(planned):
+                    resume_command.extend(("--target-episodes", str(int(episodes))))
                 result = _run(
-                    [
-                        sys.executable,
-                        str(root / "run_experiment.py"),
-                        "resume",
-                        str(resume_directory),
-                        "--target-episodes",
-                        str(int(episodes)),
-                    ],
+                    resume_command,
                     cwd=root,
                 )
             except EpisodeTrainingError as exc:
@@ -758,7 +779,11 @@ def run_candidate_training(
                     sys.executable,
                     str(root / "run_experiment.py"),
                     str(method_id),
-                    "--llm-artifact",
+                    (
+                        "--potential-artifact"
+                        if potential_method
+                        else "--llm-artifact"
+                    ),
                     str(source_design.directory),
                     "--episodes",
                     str(int(episodes)),
@@ -821,7 +846,7 @@ def run_candidate_training(
     final_evidence = _training_run_evidence(Path(run_directory))
     if result.get("status") != "COMPLETED" or final_evidence["classification"] != "completed":
         raise EpisodeTrainingError("training subprocess did not produce a validated completed run")
-    load_run_artifact(Path(run_directory), identity)
+    run_artifact_loader(Path(run_directory), identity)
     state["status"] = "completed"
     state["active_run_directory"] = str(Path(run_directory).resolve())
     if restart_authorization_id:
@@ -845,7 +870,11 @@ def run_candidate_training(
         "training_state_record": str(state_path),
         "output_root": str(output),
         "summaries": (
-            _training_summaries(
+            (
+                _potential_training_summaries
+                if potential_method
+                else _training_summaries
+            )(
                 Path(run_directory),
                 expected_episodes=int(episodes),
                 block_size=int(summary_block_size),
@@ -882,6 +911,89 @@ def _training_summaries(
             "LLM training episode metrics are incomplete or incompatible: "
             f"{exc}"
         ) from exc
+
+
+def _potential_training_summaries(
+    run_directory: Path, *, expected_episodes: int, block_size: int = 50
+) -> list[dict[str, Any]]:
+    path = run_directory / "potential_training_episode_metrics.jsonl"
+    if not path.is_file():
+        raise EpisodeTrainingError("potential training episode metrics are missing")
+    try:
+        rows = [
+            json.loads(line)
+            for line in path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+    except json.JSONDecodeError as exc:
+        raise EpisodeTrainingError("potential training metrics contain invalid JSON") from exc
+    episodes = [int(row.get("episode", -1)) for row in rows]
+    if episodes != list(range(1, int(expected_episodes) + 1)):
+        raise EpisodeTrainingError("potential training metrics are incomplete or duplicated")
+    if int(block_size) <= 0:
+        raise EpisodeTrainingError("potential summary block size must be positive")
+
+    def distribution(values):
+        array = np.asarray(values, dtype=np.float64)
+        if array.size == 0 or np.any(~np.isfinite(array)):
+            raise EpisodeTrainingError("potential summary input is missing or non-finite")
+        return {"mean": float(np.mean(array)), "standard_deviation": float(np.std(array))}
+
+    def violation(block, prefix):
+        eligible = sum(int(row[f"{prefix}_eligible_packets"]) for row in block)
+        violated = sum(int(row[f"{prefix}_violation_packets"]) for row in block)
+        return {
+            "denominator": "pooled eligible end-to-end packets",
+            "eligible_packets": eligible,
+            "violated_packets": violated,
+            "value": float(violated / eligible) if eligible else None,
+            "missing": eligible == 0,
+        }
+
+    summaries = []
+    names = list(rows[0].get("component_names") or ())
+    for start in range(0, len(rows), int(block_size)):
+        block = rows[start : start + int(block_size)]
+        raw_step = MergeableMoments()
+        for row in block:
+            raw_step.merge(MergeableMoments.from_dict(row["raw_step_reward"]))
+            if list(row.get("component_names") or ()) != names:
+                raise EpisodeTrainingError("potential component order changed during training")
+        lambda_values = [float(row["dinkelbach_lambda_used"]) for row in block]
+        summaries.append(
+            {
+                "episode_range": [int(block[0]["episode"]), int(block[-1]["episode"])],
+                "episode_count": len(block),
+                "step_count": sum(int(row["transition_count"]) for row in block),
+                "energy_efficiency_mbit_per_j": distribution(
+                    [row["energy_efficiency_mbit_per_j"] for row in block]
+                ),
+                "timely_useful_delivery_mbit": distribution(
+                    [row["timely_mbits"] for row in block]
+                ),
+                "movement_energy_j": distribution(
+                    [row["movement_energy_j"] for row in block]
+                ),
+                "vs_delay_violation_probability": violation(block, "fov"),
+                "com_delay_violation_probability": violation(block, "com"),
+                "raw_reward_sum": distribution(
+                    [row["raw_reward_sum"] for row in block]
+                ),
+                "raw_step_reward_absolute_mean": raw_step.to_dict()["mean_absolute"],
+                "shaping_sum": distribution([row["shaping_sum"] for row in block]),
+                "training_reward_sum": distribution(
+                    [row["training_reward_sum"] for row in block]
+                ),
+                "actor_updates": sum(int(row["actor_updates"]) for row in block),
+                "critic_updates": sum(int(row["critic_updates"]) for row in block),
+                "dinkelbach_lambda_range": [min(lambda_values), max(lambda_values)],
+                "potential_components": summarize_component_records(
+                    block, component_names=names
+                ),
+                "exploration": [row.get("exploration") for row in block],
+            }
+        )
+    return summaries
 
 
 def validate_baseline_preflight(

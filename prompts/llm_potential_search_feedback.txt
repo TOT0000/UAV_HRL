@@ -1,0 +1,32 @@
+Generate candidate {{CANDIDATE_ID}} by revising the historical best candidate according to the requested direction that follows this feedback.
+
+Historical best candidate, including complete code:
+{{BEST_CANDIDATE}}
+
+Baseline evaluation:
+{{BASELINE_EVALUATION_RESULTS}}
+
+Results and design summaries for all candidates in the latest completed round:
+{{LATEST_ROUND_CANDIDATE_RESULTS}}
+
+Their training and component summaries:
+{{LATEST_ROUND_TRAINING_SUMMARIES}}
+
+Earlier candidate history:
+{{HISTORICAL_CANDIDATE_SUMMARIES}}
+
+Candidates already generated in the current round, not yet trained:
+{{CURRENT_ROUND_CANDIDATE_SUMMARIES}}
+
+Summary definitions:
+- Training blocks: {{TRAINING_BLOCK_DEFINITION}}.
+- Potential statistics describe w_k * f_k(s).
+- Shaping statistics describe beta * w_k * [gamma * f_k(s_next) - f_k(s_current)].
+- Ordinary transitions and terminal corrections are reported separately.
+- Counts and missing values are explicitly identified.
+
+Use evaluation results and training changes to identify revisions worth testing. Examine whether component computations, weights, and shaping magnitudes support their stated roles.
+
+Comparisons across candidates provide evidence for revision, but do not establish the causal effect of an individual component.
+
+Briefly state the evidence motivating the revision in design_summary, and submit the complete revised candidate.

@@ -1,0 +1,5 @@
+Requested direction: REWEIGHT
+
+Preserve the reference component computations and revise their fixed weights using the reported results.
+
+Candidates already generated in the current round are included in the saved request context; avoid duplicating them.

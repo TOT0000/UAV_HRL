@@ -144,6 +144,15 @@ from llm_runtime import (
     load_approved_design,
     runtime_constants_metadata,
 )
+from llm_potential import (
+    MergeableMoments,
+    PotentialRuntime,
+    artifact_identity as potential_artifact_identity,
+    build_online_obs as build_potential_obs,
+    compute_shaping as compute_potential_shaping,
+    load_potential_artifact,
+    runtime_constants_metadata as potential_constants_metadata,
+)
 
 
 MOVEMENT_CONTROL_INTERVAL = int(round(MOVEMENT_INTERVAL_SECONDS / ROUTING_SLOT_SECONDS))
@@ -1957,6 +1966,7 @@ def train(
     sampling_seed=None,
     llm_artifact_dir=None,
     llm_worker_timeout=60.0,
+    potential_artifact_dir=None,
     rnd_config=None,
     checkpoint_episodes=None,
 ):
@@ -2009,6 +2019,20 @@ def train(
         else None
     )
     llm_identity = artifact_identity(llm_design) if llm_design is not None else None
+    if method_spec.potential_enabled and potential_artifact_dir is None:
+        raise ValueError(f"{method_spec.method_id} requires an explicit potential artifact")
+    if not method_spec.potential_enabled and potential_artifact_dir is not None:
+        raise ValueError("only the LLM potential method may load a potential artifact")
+    potential_design = (
+        load_potential_artifact(potential_artifact_dir)
+        if method_spec.potential_enabled
+        else None
+    )
+    potential_identity = (
+        potential_artifact_identity(potential_design)
+        if potential_design is not None
+        else None
+    )
     movement_state_dim = MOVEMENT_STATE_DIM + (
         int(llm_identity["feature_count"]) if llm_identity is not None else 0
     )
@@ -2021,6 +2045,15 @@ def train(
         embedded_design = load_approved_design(llm_checkpoint_artifact)
         if artifact_identity(embedded_design) != llm_identity:
             raise RuntimeError("checkpoint LLM artifact identity is incompatible")
+    potential_checkpoint_artifact = None
+    if potential_identity is not None and evaluation and checkpoint_dir is not None:
+        potential_checkpoint_artifact = Path(checkpoint_dir) / "potential_artifact"
+    elif potential_identity is not None and config.resume_dir is not None:
+        potential_checkpoint_artifact = Path(config.resume_dir) / "potential_artifact"
+    if potential_checkpoint_artifact is not None:
+        embedded = load_potential_artifact(potential_checkpoint_artifact)
+        if potential_artifact_identity(embedded) != potential_identity:
+            raise RuntimeError("checkpoint potential artifact identity is incompatible")
     resolved_exploration = exploration_schedule_configuration(config, method_spec)
     resolved_routing = routing_agent_configuration(method_spec, config)
     packet_outcome_mode = config.packet_outcome_artifact_mode
@@ -2156,6 +2189,16 @@ def train(
         llm_runtime = ApprovedDesignRuntime(
             llm_design, constants_metadata, timeout=llm_worker_timeout
         )
+    potential_runtime = None
+    potential_constants = None
+    if potential_design is not None:
+        potential_constants = potential_constants_metadata(
+            potential_design,
+            environment_width_m=env.env_width,
+            environment_height_m=env.env_height,
+            episode_seconds=config.episode_seconds,
+            task_deadlines_seconds=resolved_evaluation["task_deadlines_seconds"],
+        )
     movement_agent = create_movement_agent(
         method_spec,
         movement_state_dim,
@@ -2163,6 +2206,14 @@ def train(
         config,
         rng_streams=rng_streams,
     )
+    if potential_design is not None:
+        if float(potential_identity["gamma"]) != float(movement_agent.gamma):
+            raise RuntimeError(
+                "potential artifact gamma differs from the TD3 target discount"
+            )
+        potential_runtime = PotentialRuntime(
+            potential_design, potential_constants, timeout=llm_worker_timeout
+        )
     ddqn = create_routing_agent(
         method_spec,
         ROUTING_STATE_DIM,
@@ -2183,6 +2234,7 @@ def train(
             rng=rng_streams.numpy("movement_replay_sampling"),
             record_auxiliary=not evaluation,
             record_llm_reward=method_spec.llm_enabled,
+            record_potential_shaping=method_spec.potential_enabled,
         )
         if method_spec.learns_movement
         else None
@@ -2239,6 +2291,22 @@ def train(
         experiment_identity["movement_state_dimensions"] = {
             "original": MOVEMENT_STATE_DIM,
             "extra": int(llm_identity["feature_count"]),
+            "total": movement_state_dim,
+        }
+    if potential_identity is not None:
+        if not np.isclose(
+            float(potential_identity["gamma"]), float(movement_agent.gamma),
+            rtol=0.0, atol=0.0,
+        ):
+            raise RuntimeError(
+                "potential artifact gamma differs from the TD3 target discount"
+            )
+        experiment_identity["potential_artifact_identity"] = copy.deepcopy(
+            potential_identity
+        )
+        experiment_identity["movement_state_dimensions"] = {
+            "original": MOVEMENT_STATE_DIM,
+            "extra": 0,
             "total": movement_state_dim,
         }
     if training_run_provenance is not None:
@@ -2311,6 +2379,11 @@ def train(
                 **(
                     {"llm_artifact_identity": llm_identity}
                     if llm_identity is not None
+                    else {}
+                ),
+                **(
+                    {"potential_artifact_identity": potential_identity}
+                    if potential_identity is not None
                     else {}
                 ),
             },
@@ -2475,6 +2548,11 @@ def train(
                 **(
                     {"llm_artifact_identity": llm_identity}
                     if llm_identity is not None
+                    else {}
+                ),
+                **(
+                    {"potential_artifact_identity": potential_identity}
+                    if potential_identity is not None
                     else {}
                 ),
             },
@@ -2747,6 +2825,24 @@ def train(
         episode_reward = 0.0
         episode_existing_movement_reward = 0.0
         episode_llm_extra_reward = 0.0
+        episode_potential_shaping = 0.0
+        episode_raw_reward_stats = (
+            MergeableMoments() if potential_runtime is not None else None
+        )
+        potential_component_stats = (
+            [
+                {
+                    "weighted_potential": MergeableMoments(),
+                    "ordinary_shaping": MergeableMoments(),
+                    "terminal_shaping": MergeableMoments(),
+                }
+                for _ in range(potential_runtime.component_count)
+            ]
+            if potential_runtime is not None
+            else None
+        )
+        episode_actor_updates_before = int(movement_agent.num_actor_update_iteration)
+        episode_critic_updates_before = int(movement_agent.num_critic_update_iteration)
         episode_rnd_raw_errors = []
         episode_rnd_normalized_bonuses = []
         episode_rnd_weighted_bonuses = []
@@ -2822,6 +2918,7 @@ def train(
                     if (not evaluation and method_spec.learns_movement)
                     or transition_observer is not None
                     or method_spec.llm_enabled
+                    or method_spec.potential_enabled
                     else None
                 )
                 llm_extra_reward = 0.0
@@ -2849,6 +2946,16 @@ def train(
                     )
                 else:
                     state = original_state
+                current_potential_components = None
+                if potential_runtime is not None:
+                    current_potential_components = potential_runtime.evaluate(
+                        build_potential_obs(
+                            original_state,
+                            current_movement_mask,
+                            current_auxiliary_snapshot,
+                            interface_version=potential_runtime.observation_interface_version,
+                        )
+                    )
             except ValueError as exc:
                 if "duplicate" in str(exc):
                     duplicate_target_assertions += 1
@@ -3129,6 +3236,7 @@ def train(
                 if (not evaluation and method_spec.learns_movement)
                 or transition_observer is not None
                 or method_spec.llm_enabled
+                or method_spec.potential_enabled
                 else None
             )
             if llm_runtime is not None:
@@ -3152,6 +3260,27 @@ def train(
                 )
             else:
                 next_state = original_next_state
+            potential_record = None
+            potential_shaping = 0.0
+            if potential_runtime is not None:
+                next_potential_components = potential_runtime.evaluate(
+                    build_potential_obs(
+                        original_next_state,
+                        next_movement_mask,
+                        next_auxiliary_snapshot,
+                        interface_version=potential_runtime.observation_interface_version,
+                    )
+                )
+                potential_record = compute_potential_shaping(
+                    current_potential_components,
+                    next_potential_components,
+                    potential_runtime.weights,
+                    gamma=movement_agent.gamma,
+                    beta=potential_runtime.beta,
+                    terminated=done,
+                    bootstrap_allowed=not done,
+                )
+                potential_shaping = float(potential_record["shaping"])
             if not done:
                 expected_next_movement_state = next_state.copy()
                 expected_next_movement_mask = next_movement_mask.copy()
@@ -3190,6 +3319,9 @@ def train(
                     dinkelbach_lambda=episode_lambda,
                     llm_extra_reward=(
                         llm_extra_reward if method_spec.llm_enabled else None
+                    ),
+                    potential_shaping=(
+                        potential_shaping if method_spec.potential_enabled else None
                     ),
                 )
             global_transition_index = (
@@ -3230,6 +3362,8 @@ def train(
                 if llm_runtime is not None
                 else 0.0
             ) + (
+                potential_shaping if potential_runtime is not None else 0.0
+            ) + (
                 rnd_record["weighted_bonus"] if rnd_record is not None else 0.0
             )
             applied_penalty = float(method_spec.task_potential_enabled) * sum(
@@ -3244,6 +3378,16 @@ def train(
             episode_reward += combined_movement_reward
             episode_existing_movement_reward += interval_reward
             episode_llm_extra_reward += llm_extra_reward
+            episode_potential_shaping += potential_shaping
+            if episode_raw_reward_stats is not None:
+                episode_raw_reward_stats.add(interval_reward)
+            if potential_record is not None:
+                for index, stats in enumerate(potential_component_stats):
+                    stats["weighted_potential"].add(
+                        potential_record["weighted_current_components"][index]
+                    )
+                    target = "terminal_shaping" if done else "ordinary_shaping"
+                    stats[target].add(potential_record["component_shaping"][index])
             if llm_runtime is not None:
                 episode_llm_feature_contributions += (
                     float(llm_runtime.beta)
@@ -3312,6 +3456,40 @@ def train(
                             if llm_runtime is not None
                             else 0.0
                         ),
+                        "potential": (
+                            None
+                            if potential_record is None
+                            else {
+                                "artifact_id": potential_identity[
+                                    "artifact_content_sha256"
+                                ],
+                                "components": potential_record[
+                                    "current_components"
+                                ].copy(),
+                                "effective_next_components": potential_record[
+                                    "effective_next_components"
+                                ].copy(),
+                                "weighted_current_components": potential_record[
+                                    "weighted_current_components"
+                                ].copy(),
+                                "component_shaping": potential_record[
+                                    "component_shaping"
+                                ].copy(),
+                                "phi_current": potential_record[
+                                    "current_potential"
+                                ],
+                                "phi_effective_next": potential_record[
+                                    "effective_next_potential"
+                                ],
+                                "shaping": potential_record["shaping"],
+                                "gamma": potential_record["gamma"],
+                                "beta": potential_record["beta"],
+                                "terminated": potential_record["terminated"],
+                                "bootstrap_allowed": potential_record[
+                                    "bootstrap_allowed"
+                                ],
+                            }
+                        ),
                         "combined_movement_reward": combined_movement_reward,
                         "rnd": copy.deepcopy(rnd_record),
                         "checkpoint_lambda": (
@@ -3337,6 +3515,8 @@ def train(
                 update_kwargs = {}
                 if method_spec.llm_enabled:
                     update_kwargs["llm_reward_beta"] = llm_runtime.beta
+                if method_spec.potential_enabled:
+                    update_kwargs["potential_shaping_enabled"] = True
                 if rnd_explorer is not None:
                     update_kwargs.update(
                         intrinsic_reward_fn=rnd_explorer.intrinsic_reward,
@@ -3559,10 +3739,79 @@ def train(
                     if llm_identity is not None
                     else None
                 ),
+                "potential_artifact_id": (
+                    potential_identity["artifact_content_sha256"]
+                    if potential_identity is not None
+                    else None
+                ),
                 "existing_movement_reward": float(
                     episode_existing_movement_reward
                 ),
                 "llm_extra_reward": float(episode_llm_extra_reward),
+                "potential_shaping_sum": float(episode_potential_shaping),
+                "potential_training": (
+                    {
+                        "schema_version": "uav-hrl-potential-episode-metrics-v1",
+                        "candidate_id": potential_identity["candidate_id"],
+                        "artifact_content_sha256": potential_identity[
+                            "artifact_content_sha256"
+                        ],
+                        "interface_version": potential_runtime.design.artifact[
+                            "potential_interface_version"
+                        ],
+                        "beta": float(potential_runtime.beta),
+                        "gamma": float(potential_runtime.gamma),
+                        "component_names": list(
+                            potential_identity["component_order"]
+                        ),
+                        "weights": [
+                            float(value) for value in potential_runtime.weights
+                        ],
+                        "raw_reward_sum": float(
+                            episode_existing_movement_reward
+                        ),
+                        "shaping_sum": float(episode_potential_shaping),
+                        "training_reward_sum": float(episode_reward),
+                        "raw_step_reward": episode_raw_reward_stats.to_dict(),
+                        "actor_updates": int(
+                            movement_agent.num_actor_update_iteration
+                            - episode_actor_updates_before
+                        ),
+                        "critic_updates": int(
+                            movement_agent.num_critic_update_iteration
+                            - episode_critic_updates_before
+                        ),
+                        "actor_updates_total": int(
+                            movement_agent.num_actor_update_iteration
+                        ),
+                        "critic_updates_total": int(
+                            movement_agent.num_critic_update_iteration
+                        ),
+                        "dinkelbach_lambda_used": float(episode_lambda),
+                        "transition_count": int(config.episode_seconds),
+                        "terminal_transition_count": 1,
+                        "components": [
+                            {
+                                "index": index,
+                                "name": potential_identity[
+                                    "component_order"
+                                ][index],
+                                "weight": float(
+                                    potential_runtime.weights[index]
+                                ),
+                                **{
+                                    key: value.to_dict()
+                                    for key, value in stats.items()
+                                },
+                            }
+                            for index, stats in enumerate(
+                                potential_component_stats
+                            )
+                        ],
+                    }
+                    if potential_runtime is not None
+                    else None
+                ),
                 **(
                     {
                         "episode": int(episode + 1),
@@ -4006,6 +4255,11 @@ def train(
                 llm_artifact_dir=(
                     llm_design.directory if llm_design is not None else None
                 ),
+                potential_artifact_dir=(
+                    potential_design.directory
+                    if potential_design is not None
+                    else None
+                ),
                 rnd_explorer=rnd_explorer,
             )
         if (
@@ -4102,6 +4356,11 @@ def train(
                 keep_last=config.full_resume_keep_last,
                 llm_artifact_dir=(
                     llm_design.directory if llm_design is not None else None
+                ),
+                potential_artifact_dir=(
+                    potential_design.directory
+                    if potential_design is not None
+                    else None
                 ),
                 rnd_explorer=rnd_explorer,
             )
@@ -4229,6 +4488,8 @@ def train(
     )
     if llm_runtime is not None:
         llm_runtime.close()
+    if potential_runtime is not None:
+        potential_runtime.close()
 
     return {
         "episodes": len(reward_log),
@@ -4245,6 +4506,7 @@ def train(
         ),
         "rnd_evaluation_fingerprint_before": rnd_evaluation_fingerprint_before,
         "llm_artifact_identity": copy.deepcopy(llm_identity),
+        "potential_artifact_identity": copy.deepcopy(potential_identity),
         "joint_action_dim": JOINT_ACTION_DIM,
         "num_uav": NUM_UAV,
         "reserved_search_uav_ids": list(env.reserved_search_uav_ids),

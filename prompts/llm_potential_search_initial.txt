@@ -1,0 +1,9 @@
+Generate candidate {{CANDIDATE_ID}}.
+
+Previously generated candidates in this round:
+
+{{CURRENT_ROUND_CANDIDATE_SUMMARIES}}
+
+These candidates have not yet been evaluated unless explicitly stated.
+
+Propose a distinct potential design. Use the task-to-observation-to-formula guidance above, and avoid reproducing the same computation with different names or formatting.

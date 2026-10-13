@@ -28,6 +28,10 @@ from training_checkpoint import (
     inspect_model_checkpoint,
 )
 from llm_runtime import artifact_identity, load_run_artifact
+from llm_potential import (
+    artifact_identity as potential_artifact_identity,
+    load_run_artifact as load_potential_run_artifact,
+)
 
 
 DEFAULT_FIXED_ROI_COUNTS = tuple(range(ROI_COUNT_MIN, ROI_COUNT_MAX + 1))
@@ -321,6 +325,7 @@ def resolve_training_run_checkpoint(
     # artifact validation even when the training run is still active.
     _, calibration = load_com_capacity_reference()
     llm_identity = None
+    potential_identity = None
     movement_state_dim = MOVEMENT_STATE_DIM
     if method.llm_enabled:
         expected_llm_identity = resolved.get("llm_artifact_identity")
@@ -329,6 +334,12 @@ def resolve_training_run_checkpoint(
         design = load_run_artifact(run_dir, expected_llm_identity)
         llm_identity = artifact_identity(design)
         movement_state_dim += int(llm_identity["feature_count"])
+    if method.potential_enabled:
+        expected_potential_identity = resolved.get("potential_artifact_identity")
+        if not isinstance(expected_potential_identity, dict):
+            raise RuntimeError("potential run metadata lacks its artifact identity")
+        design = load_potential_run_artifact(run_dir, expected_potential_identity)
+        potential_identity = potential_artifact_identity(design)
     inspected = inspect_model_checkpoint(
         checkpoint,
         movement_state_dim=movement_state_dim,
@@ -345,6 +356,11 @@ def resolve_training_run_checkpoint(
                 if llm_identity is not None
                 else {}
             ),
+            **(
+                {"potential_artifact_identity": potential_identity}
+                if potential_identity is not None
+                else {}
+            ),
         },
         expected_completed_episodes=checkpoint_episode,
         expected_formal_config=expected_training_config,
@@ -356,6 +372,8 @@ def resolve_training_run_checkpoint(
     )
     if llm_identity is not None:
         load_run_artifact(checkpoint, llm_identity)
+    if potential_identity is not None:
+        load_potential_run_artifact(checkpoint, potential_identity)
     if int(inspected["completed_episode"]) != checkpoint_episode:
         raise RuntimeError(
             "checkpoint completed episode disagrees with selector: "
@@ -371,6 +389,7 @@ def resolve_training_run_checkpoint(
         "resolved": resolved,
         "run_metadata": run_metadata,
         "method": method,
+        "potential_artifact_identity": potential_identity,
         "training_seed": int(resolved["seed"]),
         "training_total_episodes": training_total,
         "checkpoint_episode": checkpoint_episode,

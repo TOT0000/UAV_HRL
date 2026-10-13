@@ -187,6 +187,7 @@ class ReplayBufferJoint:
         rng=None,
         record_auxiliary=False,
         record_llm_reward=False,
+        record_potential_shaping=False,
     ):
         self.state_dim = int(state_dim)
         self.max_size = int(max_size)
@@ -218,8 +219,11 @@ class ReplayBufferJoint:
         self.auxiliary_schema_version = REPLAY_AUXILIARY_SCHEMA_VERSION
         self.record_auxiliary = bool(record_auxiliary)
         self.record_llm_reward = bool(record_llm_reward)
+        self.record_potential_shaping = bool(record_potential_shaping)
         if self.record_llm_reward:
             self.llm_extra_reward = np.zeros((self.max_size, 1), dtype=np.float32)
+        if self.record_potential_shaping:
+            self.potential_shaping = np.zeros((self.max_size, 1), dtype=np.float32)
         if self.record_auxiliary:
             self._allocate_auxiliary_storage()
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -258,6 +262,7 @@ class ReplayBufferJoint:
         scenario_id=None,
         dinkelbach_lambda=0.0,
         llm_extra_reward=None,
+        potential_shaping=None,
     ):
         index = self.ptr
         state_array = _to_np_float32(state)
@@ -300,6 +305,12 @@ class ReplayBufferJoint:
             self.llm_extra_reward[index, 0] = float(llm_extra_reward)
         elif llm_extra_reward is not None:
             raise ValueError("baseline replay must not receive an LLM extra reward")
+        if self.record_potential_shaping:
+            if potential_shaping is None or not np.isfinite(potential_shaping):
+                raise ValueError("potential replay requires finite shaping")
+            self.potential_shaping[index, 0] = float(potential_shaping)
+        elif potential_shaping is not None:
+            raise ValueError("non-potential replay must not receive potential shaping")
         if (
             self.record_auxiliary
             or current_auxiliary_snapshot is not None
@@ -350,6 +361,8 @@ class ReplayBufferJoint:
                 }
             )
         diagnostics["llm_extra_reward_enabled"] = self.record_llm_reward
+        if self.record_potential_shaping:
+            diagnostics["potential_shaping_enabled"] = True
         return diagnostics
 
     def _reward_numpy(
@@ -363,6 +376,7 @@ class ReplayBufferJoint:
         reward_mode="dinkelbach",
         task_potential_enabled=True,
         llm_reward_beta=0.0,
+        potential_shaping_enabled=False,
     ):
         not_done = self.not_done[indices]
         delivered = self.delivered_mbits[indices]
@@ -386,6 +400,10 @@ class ReplayBufferJoint:
             if not self.record_llm_reward:
                 raise RuntimeError("LLM reward requested from a baseline replay")
             reward = reward + beta * self.llm_extra_reward[indices]
+        if potential_shaping_enabled:
+            if not self.record_potential_shaping:
+                raise RuntimeError("potential shaping requested from a non-potential replay")
+            reward = reward + self.potential_shaping[indices]
         return reward.astype(np.float32, copy=False)
 
     def sample(
@@ -400,6 +418,7 @@ class ReplayBufferJoint:
         task_potential_enabled=True,
         include_movement_masks=False,
         llm_reward_beta=0.0,
+        potential_shaping_enabled=False,
     ):
         if self.size <= 0:
             raise ValueError("Replay buffer is empty")
@@ -414,6 +433,7 @@ class ReplayBufferJoint:
             reward_mode=reward_mode,
             task_potential_enabled=task_potential_enabled,
             llm_reward_beta=llm_reward_beta,
+            potential_shaping_enabled=potential_shaping_enabled,
         )
         batch = (
             torch.from_numpy(self.state[indices]).to(self.device),
@@ -452,6 +472,8 @@ class ReplayBufferJoint:
         )
         if self.record_llm_reward:
             fields = fields + ("llm_extra_reward",)
+        if self.record_potential_shaping:
+            fields = fields + ("potential_shaping",)
         return fields + (
             tuple(self.auxiliary_fields) if self.record_auxiliary else ()
         )

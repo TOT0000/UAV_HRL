@@ -51,10 +51,11 @@ EXPECTED_SEMANTIC_FIGURES = (
 
 class PaperMethodRegistryTest(unittest.TestCase):
     def test_registry_contains_the_exact_methods(self):
-        self.assertEqual(len(METHOD_REGISTRY), 20)
+        self.assertEqual(len(METHOD_REGISTRY), 22)
         self.assertIn("td3_dinkelbach_llm", METHOD_REGISTRY)
         self.assertIn("td3_dinkelbach_llm_search", METHOD_REGISTRY)
         self.assertIn("td3_dinkelbach_llm_train_search", METHOD_REGISTRY)
+        self.assertIn("td3_dinkelbach_llm_potential", METHOD_REGISTRY)
         self.assertIn("kkm_random_action_random_routing", METHOD_REGISTRY)
         self.assertIn("td3_dinkelbach_ddqn", METHOD_REGISTRY)
 

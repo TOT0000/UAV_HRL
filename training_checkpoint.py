@@ -1,6 +1,7 @@
 import hashlib
 import json
 import math
+import os
 import random
 from copy import deepcopy
 from pathlib import Path
@@ -11,6 +12,23 @@ import zipfile
 
 import numpy as np
 import torch
+
+
+def _checkpoint_copytree(source, destination):
+    """Copy an embedded artifact without relying on the legacy Win32 path limit."""
+
+    source = Path(source).resolve()
+    destination = Path(destination).resolve()
+
+    def extended(path):
+        value = str(path)
+        if os.name != "nt" or value.startswith("\\\\?\\"):
+            return value
+        if value.startswith("\\\\"):
+            return "\\\\?\\UNC\\" + value[2:]
+        return "\\\\?\\" + value
+
+    shutil.copytree(extended(source), extended(destination))
 
 from visual_sensing import VISUAL_SENSING_CONTRACT_VERSION, visual_sensing_metadata
 
@@ -146,12 +164,15 @@ JOINT_REPLAY_FIELDS = (
     *REPLAY_AUXILIARY_FIELDS,
 )
 LLM_EXTRA_REWARD_FIELD = "llm_extra_reward"
+POTENTIAL_SHAPING_FIELD = "potential_shaping"
 
 
 def _joint_replay_fields(replay):
     fields = list(JOINT_REPLAY_FIELDS)
     if bool(getattr(replay, "record_llm_reward", False)):
         fields.append(LLM_EXTRA_REWARD_FIELD)
+    if bool(getattr(replay, "record_potential_shaping", False)):
+        fields.append(POTENTIAL_SHAPING_FIELD)
     return tuple(fields)
 ROUTING_REPLAY_FIELDS = (
     "state",
@@ -1229,6 +1250,7 @@ def save_model_checkpoint(
     experiment_metadata=None,
     routing_lifecycle_state=None,
     llm_artifact_dir=None,
+    potential_artifact_dir=None,
     rnd_explorer=None,
 ):
     checkpoint_dir = Path(checkpoint_dir)
@@ -1266,6 +1288,10 @@ def save_model_checkpoint(
         torch.save(payload, temporary / "models.pt")
         if llm_artifact_dir is not None:
             shutil.copytree(Path(llm_artifact_dir), temporary / "llm_artifact")
+        if potential_artifact_dir is not None:
+            _checkpoint_copytree(
+                potential_artifact_dir, temporary / "potential_artifact"
+            )
         (temporary / "metadata.json").write_text(
             json.dumps(metadata, indent=2) + "\n", encoding="utf-8"
         )
@@ -2481,6 +2507,7 @@ def save_full_resume_checkpoint(
     experiment_metadata=None,
     keep_last=None,
     llm_artifact_dir=None,
+    potential_artifact_dir=None,
     rnd_explorer=None,
 ):
     checkpoint_dir = Path(checkpoint_dir)
@@ -2591,6 +2618,10 @@ def save_full_resume_checkpoint(
         torch.save(payload, temporary / "training_state.pt")
         if llm_artifact_dir is not None:
             shutil.copytree(Path(llm_artifact_dir), temporary / "llm_artifact")
+        if potential_artifact_dir is not None:
+            _checkpoint_copytree(
+                potential_artifact_dir, temporary / "potential_artifact"
+            )
         (temporary / "metadata.json").write_text(
             json.dumps(metadata, indent=2) + "\n", encoding="utf-8"
         )

@@ -1,0 +1,5 @@
+Requested direction: ADD
+
+Extend the reference candidate with one or more components that provide complementary learning signals. Preserve the existing component computations and weights.
+
+Candidates already generated in the current round are included in the saved request context; avoid duplicating them.

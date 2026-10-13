@@ -297,6 +297,7 @@ class TD3():
         reward_mode="dinkelbach",
         task_potential_enabled=True,
         llm_reward_beta=0.0,
+        potential_shaping_enabled=False,
         intrinsic_reward_fn=None,
         intrinsic_eta=0.0,
     ):
@@ -319,6 +320,7 @@ class TD3():
             task_potential_enabled=task_potential_enabled,
             include_movement_masks=True,
             llm_reward_beta=llm_reward_beta,
+            potential_shaping_enabled=potential_shaping_enabled,
         )
         state = state.to(device)
         action = action.to(device)
