@@ -1457,6 +1457,33 @@ def _expanded_expression(node: ast.AST, bindings: dict[str, ast.AST]) -> ast.AST
     return ast.fix_missing_locations(expanded)
 
 
+def _return_conversion_template(
+    value: ast.AST,
+) -> tuple[list[ast.AST], ast.AST] | None:
+    """Separate literal components while retaining the complete return conversion."""
+
+    placeholder = ast.Name(id="__component_value__", ctx=ast.Load())
+    if isinstance(value, (ast.List, ast.Tuple)):
+        template = copy.deepcopy(value)
+        template.elts = [placeholder]
+        return list(value.elts), ast.fix_missing_locations(template)
+    if not (
+        isinstance(value, ast.Call)
+        and isinstance(value.func, ast.Attribute)
+        and isinstance(value.func.value, ast.Name)
+        and value.func.value.id == "np"
+        and value.func.attr in {"array", "asarray"}
+        and value.args
+        and isinstance(value.args[0], (ast.List, ast.Tuple))
+    ):
+        return None
+    template = copy.deepcopy(value)
+    input_container = copy.deepcopy(value.args[0])
+    input_container.elts = [placeholder]
+    template.args[0] = input_container
+    return list(value.args[0].elts), ast.fix_missing_locations(template)
+
+
 def _returned_feature_expressions(candidate: dict[str, Any]) -> dict[str, Any]:
     """Resolve straight-line locals and return structural component formulas.
 
@@ -1528,32 +1555,25 @@ def _returned_feature_expressions(candidate: dict[str, Any]) -> dict[str, Any]:
     if return_node is None or return_node.value is None:
         return {"status": "unconfirmed", "reason": "single return value was not found"}
     value = _expanded_expression(return_node.value, bindings)
-    if isinstance(value, (ast.List, ast.Tuple)):
-        elements = value.elts
-    elif (
-        isinstance(value, ast.Call)
-        and isinstance(value.func, ast.Attribute)
-        and value.func.attr in {"array", "asarray"}
-        and value.args
-        and isinstance(value.args[0], (ast.List, ast.Tuple))
-    ):
-        elements = value.args[0].elts
-    else:
+    conversion = _return_conversion_template(value)
+    if conversion is None:
         return {
             "status": "unconfirmed",
-            "reason": "returned component vector is not a literal list/tuple or np.array wrapper",
+            "reason": (
+                "returned component vector is not a literal list/tuple or a reliably "
+                "identified np.array/np.asarray call with a literal component container"
+            ),
         }
+    elements, conversion_template = conversion
     if any(isinstance(item, ast.Starred) for item in elements):
         return {
             "status": "unconfirmed",
             "reason": "starred return elements require dynamic sequence analysis",
         }
-    expanded = [_expanded_expression(item, bindings) for item in elements]
     unresolved_locals = sorted(
         {
             node.id
-            for expression in expanded
-            for node in ast.walk(expression)
+            for node in ast.walk(value)
             if isinstance(node, ast.Name)
             and isinstance(node.ctx, ast.Load)
             and node.id in bindings
@@ -1565,13 +1585,39 @@ def _returned_feature_expressions(candidate: dict[str, Any]) -> dict[str, Any]:
             "reason": "cyclic or forward local dependencies could not be expanded reliably",
             "unresolved_local_names": unresolved_locals,
         }
+    conversion_ast = ast.dump(
+        conversion_template, annotate_fields=True, include_attributes=False
+    )
+    conversion_source = ast.unparse(conversion_template)
+    component_formulas = [
+        {
+            "component_expression": ast.unparse(item),
+            "component_expression_ast": ast.dump(
+                item, annotate_fields=True, include_attributes=False
+            ),
+            "return_conversion": conversion_source,
+            "return_conversion_ast": conversion_ast,
+        }
+        for item in elements
+    ]
     return {
         "status": "confirmed",
-        "method": "straight_line_local_definition_expansion_and_structural_ast_comparison",
+        "method": (
+            "straight_line_local_definition_expansion_and_complete_return_"
+            "conversion_structural_ast_comparison"
+        ),
         "expressions": [
-            ast.dump(item, annotate_fields=True, include_attributes=False)
-            for item in expanded
+            _canonical_json(
+                {
+                    "component_expression_ast": item["component_expression_ast"],
+                    "return_conversion_ast": item["return_conversion_ast"],
+                }
+            )
+            for item in component_formulas
         ],
+        "component_formulas": component_formulas,
+        "return_conversion": conversion_source,
+        "return_conversion_ast": conversion_ast,
         "note": "Structural equality only; no claim of general mathematical equivalence.",
     }
 
@@ -1582,6 +1628,36 @@ def _ordered_subsequence(items: list[Any], reference: list[Any]) -> bool:
         if cursor < len(items) and items[cursor] == reference_item:
             cursor += 1
     return cursor == len(items)
+
+
+def _formula_difference_details(
+    reference: dict[str, Any], candidate: dict[str, Any]
+) -> dict[str, Any]:
+    details: dict[str, Any] = {
+        "return_conversion_difference": None,
+        "component_expression_differences": [],
+    }
+    if reference.get("return_conversion_ast") != candidate.get(
+        "return_conversion_ast"
+    ):
+        details["return_conversion_difference"] = {
+            "reference": reference.get("return_conversion"),
+            "candidate": candidate.get("return_conversion"),
+        }
+    old_components = reference.get("component_formulas") or []
+    new_components = candidate.get("component_formulas") or []
+    for index, (old, new) in enumerate(zip(old_components, new_components)):
+        if old.get("component_expression_ast") != new.get(
+            "component_expression_ast"
+        ):
+            details["component_expression_differences"].append(
+                {
+                    "component_index": index,
+                    "reference": old.get("component_expression"),
+                    "candidate": new.get("component_expression"),
+                }
+            )
+    return details
 
 
 def validate_direction(
@@ -1605,6 +1681,11 @@ def validate_direction(
         old_resolution["status"] == "confirmed"
         and new_resolution["status"] == "confirmed"
     )
+    formula_differences = (
+        _formula_difference_details(old_resolution, new_resolution)
+        if formula_confirmed
+        else None
+    )
     old_expr = old_resolution.get("expressions") or []
     new_expr = new_resolution.get("expressions") or []
     issues: list[str] = []
@@ -1621,6 +1702,17 @@ def validate_direction(
                 "reference_resolution": old_resolution,
                 "candidate_resolution": new_resolution,
             }
+        )
+    if (
+        formula_check_required
+        and formula_confirmed
+        and formula_differences["return_conversion_difference"] is not None
+    ):
+        conversion_difference = formula_differences["return_conversion_difference"]
+        issues.append(
+            "return conversion changed from "
+            f"{conversion_difference['reference']!r} to "
+            f"{conversion_difference['candidate']!r}"
         )
     exception = None
     if direction == "add":
@@ -1689,6 +1781,7 @@ def validate_direction(
             "reference": old_resolution,
             "candidate": new_resolution,
         },
+        "formula_differences": formula_differences,
         "single_feature_remove_exception": exception,
         "confirmed_violations": issues,
         "unconfirmed_checks": unconfirmed_checks,

@@ -579,6 +579,64 @@ def test_direction_resolution_detects_changed_formula_despite_same_local_name():
 
 
 @pytest.mark.parametrize(
+    ("constructor", "through_local"),
+    [("asarray", False), ("asarray", True), ("array", False), ("array", True)],
+)
+def test_reweight_detects_return_dtype_change(constructor, through_local):
+    def code(dtype):
+        if not through_local:
+            body = f"    return np.{constructor}([0.8], dtype={dtype})\n"
+        else:
+            body = (
+                "    values = [0.8]\n"
+                f"    converted = np.{constructor}(values, dtype={dtype})\n"
+                "    return converted\n"
+            )
+        return "def compute_potential_components(obs, constants):\n" + body
+
+    reference = _direction_candidate("reference", code("float"), [1.0])
+    candidate = _direction_candidate("candidate", code("int"), [2.0])
+    result = search.validate_direction("reweight", candidate, reference)
+    assert result["status"] == "failed"
+    assert result["formula_comparison_status"] == "confirmed"
+    difference = result["formula_differences"]["return_conversion_difference"]
+    assert "dtype=float" in difference["reference"]
+    assert "dtype=int" in difference["candidate"]
+    assert any(
+        "return conversion changed" in issue
+        and "dtype=float" in issue
+        and "dtype=int" in issue
+        for issue in result["confirmed_violations"]
+    )
+
+
+def test_reweight_accepts_same_return_conversion_after_local_renames():
+    reference = _direction_candidate(
+        "reference",
+        "def compute_potential_components(obs, constants):\n"
+        "    values = [0.8]\n"
+        "    selected_dtype = float\n"
+        "    converted = np.asarray(values, dtype=selected_dtype)\n"
+        "    return converted\n",
+        [1.0],
+    )
+    candidate = _direction_candidate(
+        "candidate",
+        "def compute_potential_components(obs, constants):\n"
+        "    renamed_values = [0.8]\n"
+        "    renamed_dtype = float\n"
+        "    renamed_result = np.asarray(renamed_values, dtype=renamed_dtype)\n"
+        "    return renamed_result\n",
+        [2.0],
+    )
+    result = search.validate_direction("reweight", candidate, reference)
+    assert result["status"] == "passed"
+    assert result["formula_comparison_status"] == "confirmed"
+    assert result["formula_differences"]["return_conversion_difference"] is None
+    assert result["confirmed_violations"] == []
+
+
+@pytest.mark.parametrize(
     ("direction", "reference_code", "candidate_code", "old_weights", "new_weights"),
     [
         (
