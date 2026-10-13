@@ -1954,9 +1954,16 @@ def run_training_search(
     _write_json(output / "validation_dataset.json", dataset.provenance)
     _write_json(output / "constants.json", constants)
 
-    baseline_validator = baseline_validator or __import__(
-        "llm_episode_training", fromlist=["validate_baseline_preflight"]
-    ).validate_baseline_preflight
+    episode_training = __import__(
+        "llm_episode_training",
+        fromlist=[
+            "reconcile_baseline_preflight_records",
+            "validate_baseline_preflight",
+        ],
+    )
+    baseline_validator = (
+        baseline_validator or episode_training.validate_baseline_preflight
+    )
     if dry_run:
         state["baseline_preflight"] = {
             "status": "not_run_dry_run",
@@ -1968,6 +1975,11 @@ def run_training_search(
                 "formal search requires --baseline-run and --baseline-evaluation"
             )
         manifest = Path(baseline_evaluation).resolve() / "scenario_manifest.json"
+        saved_preflight = state.get("baseline_preflight")
+        saved_identity_is_valid = bool(
+            isinstance(saved_preflight, dict)
+            and saved_preflight.get("status") == "passed"
+        )
         try:
             baseline_preflight = baseline_validator(
                 baseline_run=baseline_run,
@@ -1988,22 +2000,51 @@ def run_training_search(
             }
             state["status"] = "paused_baseline_incomplete_or_incompatible"
             state["stop_reason"] = f"{type(exc).__name__}: {exc}"
-            state["baseline_preflight"] = failure
-            _write_json(output / "baseline_preflight.json", failure)
+            state["baseline_preflight_failure"] = failure
+            if not saved_identity_is_valid:
+                state["baseline_preflight"] = failure
+                _write_json(output / "baseline_preflight.json", failure)
             _save_state(output, state)
             raise TrainingSearchError(
                 f"baseline preflight failed: {type(exc).__name__}: {exc}"
             ) from exc
-        saved_preflight = state.get("baseline_preflight")
-        if (
-            saved_preflight is not None
-            and saved_preflight.get("status") == "passed"
-            and saved_preflight != baseline_preflight
-        ):
-            raise TrainingSearchError("baseline inputs changed since the saved preflight")
+        compatibility_update = None
+        if saved_identity_is_valid:
+            saved_path = output / "baseline_preflight.json"
+            try:
+                saved_file_preflight = json.loads(
+                    saved_path.read_text(encoding="utf-8")
+                )
+                baseline_preflight, compatibility_update = (
+                    episode_training.reconcile_baseline_preflight_records(
+                        {
+                            "state.json": saved_preflight,
+                            "baseline_preflight.json": saved_file_preflight,
+                        },
+                        baseline_preflight,
+                    )
+                )
+            except Exception as exc:
+                raise TrainingSearchError(
+                    "baseline inputs changed since the saved preflight: "
+                    f"{type(exc).__name__}: {exc}"
+                ) from exc
         state["baseline_preflight"] = baseline_preflight
+        state.pop("baseline_preflight_failure", None)
         state["settings"]["evaluation_manifest"] = baseline_preflight["manifest_path"]
         _write_json(output / "baseline_preflight.json", baseline_preflight)
+        if compatibility_update is not None:
+            updates = state.setdefault("baseline_preflight_compatibility_updates", [])
+            if not any(
+                item.get("update_id") == compatibility_update["update_id"]
+                for item in updates
+            ):
+                updates.append(compatibility_update)
+            _write_json(
+                output / "baseline_preflight_compatibility.json",
+                compatibility_update,
+            )
+            _save_state(output, state)
 
     if dry_run:
         preview = output / "dry_run"

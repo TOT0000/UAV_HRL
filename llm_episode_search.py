@@ -1949,6 +1949,55 @@ def _next_revalidation_directory(output: Path) -> tuple[int, Path]:
     return index, root / f"revalidation_{index:02d}"
 
 
+def _reconcile_saved_baseline_preflight(
+    *,
+    output: Path,
+    state: dict[str, Any],
+    validated_preflight: dict[str, Any],
+) -> dict[str, Any]:
+    from llm_episode_training import reconcile_baseline_preflight_records
+
+    saved_preflight = state.get("baseline_preflight")
+    if not (
+        isinstance(saved_preflight, dict)
+        and saved_preflight.get("status") == "passed"
+    ):
+        state["baseline_preflight"] = validated_preflight
+        _write_json(output / "baseline_preflight.json", validated_preflight)
+        return validated_preflight
+    saved_path = output / "baseline_preflight.json"
+    try:
+        saved_file_preflight = json.loads(saved_path.read_text(encoding="utf-8"))
+        reconciled, compatibility_update = reconcile_baseline_preflight_records(
+            {
+                "state.json": saved_preflight,
+                "baseline_preflight.json": saved_file_preflight,
+            },
+            validated_preflight,
+        )
+    except Exception as exc:
+        raise EpisodeSearchError(
+            "baseline/pre-evaluation comparison contract changed: "
+            f"{type(exc).__name__}: {exc}"
+        ) from exc
+    state["baseline_preflight"] = reconciled
+    state.pop("baseline_preflight_failure", None)
+    _write_json(saved_path, reconciled)
+    if compatibility_update is not None:
+        updates = state.setdefault("baseline_preflight_compatibility_updates", [])
+        if not any(
+            item.get("update_id") == compatibility_update["update_id"]
+            for item in updates
+        ):
+            updates.append(compatibility_update)
+        _write_json(
+            output / "baseline_preflight_compatibility.json",
+            compatibility_update,
+        )
+        _write_json(output / "state.json", state)
+    return reconciled
+
+
 def revalidate_episode_search(
     resume: str | Path,
     *,
@@ -2017,11 +2066,11 @@ def revalidate_episode_search(
         environment_size_m=tuple(settings.get("evaluation_area_m") or ()),
         episode_seconds=60,
     )
-    saved_preflight = json.loads(
-        (output / "baseline_preflight.json").read_text(encoding="utf-8")
+    baseline_preflight = _reconcile_saved_baseline_preflight(
+        output=output,
+        state=state,
+        validated_preflight=baseline_preflight,
     )
-    if state.get("baseline_preflight") != baseline_preflight or saved_preflight != baseline_preflight:
-        raise EpisodeSearchError("baseline/pre-evaluation comparison contract changed")
 
     worker_timeout = float(settings["worker_timeout"])
     validated: dict[str, dict[str, Any]] = {}
@@ -2471,15 +2520,21 @@ def run_episode_search(
             state["status"] = "failed_baseline_preflight"
             state["stop_reason"] = f"{type(exc).__name__}: {exc}"
             state["baseline_preflight_failure"] = failure
-            _write_json(output / "baseline_preflight.json", failure)
+            saved_identity_is_valid = bool(
+                isinstance(state.get("baseline_preflight"), dict)
+                and state["baseline_preflight"].get("status") == "passed"
+            )
+            if not saved_identity_is_valid:
+                _write_json(output / "baseline_preflight.json", failure)
             _write_json(output / "state.json", state)
             raise EpisodeSearchError(
                 f"baseline preflight failed: {type(exc).__name__}: {exc}"
             ) from exc
-        if state.get("baseline_preflight") not in (None, baseline_preflight):
-            raise EpisodeSearchError("baseline comparison inputs changed since preflight")
-        state["baseline_preflight"] = baseline_preflight
-        _write_json(output / "baseline_preflight.json", baseline_preflight)
+        baseline_preflight = _reconcile_saved_baseline_preflight(
+            output=output,
+            state=state,
+            validated_preflight=baseline_preflight,
+        )
     else:
         state["baseline_preflight"] = {
             "status": "not_run_dry_run",

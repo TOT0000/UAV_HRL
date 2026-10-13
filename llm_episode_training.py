@@ -48,6 +48,12 @@ SEARCH_TRAINING_STATE_SCHEMA_VERSION = (
     "uav-hrl-llm-episode-search-training-state-v1"
 )
 SEARCH_TRAINING_STATE_FILENAME = "episode_search_training_state.json"
+BASELINE_PREFLIGHT_ADDITIVE_FIELDS = frozenset(
+    {"manifest_schema_version", "manifest_seed"}
+)
+BASELINE_PREFLIGHT_COMPATIBILITY_SCHEMA_VERSION = (
+    "uav-hrl-baseline-preflight-additive-compatibility-v1"
+)
 
 
 def _file_sha256(path: Path) -> str:
@@ -56,6 +62,86 @@ def _file_sha256(path: Path) -> str:
         for chunk in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def reconcile_baseline_preflight_records(
+    saved_records: dict[str, dict[str, Any]],
+    validated_preflight: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    """Strictly upgrade saved preflights missing only additive manifest identity fields."""
+
+    if (
+        not isinstance(validated_preflight, dict)
+        or validated_preflight.get("status") != "passed"
+    ):
+        raise EpisodeTrainingError("validated baseline preflight is not a passed record")
+    updated_records: dict[str, list[str]] = {}
+    validated_keys = set(validated_preflight)
+    for source, saved in saved_records.items():
+        if not isinstance(saved, dict) or saved.get("status") != "passed":
+            raise EpisodeTrainingError(
+                f"saved baseline preflight is not a passed record: {source}"
+            )
+        saved_keys = set(saved)
+        missing = validated_keys - saved_keys
+        extra = saved_keys - validated_keys
+        if extra:
+            raise EpisodeTrainingError(
+                "saved baseline preflight has fields absent from the validated record: "
+                f"source={source}, fields={sorted(extra)}"
+            )
+        unsupported_missing = missing - BASELINE_PREFLIGHT_ADDITIVE_FIELDS
+        if unsupported_missing:
+            raise EpisodeTrainingError(
+                "saved baseline preflight is missing non-additive fields: "
+                f"source={source}, fields={sorted(unsupported_missing)}"
+            )
+        differing = sorted(
+            key for key in saved_keys if saved[key] != validated_preflight[key]
+        )
+        if differing:
+            raise EpisodeTrainingError(
+                "saved baseline preflight differs from the validated baseline: "
+                f"source={source}, fields={differing}"
+            )
+        if missing:
+            updated_records[source] = sorted(missing)
+
+    if not updated_records:
+        return dict(validated_preflight), None
+    added_fields = sorted(
+        {field for fields in updated_records.values() for field in fields}
+    )
+    identity = {
+        "manifest_path": validated_preflight.get("manifest_path"),
+        "manifest_file_sha256": validated_preflight.get("manifest_file_sha256"),
+        "manifest_content_hash": validated_preflight.get("manifest_content_hash"),
+        "manifest_schema_version": validated_preflight.get(
+            "manifest_schema_version"
+        ),
+        "manifest_seed": validated_preflight.get("manifest_seed"),
+    }
+    signature = json.dumps(
+        {
+            "updated_records": updated_records,
+            "added_fields": {key: validated_preflight[key] for key in added_fields},
+            "verified_manifest": identity,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    )
+    return dict(validated_preflight), {
+        "schema_version": BASELINE_PREFLIGHT_COMPATIBILITY_SCHEMA_VERSION,
+        "status": "updated",
+        "reason": "saved preflight lacked only newly additive manifest identity fields",
+        "recorded_at_utc": datetime.now(timezone.utc).isoformat(),
+        "update_id": hashlib.sha256(signature.encode("utf-8")).hexdigest(),
+        "updated_records": updated_records,
+        "added_fields": {key: validated_preflight[key] for key in added_fields},
+        "verified_manifest": identity,
+    }
 
 
 def _scenario_sequence_mismatch_message(

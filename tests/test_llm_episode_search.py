@@ -2201,6 +2201,45 @@ def test_baseline_preflight_binds_run_checkpoint_manifest_and_episode_rows(tmp_p
         )
 
 
+def test_episode_search_reconciles_only_legacy_additive_preflight_fields(tmp_path):
+    current = {
+        **_preflight_fixture(),
+        "manifest_schema_version": "uav-hrl-scenario-v8",
+        "manifest_seed": 20260927,
+    }
+    legacy = {
+        key: value
+        for key, value in current.items()
+        if key not in {"manifest_schema_version", "manifest_seed"}
+    }
+    output = tmp_path / "episode-legacy-preflight"
+    output.mkdir()
+    state = {"baseline_preflight": legacy}
+    (output / "state.json").write_text(json.dumps(state), encoding="utf-8")
+    (output / "baseline_preflight.json").write_text(
+        json.dumps(legacy), encoding="utf-8"
+    )
+
+    reconciled = search._reconcile_saved_baseline_preflight(
+        output=output,
+        state=state,
+        validated_preflight=current,
+    )
+    assert reconciled == current
+    assert state["baseline_preflight"] == current
+    assert len(state["baseline_preflight_compatibility_updates"]) == 1
+    assert json.loads(
+        (output / "baseline_preflight.json").read_text(encoding="utf-8")
+    ) == current
+
+    search._reconcile_saved_baseline_preflight(
+        output=output,
+        state=state,
+        validated_preflight=current,
+    )
+    assert len(state["baseline_preflight_compatibility_updates"]) == 1
+
+
 def test_baseline_preflight_failure_happens_before_model_call(tmp_path, monkeypatch):
     dataset = _dataset()
     monkeypatch.setattr(search, "load_complete_episode_dataset", lambda _paths: dataset)
@@ -2383,6 +2422,9 @@ def test_evaluation_failure_is_persisted_and_resume_only_retries_evaluation(
         "baseline_preflight": preflight,
     }
     (output / "state.json").write_text(json.dumps(state), encoding="utf-8")
+    (output / "baseline_preflight.json").write_text(
+        json.dumps(preflight), encoding="utf-8"
+    )
     monkeypatch.setattr(search, "_git_sha", lambda: "fixture-revision")
     monkeypatch.setattr(search, "load_complete_episode_dataset", lambda _paths: dataset)
     monkeypatch.setattr(search, "build_constants", lambda _metadata: {})

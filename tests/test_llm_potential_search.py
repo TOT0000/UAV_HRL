@@ -224,6 +224,12 @@ def test_evaluation_failure_resume_retries_new_attempt_without_generation_or_tra
     model_calls, training_calls, evaluation_calls, train, evaluate, baseline = (
         _install_search_mocks(monkeypatch, tmp_path)
     )
+    legacy_preflight = baseline()
+    current_preflight = {
+        **legacy_preflight,
+        "manifest_schema_version": "uav-hrl-scenario-v8",
+        "manifest_seed": 20260927,
+    }
     attempts = []
 
     def fail_first_evaluation(**kwargs):
@@ -246,7 +252,7 @@ def test_evaluation_failure_resume_retries_new_attempt_without_generation_or_tra
         client=object(),
         training_runner=train,
         evaluation_runner=fail_first_evaluation,
-        baseline_validator=baseline,
+        baseline_validator=lambda **_kwargs: legacy_preflight,
     )
     assert first["status"] == "paused_evaluation_failure"
     assert len(model_calls) == 4
@@ -257,6 +263,33 @@ def test_evaluation_failure_resume_retries_new_attempt_without_generation_or_tra
     assert record["evaluation_failures"][0]["attempt"] == 1
     assert paused["rounds"] == []
     assert paused["best_candidate"] is None
+    assert "manifest_schema_version" not in paused["baseline_preflight"]
+    saved_legacy = json.loads(
+        (output / "baseline_preflight.json").read_text(encoding="utf-8")
+    )
+    assert "manifest_seed" not in saved_legacy
+
+    with pytest.raises(search.PotentialSearchError, match="baseline preflight failed"):
+        search.run_potential_search(
+            resume=output,
+            max_rounds=1,
+            client=object(),
+            training_runner=train,
+            evaluation_runner=fail_first_evaluation,
+            baseline_validator=lambda **_kwargs: (_ for _ in ()).throw(
+                RuntimeError("fixture baseline unavailable")
+            ),
+        )
+    failed_validation = json.loads(
+        (output / "state.json").read_text(encoding="utf-8")
+    )
+    assert failed_validation["baseline_preflight"] == legacy_preflight
+    assert failed_validation["baseline_preflight_failure"]["status"] == "failed"
+    assert json.loads(
+        (output / "baseline_preflight.json").read_text(encoding="utf-8")
+    ) == saved_legacy
+    assert len(model_calls) == 4
+    assert len(training_calls) == len(attempts) == 1
 
     resumed = search.run_potential_search(
         resume=output,
@@ -264,7 +297,7 @@ def test_evaluation_failure_resume_retries_new_attempt_without_generation_or_tra
         client=object(),
         training_runner=train,
         evaluation_runner=fail_first_evaluation,
-        baseline_validator=baseline,
+        baseline_validator=lambda **_kwargs: current_preflight,
     )
     assert resumed["status"] == "complete"
     assert len(model_calls) == 4
@@ -279,6 +312,26 @@ def test_evaluation_failure_resume_retries_new_attempt_without_generation_or_tra
     assert record["evaluation_invocations"][1]["output_directory"].endswith("a02")
     assert record["evaluation"]["status"] == "complete"
     assert saved["best_candidate"]["candidate_id"] == "r01_c04"
+    assert saved["baseline_preflight"] == current_preflight
+    assert json.loads(
+        (output / "baseline_preflight.json").read_text(encoding="utf-8")
+    ) == current_preflight
+    assert len(saved["baseline_preflight_compatibility_updates"]) == 1
+    assert (output / "baseline_preflight_compatibility.json").is_file()
+
+    repeated = search.run_potential_search(
+        resume=output,
+        max_rounds=1,
+        client=object(),
+        training_runner=train,
+        evaluation_runner=fail_first_evaluation,
+        baseline_validator=lambda **_kwargs: current_preflight,
+    )
+    assert repeated["status"] == "complete"
+    repeated_state = json.loads((output / "state.json").read_text(encoding="utf-8"))
+    assert len(repeated_state["baseline_preflight_compatibility_updates"]) == 1
+    assert len(model_calls) == len(training_calls) == 4
+    assert len(attempts) == 5
 
 
 def test_actual_prompt_assembly_has_full_best_latest_round_and_no_placeholders(

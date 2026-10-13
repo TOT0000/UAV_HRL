@@ -27,6 +27,7 @@ def _saved_manifest(tmp_path, *, seed=20260927, episodes=2, roi_count=8):
 
 def _baseline_preflight(path, manifest):
     return {
+        "status": "passed",
         "manifest_path": str(path.resolve()),
         "manifest_file_sha256": episode_training._file_sha256(path),
         "manifest_content_hash": manifest.content_hash,
@@ -35,6 +36,68 @@ def _baseline_preflight(path, manifest):
         "scenario_ids": [str(item["scenario_id"]) for item in manifest.episodes],
         "evaluation_contract": {"episode_seconds": 60},
     }
+
+
+def test_legacy_preflight_upgrade_is_strict_and_idempotent(tmp_path):
+    path, manifest = _saved_manifest(tmp_path)
+    current = {
+        **_baseline_preflight(path, manifest),
+        "checkpoint_episode": 400,
+        "metrics": {"episode_energy_efficiency_mbit_per_j": {"mean": 1.0}},
+    }
+    legacy = {
+        key: value
+        for key, value in current.items()
+        if key not in {"manifest_schema_version", "manifest_seed"}
+    }
+    reconciled, update = episode_training.reconcile_baseline_preflight_records(
+        {"state.json": legacy, "baseline_preflight.json": legacy},
+        current,
+    )
+    assert reconciled == current
+    assert update["added_fields"] == {
+        "manifest_schema_version": manifest.schema_version,
+        "manifest_seed": manifest.manifest_seed,
+    }
+    assert update["updated_records"] == {
+        "state.json": ["manifest_schema_version", "manifest_seed"],
+        "baseline_preflight.json": ["manifest_schema_version", "manifest_seed"],
+    }
+    assert update["verified_manifest"]["manifest_content_hash"] == manifest.content_hash
+
+    reconciled_again, repeated = (
+        episode_training.reconcile_baseline_preflight_records(
+            {"state.json": reconciled, "baseline_preflight.json": reconciled},
+            current,
+        )
+    )
+    assert reconciled_again == current
+    assert repeated is None
+
+    for field, bad_value in (
+        ("manifest_content_hash", "changed-hash"),
+        ("scenario_ids", list(reversed(current["scenario_ids"]))),
+        ("evaluation_contract", {"episodes": 99}),
+        ("manifest_seed", manifest.manifest_seed + 1),
+        ("manifest_schema_version", "conflicting-schema"),
+    ):
+        incompatible = {**legacy, field: bad_value}
+        with pytest.raises(episode_training.EpisodeTrainingError, match="differs"):
+            episode_training.reconcile_baseline_preflight_records(
+                {"state.json": incompatible},
+                current,
+            )
+
+    missing_original = dict(legacy)
+    missing_original.pop("manifest_content_hash")
+    with pytest.raises(
+        episode_training.EpisodeTrainingError,
+        match="missing non-additive fields",
+    ):
+        episode_training.reconcile_baseline_preflight_records(
+            {"state.json": missing_original},
+            current,
+        )
 
 
 def test_fixed_roi_explicit_manifest_uses_saved_scenarios_in_order(monkeypatch, tmp_path):

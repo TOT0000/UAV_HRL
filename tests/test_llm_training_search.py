@@ -701,6 +701,10 @@ def test_search_trains_all_four_then_resumes_with_same_round_reference(
         "excerpts": {},
         "rendered": {},
     }
+    preflight.update(
+        manifest_schema_version="uav-hrl-scenario-v8",
+        manifest_seed=20260927,
+    )
     original_estimate = search.estimate_token_budget
 
     def over_budget(prompt, *, context_length, max_output_tokens):
@@ -731,6 +735,8 @@ def test_search_trains_all_four_then_resumes_with_same_round_reference(
     assert migrated["prompt_version"] == search.SEARCH_PROMPT_VERSION
     assert migrated["current_round"]["reference_candidate_id"] == "r01_c04"
     assert len(migrated["compatibility_migrations"]) == 1
+    assert migrated["baseline_preflight"] == preflight
+    assert len(migrated["baseline_preflight_compatibility_updates"]) == 1
     assert len(migrated_pending["generation_request_migrations"]) == 1
     prompt_migration = migrated_pending["generation_request_migrations"][0]
     assert len(prompt_migration["old_generation_request_sha256"]) == 64
@@ -770,6 +776,7 @@ def test_search_trains_all_four_then_resumes_with_same_round_reference(
     assert paused_again["model_calls"] == 4
     migrated_again = json.loads(state_path.read_text(encoding="utf-8"))
     assert len(migrated_again["compatibility_migrations"]) == 1
+    assert len(migrated_again["baseline_preflight_compatibility_updates"]) == 1
     assert len(
         migrated_again["current_round"]["candidates"]["r02_c01"][
             "generation_request_migrations"
