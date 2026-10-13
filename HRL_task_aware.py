@@ -135,6 +135,7 @@ from rng_contract import CHANNEL_RNG_STREAMS, NamedRNGStreams, RNG_CONTRACT_VERS
 from scenario_manifest import validate_manifest_initial_topologies
 from search_diagnostics import build_search_diagnostics_record
 from replay_auxiliary import capture_replay_snapshot, replay_auxiliary_metadata
+from rnd_exploration import RNDConfig, RNDExplorer, is_rnd_method
 from llm_runtime import (
     ApprovedDesignRuntime,
     LLMRuntimeError,
@@ -1956,6 +1957,8 @@ def train(
     sampling_seed=None,
     llm_artifact_dir=None,
     llm_worker_timeout=60.0,
+    rnd_config=None,
+    checkpoint_episodes=None,
 ):
     if config is None:
         raise ValueError(
@@ -1970,6 +1973,32 @@ def train(
         if key != "method_id"
     })
     formal_config = effective_training_config(config, method_spec)
+    rnd_enabled = is_rnd_method(method_spec)
+    if rnd_enabled:
+        resolved_rnd_config = (
+            rnd_config
+            if isinstance(rnd_config, RNDConfig)
+            else RNDConfig.from_dict(rnd_config)
+        )
+        if (
+            not evaluation
+            and config.warmup_joint_transitions
+            < resolved_rnd_config.minimum_warmup_observations
+        ):
+            raise ValueError(
+                "RND warmup must provide at least "
+                f"{resolved_rnd_config.minimum_warmup_observations} chronological observations"
+            )
+    elif rnd_config is not None:
+        raise ValueError("RND configuration is valid only for the RND collection method")
+    else:
+        resolved_rnd_config = None
+    if checkpoint_episodes is not None:
+        checkpoint_episodes = tuple(sorted({int(value) for value in checkpoint_episodes}))
+        if not checkpoint_episodes or checkpoint_episodes[0] <= 0:
+            raise ValueError("checkpoint episodes must contain positive integers")
+        if checkpoint_episodes[-1] > int(config.total_episodes):
+            raise ValueError("checkpoint episode exceeds the configured training horizon")
     if method_spec.llm_enabled and llm_artifact_dir is None:
         raise ValueError(f"{method_spec.method_id} requires an explicit approved artifact")
     if not method_spec.llm_enabled and llm_artifact_dir is not None:
@@ -2141,6 +2170,11 @@ def train(
         rng_streams=rng_streams,
         evaluation=evaluation,
     )
+    rnd_explorer = (
+        RNDExplorer(movement_state_dim, resolved_rnd_config)
+        if rnd_enabled
+        else None
+    )
     joint_replay = (
         utils_update_v2.ReplayBufferJoint(
             movement_state_dim,
@@ -2195,6 +2229,11 @@ def train(
         evaluation=evaluation,
         rng_contract_metadata=rng_streams.metadata(),
     )
+    if rnd_explorer is not None:
+        experiment_identity["rnd"] = rnd_explorer.metadata()
+        experiment_identity["rnd"]["checkpoint_episodes"] = (
+            list(checkpoint_episodes) if checkpoint_episodes is not None else None
+        )
     if llm_identity is not None:
         experiment_identity["llm_artifact_identity"] = copy.deepcopy(llm_identity)
         experiment_identity["movement_state_dimensions"] = {
@@ -2278,6 +2317,7 @@ def train(
             expected_completed_episodes=expected_checkpoint_episodes,
             expected_formal_config=expected_checkpoint_formal_config,
             current_training_manifest=expected_checkpoint_training_manifest,
+            rnd_explorer=rnd_explorer,
         )
         checkpoint_experiment = loaded_checkpoint_metadata["experiment"]
         loaded_training_provenance = checkpoint_training_provenance(
@@ -2444,6 +2484,7 @@ def train(
                 "training_manifest_segments"
             ),
             training_run_directory=config.run_directory,
+            rnd_explorer=rnd_explorer,
         )
         training_state = restored["training_state"]
         if routing_transition_ledger is not None:
@@ -2622,6 +2663,11 @@ def train(
         if evaluation
         else None
     )
+    rnd_evaluation_fingerprint_before = (
+        rnd_explorer.fingerprint()
+        if evaluation and rnd_explorer is not None
+        else None
+    )
 
     initial_log_length = len(reward_log)
     duplicate_target_assertions = 0
@@ -2701,6 +2747,10 @@ def train(
         episode_reward = 0.0
         episode_existing_movement_reward = 0.0
         episode_llm_extra_reward = 0.0
+        episode_rnd_raw_errors = []
+        episode_rnd_normalized_bonuses = []
+        episode_rnd_weighted_bonuses = []
+        episode_rnd_predictor_losses = []
         episode_llm_feature_contributions = (
             np.zeros(llm_runtime.feature_count, dtype=np.float64)
             if llm_runtime is not None
@@ -3160,10 +3210,27 @@ def train(
                 task_potential_enabled=method_spec.task_potential_enabled,
                 ratio_objective_reward=ratio_objective_reward,
             )
+            rnd_record = None
+            if rnd_explorer is not None and not evaluation:
+                rnd_record = rnd_explorer.observe(
+                    next_state,
+                    queue_for_predictor=(
+                        total_joint_transitions >= config.warmup_joint_transitions
+                    ),
+                )
+                episode_rnd_raw_errors.append(rnd_record["raw_error"])
+                episode_rnd_normalized_bonuses.append(
+                    rnd_record["normalized_bonus"]
+                )
+                episode_rnd_weighted_bonuses.append(
+                    rnd_record["weighted_bonus"]
+                )
             combined_movement_reward = interval_reward + (
                 llm_runtime.beta * llm_extra_reward
                 if llm_runtime is not None
                 else 0.0
+            ) + (
+                rnd_record["weighted_bonus"] if rnd_record is not None else 0.0
             )
             applied_penalty = float(method_spec.task_potential_enabled) * sum(
                 constraint_penalties[name]
@@ -3246,6 +3313,7 @@ def train(
                             else 0.0
                         ),
                         "combined_movement_reward": combined_movement_reward,
+                        "rnd": copy.deepcopy(rnd_record),
                         "checkpoint_lambda": (
                             episode_lambda if method_spec.uses_dinkelbach else None
                         ),
@@ -3269,6 +3337,11 @@ def train(
                 update_kwargs = {}
                 if method_spec.llm_enabled:
                     update_kwargs["llm_reward_beta"] = llm_runtime.beta
+                if rnd_explorer is not None:
+                    update_kwargs.update(
+                        intrinsic_reward_fn=rnd_explorer.intrinsic_reward,
+                        intrinsic_eta=rnd_explorer.config.eta,
+                    )
                 movement_agent.update_joint(
                     joint_replay,
                     current_lambda=episode_lambda,
@@ -3280,6 +3353,10 @@ def train(
                     task_potential_enabled=method_spec.task_potential_enabled,
                     **update_kwargs,
                 )
+                if rnd_explorer is not None:
+                    episode_rnd_predictor_losses.extend(
+                        rnd_explorer.train_pending()
+                    )
 
         if pending_routing_transitions:
             raise AssertionError("terminal routing transitions remained pending")
@@ -3542,6 +3619,46 @@ def train(
                     float(llm_runtime.beta) if llm_runtime is not None else None
                 ),
                 "combined_movement_reward": float(episode_reward),
+                "rnd": (
+                    {
+                        "source": "online_pre_predictor_update",
+                        "raw_error_mean": float(np.mean(episode_rnd_raw_errors)),
+                        "raw_error_max": float(np.max(episode_rnd_raw_errors)),
+                        "normalized_bonus_mean": float(
+                            np.mean(episode_rnd_normalized_bonuses)
+                        ),
+                        "normalized_bonus_max": float(
+                            np.max(episode_rnd_normalized_bonuses)
+                        ),
+                        "weighted_bonus_sum": float(
+                            np.sum(episode_rnd_weighted_bonuses)
+                        ),
+                        "weighted_bonus_max": float(
+                            np.max(episode_rnd_weighted_bonuses)
+                        ),
+                        "predictor_loss_mean": (
+                            float(np.mean(episode_rnd_predictor_losses))
+                            if episode_rnd_predictor_losses
+                            else None
+                        ),
+                        "predictor_loss_last": rnd_explorer.last_predictor_loss,
+                        "observation_count": int(rnd_explorer.observation_count),
+                        "predictor_update_count": int(
+                            rnd_explorer.predictor_update_count
+                        ),
+                        "actor_update_count": int(
+                            movement_agent.num_actor_update_iteration
+                        ),
+                        "critic_update_count": int(
+                            movement_agent.num_critic_update_iteration
+                        ),
+                        "warmup_phase": bool(
+                            movement_agent.num_critic_update_iteration == 0
+                        ),
+                    }
+                    if rnd_explorer is not None and episode_rnd_raw_errors
+                    else None
+                ),
                 "training_seed": (
                     int(config.random_seed)
                     if config.random_seed is not None
@@ -3810,6 +3927,15 @@ def train(
             f"deadline_drops={packet_engine.deadline_drops} "
             f"critic_updates={movement_agent.num_critic_update_iteration} "
             f"actor_updates={movement_agent.num_actor_update_iteration}"
+            + (
+                f" original_reward={episode_existing_movement_reward:.6f}"
+                f" ee={safe_energy_efficiency(timely_goodput_mbits, episode_energy):.9f}"
+                f" rnd_bonus_mean={np.mean(episode_rnd_normalized_bonuses):.6f}"
+                f" rnd_bonus_max={np.max(episode_rnd_normalized_bonuses):.6f}"
+                f" predictor_loss={rnd_explorer.last_predictor_loss}"
+                if rnd_explorer is not None and episode_rnd_normalized_bonuses
+                else ""
+            )
         )
         if dinkelbach_event is not None and dinkelbach_event[
             "dinkelbach_block_completed"
@@ -3839,10 +3965,14 @@ def train(
             checkpoint_required
             and
             config.enable_model_checkpoints
-            and _is_checkpoint_episode(
-                episode + 1,
-                config.total_episodes,
-                config.model_checkpoint_every,
+            and (
+                (episode + 1 in checkpoint_episodes)
+                if checkpoint_episodes is not None
+                else _is_checkpoint_episode(
+                    episode + 1,
+                    config.total_episodes,
+                    config.model_checkpoint_every,
+                )
             )
         ):
             save_model_checkpoint(
@@ -3876,6 +4006,7 @@ def train(
                 llm_artifact_dir=(
                     llm_design.directory if llm_design is not None else None
                 ),
+                rnd_explorer=rnd_explorer,
             )
         if (
             not evaluation
@@ -3883,10 +4014,14 @@ def train(
             checkpoint_required
             and
             config.enable_full_resume
-            and _is_checkpoint_episode(
-                episode + 1,
-                config.total_episodes,
-                config.full_resume_every,
+            and (
+                (episode + 1 in checkpoint_episodes)
+                if checkpoint_episodes is not None
+                else _is_checkpoint_episode(
+                    episode + 1,
+                    config.total_episodes,
+                    config.full_resume_every,
+                )
             )
         ):
             save_full_resume_checkpoint(
@@ -3968,6 +4103,7 @@ def train(
                 llm_artifact_dir=(
                     llm_design.directory if llm_design is not None else None
                 ),
+                rnd_explorer=rnd_explorer,
             )
 
     if config.enable_csv:
@@ -4038,6 +4174,13 @@ def train(
         ):
             raise AssertionError("evaluation learning-state fingerprint changed")
 
+        if (
+            rnd_explorer is not None
+            and rnd_explorer.fingerprint()
+            != rnd_evaluation_fingerprint_before
+        ):
+            raise AssertionError("evaluation RND network or statistics changed")
+
     backlog_invariant_passed = None
     deadline_counter_consistent = None
     if config.mode == "smoke":
@@ -4084,7 +4227,6 @@ def train(
         if evaluation
         else None
     )
-
     if llm_runtime is not None:
         llm_runtime.close()
 
@@ -4097,6 +4239,11 @@ def train(
         "routing_state_dim": ROUTING_STATE_DIM,
         "movement_state_dim": movement_state_dim,
         "original_movement_state_dim": MOVEMENT_STATE_DIM,
+        "rnd": rnd_explorer.metadata() if rnd_explorer is not None else None,
+        "rnd_fingerprint": (
+            rnd_explorer.fingerprint() if rnd_explorer is not None else None
+        ),
+        "rnd_evaluation_fingerprint_before": rnd_evaluation_fingerprint_before,
         "llm_artifact_identity": copy.deepcopy(llm_identity),
         "joint_action_dim": JOINT_ACTION_DIM,
         "num_uav": NUM_UAV,

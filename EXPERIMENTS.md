@@ -9,7 +9,11 @@ process. The registry keys are `td3_dinkelbach`, `ddpg_dinkelbach`,
 `kkm_random_action_random_routing`,
 `km_td3_dinkelbach`, `random_assignment_td3_dinkelbach`,
 `km_ddpg_dinkelbach`, `ddpg_dinkelbach_wo_ta`,
-`td3_dinkelbach_random_routing`, and `td3_dinkelbach_dqn_wo_ta`. All eighteen methods share
+`td3_dinkelbach_random_routing`, `td3_dinkelbach_dqn_wo_ta`, and the isolated
+`td3_dinkelbach_rnd_collect` exploration collector. The RND method and its
+checkpoint-driven, zero-noise trajectory collection workflow are documented in
+`docs/rnd_collection.md`. Existing controlled methods do not allocate RND
+networks or statistics. All other methods share
 16 UAVs, the common Simulator and synchronous movement flow,
 energy/delivery accounting, evaluation, and logging.
 

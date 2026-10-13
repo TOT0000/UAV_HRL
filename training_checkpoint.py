@@ -1229,6 +1229,7 @@ def save_model_checkpoint(
     experiment_metadata=None,
     routing_lifecycle_state=None,
     llm_artifact_dir=None,
+    rnd_explorer=None,
 ):
     checkpoint_dir = Path(checkpoint_dir)
     metadata = _base_metadata(
@@ -1250,8 +1251,19 @@ def save_model_checkpoint(
     metadata["training_provenance"] = _build_training_provenance(
         metadata, routing_lifecycle_state
     )
+    if rnd_explorer is not None:
+        metadata["rnd"] = rnd_explorer.metadata()
+        metadata["rnd"].update(
+            actor_update_count=int(td3.num_actor_update_iteration),
+            critic_update_count=int(td3.num_critic_update_iteration),
+            routing_update_count=int(ddqn.num_training),
+            warmup_phase=bool(td3.num_critic_update_iteration == 0),
+        )
     def write(temporary):
-        torch.save(_network_states(td3, ddqn), temporary / "models.pt")
+        payload = _network_states(td3, ddqn)
+        if rnd_explorer is not None:
+            payload["rnd"] = rnd_explorer.state_dict(full=False)
+        torch.save(payload, temporary / "models.pt")
         if llm_artifact_dir is not None:
             shutil.copytree(Path(llm_artifact_dir), temporary / "llm_artifact")
         (temporary / "metadata.json").write_text(
@@ -1918,6 +1930,7 @@ def load_model_checkpoint(
     current_training_manifest_segments=None,
     training_run_directory=None,
     allow_incomplete_provenance=False,
+    rnd_explorer=None,
 ):
     checkpoint_dir = Path(checkpoint_dir).resolve()
     inspected = inspect_model_checkpoint(
@@ -1942,6 +1955,10 @@ def load_model_checkpoint(
         checkpoint_dir / "models.pt", map_location="cpu", weights_only=False
     )
     _load_network_states(payload, td3, ddqn)
+    if rnd_explorer is not None:
+        if "rnd" not in payload or "rnd" not in metadata:
+            raise RuntimeError("RND model checkpoint is incomplete")
+        rnd_explorer.load_state_dict(payload["rnd"], require_full=False)
     return metadata
 
 
@@ -2464,6 +2481,7 @@ def save_full_resume_checkpoint(
     experiment_metadata=None,
     keep_last=None,
     llm_artifact_dir=None,
+    rnd_explorer=None,
 ):
     checkpoint_dir = Path(checkpoint_dir)
     if not isinstance(training_state, dict):
@@ -2522,6 +2540,14 @@ def save_full_resume_checkpoint(
         metadata["training_provenance"] = _build_training_provenance(
             metadata, training_state.get("routing_lifecycle_state")
         )
+    if rnd_explorer is not None:
+        metadata["rnd"] = rnd_explorer.metadata()
+        metadata["rnd"].update(
+            actor_update_count=int(td3.num_actor_update_iteration),
+            critic_update_count=int(td3.num_critic_update_iteration),
+            routing_update_count=int(ddqn.num_training),
+            warmup_phase=bool(td3.num_critic_update_iteration == 0),
+        )
     def write(temporary):
         replay_metadata = {
             "joint": None,
@@ -2560,6 +2586,8 @@ def save_full_resume_checkpoint(
             "replay_metadata": replay_metadata,
             "rng_state": _rng_state(),
         }
+        if rnd_explorer is not None:
+            payload["rnd"] = rnd_explorer.state_dict(full=True)
         torch.save(payload, temporary / "training_state.pt")
         if llm_artifact_dir is not None:
             shutil.copytree(Path(llm_artifact_dir), temporary / "llm_artifact")
@@ -3439,6 +3467,7 @@ def load_full_resume_checkpoint(
     current_training_manifest=None,
     current_training_manifest_segments=None,
     training_run_directory=None,
+    rnd_explorer=None,
 ):
     checkpoint_dir = Path(checkpoint_dir).resolve()
     inspected = inspect_full_resume_checkpoint(
@@ -3507,10 +3536,17 @@ def load_full_resume_checkpoint(
     _load_network_states(payload["networks"], td3_probe, ddqn_probe)
     _restore_movement_training_payload(td3_probe, payload)
     _restore_routing_training_payload(ddqn_probe, payload)
+    if rnd_explorer is not None:
+        if "rnd" not in payload or "rnd" not in metadata:
+            raise RuntimeError("full-resume RND checkpoint is incomplete")
+        rnd_probe = deepcopy(rnd_explorer)
+        rnd_probe.load_state_dict(payload["rnd"], require_full=True)
 
     _load_network_states(payload["networks"], td3, ddqn)
     _restore_movement_training_payload(td3, payload)
     _restore_routing_training_payload(ddqn, payload)
+    if rnd_explorer is not None:
+        rnd_explorer.load_state_dict(payload["rnd"], require_full=True)
     if movement_replay_enabled:
         _load_replay(
             checkpoint_dir / "joint_replay.npz",

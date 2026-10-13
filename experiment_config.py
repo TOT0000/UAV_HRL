@@ -363,6 +363,13 @@ _METHOD_DEFINITIONS = {
         "reward_mode": "dinkelbach",
         "label": "TD3 + Dinkelbach",
     },
+    "td3_dinkelbach_rnd_collect": {
+        **_COMMON_METHOD,
+        "agent": "td3",
+        "movement": "centralized_td3",
+        "reward_mode": "dinkelbach",
+        "label": "TD3 + Dinkelbach + RND collection policy",
+    },
     "td3_dinkelbach_llm": {
         **_COMMON_METHOD,
         "agent": "td3",

@@ -64,6 +64,7 @@ from training_history import (
     preflight_resume_training_history,
     training_history_identity,
 )
+from rnd_exploration import RNDConfig, is_rnd_method
 from llm_runtime import (
     artifact_identity,
     copy_approved_artifact,
@@ -217,6 +218,69 @@ def _write_llm_training_episode_metrics(
 
 
 def _llm_episode_observer(run_dir, method):
+    if is_rnd_method(method):
+        path = Path(run_dir) / "rnd_training_episode_metrics.jsonl"
+
+        def persist_rnd(row):
+            rnd = row.get("rnd")
+            if not isinstance(rnd, dict):
+                raise RuntimeError("RND episode metrics are missing")
+            base = float(row["existing_movement_reward"])
+            weighted = float(rnd["weighted_bonus_sum"])
+            combined = float(row["combined_movement_reward"])
+            if not np.isclose(base + weighted, combined, rtol=1e-12, atol=1e-7):
+                raise RuntimeError("RND reward decomposition is inconsistent")
+            record = {
+                "schema_version": "uav-hrl-rnd-training-episode-metrics-v1",
+                "episode": int(row["episode"]),
+                "method_id": str(row["method_id"]),
+                "scenario_id": row.get("scenario_id"),
+                "original_reward_sum": base,
+                "raw_error_mean": float(rnd["raw_error_mean"]),
+                "raw_error_max": float(rnd["raw_error_max"]),
+                "normalized_bonus_mean": float(rnd["normalized_bonus_mean"]),
+                "normalized_bonus_max": float(rnd["normalized_bonus_max"]),
+                "weighted_bonus_sum": weighted,
+                "weighted_bonus_max": float(rnd["weighted_bonus_max"]),
+                "training_reward_sum": combined,
+                "predictor_loss_mean": rnd["predictor_loss_mean"],
+                "predictor_loss_last": rnd["predictor_loss_last"],
+                "observation_count": int(rnd["observation_count"]),
+                "predictor_update_count": int(rnd["predictor_update_count"]),
+                "actor_update_count": int(rnd["actor_update_count"]),
+                "critic_update_count": int(rnd["critic_update_count"]),
+                "warmup_phase": bool(rnd["warmup_phase"]),
+                "timely_mbits": float(row["total_timely_useful_mbits"]),
+                "movement_energy_j": float(row["total_mobility_energy_j"]),
+                "energy_efficiency_mbit_per_j": float(
+                    row["energy_efficiency_mbit_per_j"]
+                ),
+            }
+            existing = []
+            if path.is_file():
+                existing = [
+                    json.loads(line)
+                    for line in path.read_text(encoding="utf-8").splitlines()
+                    if line.strip()
+                ]
+            rows = {int(item["episode"]): item for item in existing}
+            previous = rows.get(record["episode"])
+            if previous is not None and previous != record:
+                raise RuntimeError(
+                    f"RND episode metric changed for episode {record['episode']}"
+                )
+            rows[record["episode"]] = record
+            temporary = path.with_suffix(".jsonl.tmp")
+            temporary.write_text(
+                "".join(
+                    json.dumps(rows[key], ensure_ascii=False, allow_nan=False) + "\n"
+                    for key in sorted(rows)
+                ),
+                encoding="utf-8",
+            )
+            temporary.replace(path)
+
+        return persist_rnd
     if not method.llm_enabled:
         return None
 
@@ -224,6 +288,37 @@ def _llm_episode_observer(run_dir, method):
         _write_llm_training_episode_metrics(run_dir, method, [row])
 
     return persist
+
+
+def _reconcile_rnd_training_episode_metrics(run_dir, method, completed_episode_limit):
+    if not is_rnd_method(method):
+        return
+    path = Path(run_dir) / "rnd_training_episode_metrics.jsonl"
+    if not path.is_file():
+        return
+    rows = []
+    for line_number, line in enumerate(
+        path.read_text(encoding="utf-8").splitlines(), start=1
+    ):
+        if not line.strip():
+            continue
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(
+                f"RND episode metrics contain invalid JSON at line {line_number}"
+            ) from exc
+        if int(row.get("episode", -1)) <= int(completed_episode_limit):
+            rows.append(row)
+    temporary = path.with_suffix(".jsonl.tmp")
+    temporary.write_text(
+        "".join(
+            json.dumps(row, ensure_ascii=False, allow_nan=False) + "\n"
+            for row in rows
+        ),
+        encoding="utf-8",
+    )
+    temporary.replace(path)
 
 
 def create_unique_run_directory(output_root, method_key, seed, git_sha=None):
@@ -277,6 +372,24 @@ def build_parser():
                 type=float,
                 default=60.0,
                 help="seconds allowed for each isolated candidate computation",
+            )
+        if is_rnd_method(method):
+            method_parser.add_argument(
+                "--training-manifest",
+                help="optional existing train manifest with exactly --episodes entries",
+            )
+            method_parser.add_argument("--rnd-eta", type=float, default=0.5)
+            method_parser.add_argument("--rnd-gamma", type=float, default=0.99)
+            method_parser.add_argument("--rnd-learning-rate", type=float, default=1e-4)
+            method_parser.add_argument("--rnd-seed", type=int)
+            method_parser.add_argument(
+                "--rnd-predictor-batch-size", type=int, default=64
+            )
+            method_parser.add_argument(
+                "--checkpoint-episodes",
+                type=int,
+                nargs="+",
+                default=(100, 250, 500, 750, 1000, 1500),
             )
         method_parser.set_defaults(command="train", method=method)
 
@@ -500,7 +613,7 @@ def _base_resolved(run_dir, method, manifest, config, values, args, git_sha):
     manifest_segments = initial_training_manifest_segments(
         run_dir, run_dir / "scenario_manifest.json", manifest
     )
-    return {
+    resolved = {
         "status": "RUNNING",
         "method": method.method_key,
         "method_spec": method.to_dict(),
@@ -545,6 +658,29 @@ def _base_resolved(run_dir, method, manifest, config, values, args, git_sha):
         "git_sha": git_sha,
         "run_directory": str(run_dir),
     }
+    if is_rnd_method(method):
+        resolved["rnd_config"] = RNDConfig(
+            eta=float(args.rnd_eta),
+            gamma_rnd=float(args.rnd_gamma),
+            learning_rate=float(args.rnd_learning_rate),
+            predictor_batch_size=int(args.rnd_predictor_batch_size),
+            initialization_seed=(
+                int(args.rnd_seed)
+                if args.rnd_seed is not None
+                else int(values["seed"]) + 1_000_003
+            ),
+        ).to_dict()
+        requested = (
+            []
+            if args.smoke
+            else sorted({int(value) for value in args.checkpoint_episodes})
+        )
+        if requested and requested[-1] > int(values["episodes"]):
+            raise ValueError(
+                "RND checkpoint episode exceeds the requested training horizon"
+            )
+        resolved["checkpoint_episodes"] = requested or None
+    return resolved
 
 
 def run(args):
@@ -553,12 +689,24 @@ def run(args):
     values = _resolved_values(args)
     method = args.method
     git_sha = _git_short_sha()
-    manifest = generate_manifest(
-        "train",
-        manifest_seed=values["seed"],
-        episode_count=values["episodes"],
-        num_gt=args.roi_count,
-    )
+    training_manifest_path = getattr(args, "training_manifest", None)
+    if training_manifest_path is not None:
+        manifest = ScenarioManifest.load(training_manifest_path)
+        if manifest.split != "train":
+            raise ValueError("--training-manifest must contain a train split")
+        if manifest.episode_count != values["episodes"]:
+            raise ValueError(
+                "--training-manifest episode count must exactly match --episodes"
+            )
+        if int(manifest.manifest_seed) != values["seed"]:
+            raise ValueError("--training-manifest seed must exactly match --seed")
+    else:
+        manifest = generate_manifest(
+            "train",
+            manifest_seed=values["seed"],
+            episode_count=values["episodes"],
+            num_gt=args.roi_count,
+        )
     validate_manifest_initial_topologies(
         manifest, episode_count=values["episodes"]
     )
@@ -589,7 +737,7 @@ def run(args):
         episode_seconds=values["episode_seconds"],
         random_seed=values["seed"],
         warmup_joint_transitions=(
-            0
+            (2 if is_rnd_method(method) else 0)
             if args.smoke
             else FORMAL_EXPERIMENT_DEFAULTS["movement_hyperparameters"]["warmup_joint_transitions"]
         ),
@@ -613,6 +761,10 @@ def run(args):
     )
     manifest.save(run_dir / "scenario_manifest.json")
     resolved = _base_resolved(run_dir, method, manifest, config, values, args, git_sha)
+    if training_manifest_path is not None:
+        resolved["training_manifest_source"] = str(
+            Path(training_manifest_path).resolve()
+        )
     if llm_design is not None:
         resolved["llm_artifact_identity"] = artifact_identity(llm_design)
         resolved["llm_artifact_path"] = "llm_artifact"
@@ -628,6 +780,8 @@ def run(args):
             llm_artifact_dir=(llm_design.directory if llm_design is not None else None),
             llm_worker_timeout=getattr(args, "llm_worker_timeout", 60.0),
             episode_observer=_llm_episode_observer(run_dir, method),
+            rnd_config=resolved.get("rnd_config"),
+            checkpoint_episodes=resolved.get("checkpoint_episodes"),
         )
         resolved.update(
             status="COMPLETED",
@@ -846,6 +1000,9 @@ def run_resume(args):
         [],
         completed_episode_limit=plan.resume_episode,
     )
+    _reconcile_rnd_training_episode_metrics(
+        run_dir, method, plan.resume_episode
+    )
     reconciliation = execute_resume_reconciliation(plan)
     if extension_provenance is not None:
         if not active_manifest_path.exists():
@@ -916,6 +1073,8 @@ def run_resume(args):
                 resolved.get("llm_worker_timeout_seconds", 60.0)
             ),
             episode_observer=_llm_episode_observer(run_dir, method),
+            rnd_config=resolved.get("rnd_config"),
+            checkpoint_episodes=resolved.get("checkpoint_episodes"),
         )
         resolved.update(
             status="COMPLETED",
@@ -1067,6 +1226,7 @@ def run_evaluate(args):
         llm_worker_timeout=float(
             resolved.get("llm_worker_timeout_seconds", 60.0)
         ),
+        rnd_config=resolved.get("rnd_config"),
     )
     formal_evaluation = bool(
         not args.smoke

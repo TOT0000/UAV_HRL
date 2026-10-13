@@ -72,7 +72,13 @@ NEW_METHODS = (
     "td3_dinkelbach_random_routing",
     "td3_dinkelbach_dqn_wo_ta",
 )
-EXPECTED_METHODS = (EXISTING_METHODS[0],) + LLM_METHODS + EXISTING_METHODS[1:] + NEW_METHODS
+EXPECTED_METHODS = (
+    (EXISTING_METHODS[0],)
+    + ("td3_dinkelbach_rnd_collect",)
+    + LLM_METHODS
+    + EXISTING_METHODS[1:]
+    + NEW_METHODS
+)
 
 
 class ControlledMethodRegistryTest(unittest.TestCase):
@@ -121,12 +127,13 @@ class ControlledMethodRegistryTest(unittest.TestCase):
         for key in tuple(key for key in EXPECTED_METHODS if key not in LLM_METHODS):
             with self.subTest(method=key):
                 spec = MethodSpec.parse(key)
+                rnd_method = key == "td3_dinkelbach_rnd_collect"
                 result = train(
                     TrainingConfig(
                         total_episodes=1,
                         mode="smoke",
-                        episode_seconds=1,
-                        warmup_joint_transitions=0,
+                        episode_seconds=2 if rnd_method else 1,
+                        warmup_joint_transitions=2 if rnd_method else 0,
                         routing_warmup_transitions=1,
                         batch_size=1,
                         enable_model_checkpoints=False,
@@ -141,7 +148,7 @@ class ControlledMethodRegistryTest(unittest.TestCase):
                 self.assertEqual(result["movement_agent_kind"], spec.agent)
                 self.assertEqual(result["movement_state_dim"], 531)
                 self.assertEqual(result["joint_action_dim"], 48)
-                self.assertEqual(result["proposal_batches"], 4)
+                self.assertEqual(result["proposal_batches"], 8 if rnd_method else 4)
                 self.assertIsNone(result["packet_outcome_artifacts"])
                 metadata = result["run_metadata"]
                 self.assertFalse(metadata["collect_packet_outcomes"])
@@ -169,7 +176,9 @@ class ControlledMethodRegistryTest(unittest.TestCase):
                     metadata["routing_warmup_counter_source"],
                     "routing_replay_size" if spec.learns_routing else None,
                 )
-                self.assertEqual(metadata["routing_slots_per_episode"], 4)
+                self.assertEqual(
+                    metadata["routing_slots_per_episode"], 8 if rnd_method else 4
+                )
                 self.assertEqual(
                     metadata["fov_com_pair_max_distance_m"],
                     FOV_COM_PAIR_MAX_DISTANCE_M,
@@ -194,7 +203,9 @@ class ControlledMethodRegistryTest(unittest.TestCase):
                     self.assertEqual(result["routing_target_update_count"], 0)
                 else:
                     self.assertGreaterEqual(result["routing_replay_size"], 0)
-                    self.assertEqual(result["routing_slots_executed"], 4)
+                    self.assertEqual(
+                        result["routing_slots_executed"], 8 if rnd_method else 4
+                    )
                     # A one-second scenario can legitimately have no admitted
                     # routing packet under the canonical SR lifecycle. The
                     # learner updates once only when replay was ready at the

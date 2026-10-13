@@ -297,6 +297,8 @@ class TD3():
         reward_mode="dinkelbach",
         task_potential_enabled=True,
         llm_reward_beta=0.0,
+        intrinsic_reward_fn=None,
+        intrinsic_eta=0.0,
     ):
         (
             state,
@@ -325,6 +327,20 @@ class TD3():
         not_done = not_done.to(device)
         current_movement_mask = current_movement_mask.to(device)
         next_movement_mask = next_movement_mask.to(device)
+
+        original_reward = reward.detach().clone()
+        intrinsic_reward = None
+        if intrinsic_reward_fn is not None:
+            with torch.no_grad():
+                intrinsic_reward = intrinsic_reward_fn(next_state)
+                if intrinsic_reward.shape != reward.shape:
+                    raise RuntimeError(
+                        "intrinsic reward shape disagrees with TD3 reward batch: "
+                        f"{tuple(intrinsic_reward.shape)} != {tuple(reward.shape)}"
+                    )
+                if not torch.isfinite(intrinsic_reward).all():
+                    raise RuntimeError("intrinsic reward batch contains NaN or Inf")
+                reward = reward + float(intrinsic_eta) * intrinsic_reward
 
         with torch.no_grad():
             raw_target_action = self.actor_target(next_state)
@@ -406,6 +422,13 @@ class TD3():
             "actor_loss": actor_loss_value,
             "current_movement_mask": current_movement_mask.detach().cpu(),
             "next_movement_mask": next_movement_mask.detach().cpu(),
+            "original_reward": original_reward.detach().cpu(),
+            "intrinsic_reward": (
+                None
+                if intrinsic_reward is None
+                else intrinsic_reward.detach().cpu()
+            ),
+            "training_reward": reward.detach().cpu(),
         }
         return actor_updated
 
