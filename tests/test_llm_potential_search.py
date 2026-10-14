@@ -1,3 +1,4 @@
+import copy
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -42,6 +43,57 @@ def _block():
         "potential_components": [{"name": "fixture"}],
         "exploration": [],
     }
+
+
+def _detailed_block(start, *, component_count=4):
+    def moments(mean, *, missing=False):
+        count = 0 if missing else 3000
+        return {
+            "count": count,
+            "sum": mean * count,
+            "sum_of_squares": abs(mean) * count,
+            "sum_of_absolute_values": abs(mean) * count,
+            "missing": missing,
+            "mean": None if missing else mean,
+            "standard_deviation": None if missing else abs(mean) / 10.0,
+            "mean_absolute": None if missing else abs(mean),
+        }
+
+    block = _block()
+    block.update(
+        episode_range=[start, start + 49],
+        vs_delay_violation_probability={
+            "denominator": "pooled eligible end-to-end packets",
+            "eligible_packets": 11,
+            "violated_packets": 2,
+            "value": 2 / 11,
+            "missing": False,
+        },
+        com_delay_violation_probability={
+            "denominator": "pooled eligible end-to-end packets",
+            "eligible_packets": 0,
+            "violated_packets": 0,
+            "value": None,
+            "missing": True,
+        },
+        raw_step_reward_absolute_mean=1.23456789e-8,
+        actor_updates=123,
+        critic_updates=456,
+        dinkelbach_lambda_range=[-1.23456789e-8, 2.34567891e-7],
+        potential_components=[
+            {
+                "index": index,
+                "name": f"component_{index}",
+                "weighted_potential": moments(
+                    (-1.0 if index == 0 else 1.0) * (index + 1) * 1.23456789e-8
+                ),
+                "ordinary_shaping": moments((index + 1) * 2.34567891e-7),
+                "terminal_shaping": moments(0.0, missing=(index == 3)),
+            }
+            for index in range(component_count)
+        ],
+    )
+    return block
 
 
 def _install_search_mocks(monkeypatch, tmp_path):
@@ -820,6 +872,71 @@ def test_direction_resolution_reports_unconfirmed_control_flow_without_rejection
     assert result["unconfirmed_checks"][0]["status"] == "unconfirmed_not_rejected"
 
 
+def test_compact_training_feedback_keeps_all_blocks_components_and_stat_groups():
+    candidates = {}
+    for candidate_index in range(1, 5):
+        candidate_id = f"r01_c{candidate_index:02d}"
+        candidates[candidate_id] = {
+            "candidate_id": candidate_id,
+            "status": "completed",
+            "training": {
+                "status": "complete",
+                "summaries": [
+                    _detailed_block(start) for start in range(1, 401, 50)
+                ],
+            },
+            "evaluation": {
+                "status": "complete",
+                "mean_episode_energy_efficiency_mbit_per_j": candidate_index * 1e-7,
+            },
+        }
+    round_record = {
+        "round": 1,
+        "candidate_order": list(candidates),
+        "candidates": candidates,
+    }
+    raw_before = copy.deepcopy(round_record)
+
+    _results, training = search._latest_round_feedback(round_record)
+
+    assert training["format_version"] == search.TRAINING_FEEDBACK_FORMAT_VERSION
+    assert training["component_stat_group_order"] == [
+        "weighted_potential",
+        "ordinary_shaping",
+        "terminal_shaping",
+    ]
+    assert training["component_stat_field_order_within_each_group"] == [
+        "count",
+        "missing",
+        "mean",
+        "standard_deviation",
+        "mean_absolute",
+    ]
+    assert len(training["candidates"]) == 4
+    for candidate in training["candidates"]:
+        assert len(candidate["block_rows"]) == 8
+        assert candidate["component_index_to_name"] == [
+            f"component_{index}" for index in range(4)
+        ]
+        assert len(candidate["component_rows"]) == 32
+        assert {row[0] for row in candidate["component_rows"]} == set(range(8))
+        assert {row[1] for row in candidate["component_rows"]} == set(range(4))
+
+    first = training["candidates"][0]
+    first_component = first["component_rows"][0]
+    assert first_component[4] == pytest.approx(-1.23457e-8)
+    assert first_component[9] == pytest.approx(2.34568e-7)
+    missing_terminal = first["component_rows"][3]
+    assert missing_terminal[12:17] == [0, True, None, None, None]
+    assert first["block_rows"][0][20] == pytest.approx(1.23457e-8)
+    assert first["block_rows"][0][27:] == pytest.approx(
+        [-1.23457e-8, 2.34568e-7]
+    )
+    assert round_record == raw_before
+    assert "sum_of_squares" in json.dumps(round_record)
+    assert "sum_of_squares" not in json.dumps(training)
+
+
 def test_model_adapter_receives_each_complete_long_candidate_definition_once(
     tmp_path, monkeypatch
 ):
@@ -882,6 +999,9 @@ def test_model_adapter_receives_each_complete_long_candidate_definition_once(
     assert '"mean_episode_energy_efficiency_mbit_per_j": 1.0' in (
         first_revision_prompt
     )
+    assert search.TRAINING_FEEDBACK_FORMAT_VERSION in first_revision_prompt
+    assert "component_stat_group_order" in first_revision_prompt
+    assert "sum_of_squares" not in first_revision_prompt
 
 
 def test_context_budget_pause_saves_full_prompt_and_does_not_call_model(
@@ -939,6 +1059,111 @@ def test_context_budget_pause_saves_full_prompt_and_does_not_call_model(
         in prompt
         for index in range(1, 5)
     )
+
+
+def test_legacy_oversized_pending_request_resumes_with_compact_prompt_once(
+    tmp_path, monkeypatch
+):
+    model_calls, training_calls, evaluation_calls, train, evaluate, baseline = (
+        _install_search_mocks(monkeypatch, tmp_path)
+    )
+    budget_calls = 0
+
+    def pause_on_first_revision(_prompt, **_kwargs):
+        nonlocal budget_calls
+        budget_calls += 1
+        return {
+            "fits_client_budget": budget_calls <= 4,
+            "method": "fixture_exact",
+            "exact": True,
+            "estimated_input_tokens": 1,
+        }
+
+    monkeypatch.setattr(search, "estimate_token_budget", pause_on_first_revision)
+    output = tmp_path / "search-legacy-feedback"
+    kwargs = dict(
+        validation_sources=[tmp_path / "validation"],
+        baseline_run=tmp_path / "baseline-run",
+        baseline_evaluation=tmp_path / "baseline-eval",
+        provider="openai",
+        model="fixture-model",
+        context_length=128000,
+        output_dir=output,
+        runtime_root=tmp_path / "runtime-legacy-feedback",
+        max_rounds=2,
+        client=object(),
+        training_runner=train,
+        evaluation_runner=evaluate,
+        baseline_validator=baseline,
+    )
+    paused = search.run_potential_search(**kwargs)
+    assert paused["status"] == "paused_context_budget_exceeded"
+    assert len(model_calls) == len(training_calls) == len(evaluation_calls) == 4
+
+    state_path = output / "state.json"
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    pending = state["current_round"]["candidates"]["r02_c01"]
+    legacy_stage = ("LEGACY_EXPANDED_TRAINING_FEEDBACK\n" * 2000).rstrip()
+    legacy_request = "COMMON r02_c01\n\n" + legacy_stage + "\n"
+    pending["generation_stage_request"] = legacy_stage
+    pending["generation_request"] = legacy_request
+    pending["generation_prompt_metadata"] = {
+        "prompt_version": search.SEARCH_PROMPT_VERSION,
+        "generation_request_sha256": search._sha256_text(legacy_request),
+    }
+    pending["generation_request_migrations"] = []
+    state_path.write_text(json.dumps(state), encoding="utf-8")
+
+    resumed_prompts = []
+
+    def call_model(*, prompt, **_kwargs):
+        resumed_prompts.append(prompt)
+        marker = prompt.split("COMMON ", 1)[1].split()[0]
+        return {
+            "content": json.dumps(_submission(marker)),
+            "transport_completed": True,
+            "finish_reason": "stop",
+        }
+
+    monkeypatch.setattr(search, "_call_model", call_model)
+    monkeypatch.setattr(
+        search,
+        "estimate_token_budget",
+        lambda _prompt, **_kwargs: {
+            "fits_client_budget": True,
+            "method": "fixture_exact",
+            "exact": True,
+            "estimated_input_tokens": 1,
+        },
+    )
+    completed = search.run_potential_search(resume=output, **kwargs)
+    assert completed["status"] == "complete"
+    assert len(resumed_prompts) == 4
+    assert search.TRAINING_FEEDBACK_FORMAT_VERSION in resumed_prompts[0]
+    assert "LEGACY_EXPANDED_TRAINING_FEEDBACK" not in resumed_prompts[0]
+    assert len(legacy_request) > len(resumed_prompts[0])
+    assert len(training_calls) == len(evaluation_calls) == 8
+
+    migrated_state = json.loads(state_path.read_text(encoding="utf-8"))
+    assert migrated_state["model_calls"] == 8
+    migrated = migrated_state["rounds"][1]["candidates"]["r02_c01"]
+    assert len(migrated["generation_request_migrations"]) == 1
+    migration = migrated["generation_request_migrations"][0]
+    assert migration["from_training_feedback_format_version"] == "legacy-expanded-json"
+    assert migration["to_training_feedback_format_version"] == (
+        search.TRAINING_FEEDBACK_FORMAT_VERSION
+    )
+    assert Path(migration["old_request_archive"]).read_text(encoding="utf-8") == (
+        legacy_request
+    )
+
+    before_counts = (len(resumed_prompts), len(training_calls), len(evaluation_calls))
+    repeated = search.run_potential_search(resume=output, **kwargs)
+    assert repeated["status"] == "complete"
+    assert (len(resumed_prompts), len(training_calls), len(evaluation_calls)) == before_counts
+    repeated_state = json.loads(state_path.read_text(encoding="utf-8"))
+    repeated_record = repeated_state["rounds"][1]["candidates"]["r02_c01"]
+    assert len(repeated_record["generation_request_migrations"]) == 1
 
 
 def test_previous_prompt_version_is_migrated_for_resume(tmp_path):

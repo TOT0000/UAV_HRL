@@ -82,6 +82,8 @@ SUPPORTED_LEGACY_PROMPT_VERSIONS = {
     LEGACY_PROMPT_VERSION,
 }
 PROMPT_MIGRATION_ID = "complete-candidate-feedback-v3"
+TRAINING_FEEDBACK_FORMAT_VERSION = "compact-potential-training-feedback-v2"
+PROMPT_DISPLAY_SIGNIFICANT_DIGITS = 6
 SEARCH_METHOD_ID = "td3_dinkelbach_llm_potential"
 DEFAULT_OUTPUT_ROOT = Path("results") / "llm_potential_searches"
 DEFAULT_RUNTIME_ROOT = Path.home() / "uav_hrl_rt"
@@ -93,6 +95,50 @@ DEFAULT_EVALUATION_ROI_COUNT = 8
 DEFAULT_EPISODE_SECONDS = 60
 DEFAULT_VALIDATION_EPISODES = 4
 ROUND_DIRECTIONS = ("add", "remove", "reweight", "redesign")
+
+_TRAINING_BLOCK_COLUMNS = (
+    "episode_start",
+    "episode_end",
+    "episode_count",
+    "step_count",
+    "ee_mbit_per_j_mean",
+    "ee_mbit_per_j_std",
+    "timely_delivery_mbit_mean",
+    "timely_delivery_mbit_std",
+    "movement_energy_j_mean",
+    "movement_energy_j_std",
+    "vs_delay_violation_probability",
+    "vs_delay_missing",
+    "vs_eligible_packets",
+    "vs_violated_packets",
+    "com_delay_violation_probability",
+    "com_delay_missing",
+    "com_eligible_packets",
+    "com_violated_packets",
+    "raw_reward_sum_mean",
+    "raw_reward_sum_std",
+    "raw_step_reward_absolute_mean",
+    "shaping_sum_mean",
+    "shaping_sum_std",
+    "training_reward_sum_mean",
+    "training_reward_sum_std",
+    "actor_updates",
+    "critic_updates",
+    "dinkelbach_lambda_min",
+    "dinkelbach_lambda_max",
+)
+_COMPONENT_STAT_GROUPS = (
+    "weighted_potential",
+    "ordinary_shaping",
+    "terminal_shaping",
+)
+_COMPONENT_STAT_FIELDS = (
+    "count",
+    "missing",
+    "mean",
+    "standard_deviation",
+    "mean_absolute",
+)
 
 ROOT = Path(__file__).resolve().parent
 PROMPT_ROOT = ROOT / "prompts"
@@ -726,30 +772,70 @@ def _exploration_parameter_summary(
     }
 
 
-def _compact_training_blocks(record: dict[str, Any]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+def _prompt_display_number(value: Any) -> Any:
+    """Round only an LLM-facing numeric copy; saved measurements stay untouched."""
+
+    if isinstance(value, (bool, np.bool_)) or value is None:
+        return value
+    if isinstance(value, (int, np.integer)):
+        return int(value)
+    if isinstance(value, (float, np.floating)):
+        numeric = float(value)
+        if not np.isfinite(numeric):
+            return None
+        return float(f"{numeric:.{PROMPT_DISPLAY_SIGNIFICANT_DIGITS}g}")
+    return value
+
+
+def _prompt_display_tree(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {key: _prompt_display_tree(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_prompt_display_tree(item) for item in value]
+    return _prompt_display_number(value)
+
+
+def _distribution_values(value: Any) -> list[Any]:
+    value = value if isinstance(value, dict) else {}
+    return [
+        _prompt_display_number(value.get("mean")),
+        _prompt_display_number(value.get("standard_deviation")),
+    ]
+
+
+def _violation_values(value: Any) -> list[Any]:
+    value = value if isinstance(value, dict) else {}
+    return [
+        _prompt_display_number(value.get("value")),
+        bool(value.get("missing", value.get("value") is None)),
+        value.get("eligible_packets"),
+        value.get("violated_packets"),
+    ]
+
+
+def _component_stat_values(value: Any) -> list[Any]:
+    value = value if isinstance(value, dict) else {}
+    count = value.get("count", 0)
+    missing = bool(value.get("missing", not count))
+    return [
+        int(count) if isinstance(count, (int, np.integer)) else count,
+        missing,
+        _prompt_display_number(value.get("mean")),
+        _prompt_display_number(value.get("standard_deviation")),
+        _prompt_display_number(value.get("mean_absolute")),
+    ]
+
+
+def _compact_training_blocks(
+    record: dict[str, Any],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Build a column-oriented prompt copy without changing mergeable raw stats."""
+
     summaries = (record.get("training") or {}).get("summaries") or []
     ordered_rows = _load_ordered_training_rows(record)
     compact_blocks = []
     exploration_blocks = []
-    retained = (
-        "episode_range",
-        "episode_count",
-        "step_count",
-        "energy_efficiency_mbit_per_j",
-        "timely_useful_delivery_mbit",
-        "movement_energy_j",
-        "vs_delay_violation_probability",
-        "com_delay_violation_probability",
-        "raw_reward_sum",
-        "raw_step_reward_absolute_mean",
-        "shaping_sum",
-        "training_reward_sum",
-        "actor_updates",
-        "critic_updates",
-        "dinkelbach_lambda_range",
-        "potential_components",
-    )
-    for block in summaries:
+    for block_index, block in enumerate(summaries):
         episode_range = list(block.get("episode_range") or [])
         values: list[dict[str, Any] | None]
         ordered = False
@@ -767,8 +853,50 @@ def _compact_training_blocks(record: dict[str, Any]) -> tuple[list[dict[str, Any
             values = []
         if not values:
             values = [_decode_exploration(item) for item in block.get("exploration") or []]
+        start = episode_range[0] if len(episode_range) == 2 else None
+        end = episode_range[1] if len(episode_range) == 2 else None
+        lambda_range = list(block.get("dinkelbach_lambda_range") or [])
+        summary_row = [
+            start,
+            end,
+            block.get("episode_count"),
+            block.get("step_count"),
+            *_distribution_values(block.get("energy_efficiency_mbit_per_j")),
+            *_distribution_values(block.get("timely_useful_delivery_mbit")),
+            *_distribution_values(block.get("movement_energy_j")),
+            *_violation_values(block.get("vs_delay_violation_probability")),
+            *_violation_values(block.get("com_delay_violation_probability")),
+            *_distribution_values(block.get("raw_reward_sum")),
+            _prompt_display_number(block.get("raw_step_reward_absolute_mean")),
+            *_distribution_values(block.get("shaping_sum")),
+            *_distribution_values(block.get("training_reward_sum")),
+            block.get("actor_updates"),
+            block.get("critic_updates"),
+            _prompt_display_number(lambda_range[0]) if len(lambda_range) == 2 else None,
+            _prompt_display_number(lambda_range[1]) if len(lambda_range) == 2 else None,
+        ]
+        components = list(block.get("potential_components") or [])
+        component_rows = []
+        component_names = []
+        for component_index, component in enumerate(components):
+            component_names.append(component.get("name", f"component_{component_index}"))
+            component_rows.append(
+                [
+                    block_index,
+                    int(component.get("index", component_index)),
+                    *(
+                        item
+                        for group in _COMPONENT_STAT_GROUPS
+                        for item in _component_stat_values(component.get(group))
+                    ),
+                ]
+            )
         compact_blocks.append(
-            {key: copy.deepcopy(block.get(key)) for key in retained if key in block}
+            {
+                "summary_row": summary_row,
+                "component_names": component_names,
+                "component_rows": component_rows,
+            }
         )
         exploration_blocks.append(
             {
@@ -778,7 +906,9 @@ def _compact_training_blocks(record: dict[str, Any]) -> tuple[list[dict[str, Any
                     if ordered
                     else "legacy distinct exploration list; episode order unavailable"
                 ),
-                "summary": _exploration_parameter_summary(values, ordered=ordered),
+                "summary": _prompt_display_tree(
+                    _exploration_parameter_summary(values, ordered=ordered)
+                ),
             }
         )
     return compact_blocks, exploration_blocks
@@ -818,7 +948,8 @@ def _compact_historical_training(record: dict[str, Any]) -> dict[str, Any]:
     for row in rows:
         raw_steps.merge(MergeableMoments.from_dict(row["raw_step_reward"]))
     names = list(rows[0].get("component_names") or ())
-    return {
+    component_summaries = summarize_component_records(rows, component_names=names)
+    return _prompt_display_tree({
         "source": "potential_training_episode_metrics.jsonl",
         "scope": {
             "first_episode": int(rows[0]["episode"]),
@@ -834,7 +965,9 @@ def _compact_historical_training(record: dict[str, Any]) -> dict[str, Any]:
         "vs_delay_violation_probability": violation("fov"),
         "com_delay_violation_probability": violation("com"),
         "raw_reward_sum": distribution("raw_reward_sum"),
-        "raw_step_reward": raw_steps.to_dict(),
+        "raw_step_reward_absolute_mean": (
+            raw_steps.to_dict().get("mean_absolute")
+        ),
         "shaping_sum": distribution("shaping_sum"),
         "training_reward_sum": distribution("training_reward_sum"),
         "actor_updates": sum(int(row["actor_updates"]) for row in rows),
@@ -843,14 +976,26 @@ def _compact_historical_training(record: dict[str, Any]) -> dict[str, Any]:
             min(float(row["dinkelbach_lambda_used"]) for row in rows),
             max(float(row["dinkelbach_lambda_used"]) for row in rows),
         ],
-        "potential_components": summarize_component_records(
-            rows, component_names=names
-        ),
+        "component_index_to_name": [item.get("name") for item in component_summaries],
+        "component_stat_group_order": list(_COMPONENT_STAT_GROUPS),
+        "component_stat_field_order_within_each_group": list(_COMPONENT_STAT_FIELDS),
+        "component_rows": [
+            [
+                int(item.get("index", index)),
+                *(
+                    stat
+                    for group in _COMPONENT_STAT_GROUPS
+                    for stat in _component_stat_values(item.get(group))
+                ),
+            ]
+            for index, item in enumerate(component_summaries)
+        ],
         "reduction": (
             "all episode rows merged from count, sum, sum-of-squares, and "
-            "sum-of-absolute-values; no standard deviations were averaged"
+            "sum-of-absolute-values; prompt rows show derived count/missing/mean/"
+            "standard-deviation/mean-absolute only and no standard deviations were averaged"
         ),
-    }
+    })
 
 
 def _compact_fairness(record: dict[str, Any]) -> dict[str, Any]:
@@ -896,11 +1041,25 @@ def _latest_round_feedback(
             }
         )
         blocks, exploration = _compact_training_blocks(record)
+        component_names: list[str] = []
+        block_rows = []
+        component_rows = []
+        for block in blocks:
+            block_rows.append(block["summary_row"])
+            if not component_names:
+                component_names = list(block["component_names"])
+            elif component_names != list(block["component_names"]):
+                raise PotentialSearchError(
+                    f"saved training component order changed across blocks for {candidate_id}"
+                )
+            component_rows.extend(block["component_rows"])
         training_candidates.append(
             {
                 "candidate_id": candidate_id,
                 "status": (record.get("training") or {}).get("status"),
-                "blocks": blocks,
+                "component_index_to_name": component_names,
+                "block_rows": block_rows,
+                "component_rows": component_rows,
                 "failure": record.get("failure"),
             }
         )
@@ -923,17 +1082,32 @@ def _latest_round_feedback(
     )
     if shared_exploration is None:
         for item in training_candidates:
-            item["exploration_by_block"] = exploration_by_candidate[item["candidate_id"]]
+            item["exploration_by_block"] = _prompt_display_tree(
+                exploration_by_candidate[item["candidate_id"]]
+            )
     if shared_fairness is None:
         for item in training_candidates:
-            item["fairness"] = fairness_by_candidate[item["candidate_id"]]
+            item["fairness"] = _prompt_display_tree(
+                fairness_by_candidate[item["candidate_id"]]
+            )
     training = {
+        "format_version": TRAINING_FEEDBACK_FORMAT_VERSION,
+        "display_precision": (
+            f"{PROMPT_DISPLAY_SIGNIFICANT_DIGITS} significant digits for prompt-only "
+            "floating-point display; integers are exact and null means unavailable. "
+            "Saved raw statistics retain full precision."
+        ),
         "reward_history_semantics": (
             "raw reward uses the episode lambda; weighted potential and shaping "
             "components are separate mergeable measurements"
         ),
-        "shared_fairness_and_training_contract": shared_fairness,
-        "shared_exploration_by_block": shared_exploration,
+        "block_column_order": list(_TRAINING_BLOCK_COLUMNS),
+        "delay_violation_denominator": "pooled eligible end-to-end packets",
+        "component_row_prefix": ["zero_based_block_index", "component_index"],
+        "component_stat_group_order": list(_COMPONENT_STAT_GROUPS),
+        "component_stat_field_order_within_each_group": list(_COMPONENT_STAT_FIELDS),
+        "shared_fairness_and_training_contract": _prompt_display_tree(shared_fairness),
+        "shared_exploration_by_block": _prompt_display_tree(shared_exploration),
         "candidates": training_candidates,
     }
     return results, training
@@ -1026,11 +1200,17 @@ def _generation_stage_prompt_parts(
         ensure_ascii=False,
     )
     latest_results_text = json.dumps(latest_results, indent=2, ensure_ascii=False)
-    latest_training_text = json.dumps(latest_training, indent=2, ensure_ascii=False)
+    latest_training_text = json.dumps(
+        latest_training,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
     historical_text = json.dumps(
         _historical_summaries(state, exclude_round=int(latest["round"])),
-        indent=2,
         ensure_ascii=False,
+        separators=(",", ":"),
+        allow_nan=False,
     )
     current_round_text = json.dumps(
         [
@@ -2312,6 +2492,7 @@ def _prepare_generation_request(
     sections["request_scaffolding"] = len(request) - sum(sections.values())
     metadata = {
         "prompt_version": SEARCH_PROMPT_VERSION,
+        "training_feedback_format_version": TRAINING_FEEDBACK_FORMAT_VERSION,
         "common_contract_sha256": _sha256_text(common.rstrip()),
         "generation_stage_sha256": _sha256_text(stage),
         "generation_request_sha256": _sha256_text(request),
@@ -2342,6 +2523,8 @@ def _prepare_generation_request(
             )
     already_current = (
         old_metadata.get("prompt_version") == SEARCH_PROMPT_VERSION
+        and old_metadata.get("training_feedback_format_version")
+        == TRAINING_FEEDBACK_FORMAT_VERSION
         and old_metadata.get("generation_request_sha256")
         == metadata["generation_request_sha256"]
     )
@@ -2368,6 +2551,10 @@ def _prepare_generation_request(
                 "prompt_version", LEGACY_PROMPT_VERSION
             ),
             "to_prompt_version": SEARCH_PROMPT_VERSION,
+            "from_training_feedback_format_version": old_metadata.get(
+                "training_feedback_format_version", "legacy-expanded-json"
+            ),
+            "to_training_feedback_format_version": TRAINING_FEEDBACK_FORMAT_VERSION,
             "old_generation_request_sha256": old_hash,
             "old_generation_stage_sha256": old_stage_hash,
             "new_generation_request_sha256": metadata[
@@ -2378,8 +2565,9 @@ def _prepare_generation_request(
                 str(stage_path.resolve()) if stage_path is not None else None
             ),
             "reason": (
-                "unsent cached request rebuilt with complete deduplicated candidate "
-                "definitions and structured feedback"
+                "unsent cached request rebuilt from unchanged raw records using compact "
+                "column-oriented training feedback; complete candidate definitions and "
+                "evaluation results remain authoritative"
             ),
         }
         migrations = record.setdefault("generation_request_migrations", [])
@@ -2444,6 +2632,7 @@ def _save_prompt_budget_report(
     report = {
         "schema_version": "uav-hrl-llm-potential-search-prompt-budget-v1",
         "prompt_version": SEARCH_PROMPT_VERSION,
+        "training_feedback_format_version": TRAINING_FEEDBACK_FORMAT_VERSION,
         "candidate_id": candidate_id,
         "request_kind": "repair" if repair else "generation",
         "prompt_sha256": prompt_hash,
@@ -2985,6 +3174,7 @@ def run_potential_search(
                 sections=prompt_sections,
                 repair=repair,
             )
+            record["last_token_budget"] = budget
             if not budget["fits_client_budget"]:
                 largest_sections = [
                     {"section": name, "characters": int(size)}
@@ -2997,7 +3187,6 @@ def run_potential_search(
                     f"required complete prompt for {candidate_id} does not fit the configured "
                     f"context; largest sections: {largest_sections}"
                 )
-                record["last_token_budget"] = budget
                 record["context_budget_stop"] = {
                     "reason": "complete_candidate_formulas_and_required_feedback_do_not_fit",
                     "request_was_sent": False,
@@ -3007,6 +3196,10 @@ def run_potential_search(
                 }
                 _save_state(output, state)
                 return _result(state)
+            record.pop("context_budget_stop", None)
+            if state.get("status") == "paused_context_budget_exceeded":
+                state["status"] = "running"
+                state.pop("stop_reason", None)
             state["model_calls"] += 1
             model_root = _short_runtime_output_root(
                 runtime_root,
