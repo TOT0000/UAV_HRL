@@ -75,14 +75,16 @@ from scenario_manifest import ScenarioManifest
 
 
 SEARCH_RUN_SCHEMA_VERSION = "uav-hrl-llm-potential-search-run-v1"
-SEARCH_PROMPT_VERSION = "uav-hrl-llm-potential-search-prompt-v2"
+SEARCH_PROMPT_VERSION = "uav-hrl-llm-potential-search-prompt-v3"
 LEGACY_PROMPT_VERSION = "uav-hrl-llm-potential-search-prompt-v1"
 SUPPORTED_LEGACY_PROMPT_VERSIONS = {
     "uav-hrl-llm-potential-search-prompt-v0",
     LEGACY_PROMPT_VERSION,
+    "uav-hrl-llm-potential-search-prompt-v2",
 }
-PROMPT_MIGRATION_ID = "complete-candidate-feedback-v3"
+PROMPT_MIGRATION_ID = "structured-repair-feedback-v4"
 TRAINING_FEEDBACK_FORMAT_VERSION = "compact-potential-training-feedback-v2"
+VALIDATION_FEEDBACK_FORMAT_VERSION = "potential-validation-feedback-v2"
 PROMPT_DISPLAY_SIGNIFICANT_DIGITS = 6
 SEARCH_METHOD_ID = "td3_dinkelbach_llm_potential"
 DEFAULT_OUTPUT_ROOT = Path("results") / "llm_potential_searches"
@@ -1296,11 +1298,19 @@ def _base_generation_prompt(
 
 
 def _repair_prompt(
-    *, common: str, record: dict[str, Any], duplicate: bool
+    *,
+    common: str,
+    record: dict[str, Any],
+    duplicate: bool,
+    reference_candidate: dict[str, Any] | None = None,
 ) -> str:
     generation_stage = record.get(
         "active_generation_stage_request", record["generation_stage_request"]
     )
+    validation_feedback = _repair_validation_feedback(
+        record, reference_candidate=reference_candidate
+    )
+    rendered_feedback = _render_repair_feedback(validation_feedback)
     if duplicate:
         stage = _render_stage(
             DUPLICATE_REPAIR_TEMPLATE,
@@ -1310,16 +1320,11 @@ def _repair_prompt(
                 "DUPLICATE_CANDIDATE": json.dumps(
                     record.get("last_submission"), indent=2, ensure_ascii=False
                 ),
-                "DUPLICATE_DIAGNOSTICS": json.dumps(
-                    record.get("last_validation"), indent=2, ensure_ascii=False
-                ),
+                "DUPLICATE_DIAGNOSTICS": rendered_feedback,
             },
         )
     else:
         failed_response = _load_failed_response_material(record)
-        validation_feedback = _repair_validation_feedback(
-            record.get("last_validation")
-        )
         stage = _render_stage(
             VALIDATION_REPAIR_TEMPLATE,
             {
@@ -1328,9 +1333,7 @@ def _repair_prompt(
                 "FAILED_RESPONSE_MATERIAL": json.dumps(
                     failed_response, indent=2, ensure_ascii=False
                 ),
-                "VALIDATION_FEEDBACK": json.dumps(
-                    validation_feedback, indent=2, ensure_ascii=False
-                ),
+                "VALIDATION_FEEDBACK": rendered_feedback,
                 "UNRESOLVED_CHECKS": json.dumps(
                     (record.get("last_validation") or {}).get(
                         "unresolved_checks", []
@@ -1486,6 +1489,11 @@ def _exception_details(
         "type": type(exc).__name__,
         "message": _replace_adapter_function_name(str(exc)),
     }
+    structured_issues = getattr(exc, "issues", None)
+    if isinstance(structured_issues, list):
+        details["issues"] = _replace_adapter_function_name(
+            copy.deepcopy(structured_issues)
+        )
     if isinstance(exc, CandidateExecutionError):
         if isinstance(exc.report, dict):
             details["execution_report"] = copy.deepcopy(exc.report)
@@ -1520,12 +1528,47 @@ def _exception_details(
     return details
 
 
-def _repair_validation_feedback(validation: dict[str, Any] | None) -> dict[str, Any]:
-    """Bound execution feedback without dropping any distinct reported root cause."""
+_FEEDBACK_STAGE_ORDER = {
+    "parsing": 0,
+    "schema": 1,
+    "static": 2,
+    "execution": 3,
+    "duplicate": 4,
+    "direction": 5,
+}
 
-    validation = validation or {}
-    if validation.get("stage") != "execution":
-        return copy.deepcopy(validation)
+
+def _feedback_issue(
+    *,
+    stage: str,
+    error_code: str,
+    location: Any,
+    expected: str,
+    observed: str,
+    repair_requirement: str,
+    evidence: Any = None,
+    check_id: str | None = None,
+    analysis_limit: str | None = None,
+) -> dict[str, Any]:
+    issue = {
+        "stage": stage,
+        "error_code": error_code,
+        "check_id": check_id or f"{stage}.{error_code.lower()}",
+        "location": location or "location unavailable",
+        "expected": expected,
+        "observed": observed,
+        "repair_requirement": repair_requirement,
+    }
+    if evidence not in (None, {}, []):
+        issue["evidence"] = evidence
+    if analysis_limit:
+        issue["analysis_limit"] = analysis_limit
+    return issue
+
+
+def _execution_feedback_issues(
+    validation: dict[str, Any],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
     details = validation.get("error_details") or {}
     report = (
         details.get("candidate_facing_execution_report")
@@ -1533,11 +1576,11 @@ def _repair_validation_feedback(validation: dict[str, Any] | None) -> dict[str, 
         or {}
     )
     aggregated: dict[tuple[Any, ...], dict[str, Any]] = {}
-    for raw_issue in report.get("errors") or []:
+    for raw in report.get("errors") or []:
         key = tuple(
-            _canonical_json(raw_issue.get(field))
-            if isinstance(raw_issue.get(field), (dict, list))
-            else raw_issue.get(field)
+            _canonical_json(raw.get(field))
+            if isinstance(raw.get(field), (dict, list))
+            else raw.get(field)
             for field in (
                 "code",
                 "stage",
@@ -1545,35 +1588,33 @@ def _repair_validation_feedback(validation: dict[str, Any] | None) -> dict[str, 
                 "problem",
                 "requirement",
                 "exception_type",
-                "candidate_function",
-                "candidate_line",
                 "problem_signature",
                 "operation_fingerprint",
             )
         )
         if key not in aggregated:
-            aggregated[key] = copy.deepcopy(raw_issue)
-            aggregated[key]["occurrence_count"] = int(
-                raw_issue.get("occurrence_count", 1)
-            )
+            aggregated[key] = copy.deepcopy(raw)
+            aggregated[key]["occurrence_count"] = int(raw.get("occurrence_count", 1))
             aggregated[key]["representative_samples"] = copy.deepcopy(
-                raw_issue.get("representative_samples") or []
+                raw.get("representative_samples") or []
             )
         else:
-            aggregated[key]["occurrence_count"] += int(
-                raw_issue.get("occurrence_count", 1)
-            )
+            aggregated[key]["occurrence_count"] += int(raw.get("occurrence_count", 1))
             aggregated[key]["representative_samples"].extend(
-                copy.deepcopy(raw_issue.get("representative_samples") or [])
+                copy.deepcopy(raw.get("representative_samples") or [])
             )
 
-    summary_errors = []
+    issues = []
     omissions = []
-    for index, issue in enumerate(aggregated.values()):
-        samples = issue.get("representative_samples")
-        if isinstance(samples, list) and len(samples) > 2:
-            issue["representative_samples"] = samples[:2]
-            issue["representative_samples_omitted"] = len(samples) - 2
+    for index, raw in enumerate(aggregated.values()):
+        samples = list(raw.get("representative_samples") or [])
+        evidence: dict[str, Any] = {
+            "occurrence_count": int(raw.get("occurrence_count", 1)),
+        }
+        if samples:
+            evidence["representative_samples"] = samples[:2]
+        if len(samples) > 2:
+            evidence["representative_samples_omitted"] = len(samples) - 2
             omissions.append(
                 {
                     "error_index": index,
@@ -1582,20 +1623,58 @@ def _repair_validation_feedback(validation: dict[str, Any] | None) -> dict[str, 
                     "status": "still_unresolved_not_assumed_fixed",
                 }
             )
-        summary_errors.append(issue)
-    return {
-        "status": validation.get("status"),
-        "stage": "execution",
-        "error": validation.get("error"),
-        "worker_error": report.get("error"),
-        "error_type": details.get("type"),
-        "distinct_error_count": len(summary_errors),
-        "source_reported_error_count": len(report.get("errors") or []),
-        "aggregation_semantics": (
-            "Equivalent structured error signatures are combined by summing their "
-            "occurrence counts; distinct roots remain separate."
-        ),
-        "errors": summary_errors,
+        source_line = raw.get("candidate_source_line")
+        if source_line:
+            evidence["candidate_source_line"] = source_line
+        diagnostics = raw.get("runtime_diagnostics")
+        if isinstance(diagnostics, dict):
+            retained = {
+                key: copy.deepcopy(diagnostics[key])
+                for key in (
+                    "expected_shape",
+                    "actual_shape",
+                    "expected_length",
+                    "actual_length",
+                    "dtype",
+                    "offending_value",
+                    "minimum",
+                    "maximum",
+                    "candidate_source_excerpt",
+                )
+                if key in diagnostics
+            }
+            if retained:
+                evidence["runtime_diagnostics"] = retained
+        requirement = str(
+            raw.get("requirement")
+            or "Satisfy the executable potential-component interface on every validation sample."
+        )
+        issues.append(
+            _feedback_issue(
+                stage=str(raw.get("stage") or "execution"),
+                error_code=str(raw.get("code") or "CANDIDATE_EXECUTION_ERROR"),
+                location=raw.get("location"),
+                expected=requirement,
+                observed=str(raw.get("problem") or validation.get("error") or "execution failed"),
+                evidence=evidence,
+                repair_requirement=requirement,
+                check_id=raw.get("validation_check"),
+            )
+        )
+    if not issues:
+        requirement = "The candidate must execute successfully on the validation samples."
+        issues.append(
+            _feedback_issue(
+                stage="execution",
+                error_code="CANDIDATE_EXECUTION_ERROR",
+                location="submitted candidate source location unavailable",
+                expected=requirement,
+                observed=str(validation.get("error") or report.get("error") or "worker failed"),
+                repair_requirement=requirement,
+                analysis_limit="The worker did not provide a structured error location.",
+            )
+        )
+    metadata = {
         "checks": copy.deepcopy(report.get("checks")),
         "submitted_source_mapping": {
             "status": (report.get("adapter_source_mapping") or {}).get("status"),
@@ -1605,13 +1684,569 @@ def _repair_validation_feedback(validation: dict[str, Any] | None) -> dict[str, 
             "feedback_function": "compute_potential_components",
         },
         "full_report_storage": copy.deepcopy(details.get("full_report_storage")),
+    }
+    return issues, omissions, metadata
+
+
+def _parse_or_schema_feedback_issues(
+    validation: dict[str, Any],
+) -> list[dict[str, Any]]:
+    details = validation.get("error_details") or {}
+    structured = details.get("issues") or []
+    if structured:
+        return [
+            _feedback_issue(
+                stage=str(item.get("stage") or "schema"),
+                error_code=str(item.get("code") or "CANDIDATE_SCHEMA_ERROR"),
+                location=item.get("location"),
+                expected=str(item.get("requirement") or "Satisfy the candidate schema."),
+                observed=str(item.get("problem") or details.get("message") or "schema validation failed"),
+                evidence={
+                    key: copy.deepcopy(item[key])
+                    for key in ("candidate_source_line", "operation_identity")
+                    if item.get(key) is not None
+                },
+                repair_requirement=str(
+                    item.get("requirement") or "Satisfy the candidate schema."
+                ),
+                check_id=item.get("validation_check"),
+            )
+            for item in structured
+        ]
+
+    message = str(details.get("message") or validation.get("error") or "validation failed")
+    lowered = message.lower()
+    location: Any = details.get("location")
+    field_match = re.search(r"(?:components|features)\[\d+\](?:\.[a-zA-Z_]+)?", message)
+    if field_match:
+        location = field_match.group(0)
+    if any(token in lowered for token in ("invalid json", "json key", "markdown code fence", "response is empty")):
+        stage = "parsing"
+        code = "JSON_PARSE_ERROR"
+        expected = "Return one complete JSON object using the documented candidate fields."
+    elif "output has the wrong shape" in lowered:
+        stage = "execution"
+        code = "RUNTIME_OUTPUT_SHAPE"
+        location = location or "compute_potential_components return value"
+        expected = "Return one numeric component per declared component for every sample."
+    elif "output contains nan or inf" in lowered:
+        stage = "execution"
+        code = "RUNTIME_NONFINITE"
+        location = location or "compute_potential_components return value"
+        expected = "Return finite component values for every validation sample."
+    elif "output is outside [0,1]" in lowered:
+        stage = "execution"
+        code = "RUNTIME_COMPONENT_RANGE"
+        location = location or "compute_potential_components return value"
+        expected = "Return every unweighted component within the inclusive [0,1] range."
+    elif any(token in lowered for token in ("invalid syntax", "disallowed syntax", "not allowed", "forbidden input")):
+        stage = "static"
+        code = "STATIC_CANDIDATE_ERROR"
+        expected = "Use only the documented input fields and supported deterministic operations."
+    else:
+        stage = "schema"
+        code = "CANDIDATE_SCHEMA_ERROR"
+        expected = "Satisfy the reported candidate schema requirement."
+    return [
+        _feedback_issue(
+            stage=stage,
+            error_code=code,
+            location=location,
+            expected=expected,
+            observed=message,
+            repair_requirement=expected,
+            analysis_limit=(
+                None
+                if location
+                else "No more reliable field or source location was reported by the validator."
+            ),
+        )
+    ]
+
+
+def _ordered_match_indices(items: list[Any], reference: list[Any]) -> list[int] | None:
+    cursor = 0
+    matched = []
+    for index, reference_item in enumerate(reference):
+        if cursor < len(items) and items[cursor] == reference_item:
+            matched.append(index)
+            cursor += 1
+    return matched if cursor == len(items) else None
+
+
+def _direction_feedback_issues(
+    validation: dict[str, Any],
+    *,
+    submission: dict[str, Any] | None,
+    reference_candidate: dict[str, Any] | None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    report = validation.get("direction") or {}
+    direction = str(report.get("requested_direction") or "unknown")
+    candidate_components = list((submission or {}).get("components") or [])
+    reference_components = list((reference_candidate or {}).get("components") or [])
+    candidate_weights = [item.get("weight") for item in candidate_components]
+    reference_weights = [item.get("weight") for item in reference_components]
+    context = report.get("comparison_inputs") or {
+        "reference_component_count": len(reference_components) or None,
+        "candidate_component_count": len(candidate_components) or None,
+        "reference_weights": reference_weights or None,
+        "candidate_weights": candidate_weights or None,
+        "reference_names_for_display_only": [
+            item.get("name") for item in reference_components
+        ],
+        "candidate_names_for_display_only": [
+            item.get("name") for item in candidate_components
+        ],
+    }
+    formula_resolution = report.get("formula_resolution") or {}
+    old_resolution = formula_resolution.get("reference") or {}
+    new_resolution = formula_resolution.get("candidate") or {}
+    old_formulas = [
+        item.get("component_expression")
+        for item in old_resolution.get("component_formulas") or []
+    ]
+    new_formulas = [
+        item.get("component_expression")
+        for item in new_resolution.get("component_formulas") or []
+    ]
+    old_expr = old_resolution.get("expressions") or []
+    new_expr = new_resolution.get("expressions") or []
+    formula_evidence: dict[str, Any] = {
+        "comparison_status": report.get("formula_comparison_status"),
+        "structural_comparison_only": (
+            "AST structural equality after reliable straight-line local expansion; "
+            "this does not prove general mathematical equivalence."
+        ),
+    }
+    if report.get("formula_comparison_status") == "confirmed":
+        formula_evidence.update(
+            reference_formulas=old_formulas,
+            candidate_formulas=new_formulas,
+            return_conversion_difference=copy.deepcopy(
+                (report.get("formula_differences") or {}).get(
+                    "return_conversion_difference"
+                )
+            ),
+        )
+        if direction == "remove" and reference_weights and candidate_weights:
+            formula_evidence["candidate_to_reference_formula_mapping"] = (
+                _ordered_match_indices(list(new_expr), list(old_expr))
+            )
+            pair_mapping = _ordered_match_indices(
+                list(zip(new_expr, candidate_weights)),
+                list(zip(old_expr, reference_weights)),
+            )
+            formula_evidence["candidate_to_reference_formula_weight_mapping"] = (
+                pair_mapping
+            )
+        elif direction == "add" and reference_weights and candidate_weights:
+            formula_evidence["reference_to_candidate_formula_mapping"] = (
+                _ordered_match_indices(list(old_expr), list(new_expr))
+            )
+            pair_mapping = _ordered_match_indices(
+                list(zip(old_expr, reference_weights)),
+                list(zip(new_expr, candidate_weights)),
+            )
+            formula_evidence["reference_to_candidate_formula_weight_mapping"] = (
+                pair_mapping
+            )
+        else:
+            formula_evidence["positional_formula_differences"] = copy.deepcopy(
+                (report.get("formula_differences") or {}).get(
+                    "component_expression_differences"
+                )
+            )
+
+    issue_specs = {
+        "add direction must increase feature count": (
+            "DIRECTION_ADD_COMPONENT_COUNT",
+            "The add direction must increase the component count.",
+            f"reference count={context.get('reference_component_count')}; candidate count={context.get('candidate_component_count')}",
+        ),
+        "remove direction must decrease feature count": (
+            "DIRECTION_REMOVE_COMPONENT_COUNT",
+            "The remove direction must decrease the component count.",
+            f"reference count={context.get('reference_component_count')}; candidate count={context.get('candidate_component_count')}",
+        ),
+        "reweight direction changed feature count": (
+            "DIRECTION_REWEIGHT_COMPONENT_COUNT",
+            "The reweight direction must preserve the component count.",
+            f"reference count={context.get('reference_component_count')}; candidate count={context.get('candidate_component_count')}",
+        ),
+        "reweight direction did not change any weight": (
+            "DIRECTION_REWEIGHT_NO_WEIGHT_CHANGE",
+            "The reweight direction must change at least one fixed weight.",
+            f"reference weights={context.get('reference_weights')}; candidate weights={context.get('candidate_weights')}",
+        ),
+        "add direction changed one or more retained fixed weights": (
+            "DIRECTION_ADD_RETAINED_WEIGHT_CHANGED",
+            "The add direction must preserve every retained component weight in order.",
+            f"reference weights={context.get('reference_weights')}; candidate weights={context.get('candidate_weights')}",
+        ),
+        "remove direction changed one or more remaining fixed weights": (
+            "DIRECTION_REMOVE_REMAINING_WEIGHT_CHANGED",
+            "The remove direction must preserve every remaining component weight in order.",
+            f"reference weights={context.get('reference_weights')}; candidate weights={context.get('candidate_weights')}",
+        ),
+        "reweight direction changed feature computation": (
+            "DIRECTION_REWEIGHT_FORMULA_CHANGED",
+            "The reweight direction must preserve component computations.",
+            "At least one reliably extracted component computation changed.",
+        ),
+        "reliably extracted original formulas and weights were not all retained": (
+            "DIRECTION_ADD_FORMULA_NOT_RETAINED",
+            "The add direction must retain all reference formulas and weights in order.",
+            "No complete ordered mapping of reference formula/weight pairs was confirmed.",
+        ),
+        "reliably extracted remaining formulas or weights changed": (
+            "DIRECTION_REMOVE_FORMULA_NOT_RETAINED",
+            "The remove direction must leave an ordered subset of reference formula/weight pairs.",
+            "No complete ordered mapping of candidate formula/weight pairs to the reference was confirmed.",
+        ),
+        "single-feature replacement did not change computation or weight": (
+            "DIRECTION_REMOVE_SINGLE_COMPONENT_UNCHANGED",
+            "For a one-component reference, the documented simpler-replacement exception must be substantive.",
+            "The computation fingerprint and weight are unchanged.",
+        ),
+        "redesign changed only non-executable metadata": (
+            "DIRECTION_REDESIGN_NOT_SUBSTANTIVE",
+            "The redesign direction must change executable computation or fixed weights.",
+            "Only non-executable metadata changed under the existing fingerprint.",
+        ),
+    }
+    issues = []
+    for message in report.get("confirmed_violations") or report.get("issues") or []:
+        if str(message).startswith("return conversion changed from"):
+            spec = (
+                "DIRECTION_RETURN_CONVERSION_CHANGED",
+                "Directions that preserve formulas must also preserve value-affecting return conversion.",
+                str(message),
+            )
+        else:
+            spec = issue_specs.get(str(message))
+        if spec is None:
+            spec = (
+                "DIRECTION_REQUIREMENT_VIOLATION",
+                f"Satisfy the existing {direction} direction requirements.",
+                str(message),
+            )
+        evidence = {"component_comparison": context}
+        if "FORMULA" in spec[0] or "CONVERSION" in spec[0]:
+            evidence["formula_comparison"] = formula_evidence
+        issues.append(
+            _feedback_issue(
+                stage="direction",
+                error_code=spec[0],
+                location=f"requested {direction} modification",
+                expected=spec[1],
+                observed=spec[2],
+                evidence=evidence,
+                repair_requirement=(
+                    f"Revise the candidate so it satisfies the {direction} direction; "
+                    "the validator does not prescribe which legal component design to choose."
+                ),
+                check_id=f"direction.{spec[0].lower()}",
+            )
+        )
+    limitations = []
+    for item in report.get("unconfirmed_checks") or []:
+        limitations.append(
+            {
+                "check": item.get("check"),
+                "status": "not_confirmed_not_rejected",
+                "reason": {
+                    "reference": (item.get("reference_resolution") or {}).get("reason"),
+                    "candidate": (item.get("candidate_resolution") or {}).get("reason"),
+                },
+                "meaning": (
+                    "Formula preservation was not confirmed; this limitation is not itself "
+                    "a rejection and does not imply mathematical inequality."
+                ),
+            }
+        )
+    return issues, limitations
+
+
+def _duplicate_feedback_issues(validation: dict[str, Any]) -> list[dict[str, Any]]:
+    matching = validation.get("matching_candidate_id")
+    expected = "Submit a candidate with a substantively different computation or fixed weights."
+    return [
+        _feedback_issue(
+            stage="duplicate",
+            error_code="DUPLICATE_CANDIDATE",
+            location="candidate computation fingerprint",
+            expected=expected,
+            observed=f"The fingerprint matches candidate {matching!r}.",
+            evidence={
+                "matching_candidate_id": matching,
+                "fingerprint": validation.get("fingerprint"),
+                "fingerprint_semantics": validation.get("semantics"),
+            },
+            repair_requirement=(
+                expected
+                + " Renaming, comment changes, and formatting changes are not substantive."
+            ),
+            check_id="duplicate.computation_fingerprint",
+        )
+    ]
+
+
+def _normalized_feedback_issues(
+    validation: dict[str, Any] | None,
+    *,
+    submission: dict[str, Any] | None = None,
+    reference_candidate: dict[str, Any] | None = None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
+    validation = validation or {}
+    stage = validation.get("stage")
+    if stage == "execution":
+        issues, omissions, metadata = _execution_feedback_issues(validation)
+        return issues, omissions, metadata
+    if stage == "direction":
+        issues, limitations = _direction_feedback_issues(
+            validation,
+            submission=submission,
+            reference_candidate=reference_candidate,
+        )
+        return issues, [], {"analysis_limitations": limitations}
+    if stage == "duplicate":
+        return _duplicate_feedback_issues(validation), [], {}
+    return _parse_or_schema_feedback_issues(validation), [], {}
+
+
+def _issue_signature(issue: dict[str, Any]) -> str:
+    return _sha256_json(
+        {
+            "stage": issue.get("stage"),
+            "error_code": issue.get("error_code"),
+            "check_id": issue.get("check_id"),
+        }
+    )
+
+
+def _reached_feedback_stage(validation: dict[str, Any], issues: list[dict[str, Any]]) -> int:
+    stage = validation.get("stage")
+    if stage == "direction":
+        return _FEEDBACK_STAGE_ORDER["direction"]
+    if stage == "duplicate":
+        return _FEEDBACK_STAGE_ORDER["duplicate"]
+    if stage == "execution":
+        return _FEEDBACK_STAGE_ORDER["execution"]
+    stages = [
+        _FEEDBACK_STAGE_ORDER.get(str(issue.get("stage")), 1) for issue in issues
+    ]
+    return max(stages, default=_FEEDBACK_STAGE_ORDER["schema"])
+
+
+def _cross_version_issue_tracking(
+    record: dict[str, Any],
+    *,
+    current_issues: list[dict[str, Any]],
+    current_validation: dict[str, Any],
+) -> dict[str, Any]:
+    versions = list(record.get("versions") or [])
+    current_version = int(versions[-1].get("version", len(versions))) if versions else None
+    current_by_signature = {_issue_signature(issue): issue for issue in current_issues}
+    previous: dict[str, dict[str, Any]] = {}
+    for position, version in enumerate(versions[:-1], start=1):
+        validation = version.get("validation") or {}
+        submission = None
+        try:
+            material = _load_failed_response_material({"versions": [version]})
+            submission = material.get("parsed_candidate")
+        except PotentialSearchError:
+            pass
+        issues, _omissions, _metadata = _normalized_feedback_issues(
+            validation, submission=submission
+        )
+        version_number = int(version.get("version", position))
+        for issue in issues:
+            signature = _issue_signature(issue)
+            item = previous.setdefault(
+                signature,
+                {
+                    "error_code": issue.get("error_code"),
+                    "check_id": issue.get("check_id"),
+                    "stage": issue.get("stage"),
+                    "source_versions": [],
+                },
+            )
+            item["source_versions"].append(version_number)
+
+    reached = _reached_feedback_stage(current_validation, current_issues)
+    still_present = []
+    confirmed_fixed = []
+    not_rechecked = []
+    for signature, item in previous.items():
+        if signature in current_by_signature:
+            still_present.append(
+                {
+                    **item,
+                    "current_version": current_version,
+                    "status": "reconfirmed_still_present",
+                }
+            )
+        elif _FEEDBACK_STAGE_ORDER.get(str(item.get("stage")), 1) <= reached:
+            confirmed_fixed.append(
+                {
+                    **item,
+                    "current_version": current_version,
+                    "status": "rechecked_and_not_reproduced",
+                }
+            )
+        else:
+            not_rechecked.append(
+                {
+                    **item,
+                    "current_version": current_version,
+                    "status": "not_rechecked_due_to_earlier_failure",
+                }
+            )
+    return {
+        "current_source_version": current_version,
+        "reconfirmed_still_present": still_present,
+        "rechecked_and_not_reproduced": confirmed_fixed,
+        "not_rechecked_due_to_earlier_failure": not_rechecked,
+        "semantics": (
+            "An issue is marked fixed only when its validation stage was reached again. "
+            "Later checks blocked by an earlier failure remain unverified."
+        ),
+    }
+
+
+def _repeated_failed_fingerprint(record: dict[str, Any]) -> dict[str, Any] | None:
+    versions = list(record.get("versions") or [])
+    if not versions:
+        return None
+    latest = versions[-1]
+    fingerprint = latest.get("fingerprint")
+    if not fingerprint or (latest.get("validation") or {}).get("status") != "failed":
+        return None
+    prior = [
+        int(item.get("version", index + 1))
+        for index, item in enumerate(versions[:-1])
+        if item.get("fingerprint") == fingerprint
+        and (item.get("validation") or {}).get("status") == "failed"
+    ]
+    if not prior:
+        return None
+    return {
+        "status": "identical_to_prior_failed_submission",
+        "fingerprint": fingerprint,
+        "matching_failed_versions": prior,
+        "latest_matching_failed_version": prior[-1],
+        "requirement": (
+            "The submitted computation and fixed weights are unchanged from the listed "
+            "failed version(s). Resolve the confirmed current issues with a substantive edit "
+            "before resubmitting."
+        ),
+    }
+
+
+def _repair_validation_feedback(
+    record: dict[str, Any],
+    *,
+    reference_candidate: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Create bounded, stage-specific repair feedback from persisted validation data."""
+
+    validation = record.get("last_validation") or {}
+    submission = record.get("last_submission")
+    issues, omissions, metadata = _normalized_feedback_issues(
+        validation,
+        submission=submission,
+        reference_candidate=reference_candidate,
+    )
+    versions = list(record.get("versions") or [])
+    source_version = int(versions[-1].get("version", len(versions))) if versions else None
+    for issue in issues:
+        issue["source_version"] = source_version
+    repeated = _repeated_failed_fingerprint(record)
+    if repeated is not None:
+        repeated["unresolved_error_codes"] = [
+            issue.get("error_code") for issue in issues
+        ]
+    validation_report_storage = None
+    if versions:
+        version_directory = Path(versions[-1]["directory"])
+        report_path = version_directory / "validation_report.json"
+        validation_report_storage = {
+            "path": str(report_path.resolve()),
+            "complete": report_path.is_file(),
+            "source_version": source_version,
+        }
+        if not report_path.is_file():
+            validation_report_storage["reason"] = (
+                "validation report file is unavailable in this record"
+            )
+    return {
+        "format_version": VALIDATION_FEEDBACK_FORMAT_VERSION,
+        "candidate_id": record.get("candidate_id"),
+        "source_version": source_version,
+        "failure_category": validation.get("stage"),
+        "errors": issues,
+        "cross_version_issue_tracking": _cross_version_issue_tracking(
+            record,
+            current_issues=issues,
+            current_validation=validation,
+        ),
+        "repeated_failed_submission": repeated,
+        "complete_validation_report_storage": validation_report_storage,
+        **metadata,
         "prompt_summary_omissions": omissions,
         "omission_semantics": (
-            "Only excess representative samples are omitted; every distinct reported "
-            "error remains unresolved and is included in this repair feedback."
+            "Only excess representative cases are omitted. Omitted cases and checks not "
+            "rerun are not treated as repaired or passed."
         ),
         "unresolved_checks": copy.deepcopy(validation.get("unresolved_checks", [])),
     }
+
+
+def _render_repair_feedback(feedback: dict[str, Any]) -> str:
+    lines = [
+        f"Feedback format: {feedback.get('format_version')}",
+        f"Candidate/version: {feedback.get('candidate_id')} v{feedback.get('source_version')}",
+        f"Failure category: {feedback.get('failure_category')}",
+    ]
+    for index, issue in enumerate(feedback.get("errors") or [], start=1):
+        lines.extend(
+            [
+                "",
+                f"Issue {index}",
+                f"Error: {issue.get('error_code')}",
+                f"Stage: {issue.get('stage')}",
+                f"Location: {issue.get('location')}",
+                f"Expected: {issue.get('expected')}",
+                f"Observed: {issue.get('observed')}",
+            ]
+        )
+        if issue.get("evidence") is not None:
+            lines.append(
+                "Evidence: "
+                + json.dumps(issue["evidence"], ensure_ascii=False, separators=(",", ":"))
+            )
+        if issue.get("analysis_limit"):
+            lines.append(f"Analysis limit: {issue['analysis_limit']}")
+        lines.append(f"Required correction: {issue.get('repair_requirement')}")
+    for label in (
+        "cross_version_issue_tracking",
+        "repeated_failed_submission",
+        "analysis_limitations",
+        "prompt_summary_omissions",
+        "complete_validation_report_storage",
+        "full_report_storage",
+        "unresolved_checks",
+    ):
+        value = feedback.get(label)
+        if value not in (None, {}, []):
+            lines.extend(
+                [
+                    "",
+                    f"{label}: "
+                    + json.dumps(value, ensure_ascii=False, separators=(",", ":")),
+                ]
+            )
+    return "\n".join(lines)
 
 
 def _code_ast(candidate: dict[str, Any]) -> str:
@@ -1962,6 +2597,18 @@ def validate_direction(
             "candidate": new_resolution,
         },
         "formula_differences": formula_differences,
+        "comparison_inputs": {
+            "reference_component_count": len(old_weights),
+            "candidate_component_count": len(new_weights),
+            "reference_weights": old_weights,
+            "candidate_weights": new_weights,
+            "reference_names_for_display_only": [
+                str(item["name"]) for item in reference["components"]
+            ],
+            "candidate_names_for_display_only": [
+                str(item["name"]) for item in candidate["components"]
+            ],
+        },
         "single_feature_remove_exception": exception,
         "confirmed_violations": issues,
         "unconfirmed_checks": unconfirmed_checks,
@@ -2048,6 +2695,17 @@ def _duplicate_diagnostics(
                 ),
             }
     return None
+
+
+def _failed_candidate_fingerprint(submission: Any) -> str | None:
+    """Return the existing computation fingerprint when a failed candidate permits it."""
+
+    if not isinstance(submission, dict):
+        return None
+    try:
+        return candidate_fingerprint(submission)
+    except (CandidateError, KeyError, TypeError, ValueError, SyntaxError):
+        return None
 
 
 def _save_candidate_version(
@@ -2592,7 +3250,10 @@ def _prepare_generation_request(
 
 
 def _repair_prompt_extra_sections(
-    record: dict[str, Any], *, duplicate: bool
+    record: dict[str, Any],
+    *,
+    duplicate: bool,
+    reference_candidate: dict[str, Any] | None = None,
 ) -> dict[str, int]:
     if duplicate:
         response = json.dumps(
@@ -2602,10 +3263,10 @@ def _repair_prompt_extra_sections(
         response = json.dumps(
             _load_failed_response_material(record), indent=2, ensure_ascii=False
         )
-    feedback = json.dumps(
-        _repair_validation_feedback(record.get("last_validation")),
-        indent=2,
-        ensure_ascii=False,
+    feedback = _render_repair_feedback(
+        _repair_validation_feedback(
+            record, reference_candidate=reference_candidate
+        )
     )
     return {
         "repair_failed_response": len(response),
@@ -3143,16 +3804,21 @@ def run_potential_search(
             )
             repair = bool(record["versions"])
             if repair:
+                repair_reference = (
+                    (current.get("reference_candidate") or {}).get("candidate")
+                )
                 prompt = _repair_prompt(
                     common=common,
                     record=record,
                     duplicate=(record.get("last_failure_stage") == "duplicate"),
+                    reference_candidate=repair_reference,
                 )
                 prompt_sections = {
                     **prompt_sections,
                     **_repair_prompt_extra_sections(
                         record,
                         duplicate=(record.get("last_failure_stage") == "duplicate"),
+                        reference_candidate=repair_reference,
                     ),
                 }
                 prompt_sections["repair_scaffolding"] = len(prompt) - sum(
@@ -3307,7 +3973,7 @@ def run_potential_search(
                     "error_details": error_details,
                 }
                 extra = None
-                fingerprint = None
+                fingerprint = _failed_candidate_fingerprint(submission)
             except (CandidateError, ValueError, SyntaxError) as exc:
                 validation = {
                     "status": "failed",
@@ -3316,8 +3982,11 @@ def run_potential_search(
                     "error_details": _exception_details(exc),
                 }
                 extra = None
-                fingerprint = None
+                fingerprint = _failed_candidate_fingerprint(submission)
             version = len(record["versions"]) + 1
+            validation["feedback_format_version"] = VALIDATION_FEEDBACK_FORMAT_VERSION
+            validation["source_version"] = version
+            validation["candidate_fingerprint"] = fingerprint
             candidate_root = _short_runtime_output_root(
                 runtime_root,
                 output,

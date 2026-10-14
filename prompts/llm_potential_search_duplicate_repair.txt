@@ -6,7 +6,7 @@ Original generation request:
 Duplicate candidate:
 {{DUPLICATE_CANDIDATE}}
 
-Duplicate comparison:
+Structured duplicate validation feedback:
 {{DUPLICATE_DIAGNOSTICS}}
 
 Return a substantively different complete potential candidate. The comparison covers normalized Python structure, component order/count, and fixed weights; it does not prove all mathematical equivalences.

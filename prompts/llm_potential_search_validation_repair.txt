@@ -6,7 +6,7 @@ Original generation request:
 Current complete candidate or raw response:
 {{FAILED_RESPONSE_MATERIAL}}
 
-Confirmed validation errors:
+Structured validation feedback (confirmed errors and explicit analysis limits):
 {{VALIDATION_FEEDBACK}}
 
 Earlier unresolved checks, if any:

@@ -520,6 +520,122 @@ def test_repair_prompt_has_complete_error_context_and_no_placeholders(tmp_path):
     assert "invalid JSON" in prompt
     assert "execution was not run" in prompt
     assert "not-json" in prompt
+    assert "Error: JSON_PARSE_ERROR" in prompt
+    assert "Expected: Return one complete JSON object" in prompt
+    assert "Required correction:" in prompt
+
+
+def test_static_feedback_reports_interface_violation_in_actual_repair_request(tmp_path):
+    submission = _submission("r01_c01")
+    version = tmp_path / "v01"
+    version.mkdir()
+    (version / "submission.json").write_text(json.dumps(submission), encoding="utf-8")
+    validation = {
+        "status": "failed",
+        "stage": "parse_or_schema",
+        "error": "CandidateError: code accesses forbidden input fields: ['hidden_future']",
+        "error_details": {
+            "type": "CandidateError",
+            "message": "code accesses forbidden input fields: ['hidden_future']",
+            "location": {"lineno": 2, "colno": 4},
+        },
+    }
+    record = {
+        "candidate_id": "r01_c01",
+        "generation_stage_request": "Generate the complete candidate.",
+        "versions": [
+            {
+                "version": 1,
+                "directory": str(version),
+                "response_kind": "parsed_json",
+                "validation": validation,
+            }
+        ],
+        "last_submission": submission,
+        "last_validation": validation,
+    }
+
+    prompt = search._repair_prompt(common="COMMON", record=record, duplicate=False)
+
+    assert "Error: STATIC_CANDIDATE_ERROR" in prompt
+    assert "hidden_future" in prompt
+    assert "supported deterministic operations" in prompt
+    assert "Location: {'lineno': 2, 'colno': 4}" in prompt
+
+
+def test_schema_feedback_identifies_component_field_without_inventing_a_design(tmp_path):
+    submission = _submission("r01_c01")
+    submission["components"][0]["weight"] = "heavy"
+    validation = {
+        "status": "failed",
+        "stage": "parse_or_schema",
+        "error": "CandidateError: components[0].weight must be numeric",
+        "error_details": {
+            "type": "CandidateError",
+            "message": "components[0].weight must be numeric",
+        },
+    }
+    version = _saved_failed_version(tmp_path, 1, submission, validation)
+    record = {
+        "candidate_id": "r01_c01",
+        "versions": [version],
+        "last_submission": submission,
+        "last_validation": validation,
+    }
+
+    feedback = search._repair_validation_feedback(record)
+    issue = feedback["errors"][0]
+
+    assert issue["stage"] == "schema"
+    assert issue["error_code"] == "CANDIDATE_SCHEMA_ERROR"
+    assert issue["location"] == "components[0].weight"
+    assert "formula" not in issue["repair_requirement"].lower()
+    assert "increase" not in issue["repair_requirement"].lower()
+
+
+@pytest.mark.parametrize(
+    ("message", "error_code", "expected"),
+    [
+        (
+            "potential component output has the wrong shape",
+            "RUNTIME_OUTPUT_SHAPE",
+            "one numeric component per declared component",
+        ),
+        (
+            "potential component output contains NaN or Inf",
+            "RUNTIME_NONFINITE",
+            "finite component values",
+        ),
+        (
+            "potential component output is outside [0,1]",
+            "RUNTIME_COMPONENT_RANGE",
+            "inclusive [0,1] range",
+        ),
+    ],
+)
+def test_host_numeric_validation_errors_are_reported_as_runtime(
+    tmp_path, message, error_code, expected
+):
+    submission = _submission("r01_c01")
+    validation = {
+        "status": "failed",
+        "stage": "parse_or_schema",
+        "error": f"CandidateError: {message}",
+        "error_details": {"type": "CandidateError", "message": message},
+    }
+    version = _saved_failed_version(tmp_path, 1, submission, validation)
+    record = {
+        "candidate_id": "r01_c01",
+        "versions": [version],
+        "last_submission": submission,
+        "last_validation": validation,
+    }
+
+    feedback = search._repair_validation_feedback(record)
+
+    assert feedback["errors"][0]["stage"] == "execution"
+    assert feedback["errors"][0]["error_code"] == error_code
+    assert expected in feedback["errors"][0]["expected"]
 
 
 def _direction_candidate(candidate_id, code, weights):
@@ -629,6 +745,158 @@ def test_execution_report_is_saved_complete_and_repair_feedback_keeps_all_roots(
     assert "representative_samples_omitted" in prompt
     assert "still_unresolved_not_assumed_fixed" in prompt
     assert "compute_extra_state" not in prompt
+
+
+def _execution_validation(*errors):
+    return {
+        "status": "failed",
+        "stage": "execution",
+        "error": "CandidateExecutionError: fixture failure",
+        "error_details": {
+            "type": "CandidateExecutionError",
+            "candidate_facing_execution_report": {
+                "errors": list(errors),
+                "checks": {"execution": {"status": "failed"}},
+                "adapter_source_mapping": {
+                    "status": "reliable_line_preserving_function_rename",
+                    "line_mapping_provided": True,
+                },
+            },
+        },
+    }
+
+
+def _saved_failed_version(tmp_path, number, submission, validation, fingerprint=None):
+    directory = tmp_path / f"v{number:02d}"
+    directory.mkdir()
+    (directory / "submission.json").write_text(
+        json.dumps(submission), encoding="utf-8"
+    )
+    return {
+        "version": number,
+        "directory": str(directory),
+        "response_kind": "parsed_json",
+        "validation": validation,
+        "fingerprint": fingerprint,
+    }
+
+
+def test_execution_feedback_deduplicates_samples_but_keeps_distinct_roots(tmp_path):
+    repeated = {
+        "code": "RUNTIME_SHAPE",
+        "stage": "execution",
+        "location": "compute_potential_components at submitted candidate line 2",
+        "problem": "received shape (2,)",
+        "requirement": "Return one value for the declared single component.",
+        "validation_check": "execution.output_shape",
+        "occurrence_count": 2,
+        "representative_samples": [{"sample": 1}, {"sample": 2}],
+    }
+    same_root = {**repeated, "occurrence_count": 3, "representative_samples": [{"sample": 3}]}
+    other_root = {
+        "code": "RUNTIME_NONFINITE",
+        "stage": "execution",
+        "location": "compute_potential_components at submitted candidate line 3",
+        "problem": "component 0 is NaN",
+        "requirement": "Return finite component values.",
+        "validation_check": "execution.finite_values",
+    }
+    validation = _execution_validation(repeated, same_root, other_root)
+    submission = _submission("r01_c01")
+    version = _saved_failed_version(tmp_path, 1, submission, validation)
+    record = {
+        "candidate_id": "r01_c01",
+        "generation_stage_request": "Generate candidate.",
+        "versions": [version],
+        "last_submission": submission,
+        "last_validation": validation,
+    }
+
+    feedback = search._repair_validation_feedback(record)
+
+    assert [item["error_code"] for item in feedback["errors"]] == [
+        "RUNTIME_SHAPE",
+        "RUNTIME_NONFINITE",
+    ]
+    shape = feedback["errors"][0]
+    assert shape["evidence"]["occurrence_count"] == 5
+    assert shape["evidence"]["representative_samples"] == [
+        {"sample": 1},
+        {"sample": 2},
+    ]
+    assert shape["evidence"]["representative_samples_omitted"] == 1
+
+
+def test_cross_version_feedback_distinguishes_still_fixed_and_not_rechecked(tmp_path):
+    submission = _submission("r01_c01")
+    issue_a = {
+        "code": "RUNTIME_SHAPE",
+        "stage": "execution",
+        "location": "candidate line 2",
+        "problem": "wrong shape",
+        "requirement": "Return the declared vector shape.",
+        "validation_check": "execution.output_shape",
+    }
+    issue_b = {
+        "code": "RUNTIME_NONFINITE",
+        "stage": "execution",
+        "location": "candidate line 3",
+        "problem": "NaN",
+        "requirement": "Return finite values.",
+        "validation_check": "execution.finite_values",
+    }
+    first = _execution_validation(issue_a, issue_b)
+    parse_failure = {
+        "status": "failed",
+        "stage": "parse_or_schema",
+        "error": "CandidateError: invalid JSON: missing comma",
+        "error_details": {"type": "CandidateError", "message": "invalid JSON: missing comma"},
+    }
+    v1 = _saved_failed_version(tmp_path, 1, submission, first)
+    v2_dir = tmp_path / "v02"
+    v2_dir.mkdir()
+    (v2_dir / "raw_response.txt").write_text("{bad", encoding="utf-8")
+    v2 = {
+        "version": 2,
+        "directory": str(v2_dir),
+        "response_kind": "raw_unparsed",
+        "validation": parse_failure,
+        "fingerprint": None,
+    }
+    blocked_record = {
+        "candidate_id": "r01_c01",
+        "versions": [v1, v2],
+        "last_submission": None,
+        "last_validation": parse_failure,
+    }
+
+    blocked = search._repair_validation_feedback(blocked_record)
+
+    blocked_tracking = blocked["cross_version_issue_tracking"]
+    assert {
+        item["error_code"]
+        for item in blocked_tracking["not_rechecked_due_to_earlier_failure"]
+    } == {"RUNTIME_SHAPE", "RUNTIME_NONFINITE"}
+    assert blocked_tracking["rechecked_and_not_reproduced"] == []
+
+    third = _execution_validation(issue_a)
+    v3 = _saved_failed_version(tmp_path, 3, submission, third)
+    rerun_record = {
+        "candidate_id": "r01_c01",
+        "versions": [v1, v2, v3],
+        "last_submission": submission,
+        "last_validation": third,
+    }
+    rerun = search._repair_validation_feedback(rerun_record)
+    rerun_tracking = rerun["cross_version_issue_tracking"]
+    assert {
+        item["error_code"]
+        for item in rerun_tracking["reconfirmed_still_present"]
+    } == {"RUNTIME_SHAPE"}
+    assert {
+        item["error_code"]
+        for item in rerun_tracking["rechecked_and_not_reproduced"]
+    } == {"RUNTIME_NONFINITE", "JSON_PARSE_ERROR"}
 
 
 def test_potential_adapter_renames_function_without_changing_source_lines():
@@ -872,6 +1140,181 @@ def test_direction_resolution_reports_unconfirmed_control_flow_without_rejection
     assert result["unconfirmed_checks"][0]["status"] == "unconfirmed_not_rejected"
 
 
+def test_direction_feedback_marks_formula_analysis_limit_without_guessing(tmp_path):
+    code = (
+        "def compute_potential_components(obs, constants):\n"
+        "    if obs['valid']:\n"
+        "        value = obs['distance']\n"
+        "    else:\n"
+        "        value = 0.0\n"
+        "    return [value]\n"
+    )
+    reference = _direction_candidate("reference", code, [1.0])
+    reference["components"].append(
+        {"name": "second", "description": "fixture", "weight": 2.0}
+    )
+    reference["code"] = code.replace("return [value]", "return [value, value]")
+    candidate = copy.deepcopy(reference)
+    candidate["candidate_id"] = "r02_c02"
+    report = search.validate_direction("remove", candidate, reference)
+    validation = {"status": "failed", "stage": "direction", "direction": report}
+    version = _saved_failed_version(tmp_path, 1, candidate, validation)
+    record = {
+        "candidate_id": "r02_c02",
+        "generation_stage_request": "Remove one component.",
+        "versions": [version],
+        "last_submission": candidate,
+        "last_validation": validation,
+    }
+
+    feedback = search._repair_validation_feedback(
+        record, reference_candidate=reference
+    )
+
+    assert [item["error_code"] for item in feedback["errors"]] == [
+        "DIRECTION_REMOVE_COMPONENT_COUNT"
+    ]
+    assert feedback["analysis_limitations"][0]["status"] == (
+        "not_confirmed_not_rejected"
+    )
+    assert "does not imply mathematical inequality" in feedback[
+        "analysis_limitations"
+    ][0]["meaning"]
+
+
+def test_remove_direction_handles_middle_deletion_and_rejects_delete_then_add():
+    reference = _direction_candidate(
+        "reference",
+        "def compute_potential_components(obs, constants):\n"
+        "    a = obs['distance'] * 0.1\n"
+        "    b = obs['queue'] * 0.2\n"
+        "    c = obs['energy'] * 0.3\n"
+        "    d = obs['coverage'] * 0.4\n"
+        "    return [a, b, c, d]\n",
+        [1.0, 2.0, 3.0, 4.0],
+    )
+    valid = _direction_candidate(
+        "valid",
+        "def compute_potential_components(obs, constants):\n"
+        "    renamed_a = obs['distance'] * 0.1\n"
+        "    renamed_c = obs['energy'] * 0.3\n"
+        "    renamed_d = obs['coverage'] * 0.4\n"
+        "    return [renamed_a, renamed_c, renamed_d]\n",
+        [1.0, 3.0, 4.0],
+    )
+    replace = _direction_candidate(
+        "replace",
+        "def compute_potential_components(obs, constants):\n"
+        "    renamed_a = obs['distance'] * 0.1\n"
+        "    renamed_c = obs['energy'] * 0.3\n"
+        "    renamed_d = obs['coverage'] * 0.4\n"
+        "    added = obs['latency'] * 0.5\n"
+        "    return [renamed_a, renamed_c, renamed_d, added]\n",
+        [1.0, 3.0, 4.0, 5.0],
+    )
+    rename_only = copy.deepcopy(reference)
+    rename_only["candidate_id"] = "rename-only"
+    for index, item in enumerate(rename_only["components"]):
+        item["name"] = f"renamed_display_{index}"
+
+    assert search.validate_direction("remove", valid, reference)["status"] == "passed"
+    replaced = search.validate_direction("remove", replace, reference)
+    assert replaced["status"] == "failed"
+    assert "remove direction must decrease feature count" in replaced["issues"]
+    renamed = search.validate_direction("remove", rename_only, reference)
+    assert renamed["status"] == "failed"
+    assert renamed["issues"] == ["remove direction must decrease feature count"]
+
+    wrong_weight = copy.deepcopy(valid)
+    wrong_weight["components"][1]["weight"] = 30.0
+    wrong_report = search.validate_direction("remove", wrong_weight, reference)
+    wrong_validation = {
+        "status": "failed",
+        "stage": "direction",
+        "direction": wrong_report,
+    }
+    feedback_issues, _limitations = search._direction_feedback_issues(
+        wrong_validation,
+        submission=wrong_weight,
+        reference_candidate=reference,
+    )
+    formula_issue = next(
+        item
+        for item in feedback_issues
+        if item["error_code"] == "DIRECTION_REMOVE_FORMULA_NOT_RETAINED"
+    )
+    formula_evidence = formula_issue["evidence"]["formula_comparison"]
+    assert formula_evidence["candidate_to_reference_formula_mapping"] == [0, 2, 3]
+    assert formula_evidence["candidate_to_reference_formula_weight_mapping"] is None
+    assert "positional_formula_differences" not in formula_evidence
+
+
+def test_direction_feedback_is_structured_and_repeated_fingerprint_is_reported(tmp_path):
+    reference = _direction_candidate(
+        "reference",
+        "def compute_potential_components(obs, constants):\n"
+        "    first = obs['distance'] * 0.5\n"
+        "    second = obs['queue'] * 0.1\n"
+        "    return [first, second]\n",
+        [1.0, 2.0],
+    )
+    candidate = copy.deepcopy(reference)
+    candidate["candidate_id"] = "r02_c02"
+    report = search.validate_direction("remove", candidate, reference)
+    validation = {"status": "failed", "stage": "direction", "direction": report}
+    fingerprint = search.candidate_fingerprint(candidate)
+    v1 = _saved_failed_version(tmp_path, 1, candidate, validation, fingerprint)
+    v2 = _saved_failed_version(tmp_path, 2, candidate, validation, fingerprint)
+    record = {
+        "candidate_id": "r02_c02",
+        "generation_stage_request": "Remove one component.",
+        "versions": [v1, v2],
+        "last_submission": candidate,
+        "last_validation": validation,
+    }
+
+    prompt = search._repair_prompt(
+        common="COMMON",
+        record=record,
+        duplicate=False,
+        reference_candidate=reference,
+    )
+
+    assert "Error: DIRECTION_REMOVE_COMPONENT_COUNT" in prompt
+    assert "reference count=2; candidate count=2" in prompt
+    assert "matching_failed_versions\":[1]" in prompt
+    assert "substantive edit" in prompt
+    assert "which legal component design to choose" in prompt
+    assert "increase weight" not in prompt.lower()
+
+
+def test_duplicate_feedback_uses_same_concrete_error_format(tmp_path):
+    submission = _submission("r02_c03")
+    validation = {
+        "status": "failed",
+        "stage": "duplicate",
+        "matching_candidate_id": "r01_c04",
+        "fingerprint": "same-computation",
+        "semantics": "normalized executable structure and fixed weights",
+    }
+    version = _saved_failed_version(
+        tmp_path, 1, submission, validation, "same-computation"
+    )
+    record = {
+        "candidate_id": "r02_c03",
+        "generation_stage_request": "Generate candidate.",
+        "versions": [version],
+        "last_submission": submission,
+        "last_validation": validation,
+    }
+
+    prompt = search._repair_prompt(common="COMMON", record=record, duplicate=True)
+
+    assert "Error: DUPLICATE_CANDIDATE" in prompt
+    assert "r01_c04" in prompt
+    assert "Renaming, comment changes, and formatting changes are not substantive" in prompt
+
+
 def test_compact_training_feedback_keeps_all_blocks_components_and_stat_groups():
     candidates = {}
     for candidate_index in range(1, 5):
@@ -1059,6 +1502,126 @@ def test_context_budget_pause_saves_full_prompt_and_does_not_call_model(
         in prompt
         for index in range(1, 5)
     )
+
+
+def test_resume_uses_new_feedback_and_only_explicitly_raises_cumulative_repair_limit(
+    tmp_path, monkeypatch
+):
+    model_calls, training_calls, evaluation_calls, train, evaluate, baseline = (
+        _install_search_mocks(monkeypatch, tmp_path)
+    )
+
+    def direction(direction, candidate, reference):
+        if direction != "remove":
+            return {
+                "status": "passed",
+                "requested_direction": direction,
+                "formula_comparison_available": False,
+                "single_feature_remove_exception": None,
+            }
+        return {
+            "status": "failed",
+            "requested_direction": "remove",
+            "formula_comparison_status": "confirmed",
+            "formula_comparison_available": True,
+            "formula_resolution": {
+                "reference": {"status": "confirmed", "expressions": []},
+                "candidate": {"status": "confirmed", "expressions": []},
+            },
+            "formula_differences": {
+                "return_conversion_difference": None,
+                "component_expression_differences": [],
+            },
+            "comparison_inputs": {
+                "reference_component_count": 1,
+                "candidate_component_count": 1,
+                "reference_weights": [1.0],
+                "candidate_weights": [1.0],
+                "reference_names_for_display_only": ["reference"],
+                "candidate_names_for_display_only": ["candidate"],
+            },
+            "confirmed_violations": ["remove direction must decrease feature count"],
+            "unconfirmed_checks": [],
+            "issues": ["remove direction must decrease feature count"],
+        }
+
+    monkeypatch.setattr(search, "validate_direction", direction)
+    output = tmp_path / "repair-resume"
+    initial = search.run_potential_search(
+        validation_sources=[tmp_path / "validation"],
+        baseline_run=tmp_path / "baseline-run",
+        baseline_evaluation=tmp_path / "baseline-eval",
+        provider="openai",
+        model="fixture-model",
+        context_length=128000,
+        output_dir=output,
+        runtime_root=tmp_path / "runtime-repair-resume",
+        max_rounds=2,
+        max_repairs_per_candidate=1,
+        client=object(),
+        training_runner=train,
+        evaluation_runner=evaluate,
+        baseline_validator=baseline,
+    )
+    assert initial["status"] == "paused_candidate_repairs_exhausted"
+    state_path = output / "state.json"
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    assert state["model_calls"] == 7
+    assert state["current_round"]["candidates"]["r02_c01"]["status"] == "validated"
+    assert len(training_calls) == len(evaluation_calls) == 4
+
+    state["prompt_version"] = "uav-hrl-llm-potential-search-prompt-v2"
+    for version in state["current_round"]["candidates"]["r02_c02"]["versions"]:
+        version["validation"].pop("feedback_format_version", None)
+    state_path.write_text(json.dumps(state), encoding="utf-8")
+
+    unchanged = search.run_potential_search(
+        resume=output,
+        max_rounds=2,
+        client=object(),
+        training_runner=train,
+        evaluation_runner=evaluate,
+        baseline_validator=baseline,
+    )
+    assert unchanged["status"] == "paused_candidate_repairs_exhausted"
+    unchanged_state = json.loads(state_path.read_text(encoding="utf-8"))
+    assert unchanged_state["settings"]["max_repairs_per_candidate"] == 1
+    assert unchanged_state["model_calls"] == 7
+    assert unchanged_state["compatibility_migrations"][-1]["to_prompt_version"] == (
+        search.SEARCH_PROMPT_VERSION
+    )
+
+    resumed_prompts = []
+
+    def call_model(*, prompt, **_kwargs):
+        resumed_prompts.append(prompt)
+        marker = prompt.split("COMMON ", 1)[1].split()[0]
+        return {
+            "content": json.dumps(_submission(marker)),
+            "transport_completed": True,
+            "finish_reason": "stop",
+        }
+
+    monkeypatch.setattr(search, "_call_model", call_model)
+    raised = search.run_potential_search(
+        resume=output,
+        max_rounds=2,
+        max_repairs_per_candidate=2,
+        client=object(),
+        training_runner=train,
+        evaluation_runner=evaluate,
+        baseline_validator=baseline,
+    )
+    assert raised["status"] == "paused_candidate_repairs_exhausted"
+    raised_state = json.loads(state_path.read_text(encoding="utf-8"))
+    failed = raised_state["current_round"]["candidates"]["r02_c02"]
+    assert raised_state["settings"]["max_repairs_per_candidate"] == 2
+    assert failed["corrections_used"] == 2
+    assert raised_state["model_calls"] == 8
+    assert len(resumed_prompts) == 1
+    assert search.VALIDATION_FEEDBACK_FORMAT_VERSION in resumed_prompts[0]
+    assert "Error: DIRECTION_REMOVE_COMPONENT_COUNT" in resumed_prompts[0]
+    assert len(training_calls) == len(evaluation_calls) == 4
 
 
 def test_legacy_oversized_pending_request_resumes_with_compact_prompt_once(
