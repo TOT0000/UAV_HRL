@@ -529,6 +529,13 @@ _METHOD_DEFINITIONS = {
         "task_observation": "masked",
         "label": "TD3 + Dinkelbach + controlled DQN without task-assignment observations",
     },
+    "td3_dinkelbach_llm_explorer": {
+        **_COMMON_METHOD,
+        "agent": "td3",
+        "movement": "centralized_td3",
+        "reward_mode": "dinkelbach",
+        "label": "TD3 + Dinkelbach + LLM-guided TD3/safe-DDQN exploration",
+    },
 }
 METHOD_REGISTRY = MappingProxyType(_METHOD_DEFINITIONS)
 _LEGACY_METHOD_IDS = frozenset(
@@ -616,6 +623,12 @@ class MethodSpec:
         """Keep the new behavior out of legacy MethodSpec fingerprints."""
 
         return self.method_id == "td3_dinkelbach_llm_potential"
+
+    @property
+    def llm_explorer_enabled(self) -> bool:
+        """Enable the isolated exploration controller only for its own method."""
+
+        return self.method_id == "td3_dinkelbach_llm_explorer"
 
     @property
     def fingerprint(self) -> str:

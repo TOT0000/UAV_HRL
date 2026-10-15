@@ -1,0 +1,73 @@
+Perform the guidance-generation stage.
+
+Use the analysis and verified inputs below to produce numerical exploration guidance for the current episode. The update interval is K=1. Your output remains fixed throughout this episode.
+
+1. Complete analysis-stage output
+
+{{ANALYSIS_STAGE_OUTPUT}}
+
+2. Verified environment constants and input-field definitions
+
+{{ENVIRONMENT_CONSTANTS_AND_FIELD_DEFINITIONS_JSON}}
+
+3. Current observable initial state
+
+{{CURRENT_OBSERVABLE_INITIAL_STATE_JSON}}
+
+4. Current exploration settings and numerical limits
+
+{{CURRENT_EXPLORATION_SETTINGS_JSON}}
+
+5. Previously applied exploration guidance and fallback status
+
+{{PREVIOUS_APPLIED_GUIDANCE_JSON}}
+
+Produce both outputs.
+
+A. td3_bias has shape [16,3]. Row u is UAV u and columns are [mu_speed,mu_heading,mu_vertical]. Values are normalized Actor offsets, not direct commands, and each must lie in [-sigma_episode_start,+sigma_episode_start]. Do not multiply by sigma. Output all UAVs; the initial movement mask is not permanent. Neutral bias is valid.
+
+B. routing_prior has shape [16,17]. Row u is sender u; columns 0-15 are UAV actions and 16 is GS; action u is WAIT. Every value must be finite and in [0,1], and every row must sum to 1. This prior is before the dynamic legal mask. Initial illegality or an empty queue is not permanent. Only the epsilon branch uses 0.8*MaskAndNormalize(prior)+0.2*Uniform(legal); the greedy branch remains safe-Q.
+
+Return exactly one complete JSON object with only td3_bias and routing_prior. Do not include explanations, Markdown, code fences, arithmetic expressions, ellipses, NaN, or Infinity.
+
+The structural schema is:
+
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["td3_bias", "routing_prior"],
+  "properties": {
+    "td3_bias": {
+      "type": "array",
+      "minItems": 16,
+      "maxItems": 16,
+      "items": {
+        "type": "array",
+        "minItems": 3,
+        "maxItems": 3,
+        "items": {"type": "number"}
+      }
+    },
+    "routing_prior": {
+      "type": "array",
+      "minItems": 16,
+      "maxItems": 16,
+      "items": {
+        "type": "array",
+        "minItems": 17,
+        "maxItems": 17,
+        "items": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        }
+      }
+    }
+  }
+}
+
+The schema is supplemented by the bias bounds and row-sum requirements above.
+
+If validation feedback appears below, correct every reported error and return the complete JSON object again:
+
+{{VALIDATION_FEEDBACK_OR_EMPTY}}

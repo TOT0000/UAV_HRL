@@ -1,5 +1,9 @@
 # Manifest-driven comparison experiments
 
+The additive `td3_dinkelbach_llm_explorer` comparison method and its live,
+resume, evaluation, and offline-smoke commands are documented in
+`docs/llm_explorer.md`.
+
 `run_experiment.py METHOD` runs exactly one controlled trajectory method per
 process. The registry keys are `td3_dinkelbach`, `ddpg_dinkelbach`,
 `td3_ratio`, `ddpg_ratio`, `random_action`,

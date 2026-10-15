@@ -5,6 +5,8 @@ import numpy as np
 from torch import nn
 import random
 import torch.nn.functional as F
+
+from llm_explorer import masked_routing_exploration_distribution
 import collections
 from torch.optim.lr_scheduler import StepLR
 import matplotlib.pyplot as plt
@@ -175,7 +177,19 @@ class DDQN:
         self.cost_optimizer_update_count = 0
         self.reward_target_update_count = 0
         self.cost_target_update_count = 0
-    def select_action(self, state, uav_id, mask=None, visited_nodes=None, epsilon=0.5, logits_noise_std=0.5, eta=None):
+    def select_action(
+        self,
+        state,
+        uav_id,
+        mask=None,
+        visited_nodes=None,
+        epsilon=0.5,
+        logits_noise_std=0.5,
+        eta=None,
+        exploration_prior=None,
+        zero_prior_mass_callback=None,
+        return_diagnostics=False,
+    ):
         if eta is not None and not np.isclose(float(eta), self.lambda_cost):
             raise ValueError(
                 "safe-DDQN action selection must use the episode lambda_cost"
@@ -214,12 +228,46 @@ class DDQN:
             )
 
         # ---------- ε-greedy ----------
-        if float(epsilon) > 0.0 and self.exploration_rng.random() < epsilon:
+        explored = (
+            float(epsilon) > 0.0
+            and self.exploration_rng.random() < float(epsilon)
+        )
+        zero_prior_mass = False
+        exploration_distribution = None
+        if explored:
             available_actions = np.where(final_mask)[0]
-            action = int(self.exploration_rng.choice(available_actions))
+            if exploration_prior is None:
+                # Preserve the original path and RNG behavior for every
+                # existing comparison method.
+                action = int(self.exploration_rng.choice(available_actions))
+            else:
+                exploration_distribution, zero_prior_mass = (
+                    masked_routing_exploration_distribution(
+                        exploration_prior, final_mask
+                    )
+                )
+                action = int(
+                    self.exploration_rng.choice(
+                        np.arange(self.action_dim), p=exploration_distribution
+                    )
+                )
+                if zero_prior_mass and zero_prior_mass_callback is not None:
+                    zero_prior_mass_callback()
         else:
             action = int(np.argmax(q_values_masked))
 
+        if return_diagnostics:
+            return action, {
+                "decision_branch": (
+                    "epsilon_exploration" if explored else "safe_q_greedy"
+                ),
+                "zero_legal_prior_mass_fallback": bool(zero_prior_mass),
+                "exploration_distribution": (
+                    None
+                    if exploration_distribution is None
+                    else exploration_distribution.tolist()
+                ),
+            }
         return action
 
     def inspect_action_scores(self, state, mask=None):

@@ -59,6 +59,7 @@ LLM_METHODS = (
     "td3_dinkelbach_llm",
     "td3_dinkelbach_llm_search",
     "td3_dinkelbach_llm_train_search",
+    "td3_dinkelbach_llm_potential",
 )
 NEW_METHODS = (
     "td3_dinkelbach_wo_ta",
@@ -78,6 +79,7 @@ EXPECTED_METHODS = (
     + LLM_METHODS
     + EXISTING_METHODS[1:]
     + NEW_METHODS
+    + ("td3_dinkelbach_llm_explorer",)
 )
 
 

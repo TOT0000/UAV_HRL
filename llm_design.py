@@ -254,14 +254,19 @@ class LMStudioClient:
         *,
         model: str,
         prompt: str,
+        system_prompt: str | None = None,
         temperature: float,
         max_output_tokens: int,
         seed: int,
         reasoning_effort: str | None = None,
     ) -> dict[str, Any]:
+        messages = []
+        if system_prompt is not None:
+            messages.append({"role": "system", "content": str(system_prompt)})
+        messages.append({"role": "user", "content": prompt})
         payload = {
             "model": model,
-            "messages": [{"role": "user", "content": prompt}],
+            "messages": messages,
             "temperature": float(temperature),
             "max_tokens": int(max_output_tokens),
             "seed": int(seed),
@@ -337,6 +342,7 @@ class LMStudioClient:
         *,
         model: str,
         prompt: str,
+        system_prompt: str | None = None,
         temperature: float,
         max_output_tokens: int,
         seed: int,
@@ -347,6 +353,7 @@ class LMStudioClient:
         payload = self._payload(
             model=model,
             prompt=prompt,
+            system_prompt=system_prompt,
             temperature=temperature,
             max_output_tokens=max_output_tokens,
             seed=seed,
@@ -519,14 +526,19 @@ class OpenAIClient(LMStudioClient):
         *,
         model: str,
         prompt: str,
+        system_prompt: str | None = None,
         temperature: float,
         max_output_tokens: int,
         seed: int,
         reasoning_effort: str | None = None,
     ) -> dict[str, Any]:
+        messages = []
+        if system_prompt is not None:
+            messages.append({"role": "system", "content": str(system_prompt)})
+        messages.append({"role": "user", "content": prompt})
         payload = {
             "model": model,
-            "messages": [{"role": "user", "content": prompt}],
+            "messages": messages,
             "temperature": float(temperature),
             "max_completion_tokens": int(max_output_tokens),
             "seed": int(seed),

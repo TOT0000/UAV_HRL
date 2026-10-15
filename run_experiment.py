@@ -470,6 +470,23 @@ def build_parser():
                 "--training-manifest",
                 help="optional existing train manifest with exactly --episodes entries",
             )
+        if method.llm_explorer_enabled:
+            method_parser.add_argument(
+                "--llm-explorer-model",
+                default="gpt-4o-mini",
+                help="exploration-guidance model (default: gpt-4o-mini)",
+            )
+            method_parser.add_argument(
+                "--llm-explorer-timeout",
+                type=float,
+                default=60.0,
+                help="bounded seconds per LLM request",
+            )
+            method_parser.add_argument(
+                "--llm-explorer-mock",
+                action="store_true",
+                help="use the deterministic offline guidance client",
+            )
         if is_rnd_method(method):
             method_parser.add_argument(
                 "--training-manifest",
@@ -892,6 +909,14 @@ def run(args):
         )
         resolved["potential_artifact_path"] = "potential_artifact"
         resolved["llm_worker_timeout_seconds"] = float(args.llm_worker_timeout)
+    if method.llm_explorer_enabled:
+        resolved["llm_explorer"] = {
+            "model": str(args.llm_explorer_model),
+            "request_timeout_seconds": float(args.llm_explorer_timeout),
+            "mock": bool(args.llm_explorer_mock),
+            "warmup_joint_transitions": 10000,
+            "update_interval_episodes": 1,
+        }
     _write_json_atomic(run_dir / "resolved_config.json", resolved)
     write_run_status(run_dir, "RUNNING")
     try:
@@ -910,6 +935,11 @@ def run(args):
             episode_observer=_llm_episode_observer(run_dir, method),
             rnd_config=resolved.get("rnd_config"),
             checkpoint_episodes=resolved.get("checkpoint_episodes"),
+            llm_explorer_model=getattr(
+                args, "llm_explorer_model", "gpt-4o-mini"
+            ),
+            llm_explorer_timeout=getattr(args, "llm_explorer_timeout", 60.0),
+            llm_explorer_mock=getattr(args, "llm_explorer_mock", False),
         )
         resolved.update(
             status="COMPLETED",
@@ -1222,6 +1252,17 @@ def run_resume(args):
             episode_observer=_llm_episode_observer(run_dir, method),
             rnd_config=resolved.get("rnd_config"),
             checkpoint_episodes=resolved.get("checkpoint_episodes"),
+            llm_explorer_model=(
+                resolved.get("llm_explorer") or {}
+            ).get("model", "gpt-4o-mini"),
+            llm_explorer_timeout=float(
+                (resolved.get("llm_explorer") or {}).get(
+                    "request_timeout_seconds", 60.0
+                )
+            ),
+            llm_explorer_mock=bool(
+                (resolved.get("llm_explorer") or {}).get("mock", False)
+            ),
         )
         resolved.update(
             status="COMPLETED",
@@ -1385,6 +1426,17 @@ def run_evaluate(args):
             resolved.get("llm_worker_timeout_seconds", 60.0)
         ),
         rnd_config=resolved.get("rnd_config"),
+        llm_explorer_model=(resolved.get("llm_explorer") or {}).get(
+            "model", "gpt-4o-mini"
+        ),
+        llm_explorer_timeout=float(
+            (resolved.get("llm_explorer") or {}).get(
+                "request_timeout_seconds", 60.0
+            )
+        ),
+        # Evaluation never creates a client or calls the LLM, regardless of
+        # the training run's mock/live setting.
+        llm_explorer_mock=False,
     )
     formal_evaluation = bool(
         not args.smoke

@@ -141,11 +141,37 @@ class TD3():
         self.num_training = 0
 
     def select_action(
-        self, state, episode=0, add_noise=True, noise_std=None
+        self,
+        state,
+        episode=0,
+        add_noise=True,
+        noise_std=None,
+        mean_bias=None,
+        return_diagnostics=False,
     ):
         state = torch.FloatTensor(state.reshape(1, -1)).to(device)
         with torch.no_grad():
             raw_action = self.actor(state).cpu().numpy().flatten()
+        actor_action = raw_action.copy()
+
+        if mean_bias is not None:
+            bias = np.asarray(mean_bias, dtype=np.float32).reshape(-1)
+            if bias.shape != raw_action.shape or not np.isfinite(bias).all():
+                raise ValueError(
+                    "TD3 exploration mean bias must be finite and match the joint action"
+                )
+            if noise_std is not None and np.any(
+                np.abs(bias) > float(noise_std) + 1e-12
+            ):
+                raise ValueError(
+                    "TD3 exploration mean bias exceeds the behavior-noise sigma"
+                )
+            # The fixed episode bias is an actual normalized-action offset.  It
+            # is deliberately added before fieldwise action projection and is
+            # not multiplied by sigma.
+            raw_action = raw_action + bias
+        else:
+            bias = np.zeros_like(raw_action)
 
         if add_noise:
             # Active centralized training supplies an explicit transition-based
@@ -158,13 +184,23 @@ class TD3():
                 0, noise_std, size=raw_action.shape
             )
             raw_action = raw_action + noise
+        else:
+            noise = np.zeros_like(raw_action)
 
         raw_action = raw_action.astype(np.float32, copy=False)
-        return (
+        projected = (
             project_action_domain(raw_action)
             if raw_action.shape[-1] % 3 == 0
             else raw_action
         )
+        if return_diagnostics:
+            return projected, {
+                "actor_action": actor_action.astype(np.float32, copy=False),
+                "mean_bias": bias.astype(np.float32, copy=False),
+                "gaussian_noise": np.asarray(noise, dtype=np.float32),
+                "pre_projection_action": raw_action.copy(),
+            }
+        return projected
 
 
     def decode_action(self, raw_action):

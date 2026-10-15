@@ -153,6 +153,14 @@ from llm_potential import (
     load_potential_artifact,
     runtime_constants_metadata as potential_constants_metadata,
 )
+from llm_explorer import (
+    LLMExplorerConfig,
+    LLMExplorerController,
+    build_movement_decision_record,
+    build_observable_initial_state,
+    environment_constants_and_definitions,
+    explorer_metadata,
+)
 
 
 MOVEMENT_CONTROL_INTERVAL = int(round(MOVEMENT_INTERVAL_SECONDS / ROUTING_SLOT_SECONDS))
@@ -752,6 +760,9 @@ def _run_routing_slot(
     routing_transition_ledger=None,
     routing_q_score_accumulator=None,
     routing_q_score_context=None,
+    exploration_prior=None,
+    zero_prior_mass_callback=None,
+    routing_decision_observer=None,
 ):
     del routing_masks
     packet_cost_attribution = (
@@ -853,9 +864,53 @@ def _run_routing_slot(
                 start_of_slot_hol_by_sender,
             )
 
-    next_hops = _select_routing_actions(
-        ddqn, states, effective_masks, epsilon=epsilon
+    next_hops, selection_diagnostics = _select_routing_actions(
+        ddqn,
+        states,
+        effective_masks,
+        epsilon=epsilon,
+        exploration_prior=exploration_prior,
+        zero_prior_mass_callback=zero_prior_mass_callback,
+        return_diagnostics=True,
+        capture_diagnostics=routing_decision_observer is not None,
     )
+    if routing_decision_observer is not None:
+        for uid in routing_decision_uav_ids:
+            hol = start_of_slot_hol_by_sender[uid]
+            deadline_abs = hol.get("deadline_abs")
+            remaining_deadline = (
+                None
+                if deadline_abs is None
+                else max(float(deadline_abs) - float(current_time), 0.0)
+            )
+            legal_capacity_reference_bps = {
+                str(action): (
+                    0.0
+                    if int(action) == int(uid)
+                    else float(env.routing_capacity_reference_mbps(uid, action))
+                    * 1e6
+                )
+                for action in np.flatnonzero(effective_masks[uid])
+            }
+            routing_decision_observer(
+                {
+                    "time_seconds": float(current_time),
+                    "sender_uav_id": int(uid),
+                    "selected_action": int(next_hops[uid]),
+                    "compact_routing_state": states[uid].astype(float).tolist(),
+                    "legal_action_mask": effective_masks[uid].astype(int).tolist(),
+                    "reference_capacity_bps_by_legal_action": (
+                        legal_capacity_reference_bps
+                    ),
+                    "sender_total_backlog_bits": float(backlog_before.get(uid, 0.0)),
+                    "hol_packet_id": int(hol["id"]),
+                    "hol_task_type": str(hol.get("task_type")),
+                    "hol_remaining_bits": float(hol.get("rem_bits", 0.0)),
+                    "hol_remaining_deadline_seconds": remaining_deadline,
+                    "epsilon": float(epsilon),
+                    **selection_diagnostics[uid],
+                }
+            )
     if routing_q_score_accumulator is not None:
         if not np.isclose(float(epsilon), 0.0, rtol=0.0, atol=0.0):
             raise AssertionError(
@@ -1014,22 +1069,62 @@ def _run_routing_slot(
     )
 
 
-def _select_routing_actions(ddqn, states, routing_masks, epsilon):
+def _select_routing_actions(
+    ddqn,
+    states,
+    routing_masks,
+    epsilon,
+    *,
+    exploration_prior=None,
+    zero_prior_mass_callback=None,
+    return_diagnostics=False,
+    capture_diagnostics=False,
+):
     """Select all routing actions with one shared slot-level epsilon."""
 
-    return {
-        uid: int(
-            ddqn.select_action(
+    actions = {}
+    diagnostics = {}
+    for uid in sorted(states):
+        if exploration_prior is None:
+            selection_kwargs = dict(
+                state=states[uid],
+                uav_id=uid,
+                mask=routing_masks[uid],
+                visited_nodes=None,
+                epsilon=epsilon,
+                logits_noise_std=0.0,
+            )
+            if capture_diagnostics:
+                selection_kwargs["return_diagnostics"] = True
+            selected = ddqn.select_action(
+                **selection_kwargs
+            )
+            if capture_diagnostics:
+                action, detail = selected
+                actions[uid] = int(action)
+                diagnostics[uid] = detail
+            else:
+                actions[uid] = int(selected)
+                diagnostics[uid] = {
+                    "decision_branch": "unknown_legacy_selection",
+                    "zero_legal_prior_mass_fallback": False,
+                    "exploration_distribution": None,
+                }
+        else:
+            action, detail = ddqn.select_action(
                 states[uid],
                 uid,
                 routing_masks[uid],
                 visited_nodes=None,
                 epsilon=epsilon,
                 logits_noise_std=0.0,
+                exploration_prior=np.asarray(exploration_prior)[uid],
+                zero_prior_mass_callback=zero_prior_mass_callback,
+                return_diagnostics=True,
             )
-        )
-        for uid in sorted(states)
-    }
+            actions[uid] = int(action)
+            diagnostics[uid] = detail
+    return (actions, diagnostics) if return_diagnostics else actions
 
 
 def _mark_search_observations(
@@ -1294,6 +1389,7 @@ def _full_training_state(
     channel_lifecycle_state=None,
     routing_transition_state=None,
     packet_engine_state=None,
+    llm_explorer_state=None,
 ):
     completed_episode_count = int(episode) + 1
     if lambda_cost_used_log is None:
@@ -1412,6 +1508,11 @@ def _full_training_state(
         "channel_lifecycle_state": copy.deepcopy(channel_lifecycle_state),
         "routing_transition_state": copy.deepcopy(routing_transition_state),
         "packet_engine_state": copy.deepcopy(packet_engine_state),
+        **(
+            {"llm_explorer_state": copy.deepcopy(llm_explorer_state)}
+            if llm_explorer_state is not None
+            else {}
+        ),
     }
 
 
@@ -1969,6 +2070,10 @@ def train(
     potential_artifact_dir=None,
     rnd_config=None,
     checkpoint_episodes=None,
+    llm_explorer_model="gpt-4o-mini",
+    llm_explorer_timeout=60.0,
+    llm_explorer_mock=False,
+    llm_explorer_client=None,
 ):
     if config is None:
         raise ValueError(
@@ -1982,6 +2087,13 @@ def train(
         for key, value in method_spec.to_dict().items()
         if key != "method_id"
     })
+    if not method_spec.llm_explorer_enabled and (
+        llm_explorer_mock or llm_explorer_client is not None
+    ):
+        raise ValueError(
+            "LLM explorer client settings are valid only for "
+            "td3_dinkelbach_llm_explorer"
+        )
     formal_config = effective_training_config(config, method_spec)
     rnd_enabled = is_rnd_method(method_spec)
     if rnd_enabled:
@@ -2281,6 +2393,54 @@ def train(
         evaluation=evaluation,
         rng_contract_metadata=rng_streams.metadata(),
     )
+    llm_explorer_config = (
+        LLMExplorerConfig(
+            model=str(llm_explorer_model),
+            request_timeout_seconds=float(llm_explorer_timeout),
+        )
+        if method_spec.llm_explorer_enabled
+        else None
+    )
+    llm_explorer = (
+        LLMExplorerController(
+            run_directory=config.run_directory,
+            run_identity={
+                "method_id": method_spec.method_id,
+                "training_seed": config.random_seed,
+                "run_directory": (
+                    str(Path(config.run_directory).resolve())
+                    if config.run_directory is not None
+                    else None
+                ),
+                "training_source_git_sha": (
+                    (training_run_provenance or {}).get(
+                        "initial_training_git_sha"
+                    )
+                    or experiment_identity.get("git_sha")
+                ),
+                "training_history_identity_manifest_hash": (
+                    (training_run_provenance or {}).get(
+                        "training_history_identity_manifest_hash"
+                    )
+                    or experiment_identity.get("manifest_hash")
+                ),
+            },
+            config=llm_explorer_config,
+            client=llm_explorer_client,
+            evaluation=evaluation,
+            mock=bool(llm_explorer_mock),
+            rng_seed=(
+                (0 if config.random_seed is None else int(config.random_seed))
+                ^ 0x4C4C4D45
+            ),
+        )
+        if method_spec.llm_explorer_enabled
+        else None
+    )
+    if llm_explorer_config is not None:
+        experiment_identity["llm_explorer"] = explorer_metadata(
+            llm_explorer_config
+        )
     if rnd_explorer is not None:
         experiment_identity["rnd"] = rnd_explorer.metadata()
         experiment_identity["rnd"]["checkpoint_episodes"] = (
@@ -2565,6 +2725,13 @@ def train(
             rnd_explorer=rnd_explorer,
         )
         training_state = restored["training_state"]
+        if llm_explorer is not None:
+            explorer_state = training_state.get("llm_explorer_state")
+            if explorer_state is None:
+                raise RuntimeError(
+                    "LLM explorer resume checkpoint lacks explorer state"
+                )
+            llm_explorer.load_state_dict(explorer_state)
         if routing_transition_ledger is not None:
             routing_transition_ledger.load_state_dict(
                 training_state["routing_transition_state"]
@@ -2781,6 +2948,39 @@ def train(
         packet_engine.update_fov_ema(
             env, transition_marker=f"episode={episode},map_reset"
         )
+        episode_guidance = None
+        if llm_explorer is not None:
+            episode_sigma_start = movement_behavior_noise(
+                max(
+                    total_joint_transitions - config.warmup_joint_transitions,
+                    0,
+                ),
+                td3_schedule_decay,
+                evaluation=evaluation,
+            )
+            episode_routing_epsilon_start = (
+                0.0
+                if evaluation
+                else routing_lifecycle.epsilon(ddqn_schedule_decay)
+            )
+            episode_guidance = llm_explorer.begin_episode(
+                episode_index=episode,
+                total_joint_transitions=total_joint_transitions,
+                sigma_episode_start=episode_sigma_start,
+                routing_epsilon=episode_routing_epsilon_start,
+                current_observable_initial_state=build_observable_initial_state(
+                    env, packet_engine
+                ),
+                environment_constants=environment_constants_and_definitions(
+                    episode_seconds=config.episode_seconds,
+                    routing_slot_seconds=config.routing_slot_seconds,
+                    environment_width_m=env.env_width,
+                    environment_height_m=env.env_height,
+                    task_deadlines_seconds=resolved_evaluation[
+                        "task_deadlines_seconds"
+                    ],
+                ),
+            )
         scenario_entry = (
             scenario_manifest.episodes[episode]
             if scenario_manifest is not None
@@ -2974,7 +3174,10 @@ def train(
                 expected_next_movement_state = None
                 expected_next_movement_mask = None
 
+            movement_action_diagnostics = None
+            behavior_noise = None
             if method_spec.agent == "random":
+                action_source = "random_method"
                 raw_joint_action = sample_random_joint_action(
                     JOINT_ACTION_DIM,
                     rng_streams.numpy(
@@ -2984,6 +3187,11 @@ def train(
                     ),
                 )
             elif evaluation:
+                action_source = (
+                    "evaluation_policy_with_sampling_noise"
+                    if sampling_mode
+                    else "evaluation_deterministic_policy"
+                )
                 raw_joint_action = movement_agent.select_action(
                     state,
                     add_noise=sampling_mode,
@@ -2995,24 +3203,66 @@ def train(
             elif _uses_warmup_random_action(
                 total_joint_transitions, config.warmup_joint_transitions
             ):
+                action_source = "warmup_random"
                 episode_warmup_random_action_intervals += 1
                 raw_joint_action = rng_streams.numpy(
                     "movement_exploration"
                 ).uniform(-1.0, 1.0, size=JOINT_ACTION_DIM).astype(np.float32)
             else:
+                action_source = "actor_plus_gaussian_exploration"
                 behavior_noise = movement_behavior_noise(
                     total_joint_transitions - config.warmup_joint_transitions,
                     td3_schedule_decay,
                 )
-                raw_joint_action = movement_agent.select_action(
-                    state, add_noise=True, noise_std=behavior_noise
-                )
+                if llm_explorer is not None:
+                    applied_bias = (
+                        episode_guidance["td3_bias"].reshape(-1)
+                        if episode_guidance["enabled"]
+                        and not episode_guidance["td3_fallback"]
+                        else None
+                    )
+                    if applied_bias is not None:
+                        action_source = "actor_plus_llm_bias_plus_gaussian_exploration"
+                    raw_joint_action, movement_action_diagnostics = (
+                        movement_agent.select_action(
+                            state,
+                            add_noise=True,
+                            noise_std=behavior_noise,
+                            mean_bias=applied_bias,
+                            return_diagnostics=True,
+                        )
+                    )
+                else:
+                    raw_joint_action = movement_agent.select_action(
+                        state, add_noise=True, noise_std=behavior_noise
+                    )
                 td3_noise_log.append(behavior_noise)
                 episode_behavior_noise_values.append(float(behavior_noise))
                 environment_actor_calls += 1
             projected_action = project_joint_action(
                 raw_joint_action, movement_mask=current_movement_mask
             )
+            movement_explorer_record = None
+            if llm_explorer is not None:
+                movement_explorer_record = build_movement_decision_record(
+                    env,
+                    episode_index=episode,
+                    interval_index=interval,
+                    movement_mask=current_movement_mask,
+                    action_source=action_source,
+                    executed_action=projected_action,
+                    actor_action=(
+                        movement_action_diagnostics["actor_action"]
+                        if movement_action_diagnostics is not None
+                        else None
+                    ),
+                    applied_bias=(
+                        movement_action_diagnostics["mean_bias"]
+                        if movement_action_diagnostics is not None
+                        else None
+                    ),
+                    noise_std=behavior_noise,
+                )
             velocity_commands = decode_joint_velocity_commands(
                 movement_agent, projected_action
             )
@@ -3141,6 +3391,23 @@ def train(
                         if routing_q_score_accumulator is not None
                         else None
                     ),
+                    exploration_prior=(
+                        episode_guidance["routing_prior"]
+                        if llm_explorer is not None
+                        and episode_guidance["enabled"]
+                        and not episode_guidance["routing_fallback"]
+                        else None
+                    ),
+                    zero_prior_mass_callback=(
+                        llm_explorer.record_zero_legal_prior_mass
+                        if llm_explorer is not None
+                        else None
+                    ),
+                    routing_decision_observer=(
+                        llm_explorer.record_routing
+                        if llm_explorer is not None
+                        else None
+                    ),
                 )
                 ddqn_action_selections += action_selections
                 interval_delivered_bits += delivered_bits
@@ -3174,6 +3441,22 @@ def train(
                 current_movement_mask,
                 HOVER_ACTION,
             )
+            if movement_explorer_record is not None:
+                executed_blocks = np.asarray(executed_action, dtype=float).reshape(
+                    NUM_UAV, 3
+                )
+                for item in movement_explorer_record["uavs"]:
+                    uav_id = int(item["uav_id"])
+                    item["executed_normalized_action"] = executed_blocks[
+                        uav_id
+                    ].tolist()
+                    item["movement_energy_j"] = float(
+                        interval_energies[uav_id]
+                    )
+                movement_explorer_record["joint_movement_energy_j"] = float(
+                    interval_energies.sum()
+                )
+                llm_explorer.record_movement(movement_explorer_record)
             interval_energy = float(interval_energies.sum())
             discovery_time_seconds = float(interval + 1)
             for gt in env.gts:
@@ -3734,6 +4017,17 @@ def train(
         episode_metrics.append(
             {
                 "method_id": method_spec.method_id,
+                "routing_reward_total": float(episode_routing_reward),
+                "llm_explorer": (
+                    {
+                        "applied_guidance": llm_explorer.state_dict()[
+                            "active_guidance"
+                        ],
+                        "statistics": copy.deepcopy(llm_explorer.statistics),
+                    }
+                    if llm_explorer is not None
+                    else None
+                ),
                 "llm_artifact_id": (
                     llm_identity["artifact_content_sha256"]
                     if llm_identity is not None
@@ -4100,6 +4394,46 @@ def train(
                 ),
             }
         )
+        if llm_explorer is not None:
+            llm_explorer.complete_episode(
+                episode_index=episode,
+                metrics={
+                    "energy_efficiency_bit_per_j": (
+                        total_timely_useful_bits / float(episode_energy)
+                        if float(episode_energy) > 0.0
+                        else 0.0
+                    ),
+                    "timely_useful_delivery_bits": total_timely_useful_bits,
+                    "movement_energy_j": float(episode_energy),
+                    "td3_original_cumulative_reward": float(
+                        episode_existing_movement_reward
+                    ),
+                    "safe_ddqn_original_cumulative_reward": float(
+                        episode_routing_reward
+                    ),
+                    "lambda_EE_Mbit_per_J_used": float(episode_lambda),
+                    "lambda_cost_used": episode_lambda_cost,
+                    "lambda_cost_after_episode": lambda_cost_after_episode,
+                    "system_qos_eligible_packets": int(
+                        episode_system_eligible_packet_count
+                    ),
+                    "system_qos_violation_count": int(
+                        episode_system_violation_count
+                    ),
+                    "system_qos_violation_probability": (
+                        episode_violation_probability
+                    ),
+                    "routing_stage_eligible_packets": int(
+                        episode_routing_eligible_packet_count
+                    ),
+                    "routing_stage_violation_count": int(
+                        episode_routing_stage_violation_count
+                    ),
+                    "routing_immediate_cost_sum": float(
+                        episode_routing_immediate_cost_sum
+                    ),
+                },
+            )
         if episode_observer is not None:
             episode_observer(
                 {
@@ -4335,6 +4669,11 @@ def train(
                         else RoutingTransitionLedger().state_dict()
                     ),
                     packet_engine_state=packet_engine.checkpoint_state(),
+                    llm_explorer_state=(
+                        llm_explorer.state_dict()
+                        if llm_explorer is not None
+                        else None
+                    ),
                 ),
                 formal_config=formal_config,
                 movement_state_dim=movement_state_dim,
@@ -4506,6 +4845,15 @@ def train(
         ),
         "rnd_evaluation_fingerprint_before": rnd_evaluation_fingerprint_before,
         "llm_artifact_identity": copy.deepcopy(llm_identity),
+        "llm_explorer": (
+            {
+                "configuration": explorer_metadata(llm_explorer_config),
+                "statistics": copy.deepcopy(llm_explorer.statistics),
+                "state": llm_explorer.state_dict(),
+            }
+            if llm_explorer is not None
+            else None
+        ),
         "potential_artifact_identity": copy.deepcopy(potential_identity),
         "joint_action_dim": JOINT_ACTION_DIM,
         "num_uav": NUM_UAV,
