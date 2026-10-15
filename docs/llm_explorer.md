@@ -20,15 +20,24 @@ is attempted at most twice; the underlying OpenAI client has retries disabled.
 Prompts, responses, validation results, usage, timings, and an append-only event
 journal are stored under `<run>/llm_explorer/`. Completed responses are reused
 only when the run/episode, complete input hash, model, prompt version, and
-configuration identity all match. The request payload contains filtered
-observable state and never serializes a scenario manifest or undiscovered RoI
-and SR ground truth.
+configuration identity all match. Final episode results are also cached for
+full success, partial success, and fallback outcomes. The request payload uses
+versioned compact tables built from a copy of the raw diagnostics; raw training
+records retain their original precision. Every analysis, guidance, and retry
+request is checked with the `o200k_base` tokenizer against the 128,000-token
+context limit, including reserved output and a safety margin. Token budgets are
+saved beside each attempt. The payload contains filtered observable state and
+never serializes a scenario manifest or undiscovered RoI and SR ground truth.
+The compact-input/cache schema is v2; v1 explorer checkpoints are rejected
+instead of mixing old prompt identities or inventing historical counters. Start
+a new comparison run when migrating from a v1 explorer run.
 
 ## PowerShell commands
 
 Live training:
 
 ```powershell
+python -m pip install -r requirements-llm-explorer.txt
 $env:OPENAI_API_KEY = "<your-key>"
 $episodes = [int](Read-Host "Training episode count")
 python run_experiment.py td3_dinkelbach_llm_explorer --episodes $episodes --seed 20260817 --output-root results

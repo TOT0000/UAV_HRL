@@ -76,6 +76,7 @@ from llm_potential import (
     copy_potential_artifact,
     load_run_artifact as load_potential_run_artifact,
 )
+from llm_explorer import LLM_EXPLORER_VERSION, llm_explorer_path_preflight
 
 
 TRAINING_HISTORY_MANIFEST_HASH_SEMANTICS = (
@@ -838,6 +839,18 @@ def run(args):
         values["output_root"], method.method_key, values["seed"], git_sha
     )
     write_run_status(run_dir, "PREPARING")
+    if method.llm_explorer_enabled:
+        try:
+            explorer_path_report = llm_explorer_path_preflight(
+                run_dir, maximum_episode=values["episodes"]
+            )
+            _write_json_atomic(
+                run_dir / "llm_explorer_path_preflight.json",
+                explorer_path_report,
+            )
+        except BaseException as exc:
+            write_run_status(run_dir, run_state_for_exception(exc), exception=exc)
+            raise
     if method.llm_enabled:
         try:
             path_preflight = llm_checkpoint_path_preflight(
@@ -911,6 +924,7 @@ def run(args):
         resolved["llm_worker_timeout_seconds"] = float(args.llm_worker_timeout)
     if method.llm_explorer_enabled:
         resolved["llm_explorer"] = {
+            "schema_version": LLM_EXPLORER_VERSION,
             "model": str(args.llm_explorer_model),
             "request_timeout_seconds": float(args.llm_explorer_timeout),
             "mock": bool(args.llm_explorer_mock),
@@ -973,6 +987,14 @@ def _episode_directories(root):
 
 def run_resume(args):
     run_dir, resolved, method, manifest = _load_run_context(args.run_directory)
+    if method.llm_explorer_enabled and (
+        (resolved.get("llm_explorer") or {}).get("schema_version")
+        != LLM_EXPLORER_VERSION
+    ):
+        raise ValueError(
+            "LLM explorer run uses an incompatible pre-v2 cache/checkpoint schema; "
+            "start a new run so old prompt identities and counters are not mixed"
+        )
     llm_artifact_dir, llm_identity, movement_state_dim = _llm_run_artifact(
         run_dir, resolved, method
     )
@@ -1236,6 +1258,18 @@ def run_resume(args):
             horizon_extension_history=history,
         )
     _write_json_atomic(run_dir / "resolved_config.json", resolved)
+    if method.llm_explorer_enabled:
+        try:
+            explorer_path_report = llm_explorer_path_preflight(
+                run_dir, maximum_episode=int(config.total_episodes)
+            )
+            _write_json_atomic(
+                run_dir / "llm_explorer_path_preflight.json",
+                explorer_path_report,
+            )
+        except BaseException as exc:
+            write_run_status(run_dir, run_state_for_exception(exc), exception=exc)
+            raise
     write_run_status(run_dir, "RUNNING")
     try:
         result = train(

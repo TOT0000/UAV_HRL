@@ -147,6 +147,7 @@ class TD3():
         add_noise=True,
         noise_std=None,
         mean_bias=None,
+        mean_bias_bound=None,
         return_diagnostics=False,
     ):
         state = torch.FloatTensor(state.reshape(1, -1)).to(device)
@@ -160,11 +161,19 @@ class TD3():
                 raise ValueError(
                     "TD3 exploration mean bias must be finite and match the joint action"
                 )
-            if noise_std is not None and np.any(
-                np.abs(bias) > float(noise_std) + 1e-12
-            ):
+            bound = noise_std if mean_bias_bound is None else mean_bias_bound
+            if bound is None or not np.isfinite(float(bound)) or float(bound) < 0.0:
                 raise ValueError(
-                    "TD3 exploration mean bias exceeds the behavior-noise sigma"
+                    "TD3 exploration mean bias requires a finite non-negative "
+                    "episode-start bound"
+                )
+            tolerance = max(
+                1e-7,
+                4.0 * np.finfo(np.float32).eps * max(1.0, abs(float(bound))),
+            )
+            if np.any(np.abs(bias.astype(np.float64)) > float(bound) + tolerance):
+                raise ValueError(
+                    "TD3 exploration mean bias exceeds the episode-start bound"
                 )
             # The fixed episode bias is an actual normalized-action offset.  It
             # is deliberately added before fieldwise action projection and is
@@ -197,6 +206,7 @@ class TD3():
             return projected, {
                 "actor_action": actor_action.astype(np.float32, copy=False),
                 "mean_bias": bias.astype(np.float32, copy=False),
+                "mean_bias_bound": None if mean_bias is None else float(bound),
                 "gaussian_noise": np.asarray(noise, dtype=np.float32),
                 "pre_projection_action": raw_action.copy(),
             }

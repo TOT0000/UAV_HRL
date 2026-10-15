@@ -160,6 +160,7 @@ from llm_explorer import (
     build_observable_initial_state,
     environment_constants_and_definitions,
     explorer_metadata,
+    llm_explorer_path_preflight,
 )
 
 
@@ -2401,6 +2402,15 @@ def train(
         if method_spec.llm_explorer_enabled
         else None
     )
+    if (
+        method_spec.llm_explorer_enabled
+        and not evaluation
+        and config.run_directory is not None
+    ):
+        llm_explorer_path_preflight(
+            config.run_directory,
+            maximum_episode=config.total_episodes,
+        )
     llm_explorer = (
         LLMExplorerController(
             run_directory=config.run_directory,
@@ -3229,6 +3239,7 @@ def train(
                             add_noise=True,
                             noise_std=behavior_noise,
                             mean_bias=applied_bias,
+                            mean_bias_bound=episode_sigma_start,
                             return_diagnostics=True,
                         )
                     )
