@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import copy
 import json
 import math
 from collections import Counter
@@ -24,7 +23,6 @@ from llm_explorer import (
     _compact_json,
     _json_clone,
     _routing_state_named_values,
-    _semantic_guidance,
     environment_constants_and_definitions,
     prompt_token_budget,
     render_prompt,
@@ -36,10 +34,11 @@ from llm_explorer import (
 LLM_EXPLORER_V3_METHOD_ID = "td3_dinkelbach_llm_explorer_v3"
 LLM_EXPLORER_V3_VERSION = "uav-hrl-llm-explorer-v3"
 LLM_EXPLORER_V3_PROMPT_VERSION = "uav-hrl-llm-explorer-prompts-v3"
-LLM_EXPLORER_V3_SUMMARY_VERSION = "verified-episode-summary-v1"
-LLM_EXPLORER_V3_CASE_VERSION = "deterministic-representative-cases-v1"
+LLM_EXPLORER_V3_SUMMARY_VERSION = "verified-episode-summary-v2"
+LLM_EXPLORER_V3_CASE_VERSION = "deterministic-diverse-cases-v2"
 LLM_EXPLORER_V3_ANNEAL_END_EPISODE = 600
 LLM_EXPLORER_V3_MAX_INPUT_TOKENS = 20_000
+LLM_EXPLORER_V3_TARGET_INPUT_TOKENS = 12_000
 
 
 @dataclass(frozen=True)
@@ -221,6 +220,141 @@ def _numeric_summary(values: list[float], digits: int = 5) -> dict[str, Any]:
     }
 
 
+def _case_domain(case: dict[str, Any]) -> str:
+    if case.get("domain") in {"movement", "routing"}:
+        return str(case["domain"])
+    return (
+        "movement"
+        if str(case.get("kind", "")).startswith("movement_")
+        else "routing"
+    )
+
+
+def _case_entity(case: dict[str, Any]) -> str:
+    if case.get("uav_id") is not None:
+        return f"UAV_{int(case['uav_id'])}"
+    return str(case.get("sender", "unknown"))
+
+
+def _case_time_segments(cases: list[dict[str, Any]]) -> dict[int, int | None]:
+    timed: list[tuple[int, float]] = []
+    for index, case in enumerate(cases):
+        try:
+            value = float(case.get("time_s"))
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(value):
+            timed.append((index, value))
+    if not timed:
+        return {index: None for index in range(len(cases))}
+    lower = min(value for _, value in timed)
+    upper = max(value for _, value in timed)
+    result: dict[int, int | None] = {
+        index: None for index in range(len(cases))
+    }
+    for index, value in timed:
+        if upper == lower:
+            result[index] = 0
+        else:
+            result[index] = min(
+                2, int(3.0 * (value - lower) / (upper - lower))
+            )
+    return result
+
+
+def _diverse_case_subset(
+    cases: list[dict[str, Any]], maximum: int
+) -> list[dict[str, Any]]:
+    """Select real cases deterministically by kind, entity, then time region."""
+
+    maximum = max(0, int(maximum))
+    if maximum == 0 or not cases:
+        return []
+    candidates = [_json_clone(case) for case in cases]
+    segments = _case_time_segments(candidates)
+
+    def canonical(index: int) -> tuple[Any, ...]:
+        case = candidates[index]
+        raw_time = case.get("time_s")
+        try:
+            time_value = float(raw_time)
+        except (TypeError, ValueError):
+            time_value = math.inf
+        return (
+            str(case.get("kind", "")),
+            _case_entity(case),
+            time_value,
+            json.dumps(case, ensure_ascii=False, sort_keys=True),
+        )
+
+    remaining = set(range(len(candidates)))
+    selected: list[int] = []
+    seen_kinds: set[str] = set()
+    seen_entities: set[str] = set()
+    seen_segments: set[int] = set()
+    while remaining and len(selected) < maximum:
+        def rank(index: int) -> tuple[Any, ...]:
+            case = candidates[index]
+            segment = segments[index]
+            new_kind = int(str(case.get("kind", "")) not in seen_kinds)
+            new_entity = int(_case_entity(case) not in seen_entities)
+            new_segment = int(segment is not None and segment not in seen_segments)
+            # Entity and time diversity jointly outrank another adjacent event.
+            return (
+                new_kind,
+                new_entity + new_segment,
+                new_entity,
+                new_segment,
+            )
+
+        best_rank = max(rank(index) for index in remaining)
+        eligible = [index for index in remaining if rank(index) == best_rank]
+        chosen = min(eligible, key=canonical)
+        selected.append(chosen)
+        remaining.remove(chosen)
+        selected_case = candidates[chosen]
+        seen_kinds.add(str(selected_case.get("kind", "")))
+        seen_entities.add(_case_entity(selected_case))
+        if segments[chosen] is not None:
+            seen_segments.add(int(segments[chosen]))
+    return [candidates[index] for index in selected]
+
+
+def select_representative_cases(
+    movement_cases: list[dict[str, Any]],
+    routing_cases: list[dict[str, Any]],
+    *,
+    movement_maximum: int = 3,
+    routing_maximum: int = 5,
+) -> list[dict[str, Any]]:
+    """Keep a small diverse set and reserve a real ordinary routing example."""
+
+    movement = _diverse_case_subset(movement_cases, movement_maximum)
+    routing_maximum = max(0, int(routing_maximum))
+    ordinary = [
+        case
+        for case in routing_cases
+        if case.get("kind") == "ordinary_recorded_routing_decision"
+    ]
+    anomalies = [
+        case
+        for case in routing_cases
+        if case.get("kind") != "ordinary_recorded_routing_decision"
+    ]
+    if routing_maximum == 0:
+        routing: list[dict[str, Any]] = []
+    elif ordinary:
+        # Ordinary means only that no configured anomaly filter matched; it is
+        # illustrative and is never treated as an optimal action.
+        routing = _diverse_case_subset(anomalies, routing_maximum - 1)
+        routing.extend(
+            _diverse_case_subset(ordinary, routing_maximum - len(routing))
+        )
+    else:
+        routing = _diverse_case_subset(anomalies, routing_maximum)
+    return movement + routing
+
+
 def movement_episode_summary(
     records: list[dict[str, Any]], guidance: dict[str, Any]
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
@@ -259,10 +393,10 @@ def movement_episode_summary(
                     if (
                         speed_mps >= 9.5
                         and float(raw_bias[uav_id, 0]) > 0.0
-                        and len(cases) < 8
                     ):
                         cases.append(
                             {
+                                "domain": "movement",
                                 "kind": "movement_speed_saturation_with_positive_bias",
                                 "episode": int(record.get("episode_index", -1)) + 1,
                                 "time_s": record.get("time_seconds"),
@@ -272,7 +406,6 @@ def movement_episode_summary(
                                 "action_source": record.get("action_source"),
                                 "actor_speed_mps": round(speed_mps, 4),
                                 "raw_speed_bias": round(float(raw_bias[uav_id, 0]), 6),
-                                "interpretation": "illustrative only; it does not prove a causal or optimal action",
                             }
                         )
             for target in item.get("observable_targets", []):
@@ -318,7 +451,8 @@ def routing_episode_summary(
     records: list[dict[str, Any]], maximum_cases: int = 8, episode: int | None = None
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     by_sender: dict[str, Any] = {}
-    cases: list[dict[str, Any]] = []
+    anomaly_cases: list[dict[str, Any]] = []
+    ordinary_cases: list[dict[str, Any]] = []
     for sender in range(NUM_UAV):
         sender_records = [
             record for record in records if int(record["sender_uav_id"]) == sender
@@ -360,20 +494,22 @@ def routing_episode_summary(
             if record.get("hol_remaining_deadline_seconds") is not None:
                 deadlines.append(float(record["hol_remaining_deadline_seconds"]))
             selected = int(record["selected_action"])
+            matched_anomaly = False
             if (
                 record.get("decision_branch") == "epsilon_exploration"
                 and selected == sender
                 and float(record.get("sender_total_backlog_bits", 0.0)) > 0.0
                 and any(action not in (sender,) for action in np.flatnonzero(mask))
-                and len(cases) < max(maximum_cases - 1, 0)
             ):
                 distribution = record.get("exploration_distribution")
                 wait_probability = (
                     None if distribution is None else float(distribution[sender])
                 )
                 if wait_probability is None or wait_probability >= 0.5:
-                    cases.append(
+                    matched_anomaly = True
+                    anomaly_cases.append(
                         {
+                            "domain": "routing",
                             "kind": "exploration_wait_with_backlog_and_other_legal_action",
                             "episode": episode,
                             "time_s": record.get("time_seconds"),
@@ -388,15 +524,13 @@ def routing_episode_summary(
                                 for action in np.flatnonzero(mask)
                             ],
                             "wait_exploration_probability": wait_probability,
-                            "interpretation": "illustrative only; another legal action is not necessarily better than WAIT",
                         }
                     )
-            if (
-                bool(record.get("zero_legal_prior_mass_fallback", False))
-                and len(cases) < max(maximum_cases - 1, 0)
-            ):
-                cases.append(
+            if bool(record.get("zero_legal_prior_mass_fallback", False)):
+                matched_anomaly = True
+                anomaly_cases.append(
                     {
+                        "domain": "routing",
                         "kind": "masked_prior_zero_mass",
                         "episode": episode,
                         "time_s": record.get("time_seconds"),
@@ -406,7 +540,18 @@ def routing_episode_summary(
                             routing_action_name(sender, int(action))
                             for action in np.flatnonzero(mask)
                         ],
-                        "interpretation": "the host used legal-uniform exploration for this decision",
+                    }
+                )
+            if not matched_anomaly:
+                ordinary_cases.append(
+                    {
+                        "domain": "routing",
+                        "kind": "ordinary_recorded_routing_decision",
+                        "episode": episode,
+                        "time_s": record.get("time_seconds"),
+                        "sender": f"UAV_{sender}",
+                        "branch": record.get("decision_branch"),
+                        "selected_action": routing_action_name(sender, selected),
                     }
                 )
         branch_summary: dict[str, Any] = {}
@@ -453,26 +598,265 @@ def routing_episode_summary(
             "hol_remaining_deadline_s": _numeric_summary(deadlines, 4),
             "packet_delivery_attribution": "unknown_not_recorded_per_decision",
         }
-    if len(cases) < maximum_cases:
-        for record in records:
-            sender = int(record["sender_uav_id"])
-            if bool(record.get("zero_legal_prior_mass_fallback", False)):
+    return by_sender, select_representative_cases(
+        [],
+        anomaly_cases + ordinary_cases,
+        movement_maximum=0,
+        routing_maximum=maximum_cases,
+    )
+
+
+def _summary_tuple(value: Any) -> list[Any] | None:
+    if not isinstance(value, dict):
+        return None
+    return [
+        value.get("count"),
+        value.get("mean"),
+        value.get("min"),
+        value.get("max"),
+    ]
+
+
+def _compact_movement_summaries(value: Any) -> dict[str, Any]:
+    summaries = value if isinstance(value, dict) else {}
+    rows: list[list[Any]] = []
+    for uav_id in range(NUM_UAV):
+        item = summaries.get(f"UAV_{uav_id}")
+        if not isinstance(item, dict):
+            rows.append([uav_id] + [None] * 13)
+            continue
+        task_counts = item.get("task_occurrence_counts")
+        rows.append(
+            [
+                uav_id,
+                (
+                    None
+                    if not isinstance(task_counts, dict)
+                    else [
+                        [str(key), int(count)]
+                        for key, count in sorted(task_counts.items())
+                    ]
+                ),
+                item.get("movement_mask_true_count"),
+                item.get("td3_controlled_actor_decision_count"),
+                _summary_tuple(item.get("actor_horizontal_speed_mps")),
+                _summary_tuple(item.get("actor_vertical_velocity_mps")),
+                item.get("actor_heading_circular_mean_rad"),
+                item.get("actor_near_10_mps_ratio"),
+                item.get("raw_bias"),
+                item.get("effective_bias"),
+                item.get("episode_start_sigma"),
+                item.get("nonzero_effective_bias_controlled_count"),
+                _summary_tuple(item.get("observable_target_distance_m")),
+                _summary_tuple(item.get("movement_energy_j")),
+            ]
+        )
+    return {
+        "columns": [
+            "uav_id",
+            "task_occurrence_[name,count]",
+            "movement_mask_true_count",
+            "td3_actor_decision_count",
+            "horizontal_speed_mps_[count,mean,min,max]",
+            "vertical_velocity_mps_[count,mean,min,max]",
+            "heading_circular_mean_rad",
+            "speed_ge_9.5_ratio",
+            "raw_bias_[speed,heading,vertical]",
+            "effective_bias_w_times_raw_[speed,heading,vertical]",
+            "episode_start_sigma",
+            "nonzero_effective_bias_actor_count",
+            "observable_target_distance_m_[count,mean,min,max]",
+            "movement_energy_j_[count,mean,min,max]",
+        ],
+        "rows": rows,
+    }
+
+
+def _routing_count_vector(
+    item: dict[str, Any], key: str, sender: int
+) -> list[int] | None:
+    value = item.get(key)
+    if not isinstance(value, dict):
+        return None
+    return [
+        int(value.get(routing_action_name(sender, action), 0))
+        for action in range(ROUTING_ACTION_DIM)
+    ]
+
+
+def _routing_observable_means(
+    item: dict[str, Any], field: str, sender: int
+) -> list[Any] | None:
+    values = item.get("legal_action_observable_summaries")
+    if not isinstance(values, dict):
+        return None
+    result: list[Any] = []
+    for action in range(ROUTING_ACTION_DIM):
+        action_value = values.get(routing_action_name(sender, action))
+        summary = (
+            action_value.get(field) if isinstance(action_value, dict) else None
+        )
+        result.append(summary.get("mean") if isinstance(summary, dict) else None)
+    return result
+
+
+def _compact_branch(value: Any) -> list[Any] | None:
+    if not isinstance(value, dict):
+        return None
+    return [
+        value.get("decision_count"),
+        value.get("wait_count"),
+        value.get("next_hop_count"),
+        value.get("zero_legal_prior_mass_count"),
+    ]
+
+
+def _compact_routing_summaries(value: Any) -> dict[str, Any]:
+    summaries = value if isinstance(value, dict) else {}
+    rows: list[list[Any]] = []
+    for sender in range(NUM_UAV):
+        item = summaries.get(f"UAV_{sender}")
+        if not isinstance(item, dict):
+            rows.append([sender] + [None] * 11)
+            continue
+        branches = item.get("branches")
+        branches = branches if isinstance(branches, dict) else {}
+        rows.append(
+            [
+                sender,
+                item.get("decision_count"),
+                _compact_branch(branches.get("epsilon_exploration")),
+                _compact_branch(branches.get("safe_q_greedy")),
+                _routing_count_vector(item, "selected_action_counts", sender),
+                _routing_count_vector(
+                    item, "legal_action_occurrence_counts", sender
+                ),
+                _routing_observable_means(
+                    item, "reference_capacity_norm", sender
+                ),
+                _routing_observable_means(
+                    item, "next_hop_backlog_log_norm", sender
+                ),
+                _routing_observable_means(item, "gs_progress_norm", sender),
+                _summary_tuple(item.get("sender_backlog_bits")),
+                _summary_tuple(item.get("hol_remaining_deadline_s")),
+                item.get("packet_delivery_attribution"),
+            ]
+        )
+    return {
+        "action_index_semantics": (
+            "indices 0..15 name UAV_k except sender index means WAIT; index 16 means GS"
+        ),
+        "unknown_and_zero": (
+            "null means missing/unknown; numeric 0 is observed zero; "
+            "count vectors give denominators"
+        ),
+        "columns": [
+            "sender_uav_id",
+            "decision_count",
+            "epsilon_[decision,wait,next_hop,masked_prior_zero_mass]",
+            "greedy_[decision,wait,next_hop,masked_prior_zero_mass]",
+            "selected_count_by_action_index",
+            "legal_occurrence_count_by_action_index",
+            "reference_capacity_mean_by_action_index",
+            "next_hop_backlog_mean_by_action_index",
+            "gs_progress_mean_by_action_index",
+            "sender_backlog_bits_[count,mean,min,max]",
+            "hol_remaining_deadline_s_[count,mean,min,max]",
+            "per_decision_delivery_attribution",
+        ],
+        "rows": rows,
+    }
+
+
+def _routing_prior_matrix_from_guidance(guidance: dict[str, Any]) -> Any:
+    value = guidance.get("routing_prior")
+    try:
+        matrix = np.asarray(value, dtype=np.float64)
+    except (TypeError, ValueError):
+        matrix = np.asarray([], dtype=np.float64)
+    if matrix.shape == (NUM_UAV, ROUTING_ACTION_DIM) and np.isfinite(matrix).all():
+        return matrix.round(6).tolist()
+    named = guidance.get("routing_prior_named")
+    if isinstance(named, dict):
+        try:
+            return named_routing_prior_to_matrix(named).round(6).tolist()
+        except (TypeError, ValueError, ExplorerValidationError):
+            pass
+    return None
+
+
+def _compact_applied_guidance(
+    guidance_value: Any, movement_summaries: Any
+) -> dict[str, Any]:
+    guidance = guidance_value if isinstance(guidance_value, dict) else {}
+    result = {
+        key: _json_clone(guidance[key])
+        for key in (
+            "enabled",
+            "td3_fallback",
+            "routing_fallback",
+            "td3_reason",
+            "routing_reason",
+            "analysis_attempt",
+            "td3_source_attempt",
+            "routing_source_attempt",
+            "annealing_weight",
+            "routing_alpha",
+            "sigma_episode_start",
+        )
+        if key in guidance
+    }
+    result["routing_prior_action_index_semantics"] = (
+        "rows are sender UAV IDs 0..15; columns 0..15 are UAV action indices "
+        "with the sender column meaning WAIT; column 16 is GS"
+    )
+    result["routing_prior_rows"] = _routing_prior_matrix_from_guidance(guidance)
+    movement = movement_summaries if isinstance(movement_summaries, dict) else {}
+    has_recorded_bias = all(
+        isinstance(movement.get(f"UAV_{uav_id}"), dict)
+        and "raw_bias" in movement[f"UAV_{uav_id}"]
+        and "effective_bias" in movement[f"UAV_{uav_id}"]
+        for uav_id in range(NUM_UAV)
+    )
+    if has_recorded_bias:
+        result["td3_bias_location"] = (
+            "movement summary rows contain raw and actually applied w*raw biases"
+        )
+    else:
+        raw = guidance.get("td3_bias_raw", guidance.get("td3_bias"))
+        effective = guidance.get("td3_bias_effective")
+        for key, matrix_value in (
+            ("td3_raw_bias_rows", raw),
+            ("td3_effective_bias_rows", effective),
+        ):
+            try:
+                matrix = np.asarray(matrix_value, dtype=np.float64)
+            except (TypeError, ValueError):
                 continue
-            cases.append(
-                {
-                    "kind": "ordinary_recorded_routing_decision",
-                    "episode": episode,
-                    "time_s": record.get("time_seconds"),
-                    "sender": f"UAV_{sender}",
-                    "branch": record.get("decision_branch"),
-                    "selected_action": routing_action_name(
-                        sender, int(record["selected_action"])
-                    ),
-                    "interpretation": "illustrative only; no optimality claim",
-                }
-            )
-            break
-    return by_sender, cases[:maximum_cases]
+            if matrix.shape == (NUM_UAV, 3) and np.isfinite(matrix).all():
+                result[key] = matrix.round(6).tolist()
+    return result
+
+
+def _compact_cases(cases: list[dict[str, Any]], profile: str) -> dict[str, Any]:
+    items = []
+    for case in cases:
+        item = {
+            key: value
+            for key, value in case.items()
+            if key != "interpretation"
+        }
+        items.append(_json_clone(item))
+    return {
+        "selection_profile": profile,
+        "semantics": (
+            "deterministic real-record illustrations only; ordinary means no configured "
+            "anomaly filter matched, not that the action was optimal; frequencies "
+            "come from full summaries"
+        ),
+        "items": items,
+    }
 
 
 def build_observable_initial_state_v3(env: Any, packet_engine: Any) -> dict[str, Any]:
@@ -584,28 +968,7 @@ def environment_definitions_v3(**kwargs: Any) -> dict[str, Any]:
 
 
 def output_schema_v3() -> dict[str, Any]:
-    sender_properties = {
-        f"UAV_{sender}": {
-            "type": "object",
-            "description": (
-                "Sparse probabilities over GS, WAIT, and UAV_k except the sender's own UAV_k name; omitted actions are zero"
-            ),
-            "properties": {
-                name: {"type": "number", "minimum": 0, "maximum": 1}
-                for name in (
-                    ["GS", "WAIT"]
-                    + [
-                        f"UAV_{target}"
-                        for target in range(NUM_UAV)
-                        if target != sender
-                    ]
-                )
-            },
-            "additionalProperties": False,
-            "minProperties": 1,
-        }
-        for sender in range(NUM_UAV)
-    }
+    sender_names = [f"UAV_{sender}" for sender in range(NUM_UAV)]
     return {
         "type": "object",
         "required": ["td3_bias", "routing_prior"],
@@ -624,10 +987,30 @@ def output_schema_v3() -> dict[str, Any]:
             },
             "routing_prior": {
                 "type": "object",
-                "required": list(sender_properties),
+                "required": sender_names,
                 "additionalProperties": False,
-                "properties": sender_properties,
+                "patternProperties": {
+                    "^UAV_(?:[0-9]|1[0-5])$": {"$ref": "#/$defs/sender_prior"}
+                },
             },
+        },
+        "$defs": {
+            "sender_prior": {
+                "type": "object",
+                "description": (
+                    "Sparse probabilities; omitted actions are zero. The validator "
+                    "rejects the sender's own UAV_k name and requires WAIT instead."
+                ),
+                "minProperties": 1,
+                "additionalProperties": False,
+                "patternProperties": {
+                    "^(?:GS|WAIT|UAV_(?:[0-9]|1[0-5]))$": {
+                        "type": "number",
+                        "minimum": 0,
+                        "maximum": 1,
+                    }
+                },
+            }
         },
         "semantic_constraints": [
             "Each routing sender row sums to one within 1e-6.",
@@ -744,16 +1127,40 @@ class LLMExplorerV3Controller(LLMExplorerController):
         return identity
 
     def _compact_feedback(self, previous: dict[str, Any]) -> dict[str, Any]:
+        original_cases = previous.get("representative_cases", [])
+        original_cases = (
+            original_cases if isinstance(original_cases, list) else []
+        )
+        movement_cases = [
+            case
+            for case in original_cases
+            if isinstance(case, dict) and _case_domain(case) == "movement"
+        ]
+        routing_cases = [
+            case
+            for case in original_cases
+            if isinstance(case, dict) and _case_domain(case) == "routing"
+        ]
+        cases = select_representative_cases(
+            movement_cases,
+            routing_cases,
+            movement_maximum=3,
+            routing_maximum=5,
+        )
         return {
             "metrics": _json_clone(previous.get("metrics", {})),
-            "movement_summaries": _json_clone(previous.get("movement_summaries", {})),
-            "routing_summaries": _json_clone(previous.get("routing_summaries", {})),
-            "representative_cases": _json_clone(
-                previous.get("representative_cases", [])
+            "movement_summaries": _compact_movement_summaries(
+                previous.get("movement_summaries", {})
             ),
-            "applied_guidance": _semantic_guidance(
-                previous.get("applied_guidance", {})
+            "routing_summaries": _compact_routing_summaries(
+                previous.get("routing_summaries", {})
             ),
+            "representative_cases": _compact_cases(cases, "movement=3,routing=5"),
+            "applied_guidance": _compact_applied_guidance(
+                previous.get("applied_guidance", {}),
+                previous.get("movement_summaries", {}),
+            ),
+            "_case_candidates": cases,
         }
 
     def _exploration_settings(self, *, sigma_episode_start, routing_epsilon):
@@ -789,30 +1196,34 @@ class LLMExplorerV3Controller(LLMExplorerController):
         }
 
     def _render_analysis_prompt(self, *, system_prompt, analysis_template, previous, environment_constants, current_observable_initial_state, settings):
-        cases = list(previous.get("representative_cases", []))
+        cases = list(previous.get("_case_candidates", []))
+        movement_cases = [
+            case for case in cases if _case_domain(case) == "movement"
+        ]
+        routing_cases = [
+            case for case in cases if _case_domain(case) == "routing"
+        ]
         last_prompt = None
-        candidates = []
-        for keep in (min(8, len(cases)), 4, 2, 0):
-            candidate = dict(previous)
-            candidate["representative_cases"] = cases[: min(keep, len(cases))]
-            candidates.append(candidate)
-        condensed = copy.deepcopy(candidates[-1])
-        for sender in condensed.get("routing_summaries", {}).values():
-            for action_summary in sender.get(
-                "legal_action_observable_summaries", {}
-            ).values():
-                for field, summary in list(action_summary.items()):
-                    if isinstance(summary, dict):
-                        action_summary[field] = {
-                            "count": summary.get("count"),
-                            "mean": summary.get("mean"),
-                        }
-        condensed["metrics"] = copy.deepcopy(condensed.get("metrics", {}))
-        condensed["metrics"]["input_budget_reduction"] = (
-            "representative cases removed; per-action observable ranges reduced to count and mean"
-        )
-        candidates.append(condensed)
-        for candidate in candidates:
+        smallest_hard_limit_prompt = None
+        # Fixed finite compression order. Each step reselects for diversity;
+        # it never takes a prefix or truncates rendered text/JSON.
+        profiles = ((3, 5), (2, 4), (1, 2), (0, 1), (0, 0))
+        for movement_limit, routing_limit in profiles:
+            selected = select_representative_cases(
+                movement_cases,
+                routing_cases,
+                movement_maximum=movement_limit,
+                routing_maximum=routing_limit,
+            )
+            candidate = {
+                key: value
+                for key, value in previous.items()
+                if key != "_case_candidates"
+            }
+            candidate["representative_cases"] = _compact_cases(
+                selected,
+                f"movement={movement_limit},routing={routing_limit}",
+            )
             prompt = render_prompt(
                 analysis_template,
                 self._analysis_replacements(
@@ -832,8 +1243,10 @@ class LLMExplorerV3Controller(LLMExplorerController):
             )
             last_prompt = prompt
             if budget["input_tokens"] <= self.config.input_hard_limit_tokens:
+                smallest_hard_limit_prompt = prompt
+            if budget["input_tokens"] <= LLM_EXPLORER_V3_TARGET_INPUT_TOKENS:
                 return prompt
-        return last_prompt
+        return smallest_hard_limit_prompt or last_prompt
 
     def _guidance_replacements(self, *, analysis, previous, current_observable_initial_state, settings, validation_feedback, **_):
         return {
@@ -860,6 +1273,11 @@ class LLMExplorerV3Controller(LLMExplorerController):
         budget = super()._prompt_budget(**kwargs)
         budget["input_hard_limit_tokens"] = int(
             self.config.input_hard_limit_tokens
+        )
+        budget["target_input_tokens"] = LLM_EXPLORER_V3_TARGET_INPUT_TOKENS
+        budget["within_target_input_tokens"] = bool(
+            int(budget["input_tokens"])
+            <= LLM_EXPLORER_V3_TARGET_INPUT_TOKENS
         )
         budget["fits_input_hard_limit"] = bool(
             int(budget["input_tokens"])
@@ -979,9 +1397,16 @@ class LLMExplorerV3Controller(LLMExplorerController):
             self.movement_records, self.active_guidance
         )
         routing_summary, routing_cases = routing_episode_summary(
-            self.routing_records, episode=int(episode_index) + 1
+            self.routing_records,
+            maximum_cases=5,
+            episode=int(episode_index) + 1,
         )
-        cases = movement_cases[:3] + routing_cases[:5]
+        cases = select_representative_cases(
+            movement_cases,
+            routing_cases,
+            movement_maximum=3,
+            routing_maximum=5,
+        )
         samples = stratified_routing_samples(self.routing_records, maximum=100)
         action_sources = Counter(
             str(record.get("action_source", "unknown"))
@@ -1059,6 +1484,7 @@ def explorer_metadata_v3(config: LLMExplorerV3Config) -> dict[str, Any]:
             config.warmup_joint_transitions, config.episode_joint_transitions
         ),
         "annealing_end_episode": config.annealing_end_episode,
+        "target_input_tokens": LLM_EXPLORER_V3_TARGET_INPUT_TOKENS,
         "input_hard_limit_tokens": config.input_hard_limit_tokens,
         "routing_alpha": "0.8 * w",
         "td3_intervention": "episode-fixed w * raw bias exactly once before projection",
