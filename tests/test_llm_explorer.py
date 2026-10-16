@@ -210,7 +210,8 @@ def _begin(
 
 
 def test_registry_appends_explorer_without_using_legacy_llm_flag():
-    assert tuple(METHOD_REGISTRY)[-1] == "td3_dinkelbach_llm_explorer"
+    assert "td3_dinkelbach_llm_explorer" in METHOD_REGISTRY
+    assert tuple(METHOD_REGISTRY)[-1] == "td3_dinkelbach_llm_explorer_v3"
     method = MethodSpec.parse("td3_dinkelbach_llm_explorer")
     baseline = MethodSpec.parse("td3_dinkelbach")
     assert method.llm_explorer_enabled

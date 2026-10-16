@@ -1,0 +1,31 @@
+Analyze the previous episode and recommend exploration tendencies for the upcoming episode.
+
+Training phase and exploration settings:
+{{TRAINING_PHASE_AND_SETTINGS}}
+
+Verified previous-episode metrics:
+{{EPISODE_METRICS}}
+
+Per-UAV movement summaries:
+{{MOVEMENT_SUMMARIES}}
+
+Per-sender routing summaries:
+{{ROUTING_SUMMARIES}}
+
+Selected illustrative cases:
+{{REPRESENTATIVE_CASES}}
+
+Previously requested and actually applied guidance:
+{{PREVIOUS_GUIDANCE}}
+
+Current observable initial state:
+{{CURRENT_OBSERVABLE_INITIAL_STATE}}
+
+Write a concise analysis, normally 250–400 English words:
+
+1. Evidence: identify the most decision-relevant observations using explicit UAV/sender IDs and supplied statistics.
+2. Movement recommendations: specify UAVs, action dimensions, and positive, negative, or neutral raw biases. Explain how the recommendation relates to actual TD3-controlled behavior and service requirements.
+3. Routing recommendations: specify senders and named actions whose exploration preference should increase, decrease, or remain approximately uniform. Distinguish GS, forwarding, and WAIT.
+4. Uncertainty: state the main limits of what this episode establishes.
+
+Prioritize a few supported recommendations. Do not force an intervention for every UAV. Do not calculate or output the final matrices in this stage.

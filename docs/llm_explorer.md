@@ -73,3 +73,37 @@ The mock client is deterministic and returns neutral biases and uniform priors.
 It exists for smoke/integration validation only; it is not a scientific LLM
 baseline. A live remote response is not guaranteed reproducible from a local
 seed, while a saved matching response is replayable and revalidated.
+
+## Compact annealed v3 comparison
+
+`td3_dinkelbach_llm_explorer_v3` is isolated from the original method above.
+It sends verified full-episode summaries plus at most eight deterministic
+illustrative cases, accepts named per-sender routing probabilities, and caps
+each request at 20,000 input tokens. Its host-side weight is fixed by the
+1-based episode number: after the 10,000-transition warmup, `w(168)=1`,
+`w(384)=0.5`, and `w(600)=0`. Starting at episode 600 it creates no client and
+makes no LLM request; training continues through the original no-prior paths.
+Artifacts are stored under `<run>\llm_explorer_v3\` and do not share caches or
+checkpoint identity with the original explorer.
+
+An 800-episode PowerShell run using the project Conda environment is:
+
+```powershell
+& "C:\Users\user\anaconda3\envs\LLM_HRL\python.exe" run_experiment.py td3_dinkelbach_llm_explorer_v3 --episodes 800 --seed 20260817 --checkpoint-interval 800 --llm-explorer-model gpt-4o-mini --output-root C:\uav_llm_runs
+```
+
+The command prints the exact run directory. Evaluate its episode-800 model
+checkpoint without an LLM call by replacing `<run-directory>` below:
+
+```powershell
+& "C:\Users\user\anaconda3\envs\LLM_HRL\python.exe" run_experiment.py evaluate "C:\uav_llm_runs\td3_dinkelbach_llm_explorer_v3\<run-directory>" --checkpoint-episode 800
+```
+
+Training metadata/history and checkpoints are below the run directory; v3 LLM
+prompts, responses, token budgets, timings, summaries, and event journal are in
+`llm_explorer_v3`. Evaluation output is created below `evaluation\ep_800`.
+Offline tests write only to pytest temporary directories:
+
+```powershell
+& "C:\Users\user\anaconda3\envs\LLM_HRL\python.exe" -m pytest tests\test_llm_explorer.py tests\test_llm_explorer_v3.py tests\test_experiment_framework.py tests\test_joint_td3.py tests\test_ddqn_routing.py -q
+```

@@ -1,0 +1,31 @@
+Generate numerical exploration guidance for the upcoming episode using the analysis and verified inputs below.
+
+Complete analysis:
+{{ANALYSIS_STAGE_OUTPUT}}
+
+Current observable initial state:
+{{CURRENT_OBSERVABLE_INITIAL_STATE}}
+
+Training phase, exploration settings, and numerical bounds:
+{{TRAINING_PHASE_AND_SETTINGS}}
+
+Previous guidance:
+{{PREVIOUS_GUIDANCE}}
+
+Return exactly one complete JSON object containing:
+- td3_bias: 16 rows of 3 raw numerical offsets in UAV-ID order, columns [speed, heading, vertical].
+- routing_prior: one named probability object for every sender UAV_0 through UAV_15.
+
+Routing action names are GS, WAIT, and UAV_k. Use WAIT rather than the sender's own UAV_k name. Omitted actions have probability zero. Every sender's probabilities must sum to one.
+
+TD3 biases are raw offsets before host annealing. Do not multiply them by sigma or w. Routing probabilities are also before host masking and mixing; do not apply alpha yourself.
+
+Initial roles, empty queues, and illegal links may change during the episode. Do not treat them as permanent. Neutral movement biases and approximately uniform routing priors are valid.
+
+Return JSON only, with finite numeric values and no commentary, arithmetic expressions, placeholders, or ellipses.
+
+Exact output schema:
+{{OUTPUT_JSON_SCHEMA}}
+
+Local validation feedback from the previous attempt, if any:
+{{VALIDATION_FEEDBACK_OR_EMPTY}}

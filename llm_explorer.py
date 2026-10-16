@@ -915,6 +915,8 @@ def llm_explorer_path_preflight(
     *,
     maximum_episode: int,
     windows_limit: int = WINDOWS_CONSERVATIVE_PATH_LIMIT,
+    artifact_directory: str = "llm_explorer",
+    named_routing: bool = False,
 ) -> dict[str, Any]:
     """Validate every filename produced by the explorer and streaming client.
 
@@ -938,23 +940,26 @@ def llm_explorer_path_preflight(
         "reasoning.partial.txt", "stream_status.json", ".response_metadata.json.tmp",
         ".validation.json.tmp", ".stream_status.json.tmp",
     )
+    artifact_root = Path(str(artifact_directory))
+    if artifact_root.name != str(artifact_directory) or str(artifact_directory) in {"", ".", ".."}:
+        raise ValueError("artifact_directory must be one short path component")
     relative_paths = [
-        Path("llm_explorer") / "events.jsonl",
-        Path("llm_explorer") / "state.json",
-        Path("llm_explorer") / ".state.json.tmp",
-        Path("llm_explorer") / episode / "feedback.json",
-        Path("llm_explorer") / episode / ".feedback.json.tmp",
-        Path("llm_explorer") / episode / "episode_result.json",
-        Path("llm_explorer") / episode / ".episode_result.json.tmp",
+        artifact_root / "events.jsonl",
+        artifact_root / "state.json",
+        artifact_root / ".state.json.tmp",
+        artifact_root / episode / "feedback.json",
+        artifact_root / episode / ".feedback.json.tmp",
+        artifact_root / episode / "episode_result.json",
+        artifact_root / episode / ".episode_result.json.tmp",
     ]
     for stage in stages:
         relative_paths.extend(
-            Path("llm_explorer") / episode / stage / name
+            artifact_root / episode / stage / name
             for name in stage_files
         )
         for attempt in (1, LLM_EXPLORER_MAX_ATTEMPTS):
             relative_paths.extend(
-                Path("llm_explorer") / episode / stage / f"attempt_{attempt:02d}" / name
+                artifact_root / episode / stage / f"attempt_{attempt:02d}" / name
                 for name in attempt_files
             )
     checks = [
@@ -970,10 +975,20 @@ def llm_explorer_path_preflight(
     representative_guidance = _compact_json(
         {
             "td3_bias": [[-0.123456, 0.123456, 0.0] for _ in range(NUM_UAV)],
-            "routing_prior": [
-                [round(1.0 / ROUTING_ACTION_DIM, 8) for _ in range(ROUTING_ACTION_DIM)]
-                for _ in range(NUM_UAV)
-            ],
+            "routing_prior": (
+                {
+                    f"UAV_{sender}": {
+                        ("WAIT" if action == sender else "GS" if action == NUM_UAV else f"UAV_{action}"): round(1.0 / ROUTING_ACTION_DIM, 8)
+                        for action in range(ROUTING_ACTION_DIM)
+                    }
+                    for sender in range(NUM_UAV)
+                }
+                if named_routing
+                else [
+                    [round(1.0 / ROUTING_ACTION_DIM, 8) for _ in range(ROUTING_ACTION_DIM)]
+                    for _ in range(NUM_UAV)
+                ]
+            ),
         }
     )
     representative_output_tokens = len(encoder.encode(representative_guidance))
@@ -987,6 +1002,8 @@ def llm_explorer_path_preflight(
         "native_windows_verified": os.name == "nt",
         "windows_limit_characters": int(windows_limit),
         "maximum_episode": int(maximum_episode),
+        "artifact_directory": str(artifact_root),
+        "named_routing": bool(named_routing),
         "checked_path_count": len(checks),
         "longest": longest,
         "paths": checks,
@@ -1039,6 +1056,9 @@ class DeterministicMockExplorerClient:
 class LLMExplorerController:
     """Own the two-stage episode protocol, cache, diagnostics, and sampling."""
 
+    schema_version = LLM_EXPLORER_VERSION
+    artifact_directory_name = "llm_explorer"
+
     def __init__(
         self,
         *,
@@ -1049,28 +1069,23 @@ class LLMExplorerController:
         evaluation: bool = False,
         mock: bool = False,
         rng_seed: int = 0,
+        lazy_client: bool = False,
     ) -> None:
         self.config = config or LLMExplorerConfig()
         self.run_identity = _json_clone(run_identity)
         self.evaluation = bool(evaluation)
-        self.root = None if run_directory is None else Path(run_directory) / "llm_explorer"
+        self.root = (
+            None
+            if run_directory is None
+            else Path(run_directory) / self.artifact_directory_name
+        )
         if self.root is not None:
             self.root.mkdir(parents=True, exist_ok=True)
-        if self.evaluation:
-            self.client = None
-        elif client is not None:
-            self.client = client
-        elif mock:
-            self.client = DeterministicMockExplorerClient()
-        else:
-            from llm_design import OpenAIClient
-
-            self.client = OpenAIClient(
-                timeout=float(self.config.request_timeout_seconds),
-                connect_timeout=min(10.0, float(self.config.request_timeout_seconds)),
-                total_timeout=float(self.config.request_timeout_seconds),
-                retries=0,
-            )
+        self._client_override = client
+        self._mock_client = bool(mock)
+        self.client = None
+        if not self.evaluation and not lazy_client:
+            self._ensure_client()
         self.rng = np.random.default_rng(int(rng_seed))
         self.previous_episode_feedback: dict[str, Any] | None = None
         self.active_guidance = self._unguided("not_started")
@@ -1081,6 +1096,25 @@ class LLMExplorerController:
         self._local_failure_records: dict[str, dict[str, Any]] = {}
         self.statistics = self._empty_statistics()
         self._reconcile_durable_events()
+
+    def _ensure_client(self) -> None:
+        """Construct a client on demand; v3 uses this to avoid post-cutoff setup."""
+
+        if self.evaluation or self.client is not None:
+            return
+        if self._client_override is not None:
+            self.client = self._client_override
+        elif self._mock_client:
+            self.client = DeterministicMockExplorerClient()
+        else:
+            from llm_design import OpenAIClient
+
+            self.client = OpenAIClient(
+                timeout=float(self.config.request_timeout_seconds),
+                connect_timeout=min(10.0, float(self.config.request_timeout_seconds)),
+                total_timeout=float(self.config.request_timeout_seconds),
+                retries=0,
+            )
 
     @staticmethod
     def _empty_statistics() -> dict[str, Any]:
@@ -1126,7 +1160,7 @@ class LLMExplorerController:
 
     def _event(self, kind: str, **fields: Any) -> None:
         event = {
-            "schema_version": LLM_EXPLORER_VERSION,
+            "schema_version": self.schema_version,
             "event": str(kind),
             "wall_time_unix": time.time(),
             **_json_clone(fields),
@@ -1211,7 +1245,7 @@ class LLMExplorerController:
 
     def state_dict(self) -> dict[str, Any]:
         return {
-            "schema_version": LLM_EXPLORER_VERSION,
+            "schema_version": self.schema_version,
             "config": asdict(self.config),
             "run_identity": copy.deepcopy(self.run_identity),
             "previous_episode_feedback": copy.deepcopy(self.previous_episode_feedback),
@@ -1224,7 +1258,7 @@ class LLMExplorerController:
         }
 
     def load_state_dict(self, state: dict[str, Any]) -> None:
-        if state.get("schema_version") != LLM_EXPLORER_VERSION:
+        if state.get("schema_version") != self.schema_version:
             raise ExplorerValidationError("LLM explorer checkpoint version is incompatible")
         if state.get("config") != asdict(self.config):
             raise ExplorerValidationError("LLM explorer checkpoint config is incompatible")
@@ -1253,7 +1287,12 @@ class LLMExplorerController:
     @staticmethod
     def _serializable_guidance(guidance: dict[str, Any]) -> dict[str, Any]:
         result = dict(guidance)
-        for key in ("td3_bias", "routing_prior"):
+        for key in (
+            "td3_bias",
+            "routing_prior",
+            "td3_bias_raw",
+            "td3_bias_effective",
+        ):
             if isinstance(result.get(key), np.ndarray):
                 result[key] = result[key].tolist()
         return _json_clone(result)
@@ -1267,6 +1306,12 @@ class LLMExplorerController:
         if bias.shape != (NUM_UAV, 3) or not np.isfinite(bias).all():
             raise ExplorerValidationError("checkpoint td3_bias is invalid")
         result["td3_bias"] = bias.astype(np.float32)
+        for key in ("td3_bias_raw", "td3_bias_effective"):
+            if key in result:
+                restored = np.asarray(result[key], dtype=np.float64)
+                if restored.shape != (NUM_UAV, 3) or not np.isfinite(restored).all():
+                    raise ExplorerValidationError(f"checkpoint {key} is invalid")
+                result[key] = restored.astype(np.float32)
         if result.get("routing_prior") is not None:
             result["routing_prior"] = validate_routing_prior(result["routing_prior"])
         return result
@@ -1280,6 +1325,100 @@ class LLMExplorerController:
                 "llm_explorer_analysis.txt",
                 "llm_explorer_guidance.txt",
             )
+        )
+
+    def _render_system_prompt(
+        self, template: str, environment_constants: dict[str, Any]
+    ) -> str:
+        del environment_constants
+        return template
+
+    def _compact_feedback(self, previous: dict[str, Any]) -> dict[str, Any]:
+        return compact_feedback_for_llm(previous)
+
+    def _exploration_settings(
+        self, *, sigma_episode_start: float, routing_epsilon: float
+    ) -> dict[str, Any]:
+        return {
+            "sigma_episode_start": float(sigma_episode_start),
+            "routing_epsilon_at_episode_start": float(routing_epsilon),
+            "routing_prior_mix": {"llm_after_mask": 0.8, "legal_uniform": 0.2},
+            "bias_units": "normalized action units",
+            "guidance_fixed_for_episode": True,
+            "update_interval_episodes": 1,
+        }
+
+    def _analysis_replacements(
+        self,
+        *,
+        previous: dict[str, Any],
+        environment_constants: dict[str, Any],
+        current_observable_initial_state: dict[str, Any],
+        settings: dict[str, Any],
+    ) -> dict[str, Any]:
+        return {
+            "ENVIRONMENT_CONSTANTS_AND_FIELD_DEFINITIONS_JSON": environment_constants,
+            "PREVIOUS_EPISODE_METRICS_JSON": previous["metrics"],
+            "PREVIOUS_MOVEMENT_SAMPLES_JSON": previous["movement"],
+            "PREVIOUS_ROUTING_SAMPLES_JSON": previous["routing"],
+            "PREVIOUS_FULL_EPISODE_STATISTICS_JSON": previous[
+                "full_episode_statistics"
+            ],
+            "PREVIOUS_APPLIED_GUIDANCE_JSON": previous["applied_guidance"],
+            "CURRENT_OBSERVABLE_INITIAL_STATE_JSON": current_observable_initial_state,
+            "CURRENT_EXPLORATION_SETTINGS_JSON": settings,
+        }
+
+    def _render_analysis_prompt(
+        self,
+        *,
+        system_prompt: str,
+        analysis_template: str,
+        previous: dict[str, Any],
+        environment_constants: dict[str, Any],
+        current_observable_initial_state: dict[str, Any],
+        settings: dict[str, Any],
+    ) -> str:
+        del system_prompt
+        return render_prompt(
+            analysis_template,
+            self._analysis_replacements(
+                previous=previous,
+                environment_constants=environment_constants,
+                current_observable_initial_state=current_observable_initial_state,
+                settings=settings,
+            ),
+        )
+
+    def _guidance_replacements(
+        self,
+        *,
+        analysis: str,
+        previous: dict[str, Any],
+        environment_constants: dict[str, Any],
+        current_observable_initial_state: dict[str, Any],
+        settings: dict[str, Any],
+        validation_feedback: str,
+    ) -> dict[str, Any]:
+        return {
+            "ANALYSIS_STAGE_OUTPUT": analysis,
+            "ENVIRONMENT_CONSTANTS_AND_FIELD_DEFINITIONS_JSON": environment_constants,
+            "CURRENT_OBSERVABLE_INITIAL_STATE_JSON": current_observable_initial_state,
+            "CURRENT_EXPLORATION_SETTINGS_JSON": settings,
+            "PREVIOUS_APPLIED_GUIDANCE_JSON": previous["applied_guidance"],
+            "VALIDATION_FEEDBACK_OR_EMPTY": validation_feedback,
+        }
+
+    def _parse_guidance_response(
+        self, content: str, sigma_episode_start: float
+    ) -> tuple[np.ndarray | None, np.ndarray | None, dict[str, str]]:
+        return parse_guidance_response(content, sigma_episode_start)
+
+    def _guidance_cache_content(
+        self, td3_bias: np.ndarray, routing_prior: np.ndarray
+    ) -> str:
+        return _compact_json(
+            {"td3_bias": td3_bias.tolist(), "routing_prior": routing_prior.tolist()}
         )
 
     def _cache_identity(
@@ -1450,7 +1589,7 @@ class LLMExplorerController:
             _atomic_json(
                 path,
                 {
-                    "schema_version": LLM_EXPLORER_VERSION,
+                    "schema_version": self.schema_version,
                     "identity": identity,
                     "guidance": _semantic_guidance(guidance),
                 },
@@ -1563,6 +1702,7 @@ class LLMExplorerController:
                 f"{uuid.uuid4().hex}"
             )
             try:
+                self._ensure_client()
                 response = self.client.chat(
                     model=self.config.model,
                     system_prompt=system_prompt,
@@ -1734,27 +1874,21 @@ class LLMExplorerController:
             return self.active_guidance
 
         system_template, analysis_template, guidance_template = self._templates()
-        settings = {
-            "sigma_episode_start": float(sigma_episode_start),
-            "routing_epsilon_at_episode_start": float(routing_epsilon),
-            "routing_prior_mix": {"llm_after_mask": 0.8, "legal_uniform": 0.2},
-            "bias_units": "normalized action units",
-            "guidance_fixed_for_episode": True,
-            "update_interval_episodes": 1,
-        }
-        previous = compact_feedback_for_llm(self.previous_episode_feedback)
-        analysis_prompt = render_prompt(
-            analysis_template,
-            {
-                "ENVIRONMENT_CONSTANTS_AND_FIELD_DEFINITIONS_JSON": environment_constants,
-                "PREVIOUS_EPISODE_METRICS_JSON": previous["metrics"],
-                "PREVIOUS_MOVEMENT_SAMPLES_JSON": previous["movement"],
-                "PREVIOUS_ROUTING_SAMPLES_JSON": previous["routing"],
-                "PREVIOUS_FULL_EPISODE_STATISTICS_JSON": previous["full_episode_statistics"],
-                "PREVIOUS_APPLIED_GUIDANCE_JSON": previous["applied_guidance"],
-                "CURRENT_OBSERVABLE_INITIAL_STATE_JSON": current_observable_initial_state,
-                "CURRENT_EXPLORATION_SETTINGS_JSON": settings,
-            },
+        system_template = self._render_system_prompt(
+            system_template, environment_constants
+        )
+        settings = self._exploration_settings(
+            sigma_episode_start=sigma_episode_start,
+            routing_epsilon=routing_epsilon,
+        )
+        previous = self._compact_feedback(self.previous_episode_feedback)
+        analysis_prompt = self._render_analysis_prompt(
+            system_prompt=system_template,
+            analysis_template=analysis_template,
+            previous=previous,
+            environment_constants=environment_constants,
+            current_observable_initial_state=current_observable_initial_state,
+            settings=settings,
         )
         episode_identity = self._cache_identity(
             episode_index=episode_index,
@@ -1796,14 +1930,14 @@ class LLMExplorerController:
         feedback = ""
         guidance_prompt = render_prompt(
             guidance_template,
-            {
-                "ANALYSIS_STAGE_OUTPUT": analysis,
-                "ENVIRONMENT_CONSTANTS_AND_FIELD_DEFINITIONS_JSON": environment_constants,
-                "CURRENT_OBSERVABLE_INITIAL_STATE_JSON": current_observable_initial_state,
-                "CURRENT_EXPLORATION_SETTINGS_JSON": settings,
-                "PREVIOUS_APPLIED_GUIDANCE_JSON": previous["applied_guidance"],
-                "VALIDATION_FEEDBACK_OR_EMPTY": feedback,
-            },
+            self._guidance_replacements(
+                analysis=analysis,
+                previous=previous,
+                environment_constants=environment_constants,
+                current_observable_initial_state=current_observable_initial_state,
+                settings=settings,
+                validation_feedback=feedback,
+            ),
         )
 
         # Guidance validation stays here so a valid layer from attempt one
@@ -1820,7 +1954,7 @@ class LLMExplorerController:
         cached = self._load_cached(episode_index=episode_index, stage="guidance", identity=identity)
         guidance_reused = False
         if cached is not None:
-            td3, routing, errors = parse_guidance_response(
+            td3, routing, errors = self._parse_guidance_response(
                 cached["content"], sigma_episode_start
             )
             if not errors:
@@ -1868,14 +2002,14 @@ class LLMExplorerController:
                 if attempt > 1 and feedback:
                     attempt_prompt = render_prompt(
                         guidance_template,
-                        {
-                            "ANALYSIS_STAGE_OUTPUT": analysis,
-                            "ENVIRONMENT_CONSTANTS_AND_FIELD_DEFINITIONS_JSON": environment_constants,
-                            "CURRENT_OBSERVABLE_INITIAL_STATE_JSON": current_observable_initial_state,
-                            "CURRENT_EXPLORATION_SETTINGS_JSON": settings,
-                            "PREVIOUS_APPLIED_GUIDANCE_JSON": previous["applied_guidance"],
-                            "VALIDATION_FEEDBACK_OR_EMPTY": feedback,
-                        },
+                        self._guidance_replacements(
+                            analysis=analysis,
+                            previous=previous,
+                            environment_constants=environment_constants,
+                            current_observable_initial_state=current_observable_initial_state,
+                            settings=settings,
+                            validation_feedback=feedback,
+                        ),
                     )
                 try:
                     self._prompt_budget(
@@ -1906,6 +2040,7 @@ class LLMExplorerController:
                     f"{uuid.uuid4().hex}"
                 )
                 try:
+                    self._ensure_client()
                     response = self.client.chat(
                         model=self.config.model,
                         system_prompt=system_template,
@@ -1953,7 +2088,7 @@ class LLMExplorerController:
                 completion_error = self._response_completion_error(response)
                 content = response.get("content")
                 if completion_error is None:
-                    td3, routing, errors = parse_guidance_response(
+                    td3, routing, errors = self._parse_guidance_response(
                         str(content), sigma_episode_start
                     )
                     if accepted_td3 is None and td3 is not None:
@@ -2016,11 +2151,8 @@ class LLMExplorerController:
                                 {
                                     "identity": identity,
                                     "attempt": attempt,
-                                    "content": _compact_json(
-                                        {
-                                            "td3_bias": accepted_td3.tolist(),
-                                            "routing_prior": accepted_routing.tolist(),
-                                        }
+                                    "content": self._guidance_cache_content(
+                                        accepted_td3, accepted_routing
                                     ),
                                     "td3_source_attempt": td3_attempt,
                                     "routing_source_attempt": routing_attempt,

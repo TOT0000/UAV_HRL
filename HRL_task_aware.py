@@ -162,6 +162,13 @@ from llm_explorer import (
     explorer_metadata,
     llm_explorer_path_preflight,
 )
+from llm_explorer_v3 import (
+    LLMExplorerV3Config,
+    LLMExplorerV3Controller,
+    build_observable_initial_state_v3,
+    environment_definitions_v3,
+    explorer_metadata_v3,
+)
 
 
 MOVEMENT_CONTROL_INTERVAL = int(round(MOVEMENT_INTERVAL_SECONDS / ROUTING_SLOT_SECONDS))
@@ -762,6 +769,7 @@ def _run_routing_slot(
     routing_q_score_accumulator=None,
     routing_q_score_context=None,
     exploration_prior=None,
+    exploration_prior_weight=0.8,
     zero_prior_mass_callback=None,
     routing_decision_observer=None,
 ):
@@ -871,6 +879,7 @@ def _run_routing_slot(
         effective_masks,
         epsilon=epsilon,
         exploration_prior=exploration_prior,
+        exploration_prior_weight=exploration_prior_weight,
         zero_prior_mass_callback=zero_prior_mass_callback,
         return_diagnostics=True,
         capture_diagnostics=routing_decision_observer is not None,
@@ -1077,6 +1086,7 @@ def _select_routing_actions(
     epsilon,
     *,
     exploration_prior=None,
+    exploration_prior_weight=0.8,
     zero_prior_mass_callback=None,
     return_diagnostics=False,
     capture_diagnostics=False,
@@ -1112,16 +1122,20 @@ def _select_routing_actions(
                     "exploration_distribution": None,
                 }
         else:
-            action, detail = ddqn.select_action(
-                states[uid],
-                uid,
-                routing_masks[uid],
+            prior_kwargs = dict(
                 visited_nodes=None,
                 epsilon=epsilon,
                 logits_noise_std=0.0,
                 exploration_prior=np.asarray(exploration_prior)[uid],
                 zero_prior_mass_callback=zero_prior_mass_callback,
                 return_diagnostics=True,
+            )
+            if not np.isclose(float(exploration_prior_weight), 0.8):
+                prior_kwargs["exploration_prior_weight"] = float(
+                    exploration_prior_weight
+                )
+            action, detail = ddqn.select_action(
+                states[uid], uid, routing_masks[uid], **prior_kwargs
             )
             actions[uid] = int(action)
             diagnostics[uid] = detail
@@ -2395,9 +2409,17 @@ def train(
         rng_contract_metadata=rng_streams.metadata(),
     )
     llm_explorer_config = (
-        LLMExplorerConfig(
-            model=str(llm_explorer_model),
-            request_timeout_seconds=float(llm_explorer_timeout),
+        (
+            LLMExplorerV3Config(
+                model=str(llm_explorer_model),
+                request_timeout_seconds=float(llm_explorer_timeout),
+                episode_joint_transitions=int(config.episode_seconds),
+            )
+            if method_spec.llm_explorer_v3_enabled
+            else LLMExplorerConfig(
+                model=str(llm_explorer_model),
+                request_timeout_seconds=float(llm_explorer_timeout),
+            )
         )
         if method_spec.llm_explorer_enabled
         else None
@@ -2410,9 +2432,19 @@ def train(
         llm_explorer_path_preflight(
             config.run_directory,
             maximum_episode=config.total_episodes,
+            artifact_directory=(
+                "llm_explorer_v3"
+                if method_spec.llm_explorer_v3_enabled
+                else "llm_explorer"
+            ),
+            named_routing=method_spec.llm_explorer_v3_enabled,
         )
     llm_explorer = (
-        LLMExplorerController(
+        (
+            LLMExplorerV3Controller
+            if method_spec.llm_explorer_v3_enabled
+            else LLMExplorerController
+        )(
             run_directory=config.run_directory,
             run_identity={
                 "method_id": method_spec.method_id,
@@ -2448,8 +2480,10 @@ def train(
         else None
     )
     if llm_explorer_config is not None:
-        experiment_identity["llm_explorer"] = explorer_metadata(
-            llm_explorer_config
+        experiment_identity["llm_explorer"] = (
+            explorer_metadata_v3(llm_explorer_config)
+            if method_spec.llm_explorer_v3_enabled
+            else explorer_metadata(llm_explorer_config)
         )
     if rnd_explorer is not None:
         experiment_identity["rnd"] = rnd_explorer.metadata()
@@ -2978,10 +3012,16 @@ def train(
                 total_joint_transitions=total_joint_transitions,
                 sigma_episode_start=episode_sigma_start,
                 routing_epsilon=episode_routing_epsilon_start,
-                current_observable_initial_state=build_observable_initial_state(
-                    env, packet_engine
+                current_observable_initial_state=(
+                    build_observable_initial_state_v3(env, packet_engine)
+                    if method_spec.llm_explorer_v3_enabled
+                    else build_observable_initial_state(env, packet_engine)
                 ),
-                environment_constants=environment_constants_and_definitions(
+                environment_constants=(
+                    environment_definitions_v3
+                    if method_spec.llm_explorer_v3_enabled
+                    else environment_constants_and_definitions
+                )(
                     episode_seconds=config.episode_seconds,
                     routing_slot_seconds=config.routing_slot_seconds,
                     environment_width_m=env.env_width,
@@ -3225,24 +3265,41 @@ def train(
                     td3_schedule_decay,
                 )
                 if llm_explorer is not None:
-                    applied_bias = (
-                        episode_guidance["td3_bias"].reshape(-1)
-                        if episode_guidance["enabled"]
-                        and not episode_guidance["td3_fallback"]
-                        else None
-                    )
-                    if applied_bias is not None:
-                        action_source = "actor_plus_llm_bias_plus_gaussian_exploration"
-                    raw_joint_action, movement_action_diagnostics = (
-                        movement_agent.select_action(
-                            state,
-                            add_noise=True,
-                            noise_std=behavior_noise,
-                            mean_bias=applied_bias,
-                            mean_bias_bound=episode_sigma_start,
-                            return_diagnostics=True,
+                    if (
+                        method_spec.llm_explorer_v3_enabled
+                        and not episode_guidance["enabled"]
+                    ):
+                        raw_joint_action, movement_action_diagnostics = (
+                            movement_agent.select_action(
+                                state,
+                                add_noise=True,
+                                noise_std=behavior_noise,
+                                return_diagnostics=True,
+                            )
                         )
-                    )
+                    else:
+                        applied_bias = (
+                            (
+                                episode_guidance["td3_bias_effective"].reshape(-1)
+                                if method_spec.llm_explorer_v3_enabled
+                                else episode_guidance["td3_bias"].reshape(-1)
+                            )
+                            if episode_guidance["enabled"]
+                            and not episode_guidance["td3_fallback"]
+                            else None
+                        )
+                        if applied_bias is not None:
+                            action_source = "actor_plus_llm_bias_plus_gaussian_exploration"
+                        raw_joint_action, movement_action_diagnostics = (
+                            movement_agent.select_action(
+                                state,
+                                add_noise=True,
+                                noise_std=behavior_noise,
+                                mean_bias=applied_bias,
+                                mean_bias_bound=episode_sigma_start,
+                                return_diagnostics=True,
+                            )
+                        )
                 else:
                     raw_joint_action = movement_agent.select_action(
                         state, add_noise=True, noise_std=behavior_noise
@@ -3408,6 +3465,12 @@ def train(
                         and episode_guidance["enabled"]
                         and not episode_guidance["routing_fallback"]
                         else None
+                    ),
+                    exploration_prior_weight=(
+                        episode_guidance.get("routing_alpha", 0.0)
+                        if method_spec.llm_explorer_v3_enabled
+                        and episode_guidance is not None
+                        else 0.8
                     ),
                     zero_prior_mass_callback=(
                         llm_explorer.record_zero_legal_prior_mass
@@ -4858,7 +4921,11 @@ def train(
         "llm_artifact_identity": copy.deepcopy(llm_identity),
         "llm_explorer": (
             {
-                "configuration": explorer_metadata(llm_explorer_config),
+                "configuration": (
+                    explorer_metadata_v3(llm_explorer_config)
+                    if method_spec.llm_explorer_v3_enabled
+                    else explorer_metadata(llm_explorer_config)
+                ),
                 "statistics": copy.deepcopy(llm_explorer.statistics),
                 "state": llm_explorer.state_dict(),
             }

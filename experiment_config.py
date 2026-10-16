@@ -536,6 +536,13 @@ _METHOD_DEFINITIONS = {
         "reward_mode": "dinkelbach",
         "label": "TD3 + Dinkelbach + LLM-guided TD3/safe-DDQN exploration",
     },
+    "td3_dinkelbach_llm_explorer_v3": {
+        **_COMMON_METHOD,
+        "agent": "td3",
+        "movement": "centralized_td3",
+        "reward_mode": "dinkelbach",
+        "label": "TD3 + Dinkelbach + compact annealed LLM exploration v3",
+    },
 }
 METHOD_REGISTRY = MappingProxyType(_METHOD_DEFINITIONS)
 _LEGACY_METHOD_IDS = frozenset(
@@ -628,7 +635,14 @@ class MethodSpec:
     def llm_explorer_enabled(self) -> bool:
         """Enable the isolated exploration controller only for its own method."""
 
-        return self.method_id == "td3_dinkelbach_llm_explorer"
+        return self.method_id in {
+            "td3_dinkelbach_llm_explorer",
+            "td3_dinkelbach_llm_explorer_v3",
+        }
+
+    @property
+    def llm_explorer_v3_enabled(self) -> bool:
+        return self.method_id == "td3_dinkelbach_llm_explorer_v3"
 
     @property
     def fingerprint(self) -> str:

@@ -77,6 +77,14 @@ from llm_potential import (
     load_run_artifact as load_potential_run_artifact,
 )
 from llm_explorer import LLM_EXPLORER_VERSION, llm_explorer_path_preflight
+from llm_explorer_v3 import (
+    LLM_EXPLORER_V3_ANNEAL_END_EPISODE,
+    LLM_EXPLORER_V3_CASE_VERSION,
+    LLM_EXPLORER_V3_MAX_INPUT_TOKENS,
+    LLM_EXPLORER_V3_PROMPT_VERSION,
+    LLM_EXPLORER_V3_SUMMARY_VERSION,
+    LLM_EXPLORER_V3_VERSION,
+)
 
 
 TRAINING_HISTORY_MANIFEST_HASH_SEMANTICS = (
@@ -85,6 +93,23 @@ TRAINING_HISTORY_MANIFEST_HASH_SEMANTICS = (
 TRAINING_MANIFEST_SEGMENTS_SEMANTICS = (
     "unique_episode_to_active_training_manifest_mapping"
 )
+
+
+def _explorer_schema_version(method):
+    return (
+        LLM_EXPLORER_V3_VERSION
+        if method.llm_explorer_v3_enabled
+        else LLM_EXPLORER_VERSION
+    )
+
+
+def _explorer_preflight_options(method):
+    return {
+        "artifact_directory": (
+            "llm_explorer_v3" if method.llm_explorer_v3_enabled else "llm_explorer"
+        ),
+        "named_routing": bool(method.llm_explorer_v3_enabled),
+    }
 
 
 def _git_short_sha() -> str:
@@ -842,7 +867,9 @@ def run(args):
     if method.llm_explorer_enabled:
         try:
             explorer_path_report = llm_explorer_path_preflight(
-                run_dir, maximum_episode=values["episodes"]
+                run_dir,
+                maximum_episode=values["episodes"],
+                **_explorer_preflight_options(method),
             )
             _write_json_atomic(
                 run_dir / "llm_explorer_path_preflight.json",
@@ -924,13 +951,22 @@ def run(args):
         resolved["llm_worker_timeout_seconds"] = float(args.llm_worker_timeout)
     if method.llm_explorer_enabled:
         resolved["llm_explorer"] = {
-            "schema_version": LLM_EXPLORER_VERSION,
+            "schema_version": _explorer_schema_version(method),
             "model": str(args.llm_explorer_model),
             "request_timeout_seconds": float(args.llm_explorer_timeout),
             "mock": bool(args.llm_explorer_mock),
             "warmup_joint_transitions": 10000,
             "update_interval_episodes": 1,
         }
+        if method.llm_explorer_v3_enabled:
+            resolved["llm_explorer"].update(
+                prompt_version=LLM_EXPLORER_V3_PROMPT_VERSION,
+                summary_version=LLM_EXPLORER_V3_SUMMARY_VERSION,
+                case_selection_version=LLM_EXPLORER_V3_CASE_VERSION,
+                annealing_end_episode=LLM_EXPLORER_V3_ANNEAL_END_EPISODE,
+                input_hard_limit_tokens=LLM_EXPLORER_V3_MAX_INPUT_TOKENS,
+                routing_alpha="0.8 * w",
+            )
     _write_json_atomic(run_dir / "resolved_config.json", resolved)
     write_run_status(run_dir, "RUNNING")
     try:
@@ -989,10 +1025,10 @@ def run_resume(args):
     run_dir, resolved, method, manifest = _load_run_context(args.run_directory)
     if method.llm_explorer_enabled and (
         (resolved.get("llm_explorer") or {}).get("schema_version")
-        != LLM_EXPLORER_VERSION
+        != _explorer_schema_version(method)
     ):
         raise ValueError(
-            "LLM explorer run uses an incompatible pre-v2 cache/checkpoint schema; "
+            "LLM explorer run uses an incompatible cache/checkpoint schema; "
             "start a new run so old prompt identities and counters are not mixed"
         )
     llm_artifact_dir, llm_identity, movement_state_dim = _llm_run_artifact(
@@ -1261,7 +1297,9 @@ def run_resume(args):
     if method.llm_explorer_enabled:
         try:
             explorer_path_report = llm_explorer_path_preflight(
-                run_dir, maximum_episode=int(config.total_episodes)
+                run_dir,
+                maximum_episode=int(config.total_episodes),
+                **_explorer_preflight_options(method),
             )
             _write_json_atomic(
                 run_dir / "llm_explorer_path_preflight.json",

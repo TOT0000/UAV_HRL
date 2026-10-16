@@ -187,6 +187,7 @@ class DDQN:
         logits_noise_std=0.5,
         eta=None,
         exploration_prior=None,
+        exploration_prior_weight=0.8,
         zero_prior_mass_callback=None,
         return_diagnostics=False,
     ):
@@ -243,7 +244,9 @@ class DDQN:
             else:
                 exploration_distribution, zero_prior_mass = (
                     masked_routing_exploration_distribution(
-                        exploration_prior, final_mask
+                        exploration_prior,
+                        final_mask,
+                        prior_weight=exploration_prior_weight,
                     )
                 )
                 action = int(
