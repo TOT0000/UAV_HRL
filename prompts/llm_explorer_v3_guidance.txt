@@ -12,6 +12,11 @@ Training phase, exploration settings, and numerical bounds:
 Previous guidance:
 {{PREVIOUS_GUIDANCE}}
 
+Previous episode recorded raw TD3 bias:
+{{PREVIOUS_RAW_TD3_BIAS}}
+
+The rows above are ordered by UAV ID 0 through 15 with columns [speed, heading, vertical]. They are the previous episode's raw biases before multiplication by its annealing weight. A null rows value means the raw bias is unknown, not zero. Use recorded values only as historical context: every bias you output must fit the current episode's sigma bound, so do not blindly copy an older value that may be outside the current bound.
+
 Return exactly one complete JSON object containing:
 - td3_bias: 16 rows of 3 raw numerical offsets in UAV-ID order, columns [speed, heading, vertical].
 - routing_prior: one named probability object for every sender UAV_0 through UAV_15.

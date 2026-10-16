@@ -36,6 +36,7 @@ LLM_EXPLORER_V3_VERSION = "uav-hrl-llm-explorer-v3"
 LLM_EXPLORER_V3_PROMPT_VERSION = "uav-hrl-llm-explorer-prompts-v3"
 LLM_EXPLORER_V3_SUMMARY_VERSION = "verified-episode-summary-v2"
 LLM_EXPLORER_V3_CASE_VERSION = "deterministic-diverse-cases-v2"
+LLM_EXPLORER_V3_GUIDANCE_CONTEXT_VERSION = "self-contained-raw-td3-v1"
 LLM_EXPLORER_V3_ANNEAL_END_EPISODE = 600
 LLM_EXPLORER_V3_MAX_INPUT_TOKENS = 20_000
 LLM_EXPLORER_V3_TARGET_INPUT_TOKENS = 12_000
@@ -786,8 +787,64 @@ def _routing_prior_matrix_from_guidance(guidance: dict[str, Any]) -> Any:
     return None
 
 
+def _td3_bias_rows(value: Any) -> list[list[float]] | None:
+    try:
+        matrix = np.asarray(value, dtype=np.float64)
+    except (TypeError, ValueError):
+        return None
+    if matrix.shape != (NUM_UAV, 3) or not np.isfinite(matrix).all():
+        return None
+    return matrix.round(6).tolist()
+
+
+def _recorded_raw_td3_bias(previous: dict[str, Any]) -> dict[str, Any]:
+    guidance_value = previous.get("applied_guidance")
+    guidance = guidance_value if isinstance(guidance_value, dict) else {}
+    rows = _td3_bias_rows(guidance.get("td3_bias_raw"))
+    source = "applied_guidance.td3_bias_raw"
+
+    if rows is None:
+        movement_value = previous.get("movement_summaries")
+        movement = movement_value if isinstance(movement_value, dict) else {}
+        recorded_rows = [
+            (
+                movement[f"UAV_{uav_id}"].get("raw_bias")
+                if isinstance(movement.get(f"UAV_{uav_id}"), dict)
+                else None
+            )
+            for uav_id in range(NUM_UAV)
+        ]
+        rows = _td3_bias_rows(recorded_rows)
+        source = "movement_summaries.UAV_k.raw_bias"
+
+    if rows is None and previous.get("schema_version") == LLM_EXPLORER_V3_VERSION:
+        # In persisted v3 guidance, td3_bias is the validated raw model output;
+        # v3 creates td3_bias_effective separately after applying w exactly once.
+        rows = _td3_bias_rows(guidance.get("td3_bias"))
+        source = "legacy_v3_applied_guidance.td3_bias_confirmed_raw"
+
+    if rows is None:
+        source = "unknown_not_recorded"
+    return {
+        "source": source,
+        "uav_id_order": list(range(NUM_UAV)),
+        "columns": ["speed", "heading", "vertical"],
+        "rows": rows,
+        "semantics": (
+            "previous-episode recorded raw TD3 bias before multiplication by the "
+            "previous annealing weight; rows=null means unknown, not zero"
+        ),
+        "current_episode_constraint": (
+            "use only as historical context; every new raw bias must satisfy the "
+            "current episode sigma bound and must not be copied blindly"
+        ),
+    }
+
+
 def _compact_applied_guidance(
-    guidance_value: Any, movement_summaries: Any
+    guidance_value: Any,
+    movement_summaries: Any,
+    raw_td3_bias: dict[str, Any],
 ) -> dict[str, Any]:
     guidance = guidance_value if isinstance(guidance_value, dict) else {}
     result = {
@@ -824,18 +881,14 @@ def _compact_applied_guidance(
             "movement summary rows contain raw and actually applied w*raw biases"
         )
     else:
-        raw = guidance.get("td3_bias_raw", guidance.get("td3_bias"))
         effective = guidance.get("td3_bias_effective")
         for key, matrix_value in (
-            ("td3_raw_bias_rows", raw),
+            ("td3_raw_bias_rows", raw_td3_bias.get("rows")),
             ("td3_effective_bias_rows", effective),
         ):
-            try:
-                matrix = np.asarray(matrix_value, dtype=np.float64)
-            except (TypeError, ValueError):
-                continue
-            if matrix.shape == (NUM_UAV, 3) and np.isfinite(matrix).all():
-                result[key] = matrix.round(6).tolist()
+            rows = _td3_bias_rows(matrix_value)
+            if rows is not None:
+                result[key] = rows
     return result
 
 
@@ -1124,6 +1177,10 @@ class LLMExplorerV3Controller(LLMExplorerController):
                 "warmup_joint_transitions": self.config.warmup_joint_transitions,
             },
         )
+        if kwargs.get("stage") in {"guidance", "episode_result"}:
+            identity["guidance_context_version"] = (
+                LLM_EXPLORER_V3_GUIDANCE_CONTEXT_VERSION
+            )
         return identity
 
     def _compact_feedback(self, previous: dict[str, Any]) -> dict[str, Any]:
@@ -1147,6 +1204,7 @@ class LLMExplorerV3Controller(LLMExplorerController):
             movement_maximum=3,
             routing_maximum=5,
         )
+        raw_td3_bias = _recorded_raw_td3_bias(previous)
         return {
             "metrics": _json_clone(previous.get("metrics", {})),
             "movement_summaries": _compact_movement_summaries(
@@ -1159,7 +1217,9 @@ class LLMExplorerV3Controller(LLMExplorerController):
             "applied_guidance": _compact_applied_guidance(
                 previous.get("applied_guidance", {}),
                 previous.get("movement_summaries", {}),
+                raw_td3_bias,
             ),
+            "_previous_raw_td3_bias": raw_td3_bias,
             "_case_candidates": cases,
         }
 
@@ -1249,11 +1309,19 @@ class LLMExplorerV3Controller(LLMExplorerController):
         return smallest_hard_limit_prompt or last_prompt
 
     def _guidance_replacements(self, *, analysis, previous, current_observable_initial_state, settings, validation_feedback, **_):
+        previous_guidance = _json_clone(previous["applied_guidance"])
+        for key in (
+            "td3_bias_location",
+            "td3_raw_bias_rows",
+            "td3_effective_bias_rows",
+        ):
+            previous_guidance.pop(key, None)
         return {
             "ANALYSIS_STAGE_OUTPUT": analysis,
             "CURRENT_OBSERVABLE_INITIAL_STATE": current_observable_initial_state,
             "TRAINING_PHASE_AND_SETTINGS": settings,
-            "PREVIOUS_GUIDANCE": previous["applied_guidance"],
+            "PREVIOUS_GUIDANCE": previous_guidance,
+            "PREVIOUS_RAW_TD3_BIAS": previous["_previous_raw_td3_bias"],
             "OUTPUT_JSON_SCHEMA": output_schema_v3(),
             "VALIDATION_FEEDBACK_OR_EMPTY": validation_feedback,
         }
@@ -1477,6 +1545,7 @@ def explorer_metadata_v3(config: LLMExplorerV3Config) -> dict[str, Any]:
         "prompt_version": config.prompt_version,
         "summary_version": LLM_EXPLORER_V3_SUMMARY_VERSION,
         "case_selection_version": LLM_EXPLORER_V3_CASE_VERSION,
+        "guidance_context_version": LLM_EXPLORER_V3_GUIDANCE_CONTEXT_VERSION,
         "model": config.model,
         "warmup_joint_transitions": config.warmup_joint_transitions,
         "episode_joint_transitions": config.episode_joint_transitions,

@@ -17,7 +17,9 @@ from llm_explorer import (
 from llm_explorer_v3 import (
     LLMExplorerV3Controller,
     LLM_EXPLORER_V3_CASE_VERSION,
+    LLM_EXPLORER_V3_GUIDANCE_CONTEXT_VERSION,
     LLM_EXPLORER_V3_SUMMARY_VERSION,
+    LLM_EXPLORER_V3_VERSION,
     environment_definitions_v3,
     first_eligible_episode,
     llm_guidance_weight,
@@ -238,6 +240,20 @@ def _active_guidance():
     }
 
 
+def _distinct_raw_guidance():
+    raw = (
+        np.arange(1, 16 * 3 + 1, dtype=np.float32).reshape(16, 3) / 1000.0
+    )
+    guidance = _active_guidance()
+    guidance.update(
+        td3_bias=raw,
+        td3_bias_raw=raw,
+        td3_bias_effective=0.37 * raw,
+        annealing_weight=0.37,
+    )
+    return guidance
+
+
 def _full_metrics():
     return {
         "energy_efficiency_bit_per_j": 1234.5,
@@ -365,6 +381,132 @@ def test_v3_calls_twice_and_exposes_raw_and_once_scaled_bias(tmp_path):
     restored = _begin(replay, 384, 20_000)
     assert restored["reused"] and replay_client.calls == []
     np.testing.assert_allclose(restored["td3_bias_effective"][:, 0], 0.1)
+
+
+def test_guidance_stage_receives_self_contained_previous_raw_bias(tmp_path):
+    previous_guidance = _distinct_raw_guidance()
+    raw = np.asarray(previous_guidance["td3_bias_raw"])
+    effective = np.asarray(previous_guidance["td3_bias_effective"])
+    assert not np.array_equal(raw, effective)
+    movement_summaries, _ = movement_episode_summary([], previous_guidance)
+    analysis = "Adjust UAV 1 only; keep every other previous raw bias unchanged."
+    client = SequenceClient([analysis, _guidance(0.0)])
+    controller = LLMExplorerV3Controller(
+        run_directory=tmp_path,
+        run_identity={"run": "self-contained-guidance"},
+        client=client,
+    )
+    controller.previous_episode_feedback = {
+        "schema_version": LLM_EXPLORER_V3_VERSION,
+        "metrics": {"episode": 200},
+        "movement_summaries": movement_summaries,
+        "routing_summaries": {
+            f"UAV_{sender}": {"decision_count": 0}
+            for sender in range(16)
+        },
+        "representative_cases": [],
+        "applied_guidance": controller._serializable_guidance(
+            previous_guidance
+        ),
+    }
+
+    result = _begin(controller, 201, 12_000)
+    assert result["enabled"] and len(client.calls) == 2
+    analysis_prompt = client.calls[0]["prompt"]
+    guidance_prompt = client.calls[1]["prompt"]
+    marker = "Previous episode recorded raw TD3 bias:\n"
+    raw_payload = json.loads(
+        guidance_prompt.split(marker, 1)[1].splitlines()[0]
+    )
+    assert raw_payload["source"] == "applied_guidance.td3_bias_raw"
+    assert raw_payload["uav_id_order"] == list(range(16))
+    assert raw_payload["columns"] == ["speed", "heading", "vertical"]
+    np.testing.assert_allclose(raw_payload["rows"], raw, rtol=0.0, atol=1e-6)
+    assert not np.allclose(raw_payload["rows"], effective)
+    assert analysis in guidance_prompt
+    assert "before multiplication by its annealing weight" in guidance_prompt
+    assert "must fit the current episode's sigma bound" in guidance_prompt
+    assert "td3_bias_location" not in guidance_prompt
+    assert "movement summary rows contain" in analysis_prompt
+    assert marker.strip() not in analysis_prompt
+    raw_json = json.dumps(
+        raw.astype(np.float64).round(6).tolist(), separators=(",", ":")
+    )
+    effective_json = json.dumps(
+        effective.astype(np.float64).round(6).tolist(), separators=(",", ":")
+    )
+    assert guidance_prompt.count(raw_json) == 1
+    assert effective_json not in guidance_prompt
+    assert raw_json not in analysis_prompt
+
+
+def test_raw_bias_compatibility_sources_and_unknown_are_not_guessed(tmp_path):
+    controller = LLMExplorerV3Controller(
+        run_directory=tmp_path,
+        run_identity={"run": "raw-bias-sources"},
+        evaluation=True,
+    )
+    raw = np.asarray(_distinct_raw_guidance()["td3_bias_raw"])
+    different_summary_raw = raw + 0.1
+    movement_summaries = {
+        f"UAV_{uav_id}": {
+            "raw_bias": different_summary_raw[uav_id].tolist(),
+            "effective_bias": (0.2 * different_summary_raw[uav_id]).tolist(),
+        }
+        for uav_id in range(16)
+    }
+
+    explicit = _feedback()
+    explicit.update(
+        schema_version=LLM_EXPLORER_V3_VERSION,
+        movement_summaries=movement_summaries,
+    )
+    explicit["applied_guidance"] = {
+        "td3_bias_raw": raw.tolist(),
+        "td3_bias": (raw + 0.2).tolist(),
+    }
+    explicit_compact = controller._compact_feedback(explicit)
+    explicit_payload = explicit_compact["_previous_raw_td3_bias"]
+    assert explicit_payload["source"] == "applied_guidance.td3_bias_raw"
+    np.testing.assert_allclose(explicit_payload["rows"], raw)
+
+    from_summary = copy.deepcopy(explicit)
+    from_summary["applied_guidance"] = {}
+    summary_payload = controller._compact_feedback(from_summary)[
+        "_previous_raw_td3_bias"
+    ]
+    assert summary_payload["source"] == "movement_summaries.UAV_k.raw_bias"
+    np.testing.assert_allclose(summary_payload["rows"], different_summary_raw)
+
+    legacy = _feedback()
+    legacy["schema_version"] = LLM_EXPLORER_V3_VERSION
+    legacy["applied_guidance"] = {"td3_bias": raw.tolist()}
+    legacy_payload = controller._compact_feedback(legacy)[
+        "_previous_raw_td3_bias"
+    ]
+    assert legacy_payload["source"] == (
+        "legacy_v3_applied_guidance.td3_bias_confirmed_raw"
+    )
+    np.testing.assert_allclose(legacy_payload["rows"], raw)
+
+    unknown = _feedback()
+    unknown["applied_guidance"] = {"td3_bias": raw.tolist()}
+    unknown_payload = controller._compact_feedback(unknown)[
+        "_previous_raw_td3_bias"
+    ]
+    assert unknown_payload["source"] == "unknown_not_recorded"
+    assert unknown_payload["rows"] is None
+    assert "unknown, not zero" in unknown_payload["semantics"]
+    unknown_compact = controller._compact_feedback(unknown)
+    replacements = controller._guidance_replacements(
+        analysis="Adjust UAV 1; leave the rest unchanged if supported.",
+        previous=unknown_compact,
+        current_observable_initial_state={"uav_rows": []},
+        settings={"sigma_episode_start": 0.4},
+        validation_feedback="",
+    )
+    assert replacements["PREVIOUS_RAW_TD3_BIAS"]["rows"] is None
+    assert "td3_bias_location" not in replacements["PREVIOUS_GUIDANCE"]
 
 
 def test_routing_alpha_is_point_eight_times_weight():
@@ -756,6 +898,17 @@ def test_v1_summary_checkpoint_loads_without_reset_and_uses_v2_cache_identity(
     assert identity["summary_version"] == LLM_EXPLORER_V3_SUMMARY_VERSION
     assert identity["case_selection_version"] == LLM_EXPLORER_V3_CASE_VERSION
     assert identity["summary_version"] != legacy_feedback["summary_version"]
+    assert "guidance_context_version" not in identity
+    for stage in ("guidance", "episode_result"):
+        stage_identity = restored._cache_identity(
+            episode_index=200,
+            stage=stage,
+            system_prompt="system",
+            user_prompt="prompt",
+        )
+        assert stage_identity["guidance_context_version"] == (
+            LLM_EXPLORER_V3_GUIDANCE_CONTEXT_VERSION
+        )
 
 
 def test_v3_windows_preflight_checks_named_artifact_paths(tmp_path):

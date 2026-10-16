@@ -80,6 +80,7 @@ from llm_explorer import LLM_EXPLORER_VERSION, llm_explorer_path_preflight
 from llm_explorer_v3 import (
     LLM_EXPLORER_V3_ANNEAL_END_EPISODE,
     LLM_EXPLORER_V3_CASE_VERSION,
+    LLM_EXPLORER_V3_GUIDANCE_CONTEXT_VERSION,
     LLM_EXPLORER_V3_MAX_INPUT_TOKENS,
     LLM_EXPLORER_V3_PROMPT_VERSION,
     LLM_EXPLORER_V3_SUMMARY_VERSION,
@@ -963,6 +964,7 @@ def run(args):
                 prompt_version=LLM_EXPLORER_V3_PROMPT_VERSION,
                 summary_version=LLM_EXPLORER_V3_SUMMARY_VERSION,
                 case_selection_version=LLM_EXPLORER_V3_CASE_VERSION,
+                guidance_context_version=LLM_EXPLORER_V3_GUIDANCE_CONTEXT_VERSION,
                 annealing_end_episode=LLM_EXPLORER_V3_ANNEAL_END_EPISODE,
                 input_hard_limit_tokens=LLM_EXPLORER_V3_MAX_INPUT_TOKENS,
                 routing_alpha="0.8 * w",
