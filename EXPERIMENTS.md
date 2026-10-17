@@ -316,6 +316,10 @@ pairwise gaps, Bellman/TD-error/loss summaries, out-of-range cost-Q rates, and a
 small deterministic set of representative cases. Missing observations are kept
 distinct from measured zero. Resume truncates this append-only artifact to the
 checkpoint episode before continuing, matching the other training logs.
+The `*_transition_count` fields report rows currently retained in the circular
+buffers. The `*_transitions_added` fields use the replay buffers' checkpointed
+cumulative successful-write counters, so they remain per-episode write counts
+after capacity is reached and old rows are overwritten.
 
 For example, a 50-episode Windows diagnostic run using the formal seed and
 unmodified warmup thresholds is:

@@ -3166,11 +3166,13 @@ def train(
         episode_actor_updates_before = int(movement_agent.num_actor_update_iteration)
         episode_critic_updates_before = int(movement_agent.num_critic_update_iteration)
         episode_joint_transitions_before = int(total_joint_transitions)
-        episode_routing_replay_before = (
-            int(routing_replay.size) if routing_replay is not None else 0
+        episode_routing_reward_total_added_before = (
+            int(routing_replay.total_added)
+            if routing_replay is not None
+            else 0
         )
-        episode_routing_cost_replay_before = (
-            int(routing_replay.cost_ready_size)
+        episode_routing_cost_total_added_before = (
+            int(routing_replay.path_cost_total_added)
             if routing_replay is not None
             else 0
         )
@@ -4166,19 +4168,41 @@ def train(
             )
         routing_training_diagnostic_summary = None
         if episode_routing_training_diagnostics is not None:
+            routing_replay_transitions_added = int(
+                routing_replay.total_added
+                - episode_routing_reward_total_added_before
+            )
+            routing_cost_replay_transitions_added = int(
+                routing_replay.path_cost_total_added
+                - episode_routing_cost_total_added_before
+            )
+            if routing_replay_transitions_added < 0:
+                raise AssertionError(
+                    "routing replay cumulative counter moved backwards"
+                )
+            if routing_cost_replay_transitions_added < 0:
+                raise AssertionError(
+                    "routing cost replay cumulative counter moved backwards"
+                )
+            if routing_cost_replay_transitions_added != int(
+                packet_path_diagnostics["packet_path_cost_transition_count"]
+            ):
+                raise AssertionError(
+                    "routing cost replay additions diverged from packet-path "
+                    "cost closures"
+                )
             routing_training_diagnostic_summary = (
                 episode_routing_training_diagnostics.summary(
                     episode=int(episode + 1),
                     routing_replay_transition_count=int(routing_replay.size),
-                    routing_replay_transitions_added=int(
-                        routing_replay.size - episode_routing_replay_before
+                    routing_replay_transitions_added=(
+                        routing_replay_transitions_added
                     ),
                     routing_cost_replay_transition_count=int(
                         routing_replay.cost_ready_size
                     ),
-                    routing_cost_replay_transitions_added=int(
-                        routing_replay.cost_ready_size
-                        - episode_routing_cost_replay_before
+                    routing_cost_replay_transitions_added=(
+                        routing_cost_replay_transitions_added
                     ),
                     routing_warmup_transition_threshold=int(
                         config.routing_warmup_transitions

@@ -22,22 +22,26 @@ class SimpleRunnerLifecycleIntegrationTest(unittest.TestCase):
             command = [
                 "td3_dinkelbach",
                 "--episodes", "1",
-                "--episode-seconds", "1",
+                "--episode-seconds", "2",
                 "--checkpoint-interval", "1",
-                "--roi-count", "2",
+                "--roi-count", "8",
                 "--seed", "20260817",
                 "--output-root", str(output),
                 "--routing-training-diagnostics",
             ]
-            self.assertEqual(main(command), 0)
+            with mock.patch("HRL_task_aware.ROUTING_REPLAY_CAPACITY", 3):
+                self.assertEqual(main(command), 0)
             run_dir = next((output / "td3_dinkelbach").iterdir())
             path = run_dir / "routing_training_diagnostics.jsonl"
             rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
             self.assertEqual(len(rows), 1)
             row = rows[0]
-            self.assertEqual(row["decision_count"], 64)
-            self.assertEqual(row["slot_global_reward"]["count"], 4)
-            self.assertEqual(row["routing_replay_transitions_added"], 64)
+            self.assertEqual(row["decision_count"], 128)
+            self.assertEqual(row["slot_global_reward"]["count"], 8)
+            self.assertEqual(row["routing_replay_transitions_added"], 128)
+            self.assertEqual(row["routing_replay_transition_count"], 3)
+            self.assertEqual(row["routing_cost_replay_transition_count"], 3)
+            self.assertGreater(row["routing_cost_replay_transitions_added"], 3)
             self.assertEqual(row["routing_warmup_transition_threshold"], 1000)
             self.assertEqual(row["td3_warmup_transition_threshold"], 10000)
             self.assertFalse(row["routing_optimizer_warmup_complete"])
@@ -51,14 +55,30 @@ class SimpleRunnerLifecycleIntegrationTest(unittest.TestCase):
                 row["episode_timely_useful_bits"],
             )
 
-            self.assertEqual(
-                main(["resume", str(run_dir), "--target-episodes", "2"]), 0
-            )
+            with mock.patch("HRL_task_aware.ROUTING_REPLAY_CAPACITY", 3):
+                self.assertEqual(
+                    main(["resume", str(run_dir), "--target-episodes", "2"]), 0
+                )
             resumed = [
                 json.loads(line)
                 for line in path.read_text(encoding="utf-8").splitlines()
             ]
             self.assertEqual([row["episode"] for row in resumed], [1, 2])
+            self.assertEqual(
+                [row["routing_replay_transitions_added"] for row in resumed],
+                [128, 128],
+            )
+            self.assertEqual(
+                [row["routing_replay_transition_count"] for row in resumed],
+                [3, 3],
+            )
+            for resumed_row in resumed:
+                self.assertEqual(
+                    resumed_row["routing_cost_replay_transition_count"], 3
+                )
+                self.assertGreater(
+                    resumed_row["routing_cost_replay_transitions_added"], 3
+                )
 
     def test_keyboard_interrupt_marks_new_and_resumed_run_interrupted(self):
         with tempfile.TemporaryDirectory() as temp_dir:

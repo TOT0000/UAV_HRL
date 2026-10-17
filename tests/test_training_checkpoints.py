@@ -797,6 +797,30 @@ class FullResumeCheckpointTest(unittest.TestCase):
         )
         ddqn.train(routing, batch_size=1)
         ddqn.update_target()
+        self.assertTrue(
+            routing.add_cost_transition(
+                routing_state,
+                1,
+                routing_state,
+                cost=0.25,
+                done=False,
+                tag_gt=4,
+                transition_id=100,
+                packet_id=200,
+            )
+        )
+        self.assertTrue(
+            routing.add_cost_transition(
+                routing_state,
+                2,
+                routing_state,
+                cost=0.5,
+                done=True,
+                tag_gt=4,
+                transition_id=101,
+                packet_id=201,
+            )
+        )
 
     def test_full_resume_round_trip_restores_exact_training_state_and_rng(self):
         td3, ddqn, joint, routing = self._components()
@@ -943,6 +967,19 @@ class FullResumeCheckpointTest(unittest.TestCase):
         self.assertEqual(restored_joint.size, joint.size)
         self.assertEqual(restored_routing.ptr, routing.ptr)
         self.assertEqual(restored_routing.size, routing.size)
+        self.assertEqual(restored_routing.total_added, routing.total_added)
+        self.assertEqual(
+            restored_routing.path_cost_ptr,
+            routing.path_cost_ptr,
+        )
+        self.assertEqual(
+            restored_routing.path_cost_size,
+            routing.path_cost_size,
+        )
+        self.assertEqual(
+            restored_routing.path_cost_total_added,
+            routing.path_cost_total_added,
+        )
         self.assertEqual(restored_joint.max_size, joint.max_size)
         self.assertEqual(restored_routing.max_size, routing.max_size)
         self.assertEqual(restored_routing.n_step_buffer, routing.n_step_buffer)
