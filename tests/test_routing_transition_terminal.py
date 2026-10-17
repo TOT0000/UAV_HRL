@@ -98,7 +98,7 @@ class RoutingTransitionTerminalTest(unittest.TestCase):
 
     def test_deadline_outcome_only_increments_violation_stat(self):
         packet = self.engine.create_packet(0, "COM", 100.0, 0.0)
-        packet["deadline_abs"] = 0.25
+        self.engine._set_packet_deadline(packet, 0.25)
 
         replay = self.run_slot(
             {0: 1}, {(0, 1): 0.001}

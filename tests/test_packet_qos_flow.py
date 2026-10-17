@@ -111,8 +111,8 @@ class PacketQosFlowTest(unittest.TestCase):
         self.assertEqual(fov["deadline_abs"], 0.015)
         # The remainder of this compatibility-helper test isolates its exact
         # completion and late-partial mechanics from the production deadlines.
-        com["deadline_abs"] = 2.0
-        fov["deadline_abs"] = 2.5
+        engine._set_packet_deadline(com, 2.0)
+        engine._set_packet_deadline(fov, 2.5)
 
         timely = engine.serve_active_links(
             env,

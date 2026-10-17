@@ -88,9 +88,9 @@ class RoutingImmediateCostContractTest(unittest.TestCase):
 
     def test_a_pre_action_expiry_is_system_outcome_not_current_cost(self):
         expired = self.engine.create_packet(0, "FOV", 100.0, 0.0)
-        expired["deadline_abs"] = 0.0
+        self.engine._set_packet_deadline(expired, 0.0)
         live = self.engine.create_packet(0, "FOV", 100.0, 0.0)
-        live["deadline_abs"] = 10.0
+        self.engine._set_packet_deadline(live, 10.0)
 
         replay = self.run_slot({0: 0})
 
@@ -101,10 +101,10 @@ class RoutingImmediateCostContractTest(unittest.TestCase):
 
     def _behind_hol_expiry(self, receiver, capacities):
         hol = self.engine.create_packet(0, "FOV", 1e9, 0.0)
-        hol["deadline_abs"] = 10.0
+        self.engine._set_packet_deadline(hol, 10.0)
         for _ in range(2):
             packet = self.engine.create_packet(0, "FOV", 100.0, 0.0)
-            packet["deadline_abs"] = 0.25
+            self.engine._set_packet_deadline(packet, 0.25)
         replay = self.run_slot({0: receiver}, capacities)
         return replay
 
@@ -118,9 +118,9 @@ class RoutingImmediateCostContractTest(unittest.TestCase):
 
     def test_d_and_e_post_action_relay_arrival_has_no_current_or_retroactive_cost(self):
         relayed = self.engine.create_packet(0, "FOV", 100.0, 0.0)
-        relayed["deadline_abs"] = 1.0
+        self.engine._set_packet_deadline(relayed, 1.0)
         resident = self.engine.create_packet(1, "FOV", 100.0, 0.0)
-        resident["deadline_abs"] = 10.0
+        self.engine._set_packet_deadline(resident, 10.0)
         replay = ReplayBufferDiscrete(143, 17, max_size=32, n_step=1)
 
         self.run_slot(
@@ -132,7 +132,7 @@ class RoutingImmediateCostContractTest(unittest.TestCase):
         self.assertTrue(np.all(first_costs == 0.0))
         self.assertEqual(relayed["current"], 1)
 
-        relayed["deadline_abs"] = 0.25
+        self.engine._set_packet_deadline(relayed, 0.25)
         self.run_slot({1: 1}, current_time=0.25, replay=replay)
 
         np.testing.assert_array_equal(
@@ -144,7 +144,7 @@ class RoutingImmediateCostContractTest(unittest.TestCase):
     def test_f_non_hol_frozen_packets_do_not_create_routing_decisions(self):
         for _ in range(3):
             packet = self.engine.create_packet(0, "FOV", 100.0, 0.0)
-            packet["deadline_abs"] = 0.25
+            self.engine._set_packet_deadline(packet, 0.25)
 
         replay = self.run_slot({0: 0})
 
@@ -154,7 +154,7 @@ class RoutingImmediateCostContractTest(unittest.TestCase):
 
     def test_g_com_pre_s2u_violation_is_system_only(self):
         packet = self.engine.create_sr_packet(0, 100.0, 0.0)
-        packet["deadline_abs"] = 0.0
+        self.engine._set_packet_deadline(packet, 0.0)
 
         events = self.engine.expire_packets(0.0, inclusive=True)
 
@@ -185,7 +185,7 @@ class RoutingImmediateCostContractTest(unittest.TestCase):
         self.assertEqual(result["arrivals"], [packet])
         self.assertEqual(self.engine.routing_constraint_counts(), (0, 1))
         self.assertAlmostEqual(packet["routing_eligible_time"], 0.1)
-        packet["deadline_abs"] = 0.25
+        self.engine._set_packet_deadline(packet, 0.25)
         self.engine.expire_packets(0.25, inclusive=True)
         self.assertEqual(self.engine.routing_constraint_counts(), (1, 1))
         self.assertTrue(self.engine.assert_violation_credit_conservation())
@@ -203,7 +203,7 @@ class RoutingImmediateCostContractTest(unittest.TestCase):
         ]
         self.engine.enable_packet_diagnostic_artifacts = True
         packet = self.engine.create_sr_packet(0, 100.0, 0.0)
-        packet["deadline_abs"] = 0.20
+        self.engine._set_packet_deadline(packet, 0.20)
         self.env.active_s2u_capacities = {(0, receiver): 0.001}
 
         result = self.engine.serve_active_links(
@@ -244,9 +244,9 @@ class RoutingImmediateCostContractTest(unittest.TestCase):
             }
         ]
         resident = self.engine.create_packet(receiver, "FOV", 100.0, 0.0)
-        resident["deadline_abs"] = 10.0
+        self.engine._set_packet_deadline(resident, 10.0)
         incoming = self.engine.create_sr_packet(0, 100.0, 0.0)
-        incoming["deadline_abs"] = 0.20
+        self.engine._set_packet_deadline(incoming, 0.20)
         self.env.active_s2u_capacities = {(0, receiver): 0.001}
 
         result = self.engine.serve_active_links(
@@ -269,14 +269,14 @@ class RoutingImmediateCostContractTest(unittest.TestCase):
         self.assertIs(self.engine.get_hol_packet(0), first)
         self.assertEqual(self.engine.routing_constraint_counts(), (0, 2))
 
-        second["deadline_abs"] = 0.25
+        self.engine._set_packet_deadline(second, 0.25)
         self.engine.expire_packets(0.25, inclusive=True)
 
         self.assertEqual(self.engine.routing_constraint_counts(), (1, 2))
 
     def test_episode_finalization_requires_packet_chain_attribution(self):
         frozen = self.engine.create_packet(0, "FOV", 100.0, 0.0)
-        frozen["deadline_abs"] = 10.0
+        self.engine._set_packet_deadline(frozen, 10.0)
 
         replay = self.run_slot({0: 0}, done=True)
 

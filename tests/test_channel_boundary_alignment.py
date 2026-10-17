@@ -274,7 +274,7 @@ class RoutingBoundaryReplayTest(unittest.TestCase):
     def test_pending_transition_uses_next_actual_observation_and_lock_mask(self):
         env, engine = self._environment_and_engine()
         packet = engine.create_packet(0, "COM", 1e12, 0.75)
-        packet["deadline_abs"] = 10.0
+        engine._set_packet_deadline(packet, 10.0)
         replay = ReplayBufferDiscrete(143, 17, max_size=64, n_step=1)
         pending = {}
         policy = RecordingRoutingPolicy(env.GS_ID)
@@ -335,7 +335,7 @@ class RoutingBoundaryReplayTest(unittest.TestCase):
     def test_boundary_expiration_cost_attaches_to_pending_transition_before_truncation(self):
         env, engine = self._environment_and_engine()
         packet = engine.create_packet(0, "COM", 1e12, 0.75)
-        packet["deadline_abs"] = 1.0
+        engine._set_packet_deadline(packet, 1.0)
         replay = ReplayBufferDiscrete(143, 17, max_size=64, n_step=1)
         ledger = RoutingTransitionLedger()
         ledger.begin_episode()

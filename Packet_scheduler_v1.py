@@ -1,3 +1,4 @@
+import heapq
 import math
 from copy import deepcopy
 from collections import defaultdict, deque
@@ -226,6 +227,11 @@ class BlockServiceCursor:
 
 
 class PacketEngine:
+    # Private equivalence/benchmark hook. Production always uses the index;
+    # tests can select the retained linear reference path without a CLI or a
+    # separate comparison method.
+    _DEADLINE_INDEX_ENABLED = True
+
     def __init__(
         self,
         num_uav,
@@ -266,6 +272,8 @@ class PacketEngine:
             raise ValueError("packet injection cutoff must be finite and non-negative")
         self._next_pkt_id = 0
         self._active_idx = set()
+        self._deadline_index_enabled = bool(self._DEADLINE_INDEX_ENABLED)
+        self._reset_deadline_index()
 
         # PacketManager
         self.packet_pool = []
@@ -364,6 +372,171 @@ class PacketEngine:
             ETA_MAX=60.0,
             ema_alpha=0.7,
         )
+
+    def _reset_deadline_index(self):
+        """Reset the episode-local, reconstructible deadline index."""
+
+        self._deadline_heap = []
+        self._deadline_entries = {}
+        self._queue_cleanup_pending = False
+        self._deadline_index_counters = {
+            "expiration_checks": 0,
+            "nearest_deadline_queries": 0,
+            "lightweight_heap_queries": 0,
+            "full_scans": 0,
+            "uav_queue_entries_visited": 0,
+            "sr_queue_entries_visited": 0,
+            "detached_entries_visited": 0,
+            "linear_active_packet_visits": 0,
+            "stale_heap_entries_removed": 0,
+            "heap_compactions": 0,
+            "index_rebuilds": 0,
+        }
+
+    def _register_packet_deadline(self, pkt):
+        if not self._deadline_index_enabled:
+            return
+        deadline_abs = pkt.get("deadline_abs")
+        if deadline_abs is None:
+            return
+        deadline_abs = float(deadline_abs)
+        packet_id = int(pkt["id"])
+        pool_idx = int(pkt["_pool_idx"])
+        entry = (deadline_abs, packet_id, pool_idx)
+        self._deadline_entries[packet_id] = (deadline_abs, pool_idx)
+        heapq.heappush(self._deadline_heap, entry)
+
+    def _discard_packet_deadline(self, pkt):
+        if not self._deadline_index_enabled:
+            return
+        packet_id = pkt.get("id")
+        if packet_id is not None:
+            self._deadline_entries.pop(int(packet_id), None)
+        self._compact_deadline_heap_if_needed()
+
+    def _compact_deadline_heap_if_needed(self):
+        # Lazy deletion normally removes entries within 10--15 ms. Compact
+        # unusually stale heaps so custom long-deadline runs remain bounded.
+        active_entries = len(self._deadline_entries)
+        if len(self._deadline_heap) > max(256, 4 * active_entries + 64):
+            self._deadline_heap = [
+                (deadline, entry_packet_id, pool_idx)
+                for entry_packet_id, (deadline, pool_idx) in (
+                    self._deadline_entries.items()
+                )
+            ]
+            heapq.heapify(self._deadline_heap)
+            self._deadline_index_counters["heap_compactions"] += 1
+
+    def _set_packet_deadline(self, pkt, deadline_abs):
+        """Update a live packet deadline and its runtime index atomically."""
+
+        deadline_abs = float(deadline_abs)
+        if not math.isfinite(deadline_abs):
+            raise ValueError("packet deadline must be finite")
+        pkt["deadline_abs"] = deadline_abs
+        if not self._deadline_index_enabled or pkt.get("done", False):
+            return
+        pool_idx = int(pkt.get("_pool_idx", -1))
+        if pool_idx not in self._active_idx:
+            return
+        packet_id = int(pkt["id"])
+        self._deadline_entries.pop(packet_id, None)
+        self._register_packet_deadline(pkt)
+        self._compact_deadline_heap_if_needed()
+
+    def _deadline_entry_is_valid(self, entry):
+        deadline_abs, packet_id, pool_idx = entry
+        if self._deadline_entries.get(packet_id) != (deadline_abs, pool_idx):
+            return False
+        if not (0 <= pool_idx < len(self.packet_pool)):
+            return False
+        pkt = self.packet_pool[pool_idx]
+        return bool(
+            pkt is not None
+            and not pkt.get("done", False)
+            and pool_idx in self._active_idx
+            and int(pkt.get("id", -1)) == packet_id
+            and float(pkt.get("deadline_abs", float("nan"))) == deadline_abs
+        )
+
+    def _peek_packet_deadline(self):
+        self._deadline_index_counters["lightweight_heap_queries"] += 1
+        while self._deadline_heap:
+            entry = self._deadline_heap[0]
+            if self._deadline_entry_is_valid(entry):
+                return float(entry[0])
+            heapq.heappop(self._deadline_heap)
+            deadline_abs, packet_id, pool_idx = entry
+            if self._deadline_entries.get(packet_id) == (deadline_abs, pool_idx):
+                self._deadline_entries.pop(packet_id, None)
+            self._deadline_index_counters["stale_heap_entries_removed"] += 1
+        return float("inf")
+
+    @staticmethod
+    def _deadline_is_due(deadline_abs, current_time, inclusive):
+        tolerance = event_time_tolerance_seconds(current_time, deadline_abs)
+        return (
+            current_time >= deadline_abs - tolerance
+            if inclusive
+            else current_time > deadline_abs + tolerance
+        )
+
+    def _has_due_packet_deadline(self, current_time, inclusive=True):
+        deadline_abs = self._peek_packet_deadline()
+        return bool(
+            math.isfinite(deadline_abs)
+            and self._deadline_is_due(
+                deadline_abs, float(current_time), bool(inclusive)
+            )
+        )
+
+    def next_packet_deadline(self, current_time=None):
+        """Return the nearest live deadline without changing packet state."""
+
+        self._deadline_index_counters["nearest_deadline_queries"] += 1
+        if self._deadline_index_enabled:
+            return self._peek_packet_deadline()
+        active_packets = self.get_active_packets()
+        self._deadline_index_counters["linear_active_packet_visits"] += len(
+            active_packets
+        )
+        if current_time is None:
+            return min(
+                (float(pkt["deadline_abs"]) for pkt in active_packets),
+                default=float("inf"),
+            )
+        current_time = float(current_time)
+        return min(
+            (
+                float(pkt["deadline_abs"])
+                for pkt in active_packets
+                if float(pkt["deadline_abs"]) > current_time
+            ),
+            default=float("inf"),
+        )
+
+    def _rebuild_deadline_index(self):
+        """Reconstruct the runtime index from authoritative active packets."""
+
+        self._deadline_heap = []
+        self._deadline_entries = {}
+        for pkt in self.get_active_packets():
+            self._register_packet_deadline(pkt)
+        self._deadline_index_counters["index_rebuilds"] += 1
+
+    def deadline_index_statistics(self):
+        """Return lightweight counters for tests and coarse benchmarks."""
+
+        return {
+            "enabled": bool(self._deadline_index_enabled),
+            **{
+                key: int(value)
+                for key, value in self._deadline_index_counters.items()
+            },
+            "heap_entries": int(len(self._deadline_heap)),
+            "live_entries": int(len(self._deadline_entries)),
+        }
 
     def _fov_observation_sample(
         self,
@@ -857,6 +1030,7 @@ class PacketEngine:
             self.eligible_packet_counts[task_type] += 1
         self.packet_pool.append(pkt)
         self._active_idx.add(pool_idx)
+        self._register_packet_deadline(pkt)
         self._next_pkt_id += 1
         return pkt
 
@@ -1315,6 +1489,20 @@ class PacketEngine:
         """Drop unfinished packets at an absolute deadline, exactly once."""
 
         current_time = float(current_time)
+        self._deadline_index_counters["expiration_checks"] += 1
+        if (
+            self._deadline_index_enabled
+            and not self._queue_cleanup_pending
+            and not self._has_due_packet_deadline(current_time, inclusive)
+        ):
+            return []
+        return self._expire_packets_full_scan(current_time, inclusive)
+
+    def _expire_packets_full_scan(self, current_time, inclusive=True):
+        """Reference cleanup preserving the historical queue traversal order."""
+
+        current_time = float(current_time)
+        self._deadline_index_counters["full_scans"] += 1
         violations = []
         queued_indices = set()
 
@@ -1336,6 +1524,9 @@ class PacketEngine:
             kept = deque()
             expired_bits = 0.0
             for pkt in self.uav_queues[uav_id]:
+                self._deadline_index_counters[
+                    "uav_queue_entries_visited"
+                ] += 1
                 if pkt is None:
                     continue
                 pool_idx = int(pkt.get("_pool_idx", -1))
@@ -1365,6 +1556,9 @@ class PacketEngine:
             kept = deque()
             expired_bits = 0.0
             for pkt in self.sr_queues[sr_id]:
+                self._deadline_index_counters[
+                    "sr_queue_entries_visited"
+                ] += 1
                 if pkt is None:
                     continue
                 pool_idx = int(pkt.get("_pool_idx", -1))
@@ -1398,6 +1592,7 @@ class PacketEngine:
 
         detached_indices = set(self._active_idx).difference(queued_indices)
         for pool_idx in sorted(detached_indices):
+            self._deadline_index_counters["detached_entries_visited"] += 1
             if not (0 <= pool_idx < len(self.packet_pool)):
                 self._active_idx.discard(pool_idx)
                 continue
@@ -1413,6 +1608,9 @@ class PacketEngine:
                     self._mark_sr_admission_drop(
                         pkt, current_time, remove_from_queue=False
                     )
+        self._queue_cleanup_pending = False
+        if self._deadline_index_enabled:
+            self._peek_packet_deadline()
         return violations
 
     @staticmethod
@@ -2773,15 +2971,19 @@ class PacketEngine:
             # Outcome rows snapshot diagnostics inside mark_packet_done().
             # Settle a current-slot S2U opportunity before that snapshot when
             # the deadline itself terminates the HOL packet.
-            for pkt in self.get_active_packets():
-                deadline_abs = pkt.get("deadline_abs")
-                if (
-                    deadline_abs is not None
-                    and float(deadline_abs)
-                    <= float(moment)
-                    + event_time_tolerance_seconds(deadline_abs, moment)
-                ):
-                    settle_s2u_no_service(pkt["id"])
+            if (
+                not self._deadline_index_enabled
+                or self._has_due_packet_deadline(moment, inclusive=True)
+            ):
+                for pkt in self.get_active_packets():
+                    deadline_abs = pkt.get("deadline_abs")
+                    if (
+                        deadline_abs is not None
+                        and float(deadline_abs)
+                        <= float(moment)
+                        + event_time_tolerance_seconds(deadline_abs, moment)
+                    ):
+                        settle_s2u_no_service(pkt["id"])
             for violation in self.expire_packets(moment, inclusive=True):
                 result["outcomes"].append(
                     self._outcome_from_violation(violation)
@@ -2862,15 +3064,7 @@ class PacketEngine:
                 if event_index < len(events)
                 else float("inf")
             )
-            active_packets = self.get_active_packets()
-            next_deadline = min(
-                (
-                    float(pkt["deadline_abs"])
-                    for pkt in active_packets
-                    if float(pkt["deadline_abs"]) > t
-                ),
-                default=float("inf"),
-            )
+            next_deadline = self.next_packet_deadline(t)
             rates_bps = {}
             packets_by_link = {}
             for (sender, receiver), cached_profile in uav_profiles.items():
@@ -3370,6 +3564,14 @@ class PacketEngine:
         if remove_from_queue:
             if not self._remove_from_queue(pkt):
                 self._remove_from_sr_queue(pkt)
+        elif (
+            pkt.get("_queued_uav") is not None
+            or pkt.get("_queued_sr") is not None
+        ):
+            # The full expiration pass deliberately rebuilds a queue while
+            # marking its rows. Any other deferred removal must force one
+            # cleanup pass even if no deadline is currently due.
+            self._queue_cleanup_pending = True
 
         # 3) remove from active indices
         pi = pkt.get("_pool_idx", None)
@@ -3381,6 +3583,7 @@ class PacketEngine:
             return
 
         self._active_idx.discard(pi)
+        self._discard_packet_deadline(pkt)
 
         # 4) clear pool slot
         if 0 <= pi < len(self.packet_pool):
@@ -3882,6 +4085,7 @@ class PacketEngine:
         self.packet_pool = []
         # 活躍索引
         self._active_idx = set()
+        self._reset_deadline_index()
         # 流水號歸零（或保留原值也行）
         self._next_pkt_id = 0
         # 速率積分緩衝清空

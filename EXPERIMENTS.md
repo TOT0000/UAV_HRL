@@ -485,6 +485,21 @@ python benchmarks/benchmark_active_link_capacity_cache.py --episode-seconds 5 --
 python benchmarks/benchmark_active_link_capacity_cache.py --episode-seconds 5 --roi-count 8 --seed 20260817 --profile --disable-cache
 ```
 
+Packet deadlines are indexed by absolute deadline within each episode. Packet
+creation inserts one heap entry; delivery or drop invalidates it, and stale
+entries are removed lazily with bounded compaction. Event-time deadline checks
+use the heap minimum and run the historical UAV/SR/detached queue traversal
+only when a deadline is due or deferred queue cleanup is pending. The index is
+cleared on episode reset and is reconstructed from authoritative live packets
+when requested; it is runtime-only and does not change the episode-boundary
+checkpoint schema. The exact linear reference path remains available only as
+a test/benchmark hook:
+
+```powershell
+python benchmarks/benchmark_packet_deadline_index.py --episode-seconds 5 --roi-count 8 --seed 20260817 --profile
+python benchmarks/benchmark_packet_deadline_index.py --episode-seconds 5 --roi-count 8 --seed 20260817 --profile --disable-index
+```
+
 The 5 ms duration follows Ghazikor et al., *IEEE Transactions on
 Communications* (2026), DOI `10.1109/TCOMM.2025.3650376`, for block-duration
 scale only; its interference, queue, threshold, bandwidth, and K-factor models

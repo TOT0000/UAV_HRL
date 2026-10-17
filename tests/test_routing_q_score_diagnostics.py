@@ -509,7 +509,7 @@ class RoutingQScoreNoBehaviorChangeTest(unittest.TestCase):
 
         engine = PacketEngine(num_uav=2, step_time=0.25)
         packet = engine.create_packet(0, "FOV", 100.0, 0.0)
-        packet["deadline_abs"] = 0.75
+        engine._set_packet_deadline(packet, 0.75)
         env = SimpleNamespace(
             GS_ID=2,
             GS_pos=(0.0, 0.0, 0.0),
@@ -561,7 +561,7 @@ class RoutingQScoreNoBehaviorChangeTest(unittest.TestCase):
 
         engine = PacketEngine(num_uav=16, step_time=0.25)
         packet = engine.create_packet(0, "COM", 100.0, 0.0)
-        packet["deadline_abs"] = 0.25
+        engine._set_packet_deadline(packet, 0.25)
         replay = ReplayBufferDiscrete(143, 17, max_size=16, n_step=1)
         q_r = np.asarray([2.0, 1.0, *([0.0] * 15)])
         agent = fixed_agent(q_r, np.zeros(17), lambda_cost=15.0)

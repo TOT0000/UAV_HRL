@@ -246,8 +246,8 @@ class PacketS2uHolDiagnosticTest(unittest.TestCase):
         engine = diagnostic_engine()
         first = engine.create_sr_packet(0, 100.0, 0.0)
         second = engine.create_sr_packet(0, 100.0, 0.0)
-        first["deadline_abs"] = 1.0
-        second["deadline_abs"] = 0.5
+        engine._set_packet_deadline(first, 1.0)
+        engine._set_packet_deadline(second, 0.5)
 
         engine.expire_packets(0.5)
 
@@ -356,7 +356,7 @@ class PacketS2uHolDiagnosticTest(unittest.TestCase):
         never_engine = diagnostic_engine()
         never = never_engine.create_sr_packet(0, 100.0, 0.0)
         never["s2u_receiver"] = 0
-        never["deadline_abs"] = 0.5
+        never_engine._set_packet_deadline(never, 0.5)
         never_engine.serve_s2u_links(
             routing_env(s2u_in_range=False),
             capacities={},
@@ -368,7 +368,7 @@ class PacketS2uHolDiagnosticTest(unittest.TestCase):
         partial_engine = diagnostic_engine()
         partial = partial_engine.create_sr_packet(1, 1_000_000.0, 0.0)
         partial["s2u_receiver"] = 0
-        partial["deadline_abs"] = 0.5
+        partial_engine._set_packet_deadline(partial, 0.5)
         partial_engine.serve_s2u_links(
             routing_env(),
             capacities={(1, 0): 1.0},
@@ -394,7 +394,7 @@ class PacketTerminalDiagnosticTest(unittest.TestCase):
         packet = engine.create_packet(1, "FOV", 100.0, 0.0)
         packet["path"] = [1, 2, 1]
         packet["current"] = 1
-        packet["deadline_abs"] = 0.5
+        engine._set_packet_deadline(packet, 0.5)
 
         engine.expire_packets(0.5)
 
@@ -409,7 +409,7 @@ class PacketTerminalDiagnosticTest(unittest.TestCase):
     def test_sr_uav_and_gs_terminal_locations_and_s2u_classification(self):
         pre_engine = diagnostic_engine()
         pre = pre_engine.create_sr_packet(7, 100.0, 0.0)
-        pre["deadline_abs"] = 0.5
+        pre_engine._set_packet_deadline(pre, 0.5)
         pre_engine.expire_packets(0.5)
         pre_outcome = pre_engine.packet_outcomes[0]
         self.assertEqual(pre_outcome["terminal_node_type"], "SR")
@@ -425,7 +425,7 @@ class PacketTerminalDiagnosticTest(unittest.TestCase):
         post["routing_eligible_time"] = 0.1
         post["path"].append(2)
         post["rem_bits"] = post["size_bits"]
-        post["deadline_abs"] = 0.5
+        post_engine._set_packet_deadline(post, 0.5)
         post_engine.enqueue_packet(post, 2, 0.25)
         post_engine.expire_packets(0.5)
         post_outcome = post_engine.packet_outcomes[0]
@@ -458,7 +458,7 @@ class PacketTerminalDiagnosticTest(unittest.TestCase):
         packet = engine.create_sr_packet(9, 100.0, 0.0)
         packet["s2u_completion_time"] = 0.5
         packet["path"].append(2)
-        packet["deadline_abs"] = 0.5
+        engine._set_packet_deadline(packet, 0.5)
 
         engine._mark_deadline_violation(
             packet,
@@ -475,7 +475,7 @@ class PacketTerminalDiagnosticTest(unittest.TestCase):
         engine = diagnostic_engine()
         packet = engine.create_packet(0, "FOV", 100.0, 0.0)
         self.assertFalse(engine.record_hop_transmission(packet, 0, 1, 40.0))
-        packet["deadline_abs"] = 0.5
+        engine._set_packet_deadline(packet, 0.5)
 
         engine.expire_packets(0.5)
 
@@ -487,7 +487,7 @@ class PacketTerminalDiagnosticTest(unittest.TestCase):
     def test_uav_queue_expiry_before_service_includes_terminal_wait(self):
         engine = diagnostic_engine()
         packet = engine.create_packet(0, "FOV", 100.0, 0.0)
-        packet["deadline_abs"] = 0.5
+        engine._set_packet_deadline(packet, 0.5)
 
         engine.expire_packets(0.5)
 
@@ -501,7 +501,7 @@ class PacketTerminalDiagnosticTest(unittest.TestCase):
         env = routing_env()
         engine = diagnostic_engine()
         packet = engine.create_packet(0, "FOV", 1_000_000.0, 0.0)
-        packet["deadline_abs"] = 0.5
+        engine._set_packet_deadline(packet, 0.5)
         mask = action_mask(3, 0, 1)
 
         engine.serve_active_links(
@@ -525,7 +525,7 @@ class PacketTerminalDiagnosticTest(unittest.TestCase):
         env = routing_env()
         engine = diagnostic_engine()
         packet = engine.create_packet(0, "FOV", 100.0, 0.0)
-        packet["deadline_abs"] = 0.75
+        engine._set_packet_deadline(packet, 0.75)
         mask = action_mask(3, 0, 1)
 
         engine.serve_active_links(
@@ -550,7 +550,7 @@ class PacketTerminalDiagnosticTest(unittest.TestCase):
     def test_pre_s2u_queue_expiry_reports_elapsed_wait_and_zero_airtime(self):
         engine = diagnostic_engine()
         packet = engine.create_sr_packet(4, 100.0, 0.0)
-        packet["deadline_abs"] = 0.5
+        engine._set_packet_deadline(packet, 0.5)
 
         engine.expire_packets(0.5)
 
@@ -564,7 +564,7 @@ class PacketTerminalDiagnosticTest(unittest.TestCase):
         engine = diagnostic_engine()
         packet = engine.create_sr_packet(5, 1_000_000.0, 0.0)
         packet["s2u_receiver"] = 0
-        packet["deadline_abs"] = 0.75
+        engine._set_packet_deadline(packet, 0.75)
 
         engine.serve_s2u_links(
             env,
@@ -581,7 +581,7 @@ class PacketTerminalDiagnosticTest(unittest.TestCase):
     def test_disabled_diagnostics_do_not_expand_terminal_outcome(self):
         engine = PacketEngine(num_uav=3, step_time=0.25)
         packet = engine.create_packet(0, "FOV", 100.0, 0.0)
-        packet["deadline_abs"] = 0.5
+        engine._set_packet_deadline(packet, 0.5)
 
         self.assertNotIn("routing_decision_slot_count", packet)
         engine.expire_packets(0.5)
@@ -595,7 +595,7 @@ class PacketRoutingAggregateTest(unittest.TestCase):
     def _violation_outcomes():
         pre_engine = diagnostic_engine()
         pre = pre_engine.create_sr_packet(0, 100.0, 0.0)
-        pre["deadline_abs"] = 0.5
+        pre_engine._set_packet_deadline(pre, 0.5)
         pre_engine.expire_packets(0.5)
 
         post_engine = diagnostic_engine()
@@ -606,7 +606,7 @@ class PacketRoutingAggregateTest(unittest.TestCase):
         post["routing_eligible_time"] = 0.1
         post["path"].append(2)
         post["rem_bits"] = post["size_bits"]
-        post["deadline_abs"] = 0.5
+        post_engine._set_packet_deadline(post, 0.5)
         post_engine.enqueue_packet(post, 2, 0.25)
         post_engine.expire_packets(0.5)
 
@@ -614,7 +614,7 @@ class PacketRoutingAggregateTest(unittest.TestCase):
         fov = fov_engine.create_packet(1, "FOV", 100.0, 0.0)
         fov["path"] = [1, 2, 1]
         fov["current"] = 1
-        fov["deadline_abs"] = 0.5
+        fov_engine._set_packet_deadline(fov, 0.5)
         fov["routing_decision_slot_count"] = 2
         fov["routing_wait_slot_count"] = 1
         fov["routing_voluntary_wait_with_legal_nonwait_slot_count"] = 0
@@ -706,7 +706,6 @@ class PacketRoutingAggregateTest(unittest.TestCase):
                 "path": ["SR:0", 1, 2, 1],
                 "current": 1,
                 "hops": 2,
-                "deadline_abs": 0.5,
                 "rem_bits": packet["size_bits"],
                 "s2u_actual_tx_seconds": 0.05,
                 "cumulative_actual_uav_tx_seconds": 0.2,
@@ -736,6 +735,7 @@ class PacketRoutingAggregateTest(unittest.TestCase):
                 ],
             }
         )
+        engine._set_packet_deadline(packet, 0.5)
         engine.enqueue_packet(packet, 1, 0.4)
         engine.expire_packets(0.5)
 
@@ -904,7 +904,7 @@ class PacketRoutingNoBehaviorChangeTest(unittest.TestCase):
             enable_packet_diagnostic_artifacts=diagnostics_enabled,
         )
         packet = engine.create_sr_packet(0, 1_000_000.0, 0.0)
-        packet["deadline_abs"] = 0.5
+        engine._set_packet_deadline(packet, 0.5)
 
         env.prepare_channel_routing_slot(0)
         requested_s2u_links = engine.active_s2u_links(env)
