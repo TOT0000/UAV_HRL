@@ -1038,29 +1038,49 @@ class Simulator:
         if not hasattr(self, "uav_dict") or not self.UAVs:
             return None
 
-        uav_positions = np.asarray(
-            [self.uav_dict[uav_id].get_position() for uav_id in range(self.num_UAV)],
+        uav_position_keys = tuple(
+            tuple(self.uav_dict[uav_id].get_position())
+            for uav_id in range(self.num_UAV)
+        )
+        gs_position_key = tuple(self.GS_pos)
+        uav_positions = np.asarray(uav_position_keys, dtype=np.float64)
+        gs_position = np.asarray(gs_position_key, dtype=np.float64)
+
+        # Deliberately preserve the pre-cache, per-link distance_3d calls.
+        # Batched np.linalg.norm kernels can differ by one ULP at the hard
+        # communication-range boundary on some CPU/BLAS combinations.  These
+        # O(N^2) calculations happen once per physical geometry snapshot;
+        # event-time range checks continue to reuse the resulting arrays.
+        u2u_distances = np.empty(
+            (self.num_UAV, self.num_UAV), dtype=np.float64
+        )
+        for sender_id in range(self.num_UAV):
+            for receiver_id in range(self.num_UAV):
+                u2u_distances[sender_id, receiver_id] = self.distance_3d(
+                    uav_position_keys[sender_id],
+                    uav_position_keys[receiver_id],
+                )
+        u2g_distances = np.asarray(
+            [
+                self.distance_3d(uav_position_keys[uav_id], gs_position_key)
+                for uav_id in range(self.num_UAV)
+            ],
             dtype=np.float64,
-        )
-        gs_position = np.asarray(self.GS_pos, dtype=np.float64)
-        u2u_distances = np.linalg.norm(
-            uav_positions[:, None, :] - uav_positions[None, :, :], axis=-1
-        )
-        u2g_distances = np.linalg.norm(
-            uav_positions - gs_position[None, :], axis=1
         )
 
         sr_count = len(self.SR_teams)
+        sr_position_keys = tuple(
+            tuple(self.SR_teams[sr_id].get_position())
+            for sr_id in range(sr_count)
+        )
         s2u_distances = np.empty((sr_count, self.num_UAV), dtype=np.float64)
         s2u_path_losses = np.empty((sr_count, self.num_UAV), dtype=np.float64)
         for sr_id in range(sr_count):
-            sr_position = np.asarray(
-                self.SR_teams[sr_id].get_position(), dtype=np.float64
-            )
-            s2u_distances[sr_id] = np.linalg.norm(
-                uav_positions - sr_position[None, :], axis=1
-            )
+            sr_position = np.asarray(sr_position_keys[sr_id], dtype=np.float64)
             for uav_id in range(self.num_UAV):
+                s2u_distances[sr_id, uav_id] = self.distance_3d(
+                    sr_position_keys[sr_id], uav_position_keys[uav_id]
+                )
                 los_state = self.channel.a2g_state("S2U", sr_id, uav_id)
                 s2u_path_losses[sr_id, uav_id] = float(
                     a2g_conditional_path_loss_db(
@@ -1078,12 +1098,9 @@ class Simulator:
             values.setflags(write=False)
         self._routing_geometry_cache = {
             "uav_positions": uav_positions,
-            "uav_position_keys": tuple(map(tuple, uav_positions)),
-            "sr_position_keys": tuple(
-                tuple(self.SR_teams[sr_id].get_position())
-                for sr_id in range(sr_count)
-            ),
-            "gs_position_key": tuple(self.GS_pos),
+            "uav_position_keys": uav_position_keys,
+            "sr_position_keys": sr_position_keys,
+            "gs_position_key": gs_position_key,
             "u2u_distances": u2u_distances,
             "u2g_distances": u2g_distances,
             "s2u_distances": s2u_distances,
