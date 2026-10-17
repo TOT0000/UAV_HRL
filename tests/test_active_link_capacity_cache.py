@@ -227,6 +227,56 @@ class ActiveLinkCapacityCacheTest(unittest.TestCase):
             uncached.active_link_capacity_cache_statistics()["hits"], 0
         )
 
+    def test_physical_geometry_cache_is_exact_invalidated_and_rng_neutral(self):
+        cached = self._environment(seed=2718)
+        reference = self._environment(seed=2718)
+        reference._routing_geometry_cache_enabled = False
+
+        cached_result = self._snapshot(
+            cached,
+            *cached.allocate_active_link_capacities(
+                {0: 1, 2: cached.GS_ID}, s2u_links={0: 3}
+            ),
+        )
+        reference_result = self._snapshot(
+            reference,
+            *reference.allocate_active_link_capacities(
+                {0: 1, 2: reference.GS_ID}, s2u_links={0: 3}
+            ),
+        )
+        self.assertAllocationEqual(cached_result, reference_result)
+        self.assertEqual(
+            cached.channel_small_scale_rng.bit_generator.state,
+            reference.channel_small_scale_rng.bit_generator.state,
+        )
+        stats = cached.routing_geometry_cache_statistics()
+        self.assertEqual(stats["builds"], 1)
+        self.assertGreater(stats["hits"], 0)
+
+        # Existing tools/tests may update object coordinates directly. Exact
+        # endpoint validation must reject the stale matrix without requiring
+        # a rounded coordinate key.
+        cached.uav_dict[1].x_u += 900.0
+        expected = cached.distance_3d(
+            cached.uav_dict[0].get_position(),
+            cached.uav_dict[1].get_position(),
+        ) <= simulator_module.COMMUNICATION_RANGE_M
+        self.assertEqual(cached.is_u2u_in_range(0, 1), expected)
+        self.assertEqual(
+            cached.routing_geometry_cache_statistics()["builds"], 2
+        )
+
+        channel_state = cached.channel_state_dict()
+        cached.load_channel_state_dict(channel_state)
+        self.assertFalse(
+            cached.routing_geometry_cache_statistics()["populated"]
+        )
+        cached.reset_environment()
+        self.assertEqual(
+            cached.routing_geometry_cache_statistics(),
+            {"enabled": True, "builds": 0, "hits": 0, "populated": False},
+        )
+
     def test_zero_wait_and_out_of_range_links_do_not_populate_cache(self):
         env = self._environment()
         capacities, bandwidths = env.allocate_active_link_capacities({0: 0})

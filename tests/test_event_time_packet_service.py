@@ -174,6 +174,48 @@ def test_dynamic_fdma_reallocates_only_future_time_and_is_order_independent():
     assert sum(second_result["transmitted_bits_by_link"].values()) == pytest.approx(200.0)
 
 
+def test_incremental_event_service_cache_is_exact_and_rechecks_only_dirty_nodes():
+    def run(cache_enabled):
+        env = EventCapacityEnvironment(3, bits_per_second_per_hz=0.004)
+        engine = PacketEngine(
+            3, task_deadlines_seconds={"FOV": 0.030, "COM": 0.025}
+        )
+        engine._event_service_cache_enabled = bool(cache_enabled)
+        packets = [
+            engine.create_packet(0, "COM", 60.0, 0.0),
+            engine.create_packet(0, "COM", 90.0, 0.0),
+            engine.create_packet(2, "FOV", 120.0, 0.0),
+        ]
+        result = engine.serve_event_driven_slot(
+            env,
+            _actions(1, env.GS_ID, 0),
+            0.0,
+            observed_hol_by_sender={0: packets[0], 1: None, 2: packets[2]},
+            observed_backlog_bits_by_sender={0: 150.0, 1: 0.0, 2: 120.0},
+            routing_transition_ids_by_sender={0: 10, 1: 11, 2: 12},
+            effective_masks_by_sender={
+                sender: np.ones(4, dtype=bool) for sender in range(3)
+            },
+        )
+        return result, packets, engine.event_service_cache_statistics()
+
+    cached_result, cached_packets, cached_stats = run(True)
+    reference_result, reference_packets, _ = run(False)
+
+    assert cached_result == reference_result
+    assert cached_packets == reference_packets
+    assert cached_stats["active_link_incremental_updates"] > 0
+    assert cached_stats["active_link_nodes_rechecked"] > 0
+    assert cached_stats["active_link_full_scans"] < cached_stats["active_link_queries"]
+    # Each segment owns its diagnostic mapping even though the fixed strings
+    # and ordering are prepared once per allocation.
+    segments = cached_result["resource_segments"]
+    if len(segments) >= 2:
+        assert segments[0]["bandwidth_hz_by_link"] is not segments[1][
+            "bandwidth_hz_by_link"
+        ]
+
+
 def test_completion_is_sub_5ms_and_cross_block_capacity_accumulates():
     scale = np.ones(FADING_BLOCKS_PER_ROUTING_SLOT)
     scale[0] = 0.1  # 10 kbit/s for 5 ms = 50 bits

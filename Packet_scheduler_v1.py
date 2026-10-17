@@ -231,6 +231,9 @@ class PacketEngine:
     # tests can select the retained linear reference path without a CLI or a
     # separate comparison method.
     _DEADLINE_INDEX_ENABLED = True
+    # Private equivalence/benchmark hook. Production keeps a slot-local active
+    # link view until an authoritative queue mutation changes a HOL candidate.
+    _EVENT_SERVICE_CACHE_ENABLED = True
 
     def __init__(
         self,
@@ -274,6 +277,20 @@ class PacketEngine:
         self._active_idx = set()
         self._deadline_index_enabled = bool(self._DEADLINE_INDEX_ENABLED)
         self._reset_deadline_index()
+        self._event_service_cache_enabled = bool(
+            self._EVENT_SERVICE_CACHE_ENABLED
+        )
+        self._queue_topology_revision = 0
+        self._queue_topology_events = []
+        self._event_service_counters = {
+            "active_link_queries": 0,
+            "active_link_full_scans": 0,
+            "active_link_cache_hits": 0,
+            "active_link_incremental_updates": 0,
+            "active_link_nodes_rechecked": 0,
+            "allocation_rebuilds": 0,
+            "resource_bandwidth_serializations": 0,
+        }
 
         # PacketManager
         self.packet_pool = []
@@ -849,6 +866,26 @@ class PacketEngine:
             0.0,
         )
 
+    def _mark_queue_topology_changed(self, *, uav_id=None, sr_id=None):
+        self._queue_topology_revision += 1
+        if uav_id is not None:
+            event = ("uav", int(uav_id))
+        elif sr_id is not None:
+            event = ("sr", int(sr_id))
+        else:
+            event = ("all", None)
+        self._queue_topology_events.append(event)
+
+    def event_service_cache_statistics(self):
+        return {
+            "enabled": bool(self._event_service_cache_enabled),
+            "queue_topology_revision": int(self._queue_topology_revision),
+            **{
+                key: int(value)
+                for key, value in self._event_service_counters.items()
+            },
+        }
+
     def _remove_from_queue(self, pkt, uav_id=None):
         node_id = pkt.get("_queued_uav") if uav_id is None else uav_id
         if node_id is None or not (0 <= int(node_id) < self.num_UAV):
@@ -866,6 +903,7 @@ class PacketEngine:
         if removed:
             self._decrease_backlog(node_id, pkt.get("rem_bits", 0.0))
             pkt["_queued_uav"] = None
+            self._mark_queue_topology_changed(uav_id=node_id)
         return removed
 
     def _remove_from_sr_queue(self, pkt):
@@ -889,6 +927,7 @@ class PacketEngine:
                 0.0,
             )
             pkt["_queued_sr"] = None
+            self._mark_queue_topology_changed(sr_id=sr_id)
         return removed
 
     def _mark_routing_stage_eligible(self, pkt, eligible_time):
@@ -918,6 +957,7 @@ class PacketEngine:
         pkt["_queued_uav"] = uav_id
         self.uav_queues[uav_id].append(pkt)
         self.backlog_bits[uav_id] += max(float(pkt.get("rem_bits", 0.0)), 0.0)
+        self._mark_queue_topology_changed(uav_id=uav_id)
 
     def _new_packet(
         self,
@@ -1087,6 +1127,7 @@ class PacketEngine:
         pkt["_queued_sr"] = sr_id
         self.sr_queues[sr_id].append(pkt)
         self.s2u_backlog_bits[sr_id] += float(size_bits)
+        self._mark_queue_topology_changed(sr_id=sr_id)
         return pkt
 
     def get_sr_hol_packet(self, sr_id):
@@ -1374,6 +1415,7 @@ class PacketEngine:
         if not queue or queue[0] is not pkt:
             raise AssertionError("completed packet was not in the sender FIFO")
         queue.popleft()
+        self._mark_queue_topology_changed(uav_id=sender)
         pkt["_queued_uav"] = None
         pkt["hops"] = int(pkt.get("hops", 0)) + 1
         pkt.setdefault("path", []).append(receiver)
@@ -1611,6 +1653,9 @@ class PacketEngine:
         self._queue_cleanup_pending = False
         if self._deadline_index_enabled:
             self._peek_packet_deadline()
+        # A full pass rebuilds queue objects even when it only removes stale
+        # done rows. Invalidate the slot-local HOL/link view once, not per row.
+        self._mark_queue_topology_changed()
         return violations
 
     @staticmethod
@@ -2630,6 +2675,7 @@ class PacketEngine:
         if not queue or queue[0] is not pkt:
             raise AssertionError("completed S2U packet was not SR FIFO HOL")
         queue.popleft()
+        self._mark_queue_topology_changed(sr_id=sr_id)
         pkt["_queued_sr"] = None
         pkt["s2u_completion_time"] = float(completion_time)
         service_start = float(
@@ -2838,6 +2884,13 @@ class PacketEngine:
         s2u_diagnostic_opportunities = {}
         s2u_diagnostic_serviced_packet_ids = set()
         event_clock = [slot_start]
+        assigned_com_cache = {}
+
+        def assigned_com_receiver(sr_id):
+            sr_id = int(sr_id)
+            if sr_id not in assigned_com_cache:
+                assigned_com_cache[sr_id] = self.assigned_com_uav(env, sr_id)
+            return assigned_com_cache[sr_id]
 
         def observe_s2u_hol(sr_id, pkt, resolved_links=None, profiles=None):
             if not self.enable_packet_diagnostic_artifacts or pkt is None:
@@ -2854,7 +2907,7 @@ class PacketEngine:
                 }
             receiver = pkt.get("s2u_receiver")
             if receiver is None:
-                receiver = self.assigned_com_uav(env, sr_id)
+                receiver = assigned_com_receiver(sr_id)
             if receiver is None:
                 reason = "s2u_hol_no_receiver_slot_count"
             elif not env.is_s2u_in_range(sr_id, receiver):
@@ -2918,31 +2971,164 @@ class PacketEngine:
                     }
                 )
 
-        def active_links():
-            uav_links = {}
-            for sender, receiver in actions.items():
-                pkt = self.get_hol_packet(sender)
-                if pkt is None:
-                    continue
-                register_decision_use(sender, pkt)
-                pkt["last_routing_sender"] = sender
-                locked = pkt.get("hop_receiver")
-                if receiver == sender:
-                    continue
-                if locked is not None and int(locked) != receiver:
-                    continue
-                if not env.is_routing_link_in_range(sender, receiver):
-                    continue
+        active_cache_revision = None
+        cached_active_uav_links = None
+        cached_active_s2u_links = None
+
+        def refresh_uav_link(sender, uav_links):
+            sender = int(sender)
+            uav_links.pop(sender, None)
+            receiver = actions[sender]
+            pkt = self.get_hol_packet(sender)
+            if pkt is None:
+                return
+            register_decision_use(sender, pkt)
+            pkt["last_routing_sender"] = sender
+            locked = pkt.get("hop_receiver")
+            if receiver == sender:
+                return
+            if locked is not None and int(locked) != receiver:
+                return
+            if env.is_routing_link_in_range(sender, receiver):
                 uav_links[sender] = receiver
+
+        def refresh_s2u_link(sr_id, s2u_links):
+            sr_id = int(sr_id)
+            s2u_links.pop(sr_id, None)
+            hol = self.get_sr_hol_packet(sr_id)
+            observe_s2u_hol(sr_id, hol)
+            if hol is None or self.s2u_backlog_bits[sr_id] <= PACKET_EPS:
+                return
+            receiver = hol.get("s2u_receiver")
+            if receiver is None:
+                receiver = assigned_com_receiver(sr_id)
+            if receiver is not None:
+                s2u_links[sr_id] = int(receiver)
+
+        def active_links():
+            nonlocal active_cache_revision
+            nonlocal cached_active_uav_links, cached_active_s2u_links
+            self._event_service_counters["active_link_queries"] += 1
+            if (
+                self._event_service_cache_enabled
+                and active_cache_revision == self._queue_topology_revision
+                and cached_active_uav_links is not None
+            ):
+                self._event_service_counters["active_link_cache_hits"] += 1
+                return (
+                    cached_active_uav_links,
+                    cached_active_s2u_links,
+                    False,
+                )
+
+            if (
+                self._event_service_cache_enabled
+                and cached_active_uav_links is not None
+                and self._queue_topology_events
+                and not any(
+                    kind == "all"
+                    for kind, _ in self._queue_topology_events
+                )
+            ):
+                changed_uavs = sorted(
+                    {
+                        node_id
+                        for kind, node_id in self._queue_topology_events
+                        if kind == "uav"
+                    }
+                )
+                changed_srs = sorted(
+                    {
+                        node_id
+                        for kind, node_id in self._queue_topology_events
+                        if kind == "sr"
+                    }
+                )
+                self._queue_topology_events.clear()
+                self._event_service_counters[
+                    "active_link_incremental_updates"
+                ] += 1
+                self._event_service_counters[
+                    "active_link_nodes_rechecked"
+                ] += len(changed_uavs) + len(changed_srs)
+                for sender in changed_uavs:
+                    refresh_uav_link(sender, cached_active_uav_links)
+                for sr_id in changed_srs:
+                    refresh_s2u_link(sr_id, cached_active_s2u_links)
+                active_cache_revision = self._queue_topology_revision
+                return (
+                    cached_active_uav_links,
+                    cached_active_s2u_links,
+                    True,
+                )
+
+            self._event_service_counters["active_link_full_scans"] += 1
+            uav_links = {}
+            if not self._event_service_cache_enabled:
+                for sender, receiver in actions.items():
+                    pkt = self.get_hol_packet(sender)
+                    if pkt is None:
+                        continue
+                    register_decision_use(sender, pkt)
+                    pkt["last_routing_sender"] = sender
+                    locked = pkt.get("hop_receiver")
+                    if receiver == sender:
+                        continue
+                    if locked is not None and int(locked) != receiver:
+                        continue
+                    if not env.is_routing_link_in_range(sender, receiver):
+                        continue
+                    uav_links[sender] = receiver
+                for sr_id in sorted(self.sr_queues):
+                    observe_s2u_hol(sr_id, self.get_sr_hol_packet(sr_id))
+                return uav_links, self.active_s2u_links(env), True
+
+            for sender in actions:
+                refresh_uav_link(sender, uav_links)
+            s2u_links = {}
             for sr_id in sorted(self.sr_queues):
-                observe_s2u_hol(sr_id, self.get_sr_hol_packet(sr_id))
-            return uav_links, self.active_s2u_links(env)
+                refresh_s2u_link(sr_id, s2u_links)
+            self._queue_topology_events.clear()
+            active_cache_revision = self._queue_topology_revision
+            cached_active_uav_links = uav_links
+            cached_active_s2u_links = s2u_links
+            return uav_links, s2u_links, True
 
         # The slot-start allocation seeds the event cache.  Frozen HOL and
         # backlog snapshots remain available for cost attribution and
         # diagnostics, but routing reward is computed only from authoritative
         # timely useful GS delivery after the complete slot has executed.
-        initial_uav_links, initial_s2u_links = active_links()
+        def prepare_allocation_view(capacities, bandwidths):
+            self._event_service_counters["allocation_rebuilds"] += 1
+            if not self._event_service_cache_enabled:
+                return (
+                    dict(capacities),
+                    dict(bandwidths),
+                    dict(env.active_link_capacity_profiles_mbps),
+                    dict(env.active_s2u_capacity_profiles_mbps),
+                    None,
+                )
+
+            uav_profiles = env.active_link_capacity_profiles_mbps
+            s2u_profiles = env.active_s2u_capacity_profiles_mbps
+            bandwidth_diagnostic = {
+                str(key): float(value)
+                for key, value in sorted(
+                    bandwidths.items(), key=lambda item: str(item[0])
+                )
+            }
+            self._event_service_counters[
+                "resource_bandwidth_serializations"
+            ] += 1
+            return (
+                capacities,
+                bandwidths,
+                uav_profiles,
+                s2u_profiles,
+                bandwidth_diagnostic,
+            )
+
+        initial_uav_links, initial_s2u_links, _ = active_links()
         initial_capacities, initial_bandwidths = env.allocate_active_link_capacities(
             initial_uav_links, s2u_links=initial_s2u_links
         )
@@ -2950,10 +3136,13 @@ class PacketEngine:
             tuple(sorted(initial_uav_links.items())),
             tuple(sorted(initial_s2u_links.items())),
         )
-        cached_capacities = dict(initial_capacities)
-        cached_bandwidths = dict(initial_bandwidths)
-        cached_uav_profiles = dict(env.active_link_capacity_profiles_mbps)
-        cached_s2u_profiles = dict(env.active_s2u_capacity_profiles_mbps)
+        (
+            cached_capacities,
+            cached_bandwidths,
+            cached_uav_profiles,
+            cached_s2u_profiles,
+            cached_bandwidth_diagnostic,
+        ) = prepare_allocation_view(initial_capacities, initial_bandwidths)
         def settle_s2u_no_service(packet_id):
             diagnostic = s2u_diagnostic_opportunities.get(int(packet_id))
             if (
@@ -3014,7 +3203,7 @@ class PacketEngine:
                 raise RuntimeError("event service exceeded the zero-time loop guard")
             env.current_time = t
             event_clock[0] = t
-            uav_links, s2u_links = active_links()
+            uav_links, s2u_links, topology_scanned = active_links()
             current_allocation_key = (
                 tuple(sorted(uav_links.items())),
                 tuple(sorted(s2u_links.items())),
@@ -3024,14 +3213,13 @@ class PacketEngine:
                     uav_links, s2u_links=s2u_links
                 )
                 allocation_key = current_allocation_key
-                cached_capacities = dict(capacities)
-                cached_bandwidths = dict(bandwidths)
-                cached_uav_profiles = dict(
-                    env.active_link_capacity_profiles_mbps
-                )
-                cached_s2u_profiles = dict(
-                    env.active_s2u_capacity_profiles_mbps
-                )
+                (
+                    cached_capacities,
+                    cached_bandwidths,
+                    cached_uav_profiles,
+                    cached_s2u_profiles,
+                    cached_bandwidth_diagnostic,
+                ) = prepare_allocation_view(capacities, bandwidths)
             capacities = cached_capacities
             bandwidths = cached_bandwidths
             uav_profiles = cached_uav_profiles
@@ -3040,17 +3228,18 @@ class PacketEngine:
             # physical range ceased to be serviceable.  Only returned profiles
             # consume FDMA or enter service, while diagnostics still classify
             # the unallocated candidate as unavailable.
-            allocated_s2u_links = {
-                int(sr_id): int(receiver)
-                for sr_id, receiver in s2u_profiles
-            }
-            for sr_id, receiver in s2u_links.items():
-                observe_s2u_hol(
-                    sr_id,
-                    self.get_sr_hol_packet(sr_id),
-                    resolved_links=allocated_s2u_links,
-                    profiles=s2u_profiles,
-                )
+            if topology_scanned or iteration_count == 1:
+                allocated_s2u_links = {
+                    int(sr_id): int(receiver)
+                    for sr_id, receiver in s2u_profiles
+                }
+                for sr_id, receiver in s2u_links.items():
+                    observe_s2u_hol(
+                        sr_id,
+                        self.get_sr_hol_packet(sr_id),
+                        resolved_links=allocated_s2u_links,
+                        profiles=s2u_profiles,
+                    )
             block_index = min(
                 int(math.floor((t - slot_start + 1e-12) / FADING_BLOCK_SECONDS)),
                 FADING_BLOCKS_PER_ROUTING_SLOT - 1,
@@ -3081,6 +3270,7 @@ class PacketEngine:
                     link = ("S2U", sr_id, receiver)
                     rates_bps[link] = rate
                     packets_by_link[link] = self.get_sr_hol_packet(sr_id)
+            ordered_rate_links = tuple(sorted(rates_bps, key=str))
             completion_times = {}
             for link, pkt in packets_by_link.items():
                 if pkt is None:
@@ -3122,17 +3312,25 @@ class PacketEngine:
                     "start_time_seconds": t,
                     "end_time_seconds": next_time,
                     "active_link_count": len(rates_bps),
-                    "bandwidth_hz_by_link": {
-                        str(key): float(value)
-                        for key, value in sorted(
-                            bandwidths.items(), key=lambda item: str(item[0])
-                        )
-                    },
+                    "bandwidth_hz_by_link": (
+                        cached_bandwidth_diagnostic.copy()
+                        if self._event_service_cache_enabled
+                        else {
+                            str(key): float(value)
+                            for key, value in sorted(
+                                bandwidths.items(), key=lambda item: str(item[0])
+                            )
+                        }
+                    ),
                     "fading_block_index": block_index,
                 }
             )
             completed = []
-            for link in sorted(rates_bps, key=str):
+            if not self._event_service_cache_enabled:
+                self._event_service_counters[
+                    "resource_bandwidth_serializations"
+                ] += 1
+            for link in ordered_rate_links:
                 pkt = packets_by_link[link]
                 if pkt is None or pkt.get("done", False):
                     continue
@@ -3194,9 +3392,19 @@ class PacketEngine:
                             pkt.get("s2u_hol_service_slot_count", 0)
                         ) + 1
                         s2u_diagnostic_serviced_packet_ids.add(packet_id)
-                    self.s2u_backlog_bits[int(sr_id)] = max(
-                        self.s2u_backlog_bits[int(sr_id)] - bits, 0.0
+                    previous_s2u_backlog = float(
+                        self.s2u_backlog_bits[int(sr_id)]
                     )
+                    self.s2u_backlog_bits[int(sr_id)] = max(
+                        previous_s2u_backlog - bits, 0.0
+                    )
+                    if (
+                        previous_s2u_backlog > PACKET_EPS
+                        and self.s2u_backlog_bits[int(sr_id)] <= PACKET_EPS
+                    ):
+                        # active_s2u_links excludes an effectively empty SR
+                        # backlog even if a numerical packet residual remains.
+                        self._mark_queue_topology_changed(sr_id=sr_id)
                     result["transmitted_bits_by_link"][link] += bits
                     active_key = (int(sr_id), int(receiver), "S2U")
                 else:
@@ -4086,6 +4294,17 @@ class PacketEngine:
         # 活躍索引
         self._active_idx = set()
         self._reset_deadline_index()
+        self._queue_topology_revision += 1
+        self._queue_topology_events = [("all", None)]
+        self._event_service_counters = {
+            "active_link_queries": 0,
+            "active_link_full_scans": 0,
+            "active_link_cache_hits": 0,
+            "active_link_incremental_updates": 0,
+            "active_link_nodes_rechecked": 0,
+            "allocation_rebuilds": 0,
+            "resource_bandwidth_serializations": 0,
+        }
         # 流水號歸零（或保留原值也行）
         self._next_pkt_id = 0
         # 速率積分緩衝清空

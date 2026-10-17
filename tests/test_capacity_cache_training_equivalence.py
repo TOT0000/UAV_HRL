@@ -10,6 +10,7 @@ import torch
 from experiment_config import MethodSpec
 from HRL_task_aware import TrainingConfig, train
 from packet_outcome_artifacts import PACKET_OUTCOME_MODE_BOUNDED
+from Packet_scheduler_v1 import PacketEngine
 from run_experiment import main as run_experiment
 from scenario_manifest import generate_manifest
 from Simulator import Simulator
@@ -75,6 +76,14 @@ class CapacityCacheTrainingEquivalenceTest(unittest.TestCase):
         with mock.patch.object(
             Simulator,
             "_ACTIVE_LINK_CAPACITY_CACHE_ENABLED",
+            bool(cache_enabled),
+        ), mock.patch.object(
+            Simulator,
+            "_ROUTING_GEOMETRY_CACHE_ENABLED",
+            bool(cache_enabled),
+        ), mock.patch.object(
+            PacketEngine,
+            "_EVENT_SERVICE_CACHE_ENABLED",
             bool(cache_enabled),
         ):
             return train(
@@ -144,6 +153,14 @@ class CapacityCacheTrainingEquivalenceTest(unittest.TestCase):
         with mock.patch.object(
             Simulator,
             "_ACTIVE_LINK_CAPACITY_CACHE_ENABLED",
+            bool(cache_enabled),
+        ), mock.patch.object(
+            Simulator,
+            "_ROUTING_GEOMETRY_CACHE_ENABLED",
+            bool(cache_enabled),
+        ), mock.patch.object(
+            PacketEngine,
+            "_EVENT_SERVICE_CACHE_ENABLED",
             bool(cache_enabled),
         ):
             self.assertEqual(run_experiment(command), 0)

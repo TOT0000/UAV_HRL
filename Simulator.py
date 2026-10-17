@@ -86,6 +86,9 @@ class Simulator:
     # Tests and the benchmark may disable reuse for an exact reference run.
     # This is deliberately not exposed as an experiment configuration option.
     _ACTIVE_LINK_CAPACITY_CACHE_ENABLED = True
+    # Private equivalence/benchmark hook. Virtual candidate positions continue
+    # to use the uncached position predicates.
+    _ROUTING_GEOMETRY_CACHE_ENABLED = True
     SR_UAV_CARRIER_GHZ = A2G_CARRIER_GHZ
     SR_UAV_TX_POWER_DBM = S2U_TX_POWER_DBM
     SR_UAV_NOISE_DBM_PER_HZ = NOISE_PSD_DBM_PER_HZ
@@ -178,6 +181,12 @@ class Simulator:
         self._active_link_capacity_cache_scope = None
         self._active_link_capacity_cache_hits = 0
         self._active_link_capacity_cache_misses = 0
+        self._routing_geometry_cache_enabled = bool(
+            self._ROUTING_GEOMETRY_CACHE_ENABLED
+        )
+        self._routing_geometry_cache = None
+        self._routing_geometry_cache_builds = 0
+        self._routing_geometry_cache_hits = 0
         self.GS_pos = GROUND_STATION_POSITION_M
         self.GS_ID = self.num_UAV
         self.channel = ChannelLifecycle(
@@ -854,6 +863,7 @@ class Simulator:
     def load_channel_state_dict(self, state):
         self.channel.load_state_dict(state)
         self._invalidate_active_link_capacity_cache()
+        self._invalidate_routing_geometry_cache()
 
     def _get_sr_uav_link_metrics(self, uav_id, sr_id, bandwidth_hz=None):
         """Return conditional mean SNR and deterministic expected S2U capacity."""
@@ -912,6 +922,7 @@ class Simulator:
     # =====================U2U channel model================================
     def update_u2u_channels(self):
         self._invalidate_active_link_capacity_cache()
+        self._invalidate_routing_geometry_cache()
         positions = np.asarray([uav.get_position() for uav in self.UAVs], dtype=float)
         count = len(positions)
         path_loss = np.zeros((count, count), dtype=float)
@@ -954,6 +965,7 @@ class Simulator:
     # 無人機與地面站
     def update_u2g_channels(self):
         self._invalidate_active_link_capacity_cache()
+        self._invalidate_routing_geometry_cache()
         positions = np.asarray([uav.get_position() for uav in self.UAVs], dtype=float)
         gs_position = np.asarray(self.GS_pos, dtype=float)
         los_state = np.asarray(self.channel.u2g_los_state, dtype=bool)
@@ -990,12 +1002,118 @@ class Simulator:
             )
         )
 
+    def _invalidate_routing_geometry_cache(self, *, reset_statistics=False):
+        """Discard reconstructible data for the installed physical geometry."""
+
+        self._routing_geometry_cache = None
+        if reset_statistics:
+            self._routing_geometry_cache_builds = 0
+            self._routing_geometry_cache_hits = 0
+
+    def _physical_routing_geometry(
+        self, *, validate_uav_ids=(), validate_sr_ids=(), validate_gs=False
+    ):
+        """Return exact distance/path-loss arrays for the current physical state."""
+
+        if not self._routing_geometry_cache_enabled:
+            return None
+        if self._routing_geometry_cache is not None:
+            cached = self._routing_geometry_cache
+            stale = any(
+                tuple(self.uav_dict[int(uav_id)].get_position())
+                != cached["uav_position_keys"][int(uav_id)]
+                for uav_id in validate_uav_ids
+            ) or any(
+                tuple(self.SR_teams[int(sr_id)].get_position())
+                != cached["sr_position_keys"][int(sr_id)]
+                for sr_id in validate_sr_ids
+            )
+            if validate_gs:
+                stale = stale or tuple(self.GS_pos) != cached["gs_position_key"]
+            if stale:
+                self._invalidate_routing_geometry_cache()
+                return self._physical_routing_geometry()
+            self._routing_geometry_cache_hits += 1
+            return cached
+        if not hasattr(self, "uav_dict") or not self.UAVs:
+            return None
+
+        uav_positions = np.asarray(
+            [self.uav_dict[uav_id].get_position() for uav_id in range(self.num_UAV)],
+            dtype=np.float64,
+        )
+        gs_position = np.asarray(self.GS_pos, dtype=np.float64)
+        u2u_distances = np.linalg.norm(
+            uav_positions[:, None, :] - uav_positions[None, :, :], axis=-1
+        )
+        u2g_distances = np.linalg.norm(
+            uav_positions - gs_position[None, :], axis=1
+        )
+
+        sr_count = len(self.SR_teams)
+        s2u_distances = np.empty((sr_count, self.num_UAV), dtype=np.float64)
+        s2u_path_losses = np.empty((sr_count, self.num_UAV), dtype=np.float64)
+        for sr_id in range(sr_count):
+            sr_position = np.asarray(
+                self.SR_teams[sr_id].get_position(), dtype=np.float64
+            )
+            s2u_distances[sr_id] = np.linalg.norm(
+                uav_positions - sr_position[None, :], axis=1
+            )
+            for uav_id in range(self.num_UAV):
+                los_state = self.channel.a2g_state("S2U", sr_id, uav_id)
+                s2u_path_losses[sr_id, uav_id] = float(
+                    a2g_conditional_path_loss_db(
+                        uav_positions[uav_id], sr_position, los_state
+                    )
+                )
+
+        for values in (
+            uav_positions,
+            u2u_distances,
+            u2g_distances,
+            s2u_distances,
+            s2u_path_losses,
+        ):
+            values.setflags(write=False)
+        self._routing_geometry_cache = {
+            "uav_positions": uav_positions,
+            "uav_position_keys": tuple(map(tuple, uav_positions)),
+            "sr_position_keys": tuple(
+                tuple(self.SR_teams[sr_id].get_position())
+                for sr_id in range(sr_count)
+            ),
+            "gs_position_key": tuple(self.GS_pos),
+            "u2u_distances": u2u_distances,
+            "u2g_distances": u2g_distances,
+            "s2u_distances": s2u_distances,
+            "s2u_path_losses": s2u_path_losses,
+        }
+        self._routing_geometry_cache_builds += 1
+        return self._routing_geometry_cache
+
+    def routing_geometry_cache_statistics(self):
+        return {
+            "enabled": bool(self._routing_geometry_cache_enabled),
+            "builds": int(self._routing_geometry_cache_builds),
+            "hits": int(self._routing_geometry_cache_hits),
+            "populated": self._routing_geometry_cache is not None,
+        }
+
     def is_u2u_in_range(self, sender_id, receiver_id):
         sender_id, receiver_id = int(sender_id), int(receiver_id)
         if sender_id == receiver_id:
             return False
         if not hasattr(self, "uav_dict"):
             return bool(self.u2u_range_mask[sender_id, receiver_id])
+        geometry = self._physical_routing_geometry(
+            validate_uav_ids=(sender_id, receiver_id)
+        )
+        if geometry is not None:
+            return bool(
+                geometry["u2u_distances"][sender_id, receiver_id]
+                <= COMMUNICATION_RANGE_M
+            )
         return self.distance_3d(
             self.uav_dict[sender_id].get_position(),
             self.uav_dict[receiver_id].get_position(),
@@ -1008,11 +1126,27 @@ class Simulator:
     def is_u2g_in_range(self, sender_id):
         if not hasattr(self, "uav_dict"):
             return bool(self.u2g_range_mask[int(sender_id)])
+        geometry = self._physical_routing_geometry(
+            validate_uav_ids=(int(sender_id),), validate_gs=True
+        )
+        if geometry is not None:
+            return bool(
+                geometry["u2g_distances"][int(sender_id)]
+                <= COMMUNICATION_RANGE_M
+            )
         return self.is_u2g_position_in_range(self.uav_dict[int(sender_id)].get_position())
 
     def is_s2u_in_range(self, sr_id, uav_id):
         if not hasattr(self, "uav_dict") or not self.SR_teams:
             return False
+        geometry = self._physical_routing_geometry(
+            validate_uav_ids=(int(uav_id),), validate_sr_ids=(int(sr_id),)
+        )
+        if geometry is not None:
+            return bool(
+                geometry["s2u_distances"][int(sr_id), int(uav_id)]
+                <= COMMUNICATION_RANGE_M
+            )
         return self.distance_3d(
             self.SR_teams[int(sr_id)].get_position(),
             self.uav_dict[int(uav_id)].get_position(),
@@ -1114,7 +1248,6 @@ class Simulator:
             self.prepare_channel_routing_slot(
                 0 if self.channel.routing_slot_index is None else self.channel.routing_slot_index
             )
-
         active_links = [
             (int(sender), int(receiver))
             for sender, receiver in sorted(proposed_links.items())
@@ -1126,6 +1259,9 @@ class Simulator:
             for sr_id, uav_id in dict(s2u_links or {}).items()
             if self.is_s2u_in_range(sr_id, uav_id)
         }
+        # Range predicates above validate every endpoint that can enter this
+        # allocation, including direct position mutations used by tests/tools.
+        geometry = self._physical_routing_geometry()
         total_links = len(active_links) + len(s2u_links)
         shared_bandwidth = self.B_tot / total_links if total_links else 0.0
 
@@ -1165,7 +1301,15 @@ class Simulator:
                     "gain_profile_reused": True,
                     "range_eligible": True,
                     "distance_3d_m": (
-                        self.distance_3d(
+                        (
+                            float(geometry["u2g_distances"][sender])
+                            if link_type == "U2G"
+                            else float(
+                                geometry["u2u_distances"][sender, receiver]
+                            )
+                        )
+                        if geometry is not None
+                        else self.distance_3d(
                             self.uav_dict[sender].get_position(),
                             self.GS_pos
                             if link_type == "U2G"
@@ -1182,9 +1326,13 @@ class Simulator:
             uav_position = self.uav_dict[int(uav_id)].get_position()
             sr_position = self.SR_teams[int(sr_id)].get_position()
             los_state = self.channel.a2g_state("S2U", sr_id, uav_id)
-            path_loss = float(
-                a2g_conditional_path_loss_db(
-                    uav_position, sr_position, los_state
+            path_loss = (
+                float(geometry["s2u_path_losses"][sr_id, uav_id])
+                if geometry is not None
+                else float(
+                    a2g_conditional_path_loss_db(
+                        uav_position, sr_position, los_state
+                    )
                 )
             )
             gains = self.channel.gain_profile("S2U", sr_id, uav_id)
@@ -1212,8 +1360,10 @@ class Simulator:
                     "slot_service_bits": service_bits,
                     "gain_profile_reused": True,
                     "range_eligible": True,
-                    "distance_3d_m": self.distance_3d(
-                        sr_position, uav_position
+                    "distance_3d_m": (
+                        float(geometry["s2u_distances"][sr_id, uav_id])
+                        if geometry is not None
+                        else self.distance_3d(sr_position, uav_position)
                     ),
                 }
             )
@@ -1328,6 +1478,7 @@ class Simulator:
     # ================隨機GT版本=============================
     def reset_environment(self, scenario_entry=None):
         self._invalidate_active_link_capacity_cache(reset_statistics=True)
+        self._invalidate_routing_geometry_cache(reset_statistics=True)
         if scenario_entry is not None:
             from scenario_manifest import validate_scenario_entry
 
