@@ -30,7 +30,7 @@ SUPPORTED_OBS_INTERFACE_VERSIONS = (
     LEGACY_OBS_INTERFACE_VERSION,
     OBS_INTERFACE_VERSION,
 )
-PROMPT_VERSION = "uav-hrl-llm-design-prompt-v9"
+PROMPT_VERSION = "uav-hrl-llm-design-prompt-v10"
 DESIGN_RUN_SCHEMA_VERSION = "uav-hrl-llm-design-run-v4"
 APPROVED_ARTIFACT_SCHEMA_VERSION = "uav-hrl-approved-shared-feature-design-v2"
 ROOT = Path(__file__).resolve().parent
@@ -861,23 +861,16 @@ def movement_and_energy_spec(constants_metadata: dict[str, Any]) -> str:
 
 def packet_lifecycle_and_observation_timing() -> str:
     return (
-        "At each movement boundary, current obs and its replay snapshot are captured "
-        "before the TD3 action and before that interval's first packet generation. The "
-        "initial t=0 observation is therefore before any slot injection. In every 0.25 s "
-        "slot, movement and link geometry are updated; valid VS captures create packets "
-        "directly in their sensing-UAV queues and activated COM sessions create packets "
-        "in their SR queues at slot start; packets with absolute deadline at or before "
-        "that time are "
-        "removed; frozen HOL routing decisions and S2U/UAV service then run; relay "
-        "arrivals follow existing next-slot queue causality; GS delivery is classified "
-        "at physical completion time; and unfinished packets whose deadline is at or "
-        "before slot end are removed. After the fourth slot, the next observation is "
-        "captured at the integer-second boundary, after service and slot-end expiry and "
-        "before the next interval's injection. Queue fields contain only packets still "
-        "present at that boundary. HOL fields describe only the FIFO head; empty queues "
-        "have false HOL-valid flags and zero padding. Inclusive expiry means active HOL "
-        "remaining deadlines are positive apart from the documented numerical tolerance; "
-        "historical violations are outcome counters, not retained expired queue entries."
+        "Movement observations precede TD3 and later packet events. Each 0.25 s slot, "
+        "all UAVs, including empty ones, preselect and hold one legal next hop. Activated "
+        "COM and valid VS sources generate at fixed-rate event times; future events are "
+        "unobservable. Full-packet store-and-forward S2U/U2U/U2G may multi-hop within "
+        "the slot. Only serviceable links share equal FDMA; arrival, completion, or "
+        "expiry reallocates future bandwidth without resampling current 5 ms fading. "
+        "GS arrival no later than the 10 ms COM or 15 ms VS deadline is timely. Boundary "
+        "snapshots contain only generated unfinished packets; HOL validity describes the "
+        "FIFO head, and empty queues use false validity plus zero padding. Violations are "
+        "historical outcomes."
     )
 
 

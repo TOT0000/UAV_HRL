@@ -96,7 +96,7 @@ class EnvironmentSizeSelectionTest(unittest.TestCase):
             resolve_episode_horizons_s(60, (120,))
         with self.assertRaisesRegex(ValueError, "at least one"):
             resolve_episode_horizons_s(episode_horizons_s=())
-        for invalid in (-1, 0, 1, 2, 2.5, True, "120"):
+        for invalid in (-1, 0, 2.5, True, "120"):
             with self.subTest(invalid=invalid), self.assertRaises(ValueError):
                 resolve_episode_horizons_s(episode_horizon_s=invalid)
         points = evaluation_sweep_points(
@@ -113,7 +113,7 @@ class EnvironmentSizeSelectionTest(unittest.TestCase):
         )
         self.assertEqual(
             [point["packet_injection_cutoff_s"] for point in points],
-            [57.5, 117.5, 597.5, 57.5, 117.5, 597.5],
+            [59.985, 119.985, 599.985, 59.985, 119.985, 599.985],
         )
         self.assertEqual(points[-1]["movement_transition_count"], 600)
         self.assertEqual(points[-1]["routing_slot_count"], 2400)
@@ -225,7 +225,7 @@ class EnvironmentSizeManifestAndSimulatorTest(unittest.TestCase):
         )
         self.assertEqual(
             manifest.content_hash,
-            "afcb7256a161896d6ecc48e83948410fe9cadbb83610fabccd7a6790a634efed",
+            "35bab1957e80164439cbcc36b8cdf676b005435a9f2702cc11d1a7a345ba7f0d",
         )
 
     def test_size_manifests_are_deterministic_distinct_and_in_bounds(self):
@@ -727,7 +727,7 @@ class EnvironmentSizeSmokeTest(unittest.TestCase):
                 self.assertEqual(persisted_episode["episode_horizon_seconds"], 3.0)
                 self.assertEqual(persisted_episode["movement_transition_count"], 3)
                 self.assertEqual(persisted_episode["routing_slot_count"], 12)
-                self.assertEqual(persisted_episode["packet_injection_cutoff_seconds"], 0.5)
+                self.assertEqual(persisted_episode["packet_injection_cutoff_seconds"], 2.985)
                 aggregate_json = json.loads(
                     (output / "aggregated_plot_data.json").read_text(
                         encoding="utf-8"

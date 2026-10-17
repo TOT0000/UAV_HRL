@@ -25,7 +25,7 @@ import numpy as np
 LLM_EXPLORER_METHOD_ID = "td3_dinkelbach_llm_explorer"
 LLM_EXPLORER_MODEL = "gpt-4o-mini"
 LLM_EXPLORER_VERSION = "uav-hrl-llm-explorer-v2"
-LLM_EXPLORER_PROMPT_VERSION = "uav-hrl-llm-explorer-prompts-v2"
+LLM_EXPLORER_PROMPT_VERSION = "uav-hrl-llm-explorer-prompts-v3"
 LLM_EXPLORER_COMPRESSION_VERSION = "compact-observable-tables-v1"
 LLM_EXPLORER_WARMUP_TRANSITIONS = 10_000
 LLM_EXPLORER_UPDATE_INTERVAL_EPISODES = 1
@@ -850,8 +850,13 @@ def environment_constants_and_definitions(
         "communication_range_3d_m_inclusive": float(COMMUNICATION_RANGE_M),
         "task_deadlines_seconds": {
             str(key): float(value)
-            for key, value in (task_deadlines_seconds or {"FOV": 2.5, "COM": 2.0}).items()
+            for key, value in (task_deadlines_seconds or {"FOV": 0.015, "COM": 0.010}).items()
         },
+        "packet_generation_model": "fixed intervals from effective configured rates; events are invisible before generation",
+        "routing_decision_model": "all UAVs preselect one physically legal next hop at each 0.25 s slot start and hold it for the slot",
+        "packet_service_model": "event-time full-packet store-and-forward; completed packets may traverse multiple hops in one slot",
+        "bandwidth_model": "dynamic equal-FDMA over currently serviceable S2U/U2U/U2G links; empty preselection reserves no bandwidth",
+        "fading_model": "5 ms gain blocks; service completion and next-hop start may be finer than 5 ms",
         "com_packet_bits": float(COM_PACKET_SIZE_BITS),
         "action_decode": {
             "horizontal_speed_mps": "5 * (speed_scalar + 1)",

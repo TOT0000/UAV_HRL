@@ -25,7 +25,9 @@ CHANNEL_ENVIRONMENT_CONTRACT_VERSION = (
 CHANNEL_FAIRNESS_CONTRACT_VERSION = "all-potential-links-fixed-order-crn-v1"
 CHANNEL_NORMALIZATION_VERSION = "link-type-fading-aware-physical-reference-v1"
 ROUTING_CSI_CONTRACT = "deterministic-distributional-expected-capacity-v1"
-ACTUAL_TRANSMISSION_CONTRACT = "fifty-block-cumulative-service-v1"
+ACTUAL_TRANSMISSION_CONTRACT = (
+    "event-time-store-forward-dynamic-fdma-fixed-5ms-fading-v2"
+)
 
 NOISE_PSD_DBM_PER_HZ = -169.0
 A2G_CARRIER_GHZ = 2.0

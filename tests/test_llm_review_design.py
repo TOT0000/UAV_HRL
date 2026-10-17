@@ -228,6 +228,16 @@ def test_repair_then_review_uses_complete_context_and_approves(tmp_path, monkeyp
     assert not no_proposer.calls and not no_reviewer.calls
 
     _downgrade_run_state_to_v1(Path(result["output_directory"]))
+    saved_state = json.loads(
+        (Path(result["output_directory"]) / "state.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    monkeypatch.setattr(
+        llm_review_design,
+        "LEGACY_REVIEW_COMPATIBLE_GIT_REVISIONS",
+        {saved_state["git_sha"]},
+    )
     monkeypatch.setattr(llm_review_design, "_git_sha", lambda: "new-compatible-revision")
     migrated_approved = llm_review_design.run_review_design(
         resume=result["output_directory"],
@@ -368,6 +378,12 @@ def _downgrade_run_state_to_v1(output):
 def test_legacy_run_migrates_only_from_matching_saved_submission(tmp_path, monkeypatch):
     _, output, _ = _pause_after_validation(tmp_path, "legacy-safe")
     candidate_id = _downgrade_run_state_to_v1(output)
+    saved_state = json.loads((output / "state.json").read_text(encoding="utf-8"))
+    monkeypatch.setattr(
+        llm_review_design,
+        "LEGACY_REVIEW_COMPATIBLE_GIT_REVISIONS",
+        {saved_state["git_sha"]},
+    )
     monkeypatch.setattr(llm_review_design, "_git_sha", lambda: "new-compatible-revision")
     result = llm_review_design.run_review_design(
         resume=output,
@@ -381,9 +397,8 @@ def test_legacy_run_migrates_only_from_matching_saved_submission(tmp_path, monke
     assert migrated["current_candidate_full_content_sha256"] == full_hash
     assert migrated["current_validation"]["candidate_full_content_sha256"] == full_hash
     assert migrated["migration"]["from_schema_version"].endswith("-v1")
-    assert migrated["migration"]["from_git_sha"] in (
-        llm_review_design.LEGACY_REVIEW_COMPATIBLE_GIT_REVISIONS
-    )
+    assert migrated["migration"]["from_git_sha"] == saved_state["git_sha"]
+    assert migrated["prompt_version"] == llm_review_design.REVIEW_PROMPT_VERSION
     assert migrated["git_sha"] == "new-compatible-revision"
 
 

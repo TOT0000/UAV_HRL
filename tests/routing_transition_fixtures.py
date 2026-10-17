@@ -15,6 +15,18 @@ def terminal_packet_engine_state(*, next_packet_id=0):
         "next_packet_id": int(next_packet_id),
         "active_packets": [],
         "inject_buffer": {},
+        "generation_clocks": {
+            "FOV:0:1:2": {
+                "kind": "FOV",
+                "rate_packets_per_second": 5.0,
+                "next_time_seconds": 60.2,
+            },
+            "SR_0_COM": {
+                "kind": "COM",
+                "rate_packets_per_second": 50.0,
+                "next_time_seconds": 60.02,
+            },
+        },
         "source_buffer": {},
         "uav_queue_packet_ids": {str(uid): [] for uid in range(NUM_UAV)},
         "sr_queue_packet_ids": {},

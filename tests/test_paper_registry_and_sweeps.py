@@ -73,9 +73,9 @@ class PaperMethodRegistryTest(unittest.TestCase):
             spec = MethodSpec.parse(method_id)
             resolved = comparison_method_configuration(spec)
             self.assertEqual(resolved["routing_mask_scope"], "every_slot")
-            self.assertEqual(resolved["packet_injection_cutoff_seconds"], 57.5)
-            self.assertEqual(resolved["resolved_fov_deadline_seconds"], 2.5)
-            self.assertEqual(resolved["resolved_com_deadline_seconds"], 2.0)
+            self.assertEqual(resolved["packet_injection_cutoff_seconds"], 59.985)
+            self.assertEqual(resolved["resolved_fov_deadline_seconds"], 0.015)
+            self.assertEqual(resolved["resolved_com_deadline_seconds"], 0.010)
             if spec.routing == "safe_ddqn":
                 safe_method_count += 1
                 self.assertEqual(resolved["safe_ddqn_qos_target_probability"], 0.01)
@@ -88,7 +88,7 @@ class PaperMethodRegistryTest(unittest.TestCase):
             else:
                 self.assertIsNone(resolved["safe_ddqn_qos_target_probability"])
                 self.assertIsNone(resolved["safe_ddqn_eta_c"])
-        self.assertEqual(safe_method_count, 15)
+        self.assertEqual(safe_method_count, 20)
 
     def test_td3_and_ddpg_hyperparameters_are_explicit_and_unchanged(self):
         td3 = movement_agent_configuration(MethodSpec.parse("td3_dinkelbach"))
@@ -206,11 +206,11 @@ class PaperSweepContractTest(unittest.TestCase):
         self.assertEqual(tuple(point["x_value"] for point in fov), (1.0, 2.0, 4.0, 5.0))
         self.assertEqual(
             {point["overrides"]["fov_deadline_seconds"] for point in com},
-            {2.5},
+            {0.015},
         )
         self.assertEqual(
             {point["overrides"]["com_deadline_seconds"] for point in fov},
-            {2.0},
+            {0.010},
         )
         self.assertEqual(
             {

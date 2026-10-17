@@ -161,7 +161,7 @@ COMMUNICATION_RANGE_CONTRACT_VERSION = (
     "slot-start-3d-inclusive-s2u-u2g-u2u-400m-v2"
 )
 COM_SESSION_LIFECYCLE_VERSION = (
-    "400m-activated-generation-immediate-e2e-qos-persistent-v3"
+    "400m-activated-fixed-interval-event-generation-persistent-v4"
 )
 validate_communication_range_aliases(
     A2G_COMMUNICATION_RANGE_M,
@@ -211,28 +211,28 @@ ROUTING_OPTIMIZER_UPDATE_SCOPE = "every_4_routing_slots"
 FOV_EMA_LIFECYCLE_VERSION = "nadir-contributor-footprints-empty-fov-samples-v7"
 SR_ROUTE_LIFECYCLE_VERSION = "assigned-and-arrived-derived-state-v2"
 PACKET_QOS_CONTRACT_VERSION = (
-    "assigned-fov-and-activated-com-immediate-qos-v8"
+    "e2e-event-time-com10ms-vs15ms-single-terminal-outcome-v9"
 )
 FOV_PACKET_GENERATION_CONTRACT_VERSION = (
-    "assigned-valid-sensing-rate-integrator-capture-snapshot-v3"
+    "assigned-valid-sensing-fixed-interval-event-capture-v4"
 )
 TIMELY_USEFUL_GOODPUT_CONTRACT_VERSION = (
     "fov-capture-coverage-weighted-com-full-timely-bits-v1"
 )
 PACKET_ROUTING_CAUSALITY_CONTRACT_VERSION = (
-    "sender-next-state-reward-packet-next-decision-cost-v5"
+    "all-uav-slot-action-next-slot-state-packet-use-cost-v6"
 )
 ROUTING_COST_ATTRIBUTION_CONTRACT_VERSION = (
-    "packet-path-terminal-outcome-bellman-chain-v4"
+    "multi-packet-per-decision-path-terminal-outcome-v5"
 )
 PACKET_SERVICE_CONTRACT_VERSION = (
-    "unified-400m-slot-start-fifty-5ms-block-cumulative-service-v2"
+    "event-time-store-forward-dynamic-fdma-fixed-fading-v3"
 )
 QOS_AGGREGATE_CONTRACT_VERSION = (
     "canonical-single-result-seed-ratio-of-sums-student-t-v3"
 )
 ROUTING_REWARD_CONTRACT_VERSION = (
-    "unified-400m-slot-start-backlog-fading-capacity-gs-progress-v7"
+    "all-uav-preselection-observed-hol-or-neutral-empty-v8"
 )
 ROUTING_REWARD_ALPHA_CAPACITY = 1.0
 ROUTING_REWARD_ALPHA_DELAY = 0.5
@@ -268,7 +268,7 @@ PROPULSION_PARAMETERS = MappingProxyType(
     }
 )
 PRODUCTION_EPISODE_HORIZON_SECONDS = 60.0
-PRODUCTION_TASK_DEADLINE_SECONDS = {"FOV": 2.5, "COM": 2.0}
+PRODUCTION_TASK_DEADLINE_SECONDS = {"FOV": 0.015, "COM": 0.010}
 PRODUCTION_PACKET_INJECTION_CUTOFF_SECONDS = (
     PRODUCTION_EPISODE_HORIZON_SECONDS
     - max(PRODUCTION_TASK_DEADLINE_SECONDS.values())
@@ -1176,6 +1176,12 @@ def comparison_method_configuration(method_spec: MethodSpec) -> dict:
             ROUTING_COST_ATTRIBUTION_CONTRACT_VERSION
         ),
         "packet_service_contract_version": PACKET_SERVICE_CONTRACT_VERSION,
+        "packet_generation_model": "fixed_interval_event_time",
+        "routing_decision_scope": "all_uavs_once_per_250ms_slot",
+        "routing_action_hold": "fixed_for_entire_slot",
+        "packet_forwarding_model": "full_packet_store_and_forward_same_slot_multihop",
+        "bandwidth_allocation_model": "dynamic_equal_fdma_currently_serviceable_links",
+        "deadline_completion_boundary": "gs_arrival_time_lte_absolute_deadline_strict_no_grace_period",
         "qos_aggregate_contract_version": QOS_AGGREGATE_CONTRACT_VERSION,
         "evaluation_aggregation_schema_version": (
             EVALUATION_AGGREGATION_SCHEMA_VERSION

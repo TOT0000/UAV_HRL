@@ -13,7 +13,7 @@ class FixedRoutingPolicy:
         self.actions = actions
 
     def select_action(self, state, uav_id, mask=None, **kwargs):
-        return self.actions[int(uav_id)]
+        return self.actions.get(int(uav_id), int(uav_id))
 
 
 class RoutingTransitionTerminalTest(unittest.TestCase):
@@ -25,7 +25,11 @@ class RoutingTransitionTerminalTest(unittest.TestCase):
         self.env.current_time = 0.0
         self.env.update_u2u_channels()
         self.env.update_u2g_channels()
-        self.engine = PacketEngine(num_uav=16, step_time=0.25)
+        self.engine = PacketEngine(
+            num_uav=16,
+            step_time=0.25,
+            task_deadlines_seconds={"FOV": 1.0, "COM": 1.0},
+        )
         self.masks = {
             uid: np.ones(17, dtype=bool) for uid in range(16)
         }
@@ -43,16 +47,28 @@ class RoutingTransitionTerminalTest(unittest.TestCase):
     def run_slot(
         self, actions, capacities, episode_done=False, current_time=0.0
     ):
-        self.env.allocate_active_link_capacities = (
-            lambda proposed, s2u_links=None: (
-                {
-                    (sender, receiver): capacities[(sender, receiver)]
-                    for sender, receiver in proposed.items()
-                },
-                {},
-            )
-        )
-        replay = ReplayBufferDiscrete(143, 17, max_size=16, n_step=1)
+        def allocate(proposed, s2u_links=None):
+            active = {
+                (sender, receiver): capacities.get((sender, receiver), 0.0)
+                for sender, receiver in proposed.items()
+            }
+            s2u = {
+                (sr, receiver): capacities.get(("S2U", sr, receiver), 0.0)
+                for sr, receiver in dict(s2u_links or {}).items()
+            }
+            self.env.active_link_capacity_profiles_mbps = {
+                link: np.full(50, value, dtype=float)
+                for link, value in active.items()
+            }
+            self.env.active_s2u_capacity_profiles_mbps = {
+                link: np.full(50, value, dtype=float)
+                for link, value in s2u.items()
+            }
+            self.env.active_s2u_capacities = s2u
+            return active, {}
+
+        self.env.allocate_active_link_capacities = allocate
+        replay = ReplayBufferDiscrete(143, 17, max_size=64, n_step=1)
         _run_routing_slot(
             self.env,
             self.engine,
@@ -68,15 +84,15 @@ class RoutingTransitionTerminalTest(unittest.TestCase):
         )
         return replay
 
-    def test_only_packet_delivered_to_gs_is_terminal(self):
+    def test_delivery_does_not_cut_next_slot_bootstrap(self):
         self.engine.create_packet(0, "COM", 100.0, 0.0)
 
         replay = self.run_slot(
             {0: self.env.GS_ID}, {(0, self.env.GS_ID): 0.0004}
         )
 
-        self.assertEqual(replay.size, 1)
-        self.assertEqual(replay.not_done[0, 0], 0.0)
+        self.assertEqual(replay.size, self.env.num_UAV)
+        self.assertTrue(np.all(replay.not_done[: replay.size, 0] == 1.0))
         self.assertEqual(self.stats["COM"]["timely_delivered_packets"], 1)
         self.assertEqual(self.stats["COM"]["deadline_violated_packets"], 0)
 
@@ -88,7 +104,7 @@ class RoutingTransitionTerminalTest(unittest.TestCase):
             {0: 1}, {(0, 1): 0.001}
         )
 
-        self.assertEqual(replay.cost[0, 0], 0.0)
+        self.assertTrue(np.all(replay.cost[: replay.size, 0] == 0.0))
         self.assertEqual(self.stats["COM"]["timely_delivered_packets"], 0)
         self.assertEqual(self.stats["COM"]["deadline_violated_packets"], 1)
 
@@ -98,7 +114,7 @@ class RoutingTransitionTerminalTest(unittest.TestCase):
             replay = self.run_slot(
                 {0: self.env.GS_ID}, {(0, self.env.GS_ID): 0.0002}
             )
-            self.assertEqual(replay.not_done[0, 0], 1.0)
+            self.assertTrue(np.all(replay.not_done[: replay.size, 0] == 1.0))
 
         self.engine.reset_packet_state()
         with self.subTest(case="next packet"):
@@ -107,7 +123,7 @@ class RoutingTransitionTerminalTest(unittest.TestCase):
             replay = self.run_slot(
                 {0: self.env.GS_ID}, {(0, self.env.GS_ID): 0.0004}
             )
-            self.assertEqual(replay.not_done[0, 0], 1.0)
+            self.assertTrue(np.all(replay.not_done[: replay.size, 0] == 1.0))
 
     def test_same_slot_relay_arrival_keeps_sender_bootstrap(self):
         self.engine.create_packet(0, "COM", 100.0, 0.0)
@@ -115,12 +131,12 @@ class RoutingTransitionTerminalTest(unittest.TestCase):
 
         replay = self.run_slot(
             {0: self.env.GS_ID, 1: 0},
-            {(0, self.env.GS_ID): 0.0004, (1, 0): 0.0004},
+            {(0, self.env.GS_ID): 0.0008, (1, 0): 0.0008},
         )
 
-        self.assertIs(self.engine.get_hol_packet(0), relayed)
-        self.assertEqual(replay.not_done[0, 0], 1.0)
-        self.assertEqual(replay.not_done[1, 0], 0.0)
+        self.assertTrue(relayed["done"])
+        self.assertIsNone(self.engine.get_hol_packet(0))
+        self.assertTrue(np.all(replay.not_done[: replay.size, 0] == 1.0))
 
     def test_episode_end_terminates_every_existing_transition(self):
         self.engine.create_packet(0, "COM", 100.0, 0.0)
@@ -129,14 +145,17 @@ class RoutingTransitionTerminalTest(unittest.TestCase):
             {0: 0}, {}, episode_done=True
         )
 
-        self.assertEqual(replay.not_done[0, 0], 0.0)
+        self.assertEqual(replay.size, self.env.num_UAV)
+        self.assertTrue(np.all(replay.not_done[: replay.size, 0] == 0.0))
 
-    def test_empty_sender_at_slot_start_creates_no_transition(self):
+    def test_empty_senders_preselect_and_create_neutral_reward_transitions(self):
         replay = self.run_slot({}, {})
 
-        self.assertEqual(replay.size, 0)
+        self.assertEqual(replay.size, self.env.num_UAV)
+        self.assertTrue(np.all(replay.reward[: replay.size, 0] == 0.0))
+        self.assertEqual(self.engine.system_qos_counts(), (0, 0))
 
-    def test_s2u_receiver_gets_no_same_slot_decision_or_replay(self):
+    def test_s2u_receiver_uses_its_preselected_action_in_same_slot(self):
         sr = self.env.SR_teams[0]
         sr.assigned_gt_id = 0
         receiver = 1
@@ -149,25 +168,17 @@ class RoutingTransitionTerminalTest(unittest.TestCase):
             }
         ]
         packet = self.engine.create_sr_packet(0, 100.0, generation_time=0.0)
-        self.env.active_s2u_capacities = {(0, receiver): 0.001}
-
-        replay = self.run_slot({}, {})
-
-        self.assertEqual(replay.size, 0)
-        self.assertIs(self.engine.get_hol_packet(receiver), packet)
-        self.assertIsNone(packet["last_routing_sender"])
-        self.assertEqual(packet["routing_eligible_time"], 0.1)
-        self.assertEqual(packet["rem_bits"], packet["size_bits"])
-
-        self.env.active_s2u_capacities = {}
-        next_replay = self.run_slot(
+        replay = self.run_slot(
             {receiver: self.env.GS_ID},
-            {(receiver, self.env.GS_ID): 0.001},
-            current_time=0.25,
+            {
+                ("S2U", 0, receiver): 0.001,
+                (receiver, self.env.GS_ID): 0.001,
+            },
         )
-        self.assertEqual(next_replay.size, 1)
-        self.assertEqual(next_replay.latest_index_by_agent, {receiver: 0})
+
+        self.assertEqual(replay.size, self.env.num_UAV)
         self.assertEqual(packet["last_routing_sender"], receiver)
+        self.assertAlmostEqual(packet["routing_eligible_time"], 0.1)
         self.assertTrue(packet["done"])
 
 

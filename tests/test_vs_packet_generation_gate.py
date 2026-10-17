@@ -25,7 +25,11 @@ def scene():
     # Explicitly leave COM inactive unless a test activates a session.
     for sr in env.SR_teams:
         sr.assigned_gt_id = None
-    return env, uav, task, PacketEngine(num_uav=16, step_time=.25)
+    return env, uav, task, PacketEngine(
+        num_uav=16,
+        step_time=.25,
+        task_deadlines_seconds={"FOV": 2.5, "COM": 2.0},
+    )
 
 
 def inject(env, engine, slot):

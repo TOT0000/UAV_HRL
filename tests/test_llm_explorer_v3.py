@@ -750,6 +750,13 @@ def test_full_scale_prompt_budget_statistics_and_raw_diagnostics(tmp_path):
         "prompt"
     ]
     assert "ordinary_recorded_routing_decision" in client.calls[0]["prompt"]
+    system_prompt = client.calls[0]["system_prompt"]
+    assert '"COM":0.01' in system_prompt
+    assert '"FOV":0.015' in system_prompt
+    assert '"packet_generation_model"' in system_prompt
+    assert '"routing_decision_model"' in system_prompt
+    assert '"packet_service_model"' in system_prompt
+    assert '"bandwidth_model"' in system_prompt
     assert "response must contain exactly td3_bias and routing_prior" in client.calls[2][
         "prompt"
     ]

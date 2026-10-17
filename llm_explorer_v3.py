@@ -33,8 +33,8 @@ from llm_explorer import (
 
 LLM_EXPLORER_V3_METHOD_ID = "td3_dinkelbach_llm_explorer_v3"
 LLM_EXPLORER_V3_VERSION = "uav-hrl-llm-explorer-v3"
-LLM_EXPLORER_V3_PROMPT_VERSION = "uav-hrl-llm-explorer-prompts-v3"
-LLM_EXPLORER_V3_SUMMARY_VERSION = "verified-episode-summary-v2"
+LLM_EXPLORER_V3_PROMPT_VERSION = "uav-hrl-llm-explorer-prompts-v4"
+LLM_EXPLORER_V3_SUMMARY_VERSION = "event-time-verified-episode-summary-v3"
 LLM_EXPLORER_V3_CASE_VERSION = "deterministic-diverse-cases-v2"
 LLM_EXPLORER_V3_GUIDANCE_CONTEXT_VERSION = "self-contained-raw-td3-v1"
 LLM_EXPLORER_V3_ANNEAL_END_EPISODE = 600
@@ -1002,6 +1002,11 @@ def environment_definitions_v3(**kwargs: Any) -> dict[str, Any]:
             "communication_range_3d_m_inclusive"
         ],
         "task_deadlines_seconds": base["task_deadlines_seconds"],
+        "packet_generation_model": base["packet_generation_model"],
+        "routing_decision_model": base["routing_decision_model"],
+        "packet_service_model": base["packet_service_model"],
+        "bandwidth_model": base["bandwidth_model"],
+        "fading_model": base["fading_model"],
         "action_decode": base["action_decode"],
         "routing_actions": {
             "GS": 16,

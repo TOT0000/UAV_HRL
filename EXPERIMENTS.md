@@ -230,19 +230,21 @@ Relay diagnostics artifact.
   `clip((d_3D(sender,GS) - d_3D(receiver,GS)) / 400 m, -1, 1)`; a direct GS
   action uses receiver distance zero and wait is exactly zero. Progress never
   changes the existing action mask.
-  For the frozen slot-start aggregate FIFO, transmission delay is the HOL
-  remaining bits divided by the actual equal-FDMA/fading slot capacity and
-  queue delay is all remaining bits behind that HOL divided by the same
-  capacity. Elapsed wall-clock HOL wait is diagnostic only
-- production FOV/COM deadlines `2.5 s`/`2.0 s`; completion at the exact deadline
+  Reward uses only the action-time observation: an observed HOL uses its
+  remaining bits and the initial equal-FDMA/fading capacity, while an empty
+  queue has neutral reward. A packet that arrives later may attach path cost to
+  the held action but cannot retroactively change the action-time reward
+- production FOV/COM deadlines `0.015 s`/`0.010 s`; completion at the exact deadline
   is timely
-- production packet injection cutoff `57.5 s`, derived as the 60-second horizon
+- production packet injection cutoff `59.985 s`, derived as the 60-second horizon
   minus the maximum production deadline
-- every assigned FOV source runs its rate integrator only when canonical
-  `fov_task_geometry` reports `sensing_valid_now=True`. Invalid intervals create
-  no packets and clear fractional credit; removal, ROI/task reassignment and
-  episode reset also discard that assignment's credit. Valid partial or zero
-  coverage has no separate generation gate. Every generated FOV packet freezes
+- every assigned FOV source has a deterministic fixed-interval generation clock
+  only while canonical `fov_task_geometry` reports `sensing_valid_now=True`.
+  Geometry, packet size, and capture coverage are evaluated at the actual
+  generation event. Invalid intervals create no packets and reset that
+  assignment clock; removal, ROI/task reassignment, rate change, and episode
+  reset also discard old timing credit. Valid partial or zero coverage has no
+  separate generation gate. Every generated FOV packet freezes
   physical size, raw image quantity, ROI/task identity and the authoritative
   overlap ratio as `capture_coverage_ratio`, clipped to `[0,1]`. The full physical
   `size_bits` remains the queue, service, partial-hop, and routing-reward load.
@@ -263,15 +265,19 @@ Relay diagnostics artifact.
   lifecycle fields are `assigned_gt_id` and `arrived`. A COM session produces
   no packets until its assigned UAV first enters the inclusive 400 m S2U
   range; activation is permanent for the episode and packet generation then
-  continues at 50 packets/s even while the UAV is out of range. Each activated
+  continues at fixed 20 ms intervals (50 packets/s) even while the UAV is out
+  of range. The first packet is one full effective-rate interval after
+  activation; load factors and rate overrides change the interval without
+  catch-up credit. Each activated
   COM packet is immediately `qos_eligible=True` at SR generation, while
   `routing_eligible=False` until S2U completes. S2U completion changes only
   routing eligibility and never increments the QoS denominator again. SR
   timeout or terminal settlement is one formal E2E violation measured from
   generation time; without a routing transition ID it increments the explicit
   unattributed diagnostic and never writes safe-DDQN replay. These lifecycle
-  fields remain episode-boundary snapshots in
-  full checkpoints
+  fields, deterministic generation clocks, packet queues, partial-hop state,
+  routing attribution state, and channel RNG lifecycle are represented in the
+  full-resume contract. Checkpoints remain episode-boundary terminal snapshots;
   mid-episode checkpointing is explicitly unsupported.
 - 100 evaluation episodes
 - formal model checkpoint `ep_1500`
@@ -346,9 +352,9 @@ C10 is evaluated only for C9-valid pairs with finite `d_L,d_R`, as
 constraint and does not change partial-coverage packet generation.
 
 The independent traffic-model maximum is exactly 31,600 bits. Assigned VS uses
-the existing 5 packets/s rate accumulator only during valid sensing, retaining
-the injection cutoff. Invalid intervals do not generate or accrue deferred
-credit. Each packet freezes `size_bits = 31600 * min(I,1)`,
+a 5 packets/s deterministic fixed-interval clock only during valid sensing,
+retaining the injection cutoff. Invalid intervals do not generate or accrue
+deferred credit. Each packet freezes `size_bits = 31600 * min(I,1)`,
 `capture_coverage_ratio`, `capture_image_quantity`, `capture_roi_id` and
 `capture_task_id`. Valid geometry must yield positive finite physical bits;
 inconsistent geometry raises an error before credit or counters change. Timely
@@ -398,13 +404,16 @@ mask, preserving policy-independent RNG draw counts. No `C_min`, outage/PER,
 HARQ, shadowing, or retransmission model is added.
 
 The range decision is frozen at the start of each 0.25 s routing slot and is
-shared by all fifty 5 ms service blocks in that slot. All eighteen registered
-methods use this same channel, range mask, COM activation, packet-service, and
+shared by all fifty 5 ms service blocks in that slot. Every registered method
+uses this same channel, range mask, COM activation, packet-service, and
 evaluation contract. `FOV_COM_PAIR_MAX_DISTANCE_M = 200 m` remains unchanged:
 it is a horizontal task-target compatibility rule for pairing FOV and COM, not
 a radio range.
 
-Routing decisions remain every 0.25 seconds. Before each decision the private
+Routing decisions remain every 0.25 seconds. Every UAV selects one physically
+legal next hop, including UAVs whose queue is empty, and that action is held for
+the entire slot. Empty observations keep HOL fields absent/zero rather than
+inventing a packet. Before each decision the private
 channel lifecycle vectorizes fifty 5 ms gains for every potential directed U2U,
 U2G, and S2U link in fixed type/sender/receiver order, whether or not the link
 will be selected. Separate named training/evaluation channel RNG streams make
@@ -414,14 +423,19 @@ samples: their CSI is the deterministic distributional expectation
 `B E_G[log2(1 + mean_snr*G)]`, evaluated with cached order-64 Gauss-Laguerre
 quadrature and normalized by link-type physical LoS-Rician reference capacity.
 
-After all routing actions are chosen, active S2U/U2U/U2G links share the common
-10 MHz pool by equal FDMA. Noise and capacity are recomputed with the allocated
-bandwidth while reusing the slot's cached gains; full-band capacity is never
-linearly scaled. Packet service consumes the fifty block budgets in order. A
-packet that finishes inside a block is timestamped at the block start plus its
-remaining bits divided by that block's capacity. FIFO, start-of-slot
-eligibility, next-slot S2U relay causality, partial-hop receiver locking, Wait,
-deadlines, and the communication-energy model are unchanged.
+After all routing actions are chosen, only S2U/U2U/U2G links with an actual
+serviceable HOL packet share the common 10 MHz pool by equal FDMA. Empty
+preselections reserve no bandwidth. Generation, full-hop completion, queue
+emptying, and exact deadline expiry are event boundaries; after each such
+change, bandwidth and capacity are recomputed only for future time while
+reusing the current 5 ms block's cached gains. Full-band capacity is never
+linearly scaled and no resource event draws new fading. A packet can complete
+at any positive sub-block time. Complete-packet store-and-forward immediately
+enqueues it at the receiver, whose already-held action may transmit it again in
+the same slot. FIFO, partial-hop receiver locking, Wait, hop limits, and the
+communication-energy model remain in force. An unfinished packet is removed at
+its absolute 10/15 ms deadline; a GS completion at exactly the deadline is
+processed first and is timely.
 
 The 5 ms duration follows Ghazikor et al., *IEEE Transactions on
 Communications* (2026), DOI `10.1109/TCOMM.2025.3650376`, for block-duration
@@ -440,19 +454,20 @@ movement `next_state` are then built from the new geometry/state. Constraint
 penalties use the post-action geometry at that boundary. The next loop
 iteration reuses the prepared state and projection mask.
 
-Every actual HOL routing decision, including Wait, receives a global monotonic
-transition ID and is appended to that packet's decision chain. Reward
-transitions retain sender-next-observation causality. Cost transitions instead
-link to the same packet's next routing decision, even after a UAV handoff or a
-loop back to the same UAV. At the next slot, packet injection,
-expiration/cleanup, start-of-slot HOL eligibility, effective masks, and routing
-observations are resolved in their canonical order. Earlier decisions have
-immediate cost zero. Timely delivery closes the final decision with terminal
-cost zero; violation closes it once with terminal cost one. The existing cost
-critic discount and masked Double-DQN backup propagate that terminal cost
-through the chain. Non-HOL waiting creates no decision. Packets with no routing
-decision still contribute to system QoS and the dual update without receiving
-fabricated replay credit.
+Every all-UAV slot action receives one global monotonic transition ID. Reward
+replay is written once per sender action and bootstraps to that sender's next
+slot observation; only episode termination cuts bootstrap. Whenever a real
+packet becomes HOL, including after a mid-slot S2U or U2U arrival, its use of
+the held Send or Wait action attaches that transition ID to the packet path.
+One action may therefore affect several packets and one packet may use several
+UAV actions in the same slot. Independent packet-path cost rows prevent those
+closures from overwriting one another. Earlier path rows have cost zero; timely
+delivery closes the final row with terminal cost zero and a violation closes it
+once with terminal cost one. The existing cost critic discount and masked
+Double-DQN backup propagate that terminal cost through the path. An empty
+action that affects no packet creates no cost row and cannot dilute packet DVP.
+Packets with no routing decision still contribute to system QoS and the dual
+update without fabricated replay credit.
 Formal routing replay is one-step. Episode-terminal packet outcomes and costs
 are settled before the ledger is drained.
 
@@ -856,8 +871,8 @@ accepts `--roi-count` only. It rejects `--roi-counts`, so each run has exactly
 one RoI count across all selected map sizes.
 
 `--episode-horizon-s` and `--episode-horizons-s` are mutually exclusive and
-apply only to this suite. Values are integer seconds greater than the maximum
-2.5-second packet deadline. The runner evaluates the full map-size by horizon
+apply only to this suite. Values are positive integer seconds greater than the
+maximum 15 ms packet deadline. The runner evaluates the full map-size by horizon
 Cartesian product and prints the point and episode count before execution. A
 60-second point keeps the historical `map_<size>m` ID; other horizons append
 `_t<horizon>s`.
@@ -866,7 +881,7 @@ The frozen checkpoint was trained with a 60-second horizon. Evaluating another
 horizon is recorded as a zero-shot `episode_horizon` shift and does not relax
 checkpoint architecture, method, or provenance validation. The movement loop,
 terminal finalization, trajectory bounds, and four routing slots per second use
-the point horizon. Packet injection ends at `horizon - 2.5 s`, and the
+the point horizon. Packet injection ends at `horizon - 0.015 s`, and the
 movement-state remaining-time scalar is `(horizon - elapsed) / horizon`.
 Horizons for a common map reuse the same scenario manifest, scenario IDs, and
 initial conditions; their evaluation configuration fingerprints remain
@@ -1034,8 +1049,8 @@ scenario IDs, evaluation count/horizon/seed, 16-UAV count, and fully resolved
 traffic-rate/deadline/cutoff overrides. The deadline-violation (Fig. 6) sweep
 uses a scoped `57.0 s` packet-injection cutoff so its maximum `3.0 s` deadline
 can resolve within the 60-second horizon; other training and evaluation suites
-retain the production `57.5 s` cutoff, while environment-size points use their
-selected horizon minus the maximum 2.5-second deadline.
+retain the production `59.985 s` cutoff, while environment-size points use
+their selected horizon minus the maximum 15 ms deadline.
 Within each training seed, delay is total delivered E2E delay divided by total
 delivered packet count. FOV and COM violation rows remain diagnostics. The
 formal `ALL` seed row pools the two raw violation counts over the two raw

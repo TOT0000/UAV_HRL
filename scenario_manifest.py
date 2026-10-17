@@ -795,7 +795,7 @@ def generate_scenario_entry(
             "load_factor": 1.0,
             "base_fov_packets_per_second": 5.0,
             "base_com_packets_per_second": 50.0,
-            "generation_model": "assigned-fov-rate-accumulator-v2",
+            "generation_model": "assigned-fixed-interval-event-time-v3",
         },
         "exogenous_primitives": {
             "channel_randomness": "none",
@@ -1004,7 +1004,7 @@ def validate_scenario_entry(entry: dict[str, Any]) -> dict[str, Any]:
                 "environment-size scenario identity disagrees with deployment"
             )
     if entry["traffic_primitives"].get("generation_model") != (
-        "assigned-fov-rate-accumulator-v2"
+        "assigned-fixed-interval-event-time-v3"
     ):
         raise ValueError("scenario packet generation model is incompatible")
     uav_ids = [int(item["uav_id"]) for item in entry["uavs"]]

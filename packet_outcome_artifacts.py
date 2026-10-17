@@ -8,16 +8,17 @@ import math
 from pathlib import Path
 
 
-PACKET_OUTCOME_ARTIFACT_SCHEMA_VERSION = "uav-hrl-packet-outcomes-jsonl-v6"
+PACKET_OUTCOME_ARTIFACT_SCHEMA_VERSION = "uav-hrl-packet-outcomes-jsonl-v7"
 PACKET_ROUTING_DIAGNOSTIC_CONTRACT_VERSION = (
-    "uav-hrl-packet-routing-diagnostics-v3"
+    "uav-hrl-packet-routing-diagnostics-v4"
 )
 PACKET_ROUTING_DIAGNOSTIC_DEFINITIONS = {
     "routing_wait_definition": (
         "routing_decision_slot_count increments once when a routing-eligible "
-        "packet is the frozen sender HOL and enters the routing decision path; "
+        "packet becomes sender HOL and is affected by that slot's held action; "
         "routing_wait_slot_count increments when that decision selects receiver "
-        "== sender, and routing_wait_seconds adds the authoritative slot duration"
+        "== sender, and routing_wait_seconds adds only the actual remaining "
+        "time until packet deadline or slot end"
     ),
     "routing_wait_decomposition_definition": (
         "voluntary Wait means selected receiver == sender while at least one "
@@ -26,7 +27,8 @@ PACKET_ROUTING_DIAGNOSTIC_DEFINITIONS = {
         "categories are mutually exclusive and sum to routing_wait_slot_count"
     ),
     "forced_locked_wait_definition": (
-        "a routing-eligible frozen HOL packet selected Wait, had a locked "
+        "a routing-eligible HOL packet affected by the held action selected "
+        "Wait, had a locked "
         "hop_receiver outside the authoritative inclusive 400 m 3-D routing "
         "range according to env.is_routing_link_in_range, and its effective "
         "mask contained only sender/Wait; capacity unavailability while in "
@@ -34,14 +36,14 @@ PACKET_ROUTING_DIAGNOSTIC_DEFINITIONS = {
         "fraction uses all routing decision slots as its denominator"
     ),
     "s2u_hol_opportunity_definition": (
-        "a COM packet is counted at most once per routing slot when it is the "
-        "actual SR FIFO HOL and enters that slot's canonical S2U service "
+        "a COM packet is counted at most once per routing slot when it becomes "
+        "the actual SR FIFO HOL and enters the event-time S2U service "
         "opportunity path; non-HOL queue packets are not scanned or counted"
     ),
     "s2u_hol_service_definition": (
         "an S2U HOL service slot requires actual packet bits to be consumed and "
         "the packet's actual positive-capacity S2U airtime to increase; active "
-        "link or nominal capacity alone is not service"
+        "link, preselected UAV action, or nominal capacity alone is not service"
     ),
     "s2u_hol_no_service_reason_priority": (
         "each unserved S2U HOL opportunity is assigned exactly one reason in "
@@ -340,7 +342,12 @@ def validate_packet_outcome(row):
         + sum(row[field] for field in S2U_HOL_NO_SERVICE_COUNT_FIELDS)
     ):
         raise ValueError(
-            "S2U HOL opportunities do not equal service plus no-service reasons"
+            "S2U HOL opportunities do not equal service plus no-service "
+            f"reasons for packet {row.get('packet_id')}: "
+            f"opportunities={row['s2u_hol_opportunity_slot_count']}, "
+            f"service={row['s2u_hol_service_slot_count']}, "
+            "no_service="
+            f"{sum(row[field] for field in S2U_HOL_NO_SERVICE_COUNT_FIELDS)}"
         )
     for field in (
         "generation_time_seconds",

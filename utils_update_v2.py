@@ -507,6 +507,32 @@ class ReplayBufferDiscrete:
         )
         self.cost_not_done = np.zeros((self.max_size, 1), dtype=np.float32)
         self.cost_ready = np.zeros((self.max_size, 1), dtype=bool)
+        # Packet-path cost samples are independent of sender-time reward rows.
+        # One selected action may affect multiple packets, so a single reward
+        # transition ID cannot be the storage key for cost causality.
+        self.path_cost_state = np.zeros(
+            (self.max_size, state_dim), dtype=np.float32
+        )
+        self.path_cost_action = np.zeros((self.max_size,), dtype=np.int64)
+        self.path_cost_next_state = np.zeros(
+            (self.max_size, state_dim), dtype=np.float32
+        )
+        self.path_cost_value = np.zeros((self.max_size, 1), dtype=np.float32)
+        self.path_cost_not_done = np.zeros(
+            (self.max_size, 1), dtype=np.float32
+        )
+        self.path_cost_tag_gt = np.full(
+            (self.max_size, 1), -1, dtype=np.int16
+        )
+        self.path_cost_transition_id = np.full(
+            (self.max_size,), -1, dtype=np.int64
+        )
+        self.path_cost_packet_id = np.full(
+            (self.max_size,), -1, dtype=np.int64
+        )
+        self.path_cost_ptr = 0
+        self.path_cost_size = 0
+        self.path_cost_total_added = 0
 
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -581,7 +607,55 @@ class ReplayBufferDiscrete:
 
     @property
     def cost_ready_size(self):
-        return int(np.count_nonzero(self.cost_ready[: self.size, 0]))
+        return int(
+            self.path_cost_size
+            + np.count_nonzero(self.cost_ready[: self.size, 0])
+        )
+
+    def add_cost_transition(
+        self,
+        state,
+        action,
+        next_state,
+        cost,
+        done,
+        *,
+        tag_gt=None,
+        transition_id=None,
+        packet_id=None,
+    ):
+        """Append one packet-use cost transition without duplicating reward."""
+
+        state_array = _to_np_float32(state)
+        next_state_array = _to_np_float32(next_state)
+        if state_array.shape != self.path_cost_state[0].shape:
+            raise ValueError("packet cost state shape is incompatible with replay")
+        if next_state_array.shape != self.path_cost_next_state[0].shape:
+            raise ValueError(
+                "packet cost next-state shape is incompatible with replay"
+            )
+        value = float(cost)
+        if not np.isfinite(value) or value < 0.0:
+            raise ValueError("packet-chain cost must be finite and non-negative")
+        index = self.path_cost_ptr
+        self.path_cost_state[index] = state_array
+        self.path_cost_action[index] = int(action)
+        self.path_cost_next_state[index] = next_state_array
+        self.path_cost_value[index, 0] = value
+        self.path_cost_not_done[index, 0] = 1.0 - float(bool(done))
+        self.path_cost_tag_gt[index, 0] = (
+            -1 if tag_gt is None else int(tag_gt)
+        )
+        self.path_cost_transition_id[index] = (
+            -1 if transition_id is None else int(transition_id)
+        )
+        self.path_cost_packet_id[index] = (
+            -1 if packet_id is None else int(packet_id)
+        )
+        self.path_cost_ptr = (index + 1) % self.max_size
+        self.path_cost_size = min(self.path_cost_size + 1, self.max_size)
+        self.path_cost_total_added += 1
+        return True
 
     def attach_cost_transition(self, transition_id, next_state, cost, done):
         """Attach packet-chain cost causality to an existing reward row."""
@@ -618,6 +692,17 @@ class ReplayBufferDiscrete:
         return self._gather(ind, include_cost=include_cost)
 
     def sample_cost(self, batch_size):
+        if self.path_cost_size > 0:
+            indices = self.rng.integers(
+                0, self.path_cost_size, size=int(batch_size)
+            )
+            return (
+                torch.from_numpy(self.path_cost_state[indices]).to(self.device),
+                torch.from_numpy(self.path_cost_action[indices]).to(self.device),
+                torch.from_numpy(self.path_cost_next_state[indices]).to(self.device),
+                torch.from_numpy(self.path_cost_value[indices]).to(self.device),
+                torch.from_numpy(self.path_cost_not_done[indices]).to(self.device),
+            )
         ready = np.flatnonzero(self.cost_ready[: self.size, 0])
         if ready.size == 0:
             raise ValueError("routing replay has no packet-chain cost transitions")

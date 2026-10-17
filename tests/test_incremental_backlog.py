@@ -96,6 +96,7 @@ class IncrementalBacklogTest(unittest.TestCase):
     def test_multiple_non_hol_expirations_filter_queue_once(self):
         engine = PacketEngine(num_uav=3)
         survivor = engine.create_packet(0, "FOV", 100.0, 0.75)
+        survivor["deadline_abs"] = 3.0
         expired_a = engine.create_packet(0, "COM", 30.0, 0.0)
         expired_b = engine.create_packet(0, "COM", 20.0, 0.0)
 

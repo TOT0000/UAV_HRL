@@ -191,7 +191,7 @@ class DesignDatasetIntegrationTest(unittest.TestCase):
         arrays = self.arrays_one
         self.assertEqual(DESIGN_DATASET_SCHEMA_VERSION, 9)
         self.assertEqual(self.metadata_one["schema_version"], 9)
-        self.assertEqual(self.metadata_one["checkpoint_schema_version"], 33)
+        self.assertEqual(self.metadata_one["checkpoint_schema_version"], 34)
         self.assertEqual(self.metadata_one["scenario_schema_version"], "uav-hrl-scenario-v8")
         self.assertEqual(self.metadata_one["num_uav"], 16)
         self.assertEqual(

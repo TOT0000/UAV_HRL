@@ -69,7 +69,7 @@ from scenario_manifest import ScenarioManifest
 
 
 SEARCH_RUN_SCHEMA_VERSION = "uav-hrl-llm-training-search-run-v1"
-SEARCH_PROMPT_VERSION = "uav-hrl-llm-training-search-prompt-v2"
+SEARCH_PROMPT_VERSION = "uav-hrl-llm-training-search-prompt-v3"
 LEGACY_PROMPT_VERSION = "uav-hrl-llm-training-search-prompt-v1"
 PROMPT_MIGRATION_ID = "compact-training-feedback-v2"
 SEARCH_METHOD_ID = "td3_dinkelbach_llm_train_search"

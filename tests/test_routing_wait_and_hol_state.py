@@ -41,12 +41,12 @@ class RoutingWaitAndHolStateTest(unittest.TestCase):
         )
         self.assertEqual(np.flatnonzero(mask).tolist(), [0])
 
-    def test_empty_queue_effective_mask_contains_only_wait(self):
+    def test_empty_queue_effective_mask_retains_all_physical_actions(self):
         physical = np.ones(17, dtype=bool)
 
         mask = self.engine.get_effective_action_mask(self.env, 4, physical)
 
-        self.assertEqual(np.flatnonzero(mask).tolist(), [4])
+        self.assertEqual(np.flatnonzero(mask).tolist(), list(range(17)))
 
     def test_candidate_link_delays_use_hol_bits_and_nominal_capacity(self):
         packet = self.engine.create_packet(0, "COM", 6e6, 0.0)
@@ -82,11 +82,10 @@ class RoutingWaitAndHolStateTest(unittest.TestCase):
         self.assertEqual(packet["e2e_delay_ms"], before_e2e)
 
     def test_relay_hol_context_uses_packet_identity(self):
-        packet = self.engine.create_packet(0, "COM", 100.0, 0.0)
-        packet["deadline_abs"] = 1.0
+        packet = self.engine.create_packet(0, "COM", 100.0, 0.495)
         self.engine.record_hop_transmission(packet, 0, 5, 100.0)
         arrival = self.engine.detach_completed_hop(
-            packet, 0, 5, completion_time=0.25
+            packet, 0, 5, completion_time=0.497
         )
         self.engine.enqueue_relay_arrivals([arrival])
 
@@ -100,7 +99,7 @@ class RoutingWaitAndHolStateTest(unittest.TestCase):
         )
 
         self.assertEqual(state.shape, (143,))
-        np.testing.assert_allclose(state[-4:], [0.0, 1.0, 0.25, 1.0])
+        np.testing.assert_allclose(state[-4:], [0.0, 1.0, 0.5, 1.0])
         self.engine.get_state_ta(
             self.env,
             5,

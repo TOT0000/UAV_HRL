@@ -212,7 +212,7 @@ class InitialTopologyGeometryTest(unittest.TestCase):
                 )
 
     def test_schema_15_checkpoint_is_rejected_for_old_initial_geometry(self):
-        self.assertEqual(CHECKPOINT_SCHEMA_VERSION, 33)
+        self.assertEqual(CHECKPOINT_SCHEMA_VERSION, 34)
         with self.assertRaisesRegex(
             RuntimeError, "GS-reachable initial topology.*must be retrained"
         ):
@@ -262,37 +262,36 @@ class InitialTopologyDeliveryTest(unittest.TestCase):
         engine = PacketEngine(16)
         packet = engine.create_packet(1, "COM", 256.0, 0.0)
         env.prepare_channel_routing_slot(0)
-        capacities, bandwidths = env.allocate_active_link_capacities({1: 0})
-        self.assertGreater(capacities[(1, 0)], 0.0)
-        self.assertLessEqual(sum(bandwidths.values()), env.B_tot)
-        self.assertEqual(env.active_link_capacity_profiles_mbps[(1, 0)].shape, (50,))
-        engine.serve_active_links(
-            env,
-            {1: 0},
-            capacities,
-            current_time=0.0,
-            block_capacity_profiles=env.active_link_capacity_profiles_mbps,
-        )
-        self.assertEqual(packet["current"], 0)
-
-        env.prepare_channel_routing_slot(1)
         capacities, bandwidths = env.allocate_active_link_capacities(
-            {0: env.GS_ID}
+            {1: 0, 0: env.GS_ID}
         )
+        self.assertGreater(capacities[(1, 0)], 0.0)
         self.assertGreater(capacities[(0, env.GS_ID)], 0.0)
         self.assertLessEqual(sum(bandwidths.values()), env.B_tot)
+        self.assertEqual(env.active_link_capacity_profiles_mbps[(1, 0)].shape, (50,))
         self.assertEqual(
             env.active_link_capacity_profiles_mbps[(0, env.GS_ID)].shape,
             (50,),
         )
-        result = engine.serve_active_links(
+        actions = {uav_id: uav_id for uav_id in range(env.num_UAV)}
+        actions[1] = 0
+        actions[0] = env.GS_ID
+        result = engine.serve_event_driven_slot(
             env,
-            {0: env.GS_ID},
-            capacities,
-            current_time=0.25,
-            block_capacity_profiles=env.active_link_capacity_profiles_mbps,
+            actions,
+            current_time=0.0,
+            observed_hol_by_sender={
+                uav_id: packet if uav_id == 1 else None
+                for uav_id in range(env.num_UAV)
+            },
+            observed_backlog_bits_by_sender={
+                uav_id: 256.0 if uav_id == 1 else 0.0
+                for uav_id in range(env.num_UAV)
+            },
         )
         self.assertEqual(packet["current"], env.GS_ID)
+        self.assertLessEqual(packet["finish_time"], packet["deadline_abs"])
+        self.assertEqual([hop["to"] for hop in packet["per_hop"]], [0, env.GS_ID])
         self.assertGreater(result["raw_final_hop_bits"], 0.0)
         self.assertGreater(result["timely_goodput_bits"], 0.0)
         self.assertGreater(engine.raw_final_hop_bits, 0.0)

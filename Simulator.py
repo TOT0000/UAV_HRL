@@ -1256,7 +1256,7 @@ class Simulator:
                 "load_factor": 1.0,
                 "base_fov_packets_per_second": 5.0,
                 "base_com_packets_per_second": 50.0,
-                "generation_model": "assigned-fov-rate-accumulator-v2",
+                "generation_model": "assigned-fixed-interval-event-time-v3",
             }
         if not ROI_COUNT_MIN <= int(self.num_GT) <= ROI_COUNT_MAX:
             raise ValueError(

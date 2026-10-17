@@ -105,7 +105,7 @@ class Uav16ConfigurationContractTest(unittest.TestCase):
         data["schema_version"] = "uav-hrl-scenario-v2"
         with self.assertRaisesRegex(ValueError, "16-UAV.*incompatible"):
             ScenarioManifest.from_dict(data)
-        self.assertEqual(CHECKPOINT_SCHEMA_VERSION, 33)
+        self.assertEqual(CHECKPOINT_SCHEMA_VERSION, 34)
         with self.assertRaisesRegex(RuntimeError, "must be retrained"):
             _validate_checkpoint_schema({"checkpoint_schema_version": 24})
 
@@ -397,7 +397,11 @@ class ChannelAndPacketContractTest(unittest.TestCase):
         )
 
     def test_sr_fifo_partial_lock_next_slot_causality_and_e2e(self):
-        engine = PacketEngine(NUM_UAV, step_time=0.25)
+        engine = PacketEngine(
+            NUM_UAV,
+            step_time=0.25,
+            task_deadlines_seconds={"FOV": 1.0, "COM": 1.0},
+        )
         sr = self.env.SR_teams[0]
         sr.assigned_gt_id = 0
         receiver = 1
@@ -456,7 +460,11 @@ class ChannelAndPacketContractTest(unittest.TestCase):
         self.assertEqual(engine.total_delivered, 1)
 
     def test_s2u_arrival_appends_behind_frozen_hol_without_credit(self):
-        engine = PacketEngine(NUM_UAV, step_time=0.25)
+        engine = PacketEngine(
+            NUM_UAV,
+            step_time=0.25,
+            task_deadlines_seconds={"FOV": 1.0, "COM": 1.0},
+        )
         sr = self.env.SR_teams[0]
         sr.assigned_gt_id = 0
         receiver = 1

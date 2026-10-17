@@ -71,7 +71,7 @@ LEGACY_REVIEW_RUN_SCHEMA_VERSION = "uav-hrl-llm-review-design-run-v1"
 LEGACY_REVIEW_COMPATIBLE_GIT_REVISIONS = {
     "a7aa991078f63e4ee039fed1e05709d10bf46595",
 }
-REVIEW_PROMPT_VERSION = "uav-hrl-llm-review-design-prompt-v1"
+REVIEW_PROMPT_VERSION = "uav-hrl-llm-review-design-prompt-v2"
 REVIEW_APPROVAL_VERSION = "uav-hrl-model-review-approval-v1"
 DEFAULT_REVIEW_OUTPUT_ROOT = Path("results") / "llm_review_designs"
 DEFAULT_MAX_REVIEW_ROUNDS = 5
@@ -993,6 +993,8 @@ def _restore_state(
         raise ReviewDesignError("review-design resume contract is incompatible")
     if schema_version == LEGACY_REVIEW_RUN_SCHEMA_VERSION:
         state["_legacy_schema_version"] = schema_version
+    if state.get("prompt_version") != REVIEW_PROMPT_VERSION:
+        raise ReviewDesignError("review-design resume prompt contract is incompatible")
     if state.get("git_sha") != _git_sha():
         if not (
             schema_version == LEGACY_REVIEW_RUN_SCHEMA_VERSION

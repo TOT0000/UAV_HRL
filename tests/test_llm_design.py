@@ -252,7 +252,7 @@ def _fixed_artifact(tmp_path, *, duplicate_first_state=False):
             "movement_state_feature_schema": movement_state_feature_schema(),
             "visual_sensing_configuration": visual,
             "channel_configuration": {"routing_slot_seconds": 0.25},
-            "production_task_deadline_seconds": {"FOV": 2.5, "COM": 2.0},
+            "production_task_deadline_seconds": {"FOV": 0.015, "COM": 0.010},
             "maximum_3d_communication_distance_m": 400.0,
             "ground_station_position_m": [0.0, 0.0, 0.0],
             "task_potential_configuration": {
@@ -541,10 +541,10 @@ def test_prompt_is_complete_current_only_and_example_parses(design_fixture):
     assert "Select data using validity flags" in prompt
     assert "Return only one JSON object" in prompt
     assert "d_R=(h^2+d^2)/sqrt" in prompt
-    assert "valid VS captures create packets directly in their sensing-UAV queues" in prompt
-    assert "activated COM sessions create packets in their SR queues" in prompt
-    assert "initial t=0 observation is therefore before any slot injection" in prompt
-    assert "unfinished packets whose deadline is at or before slot end are removed" in prompt
+    assert "Full-packet store-and-forward S2U/U2U/U2G" in prompt
+    assert "Activated COM and valid VS sources generate" in prompt
+    assert "all UAVs, including empty ones, preselect" in prompt
+    assert "10 ms COM or 15 ms VS deadline" in prompt
     assert "never use an object ID as a compact row" in prompt
     for name in OBS_KEYS:
         assert name in prompt
@@ -577,7 +577,7 @@ def test_prompt_is_complete_current_only_and_example_parses(design_fixture):
 
 def test_master_prompt_has_exact_placeholder_contract_and_supported_operations_match():
     template = PROMPT_TEMPLATE_PATH.read_text(encoding="utf-8")
-    assert PROMPT_VERSION == "uav-hrl-llm-design-prompt-v9"
+    assert PROMPT_VERSION == "uav-hrl-llm-design-prompt-v10"
     assert {
         token
         for token in (

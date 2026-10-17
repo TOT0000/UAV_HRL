@@ -117,7 +117,8 @@ from dinkelbach_blocks import (
     dinkelbach_config_metadata,
 )
 
-CHECKPOINT_SCHEMA_VERSION = 33
+CHECKPOINT_SCHEMA_VERSION = 34
+PRE_EVENT_TIME_SERVICE_CHECKPOINT_SCHEMA_VERSION = 33
 PRE_PACKET_PATH_COST_CHECKPOINT_SCHEMA_VERSION = 32
 PRE_HYBRID_SEARCH_CHECKPOINT_SCHEMA_VERSION = 31
 PRE_SEARCH_OVERLAP_GATEWAY_RANDOM_CHECKPOINT_SCHEMA_VERSION = 30
@@ -186,6 +187,14 @@ ROUTING_REPLAY_FIELDS = (
     "cost_next_state",
     "cost_not_done",
     "cost_ready",
+    "path_cost_state",
+    "path_cost_action",
+    "path_cost_next_state",
+    "path_cost_value",
+    "path_cost_not_done",
+    "path_cost_tag_gt",
+    "path_cost_transition_id",
+    "path_cost_packet_id",
 )
 
 FORMAL_CORE_CONFIG_FIELDS = (
@@ -297,6 +306,12 @@ FORMAL_CORE_CONFIG_FIELDS = (
     "packet_routing_causality_contract_version",
     "routing_cost_attribution_contract_version",
     "packet_service_contract_version",
+    "packet_generation_model",
+    "routing_decision_scope",
+    "routing_action_hold",
+    "packet_forwarding_model",
+    "bandwidth_allocation_model",
+    "deadline_completion_boundary",
     "qos_aggregate_contract_version",
     "evaluation_aggregation_schema_version",
     "routing_reward_contract_version",
@@ -1128,7 +1143,7 @@ def _base_metadata(
         "movement_feature_schema_version": MOVEMENT_FEATURE_SCHEMA_VERSION,
         "movement_state_feature_schema": movement_state_feature_schema(),
         "state_contract": "16-uav-search-fov-com-task-aware-v5",
-        "packet_lifecycle_contract": "sr-fifo-s2u-next-slot-routing-v1",
+        "packet_lifecycle_contract": "event-time-s2u-u2u-u2g-multihop-v2",
         "channel_contract": CHANNEL_ENVIRONMENT_CONTRACT_VERSION,
         "channel_model_version": CHANNEL_MODEL_VERSION,
         "channel_configuration": deepcopy(
@@ -1521,6 +1536,14 @@ def _checkpoint_uses_dinkelbach(metadata):
 def _validate_checkpoint_schema(metadata):
     schema = metadata.get("checkpoint_schema_version")
     if schema != CHECKPOINT_SCHEMA_VERSION:
+        if schema == PRE_EVENT_TIME_SERVICE_CHECKPOINT_SCHEMA_VERSION:
+            raise RuntimeError(
+                "checkpoint schema v33 uses 2.0/2.5 second deadlines, "
+                "slot-batched generation, backlog-only routing decisions, "
+                "and one-hop-per-slot frozen service. The 10/15 ms "
+                "event-time, all-UAV preselection, dynamic-FDMA contract is "
+                "incompatible; retraining is required"
+            )
         if schema == PRE_PACKET_PATH_COST_CHECKPOINT_SCHEMA_VERSION:
             raise RuntimeError(
                 "checkpoint schema v32 stores sender-local immediate costs, the "
@@ -1565,7 +1588,7 @@ def _validate_checkpoint_schema(metadata):
             "continuous hard-only 400 m UAV 0 gateway projection, "
             "unified inclusive 400 m S2U/U2G/U2U communication range, "
             "143-D action-wise GS-progress routing state and v7 routing reward, "
-            "2.5 s FOV / 2.0 s COM QoS deadlines, "
+            "15 ms FOV / 10 ms COM QoS deadlines and event-time service, "
             "531-D Search/FOV/COM movement state, named-RNG, projected-action "
             "and service-only replay contract, and must be retrained: "
             f"checkpoint={schema}, expected={CHECKPOINT_SCHEMA_VERSION}"
@@ -1991,7 +2014,15 @@ def load_model_checkpoint(
 def _save_replay(path, replay, fields):
     size = int(replay.size)
     arrays = {
-        field: np.asarray(getattr(replay, field)[:size])
+        field: np.asarray(
+            getattr(replay, field)[
+                : (
+                    int(getattr(replay, "path_cost_size", 0))
+                    if field.startswith("path_cost_")
+                    else size
+                )
+            ]
+        )
         for field in fields
         if hasattr(replay, field)
     }
@@ -2005,6 +2036,12 @@ def _save_replay(path, replay, fields):
         "total_added": int(getattr(replay, "total_added", size)),
         "n_step_buffer": list(getattr(replay, "n_step_buffer", [])),
     }
+    if hasattr(replay, "path_cost_size"):
+        metadata.update(
+            path_cost_ptr=int(replay.path_cost_ptr),
+            path_cost_size=int(replay.path_cost_size),
+            path_cost_total_added=int(replay.path_cost_total_added),
+        )
     if hasattr(replay, "auxiliary_schema_version"):
         saved_auxiliary = [
             field
@@ -2052,6 +2089,20 @@ def _validate_replay_payload(path, replay, fields, metadata):
             "replay wrap diagnostics are inconsistent: "
             f"size={size}, ptr={ptr}, total_added={total_added}"
         )
+    if hasattr(replay, "path_cost_size"):
+        cost_size = int(metadata.get("path_cost_size", -1))
+        cost_ptr = int(metadata.get("path_cost_ptr", -1))
+        cost_total = int(metadata.get("path_cost_total_added", -1))
+        if (
+            not 0 <= cost_size <= replay.max_size
+            or not 0 <= cost_ptr < replay.max_size
+            or cost_total < cost_size
+            or cost_ptr != cost_total % replay.max_size
+        ):
+            raise RuntimeError(
+                "packet-path cost replay wrap diagnostics are inconsistent: "
+                f"size={cost_size}, ptr={cost_ptr}, total_added={cost_total}"
+            )
     with np.load(path, allow_pickle=False) as arrays:
         for field in fields:
             if field not in arrays:
@@ -2065,10 +2116,15 @@ def _validate_replay_payload(path, replay, fields, metadata):
                 else:
                     raise RuntimeError(f"replay object lacks field: {field}")
             target = getattr(replay, field)
-            if saved.shape != target[:size].shape:
+            field_size = (
+                int(metadata.get("path_cost_size", 0))
+                if field.startswith("path_cost_")
+                else size
+            )
+            if saved.shape != target[:field_size].shape:
                 raise RuntimeError(
                     f"replay field {field} shape mismatch: "
-                    f"checkpoint={saved.shape}, current={target[:size].shape}"
+                    f"checkpoint={saved.shape}, current={target[:field_size].shape}"
                 )
         auxiliary_fields = set(getattr(replay, "auxiliary_fields", ()))
         present_auxiliary = auxiliary_fields.intersection(arrays.files)
@@ -2121,7 +2177,12 @@ def _load_replay(path, replay, fields, metadata):
             ):
                 continue
             target = getattr(replay, field)
-            target[:size] = arrays[field]
+            field_size = (
+                int(metadata.get("path_cost_size", 0))
+                if field.startswith("path_cost_")
+                else size
+            )
+            target[:field_size] = arrays[field]
         if present_auxiliary and present_auxiliary != set(
             getattr(replay, "auxiliary_fields", ())
         ):
@@ -2143,6 +2204,12 @@ def _load_replay(path, replay, fields, metadata):
     replay.ptr = ptr
     replay.total_added = int(metadata.get("total_added", size))
     replay.n_step_buffer = list(metadata.get("n_step_buffer", []))
+    if hasattr(replay, "path_cost_size"):
+        replay.path_cost_size = int(metadata.get("path_cost_size", 0))
+        replay.path_cost_ptr = int(metadata.get("path_cost_ptr", 0))
+        replay.path_cost_total_added = int(
+            metadata.get("path_cost_total_added", replay.path_cost_size)
+        )
 
 
 def _checkpoint_task_observation_mode(metadata):
@@ -2803,6 +2870,19 @@ def _validate_full_resume_logging_state(
                 raise RuntimeError(
                     f"checkpoint packet {buffer_name} state is invalid"
                 )
+        generation_clocks = packet_state.get("generation_clocks")
+        if not isinstance(generation_clocks, dict):
+            raise RuntimeError("checkpoint packet generation clocks are missing")
+        for key, clock in generation_clocks.items():
+            if (
+                not isinstance(key, str)
+                or not isinstance(clock, dict)
+                or clock.get("kind") not in {"FOV", "COM"}
+                or not np.isfinite(float(clock.get("next_time_seconds", float("nan"))))
+                or not np.isfinite(float(clock.get("rate_packets_per_second", float("nan"))))
+                or float(clock["rate_packets_per_second"]) <= 0.0
+            ):
+                raise RuntimeError("checkpoint packet generation clock is invalid")
         for count_name in ("generated_packet_counts", "eligible_packet_counts"):
             counts = packet_state.get(count_name)
             if (

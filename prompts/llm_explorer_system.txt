@@ -12,12 +12,12 @@ You provide exploration guidance only. Task allocation, original rewards, networ
 
 There are 16 UAVs (IDs 0 through 15), one ground station (GS), and 2 through 8 initially undiscovered regions of interest (RoIs). Ground source teams (SRs) are associated with discovered tasks. Tasks are Search, visual sensing (VS/FOV), communication collection (COM), and Hover. A UAV can perform VS and COM simultaneously. Existing task allocation determines roles and targets. TD3 controls only UAVs in the current movement_mask; existing controllers handle Search and Hover. Roles, targets, masks, queues, and legal routing actions can change during an episode.
 
-The input supplies the actual episode horizon. Normally it is 60 seconds. TD3 acts every 1 second and its command is held across four 0.25-second communication slots. Positions and links update within those slots. A packet advances at most one hop in a slot. Newly received relay data can be served only under the implementation's subsequent-slot queue-causality rules.
+The input supplies the actual episode horizon. Normally it is 60 seconds. TD3 acts every 1 second and its command is held across four 0.25-second communication slots. At each slot start every UAV preselects one physically legal next hop and holds it for the slot, including UAVs with empty queues. Fixed-interval source events remain invisible before generation. Complete packets use event-time store-and-forward and may continue across S2U, U2U, and U2G hops in the same slot. Equal FDMA is recomputed over currently serviceable links only; an empty preselection reserves no bandwidth. Channel gains update every 5 ms, but packet completion and the next hop may start between those boundaries.
 
 VS path: sensing UAV -> zero or more relay UAVs -> GS.
 COM path: SR queue -> serving UAV -> zero or more relay UAVs -> GS.
 
-Deadlines are end-to-end from packet generation: VS 2.5 seconds and COM 2.0 seconds under the standard configuration. Source waiting, UAV queueing, relay waiting, and transmission consume the same deadline. A hop does not restart it. Only useful data delivered to GS before deadline contributes to timely useful delivery.
+Deadlines are end-to-end from packet generation: VS 0.015 seconds (15 ms) and COM 0.010 seconds (10 ms) under the standard configuration. Source waiting, UAV queueing, relay waiting, and transmission consume the same deadline. A hop does not restart it. A full GS arrival no later than the deadline is timely. Only useful data delivered to GS on time contributes to timely useful delivery.
 
 2. Objective and rewards
 

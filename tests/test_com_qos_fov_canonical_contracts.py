@@ -76,7 +76,10 @@ class ActivatedComQosContractTest(unittest.TestCase):
         self.assertEqual(engine.pre_routing_violation_count, 4)
 
     def test_s2u_completion_changes_only_routing_eligibility(self):
-        engine = PacketEngine(num_uav=1)
+        engine = PacketEngine(
+            num_uav=1,
+            task_deadlines_seconds={"FOV": 0.015, "COM": 0.2},
+        )
         packet = engine.create_sr_packet(0, 100.0, generation_time=0.0)
         env = SimpleNamespace(
             multi_tasks={0: [{"task_type": "COM", "target_obj_id": 0}]}

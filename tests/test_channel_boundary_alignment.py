@@ -275,7 +275,7 @@ class RoutingBoundaryReplayTest(unittest.TestCase):
         env, engine = self._environment_and_engine()
         packet = engine.create_packet(0, "COM", 1e12, 0.75)
         packet["deadline_abs"] = 10.0
-        replay = ReplayBufferDiscrete(143, 17, max_size=16, n_step=1)
+        replay = ReplayBufferDiscrete(143, 17, max_size=64, n_step=1)
         pending = {}
         policy = RecordingRoutingPolicy(env.GS_ID)
         stats = violation_stats()
@@ -295,7 +295,7 @@ class RoutingBoundaryReplayTest(unittest.TestCase):
             pending_routing_transitions=pending,
         )
         self.assertEqual(replay.size, 0)
-        self.assertEqual(set(pending), {0})
+        self.assertEqual(set(pending), set(range(env.num_UAV)))
 
         env.channel.large_scale_rng = AllNlosDraws()
         env.prepare_next_movement_interval(1)
@@ -314,14 +314,21 @@ class RoutingBoundaryReplayTest(unittest.TestCase):
             pending_routing_transitions=pending,
         )
 
-        self.assertEqual(replay.size, 2)
-        self.assertEqual(replay.total_added, 2)
+        self.assertEqual(replay.size, 2 * env.num_UAV)
+        self.assertEqual(replay.total_added, 2 * env.num_UAV)
         self.assertEqual(pending, {})
         self.assertEqual(replay.not_done[0, 0], 1.0)
-        np.testing.assert_array_equal(replay.next_state[0], policy.observations[1][1])
-        self.assertFalse(np.array_equal(policy.observations[0][1], policy.observations[1][1]))
+        np.testing.assert_array_equal(
+            replay.next_state[0], policy.observations[env.num_UAV][1]
+        )
+        self.assertFalse(
+            np.array_equal(
+                policy.observations[0][1],
+                policy.observations[env.num_UAV][1],
+            )
+        )
         self.assertEqual(
-            set(np.flatnonzero(policy.observations[1][2])),
+            set(np.flatnonzero(policy.observations[env.num_UAV][2])),
             {0, env.GS_ID},
         )
 
@@ -329,7 +336,7 @@ class RoutingBoundaryReplayTest(unittest.TestCase):
         env, engine = self._environment_and_engine()
         packet = engine.create_packet(0, "COM", 1e12, 0.75)
         packet["deadline_abs"] = 1.0
-        replay = ReplayBufferDiscrete(143, 17, max_size=16, n_step=1)
+        replay = ReplayBufferDiscrete(143, 17, max_size=64, n_step=1)
         ledger = RoutingTransitionLedger()
         ledger.begin_episode()
         policy = RecordingRoutingPolicy(env.GS_ID)
@@ -354,10 +361,12 @@ class RoutingBoundaryReplayTest(unittest.TestCase):
                 routing_transition_ledger=ledger,
             )
 
-        self.assertEqual(replay.size, 1)
-        self.assertEqual(replay.not_done[0, 0], 0.0)
-        self.assertEqual(replay.cost[0, 0], 1.0)
-        self.assertTrue(replay.cost_ready[0, 0])
+        self.assertEqual(replay.size, 2 * env.num_UAV)
+        self.assertTrue(np.all(replay.not_done[: env.num_UAV, 0] == 1.0))
+        self.assertTrue(np.all(replay.not_done[env.num_UAV :, 0] == 0.0))
+        self.assertEqual(replay.path_cost_size, 1)
+        self.assertEqual(replay.path_cost_value[0, 0], 1.0)
+        self.assertEqual(replay.path_cost_not_done[0, 0], 0.0)
         self.assertEqual(ledger.episode_terminal_cost_sum, 1.0)
         self.assertEqual(stats["COM"]["deadline_violated_packets"], 1)
 
@@ -563,7 +572,7 @@ class CompatibilityAndRegistryTest(unittest.TestCase):
         )
 
     def test_old_boundary_checkpoint_is_rejected_before_restore(self):
-        self.assertEqual(CHECKPOINT_SCHEMA_VERSION, 33)
+        self.assertEqual(CHECKPOINT_SCHEMA_VERSION, 34)
         with self.assertRaisesRegex(RuntimeError, "must be retrained"):
             _validate_checkpoint_schema({"checkpoint_schema_version": 12})
 
@@ -580,7 +589,7 @@ class CompatibilityAndRegistryTest(unittest.TestCase):
                     configuration["movement_replay_contract_version"],
                 )
                 self.assertIn(
-                    "sender-next-state-reward-packet-next-decision-cost",
+                    "all-uav-slot-action-next-slot-state-packet-use-cost",
                     configuration["packet_routing_causality_contract_version"],
                 )
 

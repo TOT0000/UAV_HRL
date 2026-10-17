@@ -9,8 +9,13 @@ from Channel_model import (
     FADING_BLOCK_SECONDS,
     FADING_BLOCKS_PER_ROUTING_SLOT,
     ROUTING_SLOT_SECONDS,
+    S2U_TX_POWER_DBM,
+    U2U_U2G_TX_POWER_DBM,
+    a2g_conditional_path_loss_db,
+    block_capacity_profile_mbps,
     reference_u2g_max_capacity_mbps,
     reference_u2u_max_capacity_mbps,
+    u2u_path_loss_db,
 )
 from centralized_movement import fov_task_geometry, fov_task_metrics
 from communication_contract import normalized_gs_progress
@@ -32,7 +37,7 @@ import numpy as np
 
 
 PACKET_ENGINE_CHECKPOINT_SCHEMA_VERSION = (
-    "episode-boundary-unique-system-outcomes-packet-path-cost-v5"
+    "event-time-generation-service-and-multi-packet-cost-v6"
 )
 
 
@@ -44,6 +49,7 @@ def final_hop_delivered_bits(to_target, gs_id, bits_tx_used):
 
 MAX_PACKET_HOPS = 20
 PACKET_EPS = 1e-9
+EVENT_TIME_EPS = 1e-12
 TASK_DEADLINE_SECONDS = dict(PRODUCTION_TASK_DEADLINE_SECONDS)
 EPISODE_INJECTION_CUTOFF_SECONDS = PRODUCTION_PACKET_INJECTION_CUTOFF_SECONDS
 
@@ -254,6 +260,10 @@ class PacketEngine:
         self.packet_pool = []
         self.inject_buffer = defaultdict(float)
         self.source_buffer = defaultdict(float)
+        # Authoritative fixed-interval generation clocks.  Future events are
+        # represented only by these clocks and do not become packets until
+        # their event time is reached by the slot event loop.
+        self.generation_clocks = {}
 
         # The global pool is only a lifecycle/statistics index. Forwarding order
         # is owned by one aggregate FIFO per UAV and may mix FOV and COM packets.
@@ -781,6 +791,7 @@ class PacketEngine:
             "bn_counted": False,
             "hop_receiver": None,
             "hop_bits_sent": 0.0,
+            "_hop_service_terms": [],
             "hop_service_start_time": None,
             "hop_queue_delay_s": 0.0,
             "final_hop_accum_bits": 0.0,
@@ -791,6 +802,7 @@ class PacketEngine:
             "terminal_outcome": None,
             "s2u_receiver": None,
             "s2u_bits_sent": 0.0,
+            "_s2u_service_terms": [],
             "routing_eligible_time": None,
             # Diagnostic only; Safe-DDQN cost never follows this field into
             # future slots or packet locations.
@@ -1037,8 +1049,9 @@ class PacketEngine:
         mask[uav_id] = True
         hol = self.get_hol_packet(uav_id)
         if hol is None:
-            mask[:] = False
-            mask[uav_id] = True
+            # Empty queues still preselect a physically legal action.  HOL
+            # fields remain absent/zero in the observation; no fictitious
+            # packet is introduced merely to construct the mask.
             return mask
         locked_receiver = hol.get("hop_receiver") if hol is not None else None
         if locked_receiver is not None:
@@ -1058,6 +1071,7 @@ class PacketEngine:
         *,
         env=None,
         effective_mask=None,
+        wait_seconds=None,
     ):
         """Record one frozen-HOL decision without changing its selected action."""
 
@@ -1075,9 +1089,12 @@ class PacketEngine:
         pkt["routing_wait_slot_count"] = int(
             pkt.get("routing_wait_slot_count", 0)
         ) + 1
+        resolved_wait_seconds = float(
+            self.step_time if wait_seconds is None else wait_seconds
+        )
         pkt["routing_wait_seconds"] = float(
             pkt.get("routing_wait_seconds", 0.0)
-        ) + float(self.step_time)
+        ) + resolved_wait_seconds
 
         if effective_mask is None:
             raise RuntimeError(
@@ -1126,7 +1143,7 @@ class PacketEngine:
         ) + 1
         pkt["locked_receiver_out_of_range_wait_seconds"] = float(
             pkt.get("locked_receiver_out_of_range_wait_seconds", 0.0)
-        ) + float(self.step_time)
+        ) + resolved_wait_seconds
 
     def record_hop_transmission(self, pkt, sender, receiver, bits):
         """Apply partial hop service while keeping the packet at its sender."""
@@ -1147,8 +1164,12 @@ class PacketEngine:
             pkt["hop_receiver"] = receiver
         remaining = max(float(pkt["rem_bits"]), 0.0)
         used = min(bits, remaining)
-        pkt["rem_bits"] = max(remaining - used, 0.0)
-        pkt["hop_bits_sent"] = float(pkt.get("hop_bits_sent", 0.0)) + used
+        service_terms = pkt.setdefault("_hop_service_terms", [])
+        service_terms.append(used)
+        hop_bits_sent = math.fsum(service_terms)
+        size_bits = float(pkt["size_bits"])
+        pkt["hop_bits_sent"] = min(hop_bits_sent, size_bits)
+        pkt["rem_bits"] = max(size_bits - hop_bits_sent, 0.0)
         self._decrease_backlog(sender, used)
         if pkt["rem_bits"] > PACKET_EPS:
             self.partial_transmissions += 1
@@ -1174,6 +1195,7 @@ class PacketEngine:
         pkt["current"] = receiver
         pkt["hop_receiver"] = None
         pkt["hop_bits_sent"] = 0.0
+        pkt["_hop_service_terms"] = []
         pkt["hop_service_start_time"] = None
         pkt["hop_queue_delay_s"] = 0.0
         if self.enable_packet_diagnostic_artifacts:
@@ -1291,7 +1313,7 @@ class PacketEngine:
                 return False
             deadline_abs = float(deadline_abs)
             return (
-                current_time >= deadline_abs - PACKET_EPS
+                current_time >= deadline_abs
                 if inclusive
                 else current_time > deadline_abs + PACKET_EPS
             )
@@ -1424,7 +1446,17 @@ class PacketEngine:
         if total_backlog_bits is None:
             total_backlog_bits = float(self.backlog_bits.get(sender, 0.0))
         total_backlog_bits = max(float(total_backlog_bits), 0.0)
-        backlog_tolerance_bits = 1e-6
+        backlog_tolerance_bits = max(
+            1e-6,
+            32.0
+            * math.ulp(
+                max(
+                    abs(total_backlog_bits),
+                    abs(hol_remaining_bits),
+                    1.0,
+                )
+            ),
+        )
 
         if total_backlog_bits + backlog_tolerance_bits < hol_remaining_bits:
             raise AssertionError(
@@ -1554,7 +1586,11 @@ class PacketEngine:
         block_capacity_profiles=None,
         resolved_active_links=None,
     ):
-        """Serve SR FIFO uploads with partial HOL locks and next-slot causality."""
+        """Legacy low-level frozen-slot helper retained for compatibility tests.
+
+        Formal training and evaluation use ``serve_event_driven_slot`` and do
+        not use this helper's historical next-slot relay causality.
+        """
 
         current_time = float(current_time)
         slot_end = current_time + float(self.step_time)
@@ -2182,6 +2218,924 @@ class PacketEngine:
         result["charged_snapshot_packet_ids"] = ()
         return result
 
+    def _resolved_packet_rates(
+        self,
+        env,
+        *,
+        base_fov_rate=5,
+        base_ctrl_rate=COM_PACKET_RATE_PER_SECOND,
+        rate_overrides=None,
+    ):
+        """Return effective deterministic packet rates after all overrides."""
+
+        traffic_primitives = getattr(env, "traffic_primitives", {})
+        rates = {
+            "FOV": float(
+                traffic_primitives.get(
+                    "base_fov_packets_per_second", base_fov_rate
+                )
+            ),
+            "COM": float(
+                traffic_primitives.get(
+                    "base_com_packets_per_second", base_ctrl_rate
+                )
+            ),
+        }
+        if rate_overrides is not None:
+            for task in rates:
+                if dict(rate_overrides).get(task) is not None:
+                    rates[task] = float(dict(rate_overrides)[task])
+        load_factor = float(getattr(env, "load_factor", 1.0))
+        rates = {task: value * load_factor for task, value in rates.items()}
+        if any(
+            not np.isfinite(value) or value < 0.0
+            for value in rates.values()
+        ):
+            raise ValueError("packet rates must be finite and non-negative")
+        return rates
+
+    def schedule_generation_events(
+        self,
+        env,
+        current_time,
+        *,
+        step_time=None,
+        base_fov_rate=5,
+        base_ctrl_rate=COM_PACKET_RATE_PER_SECOND,
+        rate_overrides=None,
+    ):
+        """Schedule, but do not materialize, fixed-interval packet arrivals."""
+
+        slot_start = float(current_time)
+        duration = self.step_time if step_time is None else float(step_time)
+        if not np.isclose(duration, self.step_time, rtol=0.0, atol=1e-12):
+            raise ValueError("generation interval must match the routing slot")
+        slot_end = slot_start + duration
+        rates = self._resolved_packet_rates(
+            env,
+            base_fov_rate=base_fov_rate,
+            base_ctrl_rate=base_ctrl_rate,
+            rate_overrides=rate_overrides,
+        )
+        events = []
+
+        fov_assignments = {
+            (
+                f"FOV:{int(uav_id)}:{int(task['target_obj_id'])}:"
+                f"{task.get('target_id')}"
+            ): (int(uav_id), deepcopy(task))
+            for uav_id in sorted(env.source_uavs)
+            for task in env.multi_tasks.get(uav_id, [])
+            if task["task_type"] == "FOV"
+        }
+        live_keys = set(fov_assignments)
+        for key in list(self.generation_clocks):
+            if key.startswith("FOV:") and key not in live_keys:
+                del self.generation_clocks[key]
+
+        for key, (uav_id, task) in sorted(fov_assignments.items()):
+            rate = rates["FOV"]
+            geometry = fov_task_geometry(env, uav_id, task)
+            if rate <= 0.0 or not geometry.sensing_valid_now:
+                self.generation_clocks.pop(key, None)
+                continue
+            interval = 1.0 / rate
+            clock = self.generation_clocks.get(key)
+            if clock is None or not np.isclose(
+                float(clock.get("rate_packets_per_second", -1.0)),
+                rate,
+                rtol=0.0,
+                atol=1e-12,
+            ):
+                clock = {
+                    "kind": "FOV",
+                    "rate_packets_per_second": rate,
+                    "next_time_seconds": slot_start + interval,
+                }
+                self.generation_clocks[key] = clock
+            next_time = float(clock["next_time_seconds"])
+            while (
+                next_time <= slot_end + EVENT_TIME_EPS
+                and next_time
+                <= self.injection_cutoff_seconds + EVENT_TIME_EPS
+            ):
+                event_time = min(
+                    next_time, slot_end, self.injection_cutoff_seconds
+                )
+                events.append(
+                    {
+                        "time_seconds": event_time,
+                        "kind": "FOV",
+                        "key": key,
+                        "uav_id": uav_id,
+                        "task": deepcopy(task),
+                    }
+                )
+                next_time += interval
+            clock["next_time_seconds"] = next_time
+
+        # COM activation is persistent, but generation starts one full interval
+        # after the actual activation boundary.  No fractional credit is kept.
+        available_com_keys = {
+            f"SR_{int(sr.id)}_COM"
+            for sr in getattr(env, "SR_teams", ())
+            if getattr(sr, "assigned_gt_id", None) is not None
+        }
+        for key in list(self.generation_clocks):
+            if (
+                key.startswith("SR_")
+                and key.endswith("_COM")
+                and key not in available_com_keys
+            ):
+                del self.generation_clocks[key]
+        for sr in sorted(getattr(env, "SR_teams", ()), key=lambda item: item.id):
+            if getattr(sr, "assigned_gt_id", None) is None:
+                continue
+            sr_id = int(sr.id)
+            session = self.com_sessions.setdefault(
+                sr_id,
+                {"session_active": False, "activation_time_seconds": None},
+            )
+            assigned_uav = self.assigned_com_uav(env, sr_id)
+            if (
+                not session["session_active"]
+                and assigned_uav is not None
+                and env.is_s2u_in_range(sr_id, assigned_uav)
+            ):
+                session["session_active"] = True
+                session["activation_time_seconds"] = slot_start
+            key = f"SR_{sr_id}_COM"
+            if not session["session_active"] or rates["COM"] <= 0.0:
+                # A paused/unavailable source earns no interval credit.  The
+                # COM session remains activated, but resumption starts a new
+                # full interval from the current slot boundary.
+                self.generation_clocks.pop(key, None)
+                continue
+            rate = rates["COM"]
+            interval = 1.0 / rate
+            clock = self.generation_clocks.get(key)
+            if clock is None or not np.isclose(
+                float(clock.get("rate_packets_per_second", -1.0)),
+                rate,
+                rtol=0.0,
+                atol=1e-12,
+            ):
+                clock = {
+                    "kind": "COM",
+                    "rate_packets_per_second": rate,
+                    "next_time_seconds": slot_start + interval,
+                }
+                self.generation_clocks[key] = clock
+            next_time = float(clock["next_time_seconds"])
+            while (
+                next_time <= slot_end + EVENT_TIME_EPS
+                and next_time
+                <= self.injection_cutoff_seconds + EVENT_TIME_EPS
+            ):
+                event_time = min(
+                    next_time, slot_end, self.injection_cutoff_seconds
+                )
+                events.append(
+                    {
+                        "time_seconds": event_time,
+                        "kind": "COM",
+                        "key": key,
+                        "sr_id": sr_id,
+                    }
+                )
+                next_time += interval
+            clock["next_time_seconds"] = next_time
+
+        return sorted(
+            events,
+            key=lambda event: (
+                float(event["time_seconds"]),
+                str(event["kind"]),
+                str(event["key"]),
+            ),
+        )
+
+    def materialize_generation_event(self, env, event):
+        """Create one packet exactly at its scheduled physical event time."""
+
+        event_time = float(event["time_seconds"])
+        if event_time > self.injection_cutoff_seconds + EVENT_TIME_EPS:
+            return None
+        if event["kind"] == "COM":
+            sr_id = int(event["sr_id"])
+            session = self.com_sessions.get(sr_id, {})
+            sr = next(
+                (
+                    item
+                    for item in getattr(env, "SR_teams", ())
+                    if int(item.id) == sr_id
+                ),
+                None,
+            )
+            if (
+                sr is None
+                or getattr(sr, "assigned_gt_id", None) is None
+                or not bool(session.get("session_active", False))
+            ):
+                return None
+            return self.create_sr_packet(
+                sr_id, COM_PACKET_SIZE_BITS, event_time
+            )
+
+        uav_id = int(event["uav_id"])
+        task = event["task"]
+        still_assigned = any(
+            candidate.get("task_type") == "FOV"
+            and int(candidate.get("target_obj_id", -1))
+            == int(task.get("target_obj_id", -2))
+            and candidate.get("target_id") == task.get("target_id")
+            for candidate in env.multi_tasks.get(uav_id, [])
+        )
+        if uav_id not in env.source_uavs or not still_assigned:
+            return None
+        geometry = fov_task_geometry(env, uav_id, task)
+        if not geometry.sensing_valid_now:
+            return None
+        image_quantity = float(geometry.image_quantity)
+        packet_bits = fov_physical_packet_size_bits(image_quantity)
+        if (
+            not math.isfinite(image_quantity)
+            or image_quantity <= 0.0
+            or not math.isfinite(packet_bits)
+            or packet_bits <= 0.0
+        ):
+            raise ValueError(
+                "valid VS geometry must yield positive finite packet size"
+            )
+        return self.create_packet(
+            uav_id,
+            "FOV",
+            packet_bits,
+            event_time,
+            capture_coverage_ratio=sanitize_capture_coverage_ratio(
+                geometry.coverage_ratio
+            ),
+            capture_image_quantity=image_quantity,
+            capture_roi_id=task["target_obj_id"],
+            capture_task_id=task.get("target_id"),
+        )
+
+    @staticmethod
+    def _event_result():
+        return {
+            "reward_by_sender": defaultdict(float),
+            "cost_by_sender": defaultdict(float),
+            "timely_goodput_bits": 0.0,
+            "total_timely_useful_bits": 0.0,
+            "fov_timely_delivered_raw_bits": 0.0,
+            "fov_timely_useful_bits": 0.0,
+            "com_timely_delivered_bits": 0.0,
+            "raw_final_hop_bits": 0.0,
+            "transmitted_bits_by_link": defaultdict(float),
+            "relay_arrivals": [],
+            "s2u_arrivals": [],
+            "outcomes": [],
+            "packet_decision_uses": [],
+            "resource_segments": [],
+            "generated_packet_ids": [],
+        }
+
+    @staticmethod
+    def _outcome_from_violation(event):
+        return {
+            "attributed_sender": int(event["attributed_sender"]),
+            "routing_transition_id": event.get("routing_transition_id"),
+            "task_type": event["task_type"],
+            "packet_id": int(event["packet_id"]),
+            "violated": True,
+            "packet": event["packet"],
+        }
+
+    def _event_complete_s2u(self, pkt, sr_id, receiver, completion_time, result):
+        queue = self.sr_queues[int(sr_id)]
+        if not queue or queue[0] is not pkt:
+            raise AssertionError("completed S2U packet was not SR FIFO HOL")
+        queue.popleft()
+        pkt["_queued_sr"] = None
+        pkt["s2u_completion_time"] = float(completion_time)
+        service_start = float(
+            pkt.get("s2u_service_start_time", completion_time)
+        )
+        queue_delay = float(pkt.get("s2u_queue_delay_s", 0.0))
+        pkt.setdefault("per_hop", []).append(
+            {
+                "from": f"SR:{int(sr_id)}",
+                "to": int(receiver),
+                "queue_s": queue_delay,
+                "tx_s": max(float(completion_time) - service_start, 0.0),
+                "actual_tx_s": float(pkt.get("s2u_actual_tx_seconds", 0.0)),
+                "delay_ms": max(
+                    float(completion_time) - float(pkt["generation_time"]), 0.0
+                )
+                * 1e3,
+                "link_type": "S2U",
+            }
+        )
+        pkt["path"].append(int(receiver))
+        pkt["rem_bits"] = float(pkt["size_bits"])
+        pkt["s2u_receiver"] = None
+        pkt["s2u_service_start_time"] = None
+        pkt["s2u_queue_delay_s"] = 0.0
+        pkt["_s2u_service_terms"] = []
+        self._mark_routing_stage_eligible(pkt, completion_time)
+        self.enqueue_packet(pkt, receiver, completion_time)
+        self.s2u_completed_packets += 1
+        result["s2u_arrivals"].append(pkt)
+
+    def _event_complete_uav_hop(
+        self, env, pkt, sender, receiver, completion_time, result
+    ):
+        queue_delay = float(pkt.get("hop_queue_delay_s", 0.0))
+        service_start = float(pkt.get("hop_service_start_time", completion_time))
+        task_type = self._task_norm(pkt.get("task_type", "COM"))
+        pkt.setdefault("per_hop", []).append(
+            {
+                "from": int(sender),
+                "to": int(receiver),
+                "queue_s": queue_delay,
+                "tx_s": max(float(completion_time) - service_start, 0.0),
+                "actual_tx_s": float(
+                    pkt.get("current_hop_actual_tx_seconds", 0.0)
+                ),
+                "delay_ms": (
+                    queue_delay
+                    + max(float(completion_time) - service_start, 0.0)
+                )
+                * 1e3,
+                "link_type": (
+                    "U2G" if int(receiver) == int(env.GS_ID) else "U2U"
+                ),
+            }
+        )
+        delay_accum = self.type_delay_accum[task_type]
+        delay_accum["sum_queue"] += queue_delay
+        delay_accum["sum_tx"] += max(
+            float(completion_time) - service_start, 0.0
+        )
+        delay_accum["sum_total"] += queue_delay + max(
+            float(completion_time) - service_start, 0.0
+        )
+        delay_accum["count"] += 1
+        arrival = self.detach_completed_hop(
+            pkt, sender, receiver, completion_time
+        )
+        if int(receiver) != int(env.GS_ID):
+            if int(pkt.get("hops", 0)) >= MAX_PACKET_HOPS:
+                violation = self._mark_deadline_violation(
+                    pkt,
+                    completion_time,
+                    sender=sender,
+                    remove_from_queue=False,
+                    reason="max_hops",
+                )
+                if violation is not None:
+                    result["outcomes"].append(
+                        self._outcome_from_violation(violation)
+                    )
+                return
+            pkt["rem_bits"] = float(pkt["size_bits"])
+            self.enqueue_packet(pkt, receiver, completion_time)
+            result["relay_arrivals"].append(arrival)
+            return
+
+        pkt["e2e_delay_ms"] = max(
+            float(completion_time)
+            - float(pkt.get("generation_time", completion_time)),
+            0.0,
+        ) * 1e3
+        deadline_abs = float(pkt.get("deadline_abs", float("inf")))
+        if float(completion_time) > deadline_abs:
+            violation = self._mark_deadline_violation(
+                pkt,
+                completion_time,
+                sender=sender,
+                remove_from_queue=False,
+                reason="late_delivered",
+            )
+            if violation is not None:
+                result["outcomes"].append(
+                    self._outcome_from_violation(violation)
+                )
+            return
+
+        if not pkt.get("timely_goodput_counted", False):
+            physical_bits = float(pkt["size_bits"])
+            if task_type == "FOV":
+                coverage = sanitize_capture_coverage_ratio(
+                    pkt.get("capture_coverage_ratio", 0.0)
+                )
+                useful_bits = physical_bits * coverage
+                self.fov_timely_delivered_raw_bits += physical_bits
+                self.fov_timely_useful_bits += useful_bits
+                result["fov_timely_delivered_raw_bits"] += physical_bits
+                result["fov_timely_useful_bits"] += useful_bits
+            else:
+                useful_bits = physical_bits
+                self.com_timely_delivered_bits += physical_bits
+                result["com_timely_delivered_bits"] += physical_bits
+            pkt["timely_goodput_counted"] = True
+            pkt["timely_delivered_raw_bits"] = physical_bits
+            pkt["timely_useful_bits"] = useful_bits
+            self.total_timely_useful_bits += useful_bits
+            self.timely_goodput_bits += useful_bits
+            result["total_timely_useful_bits"] += useful_bits
+            result["timely_goodput_bits"] += useful_bits
+        self.total_delivered += 1
+        if task_type == "FOV":
+            self.fov_delivered += 1
+        else:
+            self.com_delivered += 1
+        self.mark_packet_done(
+            pkt,
+            current_time=completion_time,
+            reason="delivered",
+            remove_from_queue=False,
+        )
+        result["outcomes"].append(
+            {
+                "attributed_sender": int(sender),
+                "task_type": task_type,
+                "packet_id": int(pkt["id"]),
+                "violated": False,
+                "packet": pkt,
+            }
+        )
+
+    def serve_event_driven_slot(
+        self,
+        env,
+        actions,
+        current_time,
+        *,
+        generation_events=(),
+        observed_hol_by_sender=None,
+        observed_backlog_bits_by_sender=None,
+        routing_transition_ids_by_sender=None,
+        effective_masks_by_sender=None,
+    ):
+        """Advance one slot by physical generation/service/deadline events.
+
+        All UAV actions are fixed at the slot boundary.  Only links whose
+        current FIFO HOL can actually use that action enter equal-FDMA.  A
+        bandwidth change recomputes capacity from the already sampled fading
+        gain for the current 5 ms block; it never samples the channel again.
+        """
+
+        slot_start = float(current_time)
+        slot_end = slot_start + float(self.step_time)
+        actions = {
+            int(sender): int(receiver)
+            for sender, receiver in dict(actions).items()
+        }
+        if set(actions) != set(range(self.num_UAV)):
+            raise AssertionError("event service requires one action for every UAV")
+        observed_hol = dict(observed_hol_by_sender or {})
+        observed_backlog = dict(observed_backlog_bits_by_sender or {})
+        transition_ids = {
+            int(sender): int(transition_id)
+            for sender, transition_id in dict(
+                routing_transition_ids_by_sender or {}
+            ).items()
+        }
+        effective_masks = {
+            int(sender): np.asarray(mask, dtype=bool)
+            for sender, mask in dict(effective_masks_by_sender or {}).items()
+        }
+        result = self._event_result()
+        for sender in actions:
+            result["reward_by_sender"][sender] = 0.0
+            result["cost_by_sender"][sender] = 0.0
+        self.wait_actions += sum(
+            int(sender == receiver) for sender, receiver in actions.items()
+        )
+
+        events = list(generation_events)
+        event_index = 0
+        decision_use_keys = set()
+        decision_diagnostic_keys = set()
+        s2u_diagnostic_opportunities = {}
+        s2u_diagnostic_serviced_packet_ids = set()
+        event_clock = [slot_start]
+
+        def observe_s2u_hol(sr_id, pkt, resolved_links=None, profiles=None):
+            if not self.enable_packet_diagnostic_artifacts or pkt is None:
+                return
+            packet_id = int(pkt["id"])
+            if packet_id not in s2u_diagnostic_opportunities:
+                pkt["s2u_hol_opportunity_slot_count"] = int(
+                    pkt.get("s2u_hol_opportunity_slot_count", 0)
+                ) + 1
+                s2u_diagnostic_opportunities[packet_id] = {
+                    "packet": pkt,
+                    "reason": "s2u_hol_no_receiver_slot_count",
+                    "settled": False,
+                }
+            receiver = pkt.get("s2u_receiver")
+            if receiver is None:
+                receiver = self.assigned_com_uav(env, sr_id)
+            if receiver is None:
+                reason = "s2u_hol_no_receiver_slot_count"
+            elif not env.is_s2u_in_range(sr_id, receiver):
+                reason = "s2u_hol_receiver_out_of_range_slot_count"
+            elif dict(resolved_links or {}).get(int(sr_id)) != int(receiver):
+                reason = "s2u_hol_no_active_link_slot_count"
+            else:
+                profile = np.asarray(
+                    dict(profiles or {}).get((int(sr_id), int(receiver)), ()),
+                    dtype=np.float64,
+                )
+                positive = bool(
+                    profile.shape == (FADING_BLOCKS_PER_ROUTING_SLOT,)
+                    and np.all(np.isfinite(profile))
+                    and np.any(profile > 0.0)
+                )
+                reason = (
+                    "s2u_hol_positive_capacity_but_no_service_slot_count"
+                    if positive
+                    else "s2u_hol_no_positive_capacity_slot_count"
+                )
+            s2u_diagnostic_opportunities[packet_id]["reason"] = reason
+
+        def register_decision_use(sender, pkt):
+            sender = int(sender)
+            transition_id = transition_ids.get(sender)
+            if transition_id is None or pkt is None:
+                return
+            key = (int(pkt["id"]), transition_id)
+            if key not in decision_use_keys:
+                decision_use_keys.add(key)
+                result["packet_decision_uses"].append(
+                    {
+                        "packet_id": int(pkt["id"]),
+                        "transition_id": transition_id,
+                        "sender_uav_id": sender,
+                    }
+                )
+            if (
+                self.enable_packet_diagnostic_artifacts
+                and key not in decision_diagnostic_keys
+            ):
+                decision_diagnostic_keys.add(key)
+                self._record_routing_decision_diagnostics(
+                    pkt,
+                    sender,
+                    actions[sender],
+                    env=env,
+                    effective_mask=effective_masks.get(sender),
+                    wait_seconds=max(
+                        min(
+                            slot_end,
+                            float(pkt.get("deadline_abs", slot_end)),
+                        )
+                        - float(event_clock[0]),
+                        0.0,
+                    ),
+                )
+
+        def active_links():
+            uav_links = {}
+            for sender, receiver in actions.items():
+                pkt = self.get_hol_packet(sender)
+                if pkt is None:
+                    continue
+                register_decision_use(sender, pkt)
+                pkt["last_routing_sender"] = sender
+                locked = pkt.get("hop_receiver")
+                if receiver == sender:
+                    continue
+                if locked is not None and int(locked) != receiver:
+                    continue
+                if not env.is_routing_link_in_range(sender, receiver):
+                    continue
+                uav_links[sender] = receiver
+            for sr_id in sorted(self.sr_queues):
+                observe_s2u_hol(sr_id, self.get_sr_hol_packet(sr_id))
+            return uav_links, self.active_s2u_links(env)
+
+        # Reward uses only information visible at action selection.  An empty
+        # observation has neutral reward; later packets may still attach cost
+        # causality to the already selected action.
+        initial_uav_links, initial_s2u_links = active_links()
+        initial_capacities, initial_bandwidths = env.allocate_active_link_capacities(
+            initial_uav_links, s2u_links=initial_s2u_links
+        )
+        allocation_key = (
+            tuple(sorted(initial_uav_links.items())),
+            tuple(sorted(initial_s2u_links.items())),
+        )
+        cached_capacities = dict(initial_capacities)
+        cached_bandwidths = dict(initial_bandwidths)
+        cached_uav_profiles = dict(env.active_link_capacity_profiles_mbps)
+        cached_s2u_profiles = dict(env.active_s2u_capacity_profiles_mbps)
+        for sender, receiver in actions.items():
+            pkt = observed_hol.get(sender)
+            if pkt is None:
+                continue
+            result["reward_by_sender"][sender] = self.routing_local_reward(
+                env,
+                sender,
+                receiver,
+                float(initial_capacities.get((sender, receiver), 0.0)),
+                pkt=pkt,
+                current_time=slot_start,
+                total_backlog_bits=float(
+                    observed_backlog.get(
+                        sender, self.backlog_bits.get(sender, 0.0)
+                    )
+                ),
+            )
+
+        def settle_s2u_no_service(packet_id):
+            diagnostic = s2u_diagnostic_opportunities.get(int(packet_id))
+            if (
+                diagnostic is None
+                or diagnostic["settled"]
+                or int(packet_id) in s2u_diagnostic_serviced_packet_ids
+            ):
+                return
+            pkt = diagnostic["packet"]
+            counter = diagnostic["reason"]
+            pkt[counter] = int(pkt.get(counter, 0)) + 1
+            diagnostic["settled"] = True
+
+        def append_expirations(moment):
+            # Outcome rows snapshot diagnostics inside mark_packet_done().
+            # Settle a current-slot S2U opportunity before that snapshot when
+            # the deadline itself terminates the HOL packet.
+            for pkt in self.get_active_packets():
+                deadline_abs = pkt.get("deadline_abs")
+                if (
+                    deadline_abs is not None
+                    and float(deadline_abs) <= float(moment)
+                ):
+                    settle_s2u_no_service(pkt["id"])
+            for violation in self.expire_packets(moment, inclusive=True):
+                result["outcomes"].append(
+                    self._outcome_from_violation(violation)
+                )
+
+        def materialize_due(moment):
+            nonlocal event_index
+            while (
+                event_index < len(events)
+                and float(events[event_index]["time_seconds"])
+                <= float(moment)
+            ):
+                env.current_time = float(events[event_index]["time_seconds"])
+                pkt = self.materialize_generation_event(
+                    env, events[event_index]
+                )
+                if pkt is not None:
+                    result["generated_packet_ids"].append(int(pkt["id"]))
+                event_index += 1
+
+        t = slot_start
+        materialize_due(t)
+        append_expirations(t)
+        iteration_count = 0
+        while t < slot_end:
+            iteration_count += 1
+            if iteration_count > 100000:
+                raise RuntimeError("event service exceeded the zero-time loop guard")
+            env.current_time = t
+            event_clock[0] = t
+            uav_links, s2u_links = active_links()
+            current_allocation_key = (
+                tuple(sorted(uav_links.items())),
+                tuple(sorted(s2u_links.items())),
+            )
+            if current_allocation_key != allocation_key:
+                capacities, bandwidths = env.allocate_active_link_capacities(
+                    uav_links, s2u_links=s2u_links
+                )
+                allocation_key = current_allocation_key
+                cached_capacities = dict(capacities)
+                cached_bandwidths = dict(bandwidths)
+                cached_uav_profiles = dict(
+                    env.active_link_capacity_profiles_mbps
+                )
+                cached_s2u_profiles = dict(
+                    env.active_s2u_capacity_profiles_mbps
+                )
+            capacities = cached_capacities
+            bandwidths = cached_bandwidths
+            uav_profiles = cached_uav_profiles
+            s2u_profiles = cached_s2u_profiles
+            # The allocator is authoritative: it may remove a candidate whose
+            # physical range ceased to be serviceable.  Only returned profiles
+            # consume FDMA or enter service, while diagnostics still classify
+            # the unallocated candidate as unavailable.
+            allocated_s2u_links = {
+                int(sr_id): int(receiver)
+                for sr_id, receiver in s2u_profiles
+            }
+            for sr_id, receiver in s2u_links.items():
+                observe_s2u_hol(
+                    sr_id,
+                    self.get_sr_hol_packet(sr_id),
+                    resolved_links=allocated_s2u_links,
+                    profiles=s2u_profiles,
+                )
+            block_index = min(
+                int(math.floor((t - slot_start + 1e-12) / FADING_BLOCK_SECONDS)),
+                FADING_BLOCKS_PER_ROUTING_SLOT - 1,
+            )
+            block_end = min(
+                slot_start + (block_index + 1) * FADING_BLOCK_SECONDS,
+                slot_end,
+            )
+            next_generation = (
+                float(events[event_index]["time_seconds"])
+                if event_index < len(events)
+                else float("inf")
+            )
+            active_packets = self.get_active_packets()
+            next_deadline = min(
+                (
+                    float(pkt["deadline_abs"])
+                    for pkt in active_packets
+                    if float(pkt["deadline_abs"]) > t
+                ),
+                default=float("inf"),
+            )
+            rates_bps = {}
+            packets_by_link = {}
+            for (sender, receiver), cached_profile in uav_profiles.items():
+                profile = np.asarray(cached_profile, dtype=np.float64)
+                rate = float(profile[block_index]) * 1e6
+                if rate > PACKET_EPS:
+                    link = (sender, receiver)
+                    rates_bps[link] = rate
+                    packets_by_link[link] = self.get_hol_packet(sender)
+            for (sr_id, receiver), cached_profile in s2u_profiles.items():
+                profile = np.asarray(cached_profile, dtype=np.float64)
+                rate = float(profile[block_index]) * 1e6
+                if rate > PACKET_EPS:
+                    link = ("S2U", sr_id, receiver)
+                    rates_bps[link] = rate
+                    packets_by_link[link] = self.get_sr_hol_packet(sr_id)
+            completion_times = {}
+            for link, pkt in packets_by_link.items():
+                if pkt is None:
+                    continue
+                completion_time = (
+                    t
+                    + max(float(pkt.get("rem_bits", 0.0)), 0.0)
+                    / rates_bps[link]
+                )
+                # Very small residuals can round t + dt back to t.  Advance
+                # by one representable instant so the normal service path
+                # consumes and closes the packet without inventing a fixed
+                # minimum hop duration.
+                if completion_time <= t:
+                    completion_time = float(np.nextafter(t, float("inf")))
+                completion_times[link] = completion_time
+            next_completion = min(completion_times.values(), default=float("inf"))
+            next_time = min(
+                slot_end,
+                block_end,
+                next_generation,
+                next_deadline,
+                next_completion,
+            )
+            if next_time <= t:
+                # Exact-boundary events are processed without fabricating a
+                # minimum hop duration.  Do not use the deadline tolerance as
+                # a minimum event duration: a positive sub-nanosecond service
+                # interval is still real service and must drain the residual
+                # bits instead of spinning on the same completion event.
+                materialize_due(t)
+                append_expirations(t)
+                if block_end <= t:
+                    t = min(float(np.nextafter(t, float("inf"))), slot_end)
+                continue
+            duration = next_time - t
+            result["resource_segments"].append(
+                {
+                    "start_time_seconds": t,
+                    "end_time_seconds": next_time,
+                    "active_link_count": len(rates_bps),
+                    "bandwidth_hz_by_link": {
+                        str(key): float(value)
+                        for key, value in sorted(
+                            bandwidths.items(), key=lambda item: str(item[0])
+                        )
+                    },
+                    "fading_block_index": block_index,
+                }
+            )
+            completed = []
+            for link in sorted(rates_bps, key=str):
+                pkt = packets_by_link[link]
+                if pkt is None or pkt.get("done", False):
+                    continue
+                bits = min(
+                    max(float(pkt.get("rem_bits", 0.0)), 0.0),
+                    rates_bps[link] * duration,
+                )
+                # A floating-point residual smaller than PACKET_EPS is still
+                # real traffic.  Consuming it here lets the normal completion
+                # path close the hop at the next representable event instant;
+                # treating it as zero would repeatedly schedule the same
+                # completion and eventually trip the zero-time loop guard.
+                if bits <= 0.0:
+                    continue
+                if link[0] == "S2U":
+                    _, sr_id, receiver = link
+                    if pkt.get("s2u_receiver") is None:
+                        pkt["s2u_receiver"] = int(receiver)
+                    if float(pkt.get("s2u_bits_sent", 0.0)) <= PACKET_EPS:
+                        pkt["s2u_service_start_time"] = t
+                        pkt["s2u_queue_delay_s"] = max(
+                            t - float(pkt["generation_time"]), 0.0
+                        )
+                    service_terms = pkt.setdefault("_s2u_service_terms", [])
+                    service_terms.append(bits)
+                    s2u_bits_sent = math.fsum(service_terms)
+                    size_bits = float(pkt["size_bits"])
+                    pkt["s2u_bits_sent"] = min(s2u_bits_sent, size_bits)
+                    pkt["rem_bits"] = max(size_bits - s2u_bits_sent, 0.0)
+                    pkt["s2u_actual_tx_seconds"] = float(
+                        pkt.get("s2u_actual_tx_seconds", 0.0)
+                    ) + duration
+                    packet_id = int(pkt["id"])
+                    if (
+                        self.enable_packet_diagnostic_artifacts
+                        and packet_id
+                        not in s2u_diagnostic_serviced_packet_ids
+                    ):
+                        pkt["s2u_hol_service_slot_count"] = int(
+                            pkt.get("s2u_hol_service_slot_count", 0)
+                        ) + 1
+                        s2u_diagnostic_serviced_packet_ids.add(packet_id)
+                    self.s2u_backlog_bits[int(sr_id)] = max(
+                        self.s2u_backlog_bits[int(sr_id)] - bits, 0.0
+                    )
+                    result["transmitted_bits_by_link"][link] += bits
+                else:
+                    sender, receiver = link
+                    if float(pkt.get("hop_bits_sent", 0.0)) <= PACKET_EPS:
+                        pkt["hop_service_start_time"] = t
+                        pkt["hop_queue_delay_s"] = max(
+                            t - float(pkt.get("queue_enter_time", t)), 0.0
+                        )
+                    self.record_hop_transmission(
+                        pkt, sender, receiver, bits
+                    )
+                    pkt["current_hop_actual_tx_seconds"] = float(
+                        pkt.get("current_hop_actual_tx_seconds", 0.0)
+                    ) + duration
+                    pkt["cumulative_actual_uav_tx_seconds"] = float(
+                        pkt.get("cumulative_actual_uav_tx_seconds", 0.0)
+                    ) + duration
+                    result["transmitted_bits_by_link"][link] += bits
+                    if int(receiver) == int(env.GS_ID):
+                        pkt["final_hop_accum_bits"] = float(
+                            pkt.get("final_hop_accum_bits", 0.0)
+                        ) + bits
+                        self.raw_final_hop_bits += bits
+                        result["raw_final_hop_bits"] += bits
+                if float(pkt.get("rem_bits", 0.0)) <= 0.0:
+                    completed.append((link, pkt))
+
+            t = next_time
+            # Full store-and-forward completion is resolved before a deadline
+            # event at the same timestamp, so arrival exactly at the deadline
+            # is timely only when the receiver is the GS.
+            for link, pkt in sorted(completed, key=lambda item: str(item[0])):
+                if pkt.get("done", False):
+                    continue
+                if link[0] == "S2U":
+                    _, sr_id, receiver = link
+                    self._event_complete_s2u(
+                        pkt, sr_id, receiver, t, result
+                    )
+                else:
+                    sender, receiver = link
+                    self._event_complete_uav_hop(
+                        env, pkt, sender, receiver, t, result
+                    )
+            materialize_due(t)
+            append_expirations(t)
+
+        env.current_time = slot_end
+        if self.enable_packet_diagnostic_artifacts:
+            for packet_id, diagnostic in s2u_diagnostic_opportunities.items():
+                settle_s2u_no_service(packet_id)
+        result["transmitted_bits_by_link"] = dict(
+            result["transmitted_bits_by_link"]
+        )
+        result["start_of_slot_routing_sender_ids"] = tuple(
+            sorted(sender for sender, pkt in observed_hol.items() if pkt is not None)
+        )
+        result["charged_snapshot_packet_ids"] = ()
+        return result
+
     def inject_packets(
         self,
         env,
@@ -2346,6 +3300,10 @@ class PacketEngine:
             "inject_buffer": {
                 str(key): float(value)
                 for key, value in sorted(self.inject_buffer.items())
+            },
+            "generation_clocks": {
+                str(key): deepcopy(value)
+                for key, value in sorted(self.generation_clocks.items())
             },
             "source_buffer": {
                 str(key): float(value)
@@ -2963,6 +3921,7 @@ class PacketEngine:
         # 速率積分緩衝清空
         self.inject_buffer.clear()
         self.source_buffer.clear()
+        self.generation_clocks.clear()
         # Dual-Queue backlog tracking
         self.backlog_bits.clear()
         self.uav_queues = {

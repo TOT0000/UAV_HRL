@@ -638,7 +638,7 @@ class PacketRoutingAggregateTest(unittest.TestCase):
         )
         self.assertEqual(
             record["artifact_schema_version"],
-            "uav-hrl-packet-outcomes-jsonl-v6",
+            "uav-hrl-packet-outcomes-jsonl-v7",
         )
         self.assertEqual(
             record["artifact_schema_version"],
@@ -786,6 +786,7 @@ class PacketRoutingNoBehaviorChangeTest(unittest.TestCase):
         engine = PacketEngine(
             num_uav=3,
             step_time=0.25,
+            task_deadlines_seconds={"FOV": 1.0, "COM": 1.0},
             enable_packet_diagnostic_artifacts=diagnostics_enabled,
         )
         packet = engine.create_packet(0, "FOV", 100.0, 0.0)

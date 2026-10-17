@@ -153,22 +153,25 @@ through schema, static, fixed-sample, and empty-probe validation.
 The movement loop captures the current observation before its TD3 action and
 before the first packet injection of that one-second interval. At `t=0` this is
 also before any routing-slot generation. Each 0.25-second routing slot updates
-movement/link geometry, injects VS and activated COM source packets, removes
-packets whose absolute deadline is at or before the slot start, freezes HOL
-routing decisions, serves S2U/UAV links, classifies physical GS completion, and
-then removes unfinished packets whose deadline is at or before slot end. Relay
-arrivals keep the scheduler's next-slot causality. The next movement observation
-is captured after the fourth slot's service and inclusive expiry and before the
-next interval's injection.
+movement/link geometry, schedules future fixed-interval VS and activated COM
+generation events, expires packets at their exact absolute deadlines, and asks
+every UAV to preselect one action. The actions are held for the slot, but only
+links with actual serviceable data consume equal-FDMA bandwidth. Complete
+S2U/U2U arrivals are immediately enqueued and can use the receiver's held
+action for another hop in the same slot. Generation, completion, expiry, and
+5 ms fading boundaries advance one common event clock; future arrivals remain
+invisible until their generation time. The next movement observation is
+captured after the fourth slot's service and expiry and before the next
+interval's future arrivals.
 
 Consequently, snapshot queues contain packets still present at that boundary;
 HOL fields describe only the FIFO head. Empty queues have a false HOL-valid flag
-and zero padding. Inclusive boundary expiry means a retained packet normally has
-a positive remaining deadline (apart from the packet epsilon); violation counts
-are historical outcomes and do not imply an expired packet remains in the
-snapshot. This trace follows `_run_routing_slot()` and the interval observation
-sites in `HRL_task_aware.py`, `PacketEngine.inject_packets()`,
-`PacketEngine.serve_active_links()`/`expire_packets()` in
+and zero padding. Inclusive boundary expiry has no grace period, so a retained
+packet has a positive remaining deadline; violation counts are historical
+outcomes and do not imply an expired packet remains in the snapshot. This trace
+follows `_run_routing_slot()` and the interval observation
+sites in `HRL_task_aware.py`, `PacketEngine.schedule_generation_events()`,
+`PacketEngine.serve_event_driven_slot()`/`expire_packets()` in
 `Packet_scheduler_v1.py`, and `capture_replay_snapshot()` in
 `replay_auxiliary.py`.
 

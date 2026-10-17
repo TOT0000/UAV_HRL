@@ -296,7 +296,10 @@ class PermanentGatewayProjectionTest(unittest.TestCase):
 
     def test_gateway_remains_u2u_receiver_and_u2g_sender(self):
         env = _routing_env()
-        engine = PacketEngine(num_uav=3)
+        engine = PacketEngine(
+            num_uav=3,
+            task_deadlines_seconds={"FOV": 1.0, "COM": 1.0},
+        )
         packet = engine.create_packet(1, "COM", 100.0, 0.0)
         engine.serve_active_links(
             env, actions={1: 0}, capacities={(1, 0): 1.0}, current_time=0.0
@@ -346,7 +349,10 @@ class CoverageWeightedUsefulGoodputTest(unittest.TestCase):
 
     def test_capture_snapshot_preserves_full_physical_service_and_useful_bits(self):
         env = _routing_env()
-        engine = PacketEngine(num_uav=3)
+        engine = PacketEngine(
+            num_uav=3,
+            task_deadlines_seconds={"FOV": 1.0, "COM": 1.0},
+        )
         packet = engine.create_packet(
             0, "FOV", 100.0, 0.0, capture_coverage_ratio=0.8
         )

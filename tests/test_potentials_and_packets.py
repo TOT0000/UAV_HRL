@@ -29,7 +29,11 @@ class VisualSensingPacketGenerationTest(unittest.TestCase):
         self.env = Simulator(num_UAV=16)
         self.env.num_GT = 2
         self.env.reset_environment()
-        self.packet_engine = PacketEngine(num_uav=16, step_time=0.25)
+        self.packet_engine = PacketEngine(
+            num_uav=16,
+            step_time=0.25,
+            task_deadlines_seconds={"FOV": 1.0, "COM": 1.0},
+        )
         self.uav = self.env.uav_dict[0]
         self.target = self.env.gts[0]
         self.uav.x_u = self.target.x

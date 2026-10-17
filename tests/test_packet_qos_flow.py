@@ -23,10 +23,20 @@ def routing_env(num_uav=3):
     )
 
 
+def legacy_service_engine(num_uav=3):
+    """Give compatibility-helper tests enough time to isolate FIFO mechanics."""
+
+    return PacketEngine(
+        num_uav=num_uav,
+        step_time=0.25,
+        task_deadlines_seconds={"FOV": 2.5, "COM": 2.0},
+    )
+
+
 class PacketQosFlowTest(unittest.TestCase):
     def test_fifo_packets_share_one_link_slot_budget(self):
         env = routing_env()
-        engine = PacketEngine(num_uav=3, step_time=0.25)
+        engine = legacy_service_engine()
         packets = [
             engine.create_packet(0, "COM", size, 0.0)
             for size in (30.0, 40.0, 50.0)
@@ -54,7 +64,7 @@ class PacketQosFlowTest(unittest.TestCase):
 
     def test_wait_does_not_transmit_or_consume_a_link_budget(self):
         env = routing_env()
-        engine = PacketEngine(num_uav=3, step_time=0.25)
+        engine = legacy_service_engine()
         packet = engine.create_packet(0, "COM", 100.0, 0.0)
 
         result = engine.serve_active_links(
@@ -67,7 +77,7 @@ class PacketQosFlowTest(unittest.TestCase):
 
     def test_actual_e2e_uses_gs_completion_time_and_is_not_state_estimate(self):
         env = routing_env()
-        engine = PacketEngine(num_uav=3, step_time=0.25)
+        engine = legacy_service_engine()
         packet = engine.create_packet(0, "COM", 100.0, 0.0)
 
         with self.assertRaisesRegex(RuntimeError, "legacy hop-delay.*disabled"):
@@ -97,8 +107,12 @@ class PacketQosFlowTest(unittest.TestCase):
         engine = PacketEngine(num_uav=3, step_time=0.25)
         com = engine.create_packet(0, "COM", 100.0, 0.0)
         fov = engine.create_packet(1, "FOV", 100.0, 0.0)
-        self.assertEqual(com["deadline_abs"], 2.0)
-        self.assertEqual(fov["deadline_abs"], 2.5)
+        self.assertEqual(com["deadline_abs"], 0.010)
+        self.assertEqual(fov["deadline_abs"], 0.015)
+        # The remainder of this compatibility-helper test isolates its exact
+        # completion and late-partial mechanics from the production deadlines.
+        com["deadline_abs"] = 2.0
+        fov["deadline_abs"] = 2.5
 
         timely = engine.serve_active_links(
             env,
@@ -109,7 +123,7 @@ class PacketQosFlowTest(unittest.TestCase):
         self.assertEqual(timely["timely_goodput_bits"], 100.0)
         self.assertEqual(timely["cost_by_sender"][0], 0.0)
 
-        expired_engine = PacketEngine(num_uav=3, step_time=0.25)
+        expired_engine = legacy_service_engine()
         expired = expired_engine.create_packet(0, "COM", 100.0, 0.0)
         missed = expired_engine.serve_active_links(
             env,
@@ -126,7 +140,7 @@ class PacketQosFlowTest(unittest.TestCase):
         self.assertEqual(expired_engine.expire_packets(2.25), [])
         self.assertEqual(expired_engine.deadline_drops, 1)
 
-    def test_injection_cutoff_is_strictly_before_57_5_seconds(self):
+    def test_fixed_event_generation_stops_at_new_deadline_derived_cutoff(self):
         env = SimpleNamespace(
             source_uavs=set(),
             multi_tasks={
@@ -137,33 +151,26 @@ class PacketQosFlowTest(unittest.TestCase):
             is_s2u_in_range=lambda sr_id, uav_id: True,
         )
         engine = PacketEngine(num_uav=1, step_time=0.25)
-        engine.inject_packets(
+        first = engine.schedule_generation_events(
             env,
-            delay_bound_steps=20,
-            current_time=57.25,
+            current_time=59.5,
             step_time=0.25,
             base_ctrl_rate=4,
         )
-        self.assertEqual(engine.active_count(), 1)
-        engine.inject_packets(
+        self.assertEqual([event["time_seconds"] for event in first], [59.75])
+        engine.materialize_generation_event(env, first[0])
+        after_cutoff = engine.schedule_generation_events(
             env,
-            delay_bound_steps=20,
-            current_time=57.5,
+            current_time=59.75,
             step_time=0.25,
             base_ctrl_rate=4,
         )
-        engine.inject_packets(
-            env,
-            delay_bound_steps=20,
-            current_time=59.0,
-            step_time=0.25,
-            base_ctrl_rate=4,
-        )
+        self.assertEqual(after_cutoff, [])
         self.assertEqual(engine.active_count(), 1)
 
     def test_partial_final_hop_is_raw_only_and_timely_goodput_counts_once(self):
         env = routing_env()
-        engine = PacketEngine(num_uav=3, step_time=0.25)
+        engine = legacy_service_engine()
         packet = engine.create_packet(0, "FOV", 100.0, 0.0)
 
         partial = engine.serve_active_links(
@@ -198,9 +205,9 @@ class PacketQosFlowTest(unittest.TestCase):
         self.assertEqual(engine.timely_goodput_bits, 100.0)
         self.assertTrue(packet["timely_goodput_counted"])
 
-    def test_full_relay_arrival_cannot_forward_again_in_same_slot(self):
+    def test_legacy_frozen_service_helper_defers_relay_arrival(self):
         env = routing_env()
-        engine = PacketEngine(num_uav=3, step_time=0.25)
+        engine = legacy_service_engine()
         packet = engine.create_packet(0, "FOV", 100.0, 0.0)
 
         result = engine.serve_active_links(
@@ -218,7 +225,7 @@ class PacketQosFlowTest(unittest.TestCase):
 
     def test_relay_that_cannot_wait_until_next_slot_emits_one_packet_outcome(self):
         env = routing_env()
-        engine = PacketEngine(num_uav=3, step_time=0.25)
+        engine = legacy_service_engine()
         packet = engine.create_packet(0, "COM", 100.0, 0.0)
 
         result = engine.serve_active_links(
@@ -242,7 +249,7 @@ class PacketQosFlowTest(unittest.TestCase):
 
     def test_relay_violation_does_not_use_sender_local_cost(self):
         env = routing_env()
-        engine = PacketEngine(num_uav=3, step_time=0.25)
+        engine = legacy_service_engine()
         incoming = engine.create_packet(0, "COM", 100.0, 0.0)
         resident = engine.create_packet(2, "FOV", 100.0, 0.75)
 
@@ -260,7 +267,7 @@ class PacketQosFlowTest(unittest.TestCase):
 
     def test_resident_packet_expiration_is_reported_as_packet_outcome(self):
         env = routing_env()
-        engine = PacketEngine(num_uav=3, step_time=0.25)
+        engine = legacy_service_engine()
         resident = engine.create_packet(2, "COM", 100.0, 0.0)
 
         result = engine.serve_active_links(
@@ -274,7 +281,7 @@ class PacketQosFlowTest(unittest.TestCase):
 
     def test_timely_relay_arrival_enters_receiver_queue(self):
         env = routing_env()
-        engine = PacketEngine(num_uav=3, step_time=0.25)
+        engine = legacy_service_engine()
         packet = engine.create_packet(0, "COM", 100.0, 0.0)
 
         result = engine.serve_active_links(
@@ -291,7 +298,7 @@ class PacketQosFlowTest(unittest.TestCase):
 
     def test_deadline_outcome_is_not_counted_as_delivery(self):
         env = routing_env()
-        engine = PacketEngine(num_uav=3, step_time=0.25)
+        engine = legacy_service_engine()
         packet = engine.create_packet(0, "COM", 100.0, 0.0)
 
         result = engine.serve_active_links(

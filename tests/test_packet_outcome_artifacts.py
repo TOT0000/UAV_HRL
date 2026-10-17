@@ -83,7 +83,8 @@ class PacketOutcomeTrainingContractTest(unittest.TestCase):
 
             def record_actions(*args, **kwargs):
                 selected = select_actions(*args, **kwargs)
-                actions.append(tuple(sorted(selected.items())))
+                action_map = selected[0] if isinstance(selected, tuple) else selected
+                actions.append(tuple(sorted(action_map.items())))
                 return selected
 
             with mock.patch.object(

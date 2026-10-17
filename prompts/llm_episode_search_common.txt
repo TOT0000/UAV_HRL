@@ -34,8 +34,10 @@ VS: capturing UAV → zero or more relay UAVs → GS.
 COM: SR queue → serving UAV → zero or more relay UAVs → GS.
 
 Packet deadlines are measured from generation until GS delivery:
-- VS: 2.5 s.
-- COM: 2.0 s.
+- VS: 0.015 s (15 ms).
+- COM: 0.010 s (10 ms).
+
+Every UAV preselects one physically legal next hop at each 0.25 s routing-slot start and holds it for the slot, even if its queue is empty. Fixed-interval source events remain invisible until generation. Complete packets may continue over multiple S2U/U2U/U2G hops in the same slot using actual event time. Only currently serviceable links share equal-FDMA bandwidth; a preselected empty link reserves none. Fading changes every 5 ms, but a hop may complete and the next hop may begin between fading boundaries.
 
 Moving a packet to another UAV does not restart its deadline.
 

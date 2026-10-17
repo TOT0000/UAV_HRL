@@ -735,9 +735,10 @@ def _trajectory_state(
 
 
 def _routing_transition_done(episode_done, next_hol):
-    """Cut DDQN bootstrap when this UAV has no next routing decision."""
+    """All UAVs decide every slot, so only episode termination cuts bootstrap."""
 
-    return bool(episode_done or next_hol is None)
+    del next_hol
+    return bool(episode_done)
 
 
 def _finalize_pending_routing_transitions(
@@ -809,11 +810,10 @@ def _run_routing_slot(
     env.current_time = float(current_time)
     absolute_slot = int(round(env.current_time / step_time))
     env.prepare_channel_routing_slot(absolute_slot)
-    # Source generation precedes cleanup by contract. Prior-slot expirations are
-    # normally already gone; this makes the boundary explicit and idempotent.
-    packet_engine.inject_packets(
+    # Future fixed-interval source events remain invisible until the event-time
+    # service loop reaches them.
+    generation_events = packet_engine.schedule_generation_events(
         env,
-        delay_bound_steps,
         env.current_time,
         step_time=step_time,
         rate_overrides=traffic_rate_overrides,
@@ -833,21 +833,9 @@ def _run_routing_slot(
                 violation["packet_id"], violated=True
             )
     backlog_before = _active_backlog(packet_engine)
+    routing_decision_uav_ids = list(range(int(env.num_UAV)))
     start_of_slot_hol_by_sender = {
-        int(uid): packet_engine.get_hol_packet(uid)
-        for uid in packet_engine.nonempty_uav_ids()
-    }
-    start_of_slot_hol_by_sender = {
-        uid: pkt
-        for uid, pkt in start_of_slot_hol_by_sender.items()
-        if pkt is not None
-    }
-    routing_decision_uav_ids = sorted(start_of_slot_hol_by_sender)
-    frozen_queue_packet_ids_by_sender = {
-        uid: {
-            int(pkt["id"])
-            for pkt in packet_engine.get_queue_packets(uid)
-        }
+        uid: packet_engine.get_hol_packet(uid)
         for uid in routing_decision_uav_ids
     }
     physical_masks = {
@@ -912,7 +900,7 @@ def _run_routing_slot(
     if routing_decision_observer is not None:
         for uid in routing_decision_uav_ids:
             hol = start_of_slot_hol_by_sender[uid]
-            deadline_abs = hol.get("deadline_abs")
+            deadline_abs = None if hol is None else hol.get("deadline_abs")
             remaining_deadline = (
                 None
                 if deadline_abs is None
@@ -938,9 +926,9 @@ def _run_routing_slot(
                         legal_capacity_reference_bps
                     ),
                     "sender_total_backlog_bits": float(backlog_before.get(uid, 0.0)),
-                    "hol_packet_id": int(hol["id"]),
-                    "hol_task_type": str(hol.get("task_type")),
-                    "hol_remaining_bits": float(hol.get("rem_bits", 0.0)),
+                    "hol_packet_id": None if hol is None else int(hol["id"]),
+                    "hol_task_type": None if hol is None else str(hol.get("task_type")),
+                    "hol_remaining_bits": None if hol is None else float(hol.get("rem_bits", 0.0)),
                     "hol_remaining_deadline_seconds": remaining_deadline,
                     "epsilon": float(epsilon),
                     **selection_diagnostics[uid],
@@ -956,6 +944,11 @@ def _run_routing_slot(
         if routing_q_score_context is None:
             raise ValueError("routing Q-score diagnostics require slot context")
         for uid in routing_decision_uav_ids:
+            if start_of_slot_hol_by_sender[uid] is None:
+                # Empty-queue actions are real policy decisions but are not
+                # packet-HOL Q-score evidence and must not be assigned a fake
+                # COM/FOV task class.
+                continue
             inspection = ddqn.inspect_action_scores(
                 states[uid], effective_masks[uid]
             )
@@ -963,28 +956,17 @@ def _run_routing_slot(
                 inspection,
                 selected_action=next_hops[uid],
                 sender_uav_id=uid,
-                hol_task_type=start_of_slot_hol_by_sender[uid]["task_type"],
+                hol_task_type=(
+                    None
+                    if start_of_slot_hol_by_sender[uid] is None
+                    else start_of_slot_hol_by_sender[uid]["task_type"]
+                ),
                 scenario_id=routing_q_score_context["scenario_id"],
                 episode_index=routing_q_score_context["episode_index"],
                 slot_index=routing_q_score_context["slot_index"],
                 time_seconds=current_time,
             )
 
-    proposed_links = {
-        sender: receiver
-        for sender, receiver in next_hops.items()
-        if receiver != sender and sender in start_of_slot_hol_by_sender
-    }
-    requested_s2u_links = packet_engine.active_s2u_links(env)
-    active_capacities, _ = env.allocate_active_link_capacities(
-        proposed_links, s2u_links=requested_s2u_links
-    )
-    resolved_s2u_links = None
-    if packet_engine.enable_packet_diagnostic_artifacts:
-        resolved_s2u_links = {
-            int(sr_id): int(receiver)
-            for sr_id, receiver in env.active_s2u_capacities
-        }
     routing_transition_ids = {}
     if write_replay and routing_transition_ledger is not None:
         for uid in routing_decision_uav_ids:
@@ -993,29 +975,20 @@ def _run_routing_slot(
                 state=states[uid],
                 action=int(next_hops.get(uid, uid)),
                 tag_gt=int(env.num_GT),
-                packet_id=(
-                    int(start_of_slot_hol_by_sender[uid]["id"])
-                    if packet_cost_attribution
-                    else None
-                ),
+                packet_id=None,
             )
-    slot_result = packet_engine.serve_active_links(
+    slot_result = packet_engine.serve_event_driven_slot(
         env,
         next_hops,
-        active_capacities,
         current_time=env.current_time,
-        start_of_slot_hol_by_sender=start_of_slot_hol_by_sender,
-        start_of_slot_queue_packet_ids=frozen_queue_packet_ids_by_sender,
-        start_of_slot_backlog_bits_by_sender={
+        generation_events=generation_events,
+        observed_hol_by_sender=start_of_slot_hol_by_sender,
+        observed_backlog_bits_by_sender={
             uid: float(backlog_before.get(uid, 0.0))
             for uid in routing_decision_uav_ids
         },
         routing_transition_ids_by_sender=routing_transition_ids,
-        start_of_slot_physical_masks_by_sender=physical_masks,
-        start_of_slot_effective_masks_by_sender=effective_masks,
-        block_capacity_profiles=env.active_link_capacity_profiles_mbps,
-        s2u_block_capacity_profiles=env.active_s2u_capacity_profiles_mbps,
-        resolved_s2u_links=resolved_s2u_links,
+        effective_masks_by_sender=effective_masks,
     )
     env.current_time = float(current_time) + step_time
     for outcome in slot_result["outcomes"]:
@@ -1026,13 +999,20 @@ def _run_routing_slot(
             violation_stats[task_type]["deadline_violated_packets"] += 1
         else:
             violation_stats[task_type]["timely_delivered_packets"] += 1
-        if write_replay and packet_cost_attribution:
-            routing_transition_ledger.finalize_packet(
-                outcome["packet_id"], violated=outcome["violated"]
-            )
-
     if write_replay:
         if routing_transition_ledger is not None:
+            if packet_cost_attribution:
+                for use in slot_result["packet_decision_uses"]:
+                    routing_transition_ledger.attribute_packet(
+                        use["packet_id"], use["transition_id"]
+                    )
+                # Outcomes are replayed after attribution so a packet that is
+                # first affected and terminates in this same slot receives its
+                # one terminal path cost.
+                for outcome in slot_result["outcomes"]:
+                    routing_transition_ledger.finalize_packet(
+                        outcome["packet_id"], violated=outcome["violated"]
+                    )
             for uid, transition_id in routing_transition_ids.items():
                 routing_transition_ledger.set_reward(
                     transition_id, slot_result["reward_by_sender"][uid]
@@ -1089,13 +1069,7 @@ def _run_routing_slot(
                     tag_gt=transition["tag_gt"],
                     agent_id=uid,
                 )
-    selected_links = [
-        {
-            **dict(item),
-            "capacity_bits_per_second": float(item["capacity_mbps"]) * 1e6,
-        }
-        for item in env.active_link_diagnostics
-    ]
+    selected_links = list(slot_result.get("resource_segments", []))
     return (
         float(slot_result["timely_goodput_bits"]),
         float(sum(slot_result["reward_by_sender"].values())),
@@ -1464,6 +1438,7 @@ def _full_training_state(
             "next_packet_id": 0,
             "active_packets": [],
             "inject_buffer": {},
+            "generation_clocks": {},
             "source_buffer": {},
             "uav_queue_packet_ids": {
                 str(uid): [] for uid in range(NUM_UAV)
@@ -1854,10 +1829,22 @@ def _evaluation_state_snapshot(
             "size": size,
             "ptr": int(replay.ptr),
             "fields": {
-                field: np.asarray(getattr(replay, field))[:size].copy()
+                field: np.asarray(getattr(replay, field))[
+                    : (
+                        int(getattr(replay, "path_cost_size", 0))
+                        if field.startswith("path_cost_")
+                        else size
+                    )
+                ].copy()
                 for field in fields
             },
         }
+        if hasattr(replay, "path_cost_size"):
+            snapshot.update(
+                path_cost_size=int(replay.path_cost_size),
+                path_cost_ptr=int(replay.path_cost_ptr),
+                path_cost_total_added=int(replay.path_cost_total_added),
+            )
         if hasattr(replay, "n_step_buffer"):
             snapshot["n_step_buffer"] = copy.deepcopy(replay.n_step_buffer)
         return snapshot
@@ -1922,7 +1909,11 @@ def _evaluation_state_snapshot(
                 (
                     "state", "action", "next_state", "reward", "cost",
                     "not_done", "cost_next_state", "cost_not_done",
-                    "cost_ready", "tag_gt",
+                    "cost_ready", "tag_gt", "path_cost_state",
+                    "path_cost_action", "path_cost_next_state",
+                    "path_cost_value", "path_cost_not_done",
+                    "path_cost_tag_gt", "path_cost_transition_id",
+                    "path_cost_packet_id",
                 ),
             ),
         },

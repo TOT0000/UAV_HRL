@@ -181,7 +181,7 @@ class ScenarioManifestTest(unittest.TestCase):
         )
         self.assertEqual(
             random_manifest.content_hash,
-            "265ae8cc8dd6bce5ffc1efb02b8447ecc4608e59f9db0c62b9abb53e3a80bb7c",
+            "0400bf5fd45e340d559be6d240dc23f29df9480f5bf9e1e8786da6561a1b18ef",
         )
         self.assertEqual(balanced.to_dict(), repeated.to_dict())
         self.assertEqual(

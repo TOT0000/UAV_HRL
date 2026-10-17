@@ -39,12 +39,18 @@ class PacketPathCostAttributionTest(unittest.TestCase):
         self.assertTrue(self.ledger.finalize_packet(11, violated=True))
         self.ledger.commit_ready(self.replay)
         rows = [
-            int(np.flatnonzero(self.replay.transition_id == transition_id)[0])
+            int(
+                np.flatnonzero(
+                    self.replay.path_cost_transition_id == transition_id
+                )[0]
+            )
             for transition_id in ids
         ]
-        np.testing.assert_array_equal(self.replay.cost[rows, 0], [0.0, 0.0, 1.0])
         np.testing.assert_array_equal(
-            self.replay.cost_not_done[rows, 0], [1.0, 1.0, 0.0]
+            self.replay.path_cost_value[rows, 0], [0.0, 0.0, 1.0]
+        )
+        np.testing.assert_array_equal(
+            self.replay.path_cost_not_done[rows, 0], [1.0, 1.0, 0.0]
         )
         backed_up = _bellman_target(
             torch.tensor([0.0]), torch.tensor([1.0]),
@@ -57,9 +63,13 @@ class PacketPathCostAttributionTest(unittest.TestCase):
         final_id = self._decision(12, 1, 3, 2.0)
         self.assertTrue(self.ledger.finalize_packet(12, violated=False))
         self.ledger.commit_ready(self.replay)
-        row = int(np.flatnonzero(self.replay.transition_id == final_id)[0])
-        self.assertEqual(self.replay.cost[row, 0], 0.0)
-        self.assertEqual(self.replay.cost_not_done[row, 0], 0.0)
+        row = int(
+            np.flatnonzero(
+                self.replay.path_cost_transition_id == final_id
+            )[0]
+        )
+        self.assertEqual(self.replay.path_cost_value[row, 0], 0.0)
+        self.assertEqual(self.replay.path_cost_not_done[row, 0], 0.0)
 
     def test_loop_and_hol_wait_are_preserved_without_uav_deduplication(self):
         ids = [

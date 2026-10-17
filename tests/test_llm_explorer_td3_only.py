@@ -605,6 +605,13 @@ def test_full_scale_prompts_obey_budget_and_keep_complete_context(tmp_path):
     guidance_prompt = client.calls[1]["prompt"]
     assert "Compact communication bottleneck summary relevant to movement" in analysis_prompt
     assert "per-UAV timely GS-delivery attribution" in analysis_prompt
+    system_prompt = client.calls[0]["system_prompt"]
+    assert '"COM":0.01' in system_prompt
+    assert '"FOV":0.015' in system_prompt
+    assert '"packet_generation_model"' in system_prompt
+    assert '"routing_decision_model"' in system_prompt
+    assert '"packet_service_model"' in system_prompt
+    assert '"bandwidth_model"' in system_prompt
     assert "selected_action" not in analysis_prompt
     assert "hidden_roi_count_disclosed\":false" in analysis_prompt
     assert "known_rois_current_episode\":[]" in analysis_prompt

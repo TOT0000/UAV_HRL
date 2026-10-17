@@ -13,7 +13,7 @@ class FixedRoutingPolicy:
         self.actions = {int(key): int(value) for key, value in actions.items()}
 
     def select_action(self, state, uav_id, mask=None, **kwargs):
-        return self.actions[int(uav_id)]
+        return self.actions.get(int(uav_id), int(uav_id))
 
 
 def violation_stats():
@@ -33,7 +33,11 @@ class RoutingImmediateCostContractTest(unittest.TestCase):
         self.env.reset_environment()
         self.env.source_uavs = set()
         self.env.current_time = 0.0
-        self.engine = PacketEngine(num_uav=16, step_time=0.25)
+        self.engine = PacketEngine(
+            num_uav=16,
+            step_time=0.25,
+            task_deadlines_seconds={"FOV": 1.0, "COM": 1.0},
+        )
 
     def run_slot(
         self,
@@ -45,16 +49,28 @@ class RoutingImmediateCostContractTest(unittest.TestCase):
         replay=None,
     ):
         capacities = dict(capacities or {})
-        self.env.allocate_active_link_capacities = (
-            lambda proposed, s2u_links=None: (
-                {
-                    (sender, receiver): capacities.get((sender, receiver), 0.0)
-                    for sender, receiver in proposed.items()
-                },
-                {},
-            )
-        )
-        replay = replay or ReplayBufferDiscrete(143, 17, max_size=32, n_step=1)
+        def allocate(proposed, s2u_links=None):
+            active = {
+                (sender, receiver): capacities.get((sender, receiver), 0.0)
+                for sender, receiver in proposed.items()
+            }
+            s2u = {
+                (sr, receiver): capacities.get(("S2U", sr, receiver), 0.0)
+                for sr, receiver in dict(s2u_links or {}).items()
+            }
+            self.env.active_link_capacity_profiles_mbps = {
+                link: np.full(50, value, dtype=float)
+                for link, value in active.items()
+            }
+            self.env.active_s2u_capacity_profiles_mbps = {
+                link: np.full(50, value, dtype=float)
+                for link, value in s2u.items()
+            }
+            self.env.active_s2u_capacities = s2u
+            return active, {}
+
+        self.env.allocate_active_link_capacities = allocate
+        replay = replay or ReplayBufferDiscrete(143, 17, max_size=64, n_step=1)
         _run_routing_slot(
             self.env,
             self.engine,
@@ -78,8 +94,8 @@ class RoutingImmediateCostContractTest(unittest.TestCase):
 
         replay = self.run_slot({0: 0})
 
-        self.assertEqual(replay.size, 1)
-        self.assertEqual(replay.cost[0, 0], 0.0)
+        self.assertEqual(replay.size, self.env.num_UAV)
+        self.assertTrue(np.all(replay.cost[: replay.size, 0] == 0.0))
         self.assertEqual(self.engine.system_qos_counts(), (1, 2))
         self.assertEqual(self.engine.routing_constraint_counts(), (1, 2))
 
@@ -94,11 +110,11 @@ class RoutingImmediateCostContractTest(unittest.TestCase):
 
     def test_b_non_hol_expiry_does_not_create_sender_local_cost(self):
         replay = self._behind_hol_expiry(0, {})
-        self.assertEqual(replay.cost[0, 0], 0.0)
+        self.assertTrue(np.all(replay.cost[: replay.size, 0] == 0.0))
 
     def test_c_forward_non_hol_expiry_does_not_create_sender_local_cost(self):
         replay = self._behind_hol_expiry(1, {(0, 1): 1e-9})
-        self.assertEqual(replay.cost[0, 0], 0.0)
+        self.assertTrue(np.all(replay.cost[: replay.size, 0] == 0.0))
 
     def test_d_and_e_post_action_relay_arrival_has_no_current_or_retroactive_cost(self):
         relayed = self.engine.create_packet(0, "FOV", 100.0, 0.0)
@@ -119,8 +135,10 @@ class RoutingImmediateCostContractTest(unittest.TestCase):
         relayed["deadline_abs"] = 0.25
         self.run_slot({1: 1}, current_time=0.25, replay=replay)
 
-        np.testing.assert_array_equal(replay.cost[:2, 0], first_costs)
-        self.assertEqual(replay.cost[2, 0], 0.0)
+        np.testing.assert_array_equal(
+            replay.cost[: self.env.num_UAV, 0], first_costs
+        )
+        self.assertTrue(np.all(replay.cost[: replay.size, 0] == 0.0))
         self.assertEqual(self.engine.routing_constraint_counts(), (1, 2))
 
     def test_f_non_hol_frozen_packets_do_not_create_routing_decisions(self):
@@ -130,8 +148,8 @@ class RoutingImmediateCostContractTest(unittest.TestCase):
 
         replay = self.run_slot({0: 0})
 
-        self.assertEqual(replay.size, 1)
-        self.assertEqual(replay.cost[0, 0], 0.0)
+        self.assertEqual(replay.size, self.env.num_UAV)
+        self.assertTrue(np.all(replay.cost[: replay.size, 0] == 0.0))
         self.assertEqual(self.engine.routing_immediate_cost_sum, 0.0)
 
     def test_g_com_pre_s2u_violation_is_system_only(self):
@@ -262,7 +280,7 @@ class RoutingImmediateCostContractTest(unittest.TestCase):
 
         replay = self.run_slot({0: 0}, done=True)
 
-        self.assertEqual(replay.cost[0, 0], 0.0)
+        self.assertTrue(np.all(replay.cost[: replay.size, 0] == 0.0))
         self.assertEqual(self.engine.system_qos_counts(), (0, 1))
         self.engine.finalize_episode(0.25)
         self.assertEqual(self.engine.system_qos_counts(), (1, 1))

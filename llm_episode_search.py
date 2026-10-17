@@ -76,7 +76,7 @@ from training_history import read_committed_training_history, training_history_i
 
 
 SEARCH_RUN_SCHEMA_VERSION = "uav-hrl-llm-episode-search-run-v1"
-SEARCH_PROMPT_VERSION = "uav-hrl-llm-episode-search-prompt-v1"
+SEARCH_PROMPT_VERSION = "uav-hrl-llm-episode-search-prompt-v2"
 SEARCH_METHOD_ID = "td3_dinkelbach_llm_search"
 DEFAULT_OUTPUT_ROOT = Path("results") / "llm_episode_searches"
 DEFAULT_MAX_SEARCH_ROUNDS = 5
@@ -2288,6 +2288,8 @@ def run_episode_search(
             raise EpisodeSearchError(
                 "resume contract is incompatible; reviewer-design runs cannot be resumed as episode searches"
             )
+        if state.get("prompt_version") != SEARCH_PROMPT_VERSION:
+            raise EpisodeSearchError("resume prompt contract is incompatible")
         current_git_sha = _git_sha()
         if not _revision_transition_allows_resume(state, current_git_sha):
             if restart_failed_training:

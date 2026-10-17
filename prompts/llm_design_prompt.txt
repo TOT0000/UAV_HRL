@@ -36,7 +36,7 @@ Data paths:
 VS: sensing UAV -> zero or more relay UAVs -> GS.
 COM: SR queue -> serving UAV -> zero or more relay UAVs -> GS.
 
-Packet deadlines run from generation until GS delivery: 2.5 s for VS and 2.0 s for COM.
+End-to-end deadlines are 15 ms for VS and 10 ms for COM.
 
 The objective is higher energy efficiency and fewer end-to-end deadline violations:
 

@@ -60,7 +60,7 @@ class PaperPacketMetricTest(unittest.TestCase):
         )
         normal = PacketEngine(num_uav=16)
         self.assertEqual(short.create_packet(0, "FOV", 1.0, 0.0)["deadline"], 0.5)
-        self.assertEqual(normal.create_packet(0, "FOV", 1.0, 0.0)["deadline"], 2.5)
+        self.assertEqual(normal.create_packet(0, "FOV", 1.0, 0.0)["deadline"], 0.015)
         self.assertEqual(TASK_DEADLINE_SECONDS, production)
 
     def test_rate_override_does_not_leak_to_the_next_injection(self):
@@ -97,9 +97,9 @@ class PaperPacketMetricTest(unittest.TestCase):
         deadline_sweep = PacketEngine(
             num_uav=1, injection_cutoff_seconds=57.0
         )
-        self.assertEqual(production.injection_cutoff_seconds, 57.5)
+        self.assertEqual(production.injection_cutoff_seconds, 59.985)
         self.assertEqual(deadline_sweep.injection_cutoff_seconds, 57.0)
-        self.assertEqual(EPISODE_INJECTION_CUTOFF_SECONDS, 57.5)
+        self.assertEqual(EPISODE_INJECTION_CUTOFF_SECONDS, 59.985)
 
 
 if __name__ == "__main__":

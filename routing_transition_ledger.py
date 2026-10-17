@@ -7,7 +7,9 @@ from copy import deepcopy
 import numpy as np
 
 
-ROUTING_TRANSITION_LEDGER_SCHEMA_VERSION = "sender-reward-packet-path-cost-v3"
+ROUTING_TRANSITION_LEDGER_SCHEMA_VERSION = (
+    "all-uav-reward-multi-packet-path-cost-v4"
+)
 
 
 class RoutingTransitionLedger:
@@ -16,8 +18,9 @@ class RoutingTransitionLedger:
     def __init__(self, next_transition_id=0):
         self.next_transition_id = int(next_transition_id)
         self.entries = {}
+        self.decision_snapshots = {}
         self.packet_pending = {}
-        self.cost_closures = {}
+        self.cost_closures = []
         self.terminal_packet_ids = set()
         self.episode_decision_count = 0
         self.episode_cost_transition_count = 0
@@ -27,6 +30,7 @@ class RoutingTransitionLedger:
     def begin_episode(self):
         if self.entries or self.packet_pending or self.cost_closures:
             raise AssertionError("routing transition ledger was not drained")
+        self.decision_snapshots.clear()
         self.terminal_packet_ids.clear()
         self.episode_decision_count = 0
         self.episode_cost_transition_count = 0
@@ -48,21 +52,42 @@ class RoutingTransitionLedger:
             "done": None,
             "causality_pending": True,
         }
+        self.decision_snapshots[transition_id] = {
+            "state": state_array.copy(),
+            "action": int(action),
+            "agent_id": int(agent_id),
+            "tag_gt": int(tag_gt),
+        }
         if packet_id is not None:
-            packet_id = int(packet_id)
-            if packet_id in self.terminal_packet_ids:
-                raise AssertionError("terminal packet received another routing decision")
-            previous = self.packet_pending.get(packet_id)
-            if previous is not None:
-                self._close_cost_transition(
-                    previous["transition_id"], state_array, cost=0.0, done=False
-                )
-            self.packet_pending[packet_id] = {
-                "transition_id": transition_id,
-                "state": state_array,
-            }
-            self.episode_decision_count += 1
+            self.attribute_packet(packet_id, transition_id)
         return transition_id
+
+    def attribute_packet(self, packet_id, transition_id):
+        """Link one actually affected packet to a preselected slot action."""
+
+        packet_id, transition_id = int(packet_id), int(transition_id)
+        if packet_id in self.terminal_packet_ids:
+            raise AssertionError("terminal packet received another routing decision")
+        snapshot = self.decision_snapshots.get(transition_id)
+        if snapshot is None:
+            raise KeyError(f"unknown routing transition ID: {transition_id}")
+        previous = self.packet_pending.get(packet_id)
+        if previous is not None and int(previous["transition_id"]) == transition_id:
+            return False
+        if previous is not None:
+            self._close_cost_transition(
+                previous["transition_id"],
+                snapshot["state"],
+                cost=0.0,
+                done=False,
+                packet_id=packet_id,
+            )
+        self.packet_pending[packet_id] = {
+            "transition_id": transition_id,
+            "state": np.asarray(snapshot["state"], dtype=np.float32).copy(),
+        }
+        self.episode_decision_count += 1
+        return True
 
     def set_reward(self, transition_id, reward):
         entry = self._entry(transition_id)
@@ -86,27 +111,39 @@ class RoutingTransitionLedger:
             return False
         cost = 1.0 if bool(violated) else 0.0
         self._close_cost_transition(
-            pending["transition_id"], pending["state"], cost=cost, done=True
+            pending["transition_id"],
+            pending["state"],
+            cost=cost,
+            done=True,
+            packet_id=packet_id,
         )
         self.episode_terminal_cost_sum += cost
         return True
 
-    def _close_cost_transition(self, transition_id, next_state, *, cost, done):
+    def _close_cost_transition(
+        self, transition_id, next_state, *, cost, done, packet_id
+    ):
         transition_id = int(transition_id)
-        if transition_id in self.cost_closures:
-            raise AssertionError("packet-chain cost transition was closed twice")
-        self.cost_closures[transition_id] = {
+        snapshot = self.decision_snapshots.get(transition_id)
+        if snapshot is None:
+            raise KeyError(f"unknown routing transition ID: {transition_id}")
+        self.cost_closures.append({
+            "transition_id": transition_id,
+            "packet_id": int(packet_id),
+            "state": np.asarray(snapshot["state"], dtype=np.float32).copy(),
+            "action": int(snapshot["action"]),
+            "tag_gt": int(snapshot["tag_gt"]),
             "next_state": np.asarray(next_state, dtype=np.float32).copy(),
             "cost": float(cost),
             "done": bool(done),
-        }
+        })
         self.episode_cost_transition_count += 1
 
     def finalize_causality(self, states, start_of_slot_hol_by_sender, *, terminal=False):
         """Resolve reward transitions from the next real sender snapshot."""
 
         states = {int(key): value for key, value in dict(states).items()}
-        active_senders = {int(key) for key in dict(start_of_slot_hol_by_sender)}
+        del start_of_slot_hol_by_sender
         finalized = 0
         for transition_id in sorted(self.entries):
             entry = self.entries[transition_id]
@@ -116,7 +153,7 @@ class RoutingTransitionLedger:
             entry["next_state"] = np.asarray(
                 states.get(agent_id, entry["state"]), dtype=np.float32
             ).copy()
-            entry["done"] = bool(terminal or agent_id not in active_senders)
+            entry["done"] = bool(terminal)
             entry["causality_pending"] = False
             finalized += 1
         return finalized
@@ -137,12 +174,20 @@ class RoutingTransitionLedger:
             )
             committed.append(transition_id)
             del self.entries[transition_id]
-        for transition_id in sorted(tuple(self.cost_closures)):
-            closure = self.cost_closures[transition_id]
-            if replay.attach_cost_transition(
-                transition_id, closure["next_state"], closure["cost"], closure["done"]
+        remaining = []
+        for closure in self.cost_closures:
+            if not replay.add_cost_transition(
+                closure["state"],
+                closure["action"],
+                closure["next_state"],
+                closure["cost"],
+                closure["done"],
+                tag_gt=closure["tag_gt"],
+                transition_id=closure["transition_id"],
+                packet_id=closure["packet_id"],
             ):
-                del self.cost_closures[transition_id]
+                remaining.append(closure)
+        self.cost_closures = remaining
         return committed
 
     def episode_diagnostics(self):
@@ -160,6 +205,7 @@ class RoutingTransitionLedger:
             "schema_version": ROUTING_TRANSITION_LEDGER_SCHEMA_VERSION,
             "next_transition_id": int(self.next_transition_id),
             "entries": deepcopy(self.entries),
+            "decision_snapshots": deepcopy(self.decision_snapshots),
             "packet_pending": deepcopy(self.packet_pending),
             "cost_closures": deepcopy(self.cost_closures),
             "terminal_packet_ids": sorted(self.terminal_packet_ids),
@@ -170,6 +216,7 @@ class RoutingTransitionLedger:
         validated = validate_routing_transition_ledger_state(state)
         self.next_transition_id = validated["next_transition_id"]
         self.entries = deepcopy(validated["entries"])
+        self.decision_snapshots = deepcopy(validated["decision_snapshots"])
         self.packet_pending = deepcopy(validated["packet_pending"])
         self.cost_closures = deepcopy(validated["cost_closures"])
         self.terminal_packet_ids = set(validated["terminal_packet_ids"])
@@ -201,7 +248,7 @@ def validate_routing_transition_ledger_state(state):
             "pre-packet-path cost contract; retraining is required"
         )
     required = {
-        "schema_version", "next_transition_id", "entries", "packet_pending",
+        "schema_version", "next_transition_id", "entries", "decision_snapshots", "packet_pending",
         "cost_closures", "terminal_packet_ids", "episode_diagnostics",
     }
     if set(state) != required:
@@ -209,9 +256,11 @@ def validate_routing_transition_ledger_state(state):
     next_transition_id = state["next_transition_id"]
     if isinstance(next_transition_id, bool) or not isinstance(next_transition_id, int):
         raise RuntimeError("routing transition next ID is invalid")
-    for field in ("entries", "packet_pending", "cost_closures"):
+    for field in ("entries", "decision_snapshots", "packet_pending"):
         if not isinstance(state[field], dict):
             raise RuntimeError(f"routing transition ledger {field} is invalid")
+    if not isinstance(state["cost_closures"], list):
+        raise RuntimeError("routing transition ledger cost_closures is invalid")
     if not isinstance(state["terminal_packet_ids"], list):
         raise RuntimeError("routing terminal packet IDs are invalid")
     if not isinstance(state["episode_diagnostics"], dict):

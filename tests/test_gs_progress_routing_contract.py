@@ -112,7 +112,7 @@ class RoutingRewardAndStateContractTest(unittest.TestCase):
         self.assertEqual(ROUTING_REWARD_ALPHA_CAPACITY, 1.0)
         self.assertEqual(ROUTING_REWARD_ALPHA_DELAY, 0.5)
         self.assertEqual(ROUTING_REWARD_ALPHA_GS_PROGRESS, 2.0)
-        self.assertTrue(ROUTING_REWARD_CONTRACT_VERSION.endswith("v7"))
+        self.assertTrue(ROUTING_REWARD_CONTRACT_VERSION.endswith("v8"))
 
     def test_state_is_143d_and_progress_block_survives_task_masking(self):
         env = Simulator(num_UAV=NUM_UAV)
@@ -184,9 +184,9 @@ class RoutingRewardAndStateContractTest(unittest.TestCase):
 
 class QosAndCheckpointContractTest(unittest.TestCase):
     def test_production_deadlines_and_derived_cutoff_preserve_full_window(self):
-        self.assertEqual(validate_production_deadlines(), {"FOV": 2.5, "COM": 2.0})
-        self.assertEqual(PRODUCTION_TASK_DEADLINE_SECONDS, {"FOV": 2.5, "COM": 2.0})
-        self.assertEqual(PRODUCTION_PACKET_INJECTION_CUTOFF_SECONDS, 57.5)
+        self.assertEqual(validate_production_deadlines(), {"FOV": 0.015, "COM": 0.010})
+        self.assertEqual(PRODUCTION_TASK_DEADLINE_SECONDS, {"FOV": 0.015, "COM": 0.010})
+        self.assertEqual(PRODUCTION_PACKET_INJECTION_CUTOFF_SECONDS, 59.985)
         self.assertTrue(
             math.isclose(
                 PRODUCTION_PACKET_INJECTION_CUTOFF_SECONDS
@@ -198,7 +198,7 @@ class QosAndCheckpointContractTest(unittest.TestCase):
         self.assertEqual(DEADLINE_SWEEP_INJECTION_CUTOFF_SECONDS, 57.0)
 
     def test_schema_21_and_90d_current_schema_are_rejected(self):
-        self.assertEqual(CHECKPOINT_SCHEMA_VERSION, 33)
+        self.assertEqual(CHECKPOINT_SCHEMA_VERSION, 34)
         with self.assertRaisesRegex(RuntimeError, "must be retrained"):
             _validate_checkpoint_schema({"checkpoint_schema_version": 21})
         with self.assertRaisesRegex(RuntimeError, "GS-progress"):
