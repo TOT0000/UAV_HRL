@@ -224,16 +224,20 @@ Relay diagnostics artifact.
   outcomes. If the system denominator is zero, the update is skipped and
   diagnosed. A pre-routing failure with no routing decision creates no cost
   transition but still affects system DVP and the multiplier
-- learned routing uses the common local reward
-  `capacity_norm - 0.5 * (transmission_delay_norm + queue_delay_norm) + 2 * gs_progress_norm`
-  with fixed canonical U2U/U2G reference capacities. The soft GS progress is
+- all routing methods use the same shared slot reward:
+  `timely_useful_bits_delivered_to_GS_in_slot / 10000`. The authoritative
+  numerator is the same completed-packet quantity used by formal EE: full COM
+  bits and generation-time coverage-weighted FOV bits. It is counted only on a
+  timely GS completion, is neither clipped nor averaged, and is assigned to all
+  16 routing reward transitions for that slot. Episode-level routing reward is
+  the sum of the global slot values, not the sum of those 16 replay copies.
+  Capacity, queue delay, deadline, and soft GS progress remain routing-state
+  features but no longer contribute separate formal reward terms. The soft GS
+  progress is still
   `clip((d_3D(sender,GS) - d_3D(receiver,GS)) / 400 m, -1, 1)`; a direct GS
   action uses receiver distance zero and wait is exactly zero. Progress never
-  changes the existing action mask.
-  Reward uses only the action-time observation: an observed HOL uses its
-  remaining bits and the initial equal-FDMA/fading capacity, while an empty
-  queue has neutral reward. A packet that arrives later may attach path cost to
-  the held action but cannot retroactively change the action-time reward
+  changes the existing action mask. Packet-path terminal cost attribution and
+  the episode-level multiplier update are unchanged
 - production FOV/COM deadlines `0.015 s`/`0.010 s`; completion at the exact deadline
   is timely
 - production packet injection cutoff `59.985 s`, derived as the 60-second horizon
@@ -247,7 +251,7 @@ Relay diagnostics artifact.
   separate generation gate. Every generated FOV packet freezes
   physical size, raw image quantity, ROI/task identity and the authoritative
   overlap ratio as `capture_coverage_ratio`, clipped to `[0,1]`. The full physical
-  `size_bits` remains the queue, service, partial-hop, and routing-reward load.
+  `size_bits` remains the queue, service, and partial-hop load.
   Timely FOV useful bits are `size_bits * capture_coverage_ratio`; timely COM
   useful bits are the full `size_bits`; late packets contribute zero useful bits
 - Search coverage is sampled and committed at every 0.25-second routing
@@ -298,6 +302,32 @@ Relay diagnostics artifact.
   part of the EE denominator
 - model-only checkpoint every 50 episodes, including exactly one final checkpoint
 - full-resume checkpoint every 50 episodes, retaining only the latest two
+
+### Optional routing-training diagnostics
+
+Safe-DDQN training commands may add `--routing-training-diagnostics`. This does
+not change action selection, replay insertion, optimizer scheduling, or random
+number consumption. It writes one bounded JSON object per completed episode to
+`routing_training_diagnostics.jsonl` in the run directory. Each row records the
+global slot goodput/reward distribution and conservation check, replay and
+optimizer update counts, TD3 warmup/update status, the episode multiplier, legal
+`Q_r`, `Q_c`, `lambda*Q_c`, and safe-score distributions, argmax changes and
+pairwise gaps, Bellman/TD-error/loss summaries, out-of-range cost-Q rates, and a
+small deterministic set of representative cases. Missing observations are kept
+distinct from measured zero. Resume truncates this append-only artifact to the
+checkpoint episode before continuing, matching the other training logs.
+
+For example, a 50-episode Windows diagnostic run using the formal seed and
+unmodified warmup thresholds is:
+
+```powershell
+& "C:\Users\user\anaconda3\envs\LLM_HRL\python.exe" .\run_experiment.py td3_dinkelbach --episodes 50 --seed 20260817 --output-root C:\uav_llm_runs --routing-training-diagnostics
+```
+
+The diagnostic file is created below the printed run directory. At 50 episodes
+the routing learner can have crossed its 1,000-transition threshold, while TD3
+has not yet crossed its 10,000-joint-transition threshold; the recorded update
+counts, rather than an episode-number assumption, are authoritative.
 
 ## Movement constraint-reward contract
 

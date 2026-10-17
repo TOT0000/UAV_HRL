@@ -177,6 +177,8 @@ class DDQN:
         self.cost_optimizer_update_count = 0
         self.reward_target_update_count = 0
         self.cost_target_update_count = 0
+        self.training_diagnostics_enabled = False
+        self._training_diagnostic_events = []
     def select_action(
         self,
         state,
@@ -269,6 +271,17 @@ class DDQN:
                     None
                     if exploration_distribution is None
                     else exploration_distribution.tolist()
+                ),
+                "q_r": q_r.tolist(),
+                "q_c": q_c.tolist(),
+                "q_safe": q_values.tolist(),
+                "legal_mask": final_mask.astype(bool).tolist(),
+                "lambda_cost_used": float(self.lambda_cost),
+                "reward_argmax_action": int(
+                    np.argmax(np.where(final_mask, q_r, -np.inf))
+                ),
+                "safe_argmax_action": int(
+                    np.argmax(np.where(final_mask, q_values, -np.inf))
                 ),
             }
         return action
@@ -508,6 +521,7 @@ class DDQN:
         target_q, _, _ = self._safe_targets(
             next_state, reward, torch.zeros_like(reward), not_done
         )
+        reward_td_error = target_q - q_values
         
         loss = F.mse_loss(q_values, target_q)
         self.optimizer.zero_grad()
@@ -526,6 +540,7 @@ class DDQN:
             cost,
             cost_not_done,
         )
+        cost_td_error = target_c - c_values
 
         cost_loss = F.mse_loss(c_values, target_c)
         self.cost_optimizer.zero_grad()
@@ -534,6 +549,17 @@ class DDQN:
         self.cost_loss_log.append(cost_loss.item())
         self.cost_optimizer_update_count += 1
         self.num_training += 1
+        if self.training_diagnostics_enabled:
+            self._training_diagnostic_events.append(
+                {
+                    "reward_bellman_target": target_q.detach().cpu().tolist(),
+                    "reward_td_error": reward_td_error.detach().cpu().tolist(),
+                    "cost_bellman_target": target_c.detach().cpu().tolist(),
+                    "cost_td_error": cost_td_error.detach().cpu().tolist(),
+                    "reward_loss": float(loss.item()),
+                    "cost_loss": float(cost_loss.item()),
+                }
+            )
         # print("q_values.shape =", q_values.shape)
         # print("target_q.shape =", target_q.shape)
 
@@ -550,6 +576,19 @@ class DDQN:
         self.target_update_count += 1
         self.reward_target_update_count += 1
         self.cost_target_update_count += 1
+
+    def drain_training_diagnostic_events(self):
+        """Return optimizer diagnostics without retaining cross-episode tensors."""
+
+        events = self._training_diagnostic_events
+        self._training_diagnostic_events = []
+        return events
+
+    def set_training_diagnostics_enabled(self, enabled):
+        """Enable bounded host-side optimizer summaries without changing learning."""
+
+        self.training_diagnostics_enabled = bool(enabled)
+        self._training_diagnostic_events = []
 
     def update_parameters(current_model, target_model):
         target_model.load_state_dict(current_model.state_dict())

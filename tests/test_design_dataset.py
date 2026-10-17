@@ -40,7 +40,7 @@ from HRL_task_aware import TrainingConfig, formal_training_config, train
 from scenario_manifest import generate_manifest
 from routing_lifecycle import RoutingLearnerLifecycle
 from td3 import TD3
-from training_checkpoint import save_model_checkpoint
+from training_checkpoint import CHECKPOINT_SCHEMA_VERSION, save_model_checkpoint
 
 
 class DesignSchemaTest(unittest.TestCase):
@@ -191,7 +191,10 @@ class DesignDatasetIntegrationTest(unittest.TestCase):
         arrays = self.arrays_one
         self.assertEqual(DESIGN_DATASET_SCHEMA_VERSION, 9)
         self.assertEqual(self.metadata_one["schema_version"], 9)
-        self.assertEqual(self.metadata_one["checkpoint_schema_version"], 34)
+        self.assertEqual(
+            self.metadata_one["checkpoint_schema_version"],
+            CHECKPOINT_SCHEMA_VERSION,
+        )
         self.assertEqual(self.metadata_one["scenario_schema_version"], "uav-hrl-scenario-v8")
         self.assertEqual(self.metadata_one["num_uav"], 16)
         self.assertEqual(

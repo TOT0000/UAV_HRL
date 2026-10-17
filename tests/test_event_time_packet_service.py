@@ -141,6 +141,8 @@ def test_sr_uav_uav_gs_completes_three_real_hops_in_one_slot():
     ]
     assert [row["sender_uav_id"] for row in result["packet_decision_uses"]] == [0, 1]
     assert result["timely_goodput_bits"] == pytest.approx(100.0)
+    assert result["global_routing_reward"] == pytest.approx(0.01)
+    assert result["reward_by_sender"] == pytest.approx({0: 0.01, 1: 0.01})
 
 
 def test_dynamic_fdma_reallocates_only_future_time_and_is_order_independent():
@@ -262,11 +264,11 @@ def test_exact_deadline_completion_wins_but_later_packet_expires_immediately():
     assert late_engine.total_violated == 1
     assert len(late_result["outcomes"]) == 1
 
-    # The formal boundary has no legacy PACKET_EPS grace period: a completion
-    # even one representable instant after the deadline is not timely.
-    _, nextafter_late, _ = run(np.nextafter(100.0, float("inf")))
-    assert nextafter_late["terminal_outcome"] == "expired_dropped"
-    assert nextafter_late["timely_goodput_counted"] is False
+    # One representable arithmetic residual is treated consistently as the
+    # theoretical boundary, while the materially late case above still fails.
+    _, nextafter_boundary, _ = run(np.nextafter(100.0, float("inf")))
+    assert nextafter_boundary["terminal_outcome"] == "on_time_delivered"
+    assert nextafter_boundary["timely_goodput_counted"] is True
 
 
 def test_empty_preselected_links_reserve_no_bandwidth():
@@ -283,8 +285,33 @@ def test_empty_preselected_links_reserve_no_bandwidth():
 
     assert result["packet_decision_uses"] == []
     assert result["cost_by_sender"] == {0: 0.0, 1: 0.0, 2: 0.0}
+    assert result["global_routing_reward"] == 0.0
+    assert result["reward_by_sender"] == {0: 0.0, 1: 0.0, 2: 0.0}
+    assert result["active_links"] == []
     assert all(call["uav_links"] == () for call in env.allocation_calls)
     assert all(call["bandwidths"] == {} for call in env.allocation_calls)
+
+
+def test_evaluation_wait_diagnostics_do_not_require_replay_transition_id():
+    env = EventCapacityEnvironment(1)
+    engine = PacketEngine(
+        1,
+        task_deadlines_seconds={"FOV": 1.0, "COM": 1.0},
+        enable_packet_diagnostic_artifacts=True,
+    )
+    packet = engine.create_packet(0, "COM", 100.0, 0.0)
+    engine.serve_event_driven_slot(
+        env,
+        _actions(0),
+        0.0,
+        observed_hol_by_sender={0: packet},
+        observed_backlog_bits_by_sender={0: 100.0},
+        routing_transition_ids_by_sender={},
+        effective_masks_by_sender={0: np.asarray([True, True])},
+    )
+    assert packet["routing_decision_slot_count"] == 1
+    assert packet["routing_wait_slot_count"] == 1
+    assert packet["routing_wait_seconds"] == pytest.approx(0.25)
 
 
 def test_empty_uav_action_serves_mid_slot_arrival_and_multiple_packets(
@@ -332,9 +359,108 @@ def test_empty_uav_action_serves_mid_slot_arrival_and_multiple_packets(
     assert [row["packet"]["finish_time"] for row in result["outcomes"]] == pytest.approx(
         [0.0025, 0.0045]
     )
-    # Empty-at-decision observations stay reward-neutral and do not fabricate
-    # a packet-level cost sample until a real packet uses the held action.
-    assert result["reward_by_sender"][0] == 0.0
+    # Reward is the frozen-coverage useful goodput (2 * 50 * .75 bits), even
+    # though the UAV was EMPTY at action selection. Cost still needs real use.
+    assert result["total_timely_useful_bits"] == pytest.approx(75.0)
+    assert result["global_routing_reward"] == pytest.approx(0.0075)
+    assert result["reward_by_sender"][0] == pytest.approx(0.0075)
+
+
+def test_shared_global_reward_is_unclipped_and_not_multiplied_by_uav_count():
+    env = EventCapacityEnvironment(16, bits_per_second_per_hz=2.0)
+    engine = PacketEngine(16)
+    packet = engine.create_packet(3, "COM", 50_000.0, 0.0)
+    actions = {uid: uid for uid in range(16)}
+    actions[3] = env.GS_ID
+    result = engine.serve_event_driven_slot(
+        env,
+        actions,
+        0.0,
+        observed_hol_by_sender={uid: packet if uid == 3 else None for uid in range(16)},
+        observed_backlog_bits_by_sender={uid: 50_000.0 if uid == 3 else 0.0 for uid in range(16)},
+    )
+
+    assert result["total_timely_useful_bits"] == pytest.approx(50_000.0)
+    assert result["global_routing_reward"] == pytest.approx(5.0)
+    assert set(result["reward_by_sender"]) == set(range(16))
+    assert all(
+        value == pytest.approx(5.0)
+        for value in result["reward_by_sender"].values()
+    )
+    assert result["shared_reward_row_sum"] == pytest.approx(80.0)
+    assert len(result["active_links"]) == 1
+    active = result["active_links"][0]
+    assert (active["sender_id"], active["receiver_id"], active["link_type"]) == (
+        3,
+        16,
+        "U2G",
+    )
+    assert active["capacity_bits_per_second"] == pytest.approx(20_000_000.0)
+    assert active["transmitted_bits"] == pytest.approx(50_000.0)
+    assert active["active_seconds"] == pytest.approx(0.0025)
+
+    env2 = EventCapacityEnvironment(1, bits_per_second_per_hz=2.0)
+    engine2 = PacketEngine(1)
+    large = engine2.create_packet(0, "COM", 150_000.0, 0.0)
+    large_result = engine2.serve_event_driven_slot(
+        env2,
+        _actions(env2.GS_ID),
+        0.0,
+        observed_hol_by_sender={0: large},
+        observed_backlog_bits_by_sender={0: 150_000.0},
+    )
+    assert large_result["global_routing_reward"] == pytest.approx(15.0)
+
+
+def test_reward_is_zero_until_cross_slot_packet_reaches_gs_then_counted_once():
+    env = EventCapacityEnvironment(1, bits_per_second_per_hz=0.01)
+    engine = PacketEngine(
+        1, task_deadlines_seconds={"FOV": 1.0, "COM": 1.0}
+    )
+    packet = engine.create_packet(0, "COM", 50_000.0, 0.0)
+    first = engine.serve_event_driven_slot(
+        env,
+        _actions(env.GS_ID),
+        0.0,
+        observed_hol_by_sender={0: packet},
+        observed_backlog_bits_by_sender={0: 50_000.0},
+    )
+    second = engine.serve_event_driven_slot(
+        env,
+        _actions(env.GS_ID),
+        0.25,
+        observed_hol_by_sender={0: packet},
+        observed_backlog_bits_by_sender={0: 25_000.0},
+    )
+    third = engine.serve_event_driven_slot(
+        env,
+        _actions(env.GS_ID),
+        0.50,
+        observed_hol_by_sender={0: None},
+        observed_backlog_bits_by_sender={0: 0.0},
+    )
+    assert first["global_routing_reward"] == 0.0
+    assert second["global_routing_reward"] == pytest.approx(5.0)
+    assert third["global_routing_reward"] == 0.0
+    assert engine.total_timely_useful_bits == pytest.approx(50_000.0)
+
+
+@pytest.mark.parametrize("start_time", [0.0, 10.0, 50.0])
+def test_deadline_boundary_is_translation_invariant(start_time):
+    env = EventCapacityEnvironment(1)
+    engine = PacketEngine(
+        1, task_deadlines_seconds={"FOV": 0.015, "COM": 0.010}
+    )
+    packet = engine.create_packet(0, "COM", 1000.0, start_time)
+    result = engine.serve_event_driven_slot(
+        env,
+        _actions(env.GS_ID),
+        start_time,
+        observed_hol_by_sender={0: packet},
+        observed_backlog_bits_by_sender={0: 1000.0},
+    )
+    assert packet["terminal_outcome"] == "on_time_delivered"
+    assert result["global_routing_reward"] == pytest.approx(0.1)
 
 
 def test_fixed_generation_clock_persists_across_slots_and_rate_change_resets_credit():

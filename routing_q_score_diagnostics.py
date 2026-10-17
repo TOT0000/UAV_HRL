@@ -11,7 +11,10 @@ import numpy as np
 
 
 ROUTING_Q_SCORE_DIAGNOSTIC_CONTRACT_VERSION = (
-    "uav-hrl-routing-q-score-diagnostics-v1"
+    "uav-hrl-routing-q-score-diagnostics-v2"
+)
+ROUTING_TRAINING_DIAGNOSTIC_CONTRACT_VERSION = (
+    "uav-hrl-routing-training-diagnostics-v1"
 )
 ROUTING_Q_SCORE_DIAGNOSTIC_DEFINITIONS = {
     "routing_q_r_definition": "raw reward critic output Q_r(s,a)",
@@ -82,13 +85,17 @@ VOLUNTARY_WAIT_EVENT_FIELDS = (
     "cost_contribution_margin_against_best_safe_forward",
 )
 _DISTRIBUTION_STATISTICS = (
+    "count",
     "mean",
+    "min",
+    "max",
     "std",
     "median",
     "p10",
     "p25",
     "p75",
     "p90",
+    "p95",
 )
 
 
@@ -124,19 +131,229 @@ def _ratio(numerator, denominator):
 
 def _distribution(values):
     if not values:
-        return {statistic: None for statistic in _DISTRIBUTION_STATISTICS}
+        return {
+            statistic: (0 if statistic == "count" else None)
+            for statistic in _DISTRIBUTION_STATISTICS
+        }
     data = np.asarray(values, dtype=np.float64)
     if not np.all(np.isfinite(data)):
         raise ValueError("routing Q-score diagnostic distribution is non-finite")
     return {
+        "count": int(data.size),
         "mean": float(np.mean(data)),
+        "min": float(np.min(data)),
+        "max": float(np.max(data)),
         "std": float(np.std(data)),
         "median": float(np.median(data)),
         "p10": float(np.percentile(data, 10)),
         "p25": float(np.percentile(data, 25)),
         "p75": float(np.percentile(data, 75)),
         "p90": float(np.percentile(data, 90)),
+        "p95": float(np.percentile(data, 95)),
     }
+
+
+class RoutingTrainingEpisodeDiagnostics:
+    """Bounded, RNG-free scalar diagnostics for one training episode."""
+
+    _SAMPLE_FIELDS = (
+        "legal_q_r",
+        "legal_q_c",
+        "legal_cost_term",
+        "legal_q_safe",
+        "reward_argmax_minus_safe_argmax_q_r",
+        "reward_argmax_minus_safe_argmax_cost_term",
+        "safe_argmax_minus_reward_argmax_q_safe",
+        "reward_bellman_target",
+        "reward_td_error",
+        "cost_bellman_target",
+        "cost_td_error",
+        "reward_loss",
+        "cost_loss",
+    )
+
+    def __init__(self):
+        self._samples = {name: [] for name in self._SAMPLE_FIELDS}
+        self.slot_timely_useful_bits = []
+        self.slot_rewards = []
+        self.decision_count = 0
+        self.empty_hol_decision_count = 0
+        self.epsilon_decision_count = 0
+        self.greedy_decision_count = 0
+        self.reward_safe_argmax_difference_count = 0
+        self.greedy_selected_differs_from_reward_argmax_count = 0
+        self.legal_qc_negative_count = 0
+        self.legal_qc_above_one_count = 0
+        self.legal_qc_count = 0
+        self.representative_cases = []
+        self.optimizer_event_count = 0
+
+    def add_slot(self, timely_useful_bits, reward):
+        bits = float(timely_useful_bits)
+        reward = float(reward)
+        if not math.isfinite(bits) or bits < 0.0 or not math.isfinite(reward):
+            raise ValueError("routing slot diagnostics require finite non-negative data")
+        self.slot_timely_useful_bits.append(bits)
+        self.slot_rewards.append(reward)
+
+    def add_decision(
+        self,
+        diagnostics,
+        *,
+        selected_action,
+        sender_uav_id,
+        hol_task_type,
+        slot_index,
+    ):
+        q_r = np.asarray(diagnostics["q_r"], dtype=np.float64)
+        q_c = np.asarray(diagnostics["q_c"], dtype=np.float64)
+        q_safe = np.asarray(diagnostics["q_safe"], dtype=np.float64)
+        legal = np.asarray(diagnostics["legal_mask"], dtype=bool)
+        if q_r.ndim != 1 or not (
+            q_r.shape == q_c.shape == q_safe.shape == legal.shape
+        ) or not legal.any():
+            raise ValueError("training Q diagnostics require aligned legal scores")
+        if not all(np.all(np.isfinite(values[legal])) for values in (q_r, q_c, q_safe)):
+            raise ValueError("training Q diagnostics contain non-finite legal values")
+        lambda_cost = float(diagnostics["lambda_cost_used"])
+        cost_term = lambda_cost * q_c
+        if not np.allclose(
+            q_safe[legal],
+            (q_r - cost_term)[legal],
+            rtol=0.0,
+            atol=32.0 * np.finfo(np.float32).eps * max(
+                1.0,
+                float(np.max(np.abs(q_r[legal]))),
+                float(np.max(np.abs(cost_term[legal]))),
+            ),
+        ):
+            raise AssertionError("training Q_safe is inconsistent with Q_r-lambda*Q_c")
+        reward_argmax = _masked_argmax(q_r, legal)
+        safe_argmax = _masked_argmax(q_safe, legal)
+        branch = str(diagnostics.get("decision_branch", "unknown"))
+        is_epsilon = branch == "epsilon_exploration"
+        is_greedy = branch == "safe_q_greedy"
+        self.decision_count += 1
+        self.empty_hol_decision_count += int(hol_task_type is None)
+        self.epsilon_decision_count += int(is_epsilon)
+        self.greedy_decision_count += int(is_greedy)
+        differs = reward_argmax != safe_argmax
+        self.reward_safe_argmax_difference_count += int(differs)
+        self.greedy_selected_differs_from_reward_argmax_count += int(
+            is_greedy and int(selected_action) != reward_argmax
+        )
+        legal_qc = q_c[legal]
+        self.legal_qc_count += int(legal_qc.size)
+        self.legal_qc_negative_count += int(np.count_nonzero(legal_qc < 0.0))
+        self.legal_qc_above_one_count += int(np.count_nonzero(legal_qc > 1.0))
+        self._samples["legal_q_r"].extend(q_r[legal].tolist())
+        self._samples["legal_q_c"].extend(legal_qc.tolist())
+        self._samples["legal_cost_term"].extend(cost_term[legal].tolist())
+        self._samples["legal_q_safe"].extend(q_safe[legal].tolist())
+        self._samples["reward_argmax_minus_safe_argmax_q_r"].append(
+            float(q_r[reward_argmax] - q_r[safe_argmax])
+        )
+        self._samples[
+            "reward_argmax_minus_safe_argmax_cost_term"
+        ].append(float(cost_term[reward_argmax] - cost_term[safe_argmax]))
+        self._samples["safe_argmax_minus_reward_argmax_q_safe"].append(
+            float(q_safe[safe_argmax] - q_safe[reward_argmax])
+        )
+        case = {
+            "slot_index": int(slot_index),
+            "sender_uav_id": int(sender_uav_id),
+            "hol_task_type": (
+                "EMPTY" if hol_task_type is None else str(hol_task_type).upper()
+            ),
+            "decision_branch": branch,
+            "selected_action": int(selected_action),
+            "reward_argmax_action": reward_argmax,
+            "safe_argmax_action": safe_argmax,
+            "lambda_cost_used": lambda_cost,
+            "legal_action_count": int(np.count_nonzero(legal)),
+        }
+        # Deterministic bounded selection: retain flips first, then the first
+        # remaining decisions. No random sampling or extra inference occurs.
+        if differs:
+            flip_count = sum(
+                row["reward_argmax_action"] != row["safe_argmax_action"]
+                for row in self.representative_cases
+            )
+            if flip_count < 4:
+                self.representative_cases.insert(flip_count, case)
+            elif len(self.representative_cases) < 8:
+                self.representative_cases.append(case)
+        elif len(self.representative_cases) < 8:
+            self.representative_cases.append(case)
+
+    def add_optimizer_events(self, events):
+        for event in events:
+            self.optimizer_event_count += 1
+            for field in (
+                "reward_bellman_target",
+                "reward_td_error",
+                "cost_bellman_target",
+                "cost_td_error",
+            ):
+                self._samples[field].extend(float(value) for value in event[field])
+            self._samples["reward_loss"].append(float(event["reward_loss"]))
+            self._samples["cost_loss"].append(float(event["cost_loss"]))
+
+    def summary(self, **lifecycle):
+        slot_bits = _distribution(self.slot_timely_useful_bits)
+        slot_kbits = _distribution(
+            [value / 1000.0 for value in self.slot_timely_useful_bits]
+        )
+        slot_reward = _distribution(self.slot_rewards)
+        slot_count = len(self.slot_rewards)
+        return {
+            "schema_version": ROUTING_TRAINING_DIAGNOSTIC_CONTRACT_VERSION,
+            "slot_timely_useful_bits": slot_bits,
+            "slot_timely_useful_kbits": slot_kbits,
+            "slot_global_reward": slot_reward,
+            "slot_zero_reward_count": int(
+                np.count_nonzero(np.asarray(self.slot_rewards) == 0.0)
+            ),
+            "slot_zero_reward_fraction": _ratio(
+                int(np.count_nonzero(np.asarray(self.slot_rewards) == 0.0)),
+                slot_count,
+            ),
+            "decision_count": self.decision_count,
+            "empty_hol_decision_count": self.empty_hol_decision_count,
+            "epsilon_decision_count": self.epsilon_decision_count,
+            "greedy_decision_count": self.greedy_decision_count,
+            "other_decision_branch_count": (
+                self.decision_count
+                - self.epsilon_decision_count
+                - self.greedy_decision_count
+            ),
+            "reward_safe_argmax_difference_count": (
+                self.reward_safe_argmax_difference_count
+            ),
+            "reward_safe_argmax_difference_fraction": _ratio(
+                self.reward_safe_argmax_difference_count, self.decision_count
+            ),
+            "greedy_selected_differs_from_reward_argmax_count": (
+                self.greedy_selected_differs_from_reward_argmax_count
+            ),
+            "greedy_selected_differs_from_reward_argmax_fraction": _ratio(
+                self.greedy_selected_differs_from_reward_argmax_count,
+                self.greedy_decision_count,
+            ),
+            "legal_qc_negative_fraction": _ratio(
+                self.legal_qc_negative_count, self.legal_qc_count
+            ),
+            "legal_qc_above_one_fraction": _ratio(
+                self.legal_qc_above_one_count, self.legal_qc_count
+            ),
+            "score_distributions": {
+                field: _distribution(self._samples[field])
+                for field in self._SAMPLE_FIELDS
+            },
+            "optimizer_event_count": self.optimizer_event_count,
+            "representative_cases": list(self.representative_cases[:8]),
+            **lifecycle,
+        }
 
 
 class RoutingQScoreDiagnosticAccumulator:

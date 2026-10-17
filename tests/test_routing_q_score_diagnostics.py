@@ -20,6 +20,7 @@ from routing_q_score_diagnostics import (
     ROUTING_Q_SCORE_DIAGNOSTIC_CONTRACT_VERSION,
     VOLUNTARY_WAIT_EVENT_FIELDS,
     RoutingQScoreDiagnosticAccumulator,
+    RoutingTrainingEpisodeDiagnostics,
     write_routing_q_score_diagnostic_artifacts,
 )
 from Simulator import Simulator
@@ -219,6 +220,102 @@ class RoutingQScoreDecisionTest(unittest.TestCase):
                 slot_index=0,
                 time_seconds=0.0,
             )
+
+
+class RoutingTrainingDiagnosticTest(unittest.TestCase):
+    def test_empty_single_action_tie_negative_qc_and_lambda_zero(self):
+        accumulator = RoutingTrainingEpisodeDiagnostics()
+        inspection = {
+            "q_r": [1.0, 1.0, 999.0],
+            "q_c": [-0.25, 1.5, -999.0],
+            "q_safe": [1.0, 1.0, 999.0],
+            "legal_mask": [True, True, False],
+            "lambda_cost_used": 0.0,
+            "reward_argmax_action": 0,
+            "safe_argmax_action": 0,
+            "decision_branch": "safe_q_greedy",
+        }
+        accumulator.add_decision(
+            inspection,
+            selected_action=0,
+            sender_uav_id=0,
+            hol_task_type=None,
+            slot_index=2,
+        )
+        single = dict(inspection)
+        single.update(
+            legal_mask=[False, True, False],
+            reward_argmax_action=1,
+            safe_argmax_action=1,
+            decision_branch="epsilon_exploration",
+        )
+        accumulator.add_decision(
+            single,
+            selected_action=1,
+            sender_uav_id=1,
+            hol_task_type="COM",
+            slot_index=3,
+        )
+        accumulator.add_slot(0.0, 0.0)
+        accumulator.add_slot(50_000.0, 5.0)
+        summary = accumulator.summary(lambda_cost_used=0.0)
+
+        self.assertEqual(summary["decision_count"], 2)
+        self.assertEqual(summary["empty_hol_decision_count"], 1)
+        self.assertEqual(summary["epsilon_decision_count"], 1)
+        self.assertEqual(summary["greedy_decision_count"], 1)
+        self.assertEqual(summary["reward_safe_argmax_difference_fraction"], 0.0)
+        self.assertGreater(summary["legal_qc_negative_fraction"], 0.0)
+        self.assertGreater(summary["legal_qc_above_one_fraction"], 0.0)
+        self.assertEqual(summary["slot_zero_reward_fraction"], 0.5)
+        self.assertEqual(summary["slot_global_reward"]["max"], 5.0)
+        self.assertEqual(
+            summary["representative_cases"][0]["hol_task_type"], "EMPTY"
+        )
+
+    def test_all_action_flip_and_epsilon_are_separated_without_rng_change(self):
+        agent = fixed_agent([3.0, 2.0, 1.0], [1.0, -1.0, 0.0], 2.0)
+        state = np.zeros(2, dtype=np.float32)
+        mask = [True, True, True]
+        before = copy.deepcopy(agent.exploration_rng.bit_generator.state)
+        action, diagnostics = agent.select_action(
+            state,
+            0,
+            mask=mask,
+            epsilon=1.0,
+            logits_noise_std=0.0,
+            return_diagnostics=True,
+        )
+        after_selection = copy.deepcopy(agent.exploration_rng.bit_generator.state)
+        accumulator = RoutingTrainingEpisodeDiagnostics()
+        accumulator.add_decision(
+            diagnostics,
+            selected_action=action,
+            sender_uav_id=0,
+            hol_task_type="FOV",
+            slot_index=0,
+        )
+        self.assertEqual(
+            agent.exploration_rng.bit_generator.state, after_selection
+        )
+        self.assertNotEqual(before, after_selection)
+        summary = accumulator.summary()
+        self.assertEqual(summary["epsilon_decision_count"], 1)
+        self.assertEqual(summary["greedy_decision_count"], 0)
+        self.assertEqual(summary["reward_safe_argmax_difference_count"], 1)
+        self.assertIsNone(
+            summary["greedy_selected_differs_from_reward_argmax_fraction"]
+        )
+
+    def test_optimizer_event_capture_is_explicitly_opt_in(self):
+        agent = fixed_agent([1.0, 0.0], [0.0, 0.0], 0.0)
+        self.assertFalse(agent.training_diagnostics_enabled)
+        self.assertEqual(agent.drain_training_diagnostic_events(), [])
+        agent.set_training_diagnostics_enabled(True)
+        self.assertTrue(agent.training_diagnostics_enabled)
+        agent._training_diagnostic_events.append({"fixture": True})
+        agent.set_training_diagnostics_enabled(False)
+        self.assertEqual(agent.drain_training_diagnostic_events(), [])
 
     def test_legal_nonfinite_q_value_fails_fast(self):
         agent = fixed_agent([0.0, np.nan], [0.0, 0.0], 1.0)

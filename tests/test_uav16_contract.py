@@ -105,7 +105,7 @@ class Uav16ConfigurationContractTest(unittest.TestCase):
         data["schema_version"] = "uav-hrl-scenario-v2"
         with self.assertRaisesRegex(ValueError, "16-UAV.*incompatible"):
             ScenarioManifest.from_dict(data)
-        self.assertEqual(CHECKPOINT_SCHEMA_VERSION, 34)
+        self.assertEqual(CHECKPOINT_SCHEMA_VERSION, 35)
         with self.assertRaisesRegex(RuntimeError, "must be retrained"):
             _validate_checkpoint_schema({"checkpoint_schema_version": 24})
 
@@ -491,7 +491,7 @@ class ChannelAndPacketContractTest(unittest.TestCase):
         self.assertEqual(engine.get_queue_packets(receiver), [resident, arrival])
         self.assertEqual(resident["last_routing_sender"], receiver)
         self.assertIsNone(arrival["last_routing_sender"])
-        self.assertEqual(result["reward_by_sender"][receiver], -0.5)
+        self.assertEqual(result["reward_by_sender"][receiver], 0.0)
         self.assertEqual(result["cost_by_sender"], {receiver: 0.0})
 
     def test_s2u_completion_at_deadline_is_one_formal_violation(self):

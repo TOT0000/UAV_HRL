@@ -191,6 +191,22 @@ def validate_standalone_trajectory_source(source):
     ):
         if field not in source:
             raise ValueError(f"standalone trajectory source lacks {field}")
+    for link in source["active_links"]:
+        required = {"sender_id", "receiver_id", "link_type"}
+        missing = sorted(required.difference(link))
+        if missing:
+            raise ValueError(
+                f"standalone trajectory active link lacks fields: {missing}"
+            )
+        if str(link["link_type"]) not in {"S2U", "U2U", "U2G"}:
+            raise ValueError("standalone trajectory active link type is invalid")
+        for field in ("capacity_bits_per_second", "transmitted_bits", "active_seconds"):
+            if link.get(field) is not None and (
+                not math.isfinite(float(link[field])) or float(link[field]) < 0.0
+            ):
+                raise ValueError(
+                    f"standalone trajectory active link {field} is invalid"
+                )
     for field in CHECKPOINT_PROVENANCE_FIELDS:
         value = source.get(field)
         if not isinstance(value, str) or len(value) != 64:

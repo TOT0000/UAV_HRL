@@ -41,6 +41,7 @@ from scenario_manifest import extend_training_manifest, generate_manifest
 from training_checkpoint import (
     CHECKPOINT_SCHEMA_VERSION,
     FULL_RESUME_LOGGING_SCHEMA_VERSION,
+    PRE_SHARED_GOODPUT_REWARD_CHECKPOINT_SCHEMA_VERSION,
     PRE_SERVICE_ONLY_CHECKPOINT_SCHEMA_VERSION,
     PRE_CONTINUOUS_GATEWAY_PROJECTION_CHECKPOINT_SCHEMA_VERSION,
     PRE_UNIFIED_400M_COMMUNICATION_CHECKPOINT_SCHEMA_VERSION,
@@ -1113,6 +1114,20 @@ class FullResumeCheckpointTest(unittest.TestCase):
             metadata_path = checkpoint_dir / "metadata.json"
             metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
             metadata["checkpoint_schema_version"] = (
+                PRE_SHARED_GOODPUT_REWARD_CHECKPOINT_SCHEMA_VERSION
+            )
+            metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+            with mock.patch(
+                "training_checkpoint._load_network_states"
+            ) as load_networks:
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "sender-local shaped routing reward.*retraining is required",
+                ):
+                    load_model_checkpoint(checkpoint_dir, td3, ddqn)
+                load_networks.assert_not_called()
+
+            metadata["checkpoint_schema_version"] = (
                 PRE_SERVICE_ONLY_CHECKPOINT_SCHEMA_VERSION
             )
             metadata_path.write_text(
@@ -1382,6 +1397,20 @@ class FullResumeCheckpointTest(unittest.TestCase):
             metadata_path = checkpoint_dir / "metadata.json"
             metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
             metadata["checkpoint_schema_version"] = (
+                PRE_SHARED_GOODPUT_REWARD_CHECKPOINT_SCHEMA_VERSION
+            )
+            metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+            with mock.patch(
+                "training_checkpoint._load_network_states"
+            ) as load_networks:
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "sender-local shaped routing reward.*retraining is required",
+                ):
+                    load_full_resume_checkpoint(**common)
+                load_networks.assert_not_called()
+
+            metadata["checkpoint_schema_version"] = (
                 PRE_SERVICE_ONLY_CHECKPOINT_SCHEMA_VERSION
             )
             metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
@@ -1460,7 +1489,7 @@ class TrainingCliTest(unittest.TestCase):
         )
 
     def test_checkpoint_schema_is_explicit(self):
-        self.assertEqual(CHECKPOINT_SCHEMA_VERSION, 34)
+        self.assertEqual(CHECKPOINT_SCHEMA_VERSION, 35)
 
 
 if __name__ == "__main__":

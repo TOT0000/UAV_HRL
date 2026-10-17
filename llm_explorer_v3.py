@@ -33,8 +33,8 @@ from llm_explorer import (
 
 LLM_EXPLORER_V3_METHOD_ID = "td3_dinkelbach_llm_explorer_v3"
 LLM_EXPLORER_V3_VERSION = "uav-hrl-llm-explorer-v3"
-LLM_EXPLORER_V3_PROMPT_VERSION = "uav-hrl-llm-explorer-prompts-v4"
-LLM_EXPLORER_V3_SUMMARY_VERSION = "event-time-verified-episode-summary-v3"
+LLM_EXPLORER_V3_PROMPT_VERSION = "uav-hrl-llm-explorer-prompts-v5"
+LLM_EXPLORER_V3_SUMMARY_VERSION = "shared-goodput-event-time-episode-summary-v4"
 LLM_EXPLORER_V3_CASE_VERSION = "deterministic-diverse-cases-v2"
 LLM_EXPLORER_V3_GUIDANCE_CONTEXT_VERSION = "self-contained-raw-td3-v1"
 LLM_EXPLORER_V3_ANNEAL_END_EPISODE = 600

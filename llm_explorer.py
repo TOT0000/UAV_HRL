@@ -25,7 +25,7 @@ import numpy as np
 LLM_EXPLORER_METHOD_ID = "td3_dinkelbach_llm_explorer"
 LLM_EXPLORER_MODEL = "gpt-4o-mini"
 LLM_EXPLORER_VERSION = "uav-hrl-llm-explorer-v2"
-LLM_EXPLORER_PROMPT_VERSION = "uav-hrl-llm-explorer-prompts-v3"
+LLM_EXPLORER_PROMPT_VERSION = "uav-hrl-llm-explorer-prompts-v4"
 LLM_EXPLORER_COMPRESSION_VERSION = "compact-observable-tables-v1"
 LLM_EXPLORER_WARMUP_TRANSITIONS = 10_000
 LLM_EXPLORER_UPDATE_INTERVAL_EPISODES = 1
@@ -873,7 +873,12 @@ def environment_constants_and_definitions(
                 "com_range": float(MOVEMENT_CONSTRAINT_WEIGHT_COM),
             },
         },
-        "routing_reward": "capacity_norm - 0.5*(transmission_norm + queue_norm) + 2.0*gs_progress_norm",
+        "routing_reward": {
+            "formula": "slot timely useful bits delivered to GS / 10000",
+            "unit": "1 reward per decimal 10 kbit",
+            "sharing": "the same global slot reward is stored in every UAV routing transition; episode routing reward sums each slot once",
+            "zero_and_bounds": "zero when no timely useful GS delivery; no clipping or dynamic normalization",
+        },
         "safe_ddqn": {
             "score": "Q_reward - lambda_cost * Q_cost",
             "qos_target_probability": float(SAFE_DDQN_QOS_TARGET_PROBABILITY),

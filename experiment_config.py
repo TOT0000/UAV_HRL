@@ -211,7 +211,7 @@ ROUTING_OPTIMIZER_UPDATE_SCOPE = "every_4_routing_slots"
 FOV_EMA_LIFECYCLE_VERSION = "nadir-contributor-footprints-empty-fov-samples-v7"
 SR_ROUTE_LIFECYCLE_VERSION = "assigned-and-arrived-derived-state-v2"
 PACKET_QOS_CONTRACT_VERSION = (
-    "e2e-event-time-com10ms-vs15ms-single-terminal-outcome-v9"
+    "e2e-event-time-com10ms-vs15ms-scale-tolerant-terminal-outcome-v10"
 )
 FOV_PACKET_GENERATION_CONTRACT_VERSION = (
     "assigned-valid-sensing-fixed-interval-event-capture-v4"
@@ -226,17 +226,15 @@ ROUTING_COST_ATTRIBUTION_CONTRACT_VERSION = (
     "multi-packet-per-decision-path-terminal-outcome-v5"
 )
 PACKET_SERVICE_CONTRACT_VERSION = (
-    "event-time-store-forward-dynamic-fdma-fixed-fading-v3"
+    "event-time-store-forward-dynamic-fdma-fixed-fading-v4"
 )
 QOS_AGGREGATE_CONTRACT_VERSION = (
     "canonical-single-result-seed-ratio-of-sums-student-t-v3"
 )
 ROUTING_REWARD_CONTRACT_VERSION = (
-    "all-uav-preselection-observed-hol-or-neutral-empty-v8"
+    "shared-slot-timely-useful-gs-bits-per-10000-v9"
 )
-ROUTING_REWARD_ALPHA_CAPACITY = 1.0
-ROUTING_REWARD_ALPHA_DELAY = 0.5
-ROUTING_REWARD_ALPHA_GS_PROGRESS = 2.0
+ROUTING_REWARD_BITS_PER_UNIT = 10_000.0
 ROUTING_GS_PROGRESS_FORMULA = (
     "clip((d_3d(sender,GS)-d_3d(receiver,GS))/"
     "maximum_3d_communication_distance_m,-1,1)"
@@ -1181,16 +1179,22 @@ def comparison_method_configuration(method_spec: MethodSpec) -> dict:
         "routing_action_hold": "fixed_for_entire_slot",
         "packet_forwarding_model": "full_packet_store_and_forward_same_slot_multihop",
         "bandwidth_allocation_model": "dynamic_equal_fdma_currently_serviceable_links",
-        "deadline_completion_boundary": "gs_arrival_time_lte_absolute_deadline_strict_no_grace_period",
+        "deadline_completion_boundary": (
+            "gs_arrival_lte_deadline_with_scale_aware_floating_point_"
+            "tolerance_and_no_physical_grace_period"
+        ),
         "qos_aggregate_contract_version": QOS_AGGREGATE_CONTRACT_VERSION,
         "evaluation_aggregation_schema_version": (
             EVALUATION_AGGREGATION_SCHEMA_VERSION
         ),
         "routing_reward_contract_version": ROUTING_REWARD_CONTRACT_VERSION,
-        "routing_reward_alpha_capacity": ROUTING_REWARD_ALPHA_CAPACITY,
-        "routing_reward_alpha_delay": ROUTING_REWARD_ALPHA_DELAY,
-        "routing_reward_alpha_gs_progress": ROUTING_REWARD_ALPHA_GS_PROGRESS,
-        "routing_gs_progress_formula": ROUTING_GS_PROGRESS_FORMULA,
+        "routing_reward_formula": (
+            "slot_total_timely_useful_bits_delivered_to_gs / 10000"
+        ),
+        "routing_reward_bits_per_unit": ROUTING_REWARD_BITS_PER_UNIT,
+        "routing_reward_assignment": "same_global_slot_reward_to_every_uav_transition",
+        "routing_episode_reward_aggregation": "sum_global_slot_reward_once_per_slot",
+        "routing_state_gs_progress_formula": ROUTING_GS_PROGRESS_FORMULA,
         "routing_gs_progress_normalization_reference_m": (
             MAX_3D_COMMUNICATION_DISTANCE_M
         ),

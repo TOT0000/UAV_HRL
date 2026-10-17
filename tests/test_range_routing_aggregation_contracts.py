@@ -195,7 +195,12 @@ class HardRangeAndComSessionContractTest(unittest.TestCase):
         env.multi_tasks[0] = [{"task_type": "COM", "target_obj_id": 0}]
         env.SR_teams[0].assigned_gt_id = 0
         env.SR_teams[0].x, env.SR_teams[0].y, env.SR_teams[0].z = (0.0, 0.0, 0.0)
-        engine = PacketEngine(num_uav=16)
+        # This test isolates permanent COM-session activation from the formal
+        # millisecond deadline contract.
+        engine = PacketEngine(
+            num_uav=16,
+            task_deadlines_seconds={"FOV": 2.0, "COM": 2.0},
+        )
         for slot, expected in ((0, 0), (1, 1), (2, 2)):
             env.uav_dict[0].x_u = 400.0 if slot == 1 else 400.001
             env.uav_dict[0].y_u = 0.0
@@ -265,6 +270,7 @@ class HardRangeAndComSessionContractTest(unittest.TestCase):
         engine = PacketEngine(
             num_uav=16,
             enable_packet_diagnostic_artifacts=True,
+            task_deadlines_seconds={"FOV": 2.0, "COM": 2.0},
         )
         pkt = engine.create_packet(0, "COM", 1_000.0, 0.0)
         pkt["hop_service_start_time"] = 0.0
@@ -324,34 +330,6 @@ class HardRangeAndComSessionContractTest(unittest.TestCase):
 
 
 class RoutingCreditAndRewardContractTest(unittest.TestCase):
-    def test_reward_uses_frozen_other_backlog_not_elapsed_wait(self):
-        engine = PacketEngine(num_uav=1)
-        pkt = engine.create_packet(0, "COM", 200.0, 0.0)
-        env = SimpleNamespace(
-            GS_ID=1,
-            num_UAV=1,
-            GS_pos=(0.0, 0.0, 0.0),
-            uav_dict={
-                0: SimpleNamespace(get_position=lambda: (200.0, 0.0, 0.0))
-            },
-        )
-        first = engine.routing_local_reward(
-            env, 0, 1, 0.001, pkt=pkt, current_time=0.0,
-            total_backlog_bits=600.0,
-        )
-        second = engine.routing_local_reward(
-            env, 0, 1, 0.001, pkt=pkt, current_time=100.0,
-            total_backlog_bits=600.0,
-        )
-        self.assertEqual(first, second)
-        self.assertEqual(
-            engine.routing_local_reward(
-                env, 0, 0, 0.0, pkt=pkt, current_time=0.0,
-                total_backlog_bits=600.0,
-            ),
-            -1.0,
-        )
-
     def test_transition_commits_after_immediate_cost_and_next_state_are_known(self):
         engine = PacketEngine(num_uav=1)
         pkt = engine.create_packet(0, "COM", 100.0, 0.0)
@@ -393,7 +371,11 @@ class RoutingCreditAndRewardContractTest(unittest.TestCase):
         self.assertTrue(ledger.finalize_packet(9, violated=True))
         ledger.finalize_causality({}, {}, terminal=True)
         self.assertEqual(ledger.commit_ready(replay), [transition_id])
-        self.assertEqual(replay.cost[0, 0], 1.0)
+        # The reward replay row remains neutral; the packet-path cost has its
+        # own sample so one decision can retain independent packet outcomes.
+        self.assertEqual(replay.cost[0, 0], 0.0)
+        self.assertEqual(replay.path_cost_size, 1)
+        self.assertEqual(replay.path_cost_value[0, 0], 1.0)
 
     def test_max_hop_violation_is_a_routing_stage_outcome_without_transition_credit(self):
         engine = PacketEngine(num_uav=1)

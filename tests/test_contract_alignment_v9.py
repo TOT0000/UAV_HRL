@@ -10,7 +10,7 @@ from Channel_model import (
 )
 from DDQN import DDQN
 from Energy_model import EnergyConsumptionModel
-from Packet_scheduler_v1 import PacketEngine
+from Packet_scheduler_v1 import PacketEngine, timely_useful_bits_routing_reward
 from experiment_config import (
     FORMAL_CHECKPOINT_EPISODE,
     FORMAL_EXPERIMENT_DEFAULTS,
@@ -49,7 +49,7 @@ class FormalContractTest(unittest.TestCase):
         self.assertEqual(FORMAL_CHECKPOINT_EPISODE, 1500)
         self.assertEqual(FORMAL_EXPERIMENT_DEFAULTS["training_episodes_per_seed"], 1500)
         self.assertEqual(checkpoint_episode_schedule(1500, 50), list(range(50, 1501, 50)))
-        self.assertEqual(CHECKPOINT_SCHEMA_VERSION, 34)
+        self.assertEqual(CHECKPOINT_SCHEMA_VERSION, 35)
 
     def test_all_methods_publish_the_same_physical_contracts(self):
         shared_fields = (
@@ -60,6 +60,11 @@ class FormalContractTest(unittest.TestCase):
             "packet_routing_causality_contract_version",
             "qos_aggregate_contract_version",
             "routing_reward_contract_version",
+            "routing_reward_formula",
+            "routing_reward_bits_per_unit",
+            "routing_reward_assignment",
+            "routing_episode_reward_aggregation",
+            "routing_state_gs_progress_formula",
             "reference_u2u_max_capacity_mbps",
             "reference_u2g_max_capacity_mbps",
             "propulsion_model_id",
@@ -254,58 +259,10 @@ class QoSAndRoutingRewardContractTest(unittest.TestCase):
         self.assertEqual(engine.routing_immediate_cost_sum, 0.0)
         self.assertEqual(engine.routing_constraint_counts(), (1, 1))
 
-    def test_reward_is_exact_capacity_delay_plus_soft_gs_progress_formula(self):
-        env = _RoutingEnvironment()
-        engine = PacketEngine(2, task_deadlines_seconds={"FOV": 2.0, "COM": 1.0})
-        packet = engine.create_packet(0, "FOV", 1_000_000.0, 0.0)
-        capacity = 10.0
-        maximum = reference_u2g_max_capacity_mbps(TOTAL_COMMUNICATION_BANDWIDTH_HZ)
-        expected = capacity / maximum - 0.5 * ((0.1 / 2.0) + 0.0) + 2.0
-        first = engine.routing_local_reward(
-            env,
-            0,
-            env.GS_ID,
-            capacity,
-            pkt=packet,
-            current_time=0.0,
-        )
-        self.assertAlmostEqual(first, expected, places=12)
-        env.uav_dict[0].x_u = 200.0
-        second = engine.routing_local_reward(
-            env,
-            0,
-            env.GS_ID,
-            capacity,
-            pkt=packet,
-            current_time=0.0,
-        )
-        self.assertAlmostEqual(first - second, 1.0, places=12)
-        self.assertEqual(
-            engine.routing_local_reward(
-                env, 0, 0, 0.0, pkt=packet, current_time=0.0
-            ),
-            -0.5,
-        )
-        self.assertEqual(
-            engine.routing_local_reward(
-                env, 0, 0, 0.0, pkt=packet, current_time=1.0
-            ),
-            -0.5,
-        )
-
-    def test_partial_hop_reward_keeps_service_start_queue_wait_fixed(self):
-        env = _RoutingEnvironment()
-        engine = PacketEngine(2, task_deadlines_seconds={"FOV": 2.0, "COM": 1.0})
-        packet = engine.create_packet(0, "COM", 1_000_000.0, 0.0)
-        packet["hop_service_start_time"] = 0.25
-        first = engine.routing_local_reward(
-            env, 0, 0, 0.0, pkt=packet, current_time=0.5
-        )
-        second = engine.routing_local_reward(
-            env, 0, 0, 0.0, pkt=packet, current_time=0.75
-        )
-        self.assertEqual(first, -0.5)
-        self.assertEqual(second, first)
+    def test_reward_scale_is_independent_of_local_capacity_delay_and_progress(self):
+        self.assertEqual(timely_useful_bits_routing_reward(0.0), 0.0)
+        self.assertEqual(timely_useful_bits_routing_reward(10_000.0), 1.0)
+        self.assertEqual(timely_useful_bits_routing_reward(250_000.0), 25.0)
 
     def test_next_hol_preserves_historical_wait_and_clips_at_deadline(self):
         env = _RoutingEnvironment()
@@ -321,28 +278,6 @@ class QoSAndRoutingRewardContractTest(unittest.TestCase):
         self.assertTrue(first_packet["done"])
         self.assertIs(engine.get_hol_packet(0), second_packet)
         self.assertEqual(second_packet["queue_enter_time"], 0.0)
-        self.assertEqual(
-            engine.routing_local_reward(
-                env,
-                0,
-                0,
-                0.0,
-                pkt=second_packet,
-                current_time=0.75,
-            ),
-            -0.5,
-        )
-        self.assertEqual(
-            engine.routing_local_reward(
-                env,
-                0,
-                0,
-                0.0,
-                pkt=second_packet,
-                current_time=2.0,
-            ),
-            -0.5,
-        )
 
 
 if __name__ == "__main__":

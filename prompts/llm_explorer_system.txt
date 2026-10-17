@@ -28,16 +28,7 @@ r_movement = B_timely_Mbit - lambda_EE * E_movement_J - P_C9 - P_C10 - P_COM.
 
 B_timely is in Mbit and lambda_EE in Mbit/J, while reported EE is bit/J. Use the actual supplied lambda_EE. Safe-DDQN has a separate routing reward and safety cost. Its safe score is Q_reward(s,a) - lambda_cost * Q_cost(s,a). lambda_cost is distinct from lambda_EE.
 
-The routing reward is:
-r_routing = capacity_norm - 0.5 * (transmission_norm + queue_norm) + 2.0 * gs_progress_norm.
-
-For an available service link:
-transmission_norm = clip((HOL_remaining_bits / capacity_bps) / packet_deadline_s, 0, 1)
-other_backlog_bits = max(sender_total_backlog_bits - HOL_remaining_bits, 0)
-queue_norm = clip((other_backlog_bits / capacity_bps) / packet_deadline_s, 0, 1)
-gs_progress_norm = clip((distance_3d(sender,GS) - distance_3d(next_hop,GS)) / 400, -1, 1)
-
-capacity_norm uses the existing reference maximum. queue_norm is a reference service term, not actual elapsed HOL queue time. WAIT has zero service capacity and follows existing reward rules. Safety cost reflects final deadline violations under existing attribution. Assess EE jointly, but keep movement and routing reward totals separate; never add them into one score.
+The routing reward for a slot is the network-wide timely useful bits actually delivered to the GS in that slot divided by 10,000. The same slot reward is stored in every UAV routing transition, including EMPTY and WAIT decisions, while the episode routing reward sums each slot only once. There is no clipping or dynamic normalization. Capacity, backlog, deadline, and GS-progress values remain observable state evidence but are not additive routing-reward terms. Safety cost separately reflects final deadline outcomes under packet-path attribution. Assess EE jointly, but keep movement and routing reward totals separate; never add them into one score.
 
 3. Movement, sensing, communication, and energy
 

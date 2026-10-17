@@ -71,9 +71,7 @@ from experiment_config import (
     ROUTING_ACTION_FEATURE_GROUPS,
     ROUTING_COST_ATTRIBUTION_CONTRACT_VERSION,
     ROUTING_GS_PROGRESS_FORMULA,
-    ROUTING_REWARD_ALPHA_CAPACITY,
-    ROUTING_REWARD_ALPHA_DELAY,
-    ROUTING_REWARD_ALPHA_GS_PROGRESS,
+    ROUTING_REWARD_BITS_PER_UNIT,
     ROUTING_REWARD_CONTRACT_VERSION,
     ROUTING_STATE_DIM,
     ROUTING_STATE_SCHEMA_VERSION,
@@ -117,7 +115,8 @@ from dinkelbach_blocks import (
     dinkelbach_config_metadata,
 )
 
-CHECKPOINT_SCHEMA_VERSION = 34
+CHECKPOINT_SCHEMA_VERSION = 35
+PRE_SHARED_GOODPUT_REWARD_CHECKPOINT_SCHEMA_VERSION = 34
 PRE_EVENT_TIME_SERVICE_CHECKPOINT_SCHEMA_VERSION = 33
 PRE_PACKET_PATH_COST_CHECKPOINT_SCHEMA_VERSION = 32
 PRE_HYBRID_SEARCH_CHECKPOINT_SCHEMA_VERSION = 31
@@ -315,10 +314,11 @@ FORMAL_CORE_CONFIG_FIELDS = (
     "qos_aggregate_contract_version",
     "evaluation_aggregation_schema_version",
     "routing_reward_contract_version",
-    "routing_reward_alpha_capacity",
-    "routing_reward_alpha_delay",
-    "routing_reward_alpha_gs_progress",
-    "routing_gs_progress_formula",
+    "routing_reward_formula",
+    "routing_reward_bits_per_unit",
+    "routing_reward_assignment",
+    "routing_episode_reward_aggregation",
+    "routing_state_gs_progress_formula",
     "routing_gs_progress_normalization_reference_m",
     "routing_state_schema_version",
     "routing_state_dim",
@@ -1164,10 +1164,17 @@ def _base_metadata(
             MAX_3D_COMMUNICATION_DISTANCE_M
         ),
         "routing_reward_contract_version": ROUTING_REWARD_CONTRACT_VERSION,
-        "routing_reward_alpha_capacity": ROUTING_REWARD_ALPHA_CAPACITY,
-        "routing_reward_alpha_delay": ROUTING_REWARD_ALPHA_DELAY,
-        "routing_reward_alpha_gs_progress": ROUTING_REWARD_ALPHA_GS_PROGRESS,
-        "routing_gs_progress_formula": ROUTING_GS_PROGRESS_FORMULA,
+        "routing_reward_formula": (
+            "slot_total_timely_useful_bits_delivered_to_gs / 10000"
+        ),
+        "routing_reward_bits_per_unit": ROUTING_REWARD_BITS_PER_UNIT,
+        "routing_reward_assignment": (
+            "same_global_slot_reward_to_every_uav_transition"
+        ),
+        "routing_episode_reward_aggregation": (
+            "sum_global_slot_reward_once_per_slot"
+        ),
+        "routing_state_gs_progress_formula": ROUTING_GS_PROGRESS_FORMULA,
         "routing_gs_progress_normalization_reference_m": (
             MAX_3D_COMMUNICATION_DISTANCE_M
         ),
@@ -1536,6 +1543,12 @@ def _checkpoint_uses_dinkelbach(metadata):
 def _validate_checkpoint_schema(metadata):
     schema = metadata.get("checkpoint_schema_version")
     if schema != CHECKPOINT_SCHEMA_VERSION:
+        if schema == PRE_SHARED_GOODPUT_REWARD_CHECKPOINT_SCHEMA_VERSION:
+            raise RuntimeError(
+                "checkpoint schema v34 contains sender-local shaped routing "
+                "reward replay. The shared per-slot timely-useful GS-goodput "
+                "reward contract is incompatible; retraining is required"
+            )
         if schema == PRE_EVENT_TIME_SERVICE_CHECKPOINT_SCHEMA_VERSION:
             raise RuntimeError(
                 "checkpoint schema v33 uses 2.0/2.5 second deadlines, "

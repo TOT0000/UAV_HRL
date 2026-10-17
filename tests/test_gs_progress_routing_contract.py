@@ -8,6 +8,7 @@ from Packet_scheduler_v1 import (
     PacketEngine,
     action_wise_gs_progress,
     canonical_routing_gs_progress,
+    timely_useful_bits_routing_reward,
 )
 from communication_contract import normalized_gs_progress
 from experiment_config import (
@@ -19,9 +20,7 @@ from experiment_config import (
     PRODUCTION_TASK_DEADLINE_SECONDS,
     ROUTING_ACTION_DIM,
     ROUTING_ACTION_FEATURE_GROUPS,
-    ROUTING_REWARD_ALPHA_CAPACITY,
-    ROUTING_REWARD_ALPHA_DELAY,
-    ROUTING_REWARD_ALPHA_GS_PROGRESS,
+    ROUTING_REWARD_BITS_PER_UNIT,
     ROUTING_REWARD_CONTRACT_VERSION,
     ROUTING_STATE_DIM,
     ROUTING_STATE_SCHEMA_VERSION,
@@ -88,31 +87,12 @@ class GroundStationProgressHelperTest(unittest.TestCase):
 
 
 class RoutingRewardAndStateContractTest(unittest.TestCase):
-    def test_reward_prefers_equal_quality_link_that_is_closer_to_gs(self):
-        env = SimpleNamespace(
-            num_UAV=3,
-            GS_ID=3,
-            GS_pos=(0.0, 0.0, 0.0),
-            uav_dict={
-                0: _point((300.0, 0.0, 0.0)),
-                1: _point((100.0, 0.0, 0.0)),
-                2: _point((500.0, 0.0, 0.0)),
-            },
-        )
-        engine = PacketEngine(3)
-        packet = engine.create_packet(0, "COM", 1000.0, 0.0)
-        closer = engine.routing_local_reward(
-            env, 0, 1, 10.0, pkt=packet, current_time=0.0
-        )
-        farther = engine.routing_local_reward(
-            env, 0, 2, 10.0, pkt=packet, current_time=0.0
-        )
-        self.assertGreater(closer, farther)
-        self.assertAlmostEqual(closer - farther, 2.0, places=12)
-        self.assertEqual(ROUTING_REWARD_ALPHA_CAPACITY, 1.0)
-        self.assertEqual(ROUTING_REWARD_ALPHA_DELAY, 0.5)
-        self.assertEqual(ROUTING_REWARD_ALPHA_GS_PROGRESS, 2.0)
-        self.assertTrue(ROUTING_REWARD_CONTRACT_VERSION.endswith("v8"))
+    def test_reward_uses_only_timely_useful_gs_bits_with_fixed_scale(self):
+        self.assertEqual(ROUTING_REWARD_BITS_PER_UNIT, 10_000.0)
+        self.assertEqual(timely_useful_bits_routing_reward(0.0), 0.0)
+        self.assertEqual(timely_useful_bits_routing_reward(50_000.0), 5.0)
+        self.assertEqual(timely_useful_bits_routing_reward(150_000.0), 15.0)
+        self.assertTrue(ROUTING_REWARD_CONTRACT_VERSION.endswith("v9"))
 
     def test_state_is_143d_and_progress_block_survives_task_masking(self):
         env = Simulator(num_UAV=NUM_UAV)
@@ -198,7 +178,7 @@ class QosAndCheckpointContractTest(unittest.TestCase):
         self.assertEqual(DEADLINE_SWEEP_INJECTION_CUTOFF_SECONDS, 57.0)
 
     def test_schema_21_and_90d_current_schema_are_rejected(self):
-        self.assertEqual(CHECKPOINT_SCHEMA_VERSION, 34)
+        self.assertEqual(CHECKPOINT_SCHEMA_VERSION, 35)
         with self.assertRaisesRegex(RuntimeError, "must be retrained"):
             _validate_checkpoint_schema({"checkpoint_schema_version": 21})
         with self.assertRaisesRegex(RuntimeError, "GS-progress"):

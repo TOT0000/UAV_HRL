@@ -13,8 +13,6 @@ from Channel_model import (
     U2U_U2G_TX_POWER_DBM,
     a2g_conditional_path_loss_db,
     block_capacity_profile_mbps,
-    reference_u2g_max_capacity_mbps,
-    reference_u2u_max_capacity_mbps,
     u2u_path_loss_db,
 )
 from centralized_movement import fov_task_geometry, fov_task_metrics
@@ -27,17 +25,14 @@ from experiment_config import (
     PRODUCTION_PACKET_INJECTION_CUTOFF_SECONDS,
     PRODUCTION_TASK_DEADLINE_SECONDS,
     ROUTING_ACTION_FEATURE_GROUPS,
-    ROUTING_REWARD_ALPHA_CAPACITY,
-    ROUTING_REWARD_ALPHA_DELAY,
-    ROUTING_REWARD_ALPHA_GS_PROGRESS,
-    TOTAL_COMMUNICATION_BANDWIDTH_HZ,
+    ROUTING_REWARD_BITS_PER_UNIT,
 )
 from fov_ema_lifecycle import validate_fov_ema_state
 import numpy as np
 
 
 PACKET_ENGINE_CHECKPOINT_SCHEMA_VERSION = (
-    "event-time-generation-service-and-multi-packet-cost-v6"
+    "event-time-shared-goodput-reward-and-tolerant-deadline-v7"
 )
 
 
@@ -52,6 +47,22 @@ PACKET_EPS = 1e-9
 EVENT_TIME_EPS = 1e-12
 TASK_DEADLINE_SECONDS = dict(PRODUCTION_TASK_DEADLINE_SECONDS)
 EPISODE_INJECTION_CUTOFF_SECONDS = PRODUCTION_PACKET_INJECTION_CUTOFF_SECONDS
+
+
+def event_time_tolerance_seconds(*values):
+    """Scale-aware numerical tolerance, never a physical deadline grace period."""
+
+    scale = max((abs(float(value)) for value in values), default=1.0)
+    return max(EVENT_TIME_EPS, 32.0 * math.ulp(max(scale, 1.0)))
+
+
+def timely_useful_bits_routing_reward(timely_useful_bits):
+    """Convert the authoritative slot goodput numerator into routing reward."""
+
+    bits = float(timely_useful_bits)
+    if not math.isfinite(bits) or bits < 0.0:
+        raise ValueError("timely useful bits must be finite and non-negative")
+    return bits / ROUTING_REWARD_BITS_PER_UNIT
 
 
 def _routing_ground_station_position(env):
@@ -1312,10 +1323,13 @@ class PacketEngine:
             if deadline_abs is None:
                 return False
             deadline_abs = float(deadline_abs)
+            tolerance = event_time_tolerance_seconds(
+                current_time, deadline_abs
+            )
             return (
-                current_time >= deadline_abs
+                current_time >= deadline_abs - tolerance
                 if inclusive
-                else current_time > deadline_abs + PACKET_EPS
+                else current_time > deadline_abs + tolerance
             )
 
         for uav_id in range(self.num_UAV):
@@ -1417,93 +1431,6 @@ class PacketEngine:
         if not np.isfinite(wait_seconds):
             raise RuntimeError("HOL queue wait is NaN or Inf")
         return float(wait_seconds)
-
-    def routing_local_reward(
-        self,
-        env,
-        sender,
-        receiver,
-        capacity_mbps,
-        *,
-        pkt,
-        current_time,
-        total_backlog_bits=None,
-    ):
-        """Use frozen slot-start backlog and actual FDMA/fading capacity."""
-
-        sender, receiver = int(sender), int(receiver)
-        if pkt is None:
-            raise ValueError("routing reward requires the frozen start-of-slot HOL")
-        capacity_mbps = float(capacity_mbps)
-        deadline = float(
-            self.task_deadlines_seconds[
-                self._task_norm(pkt.get("task_type", "COM"))
-            ]
-        )
-        # Retained for diagnostics only. Wall-clock HOL wait does not enter reward.
-        self._actual_hol_queue_wait_seconds(pkt, current_time)
-        hol_remaining_bits = max(float(pkt.get("rem_bits", 0.0)), 0.0)
-        if total_backlog_bits is None:
-            total_backlog_bits = float(self.backlog_bits.get(sender, 0.0))
-        total_backlog_bits = max(float(total_backlog_bits), 0.0)
-        backlog_tolerance_bits = max(
-            1e-6,
-            32.0
-            * math.ulp(
-                max(
-                    abs(total_backlog_bits),
-                    abs(hol_remaining_bits),
-                    1.0,
-                )
-            ),
-        )
-
-        if total_backlog_bits + backlog_tolerance_bits < hol_remaining_bits:
-            raise AssertionError(
-                "slot-start total backlog is smaller than HOL remaining bits"
-            )
-        other_backlog_bits = max(
-            total_backlog_bits - hol_remaining_bits, 0.0
-        )
-        service_available = (
-            receiver != sender
-            and np.isfinite(capacity_mbps)
-            and capacity_mbps > 0.0
-        )
-        if receiver == int(env.GS_ID):
-            maximum_mbps = reference_u2g_max_capacity_mbps(
-                TOTAL_COMMUNICATION_BANDWIDTH_HZ
-            )
-        else:
-            maximum_mbps = reference_u2u_max_capacity_mbps(
-                TOTAL_COMMUNICATION_BANDWIDTH_HZ
-            )
-        if service_available:
-            capacity_bps = capacity_mbps * 1e6
-            capacity_norm = float(
-                np.clip(capacity_mbps / maximum_mbps, 0.0, 1.0)
-            )
-            transmission_delay = hol_remaining_bits / capacity_bps
-            queue_delay = other_backlog_bits / capacity_bps
-            transmission_norm = float(
-                np.clip(transmission_delay / deadline, 0.0, 1.0)
-            )
-            queue_norm = float(
-                np.clip(queue_delay / deadline, 0.0, 1.0)
-            )
-        else:
-            capacity_norm = 0.0
-            transmission_norm = 1.0 if hol_remaining_bits > 0.0 else 0.0
-            queue_norm = 1.0 if other_backlog_bits > 0.0 else 0.0
-        reward = (
-            ROUTING_REWARD_ALPHA_CAPACITY * capacity_norm
-            - ROUTING_REWARD_ALPHA_DELAY * (transmission_norm + queue_norm)
-            + ROUTING_REWARD_ALPHA_GS_PROGRESS
-            * canonical_routing_gs_progress(env, sender, receiver)
-        )
-        if not np.isfinite(reward):
-            raise RuntimeError("canonical routing reward is NaN or Inf")
-        return float(reward)
 
     def _block_service_profile(self, capacity_mbps, profile):
         """Resolve a formal profile; scalar fallback keeps unit-test APIs stable."""
@@ -1892,6 +1819,9 @@ class PacketEngine:
             "relay_arrivals": [],
             "outcomes": [],
             "start_of_slot_routing_sender_ids": tuple(sorted(frozen_hol)),
+            "global_routing_reward": 0.0,
+            "shared_reward_row_sum": 0.0,
+            "active_links": [],
         }
         pending_relay_arrivals = []
         s2u_result = self.serve_s2u_links(
@@ -1920,21 +1850,6 @@ class PacketEngine:
                 }
             )
 
-        reward_capacity_by_sender = {}
-        for sender in sorted(actions):
-            receiver = int(actions[sender])
-            capacity_mbps = float(
-                capacities.get((int(sender), receiver), 0.0)
-            )
-            profile = block_capacity_profiles.get((int(sender), receiver))
-            if receiver != int(sender) and profile is not None:
-                profile = self._block_service_profile(capacity_mbps, profile)
-                capacity_mbps = float(
-                    np.sum(profile * 1e6 * FADING_BLOCK_SECONDS)
-                    / (self.step_time * 1e6)
-                )
-            reward_capacity_by_sender[int(sender)] = capacity_mbps
-
         for sender in sorted(actions):
             receiver = int(actions[sender])
             hol = frozen_hol[int(sender)]
@@ -1947,15 +1862,6 @@ class PacketEngine:
                     effective_mask=effective_masks.get(int(sender)),
                 )
             hol["last_routing_sender"] = int(sender)
-            result["reward_by_sender"][int(sender)] = self.routing_local_reward(
-                env,
-                int(sender),
-                receiver,
-                reward_capacity_by_sender[int(sender)],
-                pkt=hol,
-                current_time=current_time,
-                total_backlog_bits=frozen_backlog[sender],
-            )
 
         for sender in sorted(actions):
             sender = int(sender)
@@ -2215,6 +2121,13 @@ class PacketEngine:
         result["cost_by_sender"] = defaultdict(float)
         for sender in frozen_hol:
             result["cost_by_sender"][sender] += 0.0
+        global_reward = timely_useful_bits_routing_reward(
+            result["total_timely_useful_bits"]
+        )
+        result["global_routing_reward"] = global_reward
+        for sender in actions:
+            result["reward_by_sender"][int(sender)] = global_reward
+        result["shared_reward_row_sum"] = global_reward * len(actions)
         result["charged_snapshot_packet_ids"] = ()
         return result
 
@@ -2497,7 +2410,10 @@ class PacketEngine:
             "outcomes": [],
             "packet_decision_uses": [],
             "resource_segments": [],
+            "active_links": [],
             "generated_packet_ids": [],
+            "global_routing_reward": 0.0,
+            "shared_reward_row_sum": 0.0,
         }
 
     @staticmethod
@@ -2609,7 +2525,9 @@ class PacketEngine:
             0.0,
         ) * 1e3
         deadline_abs = float(pkt.get("deadline_abs", float("inf")))
-        if float(completion_time) > deadline_abs:
+        if float(completion_time) > deadline_abs + event_time_tolerance_seconds(
+            completion_time, deadline_abs
+        ):
             violation = self._mark_deadline_violation(
                 pkt,
                 completion_time,
@@ -2718,6 +2636,7 @@ class PacketEngine:
         event_index = 0
         decision_use_keys = set()
         decision_diagnostic_keys = set()
+        active_link_totals = {}
         s2u_diagnostic_opportunities = {}
         s2u_diagnostic_serviced_packet_ids = set()
         event_clock = [slot_start]
@@ -2763,24 +2682,15 @@ class PacketEngine:
 
         def register_decision_use(sender, pkt):
             sender = int(sender)
-            transition_id = transition_ids.get(sender)
-            if transition_id is None or pkt is None:
+            if pkt is None:
                 return
-            key = (int(pkt["id"]), transition_id)
-            if key not in decision_use_keys:
-                decision_use_keys.add(key)
-                result["packet_decision_uses"].append(
-                    {
-                        "packet_id": int(pkt["id"]),
-                        "transition_id": transition_id,
-                        "sender_uav_id": sender,
-                    }
-                )
+            packet_id = int(pkt["id"])
+            diagnostic_key = (packet_id, sender)
             if (
                 self.enable_packet_diagnostic_artifacts
-                and key not in decision_diagnostic_keys
+                and diagnostic_key not in decision_diagnostic_keys
             ):
-                decision_diagnostic_keys.add(key)
+                decision_diagnostic_keys.add(diagnostic_key)
                 self._record_routing_decision_diagnostics(
                     pkt,
                     sender,
@@ -2795,6 +2705,19 @@ class PacketEngine:
                         - float(event_clock[0]),
                         0.0,
                     ),
+                )
+            transition_id = transition_ids.get(sender)
+            if transition_id is None:
+                return
+            use_key = (packet_id, transition_id)
+            if use_key not in decision_use_keys:
+                decision_use_keys.add(use_key)
+                result["packet_decision_uses"].append(
+                    {
+                        "packet_id": packet_id,
+                        "transition_id": transition_id,
+                        "sender_uav_id": sender,
+                    }
                 )
 
         def active_links():
@@ -2817,9 +2740,10 @@ class PacketEngine:
                 observe_s2u_hol(sr_id, self.get_sr_hol_packet(sr_id))
             return uav_links, self.active_s2u_links(env)
 
-        # Reward uses only information visible at action selection.  An empty
-        # observation has neutral reward; later packets may still attach cost
-        # causality to the already selected action.
+        # The slot-start allocation seeds the event cache.  Frozen HOL and
+        # backlog snapshots remain available for cost attribution and
+        # diagnostics, but routing reward is computed only from authoritative
+        # timely useful GS delivery after the complete slot has executed.
         initial_uav_links, initial_s2u_links = active_links()
         initial_capacities, initial_bandwidths = env.allocate_active_link_capacities(
             initial_uav_links, s2u_links=initial_s2u_links
@@ -2832,24 +2756,6 @@ class PacketEngine:
         cached_bandwidths = dict(initial_bandwidths)
         cached_uav_profiles = dict(env.active_link_capacity_profiles_mbps)
         cached_s2u_profiles = dict(env.active_s2u_capacity_profiles_mbps)
-        for sender, receiver in actions.items():
-            pkt = observed_hol.get(sender)
-            if pkt is None:
-                continue
-            result["reward_by_sender"][sender] = self.routing_local_reward(
-                env,
-                sender,
-                receiver,
-                float(initial_capacities.get((sender, receiver), 0.0)),
-                pkt=pkt,
-                current_time=slot_start,
-                total_backlog_bits=float(
-                    observed_backlog.get(
-                        sender, self.backlog_bits.get(sender, 0.0)
-                    )
-                ),
-            )
-
         def settle_s2u_no_service(packet_id):
             diagnostic = s2u_diagnostic_opportunities.get(int(packet_id))
             if (
@@ -2871,7 +2777,9 @@ class PacketEngine:
                 deadline_abs = pkt.get("deadline_abs")
                 if (
                     deadline_abs is not None
-                    and float(deadline_abs) <= float(moment)
+                    and float(deadline_abs)
+                    <= float(moment)
+                    + event_time_tolerance_seconds(deadline_abs, moment)
                 ):
                     settle_s2u_no_service(pkt["id"])
             for violation in self.expire_packets(moment, inclusive=True):
@@ -3034,10 +2942,29 @@ class PacketEngine:
                 pkt = packets_by_link[link]
                 if pkt is None or pkt.get("done", False):
                     continue
+                remaining_before = max(float(pkt.get("rem_bits", 0.0)), 0.0)
                 bits = min(
-                    max(float(pkt.get("rem_bits", 0.0)), 0.0),
+                    remaining_before,
                     rates_bps[link] * duration,
                 )
+                time_tolerance = event_time_tolerance_seconds(
+                    t, next_time, completion_times.get(link, next_time)
+                )
+                completion_tolerance_bits = max(
+                    PACKET_EPS,
+                    rates_bps[link] * time_tolerance,
+                    32.0 * math.ulp(max(remaining_before, 1.0)),
+                )
+                if (
+                    remaining_before - bits <= completion_tolerance_bits
+                    and completion_times.get(link, float("inf"))
+                    <= next_time + time_tolerance
+                ):
+                    # The arithmetic says the full packet completes at this
+                    # event.  Snap only the numerical residual into the
+                    # already-earned service budget; this is scale-aware and
+                    # does not add a physical deadline grace interval.
+                    bits = remaining_before
                 # A floating-point residual smaller than PACKET_EPS is still
                 # real traffic.  Consuming it here lets the normal completion
                 # path close the hop at the next representable event instant;
@@ -3077,6 +3004,7 @@ class PacketEngine:
                         self.s2u_backlog_bits[int(sr_id)] - bits, 0.0
                     )
                     result["transmitted_bits_by_link"][link] += bits
+                    active_key = (int(sr_id), int(receiver), "S2U")
                 else:
                     sender, receiver = link
                     if float(pkt.get("hop_bits_sent", 0.0)) <= PACKET_EPS:
@@ -3100,6 +3028,22 @@ class PacketEngine:
                         ) + bits
                         self.raw_final_hop_bits += bits
                         result["raw_final_hop_bits"] += bits
+                    active_key = (
+                        int(sender),
+                        int(receiver),
+                        "U2G" if int(receiver) == int(env.GS_ID) else "U2U",
+                    )
+                totals = active_link_totals.setdefault(
+                    active_key,
+                    {
+                        "transmitted_bits": 0.0,
+                        "active_seconds": 0.0,
+                        "capacity_time_bits": 0.0,
+                    },
+                )
+                totals["transmitted_bits"] += bits
+                totals["active_seconds"] += duration
+                totals["capacity_time_bits"] += rates_bps[link] * duration
                 if float(pkt.get("rem_bits", 0.0)) <= 0.0:
                     completed.append((link, pkt))
 
@@ -3130,6 +3074,28 @@ class PacketEngine:
         result["transmitted_bits_by_link"] = dict(
             result["transmitted_bits_by_link"]
         )
+        result["active_links"] = [
+            {
+                "sender_id": sender,
+                "receiver_id": receiver,
+                "link_type": link_type,
+                "capacity_bits_per_second": (
+                    totals["capacity_time_bits"] / totals["active_seconds"]
+                ),
+                "transmitted_bits": totals["transmitted_bits"],
+                "active_seconds": totals["active_seconds"],
+            }
+            for (sender, receiver, link_type), totals in sorted(
+                active_link_totals.items(), key=lambda item: item[0]
+            )
+        ]
+        global_reward = timely_useful_bits_routing_reward(
+            result["total_timely_useful_bits"]
+        )
+        result["global_routing_reward"] = global_reward
+        for sender in actions:
+            result["reward_by_sender"][sender] = global_reward
+        result["shared_reward_row_sum"] = global_reward * len(actions)
         result["start_of_slot_routing_sender_ids"] = tuple(
             sorted(sender for sender, pkt in observed_hol.items() if pkt is not None)
         )

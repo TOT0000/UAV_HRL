@@ -104,7 +104,9 @@ from packet_outcome_artifacts import (
 from routing_q_score_diagnostics import (
     ROUTING_Q_SCORE_DIAGNOSTIC_CONTRACT_VERSION,
     ROUTING_Q_SCORE_DIAGNOSTIC_DEFINITIONS,
+    ROUTING_TRAINING_DIAGNOSTIC_CONTRACT_VERSION,
     RoutingQScoreDiagnosticAccumulator,
+    RoutingTrainingEpisodeDiagnostics,
 )
 from routing_agents import create_routing_agent
 from routing_lifecycle import RoutingLearnerLifecycle
@@ -334,6 +336,7 @@ class TrainingConfig:
     collect_packet_outcomes: bool = False
     packet_outcome_artifact_mode: str = PACKET_OUTCOME_MODE_DISABLED
     packet_outcome_collection_limit: int = 0
+    routing_training_diagnostics: bool = False
 
     def __post_init__(self):
         if self.mode not in {"smoke", "train", "custom"}:
@@ -345,6 +348,8 @@ class TrainingConfig:
             )
         if type(self.collect_packet_outcomes) is not bool:
             raise TypeError("collect_packet_outcomes must be boolean")
+        if type(self.routing_training_diagnostics) is not bool:
+            raise TypeError("routing_training_diagnostics must be boolean")
         bounded = self.packet_outcome_artifact_mode == PACKET_OUTCOME_MODE_BOUNDED
         if self.collect_packet_outcomes != bounded:
             raise ValueError(
@@ -794,6 +799,7 @@ def _run_routing_slot(
     routing_transition_ledger=None,
     routing_q_score_accumulator=None,
     routing_q_score_context=None,
+    routing_training_diagnostics=None,
     exploration_prior=None,
     exploration_prior_weight=0.8,
     zero_prior_mass_callback=None,
@@ -895,7 +901,10 @@ def _run_routing_slot(
         exploration_prior_weight=exploration_prior_weight,
         zero_prior_mass_callback=zero_prior_mass_callback,
         return_diagnostics=True,
-        capture_diagnostics=routing_decision_observer is not None,
+        capture_diagnostics=(
+            routing_decision_observer is not None
+            or routing_training_diagnostics is not None
+        ),
     )
     if routing_decision_observer is not None:
         for uid in routing_decision_uav_ids:
@@ -966,6 +975,21 @@ def _run_routing_slot(
                 slot_index=routing_q_score_context["slot_index"],
                 time_seconds=current_time,
             )
+    if routing_training_diagnostics is not None:
+        if getattr(ddqn, "routing_agent_kind", None) != "safe_ddqn":
+            raise TypeError("training Q diagnostics require safe-DDQN")
+        for uid in routing_decision_uav_ids:
+            routing_training_diagnostics.add_decision(
+                selection_diagnostics[uid],
+                selected_action=next_hops[uid],
+                sender_uav_id=uid,
+                hol_task_type=(
+                    None
+                    if start_of_slot_hol_by_sender[uid] is None
+                    else start_of_slot_hol_by_sender[uid]["task_type"]
+                ),
+                slot_index=absolute_slot,
+            )
 
     routing_transition_ids = {}
     if write_replay and routing_transition_ledger is not None:
@@ -991,6 +1015,11 @@ def _run_routing_slot(
         effective_masks_by_sender=effective_masks,
     )
     env.current_time = float(current_time) + step_time
+    if routing_training_diagnostics is not None:
+        routing_training_diagnostics.add_slot(
+            slot_result["total_timely_useful_bits"],
+            slot_result["global_routing_reward"],
+        )
     for outcome in slot_result["outcomes"]:
         task_type = outcome["task_type"]
         if task_type not in violation_stats:
@@ -1069,10 +1098,10 @@ def _run_routing_slot(
                     tag_gt=transition["tag_gt"],
                     agent_id=uid,
                 )
-    selected_links = list(slot_result.get("resource_segments", []))
+    selected_links = list(slot_result.get("active_links", []))
     return (
         float(slot_result["timely_goodput_bits"]),
-        float(sum(slot_result["reward_by_sender"].values())),
+        float(slot_result["global_routing_reward"]),
         len(next_hops),
         selected_links,
     )
@@ -2224,6 +2253,12 @@ def train(
         raise ValueError(
             "routing Q-score diagnostics are evaluation-only and require safe-DDQN"
         )
+    if config.routing_training_diagnostics and (
+        evaluation or method_spec.routing != "safe_ddqn"
+    ):
+        raise ValueError(
+            "routing training diagnostics require non-evaluation safe-DDQN training"
+        )
     if scenario_manifest is not None:
         if scenario_manifest.episode_count < config.total_episodes:
             raise ValueError(
@@ -2364,6 +2399,10 @@ def train(
         rng_streams=rng_streams,
         evaluation=evaluation,
     )
+    if getattr(ddqn, "routing_agent_kind", None) == "safe_ddqn":
+        ddqn.set_training_diagnostics_enabled(
+            config.routing_training_diagnostics
+        )
     rnd_explorer = (
         RNDExplorer(movement_state_dim, resolved_rnd_config)
         if rnd_enabled
@@ -3126,6 +3165,26 @@ def train(
         )
         episode_actor_updates_before = int(movement_agent.num_actor_update_iteration)
         episode_critic_updates_before = int(movement_agent.num_critic_update_iteration)
+        episode_joint_transitions_before = int(total_joint_transitions)
+        episode_routing_replay_before = (
+            int(routing_replay.size) if routing_replay is not None else 0
+        )
+        episode_routing_cost_replay_before = (
+            int(routing_replay.cost_ready_size)
+            if routing_replay is not None
+            else 0
+        )
+        episode_routing_reward_updates_before = int(
+            getattr(ddqn, "reward_optimizer_update_count", 0)
+        )
+        episode_routing_cost_updates_before = int(
+            getattr(ddqn, "cost_optimizer_update_count", 0)
+        )
+        episode_routing_training_diagnostics = (
+            RoutingTrainingEpisodeDiagnostics()
+            if config.routing_training_diagnostics
+            else None
+        )
         episode_rnd_raw_errors = []
         episode_rnd_normalized_bonuses = []
         episode_rnd_weighted_bonuses = []
@@ -3492,6 +3551,9 @@ def train(
                         if routing_q_score_accumulator is not None
                         else None
                     ),
+                    routing_training_diagnostics=(
+                        episode_routing_training_diagnostics
+                    ),
                     exploration_prior=(
                         _llm_routing_exploration_prior(
                             method_spec, llm_explorer, episode_guidance
@@ -3523,6 +3585,10 @@ def train(
                     routing_lifecycle.complete_slot(
                         ddqn, routing_replay, config.batch_size
                     )
+                    if episode_routing_training_diagnostics is not None:
+                        episode_routing_training_diagnostics.add_optimizer_events(
+                            ddqn.drain_training_diagnostic_events()
+                        )
 
             if fov_transitions:
                 packet_engine.process_fov_transitions(
@@ -4084,6 +4150,104 @@ def train(
             atol=1e-9,
         ):
             raise AssertionError("timely-goodput alias diverged from useful bits")
+        expected_episode_routing_reward = total_timely_useful_bits / 10_000.0
+        if not np.isclose(
+            episode_routing_reward,
+            expected_episode_routing_reward,
+            rtol=1e-12,
+            atol=max(
+                1e-9,
+                32.0
+                * np.spacing(max(abs(expected_episode_routing_reward), 1.0)),
+            ),
+        ):
+            raise AssertionError(
+                "episode global routing reward diverged from timely useful bits"
+            )
+        routing_training_diagnostic_summary = None
+        if episode_routing_training_diagnostics is not None:
+            routing_training_diagnostic_summary = (
+                episode_routing_training_diagnostics.summary(
+                    episode=int(episode + 1),
+                    routing_replay_transition_count=int(routing_replay.size),
+                    routing_replay_transitions_added=int(
+                        routing_replay.size - episode_routing_replay_before
+                    ),
+                    routing_cost_replay_transition_count=int(
+                        routing_replay.cost_ready_size
+                    ),
+                    routing_cost_replay_transitions_added=int(
+                        routing_replay.cost_ready_size
+                        - episode_routing_cost_replay_before
+                    ),
+                    routing_warmup_transition_threshold=int(
+                        config.routing_warmup_transitions
+                    ),
+                    routing_reward_warmup_ready=bool(
+                        int(routing_replay.size)
+                        >= int(config.routing_warmup_transitions)
+                    ),
+                    routing_cost_warmup_ready=bool(
+                        int(routing_replay.cost_ready_size) > 0
+                    ),
+                    routing_optimizer_warmup_complete=bool(
+                        int(routing_replay.size)
+                        >= int(config.routing_warmup_transitions)
+                        and int(routing_replay.cost_ready_size) > 0
+                    ),
+                    routing_reward_optimizer_updates=int(
+                        getattr(ddqn, "reward_optimizer_update_count", 0)
+                        - episode_routing_reward_updates_before
+                    ),
+                    routing_cost_optimizer_updates=int(
+                        getattr(ddqn, "cost_optimizer_update_count", 0)
+                        - episode_routing_cost_updates_before
+                    ),
+                    joint_transition_count=int(
+                        total_joint_transitions - episode_joint_transitions_before
+                    ),
+                    joint_replay_transition_count=int(joint_replay.size),
+                    td3_warmup_transition_threshold=int(
+                        config.warmup_joint_transitions
+                    ),
+                    td3_warmup_complete=bool(
+                        int(total_joint_transitions)
+                        >= int(config.warmup_joint_transitions)
+                    ),
+                    td3_actor_updates=int(
+                        movement_agent.num_actor_update_iteration
+                        - episode_actor_updates_before
+                    ),
+                    td3_critic_updates=int(
+                        movement_agent.num_critic_update_iteration
+                        - episode_critic_updates_before
+                    ),
+                    lambda_cost_used=float(episode_lambda_cost),
+                    lambda_cost_after_episode=float(lambda_cost_after_episode),
+                    episode_global_routing_reward=float(
+                        episode_routing_reward
+                    ),
+                    episode_timely_useful_bits=total_timely_useful_bits,
+                    reward_bits_conservation_error=float(
+                        episode_routing_reward * 10_000.0
+                        - total_timely_useful_bits
+                    ),
+                )
+            )
+            if config.run_directory is not None:
+                diagnostic_path = (
+                    Path(config.run_directory)
+                    / "routing_training_diagnostics.jsonl"
+                )
+                with diagnostic_path.open("a", encoding="utf-8") as handle:
+                    handle.write(
+                        json.dumps(
+                            routing_training_diagnostic_summary,
+                            ensure_ascii=False,
+                            allow_nan=False,
+                        )
+                        + "\n"
+                    )
         raw_final_hop_mbits = float(packet_engine.raw_final_hop_bits) / 1e6
         dinkelbach_event = None
         if not evaluation and method_spec.uses_dinkelbach:
@@ -4124,6 +4288,9 @@ def train(
             {
                 "method_id": method_spec.method_id,
                 "routing_reward_total": float(episode_routing_reward),
+                "routing_training_diagnostics": (
+                    routing_training_diagnostic_summary
+                ),
                 "llm_explorer": (
                     {
                         "applied_guidance": llm_explorer.state_dict()[
@@ -4617,6 +4784,14 @@ def train(
             f"critic_updates={movement_agent.num_critic_update_iteration} "
             f"actor_updates={movement_agent.num_actor_update_iteration}"
             + (
+                " routing_diag="
+                f"zero={routing_training_diagnostic_summary['slot_zero_reward_fraction']} "
+                f"r_updates={routing_training_diagnostic_summary['routing_reward_optimizer_updates']} "
+                f"c_updates={routing_training_diagnostic_summary['routing_cost_optimizer_updates']}"
+                if routing_training_diagnostic_summary is not None
+                else ""
+            )
+            + (
                 f" original_reward={episode_existing_movement_reward:.6f}"
                 f" ee={safe_energy_efficiency(timely_goodput_mbits, episode_energy):.9f}"
                 f" rnd_bonus_mean={np.mean(episode_rnd_normalized_bonuses):.6f}"
@@ -5013,6 +5188,25 @@ def train(
         "energy_evaluations": energy_evaluations,
         "terminal_joint_transitions": terminal_joint_transitions,
         "routing_slots_executed": routing_slots_executed,
+        "routing_training_diagnostics_enabled": bool(
+            config.routing_training_diagnostics
+        ),
+        "routing_training_diagnostic_contract_version": (
+            ROUTING_TRAINING_DIAGNOSTIC_CONTRACT_VERSION
+            if config.routing_training_diagnostics
+            else None
+        ),
+        "routing_training_diagnostics_path": (
+            str(
+                (
+                    Path(config.run_directory)
+                    / "routing_training_diagnostics.jsonl"
+                ).resolve()
+            )
+            if config.routing_training_diagnostics
+            and config.run_directory is not None
+            else None
+        ),
         "routing_training_global_slot_count": (
             routing_lifecycle.global_slot_count
             if routing_lifecycle is not None

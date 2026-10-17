@@ -16,6 +16,50 @@ from Simulator import Simulator
 
 
 class SimpleRunnerLifecycleIntegrationTest(unittest.TestCase):
+    def test_safe_ddqn_training_diagnostics_use_formal_warmups_and_resume(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output = Path(temp_dir) / "results"
+            command = [
+                "td3_dinkelbach",
+                "--episodes", "1",
+                "--episode-seconds", "1",
+                "--checkpoint-interval", "1",
+                "--roi-count", "2",
+                "--seed", "20260817",
+                "--output-root", str(output),
+                "--routing-training-diagnostics",
+            ]
+            self.assertEqual(main(command), 0)
+            run_dir = next((output / "td3_dinkelbach").iterdir())
+            path = run_dir / "routing_training_diagnostics.jsonl"
+            rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+            self.assertEqual(len(rows), 1)
+            row = rows[0]
+            self.assertEqual(row["decision_count"], 64)
+            self.assertEqual(row["slot_global_reward"]["count"], 4)
+            self.assertEqual(row["routing_replay_transitions_added"], 64)
+            self.assertEqual(row["routing_warmup_transition_threshold"], 1000)
+            self.assertEqual(row["td3_warmup_transition_threshold"], 10000)
+            self.assertFalse(row["routing_optimizer_warmup_complete"])
+            self.assertFalse(row["td3_warmup_complete"])
+            self.assertEqual(row["routing_reward_optimizer_updates"], 0)
+            self.assertEqual(row["routing_cost_optimizer_updates"], 0)
+            self.assertEqual(row["td3_actor_updates"], 0)
+            self.assertEqual(row["td3_critic_updates"], 0)
+            self.assertAlmostEqual(
+                row["episode_global_routing_reward"] * 10_000.0,
+                row["episode_timely_useful_bits"],
+            )
+
+            self.assertEqual(
+                main(["resume", str(run_dir), "--target-episodes", "2"]), 0
+            )
+            resumed = [
+                json.loads(line)
+                for line in path.read_text(encoding="utf-8").splitlines()
+            ]
+            self.assertEqual([row["episode"] for row in resumed], [1, 2])
+
     def test_keyboard_interrupt_marks_new_and_resumed_run_interrupted(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             output = Path(temp_dir) / "results"

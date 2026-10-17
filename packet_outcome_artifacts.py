@@ -10,7 +10,7 @@ from pathlib import Path
 
 PACKET_OUTCOME_ARTIFACT_SCHEMA_VERSION = "uav-hrl-packet-outcomes-jsonl-v7"
 PACKET_ROUTING_DIAGNOSTIC_CONTRACT_VERSION = (
-    "uav-hrl-packet-routing-diagnostics-v4"
+    "uav-hrl-packet-routing-diagnostics-v5"
 )
 PACKET_ROUTING_DIAGNOSTIC_DEFINITIONS = {
     "routing_wait_definition": (

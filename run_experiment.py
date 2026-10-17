@@ -448,6 +448,32 @@ def _reconcile_potential_training_episode_metrics(
     temporary.replace(path)
 
 
+def _reconcile_routing_training_diagnostics(
+    run_dir, enabled, completed_episode_limit
+):
+    if not enabled:
+        return
+    path = Path(run_dir) / "routing_training_diagnostics.jsonl"
+    if not path.is_file():
+        return
+    rows = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        row = json.loads(line)
+        if int(row["episode"]) <= int(completed_episode_limit):
+            rows.append(row)
+    temporary = path.with_suffix(".jsonl.tmp")
+    temporary.write_text(
+        "".join(
+            json.dumps(row, ensure_ascii=False, allow_nan=False) + "\n"
+            for row in rows
+        ),
+        encoding="utf-8",
+    )
+    temporary.replace(path)
+
+
 def create_unique_run_directory(output_root, method_key, seed, git_sha=None):
     """Atomically create a new leaf; a collision is never silently reused."""
 
@@ -472,6 +498,14 @@ def _add_training_options(parser):
     parser.add_argument("--roi-count", type=_roi_count)
     parser.add_argument("--output-root")
     parser.add_argument("--checkpoint-interval", type=int)
+    parser.add_argument(
+        "--routing-training-diagnostics",
+        action="store_true",
+        help=(
+            "record bounded per-episode shared-reward and safe-DDQN Q/optimizer "
+            "diagnostics (safe-DDQN methods only)"
+        ),
+    )
     parser.add_argument(
         "--smoke",
         action="store_true",
@@ -855,6 +889,10 @@ def run(args):
 
     values = _resolved_values(args)
     method = args.method
+    if args.routing_training_diagnostics and method.routing != "safe_ddqn":
+        raise ValueError(
+            "--routing-training-diagnostics requires a safe-DDQN method"
+        )
     git_sha = _git_short_sha()
     training_manifest_path = getattr(args, "training_manifest", None)
     if training_manifest_path is not None:
@@ -949,6 +987,9 @@ def run(args):
         enable_plots=False,
         enable_csv=False,
         run_directory=str(run_dir),
+        routing_training_diagnostics=bool(
+            args.routing_training_diagnostics
+        ),
     )
     manifest.save(run_dir / "scenario_manifest.json")
     resolved = _base_resolved(run_dir, method, manifest, config, values, args, git_sha)
@@ -1272,6 +1313,11 @@ def run_resume(args):
     )
     _reconcile_potential_training_episode_metrics(
         run_dir, method, plan.resume_episode
+    )
+    _reconcile_routing_training_diagnostics(
+        run_dir,
+        bool(resolved["training_config"].get("routing_training_diagnostics")),
+        plan.resume_episode,
     )
     reconciliation = execute_resume_reconciliation(plan)
     if extension_provenance is not None:
