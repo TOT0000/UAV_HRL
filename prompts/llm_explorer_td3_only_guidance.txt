@@ -1,0 +1,56 @@
+Generate TD3 movement exploration biases for the upcoming episode using the analysis and verified inputs below.
+
+Complete analysis:
+{{ANALYSIS_STAGE_OUTPUT}}
+
+Current observable initial state:
+{{CURRENT_OBSERVABLE_INITIAL_STATE}}
+
+Training phase, exploration settings, and numerical bounds:
+{{TRAINING_PHASE_AND_SETTINGS}}
+
+Previous movement guidance:
+{{PREVIOUS_MOVEMENT_GUIDANCE}}
+
+Previous episode's complete recorded raw TD3 bias:
+{{PREVIOUS_RAW_TD3_BIAS}}
+
+The rows above are ordered by UAV ID 0 through 15, with columns [speed, heading, vertical].
+
+They are the previous episode's raw biases before multiplication by its annealing weight.
+
+A null rows value means the raw bias is unknown, not zero.
+
+Historical values are context only. Even when the analysis recommends retaining a direction, every output bias must satisfy the current episode's sigma bound. Do not copy an older value that is outside the current bound.
+
+Output requirements:
+
+Return exactly one complete JSON object with the single root key td3_bias.
+
+td3_bias must contain:
+- Exactly 16 rows ordered by UAV ID 0 through 15.
+- Exactly 3 values per row, ordered [speed, heading, vertical].
+- Finite JSON numbers only: no strings, booleans, null, NaN, or Infinity.
+- Every value within the supplied current-episode [-sigma,+sigma] bound.
+
+Output raw offsets before host annealing.
+Do not multiply by sigma or w.
+The host computes effective_bias = w * raw_bias.
+
+Choose exploration directions supported by the analysis. Neutral biases are valid for UAVs or dimensions with insufficient evidence. Nonzero values are not required everywhere.
+
+Remember that this raw bias remains fixed for the episode and is not recomputed for changing tasks, positions, or targets. Do not treat a momentary directional need in a selected case as a heading offset that is necessarily useful throughout the episode.
+
+Initial roles, empty queues, and link conditions may change within the episode. Do not treat them as permanent.
+
+Do not output routing_prior, routing probabilities, next-hop recommendations, or any other control fields.
+
+Return JSON only, with no commentary, Markdown, comments, arithmetic expressions, placeholders, or ellipses.
+
+Exact output schema:
+{{OUTPUT_JSON_SCHEMA}}
+
+Local validation feedback from the previous attempt, if any:
+{{VALIDATION_FEEDBACK_OR_EMPTY}}
+
+If validation errors are provided, correct them and return the complete matrix again.

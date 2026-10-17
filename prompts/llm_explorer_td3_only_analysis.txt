@@ -1,0 +1,69 @@
+Analyze the previous episode and recommend TD3 movement exploration tendencies for the upcoming episode.
+
+Provide movement recommendations only. Do not recommend routing control or output the final bias matrix at this stage.
+
+Training phase and exploration settings:
+{{TRAINING_PHASE_AND_SETTINGS}}
+
+Verified previous-episode metrics:
+{{EPISODE_METRICS}}
+
+Prioritize EE, timely GS-delivered data, movement energy, and important QoS metrics.
+
+Interpret each metric according to its supplied definition. Do not treat movement reward or routing reward as EE.
+
+Per-UAV movement summaries:
+{{MOVEMENT_SUMMARIES}}
+
+First establish:
+- Which UAVs were actually under TD3 control and how often.
+- Their roles, service targets, and observable service geometry at those times.
+- Actor actions, executed actions, and saturation.
+- Requested biases and their actual application.
+
+Do not attribute behavior produced by existing Search or Hover controllers to TD3 bias.
+
+Compact communication bottleneck summary relevant to movement:
+{{COMMUNICATION_BOTTLENECK_SUMMARY}}
+
+This summary contains only reliably computed statistics relevant to movement needs, such as access or link conditions, queues, and deadline violations.
+
+Use it to identify service problems that might be worth addressing through movement exploration. Do not attribute a system-wide bottleneck to an individual UAV without individual evidence.
+
+Treat unavailable statistics as unknown. Do not invent values.
+Do not analyze individual next-hop choices or recommend routing probabilities.
+
+Selected illustrative cases:
+{{REPRESENTATIVE_CASES}}
+
+Cases explain concrete situations. They do not establish full-episode frequencies or prove that an action is optimal.
+
+Previously requested and actually applied movement guidance:
+{{PREVIOUS_MOVEMENT_GUIDANCE}}
+
+If the previous episode had no intervention or used fallback, do not treat its performance as an effect of LLM bias.
+
+Current observable initial state:
+{{CURRENT_OBSERVABLE_INITIAL_STATE}}
+
+This is the observable state after initialization and initial task allocation, before the first action.
+
+Do not fill in unknown targets. Initial roles, queues, and connectivity may change during the episode.
+
+Write a concise analysis, normally 250–400 English words:
+
+1. Key evidence:
+Identify a few important observations using explicit UAV IDs and supplied statistics. Distinguish facts from possible explanations.
+
+2. Movement recommendations:
+For UAVs with supporting evidence, identify whether speed, heading, or vertical should receive a positive, negative, or neutral raw bias.
+
+Explain how the direction could improve timely delivery, service conditions, or movement energy, and why it is suitable as an episode-fixed exploration tendency.
+
+If a direction is useful only in a local situation, explain the limitation and consider a smaller or neutral bias. Do not force intervention for every UAV.
+
+3. Uncertainty:
+State what this episode cannot establish, such as insufficient controlled decisions, changing tasks, insufficient service evidence, or an inability to separate movement and routing effects.
+
+Prioritize information that affects movement-bias selection.
+Do not output the final matrix or propose changes to routing, rewards, or training hyperparameters.

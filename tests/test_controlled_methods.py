@@ -79,7 +79,11 @@ EXPECTED_METHODS = (
     + LLM_METHODS
     + EXISTING_METHODS[1:]
     + NEW_METHODS
-    + ("td3_dinkelbach_llm_explorer",)
+    + (
+        "td3_dinkelbach_llm_explorer",
+        "td3_dinkelbach_llm_explorer_v3",
+        "td3_dinkelbach_llm_explorer_td3_only",
+    )
 )
 
 

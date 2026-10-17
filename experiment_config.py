@@ -543,6 +543,13 @@ _METHOD_DEFINITIONS = {
         "reward_mode": "dinkelbach",
         "label": "TD3 + Dinkelbach + compact annealed LLM exploration v3",
     },
+    "td3_dinkelbach_llm_explorer_td3_only": {
+        **_COMMON_METHOD,
+        "agent": "td3",
+        "movement": "centralized_td3",
+        "reward_mode": "dinkelbach",
+        "label": "TD3 + Dinkelbach + LLM-guided TD3-only exploration",
+    },
 }
 METHOD_REGISTRY = MappingProxyType(_METHOD_DEFINITIONS)
 _LEGACY_METHOD_IDS = frozenset(
@@ -638,11 +645,22 @@ class MethodSpec:
         return self.method_id in {
             "td3_dinkelbach_llm_explorer",
             "td3_dinkelbach_llm_explorer_v3",
+            "td3_dinkelbach_llm_explorer_td3_only",
         }
 
     @property
     def llm_explorer_v3_enabled(self) -> bool:
         return self.method_id == "td3_dinkelbach_llm_explorer_v3"
+
+    @property
+    def llm_explorer_td3_only_enabled(self) -> bool:
+        return self.method_id == "td3_dinkelbach_llm_explorer_td3_only"
+
+    @property
+    def llm_explorer_annealed_enabled(self) -> bool:
+        """Methods that use the v3 episode schedule and w-scaled TD3 bias."""
+
+        return self.llm_explorer_v3_enabled or self.llm_explorer_td3_only_enabled
 
     @property
     def fingerprint(self) -> str:

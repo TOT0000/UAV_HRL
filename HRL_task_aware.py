@@ -169,6 +169,13 @@ from llm_explorer_v3 import (
     environment_definitions_v3,
     explorer_metadata_v3,
 )
+from llm_explorer_td3_only import (
+    LLMExplorerTD3OnlyConfig,
+    LLMExplorerTD3OnlyController,
+    build_observable_initial_state_td3_only,
+    environment_definitions_td3_only,
+    explorer_metadata_td3_only,
+)
 
 
 MOVEMENT_CONTROL_INTERVAL = int(round(MOVEMENT_INTERVAL_SECONDS / ROUTING_SLOT_SECONDS))
@@ -199,6 +206,24 @@ def normalized_remaining_time(episode_horizon_seconds, elapsed_seconds):
     if horizon <= 0.0:
         raise ValueError("episode horizon must be positive")
     return min(1.0, max(0.0, (horizon - elapsed) / horizon))
+
+
+def _llm_routing_exploration_prior(method_spec, explorer, guidance):
+    """Return a routing prior only when the method contract enables one.
+
+    The explicit TD3-only guard is independent of controller output so a
+    contaminated guidance object cannot affect safe-DDQN or its behavior RNG.
+    """
+
+    if (
+        explorer is None
+        or guidance is None
+        or method_spec.llm_explorer_td3_only_enabled
+        or not guidance.get("enabled", False)
+        or guidance.get("routing_fallback", True)
+    ):
+        return None
+    return guidance.get("routing_prior")
 
 
 def _seed_training_rng(seed):
@@ -2410,7 +2435,13 @@ def train(
     )
     llm_explorer_config = (
         (
-            LLMExplorerV3Config(
+            LLMExplorerTD3OnlyConfig(
+                model=str(llm_explorer_model),
+                request_timeout_seconds=float(llm_explorer_timeout),
+                episode_joint_transitions=int(config.episode_seconds),
+            )
+            if method_spec.llm_explorer_td3_only_enabled
+            else LLMExplorerV3Config(
                 model=str(llm_explorer_model),
                 request_timeout_seconds=float(llm_explorer_timeout),
                 episode_joint_transitions=int(config.episode_seconds),
@@ -2433,15 +2464,20 @@ def train(
             config.run_directory,
             maximum_episode=config.total_episodes,
             artifact_directory=(
-                "llm_explorer_v3"
+                "llm_explorer_td3_only"
+                if method_spec.llm_explorer_td3_only_enabled
+                else "llm_explorer_v3"
                 if method_spec.llm_explorer_v3_enabled
                 else "llm_explorer"
             ),
             named_routing=method_spec.llm_explorer_v3_enabled,
+            td3_only=method_spec.llm_explorer_td3_only_enabled,
         )
     llm_explorer = (
         (
-            LLMExplorerV3Controller
+            LLMExplorerTD3OnlyController
+            if method_spec.llm_explorer_td3_only_enabled
+            else LLMExplorerV3Controller
             if method_spec.llm_explorer_v3_enabled
             else LLMExplorerController
         )(
@@ -2481,7 +2517,9 @@ def train(
     )
     if llm_explorer_config is not None:
         experiment_identity["llm_explorer"] = (
-            explorer_metadata_v3(llm_explorer_config)
+            explorer_metadata_td3_only(llm_explorer_config)
+            if method_spec.llm_explorer_td3_only_enabled
+            else explorer_metadata_v3(llm_explorer_config)
             if method_spec.llm_explorer_v3_enabled
             else explorer_metadata(llm_explorer_config)
         )
@@ -3013,12 +3051,16 @@ def train(
                 sigma_episode_start=episode_sigma_start,
                 routing_epsilon=episode_routing_epsilon_start,
                 current_observable_initial_state=(
-                    build_observable_initial_state_v3(env, packet_engine)
+                    build_observable_initial_state_td3_only(env, packet_engine)
+                    if method_spec.llm_explorer_td3_only_enabled
+                    else build_observable_initial_state_v3(env, packet_engine)
                     if method_spec.llm_explorer_v3_enabled
                     else build_observable_initial_state(env, packet_engine)
                 ),
                 environment_constants=(
-                    environment_definitions_v3
+                    environment_definitions_td3_only
+                    if method_spec.llm_explorer_td3_only_enabled
+                    else environment_definitions_v3
                     if method_spec.llm_explorer_v3_enabled
                     else environment_constants_and_definitions
                 )(
@@ -3266,7 +3308,7 @@ def train(
                 )
                 if llm_explorer is not None:
                     if (
-                        method_spec.llm_explorer_v3_enabled
+                        method_spec.llm_explorer_annealed_enabled
                         and not episode_guidance["enabled"]
                     ):
                         raw_joint_action, movement_action_diagnostics = (
@@ -3281,7 +3323,7 @@ def train(
                         applied_bias = (
                             (
                                 episode_guidance["td3_bias_effective"].reshape(-1)
-                                if method_spec.llm_explorer_v3_enabled
+                                if method_spec.llm_explorer_annealed_enabled
                                 else episode_guidance["td3_bias"].reshape(-1)
                             )
                             if episode_guidance["enabled"]
@@ -3460,11 +3502,9 @@ def train(
                         else None
                     ),
                     exploration_prior=(
-                        episode_guidance["routing_prior"]
-                        if llm_explorer is not None
-                        and episode_guidance["enabled"]
-                        and not episode_guidance["routing_fallback"]
-                        else None
+                        _llm_routing_exploration_prior(
+                            method_spec, llm_explorer, episode_guidance
+                        )
                     ),
                     exploration_prior_weight=(
                         episode_guidance.get("routing_alpha", 0.0)
@@ -3475,6 +3515,7 @@ def train(
                     zero_prior_mass_callback=(
                         llm_explorer.record_zero_legal_prior_mass
                         if llm_explorer is not None
+                        and not method_spec.llm_explorer_td3_only_enabled
                         else None
                     ),
                     routing_decision_observer=(
@@ -4922,7 +4963,9 @@ def train(
         "llm_explorer": (
             {
                 "configuration": (
-                    explorer_metadata_v3(llm_explorer_config)
+                    explorer_metadata_td3_only(llm_explorer_config)
+                    if method_spec.llm_explorer_td3_only_enabled
+                    else explorer_metadata_v3(llm_explorer_config)
                     if method_spec.llm_explorer_v3_enabled
                     else explorer_metadata(llm_explorer_config)
                 ),

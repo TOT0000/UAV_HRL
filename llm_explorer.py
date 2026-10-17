@@ -917,6 +917,7 @@ def llm_explorer_path_preflight(
     windows_limit: int = WINDOWS_CONSERVATIVE_PATH_LIMIT,
     artifact_directory: str = "llm_explorer",
     named_routing: bool = False,
+    td3_only: bool = False,
 ) -> dict[str, Any]:
     """Validate every filename produced by the explorer and streaming client.
 
@@ -972,30 +973,30 @@ def llm_explorer_path_preflight(
     ]
     longest = max(checks, key=lambda item: item["characters"])
     encoder = _token_encoder()
-    representative_guidance = _compact_json(
-        {
-            "td3_bias": [[-0.123456, 0.123456, 0.0] for _ in range(NUM_UAV)],
-            "routing_prior": (
-                {
-                    f"UAV_{sender}": {
-                        ("WAIT" if action == sender else "GS" if action == NUM_UAV else f"UAV_{action}"): round(1.0 / ROUTING_ACTION_DIM, 8)
-                        for action in range(ROUTING_ACTION_DIM)
-                    }
-                    for sender in range(NUM_UAV)
+    representative_guidance_value = {
+        "td3_bias": [[-0.123456, 0.123456, 0.0] for _ in range(NUM_UAV)]
+    }
+    if not td3_only:
+        representative_guidance_value["routing_prior"] = (
+            {
+                f"UAV_{sender}": {
+                    ("WAIT" if action == sender else "GS" if action == NUM_UAV else f"UAV_{action}"): round(1.0 / ROUTING_ACTION_DIM, 8)
+                    for action in range(ROUTING_ACTION_DIM)
                 }
-                if named_routing
-                else [
-                    [round(1.0 / ROUTING_ACTION_DIM, 8) for _ in range(ROUTING_ACTION_DIM)]
-                    for _ in range(NUM_UAV)
-                ]
-            ),
-        }
-    )
+                for sender in range(NUM_UAV)
+            }
+            if named_routing
+            else [
+                [round(1.0 / ROUTING_ACTION_DIM, 8) for _ in range(ROUTING_ACTION_DIM)]
+                for _ in range(NUM_UAV)
+            ]
+        )
+    representative_guidance = _compact_json(representative_guidance_value)
     representative_output_tokens = len(encoder.encode(representative_guidance))
     if representative_output_tokens >= LLMExplorerConfig().guidance_max_output_tokens:
         raise ValueError(
-            "configured guidance output reserve cannot hold a complete [16,3] and "
-            "[16,17] JSON response"
+            "configured guidance output reserve cannot hold the complete "
+            + ("[16,3] JSON response" if td3_only else "[16,3] and [16,17] JSON response")
         )
     report = {
         "strategy": "conservative_windows_character_limit",
@@ -1004,6 +1005,7 @@ def llm_explorer_path_preflight(
         "maximum_episode": int(maximum_episode),
         "artifact_directory": str(artifact_root),
         "named_routing": bool(named_routing),
+        "td3_only": bool(td3_only),
         "checked_path_count": len(checks),
         "longest": longest,
         "paths": checks,
@@ -1420,6 +1422,11 @@ class LLMExplorerController:
         return _compact_json(
             {"td3_bias": td3_bias.tolist(), "routing_prior": routing_prior.tolist()}
         )
+
+    def _routing_guidance_required(self) -> bool:
+        """Whether the numerical response contract includes a routing layer."""
+
+        return True
 
     def _cache_identity(
         self, *, episode_index: int, stage: str, system_prompt: str, user_prompt: str
@@ -1863,6 +1870,7 @@ class LLMExplorerController:
     ) -> dict[str, Any]:
         self.movement_records = []
         self.routing_records = []
+        routing_guidance_required = self._routing_guidance_required()
         if self.evaluation:
             self.active_guidance = self._unguided("evaluation_disabled")
             return self.active_guidance
@@ -1919,7 +1927,9 @@ class LLMExplorerController:
         )
         if analysis is None:
             self.active_guidance = self._unguided("analysis_stage_failed")
-            self._record_fallback_episode(episode_index, td3=True, routing=True)
+            self._record_fallback_episode(
+                episode_index, td3=True, routing=routing_guidance_required
+            )
             self._save_episode_result(
                 episode_index=episode_index,
                 identity=episode_identity,
@@ -1957,16 +1967,23 @@ class LLMExplorerController:
             td3, routing, errors = self._parse_guidance_response(
                 cached["content"], sigma_episode_start
             )
-            if not errors:
+            if (
+                not errors
+                and td3 is not None
+                and (not routing_guidance_required or routing is not None)
+            ):
                 accepted_td3, accepted_routing = td3, routing
                 td3_attempt = int(
                     cached.get("td3_source_attempt", cached["attempt"])
                 )
-                routing_attempt = int(
-                    cached.get("routing_source_attempt", cached["attempt"])
-                )
+                if routing_guidance_required:
+                    routing_attempt = int(
+                        cached.get("routing_source_attempt", cached["attempt"])
+                    )
                 guidance_reused = True
-        if accepted_td3 is None or accepted_routing is None:
+        if accepted_td3 is None or (
+            routing_guidance_required and accepted_routing is None
+        ):
             if stage_root is not None:
                 try:
                     stage_root.mkdir(parents=True, exist_ok=True)
@@ -2093,14 +2110,25 @@ class LLMExplorerController:
                     )
                     if accepted_td3 is None and td3 is not None:
                         accepted_td3, td3_attempt = td3, attempt
-                    if accepted_routing is None and routing is not None:
+                    if (
+                        routing_guidance_required
+                        and accepted_routing is None
+                        and routing is not None
+                    ):
                         accepted_routing, routing_attempt = routing, attempt
-                    success = accepted_td3 is not None and accepted_routing is not None
+                    success = accepted_td3 is not None and (
+                        not routing_guidance_required
+                        or accepted_routing is not None
+                    )
                     missing_errors = {
                         layer: message
                         for layer, message in errors.items()
                         if (layer == "td3" and accepted_td3 is None)
-                        or (layer == "routing" and accepted_routing is None)
+                        or (
+                            routing_guidance_required
+                            and layer == "routing"
+                            and accepted_routing is None
+                        )
                     }
                     reason = None if success else "; ".join(
                         f"{layer}: {message}"
@@ -2138,7 +2166,12 @@ class LLMExplorerController:
                             {
                                 "errors": errors,
                                 "accepted_td3_this_attempt": td3 is not None,
-                                "accepted_routing_this_attempt": routing is not None,
+                                "routing_guidance_required": routing_guidance_required,
+                                "accepted_routing_this_attempt": (
+                                    routing is not None
+                                    if routing_guidance_required
+                                    else None
+                                ),
                             },
                         )
                         _atomic_json(
@@ -2181,7 +2214,9 @@ class LLMExplorerController:
                 )
 
         td3_fallback = accepted_td3 is None
-        routing_fallback = accepted_routing is None
+        routing_fallback = bool(
+            routing_guidance_required and accepted_routing is None
+        )
         self.active_guidance = {
             "enabled": True,
             "td3_bias": (
@@ -2189,11 +2224,21 @@ class LLMExplorerController:
                 if td3_fallback
                 else accepted_td3
             ),
-            "routing_prior": None if routing_fallback else accepted_routing,
+            "routing_prior": (
+                None
+                if not routing_guidance_required or routing_fallback
+                else accepted_routing
+            ),
             "td3_fallback": td3_fallback,
             "routing_fallback": routing_fallback,
             "td3_reason": "guidance_invalid_or_failed" if td3_fallback else None,
-            "routing_reason": "guidance_invalid_or_failed" if routing_fallback else None,
+            "routing_reason": (
+                "guidance_invalid_or_failed"
+                if routing_fallback
+                else "routing_guidance_disabled"
+                if not routing_guidance_required
+                else None
+            ),
             "analysis_attempt": analysis_attempt,
             "td3_guidance_attempt": td3_attempt,
             "routing_guidance_attempt": routing_attempt,

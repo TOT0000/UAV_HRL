@@ -86,6 +86,15 @@ from llm_explorer_v3 import (
     LLM_EXPLORER_V3_SUMMARY_VERSION,
     LLM_EXPLORER_V3_VERSION,
 )
+from llm_explorer_td3_only import (
+    LLM_EXPLORER_TD3_ONLY_ANNEAL_END_EPISODE,
+    LLM_EXPLORER_TD3_ONLY_CASE_VERSION,
+    LLM_EXPLORER_TD3_ONLY_GUIDANCE_CONTEXT_VERSION,
+    LLM_EXPLORER_TD3_ONLY_MAX_INPUT_TOKENS,
+    LLM_EXPLORER_TD3_ONLY_PROMPT_VERSION,
+    LLM_EXPLORER_TD3_ONLY_SUMMARY_VERSION,
+    LLM_EXPLORER_TD3_ONLY_VERSION,
+)
 
 
 TRAINING_HISTORY_MANIFEST_HASH_SEMANTICS = (
@@ -98,7 +107,9 @@ TRAINING_MANIFEST_SEGMENTS_SEMANTICS = (
 
 def _explorer_schema_version(method):
     return (
-        LLM_EXPLORER_V3_VERSION
+        LLM_EXPLORER_TD3_ONLY_VERSION
+        if method.llm_explorer_td3_only_enabled
+        else LLM_EXPLORER_V3_VERSION
         if method.llm_explorer_v3_enabled
         else LLM_EXPLORER_VERSION
     )
@@ -107,9 +118,14 @@ def _explorer_schema_version(method):
 def _explorer_preflight_options(method):
     return {
         "artifact_directory": (
-            "llm_explorer_v3" if method.llm_explorer_v3_enabled else "llm_explorer"
+            "llm_explorer_td3_only"
+            if method.llm_explorer_td3_only_enabled
+            else "llm_explorer_v3"
+            if method.llm_explorer_v3_enabled
+            else "llm_explorer"
         ),
         "named_routing": bool(method.llm_explorer_v3_enabled),
+        "td3_only": bool(method.llm_explorer_td3_only_enabled),
     }
 
 
@@ -959,7 +975,25 @@ def run(args):
             "warmup_joint_transitions": 10000,
             "update_interval_episodes": 1,
         }
-        if method.llm_explorer_v3_enabled:
+        if method.llm_explorer_td3_only_enabled:
+            resolved["llm_explorer"].update(
+                prompt_version=LLM_EXPLORER_TD3_ONLY_PROMPT_VERSION,
+                summary_version=LLM_EXPLORER_TD3_ONLY_SUMMARY_VERSION,
+                case_selection_version=LLM_EXPLORER_TD3_ONLY_CASE_VERSION,
+                guidance_context_version=(
+                    LLM_EXPLORER_TD3_ONLY_GUIDANCE_CONTEXT_VERSION
+                ),
+                annealing_end_episode=(
+                    LLM_EXPLORER_TD3_ONLY_ANNEAL_END_EPISODE
+                ),
+                input_hard_limit_tokens=(
+                    LLM_EXPLORER_TD3_ONLY_MAX_INPUT_TOKENS
+                ),
+                td3_guidance="enabled",
+                routing_guidance="disabled",
+                routing_intervention="none_original_safe_ddqn_epsilon_greedy",
+            )
+        elif method.llm_explorer_v3_enabled:
             resolved["llm_explorer"].update(
                 prompt_version=LLM_EXPLORER_V3_PROMPT_VERSION,
                 summary_version=LLM_EXPLORER_V3_SUMMARY_VERSION,

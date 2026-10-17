@@ -107,3 +107,34 @@ Offline tests write only to pytest temporary directories:
 ```powershell
 & "C:\Users\user\anaconda3\envs\LLM_HRL\python.exe" -m pytest tests\test_llm_explorer.py tests\test_llm_explorer_v3.py tests\test_experiment_framework.py tests\test_joint_td3.py tests\test_ddqn_routing.py -q
 ```
+
+## TD3-only annealed comparison
+
+`td3_dinkelbach_llm_explorer_td3_only` uses the v3 warmup, two-stage request,
+episode-fixed raw bias, and linear `w` schedule, but its numerical response has
+only the complete `[16,3]` `td3_bias` matrix. The host applies `w * raw_bias`
+once. Safe-DDQN receives no LLM prior and remains on its original legal-mask,
+epsilon-greedy, legal-uniform exploration, and greedy-selection paths.
+
+The movement-focused analysis input includes complete per-UAV movement
+statistics and a compact communication bottleneck summary. The latter is
+computed locally from all recorded routing decisions: queue backlog, observed
+head-of-line deadline, legal non-WAIT action availability, GS availability,
+and legal-link reference-capacity summaries, with explicit counts and units.
+System QoS counts remain system-wide. The records do not reliably provide
+per-UAV timely-GS-delivery attribution, per-UAV final deadline violations, or
+realized per-link throughput, so those fields are marked unavailable rather
+than inferred. Full raw movement and routing diagnostics remain in each
+episode's feedback artifact.
+
+An 800-episode PowerShell run with periodic checkpoints is:
+
+```powershell
+& "C:\Users\user\anaconda3\envs\LLM_HRL\python.exe" .\run_experiment.py td3_dinkelbach_llm_explorer_td3_only --episodes 800 --seed 20260817 --checkpoint-interval 100 --llm-explorer-model gpt-4o-mini --output-root C:\uav_llm_runs
+```
+
+Artifacts use the independent `llm_explorer_td3_only` directory and schema.
+Resume the exact printed run directory with `run_experiment.py resume`; a v3
+checkpoint or response cache is not accepted as a TD3-only checkpoint/cache.
+The deterministic `--llm-explorer-mock` option is for offline plumbing tests,
+not a substitute for a live-model or 800-episode scientific result.
