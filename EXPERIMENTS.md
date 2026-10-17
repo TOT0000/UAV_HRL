@@ -471,6 +471,20 @@ communication-energy model remain in force. An unfinished packet is removed at
 its absolute 10/15 ms deadline; a GS completion at exactly the deadline is
 processed first and is timely.
 
+Within one routing slot, the allocator also reuses an already computed
+50-block capacity profile when link type, directed endpoints, exact allocated
+bandwidth, path loss, and transmit power are unchanged. Average capacity and
+slot service bits are cached with the profile. Returned arrays are isolated
+copies. The bounded cache is cleared on a new slot, geometry/channel refresh,
+episode reset, scenario reload, and checkpoint channel-state load; it is not
+part of the checkpoint or experiment fingerprint. A reproducible short
+benchmark, including an uncached test reference, is available as:
+
+```powershell
+python benchmarks/benchmark_active_link_capacity_cache.py --episode-seconds 5 --roi-count 8 --seed 20260817 --profile
+python benchmarks/benchmark_active_link_capacity_cache.py --episode-seconds 5 --roi-count 8 --seed 20260817 --profile --disable-cache
+```
+
 The 5 ms duration follows Ghazikor et al., *IEEE Transactions on
 Communications* (2026), DOI `10.1109/TCOMM.2025.3650376`, for block-duration
 scale only; its interference, queue, threshold, bandwidth, and K-factor models

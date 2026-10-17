@@ -83,6 +83,9 @@ class FovCoverageTransition:
 
 
 class Simulator:
+    # Tests and the benchmark may disable reuse for an exact reference run.
+    # This is deliberately not exposed as an experiment configuration option.
+    _ACTIVE_LINK_CAPACITY_CACHE_ENABLED = True
     SR_UAV_CARRIER_GHZ = A2G_CARRIER_GHZ
     SR_UAV_TX_POWER_DBM = S2U_TX_POWER_DBM
     SR_UAV_NOISE_DBM_PER_HZ = NOISE_PSD_DBM_PER_HZ
@@ -168,6 +171,13 @@ class Simulator:
         self.active_link_capacity_profiles_mbps = {}
         self.active_s2u_capacity_profiles_mbps = {}
         self.active_link_diagnostics = []
+        self._active_link_capacity_cache_enabled = bool(
+            self._ACTIVE_LINK_CAPACITY_CACHE_ENABLED
+        )
+        self._active_link_capacity_cache = {}
+        self._active_link_capacity_cache_scope = None
+        self._active_link_capacity_cache_hits = 0
+        self._active_link_capacity_cache_misses = 0
         self.GS_pos = GROUND_STATION_POSITION_M
         self.GS_ID = self.num_UAV
         self.channel = ChannelLifecycle(
@@ -833,13 +843,17 @@ class Simulator:
     def prepare_channel_routing_slot(self, routing_slot_index):
         """Privately generate all potential-link gains in fixed CRN order."""
 
-        return self.channel.prepare_routing_slot(routing_slot_index)
+        changed = self.channel.prepare_routing_slot(routing_slot_index)
+        if changed:
+            self._invalidate_active_link_capacity_cache()
+        return changed
 
     def channel_state_dict(self):
         return self.channel.state_dict()
 
     def load_channel_state_dict(self, state):
         self.channel.load_state_dict(state)
+        self._invalidate_active_link_capacity_cache()
 
     def _get_sr_uav_link_metrics(self, uav_id, sr_id, bandwidth_hz=None):
         """Return conditional mean SNR and deterministic expected S2U capacity."""
@@ -897,6 +911,7 @@ class Simulator:
 
     # =====================U2U channel model================================
     def update_u2u_channels(self):
+        self._invalidate_active_link_capacity_cache()
         positions = np.asarray([uav.get_position() for uav in self.UAVs], dtype=float)
         count = len(positions)
         path_loss = np.zeros((count, count), dtype=float)
@@ -938,6 +953,7 @@ class Simulator:
     # ==========================U2G channel model============================
     # 無人機與地面站
     def update_u2g_channels(self):
+        self._invalidate_active_link_capacity_cache()
         positions = np.asarray([uav.get_position() for uav in self.UAVs], dtype=float)
         gs_position = np.asarray(self.GS_pos, dtype=float)
         los_state = np.asarray(self.channel.u2g_los_state, dtype=bool)
@@ -1008,8 +1024,87 @@ class Simulator:
             return self.is_u2g_in_range(sender_id)
         return self.is_u2u_in_range(sender_id, receiver_id)
 
+    def _invalidate_active_link_capacity_cache(self, *, reset_statistics=False):
+        self._active_link_capacity_cache.clear()
+        self._active_link_capacity_cache_scope = None
+        if reset_statistics:
+            self._active_link_capacity_cache_hits = 0
+            self._active_link_capacity_cache_misses = 0
+
+    def _synchronize_active_link_capacity_cache_scope(self):
+        scope = (
+            self.channel.episode_identity,
+            self.channel.movement_interval_index,
+            self.channel.routing_slot_index,
+            id(self.channel._gain_matrix),
+        )
+        if scope != self._active_link_capacity_cache_scope:
+            self._active_link_capacity_cache.clear()
+            self._active_link_capacity_cache_scope = scope
+
+    def _active_link_capacity_profile(
+        self,
+        link_type,
+        sender_id,
+        receiver_id,
+        path_loss_db,
+        bandwidth_hz,
+        transmit_power_dbm,
+        power_gains,
+    ):
+        """Return one isolated profile from the current routing-slot cache."""
+
+        self._synchronize_active_link_capacity_cache_scope()
+        key = (
+            str(link_type),
+            int(sender_id),
+            int(receiver_id),
+            float(path_loss_db),
+            float(bandwidth_hz),
+            float(transmit_power_dbm),
+        )
+        cached = (
+            self._active_link_capacity_cache.get(key)
+            if self._active_link_capacity_cache_enabled
+            else None
+        )
+        if cached is not None:
+            self._active_link_capacity_cache_hits += 1
+            profile, capacity, service_bits = cached
+            return profile.copy(), capacity, service_bits
+
+        profile = np.asarray(
+            block_capacity_profile_mbps(
+                path_loss_db,
+                bandwidth_hz,
+                transmit_power_dbm,
+                power_gains,
+            ),
+            dtype=float,
+        )
+        capacity = float(effective_capacity_mbps(profile))
+        service_bits = float(slot_service_bits(profile))
+        self._active_link_capacity_cache_misses += 1
+        if self._active_link_capacity_cache_enabled:
+            stored_profile = profile.copy()
+            stored_profile.setflags(write=False)
+            self._active_link_capacity_cache[key] = (
+                stored_profile,
+                capacity,
+                service_bits,
+            )
+        return profile, capacity, service_bits
+
+    def active_link_capacity_cache_statistics(self):
+        return {
+            "enabled": bool(self._active_link_capacity_cache_enabled),
+            "hits": int(self._active_link_capacity_cache_hits),
+            "misses": int(self._active_link_capacity_cache_misses),
+            "entries": len(self._active_link_capacity_cache),
+        }
+
     def allocate_active_link_capacities(self, proposed_links, s2u_links=None):
-        """Equal-FDMA then recompute 50 capacities using one cached gain profile."""
+        """Equal-FDMA using slot-local profiles for exact repeated inputs."""
 
         if self.channel._gain_matrix is None:
             if self.channel.u2g_los_state is None:
@@ -1047,17 +1142,17 @@ class Simulator:
             )
             bandwidths[(sender, receiver)] = float(shared_bandwidth)
             gains = self.channel.gain_profile(link_type, sender, receiver)
-            profile = np.asarray(
-                block_capacity_profile_mbps(
-                    path_loss,
-                    shared_bandwidth,
-                    U2U_U2G_TX_POWER_DBM,
-                    gains,
-                ),
-                dtype=float,
+            profile, capacity, service_bits = self._active_link_capacity_profile(
+                link_type,
+                sender,
+                receiver,
+                path_loss,
+                shared_bandwidth,
+                U2U_U2G_TX_POWER_DBM,
+                gains,
             )
             capacity_profiles[(sender, receiver)] = profile
-            capacities[(sender, receiver)] = float(effective_capacity_mbps(profile))
+            capacities[(sender, receiver)] = capacity
             diagnostics.append(
                 {
                     "link_type": link_type,
@@ -1066,7 +1161,7 @@ class Simulator:
                     "bandwidth_hz": float(shared_bandwidth),
                     "capacity_mbps": capacities[(sender, receiver)],
                     "fading_blocks": FADING_BLOCKS_PER_ROUTING_SLOT,
-                    "slot_service_bits": float(slot_service_bits(profile)),
+                    "slot_service_bits": service_bits,
                     "gain_profile_reused": True,
                     "range_eligible": True,
                     "distance_3d_m": (
@@ -1093,16 +1188,15 @@ class Simulator:
                 )
             )
             gains = self.channel.gain_profile("S2U", sr_id, uav_id)
-            profile = np.asarray(
-                block_capacity_profile_mbps(
-                    path_loss,
-                    shared_bandwidth,
-                    S2U_TX_POWER_DBM,
-                    gains,
-                ),
-                dtype=float,
+            profile, capacity, service_bits = self._active_link_capacity_profile(
+                "S2U",
+                sr_id,
+                uav_id,
+                path_loss,
+                shared_bandwidth,
+                S2U_TX_POWER_DBM,
+                gains,
             )
-            capacity = float(effective_capacity_mbps(profile))
             key = ("S2U", sr_id, uav_id)
             bandwidths[key] = float(shared_bandwidth)
             s2u_capacities[(sr_id, uav_id)] = float(capacity)
@@ -1115,7 +1209,7 @@ class Simulator:
                     "bandwidth_hz": float(shared_bandwidth),
                     "capacity_mbps": float(capacity),
                     "fading_blocks": FADING_BLOCKS_PER_ROUTING_SLOT,
-                    "slot_service_bits": float(slot_service_bits(profile)),
+                    "slot_service_bits": service_bits,
                     "gain_profile_reused": True,
                     "range_eligible": True,
                     "distance_3d_m": self.distance_3d(
@@ -1233,6 +1327,7 @@ class Simulator:
 
     # ================隨機GT版本=============================
     def reset_environment(self, scenario_entry=None):
+        self._invalidate_active_link_capacity_cache(reset_statistics=True)
         if scenario_entry is not None:
             from scenario_manifest import validate_scenario_entry
 
