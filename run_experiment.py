@@ -95,6 +95,17 @@ from llm_explorer_td3_only import (
     LLM_EXPLORER_TD3_ONLY_SUMMARY_VERSION,
     LLM_EXPLORER_TD3_ONLY_VERSION,
 )
+from llm_state_rule_explorer import (
+    LLM_STATE_RULE_CACHE_VERSION,
+    LLM_STATE_RULE_PROMPT_VERSION,
+    LLM_STATE_RULE_SUMMARY_VERSION,
+    LLM_STATE_RULE_VERSION,
+)
+from llm_explorer_state_rule import (
+    STATE_RULE_FEATURE_CATALOG_VERSION,
+    STATE_RULE_LANGUAGE_VERSION,
+    STATE_RULE_SCHEMA_VERSION,
+)
 
 
 TRAINING_HISTORY_MANIFEST_HASH_SEMANTICS = (
@@ -107,7 +118,9 @@ TRAINING_MANIFEST_SEGMENTS_SEMANTICS = (
 
 def _explorer_schema_version(method):
     return (
-        LLM_EXPLORER_TD3_ONLY_VERSION
+        LLM_STATE_RULE_VERSION
+        if method.llm_explorer_state_rule_enabled
+        else LLM_EXPLORER_TD3_ONLY_VERSION
         if method.llm_explorer_td3_only_enabled
         else LLM_EXPLORER_V3_VERSION
         if method.llm_explorer_v3_enabled
@@ -116,9 +129,11 @@ def _explorer_schema_version(method):
 
 
 def _explorer_preflight_options(method):
-    return {
+    options = {
         "artifact_directory": (
-            "llm_explorer_td3_only"
+            "llm_rule"
+            if method.llm_explorer_state_rule_enabled
+            else "llm_explorer_td3_only"
             if method.llm_explorer_td3_only_enabled
             else "llm_explorer_v3"
             if method.llm_explorer_v3_enabled
@@ -127,6 +142,9 @@ def _explorer_preflight_options(method):
         "named_routing": bool(method.llm_explorer_v3_enabled),
         "td3_only": bool(method.llm_explorer_td3_only_enabled),
     }
+    if method.llm_explorer_state_rule_enabled:
+        options["state_rule"] = True
+    return options
 
 
 def _git_short_sha() -> str:
@@ -1016,7 +1034,24 @@ def run(args):
             "warmup_joint_transitions": 10000,
             "update_interval_episodes": 1,
         }
-        if method.llm_explorer_td3_only_enabled:
+        if method.llm_explorer_state_rule_enabled:
+            resolved["llm_explorer"].update(
+                prompt_version=LLM_STATE_RULE_PROMPT_VERSION,
+                summary_version=LLM_STATE_RULE_SUMMARY_VERSION,
+                cache_version=LLM_STATE_RULE_CACHE_VERSION,
+                rule_schema_version=STATE_RULE_SCHEMA_VERSION,
+                rule_language_version=STATE_RULE_LANGUAGE_VERSION,
+                feature_catalog_version=STATE_RULE_FEATURE_CATALOG_VERSION,
+                guidance_weight_w=1.0,
+                annealing_end_episode=None,
+                input_hard_limit_tokens=None,
+                context_window_tokens=128000,
+                safety_margin_tokens=4096,
+                td3_guidance="latest_state_dependent_rule",
+                routing_guidance="disabled",
+                routing_intervention="none_original_safe_ddqn_epsilon_greedy",
+            )
+        elif method.llm_explorer_td3_only_enabled:
             resolved["llm_explorer"].update(
                 prompt_version=LLM_EXPLORER_TD3_ONLY_PROMPT_VERSION,
                 summary_version=LLM_EXPLORER_TD3_ONLY_SUMMARY_VERSION,

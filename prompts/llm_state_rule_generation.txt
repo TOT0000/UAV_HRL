@@ -1,0 +1,44 @@
+Convert the supplied complete analysis into one complete shared TD3 movement-exploration rule. This is an independent request; all required evidence and the formal interface are included below.
+
+## 1. Inputs
+
+### Complete analysis-stage design
+{{ANALYSIS_STAGE_OUTPUT}}
+
+### Host-verified key evidence
+{{VERIFIED_KEY_EVIDENCE_SUMMARY}}
+
+### Formal runtime feature catalog
+{{RUNTIME_FEATURE_CATALOG}}
+
+### Rule language and output schema
+{{RULE_LANGUAGE_AND_OUTPUT_SCHEMA}}
+
+### Previous complete rule
+{{PREVIOUS_COMPLETE_RULE}}
+
+### Previous rule application status
+{{PREVIOUS_RULE_APPLICATION_STATUS}}
+
+### Current training settings
+{{TRAINING_PHASE_AND_SETTINGS}}
+
+### Observable initial state
+{{CURRENT_OBSERVABLE_INITIAL_STATE}}
+
+### Local validation feedback
+{{VALIDATION_FEEDBACK_OR_EMPTY}}
+
+## 2. Root output format
+
+Return one JSON object with exactly four root keys: schema_version, speed, heading, and vertical. schema_version must be "td3-state-bias-rule-v1". The three action fields are raw normalized-action offsets. All UAVs share the expressions; the host evaluates them separately with latest state and the original Actor action.
+
+Node forms are a finite JSON numeric constant, {"field":"formal_name"}, or {"op":"operation","args":[...]}. Field names, types, operations, arity, lazy evaluation, angle units, and complexity limits must exactly match the supplied interface. Use validity flags before dependent fields and provide all branches.
+
+For example, a selected +0.01 speed offset only when has_fov_task is true would encode as {"op":"if","args":[{"field":"has_fov_task"},0.01,0.0]}. This is only a syntax example, not a recommendation.
+
+Normalized Actor heading psi corresponds to theta=pi*psi radians. For an Actor heading 0.99 and selected reference normalized heading -0.99, wrap_angle((-0.99-0.99)*pi)=0.02*pi and the normalized correction is 0.02. Use radians inside angle operations and normalized units for the final heading bias.
+
+The host clips raw output once to [-sigma_episode_start,+sigma_episode_start] and applies fixed w=1. Do not multiply output by sigma or w. Compatible reliable prior elements may be retained. If history is unavailable, construct from current evidence. If validation feedback is present, correct it and return the entire rule.
+
+Respect at most 40 nodes per component, 100 nodes total, and depth 8 where the root expression has depth 1. Return only the JSON object, with no Markdown fence, explanation, routing field, or extra key.

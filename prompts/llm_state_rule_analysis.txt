@@ -1,0 +1,61 @@
+Use the following evidence to design the shared TD3 movement-exploration rule for the next episode. Your complete response will be passed to an independent second request and encoded as executable JSON.
+
+## 1. Inputs
+
+### Current training phase and settings
+{{TRAINING_PHASE_AND_SETTINGS}}
+
+### Observable initial state of the current episode
+{{CURRENT_OBSERVABLE_INITIAL_STATE}}
+
+This is only the opening configuration. Runtime evaluation uses updated observations.
+
+### Previous complete rule
+{{PREVIOUS_COMPLETE_RULE}}
+
+### Actual use of the previous rule
+{{PREVIOUS_RULE_APPLICATION_STATUS}}
+
+Missing reliable history is explicit and is not a zero rule.
+
+### Previous task and source context
+{{OBSERVED_TASK_AND_TRAFFIC_SUMMARY}}
+
+### Verified episode outcomes
+{{VERIFIED_EPISODE_METRICS}}
+
+These include EE, timely useful GS bits, all-UAV movement energy, source/service outcomes, stage-specific violations with denominators, and movement/routing reward components when available.
+
+### Movement and rule-application summaries
+{{MOVEMENT_AND_RULE_APPLICATION_SUMMARIES}}
+
+These include roles and duration, TD3 control opportunities, Actor/raw/bounded/effective/executed action summaries, conditions, clipping, zero bias, and runtime fallback.
+
+### FOV, COM, queue, link, and within-slot service summaries
+{{FOV_COM_AND_SLOT_SERVICE_SUMMARIES}}
+
+Slot-start queue observations and actual within-slot access/forwarding/GS outcomes are separate. Global statistics are not individual causal attribution.
+
+### Representative cases
+{{REPRESENTATIVE_CASES}}
+
+Cases are illustrative. Complete summaries determine frequencies.
+
+## 2. Analysis and design procedure
+
+1. Select at most two priority problems using numerical evidence, task scale, offered load, EE numerator/denominator, and stage-specific denominators. State what the evidence establishes and what may be scene-dependent.
+2. Explain what horizontal speed, heading correction relative to the Actor, and vertical speed can plausibly improve for FOV, SR access, link geometry, energy, and final timely delivery. Address simultaneous FOV and COM tasks.
+3. Examine actual previous-rule use: TD3 opportunities, triggered conditions, bias directions and magnitudes, clipping, action boundaries, and other controllers. Zero controlled decisions means no control opportunity. Saturation is not proof of service improvement.
+4. Form an executable conditional design. For every component state the task/state condition, exact formal fields, bias direction and magnitude calculation, and output when unavailable. Compute shortest heading corrections in radians relative to pi*actor_heading, then convert to normalized heading units. Use current roles and geometry.
+5. State testable expected outcomes, possible costs, and evidence that would support or weaken the hypothesis.
+
+## 3. Response format
+
+Provide exactly four prose sections:
+
+1. Main problems and numerical evidence.
+2. Shared rule design with conditions, formal fields, calculations, and retained/revised elements.
+3. Expected outcomes and possible costs.
+4. Uncertainty and metrics to inspect next episode.
+
+Retaining a reliable prior rule is valid. Smaller or zero bias is valid when evidence is insufficient. Do not propose fields or operations outside the supplied formal interface.

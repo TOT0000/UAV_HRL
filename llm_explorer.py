@@ -928,6 +928,7 @@ def llm_explorer_path_preflight(
     artifact_directory: str = "llm_explorer",
     named_routing: bool = False,
     td3_only: bool = False,
+    state_rule: bool = False,
 ) -> dict[str, Any]:
     """Validate every filename produced by the explorer and streaming client.
 
@@ -983,10 +984,37 @@ def llm_explorer_path_preflight(
     ]
     longest = max(checks, key=lambda item: item["characters"])
     encoder = _token_encoder()
-    representative_guidance_value = {
-        "td3_bias": [[-0.123456, 0.123456, 0.0] for _ in range(NUM_UAV)]
-    }
-    if not td3_only:
+    if state_rule:
+        # Exercise the output reserve with a near-maximum legal AST: each
+        # balanced 17-leaf component has 33 nodes, for 99 nodes in total.
+        def representative_component() -> Any:
+            nodes: list[Any] = [round(index / 17.0, 8) for index in range(17)]
+            while len(nodes) > 1:
+                next_nodes: list[Any] = []
+                for index in range(0, len(nodes), 2):
+                    next_nodes.append(
+                        nodes[index]
+                        if index + 1 == len(nodes)
+                        else {"op": "add", "args": [nodes[index], nodes[index + 1]]}
+                    )
+                nodes = next_nodes
+            return nodes[0]
+
+        representative_guidance_value = {
+            "schema_version": "td3-state-bias-rule-v1",
+            "speed": representative_component(),
+            "heading": representative_component(),
+            "vertical": representative_component(),
+        }
+        representative_ast_nodes = 99
+        guidance_output_reserve = 4096
+    else:
+        representative_guidance_value = {
+            "td3_bias": [[-0.123456, 0.123456, 0.0] for _ in range(NUM_UAV)]
+        }
+        representative_ast_nodes = None
+        guidance_output_reserve = LLMExplorerConfig().guidance_max_output_tokens
+    if not td3_only and not state_rule:
         representative_guidance_value["routing_prior"] = (
             {
                 f"UAV_{sender}": {
@@ -1003,10 +1031,16 @@ def llm_explorer_path_preflight(
         )
     representative_guidance = _compact_json(representative_guidance_value)
     representative_output_tokens = len(encoder.encode(representative_guidance))
-    if representative_output_tokens >= LLMExplorerConfig().guidance_max_output_tokens:
+    if representative_output_tokens >= guidance_output_reserve:
         raise ValueError(
             "configured guidance output reserve cannot hold the complete "
-            + ("[16,3] JSON response" if td3_only else "[16,3] and [16,17] JSON response")
+            + (
+                "state-rule AST JSON response"
+                if state_rule
+                else "[16,3] JSON response"
+                if td3_only
+                else "[16,3] and [16,17] JSON response"
+            )
         )
     report = {
         "strategy": "conservative_windows_character_limit",
@@ -1016,12 +1050,14 @@ def llm_explorer_path_preflight(
         "artifact_directory": str(artifact_root),
         "named_routing": bool(named_routing),
         "td3_only": bool(td3_only),
+        "state_rule": bool(state_rule),
         "checked_path_count": len(checks),
         "longest": longest,
         "paths": checks,
         "tokenizer_encoding": LLM_EXPLORER_ENCODING,
         "representative_full_guidance_output_tokens": representative_output_tokens,
-        "guidance_reserved_output_tokens": LLMExplorerConfig().guidance_max_output_tokens,
+        "representative_state_rule_ast_nodes": representative_ast_nodes,
+        "guidance_reserved_output_tokens": guidance_output_reserve,
     }
     if int(longest["characters"]) > int(windows_limit):
         raise ValueError(
@@ -1466,6 +1502,14 @@ class LLMExplorerController:
         )
         return int.from_bytes(hashlib.sha256(material.encode("utf-8")).digest()[:8], "big") % (2**31 - 1)
 
+    def _stage_display_name(self, stage: str) -> str:
+        return str(stage)
+
+    def _before_request(self, *, episode_index: int, stage: str, attempt: int) -> None:
+        """Optional method-specific progress reporting before an API request."""
+
+        del episode_index, stage, attempt
+
     def _prompt_budget(
         self,
         *,
@@ -1703,7 +1747,8 @@ class LLMExplorerController:
                 )
             except PromptBudgetError as exc:
                 print(
-                    f"[LLM explorer] episode={episode_index + 1} stage={stage} "
+                    f"[LLM explorer] episode={episode_index + 1} "
+                    f"stage={self._stage_display_name(stage)} "
                     f"local_preflight_failed reason={exc} retry=false "
                     f"requests_total={self.statistics['requests_total']} "
                     f"failed_attempts_total={self.statistics['failed_attempts_total']} "
@@ -1720,6 +1765,9 @@ class LLMExplorerController:
             )
             try:
                 self._ensure_client()
+                self._before_request(
+                    episode_index=episode_index, stage=stage, attempt=attempt
+                )
                 response = self.client.chat(
                     model=self.config.model,
                     system_prompt=system_prompt,
@@ -1747,7 +1795,8 @@ class LLMExplorerController:
                 )
                 will_retry = attempt < int(self.config.max_attempts)
                 print(
-                    f"[LLM explorer] episode={episode_index + 1} stage={stage} "
+                    f"[LLM explorer] episode={episode_index + 1} "
+                    f"stage={self._stage_display_name(stage)} "
                     f"attempt={attempt} failed reason={last_reason} "
                     f"retry={str(will_retry).lower()} "
                     f"requests_total={self.statistics['requests_total']} "
@@ -1811,7 +1860,8 @@ class LLMExplorerController:
                 return value, attempt, False
             will_retry = attempt < int(self.config.max_attempts)
             print(
-                f"[LLM explorer] episode={episode_index + 1} stage={stage} "
+                f"[LLM explorer] episode={episode_index + 1} "
+                f"stage={self._stage_display_name(stage)} "
                 f"attempt={attempt} failed category={failure_category} "
                 f"reason={last_reason} retry={str(will_retry).lower()} "
                 f"requests_total={self.statistics['requests_total']} "
@@ -2051,7 +2101,8 @@ class LLMExplorerController:
                 except PromptBudgetError as exc:
                     feedback = str(exc)
                     print(
-                        f"[LLM explorer] episode={episode_index + 1} stage=guidance "
+                        f"[LLM explorer] episode={episode_index + 1} "
+                        f"stage={self._stage_display_name('guidance')} "
                         f"local_preflight_failed reason={exc} retry=false "
                         f"requests_total={self.statistics['requests_total']} "
                         f"failed_attempts_total={self.statistics['failed_attempts_total']} "
@@ -2068,6 +2119,11 @@ class LLMExplorerController:
                 )
                 try:
                     self._ensure_client()
+                    self._before_request(
+                        episode_index=episode_index,
+                        stage="guidance",
+                        attempt=attempt,
+                    )
                     response = self.client.chat(
                         model=self.config.model,
                         system_prompt=system_template,
@@ -2102,7 +2158,8 @@ class LLMExplorerController:
                     )
                     feedback = reason
                     print(
-                        f"[LLM explorer] episode={episode_index + 1} stage=guidance "
+                        f"[LLM explorer] episode={episode_index + 1} "
+                        f"stage={self._stage_display_name('guidance')} "
                         f"attempt={attempt} failed reason={reason} "
                         f"retry={str(attempt < self.config.max_attempts).lower()} "
                         f"requests_total={self.statistics['requests_total']} "
@@ -2214,7 +2271,8 @@ class LLMExplorerController:
                     break
                 feedback = reason or "unknown validation error"
                 print(
-                    f"[LLM explorer] episode={episode_index + 1} stage=guidance "
+                    f"[LLM explorer] episode={episode_index + 1} "
+                    f"stage={self._stage_display_name('guidance')} "
                     f"attempt={attempt} failed category={category} reason={feedback} "
                     f"retry={str(attempt < self.config.max_attempts).lower()} "
                     f"requests_total={self.statistics['requests_total']} "

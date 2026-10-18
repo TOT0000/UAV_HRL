@@ -147,6 +147,7 @@ class TD3():
         add_noise=True,
         noise_std=None,
         mean_bias=None,
+        mean_bias_provider=None,
         mean_bias_bound=None,
         return_diagnostics=False,
     ):
@@ -154,6 +155,16 @@ class TD3():
         with torch.no_grad():
             raw_action = self.actor(state).cpu().numpy().flatten()
         actor_action = raw_action.copy()
+
+        if mean_bias is not None and mean_bias_provider is not None:
+            raise ValueError("provide either mean_bias or mean_bias_provider, not both")
+        if mean_bias_provider is not None:
+            if not callable(mean_bias_provider):
+                raise TypeError("mean_bias_provider must be callable")
+            # The provider sees the exact Actor output before either exploration
+            # source is applied.  It is invoked inside this one action-selection
+            # call, so Actor evaluation and Gaussian RNG consumption stay single.
+            mean_bias = mean_bias_provider(actor_action.copy())
 
         if mean_bias is not None:
             bias = np.asarray(mean_bias, dtype=np.float32).reshape(-1)

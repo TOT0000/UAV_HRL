@@ -548,6 +548,13 @@ _METHOD_DEFINITIONS = {
         "reward_mode": "dinkelbach",
         "label": "TD3 + Dinkelbach + LLM-guided TD3-only exploration",
     },
+    "td3_dinkelbach_llm_explorer_state_rule": {
+        **_COMMON_METHOD,
+        "agent": "td3",
+        "movement": "centralized_td3",
+        "reward_mode": "dinkelbach",
+        "label": "TD3 + Dinkelbach + state-dependent LLM TD3 exploration rule",
+    },
 }
 METHOD_REGISTRY = MappingProxyType(_METHOD_DEFINITIONS)
 _LEGACY_METHOD_IDS = frozenset(
@@ -644,6 +651,7 @@ class MethodSpec:
             "td3_dinkelbach_llm_explorer",
             "td3_dinkelbach_llm_explorer_v3",
             "td3_dinkelbach_llm_explorer_td3_only",
+            "td3_dinkelbach_llm_explorer_state_rule",
         }
 
     @property
@@ -653,6 +661,14 @@ class MethodSpec:
     @property
     def llm_explorer_td3_only_enabled(self) -> bool:
         return self.method_id == "td3_dinkelbach_llm_explorer_td3_only"
+
+    @property
+    def llm_explorer_state_rule_enabled(self) -> bool:
+        return self.method_id == "td3_dinkelbach_llm_explorer_state_rule"
+
+    @property
+    def llm_explorer_movement_only_enabled(self) -> bool:
+        return self.llm_explorer_td3_only_enabled or self.llm_explorer_state_rule_enabled
 
     @property
     def llm_explorer_annealed_enabled(self) -> bool:

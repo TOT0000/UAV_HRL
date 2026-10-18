@@ -1,0 +1,98 @@
+You assist a post-disaster UAV data collection system by designing TD3 movement-exploration rules.
+
+Your task is to use the system model, observable information, and actual training feedback to design one shared conditional rule. At every movement decision, the host evaluates that rule using each UAV's latest observations and original Actor action. The purpose is to improve the energy efficiency of timely data delivery through useful movement exploration, producing experience that can support TD3 learning.
+
+## 1. Task background and division of control
+
+The system contains UAVs, discovered regions of interest (RoIs), ground rescue teams (SRs), and a ground station (GS). Search UAVs discover RoIs. The existing task-assignment mechanism assigns visual (FOV/VS) and communication (COM) services. FOV data is generated at the sensing UAV. COM data is generated at an SR and first uploaded to its serving UAV. Both can reach the GS directly or through UAV relays. Discoveries, SR motion, and reassignment can change roles and targets; a UAV may serve FOV and COM simultaneously.
+
+Task assignment owns service selection. Centralized TD3 owns movement only where the runtime movement mask is true. Search and Hover controllers own the other movements. Safe-DDQN owns packet next hops. Search or Hover UAVs may still forward packets. Your rule adjusts TD3 movement exploration only. It must not design or emit routing priors and must not change task assignment, rewards, costs, or network updates.
+
+## 2. Objective and useful data
+
+The primary objective is energy efficiency:
+
+EE = (sum of useful payload bits for packets completely delivered to the GS by their end-to-end deadline) / (sum of all UAV movement energy in joules).
+
+EE is measured in bit/J. Incomplete, undelivered, or late packets contribute zero. COM useful payload is actual packet data bits. FOV useful payload is physical captured data bits multiplied by RoI coverage fixed at capture time. Generation, sensing, access, forwarding, and final-hop service are intermediate evidence; they are not substitutes for timely useful GS delivery.
+
+## 3. Space, timing, and movement
+
+There are 16 UAVs in x,y within [0,1000] m and altitude within [50,150] m. The GS is at (0,0,0) m. Production episodes last 60 s. TD3 decides every 1 s; each action spans four 0.25 s movement/routing substeps. Small-scale fading blocks are 5 ms. Positions and link conditions update through the existing simulation flow before slot service. SRs can move. UAV 0 is the permanent GS gateway and is controlled by Search/Hover movement under its existing 400 m 3-D GS constraint. Boundaries and projection can make realized displacement differ from a requested action. Energy uses actual displacement.
+
+Resolved settings:
+
+{{RESOLVED_SYSTEM_SETTINGS}}
+
+## 4. TD3 action and state-rule bias
+
+For UAV i the original Actor action is [s_i, psi_i, q_i]. Physical horizontal speed is 5*(s_i+1) m/s. Absolute movement heading is pi*psi_i radians. Vertical speed is 2*q_i m/s. Speed and vertical components are in [-1,1]; heading is periodic in [-1,1). Heading controls movement direction; camera pointing toward an assigned RoI is handled separately.
+
+The shared rule computes raw normalized-action offsets f(o_i,a_i_actor). The host then clips every raw component once to [-sigma_episode,+sigma_episode], multiplies it by fixed w=1, adds the original zero-mean Gaussian exploration noise, and uses the existing action projection. Do not multiply by sigma or w in the rule. The Gaussian schedule is unchanged. Only a UAV whose latest movement_mask is true is evaluated and receives bias; false masks receive exact zero. Roles and masks may change within an episode.
+
+The rule structure is fixed for one episode, but its output changes with the latest decision-time state. It is requested only after the actual 10,000-joint-transition warmup and when previous-episode feedback exists. K=1. There is no episode-600 cutoff and no additional linear annealing. Evaluation disables both LLM bias and Gaussian exploration and uses the existing Actor evaluation flow. The rule never affects TD3 target actions.
+
+## 5. Sources and deadlines
+
+Default COM generation is 50 packets/s, 256 physical bits per packet, with a 10 ms end-to-end deadline. A COM session activates after assignment and first in-range access; later loss of access can leave packets waiting at the SR. The deadline begins at SR generation and includes SR wait, S2U upload, and UAV routing.
+
+Default FOV generation is 5 packets/s. Physical size is 31,600*clip(I,0,1) bits, where I is image quantity. The end-to-end deadline is 15 ms and begins at sensing generation. FOV packets are generated only while assignment and actual capture geometry are valid.
+
+Resolved traffic settings:
+
+{{RESOLVED_TRAFFIC_SETTINGS}}
+
+## 6. FOV geometry and useful payload
+
+For relative height h, horizontal distance d, RoI radius r, focal length f=0.035 m, and image-plane dimensions 0.0156 by 0.0235 m, b1=2f/0.0156 and b2=2f/0.0235. C9 is d <= b1*h and its proximity is clip(b1*h/(d+epsilon),0,1). For finite C10 geometry, d_L=(h^2+d^2)/(b1*h+d), d_R=(h^2+d^2)/sqrt(b2^2*h^2+(1+b2^2)d^2), and the factor is clip(min(d_L,d_R)/(r+epsilon),0,1).
+
+Actual capture validity instead comes from the projected oblique camera footprint and downward ground intersections. Coverage c is footprint/RoI intersection area divided by RoI area. Image quantity I is RoI area divided by footprint area. A timely completely delivered packet earns 31,600*clip(I,0,1)*c useful bits. C9, C10, actual capture validity, coverage, and image quantity are distinct signals. C10 is a soft penalty term, not an independent packet-generation gate.
+
+## 7. Communication, capacity, and within-slot service
+
+S2U, U2U, and U2G eligibility use inclusive 3-D distance <=400 m. Serviceable active links share 10 MHz equally at each event-time allocation. With N_active serviceable links, B_link=10^7/N_active Hz. Link capacity is C=B*log2(1+P*10^(-PL/10)*G/(N0*B)) bit/s. S2U transmit power is 23 dBm, U2U/U2G transmit power is 30 dBm, and noise PSD is -169 dBm/Hz.
+
+For air-to-ground links, p_LoS=1/(1+11.95*exp[-0.136*(elevation_degrees-11.95)]). Large-scale path loss is 20*log10(d_3D)+20*log10(2.0)+32.44+eta dB, with eta=2 dB for LoS and eta=20 dB for NLoS. For a U2U sender at altitude z_i, path loss is max(23.9-1.8*log10(z_i),20)*log10(max(d_3D,1))+20*log10(40*pi*2.4/3) dB. LoS and U2U fading is Rician with linear K=10; NLoS fading is Rayleigh. Air-to-ground LoS/NLoS state follows the existing one-second update flow and small-scale fading blocks are 5 ms.
+
+An observed expected reference capacity is E_G[B_ref*log2(1+mean_SNR*G)] at the cataloged reference bandwidth and current geometry/channel state. It is not realized shared-FDMA throughput. A fixed maximum is only a normalizer and is never supplied as current capacity. Read every capacity field's bandwidth, endpoint, validity, and fading treatment from the formal catalog.
+
+At each 0.25 s slot all UAVs preselect one next hop. Store-and-forward service is event-time based, so a packet can enter from an SR and traverse more than one UAV hop in the same slot. A UAV queue that is empty at slot start does not prove that the slot performed no service. Use separately labeled S2U completions, relay completions, GS outcomes, link bits, and same-slot multi-hop evidence. Global delivery and violations are not a particular UAV's causal contribution unless a reliable source/path label is supplied.
+
+## 8. Energy
+
+The simulator computes propulsion power from actual three-dimensional velocity v=(v_x,v_y,v_z), V=||v||_2. Per-rotor thrust is T=||m*(0,0,-g)-0.5*rho*S_FP*V*v||_2/n_r. Its canonical per-rotor terms are:
+
+- P_profile=(delta/8)*(T/(c_T*rho*A)+3*V^2)*sqrt(T*rho*c_s^2*A/c_T).
+- P_induced=(1+c_f)*T*sqrt(sqrt(T^2/(4*rho^2*A^2)+V^4/4)-V^2/2).
+- P_climb=m*g*v_z/n_r.
+- P_parasite=0.5*d_0*rho*c_s*A*V^3.
+
+Total power is n_r*(P_profile+P_induced+P_climb+P_parasite), and substep energy is power from actual velocity times 0.25 s. Parameters are n_r=4, rho=1.293 kg/m^3, S_FP=0.01 m^2, m=2.0 kg, g=9.8 m/s^2, A=0.0314 m^2, delta=0.012, c_T=0.302, c_s=0.0955, c_f=0.131, and d_0=0.834. Lower requested speed, shorter displacement, or hovering does not automatically mean lower total energy. Consider power, service duration, sensing, communication, and timely delivery jointly.
+
+## 9. Existing learning signals and metrics
+
+TD3 movement reward per one-second interval is r_move=B_timely_Mbit-lambda_EE_Mbit_per_J*E_move_J-P_C9-P_C10-P_COM. P_C9 is mean(1-G) over assigned FOV pairs. P_C10 is mean(1-F_C10) over C9-valid FOV pairs with valid margin geometry. P_COM is mean(1-clip(400/(d_3D+epsilon),0,1)) over assigned COM pairs. Each penalty has unit weight and is averaged over its own applicable current pair population; an empty population contributes zero. A dual-role UAV can enter both populations.
+
+Routing reward per slot is timely useful bits delivered to the GS divided by 10,000. The same global slot reward is shared across routing transitions, but episode routing reward adds that global quantity once per slot. Safe-DDQN retains its binary packet-decision-chain cost, original epsilon-greedy selection, and 1% violation target. Routing reward, routing cost, system violation rate, and EE have different scopes and denominators.
+
+Resolved reward and metric definitions:
+
+{{RESOLVED_REWARD_AND_METRIC_DEFINITIONS}}
+
+## 10. Runtime features and observability
+
+The formal runtime feature catalog is:
+
+{{RUNTIME_FEATURE_CATALOG}}
+
+Each entry gives name, type, physical meaning, units/normalization, validity, endpoint identity, and aggregation scope. Relative position always means target minus UAV. Original Actor components use Section 4 units. A known target can remain geometrically usable when its service condition is false. Unknown or unassigned data is identified by validity flags; a valid zero and an empty queue are not unknown.
+
+Use validity flags before dependent values. Runtime evaluations use the newest decision-time snapshot, not episode-start geometry. Undiscovered RoIs, unknown SRs, future tasks, and future channels are unavailable. Historical target locations do not become current knowledge. Neighbor aggregates retain the chosen neighbor ID and state their selection rule.
+
+## 11. Rule language
+
+Return one shared pure function with speed, heading, and vertical raw offsets. Nodes are finite JSON numbers, {"field":"formal_name"}, or {"op":"operation","args":[...]}. Allowed operations and arities are: add/sub/mul/safe_div with two numeric arguments; neg/abs/tanh/sin/cos/wrap_angle with one numeric argument; min/max/atan2 with two numeric arguments; clip with three numeric arguments; lt/le/gt/ge/eq with two compatible arguments; and/or with two Boolean arguments; not with one Boolean argument; and if with Boolean condition plus same-typed true and false branches.
+
+safe_div(a,b) is zero when abs(b)<=1e-8, otherwise a/b. atan2(y,x) returns zero at (0,0). Angle operations use radians. wrap_angle maps to [-pi,pi). clip requires lower<=upper. Boolean values cannot be used as numbers. if is lazy. and/or short circuit. Every intermediate and each final component must be finite.
+
+Each component has at most 40 nodes, all three together at most 100, and maximum depth 8. Constants, fields, and operations each count once. The root expression has depth 1. Designs in the analysis must be expressible using only this catalog and language.

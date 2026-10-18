@@ -1,5 +1,5 @@
 import argparse
-from collections import defaultdict
+from collections import Counter, defaultdict
 import copy
 from dataclasses import dataclass
 import hashlib
@@ -178,6 +178,12 @@ from llm_explorer_td3_only import (
     environment_definitions_td3_only,
     explorer_metadata_td3_only,
 )
+from llm_state_rule_explorer import (
+    LLMStateRuleConfig,
+    LLMStateRuleController,
+    environment_definitions_state_rule,
+    explorer_metadata_state_rule,
+)
 
 
 MOVEMENT_CONTROL_INTERVAL = int(round(MOVEMENT_INTERVAL_SECONDS / ROUTING_SLOT_SECONDS))
@@ -220,7 +226,7 @@ def _llm_routing_exploration_prior(method_spec, explorer, guidance):
     if (
         explorer is None
         or guidance is None
-        or method_spec.llm_explorer_td3_only_enabled
+        or method_spec.llm_explorer_movement_only_enabled
         or not guidance.get("enabled", False)
         or guidance.get("routing_fallback", True)
     ):
@@ -804,6 +810,7 @@ def _run_routing_slot(
     exploration_prior_weight=0.8,
     zero_prior_mass_callback=None,
     routing_decision_observer=None,
+    routing_slot_observer=None,
 ):
     del routing_masks
     packet_cost_attribution = (
@@ -1014,6 +1021,43 @@ def _run_routing_slot(
         routing_transition_ids_by_sender=routing_transition_ids,
         effective_masks_by_sender=effective_masks,
     )
+    if routing_slot_observer is not None:
+        packet_use_counts = Counter(
+            int(item["packet_id"])
+            for item in slot_result.get("packet_decision_uses", ())
+            if isinstance(item, dict) and item.get("packet_id") is not None
+        )
+        serviced_packet_ids = set(packet_use_counts)
+        for key in ("s2u_arrivals", "relay_arrivals", "outcomes"):
+            for item in slot_result.get(key, ()):
+                if isinstance(item, dict) and item.get("packet_id") is not None:
+                    serviced_packet_ids.add(int(item["packet_id"]))
+        routing_slot_observer(
+            {
+                "time_seconds": float(current_time),
+                "start_of_slot_nonempty_sender_ids": list(
+                    map(int, slot_result.get("start_of_slot_routing_sender_ids", ()))
+                ),
+                "serviced_packet_ids": sorted(serviced_packet_ids),
+                "s2u_completed_packets": len(slot_result.get("s2u_arrivals", ())),
+                "uav_relay_completions": len(slot_result.get("relay_arrivals", ())),
+                "gs_delivery_outcomes": sum(
+                    bool(item.get("delivered_to_gs", False))
+                    or str(item.get("reason", "")) in {"delivered", "late_delivered"}
+                    for item in slot_result.get("outcomes", ())
+                    if isinstance(item, dict)
+                ),
+                "same_slot_multi_hop_packets": sum(
+                    count >= 2 for count in packet_use_counts.values()
+                ),
+                "transmitted_bits_by_link": {
+                    str(key): float(value)
+                    for key, value in slot_result.get(
+                        "transmitted_bits_by_link", {}
+                    ).items()
+                },
+            }
+        )
     env.current_time = float(current_time) + step_time
     if routing_training_diagnostics is not None:
         routing_training_diagnostics.add_slot(
@@ -2465,7 +2509,13 @@ def train(
     )
     llm_explorer_config = (
         (
-            LLMExplorerTD3OnlyConfig(
+            LLMStateRuleConfig(
+                model=str(llm_explorer_model),
+                request_timeout_seconds=float(llm_explorer_timeout),
+                episode_joint_transitions=int(config.episode_seconds),
+            )
+            if method_spec.llm_explorer_state_rule_enabled
+            else LLMExplorerTD3OnlyConfig(
                 model=str(llm_explorer_model),
                 request_timeout_seconds=float(llm_explorer_timeout),
                 episode_joint_transitions=int(config.episode_seconds),
@@ -2494,7 +2544,9 @@ def train(
             config.run_directory,
             maximum_episode=config.total_episodes,
             artifact_directory=(
-                "llm_explorer_td3_only"
+                "llm_rule"
+                if method_spec.llm_explorer_state_rule_enabled
+                else "llm_explorer_td3_only"
                 if method_spec.llm_explorer_td3_only_enabled
                 else "llm_explorer_v3"
                 if method_spec.llm_explorer_v3_enabled
@@ -2502,10 +2554,13 @@ def train(
             ),
             named_routing=method_spec.llm_explorer_v3_enabled,
             td3_only=method_spec.llm_explorer_td3_only_enabled,
+            state_rule=method_spec.llm_explorer_state_rule_enabled,
         )
     llm_explorer = (
         (
-            LLMExplorerTD3OnlyController
+            LLMStateRuleController
+            if method_spec.llm_explorer_state_rule_enabled
+            else LLMExplorerTD3OnlyController
             if method_spec.llm_explorer_td3_only_enabled
             else LLMExplorerV3Controller
             if method_spec.llm_explorer_v3_enabled
@@ -2547,7 +2602,9 @@ def train(
     )
     if llm_explorer_config is not None:
         experiment_identity["llm_explorer"] = (
-            explorer_metadata_td3_only(llm_explorer_config)
+            explorer_metadata_state_rule(llm_explorer_config)
+            if method_spec.llm_explorer_state_rule_enabled
+            else explorer_metadata_td3_only(llm_explorer_config)
             if method_spec.llm_explorer_td3_only_enabled
             else explorer_metadata_v3(llm_explorer_config)
             if method_spec.llm_explorer_v3_enabled
@@ -3082,13 +3139,17 @@ def train(
                 routing_epsilon=episode_routing_epsilon_start,
                 current_observable_initial_state=(
                     build_observable_initial_state_td3_only(env, packet_engine)
+                    if method_spec.llm_explorer_state_rule_enabled
+                    else build_observable_initial_state_td3_only(env, packet_engine)
                     if method_spec.llm_explorer_td3_only_enabled
                     else build_observable_initial_state_v3(env, packet_engine)
                     if method_spec.llm_explorer_v3_enabled
                     else build_observable_initial_state(env, packet_engine)
                 ),
                 environment_constants=(
-                    environment_definitions_td3_only
+                    environment_definitions_state_rule
+                    if method_spec.llm_explorer_state_rule_enabled
+                    else environment_definitions_td3_only
                     if method_spec.llm_explorer_td3_only_enabled
                     else environment_definitions_v3
                     if method_spec.llm_explorer_v3_enabled
@@ -3359,7 +3420,43 @@ def train(
                     td3_schedule_decay,
                 )
                 if llm_explorer is not None:
-                    if (
+                    if method_spec.llm_explorer_state_rule_enabled:
+                        state_rule_active = bool(
+                            episode_guidance["enabled"]
+                            and not episode_guidance["td3_fallback"]
+                        )
+                        if state_rule_active:
+                            action_source = (
+                                "actor_plus_state_rule_bias_plus_gaussian_exploration"
+                            )
+                        raw_joint_action, movement_action_diagnostics = (
+                            movement_agent.select_action(
+                                state,
+                                add_noise=True,
+                                noise_std=behavior_noise,
+                                mean_bias_provider=(
+                                    (
+                                        lambda actor_action: llm_explorer.evaluate_movement_bias(
+                                            env,
+                                            current_auxiliary_snapshot,
+                                            current_movement_mask,
+                                            actor_action,
+                                            sigma_episode_start=episode_sigma_start,
+                                            episode_seconds=config.episode_seconds,
+                                        )
+                                    )
+                                    if state_rule_active
+                                    else None
+                                ),
+                                mean_bias_bound=(
+                                    episode_sigma_start
+                                    if state_rule_active
+                                    else None
+                                ),
+                                return_diagnostics=True,
+                            )
+                        )
+                    elif (
                         method_spec.llm_explorer_annealed_enabled
                         and not episode_guidance["enabled"]
                     ):
@@ -3425,6 +3522,30 @@ def train(
                     ),
                     noise_std=behavior_noise,
                 )
+                if method_spec.llm_explorer_state_rule_enabled:
+                    runtime_rows = {
+                        int(item["uav_id"]): item
+                        for item in llm_explorer.consume_last_runtime_rows()
+                    }
+                    for item in movement_explorer_record["uavs"]:
+                        item["state_rule"] = runtime_rows.get(
+                            int(item["uav_id"]),
+                            {
+                                "uav_id": int(item["uav_id"]),
+                                "movement_mask": bool(item["movement_mask"]),
+                                "raw_bias": [0.0, 0.0, 0.0],
+                                "bounded_bias": [0.0, 0.0, 0.0],
+                                "effective_bias": [0.0, 0.0, 0.0],
+                                "clipped_components": 0,
+                                "runtime_failure": None,
+                                "trace": {
+                                    "conditions_evaluated": 0,
+                                    "conditions_true": 0,
+                                    "short_circuits": 0,
+                                },
+                                "features": None,
+                            },
+                        )
             velocity_commands = decode_joint_velocity_commands(
                 movement_agent, projected_action
             )
@@ -3570,12 +3691,17 @@ def train(
                     zero_prior_mass_callback=(
                         llm_explorer.record_zero_legal_prior_mass
                         if llm_explorer is not None
-                        and not method_spec.llm_explorer_td3_only_enabled
+                        and not method_spec.llm_explorer_movement_only_enabled
                         else None
                     ),
                     routing_decision_observer=(
                         llm_explorer.record_routing
                         if llm_explorer is not None
+                        else None
+                    ),
+                    routing_slot_observer=(
+                        llm_explorer.record_slot_service
+                        if method_spec.llm_explorer_state_rule_enabled
                         else None
                     ),
                 )
@@ -4729,6 +4855,39 @@ def train(
                     "routing_immediate_cost_sum": float(
                         episode_routing_immediate_cost_sum
                     ),
+                    **(
+                        {
+                            key: episode_metrics[-1].get(key)
+                            for key in (
+                                "fov_generated_raw_bits",
+                                "fov_timely_delivered_raw_bits",
+                                "fov_timely_useful_bits",
+                                "fov_mean_capture_coverage",
+                                "fov_zero_coverage_packet_count",
+                                "fov_timely_delivered_packets",
+                                "com_timely_delivered_bits",
+                                "com_timely_delivered_packets",
+                                "fov_deadline_violations",
+                                "com_deadline_violations",
+                                "fov_generated_packets",
+                                "com_generated_packets",
+                                "fov_eligible_packets",
+                                "com_eligible_packets",
+                                "fov_violated_packets",
+                                "com_violated_packets",
+                            )
+                        }
+                        | {
+                            "s2u_completed_packets": int(
+                                packet_engine.s2u_completed_packets
+                            ),
+                            "s2u_partial_transmissions": int(
+                                packet_engine.s2u_partial_transmissions
+                            ),
+                        }
+                        if method_spec.llm_explorer_state_rule_enabled
+                        else {}
+                    ),
                 },
             )
         if episode_observer is not None:
@@ -5153,7 +5312,9 @@ def train(
         "llm_explorer": (
             {
                 "configuration": (
-                    explorer_metadata_td3_only(llm_explorer_config)
+                    explorer_metadata_state_rule(llm_explorer_config)
+                    if method_spec.llm_explorer_state_rule_enabled
+                    else explorer_metadata_td3_only(llm_explorer_config)
                     if method_spec.llm_explorer_td3_only_enabled
                     else explorer_metadata_v3(llm_explorer_config)
                     if method_spec.llm_explorer_v3_enabled
