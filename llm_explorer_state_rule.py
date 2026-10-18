@@ -21,7 +21,7 @@ from replay_auxiliary import TASK_TYPE_ENCODING
 
 STATE_RULE_SCHEMA_VERSION = "td3-state-bias-rule-v1"
 STATE_RULE_LANGUAGE_VERSION = "td3-state-bias-rule-language-v1"
-STATE_RULE_FEATURE_CATALOG_VERSION = "td3-state-bias-runtime-features-v1"
+STATE_RULE_FEATURE_CATALOG_VERSION = "td3-state-bias-runtime-features-v2"
 STATE_RULE_MAX_COMPONENT_NODES = 40
 STATE_RULE_MAX_TOTAL_NODES = 100
 STATE_RULE_MAX_DEPTH = 8
@@ -49,9 +49,10 @@ RUNTIME_FEATURE_CATALOG: dict[str, dict[str, str]] = {
     "uav_id": _field(NUMBER, "UAV identifier", "integer-valued ID 0..15", "always", "evaluated UAV"),
     "time_s": _field(NUMBER, "episode time at this policy observation", "seconds, not normalized", "always", "episode clock"),
     "remaining_time_fraction": _field(NUMBER, "fraction of episode time remaining", "dimensionless [0,1]", "always", "episode clock"),
-    "actor_speed": _field(NUMBER, "original Actor horizontal-speed scalar", "normalized action [-1,1]; physical speed is 5*(value+1) m/s", "always", "evaluated UAV"),
-    "actor_heading": _field(NUMBER, "original Actor absolute-heading scalar", "periodic normalized action [-1,1); radians are pi*value", "always", "evaluated UAV"),
-    "actor_vertical": _field(NUMBER, "original Actor vertical-speed scalar", "normalized action [-1,1]; physical vertical speed is 2*value m/s", "always", "evaluated UAV"),
+    "actor_action_valid": _field(BOOLEAN, "whether an original Actor action was available at this boundary", "Boolean", "always", "evaluated UAV"),
+    "actor_speed": _field(NUMBER, "original Actor horizontal-speed scalar", "normalized action [-1,1]; physical speed is 5*(value+1) m/s", "when actor_action_valid", "evaluated UAV"),
+    "actor_heading": _field(NUMBER, "original Actor absolute-heading scalar", "periodic normalized action [-1,1); radians are pi*value", "when actor_action_valid", "evaluated UAV"),
+    "actor_vertical": _field(NUMBER, "original Actor vertical-speed scalar", "normalized action [-1,1]; physical vertical speed is 2*value m/s", "when actor_action_valid", "evaluated UAV"),
     "movement_mask": _field(BOOLEAN, "whether TD3 owns movement now", "Boolean", "always", "evaluated UAV"),
     "has_fov_task": _field(BOOLEAN, "current assigned visual/FOV service role", "Boolean", "always", "evaluated UAV and assigned discovered RoI"),
     "has_com_task": _field(BOOLEAN, "current assigned COM service role", "Boolean", "always", "evaluated UAV and observable SR"),
@@ -167,7 +168,12 @@ def _compile_expression(value: Any, *, path: str) -> _NodeInfo:
     if isinstance(value, bool):
         raise ExplorerValidationError(f"{path}: Boolean constants are not expression nodes")
     if isinstance(value, (int, float)):
-        number = float(value)
+        try:
+            number = float(value)
+        except (OverflowError, TypeError, ValueError) as exc:
+            raise ExplorerValidationError(
+                f"{path}: numeric constant cannot be represented as a finite float"
+            ) from exc
         if not math.isfinite(number):
             raise ExplorerValidationError(f"{path}: numeric constant must be finite")
         return _NodeInfo(_Node("constant", NUMBER, number), 1, 1)
@@ -253,7 +259,14 @@ class CompiledStateRule:
 def parse_and_compile_state_rule(content: str) -> CompiledStateRule:
     try:
         value = json.loads(str(content), object_pairs_hook=_reject_duplicate_pairs)
-    except (TypeError, json.JSONDecodeError, ExplorerValidationError) as exc:
+    except (
+        TypeError,
+        ValueError,
+        OverflowError,
+        RecursionError,
+        json.JSONDecodeError,
+        ExplorerValidationError,
+    ) as exc:
         raise ExplorerValidationError(
             f"invalid state-rule JSON: {type(exc).__name__}: {exc}"
         ) from exc
@@ -272,10 +285,15 @@ def compile_state_rule(value: Any) -> CompiledStateRule:
         raise ExplorerValidationError(
             f"state-rule schema_version must be {STATE_RULE_SCHEMA_VERSION!r}"
         )
-    infos = tuple(
-        _compile_expression(value[name], path=name)
-        for name in ("speed", "heading", "vertical")
-    )
+    try:
+        infos = tuple(
+            _compile_expression(value[name], path=name)
+            for name in ("speed", "heading", "vertical")
+        )
+    except RecursionError as exc:
+        raise ExplorerValidationError(
+            "state-rule expression nesting exceeds the supported depth"
+        ) from exc
     for name, info in zip(("speed", "heading", "vertical"), infos):
         if info.node.value_type != NUMBER:
             raise ExplorerValidationError(f"{name}: final component must be numeric")
@@ -299,7 +317,12 @@ def compile_state_rule(value: Any) -> CompiledStateRule:
 def _number(value: Any, *, context: str) -> float:
     if isinstance(value, (bool, np.bool_)) or not isinstance(value, (int, float, np.number)):
         raise ExplorerValidationError(f"{context} must be numeric")
-    result = float(value)
+    try:
+        result = float(value)
+    except (OverflowError, TypeError, ValueError) as exc:
+        raise ExplorerValidationError(
+            f"{context} cannot be represented as a finite float"
+        ) from exc
     if not math.isfinite(result):
         raise ExplorerValidationError(f"{context} must be finite")
     return result
@@ -392,7 +415,7 @@ def state_rule_output_schema() -> dict[str, Any]:
 def _scalar(snapshot: Mapping[str, Any], name: str, index: Any, default: float = 0.0) -> float:
     try:
         value = float(np.asarray(snapshot[name])[index])
-    except (KeyError, IndexError, TypeError, ValueError):
+    except (KeyError, IndexError, OverflowError, TypeError, ValueError):
         return float(default)
     return value if math.isfinite(value) else float(default)
 
@@ -415,9 +438,18 @@ def build_runtime_feature_rows(
     """Build read-only decision-aligned rule inputs from an existing snapshot."""
 
     mask = np.asarray(movement_mask, dtype=bool).reshape(NUM_UAV)
-    actors = np.asarray(actor_action, dtype=np.float64).reshape(NUM_UAV, 3)
-    if not np.isfinite(actors).all():
-        raise ExplorerValidationError("original Actor action must be finite")
+    actor_action_valid = actor_action is not None
+    if actor_action_valid:
+        try:
+            actors = np.asarray(actor_action, dtype=np.float64).reshape(NUM_UAV, 3)
+        except (OverflowError, TypeError, ValueError) as exc:
+            raise ExplorerValidationError(
+                "original Actor action must contain 16 finite three-component rows"
+            ) from exc
+        if not np.isfinite(actors).all():
+            raise ExplorerValidationError("original Actor action must be finite")
+    else:
+        actors = np.zeros((NUM_UAV, 3), dtype=np.float64)
     time_s = _scalar(snapshot, "snapshot_time_s", 0)
     duration = float(episode_seconds)
     if not math.isfinite(duration) or duration <= 0.0:
@@ -453,6 +485,7 @@ def build_runtime_feature_rows(
         row.update({
             "uav_id": float(uav_id), "time_s": time_s,
             "remaining_time_fraction": remaining,
+            "actor_action_valid": bool(actor_action_valid),
             "actor_speed": float(actors[uav_id, 0]),
             "actor_heading": float(actors[uav_id, 1]),
             "actor_vertical": float(actors[uav_id, 2]),

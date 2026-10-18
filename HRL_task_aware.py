@@ -183,6 +183,8 @@ from llm_state_rule_explorer import (
     LLMStateRuleController,
     environment_definitions_state_rule,
     explorer_metadata_state_rule,
+    routing_expected_capacity_observation,
+    state_rule_slot_service_record,
 )
 
 
@@ -811,6 +813,7 @@ def _run_routing_slot(
     zero_prior_mass_callback=None,
     routing_decision_observer=None,
     routing_slot_observer=None,
+    record_current_expected_capacities=False,
 ):
     del routing_masks
     packet_cost_attribution = (
@@ -922,15 +925,25 @@ def _run_routing_slot(
                 if deadline_abs is None
                 else max(float(deadline_abs) - float(current_time), 0.0)
             )
-            legal_capacity_reference_bps = {
-                str(action): (
-                    0.0
-                    if int(action) == int(uid)
-                    else float(env.routing_capacity_reference_mbps(uid, action))
-                    * 1e6
+            legal_actions = np.flatnonzero(effective_masks[uid])
+            if record_current_expected_capacities:
+                capacity_observation = routing_expected_capacity_observation(
+                    env, uid, legal_actions
                 )
-                for action in np.flatnonzero(effective_masks[uid])
-            }
+            else:
+                capacity_observation = {
+                    "reference_capacity_bps_by_legal_action": {
+                        str(action): (
+                            0.0
+                            if int(action) == int(uid)
+                            else float(
+                                env.routing_capacity_reference_mbps(uid, action)
+                            )
+                            * 1e6
+                        )
+                        for action in legal_actions
+                    }
+                }
             routing_decision_observer(
                 {
                     "time_seconds": float(current_time),
@@ -938,9 +951,7 @@ def _run_routing_slot(
                     "selected_action": int(next_hops[uid]),
                     "compact_routing_state": states[uid].astype(float).tolist(),
                     "legal_action_mask": effective_masks[uid].astype(int).tolist(),
-                    "reference_capacity_bps_by_legal_action": (
-                        legal_capacity_reference_bps
-                    ),
+                    **capacity_observation,
                     "sender_total_backlog_bits": float(backlog_before.get(uid, 0.0)),
                     "hol_packet_id": None if hol is None else int(hol["id"]),
                     "hol_task_type": None if hol is None else str(hol.get("task_type")),
@@ -1022,41 +1033,12 @@ def _run_routing_slot(
         effective_masks_by_sender=effective_masks,
     )
     if routing_slot_observer is not None:
-        packet_use_counts = Counter(
-            int(item["packet_id"])
-            for item in slot_result.get("packet_decision_uses", ())
-            if isinstance(item, dict) and item.get("packet_id") is not None
-        )
-        serviced_packet_ids = set(packet_use_counts)
-        for key in ("s2u_arrivals", "relay_arrivals", "outcomes"):
-            for item in slot_result.get(key, ()):
-                if isinstance(item, dict) and item.get("packet_id") is not None:
-                    serviced_packet_ids.add(int(item["packet_id"]))
         routing_slot_observer(
-            {
-                "time_seconds": float(current_time),
-                "start_of_slot_nonempty_sender_ids": list(
-                    map(int, slot_result.get("start_of_slot_routing_sender_ids", ()))
-                ),
-                "serviced_packet_ids": sorted(serviced_packet_ids),
-                "s2u_completed_packets": len(slot_result.get("s2u_arrivals", ())),
-                "uav_relay_completions": len(slot_result.get("relay_arrivals", ())),
-                "gs_delivery_outcomes": sum(
-                    bool(item.get("delivered_to_gs", False))
-                    or str(item.get("reason", "")) in {"delivered", "late_delivered"}
-                    for item in slot_result.get("outcomes", ())
-                    if isinstance(item, dict)
-                ),
-                "same_slot_multi_hop_packets": sum(
-                    count >= 2 for count in packet_use_counts.values()
-                ),
-                "transmitted_bits_by_link": {
-                    str(key): float(value)
-                    for key, value in slot_result.get(
-                        "transmitted_bits_by_link", {}
-                    ).items()
-                },
-            }
+            state_rule_slot_service_record(
+                slot_result,
+                pre_slot_violations=pre_slot_violations,
+                current_time=current_time,
+            )
         )
     env.current_time = float(current_time) + step_time
     if routing_training_diagnostics is not None:
@@ -3523,6 +3505,17 @@ def train(
                     noise_std=behavior_noise,
                 )
                 if method_spec.llm_explorer_state_rule_enabled:
+                    llm_explorer.observe_movement_boundary(
+                        env,
+                        current_auxiliary_snapshot,
+                        current_movement_mask,
+                        (
+                            movement_action_diagnostics["actor_action"]
+                            if movement_action_diagnostics is not None
+                            else None
+                        ),
+                        episode_seconds=config.episode_seconds,
+                    )
                     runtime_rows = {
                         int(item["uav_id"]): item
                         for item in llm_explorer.consume_last_runtime_rows()
@@ -3538,6 +3531,7 @@ def train(
                                 "effective_bias": [0.0, 0.0, 0.0],
                                 "clipped_components": 0,
                                 "runtime_failure": None,
+                                "evaluation_status": "feature_capture_unavailable",
                                 "trace": {
                                     "conditions_evaluated": 0,
                                     "conditions_true": 0,
@@ -3703,6 +3697,9 @@ def train(
                         llm_explorer.record_slot_service
                         if method_spec.llm_explorer_state_rule_enabled
                         else None
+                    ),
+                    record_current_expected_capacities=(
+                        method_spec.llm_explorer_state_rule_enabled
                     ),
                 )
                 ddqn_action_selections += action_selections
@@ -4867,6 +4864,14 @@ def train(
                                 "fov_timely_delivered_packets",
                                 "com_timely_delivered_bits",
                                 "com_timely_delivered_packets",
+                                "fov_on_time_delivered_packets",
+                                "fov_late_delivered_packets",
+                                "fov_expired_dropped_packets",
+                                "fov_sr_admission_drop_packets",
+                                "com_on_time_delivered_packets",
+                                "com_late_delivered_packets",
+                                "com_expired_dropped_packets",
+                                "com_sr_admission_drop_packets",
                                 "fov_deadline_violations",
                                 "com_deadline_violations",
                                 "fov_generated_packets",

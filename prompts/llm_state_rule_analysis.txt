@@ -29,12 +29,12 @@ These include EE, timely useful GS bits, all-UAV movement energy, source/service
 ### Movement and rule-application summaries
 {{MOVEMENT_AND_RULE_APPLICATION_SUMMARIES}}
 
-These include roles and duration, TD3 control opportunities, Actor/raw/bounded/effective/executed action summaries, conditions, clipping, zero bias, and runtime fallback.
+These include roles and duration, TD3 control opportunities, Actor/raw/bounded/effective/executed action summaries, conditions, clipping, zero bias, runtime fallback, and complete per-UAV FOV/COM service geometry split between TD3-controlled and other-controller decisions. Every ratio includes its valid denominator; unavailable observations are not measured zeros.
 
 ### FOV, COM, queue, link, and within-slot service summaries
 {{FOV_COM_AND_SLOT_SERVICE_SUMMARIES}}
 
-Slot-start queue observations and actual within-slot access/forwarding/GS outcomes are separate. Global statistics are not individual causal attribution.
+Routing expected-capacity distributions are read at each decision boundary from the already refreshed current-geometry channel caches at their stated reference bandwidth. They are distinct from actual shared-FDMA active-link service and from fixed maximum reference normalizers. Slot-start queue observations and actual within-slot access/forwarding/GS outcomes are separate. GS delivery outcomes count unique on-time plus late deliveries; timely useful bits include only complete on-time delivery and retain FOV coverage weighting. Global statistics are not individual causal attribution.
 
 ### Representative cases
 {{REPRESENTATIVE_CASES}}
@@ -44,7 +44,7 @@ Cases are illustrative. Complete summaries determine frequencies.
 ## 2. Analysis and design procedure
 
 1. Select at most two priority problems using numerical evidence, task scale, offered load, EE numerator/denominator, and stage-specific denominators. State what the evidence establishes and what may be scene-dependent.
-2. Explain what horizontal speed, heading correction relative to the Actor, and vertical speed can plausibly improve for FOV, SR access, link geometry, energy, and final timely delivery. Address simultaneous FOV and COM tasks.
+2. Explain what horizontal speed, heading correction relative to the Actor, and vertical speed can plausibly improve for FOV, SR access, current expected link geometry, actual shared service, energy, and final timely delivery. Address simultaneous FOV and COM tasks without treating a fixed normalizer as current capacity.
 3. Examine actual previous-rule use: TD3 opportunities, triggered conditions, bias directions and magnitudes, clipping, action boundaries, and other controllers. Zero controlled decisions means no control opportunity. Saturation is not proof of service improvement.
 4. Form an executable conditional design. For every component state the task/state condition, exact formal fields, bias direction and magnitude calculation, and output when unavailable. Compute shortest heading corrections in radians relative to pi*actor_heading, then convert to normalized heading units. Use current roles and geometry.
 5. State testable expected outcomes, possible costs, and evidence that would support or weaken the hypothesis.

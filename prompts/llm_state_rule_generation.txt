@@ -33,7 +33,7 @@ Convert the supplied complete analysis into one complete shared TD3 movement-exp
 
 Return one JSON object with exactly four root keys: schema_version, speed, heading, and vertical. schema_version must be "td3-state-bias-rule-v1". The three action fields are raw normalized-action offsets. All UAVs share the expressions; the host evaluates them separately with latest state and the original Actor action.
 
-Node forms are a finite JSON numeric constant, {"field":"formal_name"}, or {"op":"operation","args":[...]}. Field names, types, operations, arity, lazy evaluation, angle units, and complexity limits must exactly match the supplied interface. Use validity flags before dependent fields and provide all branches.
+Node forms are a finite JSON numeric constant, {"field":"formal_name"}, or {"op":"operation","args":[...]}. Field names, types, operations, arity, lazy evaluation, angle units, and complexity limits must exactly match the supplied interface. Use validity flags before dependent fields and provide all branches, including actor_action_valid before Actor fields when the design can encounter warmup/background observations.
 
 For example, a selected +0.01 speed offset only when has_fov_task is true would encode as {"op":"if","args":[{"field":"has_fov_task"},0.01,0.0]}. This is only a syntax example, not a recommendation.
 

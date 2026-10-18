@@ -6,6 +6,8 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
+from Packet_scheduler_v1 import PacketEngine
+from Simulator import Simulator
 from experiment_config import MethodSpec
 from HRL_task_aware import TrainingConfig, _llm_routing_exploration_prior, train
 from llm_explorer import ExplorerValidationError, PromptBudgetError, llm_explorer_path_preflight
@@ -22,6 +24,9 @@ from llm_state_rule_explorer import (
     LLMStateRuleController,
     environment_definitions_state_rule,
     explorer_metadata_state_rule,
+    routing_expected_capacity_observation,
+    state_rule_movement_summary,
+    state_rule_slot_service_record,
     slot_service_summary,
 )
 from replay_auxiliary import TASK_TYPE_ENCODING, empty_snapshot
@@ -67,6 +72,59 @@ class Uav:
 
     def get_position(self):
         return self.position.copy()
+
+
+class OneUavEventEnvironment:
+    """Minimal deterministic environment that exercises PacketEngine events."""
+
+    def __init__(self):
+        self.num_UAV = 1
+        self.GS_ID = 1
+        self.GS_pos = (100.0, 0.0, 0.0)
+        self.uav_dict = {0: Uav((0.0, 0.0, 100.0))}
+        self.B_tot = 10e6
+        self.current_time = 0.0
+        self.source_uavs = {0}
+        self.multi_tasks = {0: []}
+        self.SR_teams = []
+        self.active_link_capacity_profiles_mbps = {}
+        self.active_s2u_capacity_profiles_mbps = {}
+        self.active_s2u_capacities = {}
+        self.active_link_diagnostics = []
+
+    def is_routing_link_in_range(self, sender, receiver):
+        return int(sender) != int(receiver)
+
+    def is_s2u_in_range(self, sr_id, receiver):
+        del sr_id, receiver
+        return True
+
+    def allocate_active_link_capacities(self, proposed_links, s2u_links=None):
+        links = {
+            (int(sender), int(receiver))
+            for sender, receiver in dict(proposed_links).items()
+            if int(sender) != int(receiver)
+        }
+        source_links = {
+            (int(sr), int(receiver))
+            for sr, receiver in dict(s2u_links or {}).items()
+        }
+        count = len(links) + len(source_links)
+        capacity_mbps = 1.0 if count else 0.0
+        bandwidth = self.B_tot / count if count else 0.0
+        profile = np.full(50, capacity_mbps, dtype=float)
+        self.active_link_capacity_profiles_mbps = {
+            link: profile.copy() for link in links
+        }
+        self.active_s2u_capacity_profiles_mbps = {
+            link: profile.copy() for link in source_links
+        }
+        self.active_s2u_capacities = {
+            link: capacity_mbps for link in source_links
+        }
+        bandwidths = {link: bandwidth for link in links}
+        bandwidths.update({("S2U", *link): bandwidth for link in source_links})
+        return {link: capacity_mbps for link in links}, bandwidths
 
 
 def runtime_fixture():
@@ -435,7 +493,7 @@ def test_two_stage_prompt_is_self_contained_cache_isolated_and_resume_restores_r
     assert restored._compiled_rule is not None
 
     wrong = copy.deepcopy(state)
-    wrong["schema_version"] = "uav-hrl-llm-explorer-td3-only-v1"
+    wrong["schema_version"] = "uav-hrl-llm-state-rule-explorer-v1"
     with pytest.raises(ExplorerValidationError, match="incompatible"):
         restored.load_state_dict(wrong)
 
@@ -648,6 +706,443 @@ def test_slot_service_summary_does_not_equate_empty_slot_start_with_no_service()
     assert summary["same_slot_multi_hop_packets"] == 1
 
 
+def test_real_packet_engine_slot_delivery_uses_nested_outcome_and_fov_useful_bits():
+    env = OneUavEventEnvironment()
+    engine = PacketEngine(
+        1, task_deadlines_seconds={"FOV": 1.0, "COM": 1.0}
+    )
+    packet = engine.create_packet(
+        0,
+        "FOV",
+        1000.0,
+        0.0,
+        capture_coverage_ratio=0.25,
+        capture_image_quantity=0.5,
+    )
+    result = engine.serve_event_driven_slot(
+        env,
+        {0: env.GS_ID},
+        0.0,
+        observed_hol_by_sender={0: packet},
+        observed_backlog_bits_by_sender={0: 1000.0},
+        effective_masks_by_sender={0: np.ones(2, dtype=bool)},
+    )
+    assert result["outcomes"][0]["packet"]["terminal_outcome"] == (
+        "on_time_delivered"
+    )
+    assert "delivered_to_gs" not in result["outcomes"][0]
+    assert "reason" not in result["outcomes"][0]
+
+    record = state_rule_slot_service_record(result, current_time=0.0)
+    assert record["on_time_gs_delivery_packets"] == 1
+    assert record["late_gs_delivery_packets"] == 0
+    assert record["gs_delivery_outcomes"] == 1
+    assert record["fov_timely_delivered_raw_bits"] == pytest.approx(1000.0)
+    assert record["fov_timely_useful_bits"] == pytest.approx(250.0)
+    assert record["total_timely_useful_bits"] == pytest.approx(250.0)
+
+    packet_metrics = engine.packet_metric_summary()
+    metrics = {
+        "fov_on_time_delivered_packets": packet_metrics["FOV"][
+            "on_time_delivered_packets"
+        ],
+        "fov_late_delivered_packets": packet_metrics["FOV"][
+            "late_delivered_packets"
+        ],
+        "com_on_time_delivered_packets": 0,
+        "com_late_delivered_packets": 0,
+        "timely_useful_delivery_bits": engine.total_timely_useful_bits,
+        "fov_timely_delivered_raw_bits": engine.fov_timely_delivered_raw_bits,
+        "fov_timely_useful_bits": engine.fov_timely_useful_bits,
+        "com_timely_delivered_bits": engine.com_timely_delivered_bits,
+    }
+    summary = slot_service_summary([record], metrics)
+    assert all(
+        value is True
+        for value in summary[
+            "recorded_slot_sum_matches_authoritative_episode_total"
+        ].values()
+    )
+
+
+def test_terminal_outcome_classification_and_packet_id_deduplication():
+    engine = PacketEngine(
+        1, task_deadlines_seconds={"FOV": 1.0, "COM": 1.0}
+    )
+    late_packet = engine.create_packet(0, "COM", 100.0, 0.0)
+    late_event = engine._mark_deadline_violation(
+        late_packet, 1.2, sender=0, reason="late_delivered"
+    )
+    dropped_packet = engine.create_packet(0, "FOV", 100.0, 0.0)
+    dropped_event = engine._mark_deadline_violation(
+        dropped_packet, 1.2, sender=0, reason="deadline"
+    )
+    late_outcome = engine._outcome_from_violation(late_event)
+    dropped_outcome = engine._outcome_from_violation(dropped_event)
+    slot_result = {
+        "packet_decision_uses": [
+            {"packet_id": late_packet["id"]},
+            {"packet_id": late_packet["id"]},
+        ],
+        "s2u_arrivals": [],
+        "relay_arrivals": [],
+        "outcomes": [late_outcome, late_outcome, dropped_outcome],
+        "start_of_slot_routing_sender_ids": (0,),
+        "active_links": [],
+        "transmitted_bits_by_link": {},
+    }
+    record = state_rule_slot_service_record(
+        slot_result,
+        pre_slot_violations=[dropped_event],
+        current_time=1.0,
+    )
+    assert record["late_gs_delivery_packets"] == 1
+    assert record["on_time_gs_delivery_packets"] == 0
+    assert record["gs_delivery_outcomes"] == 1
+    assert record["expired_dropped_packets"] == 1
+    assert record["terminal_outcomes_by_task"]["COM"][
+        "late_delivered_packets"
+    ] == 1
+    assert record["terminal_outcomes_by_task"]["FOV"][
+        "expired_dropped_packets"
+    ] == 1
+    assert record["terminal_packet_ids"] == sorted(
+        [late_packet["id"], dropped_packet["id"]]
+    )
+
+
+def test_current_expected_routing_capacity_varies_with_geometry_without_rng_use():
+    env = Simulator(16, rng_streams=NamedRNGStreams(908))
+    env.num_GT = 4
+    env.reset_environment()
+    env.uav_dict[0].x_u, env.uav_dict[0].y_u, env.uav_dict[0].z_u = (
+        0.0,
+        0.0,
+        100.0,
+    )
+    env.uav_dict[1].x_u, env.uav_dict[1].y_u, env.uav_dict[1].z_u = (
+        50.0,
+        0.0,
+        100.0,
+    )
+    env.update_u2u_channels()
+    env.update_u2g_channels()
+    rng_before = copy.deepcopy(env.channel_small_scale_rng.bit_generator.state)
+    close = routing_expected_capacity_observation(env, 0, [0, 1, env.GS_ID])
+    assert env.channel_small_scale_rng.bit_generator.state == rng_before
+
+    env.uav_dict[1].x_u = 350.0
+    env.update_u2u_channels()
+    env.update_u2g_channels()
+    rng_before = copy.deepcopy(env.channel_small_scale_rng.bit_generator.state)
+    far = routing_expected_capacity_observation(env, 0, [0, 1, env.GS_ID])
+    assert env.channel_small_scale_rng.bit_generator.state == rng_before
+
+    close_capacity = close["current_expected_capacity_bps_by_legal_action"]["1"]
+    far_capacity = far["current_expected_capacity_bps_by_legal_action"]["1"]
+    assert close_capacity > far_capacity > 0.0
+    assert close["maximum_reference_normalizer_bps_by_legal_action"]["1"] == (
+        far["maximum_reference_normalizer_bps_by_legal_action"]["1"]
+    )
+    assert close_capacity != close[
+        "maximum_reference_normalizer_bps_by_legal_action"
+    ]["1"]
+    assert close["capacity_context_by_legal_action"]["1"] == {
+        "link_type": "U2U",
+        "sender_uav_id": 0,
+        "receiver_id": 1,
+        "distance_3d_m": 50.0,
+        "reference_bandwidth_hz": 10e6,
+        "fading_or_los_treatment": "expected Rician fading; no new channel sample",
+    }
+
+
+def _movement_record(time_s, rows):
+    return {
+        "episode_index": 0,
+        "time_seconds": float(time_s),
+        "uavs": rows,
+    }
+
+
+def _movement_item(uav_id, tasks, features, *, mask=True, state_rule=None):
+    diagnostic = {
+        "raw_bias": [0.0, 0.0, 0.0],
+        "bounded_bias": [0.0, 0.0, 0.0],
+        "effective_bias": [0.0, 0.0, 0.0],
+        "clipped_components": 0,
+        "runtime_failure": None,
+        "evaluation_status": "not_evaluated_no_active_rule",
+        "trace": {
+            "conditions_evaluated": 0,
+            "conditions_true": 0,
+            "short_circuits": 0,
+        },
+        "features": features,
+    }
+    if state_rule:
+        diagnostic.update(state_rule)
+    return {
+        "uav_id": int(uav_id),
+        "task_types": list(tasks),
+        "movement_mask": bool(mask),
+        "actor_normalized_action": (
+            [0.0, 0.0, 0.0]
+            if features and features.get("actor_action_valid")
+            else None
+        ),
+        "executed_normalized_action": [0.0, 0.0, 0.0],
+        "movement_energy_j": 1.0,
+        "state_rule": diagnostic,
+    }
+
+
+def test_complete_service_geometry_denominators_dual_role_and_warmup_background():
+    first = {
+        "actor_action_valid": False,
+        "has_fov_task": True,
+        "has_com_task": True,
+        "fov_target_valid": True,
+        "fov_c9_satisfied": True,
+        "fov_c10_geometry_valid": True,
+        "fov_c10_satisfied": True,
+        "fov_capture_valid": True,
+        "fov_coverage_ratio": 0.5,
+        "fov_image_quantity": 0.25,
+        "com_target_valid": True,
+        "com_in_range": True,
+        "com_distance_3d_m": 100.0,
+        "com_reference_capacity_valid": True,
+        "com_reference_capacity_mbps": 20.0,
+        "com_sr_queue_valid": True,
+        "com_sr_queue_empty": True,
+        "com_sr_backlog_bits": 0.0,
+        "com_sr_packet_count": 0.0,
+        "com_sr_hol_deadline_valid": False,
+    }
+    second = {
+        **first,
+        "actor_action_valid": True,
+        "fov_c9_satisfied": False,
+        "fov_c10_geometry_valid": False,
+        "fov_c10_satisfied": False,
+        "fov_capture_valid": False,
+        "fov_coverage_ratio": 0.0,
+        "com_in_range": False,
+        "com_distance_3d_m": 450.0,
+        "com_reference_capacity_valid": False,
+        "com_reference_capacity_mbps": 0.0,
+        "com_sr_queue_empty": False,
+        "com_sr_backlog_bits": 100.0,
+        "com_sr_packet_count": 1.0,
+        "com_sr_hol_deadline_valid": True,
+        "com_sr_hol_remaining_deadline_s": 0.1,
+    }
+    third = {
+        "actor_action_valid": True,
+        "has_fov_task": True,
+        "has_com_task": False,
+        "fov_target_valid": False,
+    }
+    records = []
+    for time_s, features, tasks, mask in (
+        (0, first, ["FOV", "COM"], True),
+        (1, second, ["FOV", "COM"], True),
+        (2, third, ["FOV"], False),
+    ):
+        rows = [
+            _movement_item(0, tasks, features, mask=mask),
+            *[
+                _movement_item(uav_id, [], None, mask=False)
+                for uav_id in range(1, 16)
+            ],
+        ]
+        records.append(_movement_record(time_s, rows))
+    summary, _ = state_rule_movement_summary(records)
+    scopes = summary["by_uav"]["UAV_0"]["service_geometry_by_control_scope"]
+    all_decisions = scopes["all_decisions"]
+    assert all_decisions["actor_action_availability"] == {
+        "count": 2,
+        "denominator": 3,
+        "ratio": pytest.approx(2 / 3),
+    }
+    assert all_decisions["dual_fov_com_assigned_decisions"] == 2
+    assert all_decisions["fov"]["assigned_target_known"]["denominator"] == 3
+    assert all_decisions["fov"]["c9_satisfied"] == {
+        "count": 1,
+        "denominator": 2,
+        "ratio": 0.5,
+    }
+    assert all_decisions["fov"]["c10_satisfied_given_valid_geometry"] == {
+        "count": 1,
+        "denominator": 1,
+        "ratio": 1.0,
+    }
+    assert all_decisions["com"]["in_range"]["denominator"] == 2
+    assert all_decisions["com"]["current_expected_capacity_valid"] == {
+        "count": 1,
+        "denominator": 2,
+        "ratio": 0.5,
+    }
+    assert all_decisions["com"]["sr_queue_empty_given_valid"] == {
+        "count": 1,
+        "denominator": 2,
+        "ratio": 0.5,
+    }
+    assert scopes["td3_controlled_decisions"]["decision_count"] == 2
+    assert scopes["other_controller_decisions"]["decision_count"] == 1
+    assert summary["by_uav"]["UAV_1"][
+        "service_geometry_by_control_scope"
+    ]["all_decisions"]["available"] is False
+
+
+def test_representative_cases_use_full_multi_uav_episode_and_time_regions():
+    records = []
+    for time_s in range(60):
+        rows = []
+        for uav_id in range(16):
+            role = ("FOV", "COM", "FOV_COM")[uav_id % 3]
+            tasks = ["FOV", "COM"] if role == "FOV_COM" else [role]
+            features = {
+                "actor_action_valid": True,
+                "has_fov_task": "FOV" in tasks,
+                "has_com_task": "COM" in tasks,
+            }
+            diagnostic = None
+            if time_s == 10:
+                diagnostic = {"effective_bias": [0.1, 0.0, 0.0]}
+            elif time_s == 30:
+                diagnostic = {
+                    "raw_bias": [1.0, 0.0, 0.0],
+                    "bounded_bias": [0.2, 0.0, 0.0],
+                    "effective_bias": [0.2, 0.0, 0.0],
+                    "clipped_components": 1,
+                }
+            elif time_s == 50:
+                diagnostic = {"runtime_failure": "ArithmeticError: test"}
+            rows.append(
+                _movement_item(
+                    uav_id, tasks, features, mask=True, state_rule=diagnostic
+                )
+            )
+        records.append(_movement_record(time_s, rows))
+    _, cases = state_rule_movement_summary(records)
+    assert len(cases) == 3
+    assert len({case["uav_id"] for case in cases}) >= 2
+    assert {case["service_role"] for case in cases} == {"fov", "com", "dual"}
+    assert len({case["rule_behavior"] for case in cases}) == 3
+    assert {int(float(case["time_s"]) // 20) for case in cases} == {0, 1, 2}
+    assert len({json.dumps(case, sort_keys=True) for case in cases}) == 3
+
+
+def test_huge_json_integer_retries_then_succeeds_and_invalid_cache_is_ignored(tmp_path):
+    huge = json.dumps(rule(speed=10**1000), separators=(",", ":"))
+    with pytest.raises(ExplorerValidationError, match="finite float"):
+        parse_and_compile_state_rule(huge)
+    deeply_nested = (
+        '{"schema_version":"td3-state-bias-rule-v1","speed":'
+        + '{"op":"neg","args":[' * 1200
+        + "0"
+        + "]}" * 1200
+        + ',"heading":0,"vertical":0}'
+    )
+    with pytest.raises(ExplorerValidationError, match="JSON|nesting|depth"):
+        parse_and_compile_state_rule(deeply_nested)
+
+    client = SequenceClient(["analysis", huge, json.dumps(rule(speed=0.02))])
+    controller = LLMStateRuleController(
+        run_directory=tmp_path,
+        run_identity={"method_id": "td3_dinkelbach_llm_explorer_state_rule"},
+        client=client,
+    )
+    controller.previous_episode_feedback = previous_feedback()
+    result = controller.begin_episode(
+        episode_index=210,
+        total_joint_transitions=10_000,
+        sigma_episode_start=0.2,
+        routing_epsilon=0.5,
+        current_observable_initial_state={},
+        environment_constants=environment_definitions_state_rule(
+            episode_seconds=60, routing_slot_seconds=0.25
+        ),
+    )
+    assert result["rule"] == rule(speed=0.02)
+    assert controller.statistics["failure_counts"]["content_validation"] == 1
+    assert len(client.calls) == 3
+    validation = json.loads(
+        (
+            tmp_path
+            / "llm_rule"
+            / "episode_000211"
+            / "guidance"
+            / "attempt_01"
+            / "validation.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert "finite float" in validation["errors"]["td3"]
+
+    identity = {"cache": "invalid-huge-rule"}
+    path = controller._episode_result_path(999)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(
+            {
+                "schema_version": controller.schema_version,
+                "identity": identity,
+                "guidance": {
+                    "enabled": True,
+                    "td3_fallback": False,
+                    "rule": rule(speed=10**1000),
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    assert controller._load_episode_result(999, identity, 0.2) is None
+
+
+def test_all_huge_rules_fallback_and_keyboard_interrupt_propagates():
+    huge = json.dumps(rule(speed=10**1000), separators=(",", ":"))
+    failing = SequenceClient(["analysis", huge, huge])
+    controller = LLMStateRuleController(
+        run_directory=None,
+        run_identity={"method_id": "td3_dinkelbach_llm_explorer_state_rule"},
+        client=failing,
+    )
+    controller.previous_episode_feedback = previous_feedback()
+    result = controller.begin_episode(
+        episode_index=211,
+        total_joint_transitions=10_000,
+        sigma_episode_start=0.2,
+        routing_epsilon=0.5,
+        current_observable_initial_state={},
+        environment_constants=environment_definitions_state_rule(
+            episode_seconds=60, routing_slot_seconds=0.25
+        ),
+    )
+    assert result["td3_fallback"] is True
+    assert result["rule"] is None
+    assert controller.statistics["failure_counts"]["content_validation"] == 2
+
+    interrupted = LLMStateRuleController(
+        run_directory=None,
+        run_identity={"method_id": "td3_dinkelbach_llm_explorer_state_rule"},
+        client=SequenceClient([KeyboardInterrupt()]),
+    )
+    interrupted.previous_episode_feedback = previous_feedback()
+    with pytest.raises(KeyboardInterrupt):
+        interrupted.begin_episode(
+            episode_index=212,
+            total_joint_transitions=10_000,
+            sigma_episode_start=0.2,
+            routing_epsilon=0.5,
+            current_observable_initial_state={},
+            environment_constants=environment_definitions_state_rule(
+                episode_seconds=60, routing_slot_seconds=0.25
+            ),
+        )
+
+
 def test_mock_short_training_integration_completes_without_paid_api():
     result = train(
         TrainingConfig(
@@ -672,3 +1167,49 @@ def test_mock_short_training_integration_completes_without_paid_api():
         "td3_dinkelbach_llm_explorer_state_rule"
     )
     assert result["llm_explorer"]["statistics"]["requests_total"] == 0
+
+
+def test_two_episode_mock_training_enters_guidance_and_sends_v2_summaries(
+    tmp_path, monkeypatch
+):
+    client = SequenceClient(["analysis", json.dumps(rule())])
+    original_begin_episode = LLMStateRuleController.begin_episode
+
+    def begin_after_simulated_warmup(self, *args, **kwargs):
+        kwargs["total_joint_transitions"] = max(
+            int(kwargs.get("total_joint_transitions", 0)), 10_000
+        )
+        return original_begin_episode(self, *args, **kwargs)
+
+    monkeypatch.setattr(
+        LLMStateRuleController, "begin_episode", begin_after_simulated_warmup
+    )
+    result = train(
+        TrainingConfig(
+            total_episodes=2,
+            mode="smoke",
+            episode_seconds=1,
+            warmup_joint_transitions=0,
+            routing_warmup_transitions=1,
+            batch_size=1,
+            enable_model_checkpoints=False,
+            enable_full_resume=False,
+            enable_plots=False,
+            enable_csv=False,
+            run_directory=None,
+            random_seed=20260818,
+        ),
+        method_spec=MethodSpec.parse(
+            "td3_dinkelbach_llm_explorer_state_rule"
+        ),
+        llm_explorer_client=client,
+    )
+    assert result["episodes_run"] == 2
+    assert result["llm_explorer"]["statistics"]["requests_total"] == 2
+    assert len(client.calls) == 2
+    for call in client.calls:
+        prompt = call["prompt"]
+        assert "service_geometry_by_control_scope" in prompt
+        assert "current_expected_capacity_bps_by_link_type" in prompt
+        assert "actual_shared_fdma_service_by_link_type" in prompt
+        assert "on_time_gs_delivery_packets" in prompt
