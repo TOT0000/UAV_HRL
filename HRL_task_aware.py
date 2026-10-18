@@ -3504,7 +3504,10 @@ def train(
                     ),
                     noise_std=behavior_noise,
                 )
-                if method_spec.llm_explorer_state_rule_enabled:
+                if (
+                    method_spec.llm_explorer_state_rule_enabled
+                    and not evaluation
+                ):
                     llm_explorer.observe_movement_boundary(
                         env,
                         current_auxiliary_snapshot,

@@ -1,6 +1,8 @@
 import copy
 import json
 import math
+import tempfile
+from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
@@ -20,8 +22,13 @@ from llm_explorer_state_rule import (
     runtime_feature_catalog,
 )
 from llm_state_rule_explorer import (
+    LLM_STATE_RULE_CACHE_VERSION,
+    LLM_STATE_RULE_PROMPT_VERSION,
+    LLM_STATE_RULE_SUMMARY_VERSION,
+    DeterministicMockStateRuleClient,
     LLMStateRuleConfig,
     LLMStateRuleController,
+    communication_bottleneck_summary_state_rule,
     environment_definitions_state_rule,
     explorer_metadata_state_rule,
     routing_expected_capacity_observation,
@@ -31,7 +38,7 @@ from llm_state_rule_explorer import (
 )
 from replay_auxiliary import TASK_TYPE_ENCODING, empty_snapshot
 from rng_contract import NamedRNGStreams
-from run_experiment import _explorer_preflight_options, build_parser
+from run_experiment import _explorer_preflight_options, build_parser, main as run_experiment_main
 from td3 import TD3
 
 
@@ -77,7 +84,7 @@ class Uav:
 class OneUavEventEnvironment:
     """Minimal deterministic environment that exercises PacketEngine events."""
 
-    def __init__(self):
+    def __init__(self, *, capacity_mbps=1.0):
         self.num_UAV = 1
         self.GS_ID = 1
         self.GS_pos = (100.0, 0.0, 0.0)
@@ -91,6 +98,7 @@ class OneUavEventEnvironment:
         self.active_s2u_capacity_profiles_mbps = {}
         self.active_s2u_capacities = {}
         self.active_link_diagnostics = []
+        self.capacity_mbps = float(capacity_mbps)
 
     def is_routing_link_in_range(self, sender, receiver):
         return int(sender) != int(receiver)
@@ -110,7 +118,7 @@ class OneUavEventEnvironment:
             for sr, receiver in dict(s2u_links or {}).items()
         }
         count = len(links) + len(source_links)
-        capacity_mbps = 1.0 if count else 0.0
+        capacity_mbps = self.capacity_mbps if count else 0.0
         bandwidth = self.B_tot / count if count else 0.0
         profile = np.full(50, capacity_mbps, dtype=float)
         self.active_link_capacity_profiles_mbps = {
@@ -498,6 +506,130 @@ def test_two_stage_prompt_is_self_contained_cache_isolated_and_resume_restores_r
         restored.load_state_dict(wrong)
 
 
+def test_v3_cache_identity_and_v2_checkpoint_feedback_migrates_from_raw(tmp_path):
+    identity = {"method_id": "td3_dinkelbach_llm_explorer_state_rule"}
+    controller = LLMStateRuleController(
+        run_directory=tmp_path,
+        run_identity=identity,
+        evaluation=True,
+    )
+    cache_identity = controller._cache_identity(
+        episode_index=1,
+        stage="episode_result",
+        system_prompt="system",
+        user_prompt="prompt",
+    )
+    assert cache_identity["cache_version"] == LLM_STATE_RULE_CACHE_VERSION
+    assert cache_identity["cache_version"].endswith("v3")
+    old_cache_identity = dict(cache_identity)
+    old_cache_identity["cache_version"] = "state-rule-complete-input-cache-v2"
+    old_cache_path = controller._episode_result_path(1)
+    old_cache_path.parent.mkdir(parents=True, exist_ok=True)
+    old_cache_path.write_text(
+        json.dumps(
+            {
+                "schema_version": controller.schema_version,
+                "identity": old_cache_identity,
+                "guidance": controller._serializable_guidance(
+                    controller.active_guidance
+                ),
+            }
+        ),
+        encoding="utf-8",
+    )
+    assert controller._load_episode_result(1, cache_identity, 0.1) is None
+    metadata = explorer_metadata_state_rule(controller.config)
+    assert metadata["prompt_version"] == LLM_STATE_RULE_PROMPT_VERSION
+    assert metadata["summary_version"] == LLM_STATE_RULE_SUMMARY_VERSION
+
+    metrics = {"migration_marker": 7}
+    controller.previous_episode_feedback = {
+        "schema_version": controller.schema_version,
+        "summary_version": "state-rule-observed-service-summary-v2",
+        "metrics": metrics,
+        "observed_task_and_traffic_summary": {},
+        "movement_and_rule_application_summaries": {},
+        "fov_com_and_slot_service_summaries": {
+            "routing_decision_observations": {},
+            "actual_within_slot_service": {
+                "slots_with_no_starting_uav_hol_but_actual_service": 99
+            },
+        },
+        "representative_cases": [],
+        "applied_guidance": controller._serializable_guidance(
+            controller.active_guidance
+        ),
+    }
+    state = controller.state_dict()
+    state["config"]["prompt_version"] = (
+        "uav-hrl-llm-state-rule-prompts-v2"
+    )
+    episode_root = tmp_path / "llm_rule" / "episode_000001"
+    episode_root.mkdir(parents=True)
+    (episode_root / "feedback.json").write_text(
+        json.dumps(
+            {
+                "metrics": metrics,
+                "movement_decisions": [],
+                "routing_decisions": [
+                    {
+                        **_saved_routing_record(0),
+                        "sender_total_backlog_bits": 321.0,
+                        "hol_packet_id": 4,
+                        "hol_remaining_deadline_seconds": 0.002,
+                    }
+                ],
+                "slot_service_records": [
+                    {
+                        "start_of_slot_nonempty_sender_ids": [],
+                        "transmitted_bits_by_link": {},
+                    }
+                ],
+                "applied_guidance": controller._serializable_guidance(
+                    controller.active_guidance
+                ),
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    restored = LLMStateRuleController(
+        run_directory=tmp_path,
+        run_identity=identity,
+        evaluation=True,
+    )
+    restored.load_state_dict(state)
+    migrated = restored.previous_episode_feedback
+    assert migrated["summary_version"] == LLM_STATE_RULE_SUMMARY_VERSION
+    assert migrated["diagnostic_summary_migration"][
+        "rebuilt_from_saved_raw_records"
+    ] is True
+    summaries = migrated["fov_com_and_slot_service_summaries"]
+    assert summaries["routing_decision_observations"][
+        "routing_queue_and_hol_observations"
+    ]["system"]["sender_total_backlog_bits"]["max"] == 321.0
+    assert summaries["actual_within_slot_service"][
+        "slots_with_no_starting_uav_hol_but_actual_service"
+    ] == 0
+
+    no_raw = LLMStateRuleController(
+        run_directory=None,
+        run_identity=identity,
+        evaluation=True,
+    )
+    no_raw.load_state_dict(state)
+    unavailable = no_raw.previous_episode_feedback[
+        "fov_com_and_slot_service_summaries"
+    ]["routing_decision_observations"]["routing_queue_and_hol_observations"]
+    assert unavailable["available"] is False
+    assert "not replaced by zeros" in unavailable["scope"]
+    assert no_raw.previous_episode_feedback[
+        "fov_com_and_slot_service_summaries"
+    ]["actual_within_slot_service"][
+        "slots_with_no_starting_uav_hol_but_actual_service"
+    ] is None
+
+
 def test_api_validation_fallback_zero_rule_and_retry_budget_recheck(tmp_path):
     client = SequenceClient(
         [
@@ -603,6 +735,58 @@ def test_warmup_and_evaluation_make_no_calls_and_episode_600_has_no_cutoff():
     assert result["enabled"] and result["guidance_weight_w"] == 1.0
 
 
+def test_training_feature_summary_capture_survives_warmup_active_and_fallback():
+    env, snapshot = runtime_fixture()
+    mask = np.ones(16, dtype=bool)
+    actors = np.zeros((16, 3), dtype=np.float32)
+    controller = LLMStateRuleController(
+        run_directory=None,
+        run_identity={"method_id": "td3_dinkelbach_llm_explorer_state_rule"},
+        client=SequenceClient([]),
+        lazy_client=True,
+    )
+
+    controller.begin_episode(
+        episode_index=0,
+        total_joint_transitions=0,
+        sigma_episode_start=0.2,
+    )
+    controller.observe_movement_boundary(
+        env, snapshot, mask, None, episode_seconds=60
+    )
+    warmup_rows = controller.consume_last_runtime_rows()
+    assert warmup_rows[0]["features"]["fov_target_valid"] is True
+    assert warmup_rows[0]["features"]["actor_action_valid"] is False
+
+    controller._compiled_rule = compile_state_rule(rule(speed=0.01))
+    controller.evaluate_movement_bias(
+        env,
+        snapshot,
+        mask,
+        actors,
+        sigma_episode_start=0.2,
+        episode_seconds=60,
+    )
+    controller.observe_movement_boundary(
+        env, snapshot, mask, actors, episode_seconds=60
+    )
+    active_rows = controller.consume_last_runtime_rows()
+    assert active_rows[0]["evaluation_status"] == "rule_evaluated"
+    assert active_rows[0]["features"]["actor_action_valid"] is True
+
+    controller._compiled_rule = None
+    controller._last_runtime_rows = []
+    controller.active_guidance = controller._unguided("guidance_invalid_or_failed")
+    controller.observe_movement_boundary(
+        env, snapshot, mask, actors, episode_seconds=60
+    )
+    fallback_rows = controller.consume_last_runtime_rows()
+    assert fallback_rows[0]["evaluation_status"] == (
+        "not_evaluated_no_active_rule"
+    )
+    assert fallback_rows[0]["features"]["fov_target_valid"] is True
+
+
 def test_token_budget_has_no_20000_limit_and_rejects_context_overflow_before_send():
     with pytest.raises(ValueError, match="4,096-token safety margin"):
         LLMStateRuleConfig(safety_margin_tokens=2048)
@@ -704,6 +888,80 @@ def test_slot_service_summary_does_not_equate_empty_slot_start_with_no_service()
     assert summary["s2u_completed_packets"] == 1
     assert summary["uav_relay_completions"] == 2
     assert summary["same_slot_multi_hop_packets"] == 1
+
+
+def _serve_sr_only_slot(*, capacity_mbps, size_bits, deadline_seconds):
+    env = OneUavEventEnvironment(capacity_mbps=capacity_mbps)
+    engine = PacketEngine(
+        1,
+        task_deadlines_seconds={"FOV": 1.0, "COM": deadline_seconds},
+    )
+    packet = engine.create_sr_packet(0, size_bits, generation_time=0.0)
+    packet["s2u_receiver"] = 0
+    result = engine.serve_event_driven_slot(
+        env,
+        {0: 0},
+        0.0,
+        observed_hol_by_sender={0: None},
+        observed_backlog_bits_by_sender={0: 0.0},
+        effective_masks_by_sender={0: np.asarray([True, False])},
+    )
+    return engine, packet, result
+
+
+def test_real_packet_engine_zero_capacity_expiry_is_not_actual_service():
+    _, packet, result = _serve_sr_only_slot(
+        capacity_mbps=0.0,
+        size_bits=100_000.0,
+        deadline_seconds=0.01,
+    )
+    assert result["transmitted_bits_by_link"] == {}
+    assert result["outcomes"][0]["packet"]["terminal_outcome"] == (
+        "expired_dropped"
+    )
+    record = state_rule_slot_service_record(result, current_time=0.0)
+    assert record["terminal_packet_ids"] == [packet["id"]]
+    assert record["serviced_packet_ids"] == []
+    assert record["had_actual_transmission"] is False
+    summary = slot_service_summary([record])
+    assert summary["slots_with_actual_transmission_observed"] == 0
+    assert summary["slots_with_no_actual_transmission_observed"] == 1
+    assert summary["slots_with_no_starting_uav_hol_but_actual_service"] == 0
+
+
+def test_real_packet_engine_s2u_completion_from_empty_uav_start_is_service():
+    _, packet, result = _serve_sr_only_slot(
+        capacity_mbps=1.0,
+        size_bits=100_000.0,
+        deadline_seconds=1.0,
+    )
+    assert result["start_of_slot_routing_sender_ids"] == ()
+    assert result["s2u_arrivals"][0]["id"] == packet["id"]
+    record = state_rule_slot_service_record(result, current_time=0.0)
+    assert record["had_actual_transmission"] is True
+    assert record["positive_transmission_bits"] == pytest.approx(100_000.0)
+    assert record["serviced_packet_ids"] == [packet["id"]]
+    summary = slot_service_summary([record])
+    assert summary["slots_with_no_starting_uav_hol_but_actual_service"] == 1
+
+
+def test_real_packet_engine_partial_s2u_bits_count_without_hop_completion():
+    _, packet, result = _serve_sr_only_slot(
+        capacity_mbps=1.0,
+        size_bits=1_000_000.0,
+        deadline_seconds=1.0,
+    )
+    assert result["s2u_arrivals"] == []
+    assert result["relay_arrivals"] == []
+    assert result["outcomes"] == []
+    record = state_rule_slot_service_record(result, current_time=0.0)
+    assert record["had_actual_transmission"] is True
+    assert record["positive_transmission_bits"] == pytest.approx(250_000.0)
+    assert record["serviced_packet_ids"] == []
+    assert packet["rem_bits"] == pytest.approx(750_000.0)
+    summary = slot_service_summary([record])
+    assert summary["slots_with_actual_transmission_observed"] == 1
+    assert summary["slots_with_no_starting_uav_hol_but_actual_service"] == 1
 
 
 def test_real_packet_engine_slot_delivery_uses_nested_outcome_and_fov_useful_bits():
@@ -855,6 +1113,83 @@ def test_current_expected_routing_capacity_varies_with_geometry_without_rng_use(
         "reference_bandwidth_hz": 10e6,
         "fading_or_los_treatment": "expected Rician fading; no new channel sample",
     }
+
+
+def _saved_routing_record(sender, *, backlog_marker=True, hol_marker=True):
+    record = {
+        "sender_uav_id": int(sender),
+        "selected_action": 16,
+        "current_expected_capacity_bps_by_legal_action": {
+            str(sender): 0.0,
+            "16": 2_000_000.0,
+        },
+        "maximum_reference_normalizer_bps_by_legal_action": {
+            str(sender): 0.0,
+            "16": 5_000_000.0,
+        },
+        "capacity_context_by_legal_action": {
+            str(sender): {
+                "link_type": "WAIT",
+                "sender_uav_id": int(sender),
+                "receiver_id": int(sender),
+                "distance_3d_m": 0.0,
+                "reference_bandwidth_hz": 0.0,
+                "fading_or_los_treatment": "not applicable",
+            },
+            "16": {
+                "link_type": "U2G",
+                "sender_uav_id": int(sender),
+                "receiver_id": 16,
+                "distance_3d_m": 100.0,
+                "reference_bandwidth_hz": 10e6,
+                "fading_or_los_treatment": "installed expected fading",
+                "installed_los_state": True,
+            },
+        },
+    }
+    if backlog_marker:
+        record["sender_total_backlog_bits"] = 0.0
+    if hol_marker:
+        record["hol_packet_id"] = None
+        record["hol_remaining_deadline_seconds"] = None
+    return record
+
+
+def test_capacity_equal_queue_summary_distinguishes_backlog_hol_empty_and_unknown():
+    empty = _saved_routing_record(0)
+    unknown = _saved_routing_record(
+        1, backlog_marker=False, hol_marker=False
+    )
+    loaded = copy.deepcopy(empty)
+    loaded.update(
+        sender_total_backlog_bits=1_500_000.0,
+        hol_packet_id=91,
+        hol_remaining_deadline_seconds=0.001,
+    )
+    empty_summary = communication_bottleneck_summary_state_rule(
+        [empty, unknown], {}
+    )
+    loaded_summary = communication_bottleneck_summary_state_rule(
+        [loaded, unknown], {}
+    )
+    assert empty_summary[
+        "current_expected_capacity_bps_by_link_type"
+    ] == loaded_summary["current_expected_capacity_bps_by_link_type"]
+    empty_queue = empty_summary["routing_queue_and_hol_observations"]
+    loaded_queue = loaded_summary["routing_queue_and_hol_observations"]
+    assert empty_queue != loaded_queue
+    assert empty_queue["system"]["backlog_zero_count"] == 1
+    assert empty_queue["system"]["no_hol_count"] == 1
+    assert empty_queue["system"]["hol_presence_unknown_count"] == 1
+    assert empty_queue["system"]["backlog_unknown_count"] == 1
+    assert loaded_queue["system"]["backlog_positive_count"] == 1
+    assert loaded_queue["system"]["sender_total_backlog_bits"]["max"] == (
+        1_500_000.0
+    )
+    assert loaded_queue["system"]["hol_present_count"] == 1
+    assert loaded_queue["system"]["hol_remaining_deadline_seconds"][
+        "min"
+    ] == pytest.approx(0.001)
 
 
 def _movement_record(time_s, rows):
@@ -1169,7 +1504,111 @@ def test_mock_short_training_integration_completes_without_paid_api():
     assert result["llm_explorer"]["statistics"]["requests_total"] == 0
 
 
-def test_two_episode_mock_training_enters_guidance_and_sends_v2_summaries(
+def test_zero_rule_diagnostics_preserve_baseline_core_training_result():
+    def config():
+        return TrainingConfig(
+            total_episodes=1,
+            mode="smoke",
+            episode_seconds=1,
+            warmup_joint_transitions=0,
+            routing_warmup_transitions=1,
+            batch_size=1,
+            enable_model_checkpoints=False,
+            enable_full_resume=False,
+            enable_plots=False,
+            enable_csv=False,
+            run_directory=None,
+            random_seed=20261018,
+        )
+
+    baseline = train(
+        config(), method_spec=MethodSpec.parse("td3_dinkelbach")
+    )["episode_metrics"][0]
+    state_rule = train(
+        config(),
+        method_spec=MethodSpec.parse(
+            "td3_dinkelbach_llm_explorer_state_rule"
+        ),
+        llm_explorer_mock=True,
+    )["episode_metrics"][0]
+    for key in (
+        "routing_reward_total",
+        "existing_movement_reward",
+        "combined_movement_reward",
+        "total_timely_useful_bits",
+        "total_mobility_energy_j",
+        "routing_cost_sum",
+        "system_qos_eligible_packets",
+        "system_qos_violation_count",
+        "movement_base_reward_sum",
+        "movement_final_reward_sum",
+        "routing_wait_count",
+        "partial_transmission_count",
+        "coverage",
+    ):
+        assert state_rule[key] == pytest.approx(baseline[key])
+
+
+def test_real_cli_train_evaluate_and_resume_without_llm_call(monkeypatch):
+    calls = []
+
+    def unexpected_chat(self, **kwargs):
+        calls.append(kwargs)
+        raise AssertionError("short warmup/evaluation/resume must not call the LLM")
+
+    monkeypatch.setattr(
+        DeterministicMockStateRuleClient, "chat", unexpected_chat
+    )
+    with tempfile.TemporaryDirectory(prefix="sr-") as short_temp:
+        output_root = Path(short_temp)
+        method = "td3_dinkelbach_llm_explorer_state_rule"
+        assert run_experiment_main(
+            [
+                method,
+                "--episodes",
+                "1",
+                "--episode-seconds",
+                "1",
+                "--checkpoint-interval",
+                "1",
+                "--roi-count",
+                "2",
+                "--seed",
+                "20261019",
+                "--output-root",
+                str(output_root),
+                "--llm-explorer-mock",
+            ]
+        ) == 0
+        run_dir = next((output_root / method).iterdir())
+        assert (run_dir / "checkpoints" / "models" / "ep_0001").is_dir()
+
+        assert run_experiment_main(
+            [
+                "evaluate",
+                str(run_dir),
+                "--checkpoint-episode",
+                "1",
+                "--smoke",
+            ]
+        ) == 0
+        evaluation_dir = next((run_dir / "evaluation" / "ep_1").iterdir())
+        metadata = json.loads(
+            (evaluation_dir / "run_metadata.json").read_text(encoding="utf-8")
+        )
+        assert metadata["smoke_evaluation"] is True
+        assert metadata["evaluation_invariants"]["exploration_disabled"] is True
+        assert all(metadata["evaluation_invariants"].values())
+        assert calls == []
+
+        assert run_experiment_main(
+            ["resume", str(run_dir), "--target-episodes", "2"]
+        ) == 0
+        assert (run_dir / "checkpoints" / "models" / "ep_0002").is_dir()
+        assert calls == []
+
+
+def test_two_episode_mock_training_enters_guidance_and_sends_v3_summaries(
     tmp_path, monkeypatch
 ):
     client = SequenceClient(["analysis", json.dumps(rule())])
@@ -1213,3 +1652,6 @@ def test_two_episode_mock_training_enters_guidance_and_sends_v2_summaries(
         assert "current_expected_capacity_bps_by_link_type" in prompt
         assert "actual_shared_fdma_service_by_link_type" in prompt
         assert "on_time_gs_delivery_packets" in prompt
+        assert "routing_queue_and_hol_observations" in prompt
+        assert "sender_total_backlog_bits" in prompt
+        assert "hol_remaining_deadline_seconds" in prompt

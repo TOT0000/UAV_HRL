@@ -1403,6 +1403,17 @@ def run_resume(args):
             method, config
         ),
     )
+    if method.llm_explorer_state_rule_enabled:
+        explorer_resolution = dict(resolved.get("llm_explorer") or {})
+        explorer_resolution.update(
+            prompt_version=LLM_STATE_RULE_PROMPT_VERSION,
+            summary_version=LLM_STATE_RULE_SUMMARY_VERSION,
+            cache_version=LLM_STATE_RULE_CACHE_VERSION,
+            rule_schema_version=STATE_RULE_SCHEMA_VERSION,
+            rule_language_version=STATE_RULE_LANGUAGE_VERSION,
+            feature_catalog_version=STATE_RULE_FEATURE_CATALOG_VERSION,
+        )
+        resolved["llm_explorer"] = explorer_resolution
     if extension_provenance is not None:
         history = list(resolved.get("horizon_extension_history") or ())
         history.append(extension_provenance)

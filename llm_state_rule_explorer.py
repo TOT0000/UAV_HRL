@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import copy
 import json
+import math
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -44,9 +46,9 @@ from llm_explorer_state_rule import (
 
 LLM_STATE_RULE_METHOD_ID = "td3_dinkelbach_llm_explorer_state_rule"
 LLM_STATE_RULE_VERSION = "uav-hrl-llm-state-rule-explorer-v2"
-LLM_STATE_RULE_PROMPT_VERSION = "uav-hrl-llm-state-rule-prompts-v2"
-LLM_STATE_RULE_SUMMARY_VERSION = "state-rule-observed-service-summary-v2"
-LLM_STATE_RULE_CACHE_VERSION = "state-rule-complete-input-cache-v2"
+LLM_STATE_RULE_PROMPT_VERSION = "uav-hrl-llm-state-rule-prompts-v3"
+LLM_STATE_RULE_SUMMARY_VERSION = "state-rule-observed-service-summary-v3"
+LLM_STATE_RULE_CACHE_VERSION = "state-rule-complete-input-cache-v3"
 LLM_STATE_RULE_ANALYSIS_OUTPUT_TOKENS = 4096
 LLM_STATE_RULE_RULE_OUTPUT_TOKENS = 4096
 
@@ -599,6 +601,60 @@ def _packet_id_from_event(item: Any) -> int | None:
     return None if value is None else int(value)
 
 
+def _positive_transmission_evidence(
+    value: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Read actual PacketEngine service without inferring it from outcomes."""
+
+    if "transmitted_bits_by_link" not in value:
+        return {
+            "available": False,
+            "unavailable_reason": "authoritative transmitted_bits_by_link was not recorded",
+            "positive_bits": None,
+            "positive_link_count": None,
+            "had_actual_transmission": None,
+        }
+    transmitted = value.get("transmitted_bits_by_link")
+    if not isinstance(transmitted, Mapping):
+        return {
+            "available": False,
+            "unavailable_reason": "recorded transmitted_bits_by_link is not a mapping",
+            "positive_bits": None,
+            "positive_link_count": None,
+            "had_actual_transmission": None,
+        }
+    positive: list[float] = []
+    for raw in transmitted.values():
+        try:
+            bits = float(raw)
+        except (TypeError, ValueError):
+            return {
+                "available": False,
+                "unavailable_reason": "recorded transmitted bits contain a non-numeric value",
+                "positive_bits": None,
+                "positive_link_count": None,
+                "had_actual_transmission": None,
+            }
+        if not math.isfinite(bits) or bits < 0.0:
+            return {
+                "available": False,
+                "unavailable_reason": "recorded transmitted bits contain a negative or non-finite value",
+                "positive_bits": None,
+                "positive_link_count": None,
+                "had_actual_transmission": None,
+            }
+        if bits > 0.0:
+            positive.append(bits)
+    total = math.fsum(positive)
+    return {
+        "available": True,
+        "unavailable_reason": None,
+        "positive_bits": float(total),
+        "positive_link_count": len(positive),
+        "had_actual_transmission": bool(positive),
+    }
+
+
 def state_rule_slot_service_record(
     slot_result: Mapping[str, Any],
     *,
@@ -615,8 +671,11 @@ def state_rule_slot_service_record(
         )
         if packet_id is not None
     )
-    serviced_packet_ids = set(packet_use_counts)
-    for key in ("s2u_arrivals", "relay_arrivals", "outcomes"):
+    # A decision use or terminal outcome does not prove service.  Packet IDs
+    # enter this set only when a completion/delivery event proves service, or
+    # when a UAV decision use can be joined to a link with positive bits.
+    serviced_packet_ids: set[int] = set()
+    for key in ("s2u_arrivals", "relay_arrivals"):
         for item in slot_result.get(key, ()):
             packet_id = _packet_id_from_event(item)
             if packet_id is not None:
@@ -650,6 +709,10 @@ def state_rule_slot_service_record(
                 f"packet {packet_id} has conflicting terminal outcomes {previous} and {(outcome, task_type)}"
             )
 
+    for packet_id, (outcome, _) in terminal_by_packet.items():
+        if outcome in {"on_time_delivered", "late_delivered"}:
+            serviced_packet_ids.add(packet_id)
+
     terminal_counts = Counter(outcome for outcome, _ in terminal_by_packet.values())
     by_task: dict[str, dict[str, int]] = {}
     for task in ("FOV", "COM"):
@@ -676,13 +739,55 @@ def state_rule_slot_service_record(
         for item in slot_result.get("active_links", ())
         if isinstance(item, dict)
     ]
+    positive_uav_senders = {
+        int(item["sender_id"])
+        for item in active_links
+        if str(item.get("link_type")) in {"U2U", "U2G"}
+        and float(item.get("transmitted_bits", 0.0)) > 0.0
+    }
+    decision_packet_ids_by_sender: dict[int, set[int]] = {}
+    for item in slot_result.get("packet_decision_uses", ()):
+        if not isinstance(item, dict):
+            continue
+        sender = item.get("sender_uav_id")
+        packet_id = _packet_id_from_event(item)
+        if sender is not None and packet_id is not None:
+            decision_packet_ids_by_sender.setdefault(int(sender), set()).add(
+                packet_id
+            )
+    for sender in positive_uav_senders:
+        candidates = decision_packet_ids_by_sender.get(sender, set())
+        if len(candidates) == 1:
+            serviced_packet_ids.update(candidates)
+    transmission = _positive_transmission_evidence(slot_result)
     return {
         "time_seconds": float(current_time),
         "start_of_slot_nonempty_sender_ids": list(
             map(int, slot_result.get("start_of_slot_routing_sender_ids", ()))
         ),
         "serviced_packet_ids": sorted(serviced_packet_ids),
+        "serviced_packet_ids_definition": (
+            "packet IDs confirmed by a completed S2U/UAV hop, a GS delivery, "
+            "or one unambiguous UAV decision-use packet joined to a positive-bit "
+            "U2U/U2G sender; "
+            "unidentified partial S2U service is not guessed"
+        ),
         "terminal_packet_ids": sorted(terminal_by_packet),
+        "terminal_packet_ids_definition": (
+            "unique packet IDs with a canonical terminal outcome; terminal "
+            "membership alone is not evidence of transmission"
+        ),
+        "actual_transmission_observation_available": bool(
+            transmission["available"]
+        ),
+        "actual_transmission_unavailable_reason": transmission[
+            "unavailable_reason"
+        ],
+        "had_actual_transmission": transmission["had_actual_transmission"],
+        "positive_transmission_bits": transmission["positive_bits"],
+        "positive_transmission_link_count": transmission[
+            "positive_link_count"
+        ],
         "s2u_completed_packets": len(slot_result.get("s2u_arrivals", ())),
         "uav_relay_completions": len(slot_result.get("relay_arrivals", ())),
         "on_time_gs_delivery_packets": int(
@@ -734,8 +839,20 @@ def slot_service_summary(
     slots_with_empty_start_and_service = 0
     for record in records:
         start_senders = set(map(int, record.get("start_of_slot_nonempty_sender_ids", [])))
-        service_packet_ids = set(map(int, record.get("serviced_packet_ids", [])))
+        transmission = _positive_transmission_evidence(record)
         totals["slot_count"] += 1
+        if transmission["available"]:
+            totals["slots_with_actual_transmission_observed"] += int(
+                bool(transmission["had_actual_transmission"])
+            )
+            totals["slots_with_no_actual_transmission_observed"] += int(
+                not bool(transmission["had_actual_transmission"])
+            )
+            totals["positive_transmission_bits"] += float(
+                transmission["positive_bits"]
+            )
+        else:
+            totals["slots_with_actual_transmission_unavailable"] += 1
         totals["s2u_completed_packets"] += int(record.get("s2u_completed_packets", 0))
         totals["uav_relay_completions"] += int(record.get("uav_relay_completions", 0))
         totals["on_time_gs_delivery_packets"] += int(
@@ -764,12 +881,19 @@ def slot_service_summary(
                 continue
             for key, value in values.items():
                 by_task[task][str(key)] += int(value)
-        if service_packet_ids and not start_senders:
+        if transmission["had_actual_transmission"] is True and not start_senders:
             # This is deliberately only a slot-level fact. Packet IDs and
             # sender IDs are separate namespaces, so no per-UAV attribution is
             # inferred from an empty start followed by actual service.
             slots_with_empty_start_and_service += 1
-        transmitted_bits.extend(float(value) for value in record.get("transmitted_bits_by_link", {}).values())
+        if transmission["available"]:
+            transmitted_bits.extend(
+                float(value)
+                for value in record.get(
+                    "transmitted_bits_by_link", {}
+                ).values()
+                if float(value) > 0.0
+            )
         for link in record.get("active_links", ()):
             if not isinstance(link, dict):
                 continue
@@ -784,6 +908,13 @@ def slot_service_summary(
                 link.get("transmitted_bits", 0.0)
             )
     metrics = metrics if isinstance(metrics, Mapping) else {}
+    for key in (
+        "slots_with_actual_transmission_observed",
+        "slots_with_no_actual_transmission_observed",
+        "slots_with_actual_transmission_unavailable",
+        "positive_transmission_bits",
+    ):
+        totals.setdefault(key, 0)
 
     def metric_number(name: str) -> float | None:
         value = metrics.get(name)
@@ -833,6 +964,16 @@ def slot_service_summary(
             for task, values in by_task.items()
         },
         "slots_with_no_starting_uav_hol_but_actual_service": slots_with_empty_start_and_service,
+        "actual_service_slot_definition": (
+            "a slot has actual service only when authoritative "
+            "transmitted_bits_by_link contains a finite positive amount; "
+            "terminal outcomes, decisions, and enabled links alone do not qualify"
+        ),
+        "serviced_packet_ids_semantics": (
+            "diagnostic packet identities are confirmed only where an event or "
+            "positive UAV-link join permits it; slot service counts do not depend "
+            "on identifying a packet, so partial S2U transmissions are retained"
+        ),
         "transmitted_bits_per_active_link": _numeric_summary(transmitted_bits, 2),
         "actual_shared_fdma_service_by_link_type": {
             link_type: {
@@ -849,7 +990,7 @@ def slot_service_summary(
         },
         "authoritative_episode_totals": authoritative,
         "recorded_slot_sum_matches_authoritative_episode_total": alignment,
-        "note": "slot-start empty queues do not imply no service; generation, S2U access, and same-slot forwarding can occur later in the slot",
+        "note": "slot-start empty UAV queues do not imply no service; SR-to-UAV access, generation, and same-slot forwarding can occur later in the slot",
     }
     return result
 
@@ -921,6 +1062,166 @@ def routing_expected_capacity_observation(
         "current_expected_capacity_bps_by_legal_action": current,
         "maximum_reference_normalizer_bps_by_legal_action": normalizers,
         "capacity_context_by_legal_action": contexts,
+    }
+
+
+def _observed_float(
+    record: Mapping[str, Any], key: str, *, nonnegative: bool = False
+) -> float | None:
+    if key not in record or isinstance(record.get(key), (bool, np.bool_)):
+        return None
+    try:
+        value = float(record[key])
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(value) or (nonnegative and value < 0.0):
+        return None
+    return value
+
+
+def _routing_queue_and_hol_summary(
+    records: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Aggregate only queue/HOL values saved at each routing decision."""
+
+    valid_records = [record for record in records if isinstance(record, Mapping)]
+    per_sender: list[list[Any]] = []
+    all_backlogs: list[float] = []
+    all_deadlines: list[float] = []
+    system = Counter()
+
+    for sender in range(NUM_UAV):
+        sender_records = [
+            record
+            for record in valid_records
+            if record.get("sender_uav_id") == sender
+        ]
+        backlogs: list[float] = []
+        deadlines: list[float] = []
+        counts = Counter()
+        counts["routing_decision_count"] = len(sender_records)
+        for record in sender_records:
+            backlog = _observed_float(
+                record, "sender_total_backlog_bits", nonnegative=True
+            )
+            if backlog is None:
+                counts["backlog_unknown_count"] += 1
+            else:
+                backlogs.append(backlog)
+                all_backlogs.append(backlog)
+                counts["backlog_known_count"] += 1
+                counts["backlog_zero_count"] += int(backlog == 0.0)
+                counts["backlog_positive_count"] += int(backlog > 0.0)
+
+            if "hol_packet_id" not in record:
+                counts["hol_presence_unknown_count"] += 1
+                continue
+            counts["hol_presence_known_count"] += 1
+            if record.get("hol_packet_id") is None:
+                counts["no_hol_count"] += 1
+                counts["no_hol_with_unexpected_deadline_count"] += int(
+                    _observed_float(record, "hol_remaining_deadline_seconds")
+                    is not None
+                )
+                continue
+            counts["hol_present_count"] += 1
+            deadline = _observed_float(
+                record, "hol_remaining_deadline_seconds"
+            )
+            if deadline is None:
+                counts["hol_deadline_unknown_for_present_hol_count"] += 1
+            else:
+                deadlines.append(deadline)
+                all_deadlines.append(deadline)
+                counts["hol_deadline_known_count"] += 1
+                counts["hol_deadline_at_or_below_zero_count"] += int(
+                    deadline <= 0.0
+                )
+
+        for key, value in counts.items():
+            system[key] += int(value)
+        per_sender.append(
+            [
+                sender,
+                int(counts["routing_decision_count"]),
+                _numeric_summary(backlogs, 2),
+                int(counts["backlog_unknown_count"]),
+                int(counts["backlog_zero_count"]),
+                int(counts["backlog_positive_count"]),
+                int(counts["hol_presence_known_count"]),
+                int(counts["hol_presence_unknown_count"]),
+                int(counts["no_hol_count"]),
+                int(counts["hol_present_count"]),
+                _numeric_summary(deadlines, 6),
+                int(counts["hol_deadline_unknown_for_present_hol_count"]),
+                int(counts["hol_deadline_at_or_below_zero_count"]),
+            ]
+        )
+
+    backlog_available = bool(system["backlog_known_count"])
+    hol_available = bool(system["hol_presence_known_count"])
+    return {
+        "available": bool(backlog_available or hol_available),
+        "unavailable_reason": (
+            None
+            if backlog_available or hol_available
+            else "saved routing decisions do not contain contemporaneous UAV backlog or HOL-presence fields; values are not reconstructed from later state"
+        ),
+        "scope": (
+            "complete episode routing-decision observations; values are the "
+            "sender UAV queue at that recorded decision boundary"
+        ),
+        "units_and_missing_value_semantics": {
+            "sender_total_backlog_bits": "bits; a recorded 0 is an observed empty backlog, while absent, invalid, or negative values are unknown",
+            "hol_remaining_deadline_seconds": "seconds; summarized only when a recorded non-null hol_packet_id proves a HOL existed",
+            "no_hol": "hol_packet_id was recorded as null; this is distinct from unknown HOL presence",
+            "unknown_hol_presence": "hol_packet_id was not saved; no queue state is inferred",
+            "sample_counts": "every numeric summary includes its valid sample count; decision and missing counts use routing-decision observations",
+        },
+        "system": {
+            "routing_decision_count": len(valid_records),
+            "sender_uav_count": NUM_UAV,
+            "backlog_observation_available": backlog_available,
+            "backlog_known_count": int(system["backlog_known_count"]),
+            "backlog_unknown_count": int(system["backlog_unknown_count"]),
+            "backlog_zero_count": int(system["backlog_zero_count"]),
+            "backlog_positive_count": int(system["backlog_positive_count"]),
+            "sender_total_backlog_bits": _numeric_summary(all_backlogs, 2),
+            "hol_presence_observation_available": hol_available,
+            "hol_presence_known_count": int(system["hol_presence_known_count"]),
+            "hol_presence_unknown_count": int(system["hol_presence_unknown_count"]),
+            "no_hol_count": int(system["no_hol_count"]),
+            "hol_present_count": int(system["hol_present_count"]),
+            "hol_deadline_known_count": int(system["hol_deadline_known_count"]),
+            "hol_deadline_unknown_for_present_hol_count": int(
+                system["hol_deadline_unknown_for_present_hol_count"]
+            ),
+            "hol_remaining_deadline_seconds": _numeric_summary(
+                all_deadlines, 6
+            ),
+            "hol_deadline_at_or_below_zero_count": int(
+                system["hol_deadline_at_or_below_zero_count"]
+            ),
+            "no_hol_with_unexpected_deadline_count": int(
+                system["no_hol_with_unexpected_deadline_count"]
+            ),
+        },
+        "per_sender_columns": [
+            "sender_uav_id",
+            "routing_decision_count",
+            "sender_total_backlog_bits_summary",
+            "backlog_unknown_count",
+            "backlog_zero_count",
+            "backlog_positive_count",
+            "hol_presence_known_count",
+            "hol_presence_unknown_count",
+            "no_hol_count",
+            "hol_present_count",
+            "hol_remaining_deadline_seconds_summary",
+            "hol_deadline_unknown_for_present_hol_count",
+            "hol_deadline_at_or_below_zero_count",
+        ],
+        "per_sender_rows": per_sender,
     }
 
 
@@ -1020,6 +1321,9 @@ def communication_bottleneck_summary_state_rule(
             }
             for link_type in ("U2U", "U2G")
         },
+        "routing_queue_and_hol_observations": _routing_queue_and_hol_summary(
+            records
+        ),
         "episode_context": {
             key: metrics.get(key)
             for key in (
@@ -1028,6 +1332,45 @@ def communication_bottleneck_summary_state_rule(
                 "routing_immediate_cost_sum",
             )
         },
+    }
+
+
+def _assemble_state_rule_feedback(
+    *,
+    metrics: Mapping[str, Any],
+    movement_records: list[dict[str, Any]],
+    routing_records: list[dict[str, Any]],
+    slot_service_records: list[dict[str, Any]],
+    applied_guidance: Mapping[str, Any],
+) -> dict[str, Any]:
+    movement, cases = state_rule_movement_summary(movement_records)
+    communication = communication_bottleneck_summary_state_rule(
+        routing_records, metrics
+    )
+    service = slot_service_summary(slot_service_records, metrics)
+    roles = {
+        key: value["role_decision_counts"]
+        for key, value in movement["by_uav"].items()
+    }
+    return {
+        "schema_version": LLM_STATE_RULE_VERSION,
+        "summary_version": LLM_STATE_RULE_SUMMARY_VERSION,
+        "metrics": _json_clone(metrics),
+        "observed_task_and_traffic_summary": {
+            "role_decision_counts_by_uav": roles,
+            "source_and_task_metrics": {
+                key: value
+                for key, value in metrics.items()
+                if key.startswith(("fov_", "com_"))
+            },
+        },
+        "movement_and_rule_application_summaries": movement,
+        "fov_com_and_slot_service_summaries": {
+            "routing_decision_observations": communication,
+            "actual_within_slot_service": service,
+        },
+        "representative_cases": cases,
+        "applied_guidance": _json_clone(applied_guidance),
     }
 
 
@@ -1098,10 +1441,139 @@ class LLMStateRuleController(LLMExplorerController):
         return result
 
     def load_state_dict(self, state: dict[str, Any]) -> None:
-        super().load_state_dict(state)
+        compatible_state = copy.deepcopy(state)
+        saved_config = compatible_state.get("config")
+        current_config = asdict(self.config)
+        if (
+            compatible_state.get("schema_version") == self.schema_version
+            and isinstance(saved_config, dict)
+            and saved_config.get("prompt_version")
+            == "uav-hrl-llm-state-rule-prompts-v2"
+        ):
+            upgraded_config = dict(saved_config)
+            upgraded_config["prompt_version"] = current_config["prompt_version"]
+            if upgraded_config == current_config:
+                # Prompt/summary/cache v3 changes diagnostic evidence only.  It
+                # must not invalidate otherwise identical same-method training.
+                compatible_state["config"] = current_config
+        super().load_state_dict(compatible_state)
+        self._upgrade_saved_feedback_diagnostics()
         rule = self.active_guidance.get("rule")
         self._compiled_rule = None if rule is None else compile_state_rule(rule)
         self.runtime_failure_total = int(state.get("runtime_failure_total", 0))
+
+    def _saved_raw_feedback(self) -> dict[str, Any] | None:
+        previous = self.previous_episode_feedback
+        if self.root is None or not isinstance(previous, dict):
+            return None
+        expected_metrics = previous.get("metrics")
+        for path in sorted(
+            self.root.glob("episode_*/feedback.json"), reverse=True
+        ):
+            try:
+                candidate = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, TypeError, ValueError, json.JSONDecodeError):
+                continue
+            if (
+                isinstance(candidate, dict)
+                and candidate.get("metrics") == expected_metrics
+                and all(
+                    isinstance(candidate.get(key), list)
+                    for key in (
+                        "movement_decisions",
+                        "routing_decisions",
+                        "slot_service_records",
+                    )
+                )
+            ):
+                return candidate
+        return None
+
+    @staticmethod
+    def _mark_diagnostics_unavailable(
+        feedback: Mapping[str, Any], *, reason: str
+    ) -> dict[str, Any]:
+        value = _json_clone(feedback)
+        summaries = value.setdefault("fov_com_and_slot_service_summaries", {})
+        if not isinstance(summaries, dict):
+            summaries = {}
+            value["fov_com_and_slot_service_summaries"] = summaries
+        routing = summaries.setdefault("routing_decision_observations", {})
+        if not isinstance(routing, dict):
+            routing = {}
+            summaries["routing_decision_observations"] = routing
+        routing.setdefault(
+            "routing_queue_and_hol_observations",
+            {
+                "available": False,
+                "unavailable_reason": reason,
+                "scope": "saved raw routing decisions unavailable; values are not replaced by zeros or reconstructed from later state",
+            },
+        )
+        service = summaries.setdefault("actual_within_slot_service", {})
+        if not isinstance(service, dict):
+            service = {}
+            summaries["actual_within_slot_service"] = service
+        if "actual_service_slot_definition" not in service:
+            service["slots_with_no_starting_uav_hol_but_actual_service"] = None
+            service["actual_service_slot_definition"] = (
+                "unavailable because saved slot records with authoritative "
+                "transmitted bits were not available for migration"
+            )
+        value["summary_version"] = LLM_STATE_RULE_SUMMARY_VERSION
+        value["diagnostic_summary_migration"] = {
+            "rebuilt_from_saved_raw_records": False,
+            "unavailable_reason": reason,
+        }
+        return value
+
+    def _upgrade_saved_feedback_diagnostics(self) -> None:
+        previous = self.previous_episode_feedback
+        if not isinstance(previous, dict):
+            return
+        summaries = previous.get("fov_com_and_slot_service_summaries")
+        routing = (
+            summaries.get("routing_decision_observations")
+            if isinstance(summaries, dict)
+            else None
+        )
+        service = (
+            summaries.get("actual_within_slot_service")
+            if isinstance(summaries, dict)
+            else None
+        )
+        if (
+            previous.get("summary_version") == LLM_STATE_RULE_SUMMARY_VERSION
+            and isinstance(routing, dict)
+            and "routing_queue_and_hol_observations" in routing
+            and isinstance(service, dict)
+            and "actual_service_slot_definition" in service
+        ):
+            return
+        raw = self._saved_raw_feedback()
+        if raw is not None:
+            rebuilt = _assemble_state_rule_feedback(
+                metrics=raw.get("metrics", {}),
+                movement_records=raw["movement_decisions"],
+                routing_records=raw["routing_decisions"],
+                slot_service_records=raw["slot_service_records"],
+                applied_guidance=previous.get(
+                    "applied_guidance", raw.get("applied_guidance", {})
+                ),
+            )
+            rebuilt["diagnostic_summary_migration"] = {
+                "rebuilt_from_saved_raw_records": True,
+                "unavailable_reason": None,
+            }
+            self.previous_episode_feedback = rebuilt
+            return
+        self.previous_episode_feedback = self._mark_diagnostics_unavailable(
+            previous,
+            reason=(
+                "checkpoint feedback predates diagnostic summary v3 and no "
+                "matching saved raw episode records were found"
+            ),
+        )
 
     def state_dict(self) -> dict[str, Any]:
         result = super().state_dict()
@@ -1271,6 +1743,30 @@ class LLMStateRuleController(LLMExplorerController):
         }
 
     def _compact_feedback(self, previous: dict[str, Any]) -> dict[str, Any]:
+        summaries = previous.get("fov_com_and_slot_service_summaries")
+        routing = (
+            summaries.get("routing_decision_observations")
+            if isinstance(summaries, dict)
+            else None
+        )
+        service = (
+            summaries.get("actual_within_slot_service")
+            if isinstance(summaries, dict)
+            else None
+        )
+        if not (
+            isinstance(routing, dict)
+            and "routing_queue_and_hol_observations" in routing
+            and isinstance(service, dict)
+            and "actual_service_slot_definition" in service
+        ):
+            previous = self._mark_diagnostics_unavailable(
+                previous,
+                reason=(
+                    "this feedback object has no saved v3 queue/HOL or positive-bit "
+                    "service diagnostics; missing observations are not treated as zero"
+                ),
+            )
         return {
             "metrics": _json_clone(previous.get("metrics", {})),
             "previous_complete_rule": self._previous_rule(previous),
@@ -1538,34 +2034,15 @@ class LLMStateRuleController(LLMExplorerController):
         self.slot_service_records.append(_json_clone(record))
 
     def complete_episode(self, *, episode_index: int, metrics: dict[str, Any]) -> None:
-        movement, cases = state_rule_movement_summary(self.movement_records)
-        communication = communication_bottleneck_summary_state_rule(
-            self.routing_records, metrics
+        feedback = _assemble_state_rule_feedback(
+            metrics=metrics,
+            movement_records=self.movement_records,
+            routing_records=self.routing_records,
+            slot_service_records=self.slot_service_records,
+            applied_guidance=self._serializable_guidance(
+                self.active_guidance
+            ),
         )
-        service = slot_service_summary(self.slot_service_records, metrics)
-        roles = {
-            key: value["role_decision_counts"]
-            for key, value in movement["by_uav"].items()
-        }
-        feedback = {
-            "schema_version": LLM_STATE_RULE_VERSION,
-            "summary_version": LLM_STATE_RULE_SUMMARY_VERSION,
-            "metrics": _json_clone(metrics),
-            "observed_task_and_traffic_summary": {
-                "role_decision_counts_by_uav": roles,
-                "source_and_task_metrics": {
-                    key: value for key, value in metrics.items()
-                    if key.startswith(("fov_", "com_"))
-                },
-            },
-            "movement_and_rule_application_summaries": movement,
-            "fov_com_and_slot_service_summaries": {
-                "routing_decision_observations": communication,
-                "actual_within_slot_service": service,
-            },
-            "representative_cases": cases,
-            "applied_guidance": self._serializable_guidance(self.active_guidance),
-        }
         self.previous_episode_feedback = _json_clone(feedback)
         if self.root is not None:
             episode_root = self.root / f"episode_{episode_index + 1:06d}"
@@ -1581,8 +2058,8 @@ class LLMStateRuleController(LLMExplorerController):
             _atomic_json(self.root / "state.json", self.state_dict())
         print(
             f"[LLM state rule] episode={episode_index + 1} summary "
-            f"controlled={movement['totals'].get('controlled_decisions', 0)} "
-            f"runtime_failures={movement['totals'].get('runtime_failures', 0)} "
+            f"controlled={feedback['movement_and_rule_application_summaries']['totals'].get('controlled_decisions', 0)} "
+            f"runtime_failures={feedback['movement_and_rule_application_summaries']['totals'].get('runtime_failures', 0)} "
             f"requests={self.statistics['requests_total']} "
             f"failed_attempts={self.statistics['failed_attempts_total']} "
             f"fallback_episodes={self.statistics['td3_fallback_episodes_total']}",
