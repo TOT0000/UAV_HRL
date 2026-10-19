@@ -124,9 +124,9 @@ When a reliable preference is unavailable, a uniform prior over all 17 actions p
 
 Use global outcomes and complete statistics to assess how widespread a problem is. Use a few cases to explain concrete situations. Interpret each value using its time, control branch, unit, and valid denominator.
 
-Routing preselection counts, actual packet use, positive transmitted bits, completed hops, and timely useful GS delivery are different measures. Interpret WAIT using time during which an actual HOL packet was waiting. Relay bits do not count as additional GS delivery.
+Routing preselection counts, slot-start HOL observations, actual packet use, positive transmitted bits, completed hops, and timely useful GS delivery are different measures. Slot-start HOL fields are decision-boundary counts, not durations. actual_hol_wait_time_seconds is the event-time union during which that sender selected WAIT and an actual UAV HOL packet existed; non-WAIT no-service time is excluded. Missing legacy event-time diagnostics are unknown, not zero. Relay bits do not count as additional GS delivery.
 
-Distinguish TD3 control opportunities, applied biases, and executed actions. Zero TD3-controlled decisions indicates control by other controllers. Interpret headings using circular statistics, directional dispersion, and representative cases.
+Distinguish the requested full 16x3 bias, the pre-projection Actor offset, the offset actually added on movement_mask=true decisions, and the final projected/executed action. An active zero offset is a valid applied intervention; warmup, fallback, and other-controller decisions are not applications. Zero TD3-controlled decisions indicates control by other controllers. Interpret headings using circular statistics, directional dispersion, and representative cases.
 
 Measured zero, an empty queue, an unassigned target, and unknown information have different meanings. Omitted detailed link information means it was not supplied. The representative-link list is not a list of the only selectable actions.
 

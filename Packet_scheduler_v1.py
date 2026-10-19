@@ -2678,6 +2678,16 @@ class PacketEngine:
         self._mark_queue_topology_changed(sr_id=sr_id)
         pkt["_queued_sr"] = None
         pkt["s2u_completion_time"] = float(completion_time)
+        first_gen_diagnostics = result.get("first_gen_event_diagnostics")
+        if isinstance(first_gen_diagnostics, dict):
+            first_gen_diagnostics["s2u_completion_events"].append(
+                {
+                    "packet_id": int(pkt["id"]),
+                    "source_sr_id": int(sr_id),
+                    "receiver_uav_id": int(receiver),
+                    "completion_time_seconds": float(completion_time),
+                }
+            )
         service_start = float(
             pkt.get("s2u_service_start_time", completion_time)
         )
@@ -2839,6 +2849,7 @@ class PacketEngine:
         observed_backlog_bits_by_sender=None,
         routing_transition_ids_by_sender=None,
         effective_masks_by_sender=None,
+        collect_first_gen_event_diagnostics=False,
     ):
         """Advance one slot by physical generation/service/deadline events.
 
@@ -2869,6 +2880,12 @@ class PacketEngine:
             for sender, mask in dict(effective_masks_by_sender or {}).items()
         }
         result = self._event_result()
+        if bool(collect_first_gen_event_diagnostics):
+            result["first_gen_event_diagnostics"] = {
+                "schema_version": "first-gen-event-service-v1",
+                "hol_wait_seconds_by_sender": None,
+                "s2u_completion_events": [],
+            }
         for sender in actions:
             result["reward_by_sender"][sender] = 0.0
             result["cost_by_sender"][sender] = 0.0
@@ -2881,6 +2898,14 @@ class PacketEngine:
         decision_use_keys = set()
         decision_diagnostic_keys = set()
         active_link_totals = {}
+        wait_senders = tuple(
+            sender
+            for sender, receiver in sorted(actions.items())
+            if sender == receiver
+        )
+        hol_wait_duration_terms = {
+            sender: [] for sender in wait_senders
+        }
         s2u_diagnostic_opportunities = {}
         s2u_diagnostic_serviced_packet_ids = set()
         event_clock = [slot_start]
@@ -3307,6 +3332,15 @@ class PacketEngine:
                     t = min(float(np.nextafter(t, float("inf"))), slot_end)
                 continue
             duration = next_time - t
+            if bool(collect_first_gen_event_diagnostics):
+                # Events at t have already been materialized/expired.  The
+                # HOL observed here therefore exists throughout [t,next_time)
+                # unless next_time is precisely its completion/deadline/event
+                # boundary.  One duration is added per sender, never per
+                # packet, so successive HOL packets cannot overlap.
+                for sender in wait_senders:
+                    if self.get_hol_packet(sender) is not None:
+                        hol_wait_duration_terms[sender].append(duration)
             result["resource_segments"].append(
                 {
                     "start_time_seconds": t,
@@ -3470,6 +3504,24 @@ class PacketEngine:
             append_expirations(t)
 
         env.current_time = slot_end
+        if bool(collect_first_gen_event_diagnostics):
+            slot_seconds = slot_end - slot_start
+            wait_seconds_by_sender = {}
+            for sender in sorted(actions):
+                total = math.fsum(hol_wait_duration_terms.get(sender, ()))
+                tolerance = event_time_tolerance_seconds(
+                    slot_start, slot_end, slot_start + total
+                )
+                if total < -tolerance or total > slot_seconds + tolerance:
+                    raise AssertionError(
+                        "event-time HOL WAIT duration lies outside the slot"
+                    )
+                wait_seconds_by_sender[str(sender)] = min(
+                    max(float(total), 0.0), slot_seconds
+                )
+            result["first_gen_event_diagnostics"][
+                "hol_wait_seconds_by_sender"
+            ] = wait_seconds_by_sender
         if self.enable_packet_diagnostic_artifacts:
             for packet_id, diagnostic in s2u_diagnostic_opportunities.items():
                 settle_s2u_no_service(packet_id)

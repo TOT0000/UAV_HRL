@@ -26,13 +26,13 @@ Actual application, non-intervention, and fallback summary:
 
 {{UAV_CORE_SUMMARY}}
 
-These include roles, TD3 control opportunities, Actor and executed actions, bias application, energy, target-relative directions/distances with valid sample counts and directional dispersion, and necessary sensing, access, and queue statistics.
+These include roles, TD3 control opportunities, the requested full bias, pre-projection Actor offsets, offsets actually added under the movement mask, final projected/executed actions, energy, target-relative directions/distances with valid sample counts and directional dispersion, and necessary sensing, access, and queue statistics.
 
 [Core routing summaries for all sender UAVs]
 
 {{ROUTING_CORE_SUMMARY}}
 
-These include all 17 action counts separated by epsilon-exploration and greedy branches, legal-action opportunities, actual service, HOL waiting, and zero-prior-mass fallbacks.
+These include all 17 action counts separated by epsilon-exploration and greedy branches, legal-action opportunities, actual service, slot-start HOL observation counts, event-time WAIT-with-HOL seconds, and zero-prior-mass fallbacks. Missing legacy event-time values are unavailable rather than zero.
 
 Each sender has at most three representative link profiles, with selection reasons, endpoints, reference capacity, neighbor backlog, and actual service. Other actions remain available for exploration.
 

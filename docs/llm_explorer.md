@@ -25,14 +25,20 @@ only when the run/episode, complete input hash, model, prompt version, and
 configuration, summary, and cache identities all match. Final episode results are also cached for
 full success, partial success, and fallback outcomes. The request payload uses
 versioned complete episode aggregates for all 16 UAVs, all routing senders,
-authoritative event-time service, and at most eight deterministic cases; raw
+authoritative event-time service, including WAIT-with-HOL interval unions and
+immutable S2U completion endpoints, and at most eight deterministic cases; raw
 training records retain their original precision. Every analysis, guidance, and retry
 request is checked with the `o200k_base` tokenizer against the 128,000-token
 context limit, including reserved output and a safety margin. Token budgets are
 saved beside each attempt. The payload contains filtered observable state and
 never serializes a scenario manifest or undiscovered RoI and SR ground truth.
-The first-generation controller schema is `uav-hrl-llm-explorer-firstgen-v3`, prompt schema is v5, and summary
-schema is `complete-core-feedback-v2`. Older first-generation explorer
+The first-generation controller schema is `uav-hrl-llm-explorer-firstgen-v4`,
+prompt schema is v6, summary schema is `complete-core-feedback-v3`, and cache
+schema is `episode-fixed-dual-guidance-cache-v3`. Slot-start HOL fields remain
+observation counts; actual WAIT time is accumulated on the PacketEngine event
+clock and unavailable legacy values stay unknown. Movement feedback separates
+the requested matrix, Actor pre-projection offset, movement-mask-qualified
+application, and final projected/executed action. Older first-generation explorer
 checkpoints are rejected instead of mixing the former 80/20 behavior or
 inventing unavailable historical matrices. Start a new comparison run when
 migrating from an older first-generation explorer run.

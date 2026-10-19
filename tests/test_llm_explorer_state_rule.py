@@ -15,6 +15,7 @@ from HRL_task_aware import TrainingConfig, _llm_routing_exploration_prior, train
 from llm_explorer import (
     ExplorerValidationError,
     PromptBudgetError,
+    first_gen_routing_summary,
     first_gen_slot_service_record,
     llm_explorer_path_preflight,
 )
@@ -138,6 +139,21 @@ class OneUavEventEnvironment:
         bandwidths = {link: bandwidth for link in links}
         bandwidths.update({("S2U", *link): bandwidth for link in source_links})
         return {link: capacity_mbps for link in links}, bandwidths
+
+
+class SixteenUavEventEnvironment(OneUavEventEnvironment):
+    """Deterministic 16-UAV fixture with the production action IDs."""
+
+    def __init__(self, *, capacity_mbps=10.0):
+        super().__init__(capacity_mbps=capacity_mbps)
+        self.num_UAV = 16
+        self.GS_ID = 16
+        self.uav_dict = {
+            uav_id: Uav((float(uav_id), 0.0, 100.0))
+            for uav_id in range(16)
+        }
+        self.source_uavs = set(range(16))
+        self.multi_tasks = {uav_id: [] for uav_id in range(16)}
 
 
 def runtime_fixture():
@@ -895,7 +911,10 @@ def test_slot_service_summary_does_not_equate_empty_slot_start_with_no_service()
     assert summary["same_slot_multi_hop_packets"] == 1
 
 
-def _serve_sr_only_slot(*, capacity_mbps, size_bits, deadline_seconds):
+def _serve_sr_only_slot(
+    *, capacity_mbps, size_bits, deadline_seconds,
+    collect_first_gen_event_diagnostics=False,
+):
     env = OneUavEventEnvironment(capacity_mbps=capacity_mbps)
     engine = PacketEngine(
         1,
@@ -910,11 +929,14 @@ def _serve_sr_only_slot(*, capacity_mbps, size_bits, deadline_seconds):
         observed_hol_by_sender={0: None},
         observed_backlog_bits_by_sender={0: 0.0},
         effective_masks_by_sender={0: np.asarray([True, False])},
+        collect_first_gen_event_diagnostics=collect_first_gen_event_diagnostics,
     )
     return engine, packet, result
 
 
-def _serve_sr_then_forward_to_gs_in_same_slot():
+def _serve_sr_then_forward_to_gs_in_same_slot(
+    *, collect_first_gen_event_diagnostics=False,
+):
     env = OneUavEventEnvironment(capacity_mbps=1.0)
     engine = PacketEngine(
         1,
@@ -929,8 +951,171 @@ def _serve_sr_then_forward_to_gs_in_same_slot():
         observed_hol_by_sender={0: None},
         observed_backlog_bits_by_sender={0: 0.0},
         effective_masks_by_sender={0: np.asarray([True, True])},
+        collect_first_gen_event_diagnostics=collect_first_gen_event_diagnostics,
     )
     return packet, result
+
+
+def _serve_waiting_uav_packets(
+    packet_specs, *, action=0, capacity_mbps=1.0,
+    collect_first_gen_event_diagnostics=True,
+):
+    env = OneUavEventEnvironment(capacity_mbps=capacity_mbps)
+    engine = PacketEngine(
+        1,
+        task_deadlines_seconds={"FOV": 0.015, "COM": 0.03},
+    )
+    packets = [
+        engine.create_packet(
+            0,
+            task_type,
+            size_bits,
+            0.0,
+            capture_coverage_ratio=(1.0 if task_type == "FOV" else None),
+        )
+        for task_type, size_bits in packet_specs
+    ]
+    hol = packets[0] if packets else None
+    result = engine.serve_event_driven_slot(
+        env,
+        {0: int(action)},
+        0.0,
+        observed_hol_by_sender={0: hol},
+        observed_backlog_bits_by_sender={
+            0: float(sum(size for _, size in packet_specs))
+        },
+        effective_masks_by_sender={0: np.asarray([True, True])},
+        collect_first_gen_event_diagnostics=collect_first_gen_event_diagnostics,
+    )
+    return engine, packets, result
+
+
+def _first_gen_wait_seconds(result):
+    return result["first_gen_event_diagnostics"][
+        "hol_wait_seconds_by_sender"
+    ]["0"]
+
+
+def test_first_generation_wait_time_uses_event_clock_for_expiry_and_deadlines():
+    _, fov_packets, fov = _serve_waiting_uav_packets([("FOV", 100.0)])
+    assert fov_packets[0]["terminal_outcome"] == "expired_dropped"
+    assert _first_gen_wait_seconds(fov) == pytest.approx(0.015)
+
+    env = OneUavEventEnvironment()
+    engine = PacketEngine(
+        1, task_deadlines_seconds={"FOV": 1.0, "COM": 0.01}
+    )
+    packet = engine.create_packet(0, "COM", 100.0, 0.0)
+    com = engine.serve_event_driven_slot(
+        env,
+        {0: 0},
+        0.0,
+        observed_hol_by_sender={0: packet},
+        observed_backlog_bits_by_sender={0: 100.0},
+        effective_masks_by_sender={0: np.ones(2, dtype=bool)},
+        collect_first_gen_event_diagnostics=True,
+    )
+    assert packet["terminal_outcome"] == "expired_dropped"
+    assert _first_gen_wait_seconds(com) == pytest.approx(0.01)
+
+
+def test_first_generation_wait_time_handles_intra_slot_arrival_empty_and_successive_hol():
+    _, _, arrival = _serve_sr_only_slot(
+        capacity_mbps=1.0,
+        size_bits=100_000.0,
+        deadline_seconds=1.0,
+        collect_first_gen_event_diagnostics=True,
+    )
+    # S2U takes 100 ms; the newly arrived UAV HOL then waits for the
+    # remaining 150 ms of the routing slot.
+    assert _first_gen_wait_seconds(arrival) == pytest.approx(0.15)
+
+    _, packets, successive = _serve_waiting_uav_packets(
+        [("FOV", 100.0), ("COM", 100.0)]
+    )
+    assert [packet["terminal_outcome"] for packet in packets] == [
+        "expired_dropped",
+        "expired_dropped",
+    ]
+    # [0,.015) belongs to the FOV HOL and [.015,.03) to COM.  The two
+    # intervals form a union; they must never be added as overlapping waits.
+    assert _first_gen_wait_seconds(successive) == pytest.approx(0.03)
+    assert _first_gen_wait_seconds(successive) <= 0.25
+
+    _, _, empty = _serve_waiting_uav_packets([])
+    assert _first_gen_wait_seconds(empty) == 0.0
+
+
+def test_first_generation_wait_time_excludes_non_wait_no_service_and_marks_legacy_unknown():
+    _, packets, non_wait = _serve_waiting_uav_packets(
+        [("FOV", 100.0)], action=1, capacity_mbps=0.0
+    )
+    assert packets[0]["terminal_outcome"] == "expired_dropped"
+    assert _first_gen_wait_seconds(non_wait) == 0.0
+
+    record = first_gen_slot_service_record(
+        non_wait,
+        current_time=0.0,
+        slot_seconds=0.25,
+        preselected_actions_by_sender={0: 1},
+    )
+    summary, _ = first_gen_routing_summary([], [record])
+    actual = summary["by_sender"]["UAV_0"]["actual_hol_wait_time_seconds"]
+    assert actual["status"] == "available_complete_episode"
+    assert actual["episode_sum_seconds"] == 0.0
+
+    legacy_record = dict(record)
+    legacy_record.pop("actual_hol_wait_seconds_available")
+    legacy_record.pop("actual_hol_wait_seconds_by_sender")
+    legacy, _ = first_gen_routing_summary([], [legacy_record])
+    legacy_actual = legacy["by_sender"]["UAV_0"][
+        "actual_hol_wait_time_seconds"
+    ]
+    assert legacy_actual["status"] == "unavailable_legacy_slot_records"
+    assert legacy_actual["episode_sum_seconds"] is None
+    assert legacy_actual["observed_partial_sum_seconds"] is None
+
+
+def test_first_generation_light_event_stats_do_not_change_packet_results_or_rng():
+    initial_rng_state = np.random.get_state()
+    try:
+        np.random.set_state(initial_rng_state)
+        disabled_engine, disabled_packets, disabled = _serve_waiting_uav_packets(
+            [("FOV", 100.0), ("COM", 100.0)],
+            collect_first_gen_event_diagnostics=False,
+        )
+        disabled_rng_state = np.random.get_state()
+        np.random.set_state(initial_rng_state)
+        enabled_engine, enabled_packets, enabled = _serve_waiting_uav_packets(
+            [("FOV", 100.0), ("COM", 100.0)],
+            collect_first_gen_event_diagnostics=True,
+        )
+        enabled_rng_state = np.random.get_state()
+    finally:
+        np.random.set_state(initial_rng_state)
+
+    assert "first_gen_event_diagnostics" not in disabled
+    assert "first_gen_event_diagnostics" in enabled
+    for key in (
+        "transmitted_bits_by_link",
+        "reward_by_sender",
+        "cost_by_sender",
+        "global_routing_reward",
+        "shared_reward_row_sum",
+    ):
+        assert enabled[key] == disabled[key]
+    assert [packet["terminal_outcome"] for packet in enabled_packets] == [
+        packet["terminal_outcome"] for packet in disabled_packets
+    ]
+    assert enabled_engine.packet_metric_summary() == (
+        disabled_engine.packet_metric_summary()
+    )
+    assert enabled_engine.wait_actions == disabled_engine.wait_actions
+    assert enabled_engine.total_delivered == disabled_engine.total_delivered
+    assert enabled_engine.total_violated == disabled_engine.total_violated
+    assert disabled_rng_state[0] == enabled_rng_state[0]
+    np.testing.assert_array_equal(disabled_rng_state[1], enabled_rng_state[1])
+    assert disabled_rng_state[2:] == enabled_rng_state[2:]
 
 
 def test_real_packet_engine_zero_capacity_expiry_is_not_actual_service():
@@ -1038,6 +1223,139 @@ def test_first_generation_records_empty_start_then_same_slot_forwarding():
     assert summary["slots_with_no_starting_uav_hol_but_actual_service"] == 1
     assert summary["s2u_completed_packets"] == 1
     assert summary["gs_delivery_outcomes"] == 1
+
+
+def _serve_sixteen_uav_s2u_chain(
+    actions, *, size_bits=10_000.0, capacity_mbps=10.0
+):
+    env = SixteenUavEventEnvironment(capacity_mbps=capacity_mbps)
+    engine = PacketEngine(
+        16, task_deadlines_seconds={"FOV": 1.0, "COM": 1.0}
+    )
+    packet = engine.create_sr_packet(0, size_bits, generation_time=0.0)
+    packet["s2u_receiver"] = 0
+    frozen_actions = {uav_id: uav_id for uav_id in range(16)}
+    frozen_actions.update({int(key): int(value) for key, value in actions.items()})
+    result = engine.serve_event_driven_slot(
+        env,
+        frozen_actions,
+        0.0,
+        observed_hol_by_sender={uav_id: None for uav_id in range(16)},
+        observed_backlog_bits_by_sender={uav_id: 0.0 for uav_id in range(16)},
+        effective_masks_by_sender={
+            uav_id: np.ones(17, dtype=bool) for uav_id in range(16)
+        },
+        collect_first_gen_event_diagnostics=True,
+    )
+    record = first_gen_slot_service_record(
+        result,
+        current_time=0.0,
+        slot_seconds=0.25,
+        preselected_actions_by_sender=frozen_actions,
+    )
+    summary, _ = first_gen_routing_summary([], [record])
+    return packet, result, record, summary
+
+
+def test_first_generation_s2u_endpoint_survives_same_slot_u2g_forwarding():
+    packet, result, record, summary = _serve_sixteen_uav_s2u_chain({0: 16})
+    assert [hop["link_type"] for hop in packet["per_hop"]] == ["S2U", "U2G"]
+    assert result["first_gen_event_diagnostics"]["s2u_completion_events"] == [
+        {
+            "packet_id": packet["id"],
+            "source_sr_id": 0,
+            "receiver_uav_id": 0,
+            "completion_time_seconds": pytest.approx(0.001),
+        }
+    ]
+    s2u_hops = [
+        hop for hop in record["completed_hops"] if hop["link_type"] == "S2U"
+    ]
+    assert len(s2u_hops) == 1
+    assert s2u_hops[0]["sender_id"] == "SR:0"
+    assert s2u_hops[0]["source_sr_id"] == 0
+    assert s2u_hops[0]["receiver_id"] == 0
+    assert summary["by_sender"]["UAV_0"]["s2u_access_received"][
+        "completed_packets"
+    ] == 1
+    assert summary["by_sender"]["UAV_1"]["s2u_access_received"][
+        "completed_packets"
+    ] == 0
+    assert summary["by_sender"]["UAV_0"]["actual_uav_service"][
+        "completed_hops"
+    ] == 1
+
+    result["first_gen_event_diagnostics"]["s2u_completion_events"].append(
+        dict(
+            result["first_gen_event_diagnostics"][
+                "s2u_completion_events"
+            ][0]
+        )
+    )
+    deduplicated_record = first_gen_slot_service_record(
+        result, current_time=0.0, slot_seconds=0.25
+    )
+    assert sum(
+        hop["link_type"] == "S2U"
+        for hop in deduplicated_record["completed_hops"]
+    ) == 1
+
+
+def test_first_generation_s2u_endpoint_survives_same_slot_u2u_u2g_chain():
+    packet, _, record, summary = _serve_sixteen_uav_s2u_chain(
+        {0: 1, 1: 16}
+    )
+    assert [hop["link_type"] for hop in packet["per_hop"]] == [
+        "S2U",
+        "U2U",
+        "U2G",
+    ]
+    assert [hop["link_type"] for hop in record["completed_hops"]] == [
+        "S2U",
+        "U2U",
+        "U2G",
+    ]
+    s2u = record["completed_hops"][0]
+    assert (s2u["source_sr_id"], s2u["receiver_id"]) == (0, 0)
+    assert summary["by_sender"]["UAV_0"]["s2u_access_received"][
+        "completed_packets"
+    ] == 1
+    assert summary["by_sender"]["UAV_1"]["s2u_access_received"][
+        "completed_packets"
+    ] == 0
+    assert summary["by_sender"]["UAV_0"]["actual_uav_service"][
+        "completed_hops"
+    ] == 1
+    assert summary["by_sender"]["UAV_1"]["actual_uav_service"][
+        "completed_hops"
+    ] == 1
+
+
+def test_first_generation_s2u_completion_without_forwarding_and_partial_bits():
+    packet, _, record, summary = _serve_sixteen_uav_s2u_chain({})
+    assert [hop["link_type"] for hop in packet["per_hop"]] == ["S2U"]
+    assert [hop["link_type"] for hop in record["completed_hops"]] == ["S2U"]
+    assert summary["by_sender"]["UAV_0"]["s2u_access_received"][
+        "completed_packets"
+    ] == 1
+    assert summary["by_sender"]["UAV_0"]["actual_uav_service"][
+        "completed_hops"
+    ] == 0
+
+    partial_packet, partial_result, partial_record, partial_summary = (
+        _serve_sixteen_uav_s2u_chain(
+            {}, size_bits=1_000_000.0, capacity_mbps=1.0
+        )
+    )
+    assert partial_packet["rem_bits"] == pytest.approx(750_000.0)
+    assert partial_result["s2u_arrivals"] == []
+    assert partial_result["first_gen_event_diagnostics"][
+        "s2u_completion_events"
+    ] == []
+    assert partial_record["completed_hops"] == []
+    access = partial_summary["by_sender"]["UAV_0"]["s2u_access_received"]
+    assert access["transmitted_bits"] == pytest.approx(250_000.0)
+    assert access["completed_packets"] == 0
 
 
 def test_real_packet_engine_slot_delivery_uses_nested_outcome_and_fov_useful_bits():

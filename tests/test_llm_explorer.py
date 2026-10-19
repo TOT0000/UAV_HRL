@@ -1,5 +1,8 @@
+import hashlib
 import json
 import shutil
+import tempfile
+from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
@@ -17,11 +20,13 @@ from llm_explorer import (
     LLM_EXPLORER_VERSION,
     LLMExplorerConfig,
     LLMExplorerController,
+    DeterministicMockExplorerClient,
     assemble_first_gen_feedback,
     build_observable_initial_state,
     compact_feedback_for_llm,
     compact_routing_record,
     environment_constants_and_definitions,
+    environment_constants_and_definitions_first_gen,
     explorer_metadata,
     first_gen_movement_summary,
     first_gen_routing_summary,
@@ -33,6 +38,20 @@ from llm_explorer import (
     stratified_routing_samples,
 )
 from observation_strategy import routing_state_feature_names
+from llm_explorer_td3_only import (
+    LLMExplorerTD3OnlyController,
+    environment_definitions_td3_only,
+)
+from llm_explorer_v3 import (
+    LLMExplorerV3Controller,
+    environment_definitions_v3,
+)
+from llm_state_rule_explorer import (
+    LLMStateRuleController,
+    environment_definitions_state_rule,
+)
+from run_experiment import main as run_experiment_main
+from scenario_manifest import generate_manifest
 from td3 import TD3
 
 
@@ -262,6 +281,70 @@ def test_prompt_renderer_does_not_reinterpret_inserted_braces():
     )
 
 
+def test_other_explorer_environment_and_system_prompts_match_parent_baseline():
+    kwargs = {
+        "episode_seconds": 60,
+        "routing_slot_seconds": 0.25,
+        "environment_width_m": 1000.0,
+        "environment_height_m": 1000.0,
+        "task_deadlines_seconds": {"FOV": 0.015, "COM": 0.01},
+    }
+    expected = {
+        "v3": (
+            "9f362f3a2c3d7743f4cf954774e0ede67274721efd94d8dee79a0e3f92480a5c",
+            "578cc4bc85ae3089ab97382e6dbfb2227c763559c72ba89985502d0f924904bb",
+        ),
+        "td3_only": (
+            "271a70cfb9c17bb7edbc00535775c31b81af8ddef8e707e636e4f0beacbb735e",
+            "5b711f05970beec01e4cea6340523a6dc2b8ff2758ddef8fbc40bcd9fcfca3dd",
+        ),
+        "state_rule": (
+            "b16ddb898871056e94a092052e6a4f87bd4a96eaa5a45314161224a84fd11c1e",
+            "f8514aee68e88ecf6e7575c8a5d36577dab74728dd4fa482a8fbe4791ae0e78b",
+        ),
+    }
+    variants = (
+        ("v3", environment_definitions_v3, LLMExplorerV3Controller),
+        (
+            "td3_only",
+            environment_definitions_td3_only,
+            LLMExplorerTD3OnlyController,
+        ),
+        (
+            "state_rule",
+            environment_definitions_state_rule,
+            LLMStateRuleController,
+        ),
+    )
+    for name, environment_builder, controller_type in variants:
+        environment = environment_builder(**kwargs)
+        controller = controller_type(
+            run_directory=None,
+            run_identity={"isolation": name},
+            evaluation=True,
+        )
+        system_template = controller._templates()[0]
+        rendered = controller._render_system_prompt(system_template, environment)
+        environment_hash = hashlib.sha256(
+            json.dumps(
+                environment,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        prompt_hash = hashlib.sha256(rendered.encode("utf-8")).hexdigest()
+        assert (environment_hash, prompt_hash) == expected[name]
+
+    shared = environment_constants_and_definitions(**kwargs)
+    first_gen = environment_constants_and_definitions_first_gen(**kwargs)
+    assert "propulsion" not in shared
+    assert "feedback_dictionary" not in shared
+    assert "traffic_defaults_packets_per_second" not in shared
+    assert "propulsion" in first_gen
+    assert "feedback_dictionary" in first_gen
+    assert "traffic_defaults_packets_per_second" in first_gen
+
+
 def test_mask_then_normalize_uses_100_percent_prior_and_edge_cases():
     prior = np.zeros(17)
     prior[3] = 3.0
@@ -487,6 +570,40 @@ def test_matching_saved_responses_replay_without_new_requests(tmp_path):
     assert replay.statistics["requests_total"] == 2
 
 
+def test_old_first_generation_cache_identity_is_not_reused(tmp_path):
+    first = LLMExplorerController(
+        run_directory=tmp_path,
+        run_identity={"run": "old-cache"},
+        client=SequenceClient(["old analysis", _guidance(0.05)]),
+    )
+    first.previous_episode_feedback = _previous_feedback()
+    _begin(first)
+
+    episode_root = tmp_path / "llm_explorer" / "episode_000168"
+    identity_files = [
+        episode_root / "episode_result.json",
+        episode_root / "analysis" / "completed.json",
+        episode_root / "guidance" / "completed.json",
+    ]
+    for path in identity_files:
+        value = json.loads(path.read_text(encoding="utf-8"))
+        value["identity"]["cache_version"] = (
+            "episode-fixed-dual-guidance-cache-v2"
+        )
+        path.write_text(json.dumps(value), encoding="utf-8")
+
+    client = SequenceClient(["new analysis", _guidance(0.04)])
+    replay = LLMExplorerController(
+        run_directory=tmp_path,
+        run_identity={"run": "old-cache"},
+        client=client,
+    )
+    replay.previous_episode_feedback = _previous_feedback()
+    restored = _begin(replay)
+    assert restored["reused"] is False
+    assert len(client.calls) == 2
+
+
 def test_stratified_routing_sampling_does_not_invent_decisions():
     records = [
         {"sender_uav_id": 0, "time_seconds": float(index), "selected_action": 0}
@@ -595,13 +712,19 @@ def test_real_size_compact_prompts_preserve_samples_and_fit_all_attempts(tmp_pat
     result = _begin(
         controller,
         current_state=current_state,
-        environment_constants=environment_constants_and_definitions(
+        environment_constants=environment_constants_and_definitions_first_gen(
             episode_seconds=60,
             routing_slot_seconds=0.25,
         ),
     )
     assert not result["td3_fallback"] and not result["routing_fallback"]
     assert len(client.calls) == 3
+    assert "actual_hol_wait_time_seconds" in client.calls[0]["system_prompt"]
+    assert "slot-start hol fields" in client.calls[0]["system_prompt"].lower()
+    assert "actor_pre_projection_guidance_bias_normalized" in client.calls[0][
+        "prompt"
+    ]
+    assert "actual_hol_wait_time_seconds" in client.calls[0]["prompt"]
 
     compact = compact_feedback_for_llm(previous)
     assert len(compact["uav_core_summary"]["by_uav"]) == 16
@@ -936,10 +1059,191 @@ def test_movement_summary_uses_circular_heading_and_target_bearing():
         {"enabled": False, "td3_fallback": True},
     )
     uav = summary["by_uav"]["UAV_0"]
-    assert abs(abs(uav["actor_heading_circular_rad"]["circular_mean_rad"]) - np.pi) < 0.05
-    bearing = uav["service_target_geometry"]["FOV"]["bearing_xy_rad"]
+    assert abs(
+        abs(
+            uav["actor_heading_circular_rad_td3_controlled_only"][
+                "circular_mean_rad"
+            ]
+        )
+        - np.pi
+    ) < 0.05
+    bearing = uav["service_target_geometry"]["by_service"]["FOV"][
+        "bearing_xy_rad"
+    ]
     assert abs(abs(bearing["circular_mean_rad"]) - np.pi) < 0.05
     assert bearing["resultant_length"] > 0.99
+
+
+def _first_gen_movement_record(
+    interval, *, controlled_uav_ids=(), bias_value=0.02,
+    guidance_active=True,
+):
+    controlled = {int(value) for value in controlled_uav_ids}
+    bias = [float(bias_value), 0.0, 0.0]
+    return {
+        "time_seconds": float(interval),
+        "uavs": [
+            {
+                "uav_id": uav_id,
+                "task_types": ["FOV"] if uav_id == 0 else [],
+                "movement_mask": uav_id in controlled,
+                "actor_normalized_action": [0.1, 0.0, 0.0],
+                "pre_projection_normalized_action": [
+                    0.1 + float(bias_value),
+                    0.0,
+                    0.0,
+                ],
+                "policy_projected_normalized_action": [
+                    0.1 + float(bias_value),
+                    0.0,
+                    0.0,
+                ],
+                "executed_normalized_action": (
+                    [0.1 + float(bias_value), 0.0, 0.0]
+                    if uav_id in controlled
+                    else [-1.0, 0.0, 0.0]
+                ),
+                "td3_guidance_active": bool(guidance_active),
+                "actor_pre_projection_llm_bias": (
+                    bias if guidance_active else None
+                ),
+                "td3_controlled_applied_llm_bias": (
+                    bias
+                    if guidance_active and uav_id in controlled
+                    else None
+                ),
+                # A TD3 diagnostic zero/value can exist independently of
+                # whether the host movement mask admits TD3 control.
+                "applied_llm_bias": bias,
+                "observable_targets": (
+                    [
+                        {
+                            "kind": "roi",
+                            "id": 1,
+                            "relative_position_m": [10.0, 0.0, -100.0],
+                        }
+                    ]
+                    if uav_id == 0
+                    else []
+                ),
+                "service_observation": None,
+                "movement_energy_j": 1.0,
+            }
+            for uav_id in range(16)
+        ],
+    }
+
+
+def _active_first_gen_guidance(value=0.02):
+    return {
+        "enabled": True,
+        "td3_fallback": False,
+        "routing_fallback": False,
+        "td3_bias": [[float(value), 0.0, 0.0] for _ in range(16)],
+        "routing_prior": [[1.0 / 17.0] * 17 for _ in range(16)],
+    }
+
+
+def test_movement_bias_application_requires_td3_control_but_keeps_requested_bias():
+    records = [
+        _first_gen_movement_record(index, controlled_uav_ids=())
+        for index in range(3)
+    ]
+    summary, cases = first_gen_movement_summary(
+        records, _active_first_gen_guidance()
+    )
+    uav = summary["by_uav"]["UAV_0"]
+    assert uav["td3_controlled_decision_count"] == 0
+    assert uav["requested_episode_fixed_raw_bias_normalized"] == [
+        0.02,
+        0.0,
+        0.0,
+    ]
+    assert uav["actor_pre_projection_guidance_bias_normalized"]["speed"][
+        "valid_sample_count"
+    ] == 3
+    assert uav["actually_added_bias_normalized"]["speed"][
+        "valid_sample_count"
+    ] == 0
+    assert uav["bias_application_count"] == 0
+    assert uav["td3_controlled_service_target_geometry"]["by_service"][
+        "FOV"
+    ]["distance_3d_m"]["valid_sample_count"] == 0
+    assert all(
+        case["td3_controlled_applied_llm_bias"] is None for case in cases
+    )
+
+
+def test_movement_bias_application_tracks_mask_switches_and_global_count():
+    records = [
+        _first_gen_movement_record(0, controlled_uav_ids=()),
+        _first_gen_movement_record(1, controlled_uav_ids={0}),
+        _first_gen_movement_record(2, controlled_uav_ids=()),
+    ]
+    guidance = _active_first_gen_guidance()
+    movement, cases = first_gen_movement_summary(records, guidance)
+    uav = movement["by_uav"]["UAV_0"]
+    assert uav["td3_controlled_decision_count"] == 1
+    assert uav["bias_application_count"] == 1
+    assert uav["actually_added_bias_normalized"]["speed"][
+        "valid_sample_count"
+    ] == 1
+    assert any(
+        case["uav_id"] == 0
+        and case["movement_mask"] is True
+        and case["td3_controlled_applied_llm_bias"] == [0.02, 0.0, 0.0]
+        for case in cases
+    )
+
+    feedback = assemble_first_gen_feedback(
+        metrics={},
+        movement_records=records,
+        routing_records=[],
+        slot_service_records=[],
+        applied_guidance=guidance,
+    )
+    by_uav_count = sum(
+        item["bias_application_count"]
+        for item in feedback["uav_core_summary"]["by_uav"].values()
+    )
+    assert by_uav_count == 1
+    assert feedback["previous_application_status"][
+        "td3_bias_application_count"
+    ] == by_uav_count
+
+
+def test_active_zero_bias_is_application_but_fallback_zero_is_not():
+    active_record = _first_gen_movement_record(
+        0, controlled_uav_ids={0}, bias_value=0.0, guidance_active=True
+    )
+    active, active_cases = first_gen_movement_summary(
+        [active_record], _active_first_gen_guidance(0.0)
+    )
+    active_uav = active["by_uav"]["UAV_0"]
+    assert active_uav["bias_application_count"] == 1
+    assert active_uav["actually_added_bias_normalized"]["speed"]["mean"] == 0.0
+    assert any(
+        case["uav_id"] == 0
+        and case["td3_controlled_applied_llm_bias"] == [0.0, 0.0, 0.0]
+        for case in active_cases
+    )
+
+    inactive_record = _first_gen_movement_record(
+        0, controlled_uav_ids={0}, bias_value=0.0, guidance_active=False
+    )
+    fallback, fallback_cases = first_gen_movement_summary(
+        [inactive_record], {"enabled": False, "td3_fallback": True}
+    )
+    fallback_uav = fallback["by_uav"]["UAV_0"]
+    assert fallback_uav["requested_episode_fixed_raw_bias_normalized"] is None
+    assert fallback_uav["bias_application_count"] == 0
+    assert fallback_uav["actually_added_bias_normalized"]["speed"][
+        "valid_sample_count"
+    ] == 0
+    assert all(
+        case["td3_controlled_applied_llm_bias"] is None
+        for case in fallback_cases
+    )
 
 
 def test_routing_summary_separates_preselection_service_and_shared_reward():
@@ -1021,7 +1325,7 @@ def test_first_generation_versions_metadata_and_old_checkpoint_rejection(tmp_pat
     restored.load_state_dict(state)
     assert restored.state_dict()["schema_version"] == LLM_EXPLORER_VERSION
 
-    state["schema_version"] = "uav-hrl-llm-explorer-v2"
+    state["schema_version"] = "uav-hrl-llm-explorer-firstgen-v3"
     with pytest.raises(Exception, match="checkpoint version is incompatible"):
         controller.load_state_dict(state)
 
@@ -1067,3 +1371,123 @@ def test_first_generation_observers_do_not_change_warmup_training_result():
         "coverage",
     ):
         assert first_generation[key] == pytest.approx(baseline[key])
+
+
+def test_two_episode_mock_training_applies_first_generation_guidance(
+    tmp_path, monkeypatch
+):
+    client = SequenceClient(["guided analysis", _guidance(0.02)])
+    original_begin_episode = LLMExplorerController.begin_episode
+
+    def begin_after_simulated_warmup(self, *args, **kwargs):
+        kwargs["total_joint_transitions"] = max(
+            int(kwargs.get("total_joint_transitions", 0)), 10_000
+        )
+        return original_begin_episode(self, *args, **kwargs)
+
+    monkeypatch.setattr(
+        LLMExplorerController, "begin_episode", begin_after_simulated_warmup
+    )
+    result = train(
+        TrainingConfig(
+            total_episodes=2,
+            mode="smoke",
+            episode_seconds=8,
+            warmup_joint_transitions=0,
+            routing_warmup_transitions=1,
+            batch_size=1,
+            enable_model_checkpoints=False,
+            enable_full_resume=False,
+            enable_plots=False,
+            enable_csv=False,
+            run_directory=str(tmp_path),
+            random_seed=20261019,
+        ),
+        scenario_manifest=generate_manifest(
+            "train", 20261019, 2, num_gt=2
+        ),
+        method_spec=MethodSpec.parse("td3_dinkelbach_llm_explorer"),
+        llm_explorer_client=client,
+    )
+    assert result["episodes_run"] == 2
+    assert result["llm_explorer"]["statistics"]["requests_total"] == 2
+    assert len(client.calls) == 2
+    feedback = json.loads(
+        (
+            tmp_path
+            / "llm_explorer"
+            / "episode_000002"
+            / "feedback.json"
+        ).read_text(encoding="utf-8")
+    )
+    application = feedback["previous_application_status"]
+    assert application["guidance_enabled"] is True
+    assert application["td3_fallback"] is False
+    assert application["routing_fallback"] is False
+    assert application["td3_bias_application_count"] > 0
+    assert application["td3_bias_application_count"] == sum(
+        item["bias_application_count"]
+        for item in feedback["uav_core_summary"]["by_uav"].values()
+    )
+    assert "actual_hol_wait_time_seconds" in client.calls[0]["prompt"]
+
+
+def test_first_generation_cli_train_evaluate_and_resume_without_llm_call(
+    monkeypatch
+):
+    calls = []
+
+    def unexpected_chat(self, **kwargs):
+        calls.append(kwargs)
+        raise AssertionError("short warmup/evaluation/resume must not call the LLM")
+
+    monkeypatch.setattr(
+        DeterministicMockExplorerClient, "chat", unexpected_chat
+    )
+    with tempfile.TemporaryDirectory(prefix="fg-") as short_temp:
+        output_root = Path(short_temp)
+        method = "td3_dinkelbach_llm_explorer"
+        assert run_experiment_main(
+            [
+                method,
+                "--episodes",
+                "1",
+                "--episode-seconds",
+                "1",
+                "--checkpoint-interval",
+                "1",
+                "--roi-count",
+                "2",
+                "--seed",
+                "20261019",
+                "--output-root",
+                str(output_root),
+                "--llm-explorer-mock",
+            ]
+        ) == 0
+        run_dir = next((output_root / method).iterdir())
+        assert (run_dir / "checkpoints" / "models" / "ep_0001").is_dir()
+
+        assert run_experiment_main(
+            [
+                "evaluate",
+                str(run_dir),
+                "--checkpoint-episode",
+                "1",
+                "--smoke",
+            ]
+        ) == 0
+        evaluation_dir = next((run_dir / "evaluation" / "ep_1").iterdir())
+        metadata = json.loads(
+            (evaluation_dir / "run_metadata.json").read_text(encoding="utf-8")
+        )
+        assert metadata["smoke_evaluation"] is True
+        assert metadata["evaluation_invariants"]["exploration_disabled"] is True
+        assert all(metadata["evaluation_invariants"].values())
+        assert calls == []
+
+        assert run_experiment_main(
+            ["resume", str(run_dir), "--target-episodes", "2"]
+        ) == 0
+        assert (run_dir / "checkpoints" / "models" / "ep_0002").is_dir()
+        assert calls == []

@@ -162,6 +162,7 @@ from llm_explorer import (
     build_movement_decision_record,
     build_observable_initial_state,
     environment_constants_and_definitions,
+    environment_constants_and_definitions_first_gen,
     explorer_metadata,
     first_gen_slot_service_record,
     llm_explorer_path_preflight,
@@ -1034,6 +1035,9 @@ def _run_routing_slot(
         },
         routing_transition_ids_by_sender=routing_transition_ids,
         effective_masks_by_sender=effective_masks,
+        collect_first_gen_event_diagnostics=(
+            first_gen_slot_service_observer
+        ),
     )
     if routing_slot_observer is not None:
         routing_slot_observer(
@@ -3146,6 +3150,9 @@ def train(
                     if method_spec.llm_explorer_td3_only_enabled
                     else environment_definitions_v3
                     if method_spec.llm_explorer_v3_enabled
+                    else environment_constants_and_definitions_first_gen
+                    if method_spec.method_id
+                    == "td3_dinkelbach_llm_explorer"
                     else environment_constants_and_definitions
                 )(
                     episode_seconds=config.episode_seconds,
@@ -3512,6 +3519,12 @@ def train(
                         movement_action_diagnostics["mean_bias"]
                         if movement_action_diagnostics is not None
                         else None
+                    ),
+                    td3_guidance_active=(
+                        method_spec.method_id
+                        == "td3_dinkelbach_llm_explorer"
+                        and bool(episode_guidance.get("enabled", False))
+                        and not bool(episode_guidance.get("td3_fallback", True))
                     ),
                     noise_std=behavior_noise,
                     auxiliary_snapshot=(
