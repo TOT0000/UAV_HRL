@@ -79,6 +79,7 @@ from llm_potential import (
 from llm_explorer import (
     LLM_EXPLORER_CACHE_VERSION,
     LLM_EXPLORER_CASE_VERSION,
+    LLM_EXPLORER_GUIDANCE_MAX_OUTPUT_TOKENS,
     LLM_EXPLORER_METHOD_ID,
     LLM_EXPLORER_NUMERICAL_OUTPUT_PROTOCOL,
     LLM_EXPLORER_PROMPT_VERSION,
@@ -1100,15 +1101,20 @@ def run(args):
                 numerical_output_protocol=(
                     LLM_EXPLORER_NUMERICAL_OUTPUT_PROTOCOL
                 ),
+                guidance_max_output_tokens=(
+                    LLM_EXPLORER_GUIDANCE_MAX_OUTPUT_TOKENS
+                ),
                 context_window_tokens=128000,
                 safety_margin_tokens=4096,
                 guidance_weight=1.0,
                 annealing_end_episode=None,
                 td3_guidance="episode_fixed_raw_bias_added_once",
-                routing_guidance="episode_fixed_16x17_prior",
+                routing_guidance=(
+                    "episode_fixed_16x17_raw_relative_weights_with_host_normalized_pre_mask_prior"
+                ),
                 routing_intervention=(
-                    "epsilon_branch_100_percent_masked_renormalized_prior; "
-                    "legal_uniform_only_on_zero_legal_mass"
+                    "epsilon_branch_100_percent_masked_renormalized_weights; "
+                    "legal_uniform_on_whole_row_or_masked_legal_zero_weight"
                 ),
             )
     _write_json_atomic(run_dir / "resolved_config.json", resolved)
@@ -1451,11 +1457,29 @@ def run_resume(args):
             numerical_output_protocol=(
                 LLM_EXPLORER_NUMERICAL_OUTPUT_PROTOCOL
             ),
+            guidance_max_output_tokens=(
+                LLM_EXPLORER_GUIDANCE_MAX_OUTPUT_TOKENS
+            ),
         )
         resolved["llm_explorer"] = explorer_resolution
         if explorer_protocol_upgrade is not None:
+            checkpoint_explorer_config = (
+                (
+                    plan.resume_training_state.get("llm_explorer_state")
+                    or {}
+                ).get("config")
+                or {}
+            )
             migration = {
                 **explorer_protocol_upgrade,
+                "source_checkpoint_prompt_version": (
+                    checkpoint_explorer_config.get("prompt_version")
+                ),
+                "source_checkpoint_guidance_max_output_tokens": int(
+                    checkpoint_explorer_config.get(
+                        "guidance_max_output_tokens", 5_000
+                    )
+                ),
                 "source_checkpoint": str(Path(checkpoint).resolve()),
                 "source_checkpoint_episode": int(plan.resume_episode),
                 "effective_episode": int(plan.resume_episode) + 1,

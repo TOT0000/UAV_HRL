@@ -1,18 +1,18 @@
-You convert the first-stage exploration analysis into numerical exploration guidance for TD3 and routing.
+Convert the first-stage analysis into numerical exploration guidance for TD3 and routing.
 
-The system uses 16 UAVs to collect FOV/COM data and deliver it to the ground station, GS. The objective is to maximize timely useful bits per joule of movement energy. Standard FOV/COM end-to-end deadlines are 15/10 ms.
+The system uses 16 UAVs to collect data and deliver it to GS. The objective is to maximize timely useful bits per joule of movement energy. Use the analysis, current state, numerical bounds, and previous-episode feedback to produce this episode's guidance.
 
-Use the complete analysis, current state, numerical bounds, and historical guidance to produce the two matrices for this episode.
+[TD3 bias]
 
-[1. TD3 exploration bias]
-
-td3_bias must be a 16x3 matrix. Rows correspond to UAV IDs 0-15. Columns are speed, heading, and vertical.
+td3_bias must be a 16x3 matrix:
+- Rows correspond to UAV IDs 0-15.
+- Columns are speed, heading, and vertical.
 
 Normalized actions are decoded as:
-- Horizontal speed: v_xy = 5 * (speed + 1) m/s.
-- Heading angle: theta = pi * heading rad.
-- Horizontal components: v_x = v_xy * cos(theta), v_y = v_xy * sin(theta).
-- Vertical speed: v_z = 2 * vertical m/s.
+v_xy = 5 * (speed + 1) m/s.
+theta = pi * heading rad.
+v_x = v_xy * cos(theta), v_y = v_xy * sin(theta).
+v_z = 2 * vertical m/s.
 
 The domains of speed and vertical are [-1,1]. Heading is periodic in [-1,1). A speed value of 0 means a horizontal speed of 5 m/s.
 
@@ -22,77 +22,66 @@ Every bias must be finite and satisfy:
 On TD3-controlled decisions, the host executes:
 Project[Actor(s) + td3_bias + original Gaussian noise].
 
-The bias is added directly, without another sigma multiplication or an annealing weight. It remains fixed within the episode, while control eligibility and action projection are evaluated at each decision. Do not treat the initial movement mask as an episode-long eligibility constraint.
+The bias is added directly, without another sigma multiplication or an annealing weight. It remains fixed within the episode, while control eligibility and projection constraints are evaluated at each decision. The initial movement mask is not an episode-long eligibility constraint.
 
-[2. Routing exploration probabilities]
+[Routing weights]
 
-routing_prior must be a 16x17 matrix:
+routing_weights must be a 16x17 matrix:
 - Rows correspond to sender UAV IDs 0-15.
-- Columns 0-15 correspond to UAV actions, and column 16 corresponds to GS.
+- Columns 0-15 correspond to UAVs 0-15, and column 16 corresponds to GS.
 - A sender's own column represents WAIT. For example, column 3 is WAIT for UAV 3.
 
-Each row must be a valid probability distribution: every entry must be a finite number in [0,1], and the absolute difference between its row sum and 1 must not exceed 0.000001. These are probabilities, not unnormalized weights. For example, assigning 0.6 to one action leaves a total probability of 0.4 for all remaining actions combined.
+Weights must be finite and nonnegative. They do not need to sum to 1 and are not restricted to values at or below 1. They express relative preferences among one sender's actions. For example, [3,1,1] corresponds to probabilities [0.6,0.2,0.2]. Output the weights; the host computes the probabilities.
 
-The matrix remains fixed within the episode. During epsilon exploration, the host removes currently illegal actions, renormalizes the remaining probabilities, and samples entirely from that distribution. It falls back to legal-uniform sampling only when the total probability of legal actions is zero. Greedy decisions and the original epsilon schedule remain unchanged.
+During epsilon exploration, the host removes currently illegal actions, normalizes the remaining weights, and samples from that distribution. If an entire row or its legal weights sum to zero, that UAV uses legal-uniform exploration while other UAVs retain their valid guidance.
 
-Consequently, a zero probability can exclude a legal action from exploration. If WAIT is the only legal action with positive probability, the resulting exploration probability of WAIT becomes 1.
+When another legal action has positive weight, a zero-weight action cannot be selected. If WAIT is the only legal action with positive weight, exploration selects WAIT with probability 1.
 
-[3. Converting the analysis into numbers]
+Weights remain fixed within the episode. Greedy decisions and the epsilon schedule remain unchanged.
 
-Follow the analysis's UAV IDs, bias directions, magnitudes, and probability-allocation rationale. If a bias magnitude is expressed as a fraction of sigma, convert it into the actual raw bias.
+[Choosing numerical values]
 
-For unspecified entries, follow the analysis's choice of neutral guidance or reliable historical guidance:
+Follow the analysis's UAV IDs, bias directions, magnitudes, and weight-allocation rationale. Convert TD3 magnitudes expressed as fractions of sigma into actual raw bias values.
+
+For unspecified entries, follow the analysis's choice of neutral guidance or evidence-supported previous guidance:
 - Neutral TD3 bias is zero.
-- Neutral routing is uniform over all 17 actions.
-- History marked unknown provides no reliable historical basis.
+- Neutral routing weights are 17 ones per row.
 
-Historical matrices are rounded reference values. Reused guidance must still satisfy the current bias bounds and row-sum requirements.
+Reused TD3 bias must satisfy the current bounds.
 
-Three-decimal input presentation does not restrict output precision. Use enough precision to avoid invalidating a probability distribution through rounding.
+Prefer integers or short decimals for weights. Use sufficient precision for TD3 bias to satisfy its bounds. Three-decimal input presentation does not restrict output precision.
 
-[4. Output requirements and example]
+[Output format]
 
-Return only one JSON object containing td3_bias and routing_prior. Do not include Markdown code fences, comments, or explanatory text. Write every matrix element as an evaluated finite JSON number; do not use expressions or ellipses.
+Return only one complete JSON object containing td3_bias and routing_weights. Do not include Markdown code fences, comments, or explanatory text.
 
-Before responding, verify both matrix dimensions, the bias bounds, and every probability row sum. If validation feedback is provided, correct the identified errors and return both complete matrices.
+Every element must be a finite JSON number, not a string, expression, or ellipsis. Before responding, verify the matrix dimensions, TD3 bounds, and nonnegative weights. If validation feedback is provided, correct the identified errors and return both complete matrices.
 
-The following is a complete valid format example using zero bias and uniform exploration. Determine the actual guidance from this episode's analysis rather than copying the example.
+The following example uses zero bias and neutral routing weights to demonstrate a valid format. Determine the actual values from this episode's analysis.
 
 {
   "td3_bias": [
-    [0,0,0],
-    [0,0,0],
-    [0,0,0],
-    [0,0,0],
-    [0,0,0],
-    [0,0,0],
-    [0,0,0],
-    [0,0,0],
-    [0,0,0],
-    [0,0,0],
-    [0,0,0],
-    [0,0,0],
-    [0,0,0],
-    [0,0,0],
-    [0,0,0],
-    [0,0,0]
+    [0,0,0], [0,0,0], [0,0,0], [0,0,0],
+    [0,0,0], [0,0,0], [0,0,0], [0,0,0],
+    [0,0,0], [0,0,0], [0,0,0], [0,0,0],
+    [0,0,0], [0,0,0], [0,0,0], [0,0,0]
   ],
-  "routing_prior": [
-    [0.05882353,0.05882353,0.05882353,0.05882353,0.05882353,0.05882353,0.05882353,0.05882353,0.05882353,0.05882353,0.05882353,0.05882353,0.05882353,0.05882353,0.05882353,0.05882353,0.05882353],
-    [0.05882353,0.05882353,0.05882353,0.05882353,0.05882353,0.05882353,0.05882353,0.05882353,0.05882353,0.05882353,0.05882353,0.05882353,0.05882353,0.05882353,0.05882353,0.05882353,0.05882353],
-    [0.05882353,0.05882353,0.05882353,0.05882353,0.05882353,0.05882353,0.05882353,0.05882353,0.05882353,0.05882353,0.05882353,0.05882353,0.05882353,0.05882353,0.05882353,0.05882353,0.05882353],
-    [0.05882353,0.05882353,0.05882353,0.05882353,0.05882353,0.05882353,0.05882353,0.05882353,0.05882353,0.05882353,0.05882353,0.05882353,0.05882353,0.05882353,0.05882353,0.05882353,0.05882353],
-    [0.05882353,0.05882353,0.05882353,0.05882353,0.05882353,0.05882353,0.05882353,0.05882353,0.05882353,0.05882353,0.05882353,0.05882353,0.05882353,0.05882353,0.05882353,0.05882353,0.05882353],
-    [0.05882353,0.05882353,0.05882353,0.05882353,0.05882353,0.05882353,0.05882353,0.05882353,0.05882353,0.05882353,0.05882353,0.05882353,0.05882353,0.05882353,0.05882353,0.05882353,0.05882353],
-    [0.05882353,0.05882353,0.05882353,0.05882353,0.05882353,0.05882353,0.05882353,0.05882353,0.05882353,0.05882353,0.05882353,0.05882353,0.05882353,0.05882353,0.05882353,0.05882353,0.05882353],
-    [0.05882353,0.05882353,0.05882353,0.05882353,0.05882353,0.05882353,0.05882353,0.05882353,0.05882353,0.05882353,0.05882353,0.05882353,0.05882353,0.05882353,0.05882353,0.05882353,0.05882353],
-    [0.05882353,0.05882353,0.05882353,0.05882353,0.05882353,0.05882353,0.05882353,0.05882353,0.05882353,0.05882353,0.05882353,0.05882353,0.05882353,0.05882353,0.05882353,0.05882353,0.05882353],
-    [0.05882353,0.05882353,0.05882353,0.05882353,0.05882353,0.05882353,0.05882353,0.05882353,0.05882353,0.05882353,0.05882353,0.05882353,0.05882353,0.05882353,0.05882353,0.05882353,0.05882353],
-    [0.05882353,0.05882353,0.05882353,0.05882353,0.05882353,0.05882353,0.05882353,0.05882353,0.05882353,0.05882353,0.05882353,0.05882353,0.05882353,0.05882353,0.05882353,0.05882353,0.05882353],
-    [0.05882353,0.05882353,0.05882353,0.05882353,0.05882353,0.05882353,0.05882353,0.05882353,0.05882353,0.05882353,0.05882353,0.05882353,0.05882353,0.05882353,0.05882353,0.05882353,0.05882353],
-    [0.05882353,0.05882353,0.05882353,0.05882353,0.05882353,0.05882353,0.05882353,0.05882353,0.05882353,0.05882353,0.05882353,0.05882353,0.05882353,0.05882353,0.05882353,0.05882353,0.05882353],
-    [0.05882353,0.05882353,0.05882353,0.05882353,0.05882353,0.05882353,0.05882353,0.05882353,0.05882353,0.05882353,0.05882353,0.05882353,0.05882353,0.05882353,0.05882353,0.05882353,0.05882353],
-    [0.05882353,0.05882353,0.05882353,0.05882353,0.05882353,0.05882353,0.05882353,0.05882353,0.05882353,0.05882353,0.05882353,0.05882353,0.05882353,0.05882353,0.05882353,0.05882353,0.05882353],
-    [0.05882353,0.05882353,0.05882353,0.05882353,0.05882353,0.05882353,0.05882353,0.05882353,0.05882353,0.05882353,0.05882353,0.05882353,0.05882353,0.05882353,0.05882353,0.05882353,0.05882353]
+  "routing_weights": [
+    [1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1],
+    [1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1],
+    [1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1],
+    [1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1],
+    [1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1],
+    [1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1],
+    [1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1],
+    [1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1],
+    [1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1],
+    [1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1],
+    [1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1],
+    [1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1],
+    [1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1],
+    [1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1],
+    [1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1],
+    [1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1]
   ]
 }

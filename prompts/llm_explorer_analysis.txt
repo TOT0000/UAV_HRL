@@ -18,7 +18,7 @@ These include EE, timely useful GS bits, movement energy of all UAVs, separate F
 
 {{PREVIOUS_APPLICATION_STATUS}}
 
-Historical guidance includes the complete 16x3 raw TD3 bias and 16x17 routing prior, presented as rounded references. Unavailable history is explicitly marked unknown.
+Historical guidance includes the complete 16x3 raw TD3 bias, 16x17 raw routing weights when recorded, and the 16x17 host-normalized pre-mask routing prior, presented as rounded references. Unavailable history is explicitly marked unknown.
 
 [Current observable initial state]
 
@@ -65,18 +65,18 @@ Absolute case time_s remains in seconds. Explicit service durations and UAV/SR H
 
 [Requested analysis]
 
-Return four concise sections:
+Use the previous episode's outcomes and behavior statistics, together with the current observable initial state, to propose exploration guidance for this episode. Return four concise sections:
 
-1. Priority limitations.
-Select at most two issues. Cite supporting values and valid denominators. Distinguish sensing, SR access, routing, WAIT, deadline, and energy limitations.
+1. Priority limitations
+Select at most two main issues affecting timely useful delivery or energy. Support your assessment with values and valid denominators, distinguishing sensing, SR access, routing, WAIT, deadline, and energy limitations.
 
-2. TD3 recommendations.
-Identify UAV IDs, action components, signed bias directions, and magnitude evidence. For proposed changes, give a raw-bias value or a fraction of the current bound. Assess whether an episode-fixed offset is compatible with role and target-direction changes.
+2. TD3 recommendations
+Identify UAV IDs, action components, signed bias directions, and evidence for their magnitudes. Express magnitudes as raw bias values or fractions of the current sigma bound. Consider whether an episode-fixed offset remains appropriate as roles and target directions change.
 
-3. Routing recommendations.
-Use sender IDs and GS/WAIT/UAV_j names. For distributions to change, specify probabilities for important actions and how remaining mass should be allocated, so the next stage can construct numerical distributions.
+3. Routing recommendations
+Use sender UAV IDs and GS, WAIT, or UAV_j action names. Specify relative weights for important actions, explain the evidence, and state how other actions should be handled. Use integers or short decimals; do not convert weights into probabilities.
 
-4. Expected effects and limitations.
-Explain possible effects on useful delivery, energy, and deadline violations. Identify major unknowns and hypotheses requiring observation. Explicitly choose neutral guidance or evidence-supported historical reuse for unspecified entries.
+4. Expected effects and uncertainty
+Explain potential effects on useful delivery, energy, and deadline violations. Distinguish observations from hypotheses requiring validation. For unspecified entries, explicitly choose neutral guidance or evidence-supported reuse of the previous episode's guidance.
 
-Neutral guidance means zero TD3 bias and a uniform 17-action routing prior. This stage returns the analysis and necessary numerical rationale. The next stage produces the complete matrices.
+Neutral guidance means zero TD3 bias and routing weights of 1 for every action. This stage supplies analysis and necessary numerical rationale; the next stage produces the complete matrices.

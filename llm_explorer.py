@@ -27,21 +27,32 @@ import numpy as np
 LLM_EXPLORER_METHOD_ID = "td3_dinkelbach_llm_explorer"
 LLM_EXPLORER_MODEL = "gpt-4o-mini"
 LLM_EXPLORER_VERSION = "uav-hrl-llm-explorer-firstgen-v6"
-LLM_EXPLORER_PROMPT_VERSION = "uav-hrl-llm-explorer-prompts-v9"
+LLM_EXPLORER_PROMPT_VERSION = "uav-hrl-llm-explorer-prompts-v10"
 LLM_EXPLORER_SUMMARY_VERSION = "complete-core-feedback-v4"
 LLM_EXPLORER_CASE_VERSION = "deterministic-diverse-cases-v1"
-LLM_EXPLORER_CACHE_VERSION = "episode-fixed-dual-guidance-cache-v6"
+LLM_EXPLORER_CACHE_VERSION = "episode-fixed-dual-guidance-cache-v7"
 LLM_EXPLORER_COMPRESSION_VERSION = LLM_EXPLORER_SUMMARY_VERSION
 LLM_EXPLORER_PRESENTATION_VERSION = "firstgen-columns-rows-3dp-ms-v2"
 LLM_EXPLORER_NUMERICAL_OUTPUT_PROTOCOL = (
-    "chat-completions-strict-json-schema-v1"
+    "chat-completions-strict-json-schema-routing-weights-v2"
 )
-LLM_EXPLORER_NUMERICAL_STAGE = "numerical_json_schema_v1"
-LLM_EXPLORER_COMPATIBLE_RESUME_PROMPT_VERSIONS = frozenset(
-    {"uav-hrl-llm-explorer-prompts-v8"}
-)
-LLM_EXPLORER_COMPATIBLE_RESUME_CACHE_VERSIONS = frozenset(
-    {"episode-fixed-dual-guidance-cache-v5"}
+LLM_EXPLORER_NUMERICAL_STAGE = "numerical_routing_weights_v2"
+LLM_EXPLORER_GUIDANCE_MAX_OUTPUT_TOKENS = 8_000
+LLM_EXPLORER_COMPATIBLE_RESUME_PROTOCOLS = frozenset(
+    {
+        (
+            "uav-hrl-llm-explorer-prompts-v8",
+            "episode-fixed-dual-guidance-cache-v5",
+            None,
+            5_000,
+        ),
+        (
+            "uav-hrl-llm-explorer-prompts-v9",
+            "episode-fixed-dual-guidance-cache-v6",
+            "chat-completions-strict-json-schema-v1",
+            5_000,
+        ),
+    }
 )
 SHARED_ENVIRONMENT_DEFINITIONS_VERSION = "uav-hrl-llm-explorer-v2"
 LLM_EXPLORER_WARMUP_TRANSITIONS = 10_000
@@ -87,14 +98,14 @@ def first_gen_numerical_response_format() -> dict[str, Any]:
                         "maxItems": 16,
                         "items": number_row_3,
                     },
-                    "routing_prior": {
+                    "routing_weights": {
                         "type": "array",
                         "minItems": 16,
                         "maxItems": 16,
                         "items": number_row_17,
                     },
                 },
-                "required": ["td3_bias", "routing_prior"],
+                "required": ["td3_bias", "routing_weights"],
                 "additionalProperties": False,
             },
         },
@@ -104,7 +115,7 @@ def first_gen_numerical_response_format() -> dict[str, Any]:
 def first_gen_resume_protocol_upgrade(
     resolved_explorer: Mapping[str, Any],
 ) -> dict[str, Any] | None:
-    """Validate and describe the sole pre-v9 first-gen resume upgrade."""
+    """Validate and describe a known pre-v10 first-gen protocol upgrade."""
 
     source = dict(resolved_explorer or {})
     if source.get("schema_version") != LLM_EXPLORER_VERSION:
@@ -114,17 +125,21 @@ def first_gen_resume_protocol_upgrade(
     prompt_version = source.get("prompt_version")
     cache_version = source.get("cache_version")
     output_protocol = source.get("numerical_output_protocol")
+    guidance_budget = int(source.get("guidance_max_output_tokens", 5_000))
     if (
         prompt_version == LLM_EXPLORER_PROMPT_VERSION
         and cache_version == LLM_EXPLORER_CACHE_VERSION
         and output_protocol == LLM_EXPLORER_NUMERICAL_OUTPUT_PROTOCOL
+        and guidance_budget == LLM_EXPLORER_GUIDANCE_MAX_OUTPUT_TOKENS
     ):
         return None
-    if (
-        prompt_version in LLM_EXPLORER_COMPATIBLE_RESUME_PROMPT_VERSIONS
-        and cache_version in LLM_EXPLORER_COMPATIBLE_RESUME_CACHE_VERSIONS
-        and output_protocol is None
-    ):
+    source_profile = (
+        prompt_version,
+        cache_version,
+        output_protocol,
+        guidance_budget,
+    )
+    if source_profile in LLM_EXPLORER_COMPATIBLE_RESUME_PROTOCOLS:
         return {
             "source_schema_version": source["schema_version"],
             "target_schema_version": LLM_EXPLORER_VERSION,
@@ -132,10 +147,16 @@ def first_gen_resume_protocol_upgrade(
             "target_prompt_version": LLM_EXPLORER_PROMPT_VERSION,
             "source_cache_version": cache_version,
             "target_cache_version": LLM_EXPLORER_CACHE_VERSION,
-            "source_numerical_output_protocol": None,
+            "source_numerical_output_protocol": output_protocol,
             "target_numerical_output_protocol": (
                 LLM_EXPLORER_NUMERICAL_OUTPUT_PROTOCOL
             ),
+            "source_guidance_max_output_tokens": guidance_budget,
+            "target_guidance_max_output_tokens": (
+                LLM_EXPLORER_GUIDANCE_MAX_OUTPUT_TOKENS
+            ),
+            "source_routing_output": "routing_prior",
+            "target_routing_output": "routing_weights",
             "training_state_compatibility": (
                 "full_state_preserved_format_only_upgrade"
             ),
@@ -144,7 +165,7 @@ def first_gen_resume_protocol_upgrade(
     raise ExplorerValidationError(
         "LLM explorer run has an unsupported prompt/cache/output protocol "
         f"combination: prompt={prompt_version!r}, cache={cache_version!r}, "
-        f"output_protocol={output_protocol!r}"
+        f"output_protocol={output_protocol!r}, guidance_budget={guidance_budget!r}"
     )
 
 
@@ -193,6 +214,18 @@ class LLMExplorerConfig:
             raise ValueError("LLM explorer token safety margin is too small")
         if str(self.tokenizer_encoding) != LLM_EXPLORER_ENCODING:
             raise ValueError("LLM explorer must use the o200k_base tokenizer")
+
+
+@dataclass(frozen=True)
+class FirstGenLLMExplorerConfig(LLMExplorerConfig):
+    """First-generation protocol settings, isolated from later methods."""
+
+    guidance_max_output_tokens: int = LLM_EXPLORER_GUIDANCE_MAX_OUTPUT_TOKENS
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        if int(self.guidance_max_output_tokens) != 8_000:
+            raise ValueError("first-gen numerical output reserve must remain 8,000")
 
 
 def _json_clone(value: Any) -> Any:
@@ -762,16 +795,28 @@ def _first_gen_outcome_payload(
 
 def _first_gen_guidance_reference(value: Mapping[str, Any]) -> dict[str, Any]:
     td3 = _json_clone(value.get("td3_bias", {}))
-    routing = _json_clone(value.get("routing_prior", {}))
+    routing_weights = _json_clone(value.get("routing_weights", {}))
+    routing_prior = _json_clone(value.get("routing_prior", {}))
     for item, label in (
         (td3, "complete rounded 16x3 reference; source guidance is unchanged"),
         (
-            routing,
+            routing_weights,
+            "complete rounded 16x17 raw relative-weight reference; rows need not sum to 1",
+        ),
+        (
+            routing_prior,
             "complete rounded 16x17 reference; rounded rows may not sum to 1 and rounded zero may be a small source value",
         ),
     ):
-        item["presentation_semantics"] = label
-    return first_gen_present_for_llm({"td3_bias": td3, "routing_prior": routing})
+        if isinstance(item, dict):
+            item["presentation_semantics"] = label
+    return first_gen_present_for_llm(
+        {
+            "td3_bias": td3,
+            "routing_weights": routing_weights,
+            "routing_prior": routing_prior,
+        }
+    )
 
 
 def _numeric_summary_row(value: Mapping[str, Any]) -> list[Any]:
@@ -1259,6 +1304,12 @@ def masked_routing_exploration_distribution(
     uniform = np.zeros_like(weights)
     uniform[legal_indices] = 1.0 / float(legal_indices.size)
     masked = np.where(mask, weights, 0.0)
+    # Scaling by the largest legal value prevents overflow for finite raw
+    # LLM weights while preserving every relative probability exactly enough
+    # for sampling.  Existing normalized priors take the same path/result.
+    legal_max = float(masked.max())
+    if legal_max > 0.0:
+        masked = masked / legal_max
     legal_mass = float(masked.sum())
     zero_mass = not math.isfinite(legal_mass) or legal_mass <= 0.0
     llm_distribution = uniform if zero_mass else masked / legal_mass
@@ -1413,12 +1464,108 @@ def validate_routing_prior(
     return prior / sums[:, None]
 
 
+def validate_routing_weights(
+    value: Any, *, detailed_errors: bool = False
+) -> np.ndarray:
+    """Validate raw non-negative first-generation routing weights."""
+
+    if _contains_boolean(value):
+        raise ExplorerValidationError(
+            "routing_weights must contain JSON numbers, not booleans"
+        )
+    invalid_scalar = _first_non_numeric_scalar(value)
+    if invalid_scalar is not None:
+        path, scalar = invalid_scalar
+        raise ExplorerValidationError(
+            "routing_weights must contain JSON numbers; "
+            f"element {path} has type {type(scalar).__name__}"
+        )
+    try:
+        weights = np.asarray(value, dtype=np.float64)
+    except (TypeError, ValueError, OverflowError) as exc:
+        if not detailed_errors:
+            raise ExplorerValidationError("routing_weights must be numeric") from exc
+        raise ExplorerValidationError(
+            "routing_weights: expected shape [16,17]; actual value is ragged, "
+            "non-numeric, or outside finite float range"
+        ) from exc
+    if weights.shape != (NUM_UAV, ROUTING_ACTION_DIM):
+        message = "routing_weights must have shape [16,17]"
+        if detailed_errors:
+            message = (
+                "routing_weights: expected shape [16,17]; "
+                f"actual shape={list(weights.shape)}"
+            )
+        raise ExplorerValidationError(message)
+    invalid = np.argwhere(~np.isfinite(weights) | (weights < 0.0))
+    if len(invalid):
+        if not detailed_errors:
+            raise ExplorerValidationError(
+                "routing_weights must contain finite non-negative values"
+            )
+        details = "; ".join(
+            (
+                f"row {int(row)} (UAV {int(row)}) column {int(column)}: "
+                f"value={weights[row, column]!r}; expected finite and >= 0"
+            )
+            for row, column in invalid[:8]
+        )
+        raise ExplorerValidationError(f"invalid routing_weights: {details}")
+    return weights
+
+
+def routing_weights_to_prior(
+    value: Any,
+) -> tuple[np.ndarray, list[int]]:
+    """Convert raw weights to a stable pre-mask prior.
+
+    Whole-zero rows deliberately become uniform here, while their row ids are
+    retained so diagnostics can distinguish them from legal-mask zero mass.
+    """
+
+    weights = validate_routing_weights(value)
+    prior = np.empty_like(weights)
+    zero_rows: list[int] = []
+    for row_index, row in enumerate(weights):
+        row_max = float(row.max())
+        if row_max <= 0.0:
+            prior[row_index] = 1.0 / float(ROUTING_ACTION_DIM)
+            zero_rows.append(row_index)
+            continue
+        scaled = row / row_max
+        mass = float(scaled.sum())
+        if not math.isfinite(mass) or mass <= 0.0:
+            raise ExplorerValidationError(
+                f"routing_weights row {row_index} cannot be normalized"
+            )
+        prior[row_index] = scaled / mass
+    return validate_routing_prior(prior), zero_rows
+
+
 def _contains_boolean(value: Any) -> bool:
     if isinstance(value, (bool, np.bool_)):
         return True
     if isinstance(value, (list, tuple)):
         return any(_contains_boolean(item) for item in value)
     return False
+
+
+def _first_non_numeric_scalar(
+    value: Any, path: str = "root"
+) -> tuple[str, Any] | None:
+    if isinstance(value, np.ndarray):
+        value = value.tolist()
+    if isinstance(value, (list, tuple)):
+        for index, item in enumerate(value):
+            invalid = _first_non_numeric_scalar(item, f"{path}[{index}]")
+            if invalid is not None:
+                return invalid
+        return None
+    if isinstance(value, (int, float, np.integer, np.floating)) and not isinstance(
+        value, (bool, np.bool_)
+    ):
+        return None
+    return path, value
 
 
 def _strip_complete_json_code_fence(content: str) -> str:
@@ -1452,14 +1599,14 @@ def parse_guidance_response(
             "td3": "response root is not an object",
             "routing": "response root is not an object",
         }
-    extra = sorted(set(value).difference({"td3_bias", "routing_prior"}))
+    extra = sorted(set(value).difference({"td3_bias", "routing_weights"}))
     if extra:
         reason = f"unexpected response fields: {extra}"
         return None, None, {"td3": reason, "routing": reason}
-    missing = sorted({"td3_bias", "routing_prior"}.difference(value))
+    missing = sorted({"td3_bias", "routing_weights"}.difference(value))
     for layer, field in (
         ("td3", "td3_bias"),
-        ("routing", "routing_prior"),
+        ("routing", "routing_weights"),
     ):
         if field in missing:
             errors[layer] = f"response is missing required field {field!r}"
@@ -1477,17 +1624,17 @@ def parse_guidance_response(
         td3_bias = None
         errors["td3"] = str(exc)
     try:
-        routing_prior = (
+        routing_weights = (
             None
             if "routing" in errors
-            else validate_routing_prior(
-                value["routing_prior"], detailed_errors=True
+            else validate_routing_weights(
+                value["routing_weights"], detailed_errors=True
             )
         )
     except (ExplorerValidationError, TypeError, ValueError) as exc:
-        routing_prior = None
+        routing_weights = None
         errors["routing"] = str(exc)
-    return td3_bias, routing_prior, errors
+    return td3_bias, routing_weights, errors
 
 
 def stratified_routing_samples(
@@ -2803,6 +2950,7 @@ def _complete_previous_guidance(guidance: Mapping[str, Any]) -> dict[str, Any]:
     routing_known = bool(guidance.get("enabled")) and not bool(
         guidance.get("routing_fallback", True)
     )
+    raw_weights = guidance.get("routing_weights")
     return {
         "td3_bias": (
             {
@@ -2814,6 +2962,30 @@ def _complete_previous_guidance(guidance: Mapping[str, Any]) -> dict[str, Any]:
             else {
                 "status": "unknown_no_applied_guidance",
                 "reason": guidance.get("td3_reason"),
+                "value": None,
+            }
+        ),
+        "routing_weights": (
+            {
+                "status": "known_model_output",
+                "shape": [NUM_UAV, ROUTING_ACTION_DIM],
+                "value": np.asarray(raw_weights, dtype=float).tolist(),
+                "whole_zero_weight_rows": list(
+                    guidance.get("routing_zero_weight_rows") or []
+                ),
+            }
+            if routing_known and raw_weights is not None
+            else {
+                "status": (
+                    "unavailable_pre_weight_protocol"
+                    if routing_known and guidance.get("routing_prior") is not None
+                    else "unknown_no_applied_guidance"
+                ),
+                "reason": (
+                    "raw_weights_unavailable"
+                    if routing_known and guidance.get("routing_prior") is not None
+                    else guidance.get("routing_reason")
+                ),
                 "value": None,
             }
         ),
@@ -2876,6 +3048,29 @@ def assemble_first_gen_feedback(
                 for record in routing_records
             )
         ),
+        "routing_whole_zero_weight_row_decision_count": int(
+            sum(
+                bool(record.get("routing_weight_row_all_zero", False))
+                for record in routing_records
+            )
+        ),
+        "routing_whole_zero_weight_uniform_fallback_count": int(
+            sum(
+                record.get("routing_weight_uniform_fallback_reason")
+                == "all_weights_zero"
+                for record in routing_records
+            )
+        ),
+        "routing_masked_zero_legal_weight_fallback_count": int(
+            sum(
+                bool(record.get("zero_legal_routing_weight_after_mask", False))
+                for record in routing_records
+            )
+        ),
+        "routing_whole_zero_weight_rows": list(
+            applied_guidance.get("routing_zero_weight_rows") or []
+        ),
+        "routing_weights_status": applied_guidance.get("routing_weights_status"),
     }
     return {
         "schema_version": LLM_EXPLORER_VERSION,
@@ -3749,7 +3944,7 @@ def first_gen_resolved_settings_and_dictionary(
                     "small non-zero values may use scientific notation; validity and threshold decisions were made from source precision before presentation"
                 ),
                 "historical_guidance": (
-                    "complete rounded reference only; rounded prior rows may not sum to one and displayed zero may represent a small source value; source guidance and checkpoints remain unchanged"
+                    "complete rounded reference of raw routing weights and host-normalized pre-mask prior; raw rows need not sum to one, while rounded normalized-prior rows may not display an exact sum of one"
                 ),
                 "unknown_empty_zero": environment.get("validity"),
                 "coordinates": {
@@ -3839,8 +4034,16 @@ def first_gen_numerical_settings(
             "routing_epsilon_at_episode_start": settings.get(
                 "routing_epsilon_at_episode_start"
             ),
-            "routing_prior_value_bounds_inclusive": [0.0, 1.0],
-            "routing_prior_row_sum_absolute_tolerance": 1e-6,
+            "routing_weights_value_bounds": "finite values >= 0; no upper bound",
+            "routing_weights_row_sum_requirement": "none",
+            "host_pre_mask_normalization": (
+                "each positive row is divided by its finite sum using stable scaling; "
+                "a whole-zero row becomes uniform over all 17 actions and is recorded"
+            ),
+            "legal_mask_application": (
+                "the host zeros illegal actions and renormalizes legal weights; if "
+                "legal weight is zero, it uses legal-uniform"
+            ),
             "coordinate_and_field_definitions": numerical_dictionary,
         },
         preserve_precision_keys=frozenset(
@@ -3848,7 +4051,6 @@ def first_gen_numerical_settings(
                 "sigma_episode_start",
                 "raw_td3_bias_bounds_inclusive",
                 "td3_host_validation_tolerance",
-                "routing_prior_row_sum_absolute_tolerance",
             }
         ),
     )
@@ -3983,9 +4185,18 @@ def llm_explorer_path_preflight(
             "td3_bias": [[-0.123456, 0.123456, 0.0] for _ in range(NUM_UAV)]
         }
         representative_ast_nodes = None
-        guidance_output_reserve = LLMExplorerConfig().guidance_max_output_tokens
+        guidance_output_reserve = (
+            FirstGenLLMExplorerConfig().guidance_max_output_tokens
+            if first_generation_four_prompt_contract
+            else LLMExplorerConfig().guidance_max_output_tokens
+        )
     if not td3_only and not state_rule:
-        representative_guidance_value["routing_prior"] = (
+        routing_field = (
+            "routing_weights"
+            if first_generation_four_prompt_contract
+            else "routing_prior"
+        )
+        representative_guidance_value[routing_field] = (
             {
                 f"UAV_{sender}": {
                     ("WAIT" if action == sender else "GS" if action == NUM_UAV else f"UAV_{action}"): round(1.0 / ROUTING_ACTION_DIM, 8)
@@ -3995,7 +4206,14 @@ def llm_explorer_path_preflight(
             }
             if named_routing
             else [
-                [round(1.0 / ROUTING_ACTION_DIM, 8) for _ in range(ROUTING_ACTION_DIM)]
+                [
+                    (
+                        1.0
+                        if first_generation_four_prompt_contract
+                        else round(1.0 / ROUTING_ACTION_DIM, 8)
+                    )
+                    for _ in range(ROUTING_ACTION_DIM)
+                ]
                 for _ in range(NUM_UAV)
             ]
         )
@@ -4048,15 +4266,15 @@ class DeterministicMockExplorerClient:
             content = (
                 "1. Priority issues\nNo reliable issue in offline mock data.\n"
                 "2. TD3 recommendations\nUse neutral raw biases.\n"
-                "3. Routing recommendations\nUse neutral priors.\n"
+                "3. Routing recommendations\nUse neutral relative weights.\n"
                 "4. Expected effects and limitations\nNo live model inference."
             )
         else:
             content = json.dumps(
                 {
                     "td3_bias": [[0.0, 0.0, 0.0] for _ in range(NUM_UAV)],
-                    "routing_prior": [
-                        [1.0 / ROUTING_ACTION_DIM for _ in range(ROUTING_ACTION_DIM)]
+                    "routing_weights": [
+                        [1.0 for _ in range(ROUTING_ACTION_DIM)]
                         for _ in range(NUM_UAV)
                     ],
                 },
@@ -4096,7 +4314,7 @@ class LLMExplorerController:
         rng_seed: int = 0,
         lazy_client: bool = False,
     ) -> None:
-        self.config = config or LLMExplorerConfig()
+        self.config = config or FirstGenLLMExplorerConfig()
         self.run_identity = _json_clone(run_identity)
         self.evaluation = bool(evaluation)
         self.root = (
@@ -4170,7 +4388,10 @@ class LLMExplorerController:
         return {
             "enabled": False,
             "td3_bias": np.zeros((NUM_UAV, 3), dtype=np.float32),
+            "routing_weights": None,
             "routing_prior": None,
+            "routing_zero_weight_rows": [],
+            "routing_weights_status": "unavailable_no_applied_guidance",
             "td3_fallback": True,
             "routing_fallback": True,
             "td3_reason": str(reason),
@@ -4299,13 +4520,21 @@ class LLMExplorerController:
                     "LLM explorer checkpoint config is incompatible"
                 )
             source_prompt = saved_config.get("prompt_version")
+            source_budget = int(
+                saved_config.get("guidance_max_output_tokens", 5_000)
+            )
             saved_without_prompt = dict(saved_config)
             current_without_prompt = dict(current_config)
             saved_without_prompt.pop("prompt_version", None)
             current_without_prompt.pop("prompt_version", None)
+            saved_without_prompt.pop("guidance_max_output_tokens", None)
+            current_without_prompt.pop("guidance_max_output_tokens", None)
             if not (
-                source_prompt
-                in LLM_EXPLORER_COMPATIBLE_RESUME_PROMPT_VERSIONS
+                source_prompt in {
+                    "uav-hrl-llm-explorer-prompts-v8",
+                    "uav-hrl-llm-explorer-prompts-v9",
+                }
+                and source_budget == 5_000
                 and saved_without_prompt == current_without_prompt
             ):
                 raise ExplorerValidationError(
@@ -4316,14 +4545,26 @@ class LLMExplorerController:
                 "target_schema_version": self.schema_version,
                 "source_prompt_version": source_prompt,
                 "target_prompt_version": self.config.prompt_version,
-                "source_cache_version": next(
-                    iter(LLM_EXPLORER_COMPATIBLE_RESUME_CACHE_VERSIONS)
+                "source_cache_version": (
+                    "episode-fixed-dual-guidance-cache-v5"
+                    if source_prompt.endswith("v8")
+                    else "episode-fixed-dual-guidance-cache-v6"
                 ),
                 "target_cache_version": LLM_EXPLORER_CACHE_VERSION,
-                "source_numerical_output_protocol": None,
+                "source_numerical_output_protocol": (
+                    None
+                    if source_prompt.endswith("v8")
+                    else "chat-completions-strict-json-schema-v1"
+                ),
                 "target_numerical_output_protocol": (
                     LLM_EXPLORER_NUMERICAL_OUTPUT_PROTOCOL
                 ),
+                "source_guidance_max_output_tokens": source_budget,
+                "target_guidance_max_output_tokens": (
+                    LLM_EXPLORER_GUIDANCE_MAX_OUTPUT_TOKENS
+                ),
+                "source_routing_output": "routing_prior",
+                "target_routing_output": "routing_weights",
                 "training_state_compatibility": (
                     "full_state_preserved_format_only_upgrade"
                 ),
@@ -4362,6 +4603,7 @@ class LLMExplorerController:
         result = dict(guidance)
         for key in (
             "td3_bias",
+            "routing_weights",
             "routing_prior",
             "td3_bias_raw",
             "td3_bias_effective",
@@ -4385,8 +4627,24 @@ class LLMExplorerController:
                 if restored.shape != (NUM_UAV, 3) or not np.isfinite(restored).all():
                     raise ExplorerValidationError(f"checkpoint {key} is invalid")
                 result[key] = restored.astype(np.float32)
-        if result.get("routing_prior") is not None:
+        if result.get("routing_weights") is not None:
+            weights = validate_routing_weights(result["routing_weights"])
+            prior, zero_rows = routing_weights_to_prior(weights)
+            result["routing_weights"] = weights
+            result["routing_prior"] = prior
+            result["routing_zero_weight_rows"] = zero_rows
+            result["routing_weights_status"] = "known_model_output"
+        elif result.get("routing_prior") is not None:
             result["routing_prior"] = validate_routing_prior(result["routing_prior"])
+            result["routing_weights"] = None
+            result["routing_zero_weight_rows"] = []
+            result["routing_weights_status"] = "unavailable_pre_weight_protocol"
+        else:
+            result["routing_weights"] = None
+            result["routing_zero_weight_rows"] = []
+            result.setdefault(
+                "routing_weights_status", "unavailable_no_applied_guidance"
+            )
         return result
 
     def _templates(self) -> tuple[str, str, str, str]:
@@ -4439,8 +4697,8 @@ class LLMExplorerController:
             "routing_epsilon_at_episode_start": float(routing_epsilon),
             "routing_epsilon_schedule": "unchanged host schedule",
             "routing_epsilon_branch": (
-                "100% masked and renormalized LLM prior; legal-uniform only "
-                "when legal prior mass is zero"
+                "100% masked and renormalized LLM relative weights; legal-uniform "
+                "when the whole row or the legal subset has zero weight"
             ),
             "bias_units": "normalized action units",
             "guidance_fixed_for_episode": True,
@@ -4530,6 +4788,7 @@ class LLMExplorerController:
                 current_observable_initial_state
             ),
             "PREVIOUS_COMPLETE_TD3_BIAS": guidance["td3_bias"],
+            "PREVIOUS_COMPLETE_ROUTING_WEIGHTS": guidance["routing_weights"],
             "PREVIOUS_COMPLETE_ROUTING_PRIOR": guidance["routing_prior"],
             "PREVIOUS_APPLICATION_STATUS": previous[
                 "previous_application_status"
@@ -4546,10 +4805,13 @@ class LLMExplorerController:
         return parse_guidance_response(content, sigma_episode_start)
 
     def _guidance_cache_content(
-        self, td3_bias: np.ndarray, routing_prior: np.ndarray
+        self, td3_bias: np.ndarray, routing_weights: np.ndarray
     ) -> str:
         return _compact_json(
-            {"td3_bias": td3_bias.tolist(), "routing_prior": routing_prior.tolist()}
+            {
+                "td3_bias": td3_bias.tolist(),
+                "routing_weights": routing_weights.tolist(),
+            }
         )
 
     def _routing_guidance_required(self) -> bool:
@@ -4743,9 +5005,15 @@ class LLMExplorerController:
                     guidance["td3_bias"], sigma
                 )
             if not guidance.get("routing_fallback"):
-                guidance["routing_prior"] = validate_routing_prior(
-                    guidance["routing_prior"]
+                if guidance.get("routing_weights") is None:
+                    return None
+                guidance["routing_weights"] = validate_routing_weights(
+                    guidance["routing_weights"]
                 )
+                (
+                    guidance["routing_prior"],
+                    guidance["routing_zero_weight_rows"],
+                ) = routing_weights_to_prior(guidance["routing_weights"])
             guidance["reused"] = True
             guidance["cache_source"] = "episode_result"
             return guidance
@@ -5460,6 +5728,12 @@ class LLMExplorerController:
         routing_fallback = bool(
             routing_guidance_required and accepted_routing is None
         )
+        routing_prior = None
+        routing_zero_weight_rows: list[int] = []
+        if routing_guidance_required and not routing_fallback:
+            routing_prior, routing_zero_weight_rows = routing_weights_to_prior(
+                accepted_routing
+            )
         self.active_guidance = {
             "enabled": True,
             "td3_bias": (
@@ -5467,10 +5741,17 @@ class LLMExplorerController:
                 if td3_fallback
                 else accepted_td3
             ),
-            "routing_prior": (
+            "routing_weights": (
                 None
                 if not routing_guidance_required or routing_fallback
                 else accepted_routing
+            ),
+            "routing_prior": routing_prior,
+            "routing_zero_weight_rows": routing_zero_weight_rows,
+            "routing_weights_status": (
+                "known_model_output"
+                if not routing_fallback and routing_guidance_required
+                else "unavailable_no_applied_guidance"
             ),
             "td3_fallback": td3_fallback,
             "routing_fallback": routing_fallback,

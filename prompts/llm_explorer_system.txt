@@ -143,22 +143,19 @@ Raw bias is added directly in normalized action units, without another sigma mul
 
 Heading bias is a fixed angular offset relative to the Actor's direction. Use signed target-direction errors, directional dispersion, and role changes to assess whether one offset has a consistent purpose throughout the episode. Zero bias is a valid choice.
 
-[Routing exploration prior]
+[Routing exploration weights]
 
-Each sender UAV has one episode-fixed distribution over 17 actions:
-- Columns 0-15 correspond to UAV actions.
-- Column 16 corresponds to GS.
-- The sender's own column represents WAIT.
+Each sender UAV uses one episode-fixed set of relative exploration weights:
+- There are 17 actions. Columns 0-15 correspond to UAVs 0-15, and column 16 corresponds to GS.
+- A sender's own column represents WAIT. WAIT pauses that UAV's forwarding to a next hop; it is distinct from movement and SR access.
 
-WAIT pauses that UAV's forwarding to a next hop. It is separate from movement and SR access.
+Weights express relative exploration preferences among one sender's actions and do not need to sum to 1. For example, [3,1,1] expresses a relative preference of 3:1:1.
 
-The epsilon-exploration branch uses 100% of the LLM prior after the host zeros currently illegal actions and renormalizes legal probabilities.
+During epsilon exploration, the host removes currently illegal actions, normalizes the remaining weights into probabilities, and samples from that distribution. If the total legal weight is zero, that UAV uses legal-uniform exploration. Greedy decisions and the epsilon schedule remain unchanged.
 
-If legal probability mass is zero, the host uses and records legal-uniform fallback. Other decisions retain Q_safe greedy selection. The original epsilon schedule remains unchanged.
+When another legal action has positive weight, a zero-weight action cannot be selected for exploration. If WAIT is the only legal action with positive weight, exploration selects WAIT with probability 1.
 
-Output the prior before masking. A currently disconnected neighbor may become legal later, while a historically available neighbor may become unavailable.
-
-When reliable preferences are absent, a uniform prior over all 17 actions preserves legal-uniform exploration after masking.
+Provide weights before legal masking and account for links changing within the episode. When no reliable preference is available, assign equal weights of 1 to all actions.
 
 [Evidence and observability]
 
@@ -175,6 +172,6 @@ Zero TD3 control does not imply that a UAV was stationary. An empty queue at slo
 
 Current-episode information contains only observable UAVs, known RoIs/SRs, tasks, and links. Previous-episode targets and positions remain historical information rather than newly discovered current targets.
 
-General observation and summary values are rounded to at most three decimal places. Representative-case absolute time_s is in seconds, while explicit service durations and UAV/SR HOL remaining deadlines use milliseconds and _ms field names. The dictionary specifies units and precision exceptions; a very small nonzero duration may retain extra significant digits or scientific notation rather than become zero. Historical guidance matrices are complete rounded references; their row sums may differ slightly from one, and a rounded zero may represent a small source value. Actual host guidance retains its original precision.
+General observation and summary values are rounded to at most three decimal places. Representative-case absolute time_s is in seconds, while explicit service durations and UAV/SR HOL remaining deadlines use milliseconds and _ms field names. The dictionary specifies units and precision exceptions; a very small nonzero duration may retain extra significant digits or scientific notation rather than become zero. Historical guidance includes complete rounded raw weights and host-normalized pre-mask probabilities. Raw-weight rows need not sum to one; rounded normalized probabilities may not display an exact sum of one. Actual host guidance retains its original precision.
 
 Provide testable exploration hypotheses and distinguish observations, hypotheses, and unknowns. When violation locations are unknown, retain that uncertainty.

@@ -21,6 +21,7 @@ from llm_explorer import (
     LLM_EXPLORER_PROMPT_VERSION,
     LLM_EXPLORER_SUMMARY_VERSION,
     LLM_EXPLORER_VERSION,
+    FirstGenLLMExplorerConfig,
     LLMExplorerConfig,
     LLMExplorerController,
     DeterministicMockExplorerClient,
@@ -41,18 +42,23 @@ from llm_explorer import (
     parse_guidance_response,
     prompt_token_budget,
     render_prompt,
+    routing_weights_to_prior,
     stratified_routing_samples,
+    validate_routing_weights,
 )
 from observation_strategy import routing_state_feature_names
 from llm_explorer_td3_only import (
+    LLMExplorerTD3OnlyConfig,
     LLMExplorerTD3OnlyController,
     environment_definitions_td3_only,
 )
 from llm_explorer_v3 import (
+    LLMExplorerV3Config,
     LLMExplorerV3Controller,
     environment_definitions_v3,
 )
 from llm_state_rule_explorer import (
+    LLMStateRuleConfig,
     LLMStateRuleController,
     environment_definitions_state_rule,
 )
@@ -63,11 +69,11 @@ from td3 import TD3
 
 def _guidance(td3_value=0.0, routing=None):
     if routing is None:
-        routing = [[1.0 / 17.0] * 17 for _ in range(16)]
+        routing = [[1.0] * 17 for _ in range(16)]
     return json.dumps(
         {
             "td3_bias": [[td3_value, -td3_value, 0.0] for _ in range(16)],
-            "routing_prior": routing,
+            "routing_weights": routing,
         }
     )
 
@@ -112,6 +118,11 @@ def _previous_feedback():
                 "value": None,
             },
             "routing_prior": {
+                "status": "unknown_no_applied_guidance",
+                "reason": "warmup",
+                "value": None,
+            },
+            "routing_weights": {
                 "status": "unknown_no_applied_guidance",
                 "reason": "warmup",
                 "value": None,
@@ -547,7 +558,7 @@ def test_rounded_history_is_reference_only_and_new_output_remains_strict():
     td3, routing, errors = parse_guidance_response(_guidance(0.123456), 0.2)
     assert errors == {}
     assert td3 is not None and routing is not None
-    assert routing[0].sum() == pytest.approx(1.0, abs=1e-12)
+    assert routing[0].sum() == pytest.approx(17.0, abs=1e-12)
 
 
 def test_other_explorer_environment_and_system_prompts_match_parent_baseline():
@@ -644,6 +655,47 @@ def test_mask_then_normalize_uses_100_percent_prior_and_edge_cases():
     assert distribution[16] == pytest.approx(1.0)
 
 
+def test_raw_weight_normalization_is_stable_scale_invariant_and_tracks_zero_rows():
+    weights = np.ones((16, 17), dtype=np.float64)
+    weights[0] = 0.0
+    weights[1, :3] = [3.0, 1.0, 1.0]
+    weights[1, 3:] = 0.0
+    weights[2, :3] = [1.6e308, 8.0e307, 8.0e307]
+    weights[2, 3:] = 0.0
+    prior, zero_rows = routing_weights_to_prior(weights)
+    assert zero_rows == [0]
+    np.testing.assert_allclose(prior[0], np.full(17, 1.0 / 17.0))
+    np.testing.assert_allclose(prior[1, :3], [0.6, 0.2, 0.2])
+    np.testing.assert_allclose(prior[2, :3], [0.5, 0.25, 0.25])
+    assert np.isfinite(prior).all()
+    np.testing.assert_allclose(prior.sum(axis=1), 1.0)
+
+    _, parsed_weights, errors = parse_guidance_response(
+        _guidance(0.0, weights.tolist()), 0.2
+    )
+    assert errors == {}
+    np.testing.assert_array_equal(parsed_weights[0], np.zeros(17))
+
+    scaled, _ = routing_weights_to_prior(weights * 0.5)
+    np.testing.assert_allclose(scaled, prior)
+
+
+@pytest.mark.parametrize("bad", [-1.0, True, "1", None, float("inf")])
+def test_raw_weight_validation_rejects_non_numeric_nonfinite_and_negative(bad):
+    weights = [[1.0] * 17 for _ in range(16)]
+    weights[4][6] = bad
+    with pytest.raises((ValueError, TypeError), match="routing_weights"):
+        validate_routing_weights(weights, detailed_errors=True)
+
+
+def test_first_gen_output_budget_is_isolated_from_other_explorers():
+    assert FirstGenLLMExplorerConfig().guidance_max_output_tokens == 8_000
+    assert LLMExplorerConfig().guidance_max_output_tokens == 5_000
+    assert LLMExplorerV3Config().guidance_max_output_tokens == 5_000
+    assert LLMExplorerTD3OnlyConfig().guidance_max_output_tokens == 5_000
+    assert LLMStateRuleConfig().guidance_max_output_tokens == 4_096
+
+
 def test_safe_ddqn_uses_prior_only_in_epsilon_branch():
     agent = DDQN(state_dim=4, action_dim=17, master_seed=4)
 
@@ -717,8 +769,8 @@ def test_td3_bias_is_actual_offset_before_field_projection():
     [
         ("truncated {", "td3"),
         (_guidance(float("nan")), "td3"),
-        (json.dumps({"td3_bias": [[0.0] * 3], "routing_prior": [[1 / 17] * 17] * 16}), "td3"),
-        (_guidance(0.0, routing=[[-0.1] + [1.1 / 16] * 16] * 16), "routing"),
+        (json.dumps({"td3_bias": [[0.0] * 3], "routing_weights": [[1] * 17] * 16}), "td3"),
+        (_guidance(0.0, routing=[[-0.1] + [1.1] * 16] * 16), "routing"),
     ],
 )
 def test_guidance_json_validation_rejects_bad_values(content, error_layer):
@@ -743,27 +795,26 @@ def test_guidance_parser_accepts_only_json_or_complete_outer_json_fence():
         assert "invalid JSON" in errors["td3"]
 
 
-def test_probability_rows_with_gross_sums_are_rejected_with_actionable_details():
-    prior = [[1.0 / 17.0] * 17 for _ in range(16)]
+def test_weight_rows_with_arbitrary_sums_are_accepted_and_normalized():
+    prior = [[1.0] * 17 for _ in range(16)]
     prior[3] = [0.1] * 16 + [0.0]
     prior[7] = [0.2] * 10 + [0.0] * 7
     td3, routing, errors = parse_guidance_response(
         _guidance(0.1, prior), sigma_episode_start=0.2
     )
     assert td3 is not None
-    assert routing is None
-    assert "row 3 (UAV 3)" in errors["routing"]
-    assert "sum=1.6" in errors["routing"]
-    assert "row 7 (UAV 7)" in errors["routing"]
-    assert "sum=2.0" in errors["routing"]
-    assert "absolute tolerance 0.000001" in errors["routing"]
+    assert routing is not None
+    assert errors == {}
+    normalized, zero_rows = routing_weights_to_prior(routing)
+    assert zero_rows == []
+    np.testing.assert_allclose(normalized.sum(axis=1), 1.0)
 
 
 def test_matrix_shape_and_td3_bound_errors_identify_actual_uav_values():
     wrong_shape = json.dumps(
         {
             "td3_bias": [[0.0, 0.0, 0.0]] * 15,
-            "routing_prior": [[1.0 / 17.0] * 17 for _ in range(16)],
+            "routing_weights": [[1.0] * 17 for _ in range(16)],
         }
     )
     td3, routing, errors = parse_guidance_response(wrong_shape, 0.2)
@@ -782,12 +833,12 @@ def test_matrix_shape_and_td3_bound_errors_identify_actual_uav_values():
     assert "[-0.2,0.2]" in errors["td3"]
 
 
-def test_uniform_eight_decimal_probability_rows_and_prompt_example_validate():
+def test_arbitrary_decimal_weight_rows_and_prompt_example_validate():
     uniform = [[0.05882353] * 17 for _ in range(16)]
     _, routing, errors = parse_guidance_response(_guidance(0.0, uniform), 0.2)
     assert errors == {}
     assert routing is not None
-    np.testing.assert_allclose(routing.sum(axis=1), 1.0, atol=1e-12)
+    np.testing.assert_allclose(routing, uniform)
 
     prompt = (
         Path(__file__).parents[1]
@@ -806,10 +857,10 @@ def test_first_gen_strict_response_schema_has_exact_matrix_contract():
     contract = response_format["json_schema"]
     assert contract["strict"] is True
     schema = contract["schema"]
-    assert schema["required"] == ["td3_bias", "routing_prior"]
+    assert schema["required"] == ["td3_bias", "routing_weights"]
     assert schema["additionalProperties"] is False
     td3 = schema["properties"]["td3_bias"]
-    routing = schema["properties"]["routing_prior"]
+    routing = schema["properties"]["routing_weights"]
     assert (td3["minItems"], td3["maxItems"]) == (16, 16)
     assert (td3["items"]["minItems"], td3["items"]["maxItems"]) == (3, 3)
     assert (routing["minItems"], routing["maxItems"]) == (16, 16)
@@ -864,9 +915,9 @@ def test_warmup_has_no_calls_then_two_stage_guidance_at_transition_boundary(tmp_
     assert numerical_metadata["response_format"] == first_gen_numerical_response_format()
 
 
-def test_row_sum_retry_feedback_retains_independently_valid_td3_layer(tmp_path):
-    invalid = [[1.0 / 17.0] * 17 for _ in range(16)]
-    invalid[5] = [0.1] * 16 + [0.0]
+def test_negative_weight_retry_feedback_retains_independently_valid_td3_layer(tmp_path):
+    invalid = [[1.0] * 17 for _ in range(16)]
+    invalid[5][4] = -0.1
     client = SequenceClient(
         [
             "analysis",
@@ -887,12 +938,12 @@ def test_row_sum_retry_feedback_retains_independently_valid_td3_layer(tmp_path):
     assert result["td3_bias"][0, 0] == pytest.approx(0.12)
     retry_prompt = client.calls[2]["prompt"]
     assert "row 5 (UAV 5)" in retry_prompt
-    assert "sum=1.6" in retry_prompt
-    assert "return both complete matrices" in retry_prompt
+    assert "column 4" in retry_prompt
+    assert "provide both complete matrices" in retry_prompt
 
 
 def test_partial_layer_retry_keeps_valid_first_layer_and_counts_retry(tmp_path):
-    bad_routing = [[1.0 / 17.0] * 17 for _ in range(16)]
+    bad_routing = [[1.0] * 17 for _ in range(16)]
     bad_routing[0][0] = -1.0
     client = SequenceClient(
         [
@@ -901,7 +952,7 @@ def test_partial_layer_retry_keeps_valid_first_layer_and_counts_retry(tmp_path):
             json.dumps(
                 {
                     "td3_bias": [[9.0, 0.0, 0.0]] * 16,
-                    "routing_prior": [[1.0 / 17.0] * 17 for _ in range(16)],
+                    "routing_weights": [[1.0] * 17 for _ in range(16)],
                 }
             ),
         ]
@@ -1016,6 +1067,7 @@ def test_pre_v9_first_gen_checkpoint_state_migrates_without_reset(tmp_path):
     source.statistics["routing_zero_legal_prior_mass_total"] = 7
     state = source.state_dict()
     state["config"]["prompt_version"] = "uav-hrl-llm-explorer-prompts-v8"
+    state["config"]["guidance_max_output_tokens"] = 5_000
     expected_rng = np.random.default_rng()
     expected_rng.bit_generator.state = copy.deepcopy(state["rng_state"])
     expected_next_random = expected_rng.random()
@@ -1033,6 +1085,11 @@ def test_pre_v9_first_gen_checkpoint_state_migrates_without_reset(tmp_path):
     )
     np.testing.assert_allclose(
         restored.active_guidance["routing_prior"], source.active_guidance["routing_prior"]
+    )
+    assert restored.active_guidance["routing_weights"] is None
+    assert (
+        restored.active_guidance["routing_weights_status"]
+        == "unavailable_pre_weight_protocol"
     )
     assert restored.statistics["requests_total"] == 1
     assert restored.statistics["fallback_episodes_total"] == 1
@@ -1250,7 +1307,7 @@ def test_real_size_compact_prompts_preserve_samples_and_fit_all_attempts(tmp_pat
     assert len(client.calls) == 3
     assert client.calls[0]["system_prompt"] != client.calls[1]["system_prompt"]
     assert "[Evidence and observability]" in client.calls[0]["system_prompt"]
-    assert "[4. Output requirements and example]" in client.calls[1]["system_prompt"]
+    assert "[Output format]" in client.calls[1]["system_prompt"]
     assert "actual_hol_wait_duration_ms" in client.calls[0]["prompt"]
     assert '"b1":' in client.calls[0]["prompt"]
     assert '"b2":' in client.calls[0]["prompt"]
@@ -1580,6 +1637,43 @@ def test_first_generation_training_path_passes_full_prior_weight():
     assert agent.weights == [1.0]
 
 
+def test_first_generation_diagnostics_distinguish_whole_and_masked_zero_weights():
+    class CaptureAgent:
+        def select_action(self, *args, **kwargs):
+            row = np.asarray(kwargs["exploration_prior"], dtype=float)
+            legal = np.asarray(args[2], dtype=bool)
+            zero = not np.any(row[legal] > 0.0)
+            return int(np.flatnonzero(legal)[0]), {
+                "decision_branch": "epsilon_exploration",
+                "zero_legal_prior_mass_fallback": zero,
+                "exploration_distribution": None,
+            }
+
+    weights = np.ones((16, 17), dtype=float)
+    weights[0] = 0.0
+    weights[1] = 0.0
+    weights[1, 3] = 2.0
+    states = {0: np.zeros(4), 1: np.zeros(4)}
+    masks = {
+        0: np.asarray([True] + [False] * 16),
+        1: np.asarray([False, True] + [False] * 15),
+    }
+    _, details = _select_routing_actions(
+        CaptureAgent(),
+        states,
+        masks,
+        epsilon=1.0,
+        exploration_prior=weights,
+        exploration_guidance_kind="routing_weights",
+        exploration_prior_weight=1.0,
+        return_diagnostics=True,
+    )
+    assert details[0]["routing_weight_uniform_fallback_reason"] == "all_weights_zero"
+    assert details[0]["routing_weight_row_all_zero"] is True
+    assert details[1]["routing_weight_uniform_fallback_reason"] == "legal_weights_zero_after_mask"
+    assert details[1]["zero_legal_routing_weight_after_mask"] is True
+
+
 def test_guidance_remains_eligible_after_episode_600(tmp_path):
     client = SequenceClient(["analysis after 600", _guidance(0.0)])
     controller = LLMExplorerController(
@@ -1782,7 +1876,10 @@ def _active_first_gen_guidance(value=0.02):
         "td3_fallback": False,
         "routing_fallback": False,
         "td3_bias": [[float(value), 0.0, 0.0] for _ in range(16)],
+        "routing_weights": [[1.0] * 17 for _ in range(16)],
         "routing_prior": [[1.0 / 17.0] * 17 for _ in range(16)],
+        "routing_zero_weight_rows": [],
+        "routing_weights_status": "known_model_output",
     }
 
 
@@ -2154,6 +2251,9 @@ def test_first_generation_cli_evaluate_and_pre_v9_full_resume_migration(
         payload_one["training_state"]["llm_explorer_state"]["config"][
             "prompt_version"
         ] = "uav-hrl-llm-explorer-prompts-v8"
+        payload_one["training_state"]["llm_explorer_state"]["config"][
+            "guidance_max_output_tokens"
+        ] = 5_000
         payload_one["training_state"]["llm_explorer_state"].pop(
             "resume_protocol_migrations", None
         )
@@ -2168,6 +2268,7 @@ def test_first_generation_cli_evaluate_and_pre_v9_full_resume_migration(
             "episode-fixed-dual-guidance-cache-v5"
         )
         resolved["llm_explorer"].pop("numerical_output_protocol", None)
+        resolved["llm_explorer"]["guidance_max_output_tokens"] = 5_000
         resolved_path.write_text(
             json.dumps(resolved, indent=2) + "\n", encoding="utf-8"
         )
@@ -2195,6 +2296,7 @@ def test_first_generation_cli_evaluate_and_pre_v9_full_resume_migration(
         assert len(calls) == 2
         assert "response_format" not in calls[0]
         assert calls[1]["response_format"] == first_gen_numerical_response_format()
+        assert calls[1]["max_output_tokens"] == 8_000
 
         migrated_resolved = json.loads(resolved_path.read_text(encoding="utf-8"))
         assert migrated_resolved["llm_explorer"]["prompt_version"] == LLM_EXPLORER_PROMPT_VERSION
@@ -2213,6 +2315,8 @@ def test_first_generation_cli_evaluate_and_pre_v9_full_resume_migration(
         )
         state_two = payload_two["training_state"]
         assert state_two["llm_explorer_state"]["config"]["prompt_version"] == LLM_EXPLORER_PROMPT_VERSION
+        assert state_two["llm_explorer_state"]["config"]["guidance_max_output_tokens"] == 8_000
+        assert state_two["llm_explorer_state"]["active_guidance"]["routing_weights"] is not None
         assert state_two["llm_explorer_state"]["resume_protocol_migrations"][-1]["source_prompt_version"].endswith("v8")
         assert state_two["training_history_rows"][:1] == original_state["training_history_rows"]
         assert state_two["total_joint_transitions"] > original_state["total_joint_transitions"]

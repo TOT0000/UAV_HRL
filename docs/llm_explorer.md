@@ -7,10 +7,11 @@ packet model, and update schedules. Its only training interventions are:
 
 - a fixed per-episode `[16,3]` mean offset added to the TD3 Actor action before
   the existing Gaussian behavior noise is projected; and
-- a fixed pre-mask `[16,17]` routing prior used only in safe-DDQN's epsilon
-  branch. The host masks illegal actions and renormalizes 100% of the remaining
-  prior. It uses legal-uniform only when legal prior mass is zero and records
-  that fallback separately.
+- fixed per-episode `[16,17]` nonnegative routing weights used only in
+  safe-DDQN's epsilon branch. The host stably converts them to a normalized
+  pre-mask prior, masks illegal actions, and renormalizes the legal weights.
+  A whole-zero row and a positive row whose legal subset has zero weight both
+  use legal-uniform exploration, with distinct diagnostics.
 
 The first guided episode begins only after 10,000 joint movement transitions
 have already completed and a previous episode is available. With the standard
@@ -42,12 +43,13 @@ context limit, including reserved output and a safety margin. Token budgets are
 saved beside each attempt. The payload contains filtered observable state and
 never serializes a scenario manifest or undiscovered RoI and SR ground truth.
 The first-generation controller schema is `uav-hrl-llm-explorer-firstgen-v6`,
-prompt schema is v9, summary schema is `complete-core-feedback-v4`, and cache
-schema is `episode-fixed-dual-guidance-cache-v6`. The first-generation numerical
+prompt schema is v10, summary schema is `complete-core-feedback-v4`, and cache
+schema is `episode-fixed-dual-guidance-cache-v7`. The first-generation numerical
 Chat Completions request uses a strict JSON Schema for exactly one object with
-complete `[16,3]` and `[16,17]` numeric matrices. Host validation remains
-authoritative: probability rows must sum to one within `0.000001`, and grossly
-invalid rows are rejected rather than normalized. The parser accepts bare JSON
+complete `[16,3]` `td3_bias` and `[16,17]` `routing_weights` matrices and reserves
+8,000 output tokens. Host validation remains authoritative: weights must be
+finite and nonnegative, but have no upper bound or row-sum requirement. Stable
+maximum scaling prevents overflow before normalization. The parser accepts bare JSON
 or a complete outer plain/`json` Markdown fence, but does not extract JSON from
 explanatory text or repair truncated output. Representative-case service
 durations and HOL remaining deadlines use explicitly named millisecond fields,
@@ -59,12 +61,14 @@ observation counts; actual WAIT time is accumulated on the PacketEngine event
 clock and unavailable legacy values stay unknown. Movement feedback separates
 the requested matrix, Actor pre-projection offset, movement-mask-qualified
 application, and final projected/executed action. Exact resume permits the known
-format-only v8/v5 first-generation protocol to move to v9/v6 without resetting
+format-only v8/v5 and v9/v6 first-generation protocols to move to v10/v7 without resetting
 the saved training, optimizer, replay, RNG, guidance, feedback, request, or
 fallback state. The migration and effective episode are recorded in resolved
-configuration and later checkpoints. Other old or unknown protocol combinations
+configuration and later checkpoints. Old active guidance without raw weights
+retains its valid normalized prior and records raw weights as unavailable; the
+next generated episode uses the new protocol. Other old or unknown protocol combinations
 remain incompatible. Numerical template hashes and the output protocol are part
-of the cache identity, and the v9 numerical stage uses a versioned directory, so
+of the cache identity, and the v10 numerical stage uses a versioned directory, so
 old numerical artifacts are preserved but never silently reused.
 
 ## PowerShell commands
@@ -104,7 +108,7 @@ Targeted offline tests:
 python -m pytest tests\test_llm_explorer.py tests\test_experiment_framework.py tests\test_joint_td3.py tests\test_ddqn_routing.py -q
 ```
 
-The mock client is deterministic and returns neutral biases and uniform priors.
+The mock client is deterministic and returns neutral biases and all-one routing weights.
 It exists for smoke/integration validation only; it is not a scientific LLM
 baseline. A live remote response is not guaranteed reproducible from a local
 seed, while a saved matching response is replayable and revalidated.

@@ -6,23 +6,26 @@ Produce this episode's numerical exploration guidance using the following inform
 [Current numerical settings and field definitions]
 {{CURRENT_NUMERICAL_SETTINGS_AND_DEFINITIONS}}
 
-These include the current sigma_episode_start, bias bounds, epsilon, validation tolerances, and coordinate and state-field definitions and units.
+These include sigma_episode_start, TD3 bias bounds, epsilon, validation tolerances, and coordinate and state-field definitions and units.
 
 [Necessary current observable initial state]
 {{CURRENT_OBSERVABLE_INITIAL_STATE}}
 
-Initial task roles and legal links may change within the episode.
+Task roles and legal links may change within the episode.
 
-[Previous complete TD3 bias]
+[Previous episode's TD3 bias]
 {{PREVIOUS_COMPLETE_TD3_BIAS}}
 
-[Previous complete routing prior]
+[Previous episode's raw routing weights]
+{{PREVIOUS_COMPLETE_ROUTING_WEIGHTS}}
+
+[Previous episode's normalized routing probabilities before legal masking]
 {{PREVIOUS_COMPLETE_ROUTING_PRIOR}}
 
-[Previous application and fallback summary]
+[Previous episode's application and fallback summary]
 {{PREVIOUS_APPLICATION_STATUS}}
 
 [Validation feedback; empty on the first attempt]
 {{VALIDATION_FEEDBACK_OR_EMPTY}}
 
-Return complete JSON satisfying the system specifications. If validation feedback is present, correct the identified errors and still provide both complete matrices.
+Return only complete JSON satisfying the system specifications. If validation feedback is present, correct the identified errors and provide both complete matrices.

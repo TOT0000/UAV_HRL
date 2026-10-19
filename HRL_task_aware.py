@@ -156,6 +156,7 @@ from llm_potential import (
     runtime_constants_metadata as potential_constants_metadata,
 )
 from llm_explorer import (
+    FirstGenLLMExplorerConfig,
     LLMExplorerConfig,
     LLMExplorerController,
     FIRST_GEN_ROUTING_PRIOR_WEIGHT,
@@ -236,6 +237,11 @@ def _llm_routing_exploration_prior(method_spec, explorer, guidance):
         or guidance.get("routing_fallback", True)
     ):
         return None
+    if (
+        method_spec.method_id == "td3_dinkelbach_llm_explorer"
+        and guidance.get("routing_weights") is not None
+    ):
+        return guidance.get("routing_weights")
     return guidance.get("routing_prior")
 
 
@@ -812,6 +818,7 @@ def _run_routing_slot(
     routing_q_score_context=None,
     routing_training_diagnostics=None,
     exploration_prior=None,
+    exploration_guidance_kind=None,
     exploration_prior_weight=0.8,
     zero_prior_mass_callback=None,
     routing_decision_observer=None,
@@ -912,6 +919,7 @@ def _run_routing_slot(
         effective_masks,
         epsilon=epsilon,
         exploration_prior=exploration_prior,
+        exploration_guidance_kind=exploration_guidance_kind,
         exploration_prior_weight=exploration_prior_weight,
         zero_prior_mass_callback=zero_prior_mass_callback,
         return_diagnostics=True,
@@ -1155,6 +1163,7 @@ def _select_routing_actions(
     epsilon,
     *,
     exploration_prior=None,
+    exploration_guidance_kind=None,
     exploration_prior_weight=0.8,
     zero_prior_mass_callback=None,
     return_diagnostics=False,
@@ -1206,6 +1215,26 @@ def _select_routing_actions(
             action, detail = ddqn.select_action(
                 states[uid], uid, routing_masks[uid], **prior_kwargs
             )
+            if exploration_guidance_kind == "routing_weights":
+                raw_row = np.asarray(exploration_prior, dtype=np.float64)[uid]
+                whole_zero = not bool(np.any(raw_row > 0.0))
+                zero_legal = bool(
+                    detail.get("zero_legal_prior_mass_fallback", False)
+                )
+                detail["routing_weights_applied"] = True
+                detail["routing_weight_row_all_zero"] = whole_zero
+                detail["routing_weight_row_positive"] = not whole_zero
+                detail["zero_legal_routing_weight_after_mask"] = bool(
+                    zero_legal and not whole_zero
+                )
+                detail["routing_weight_uniform_fallback_used"] = zero_legal
+                detail["routing_weight_uniform_fallback_reason"] = (
+                    "all_weights_zero"
+                    if zero_legal and whole_zero
+                    else "legal_weights_zero_after_mask"
+                    if zero_legal
+                    else None
+                )
             actions[uid] = int(action)
             diagnostics[uid] = detail
     return (actions, diagnostics) if return_diagnostics else actions
@@ -2524,7 +2553,7 @@ def train(
                 episode_joint_transitions=int(config.episode_seconds),
             )
             if method_spec.llm_explorer_v3_enabled
-            else LLMExplorerConfig(
+            else FirstGenLLMExplorerConfig(
                 model=str(llm_explorer_model),
                 request_timeout_seconds=float(llm_explorer_timeout),
             )
@@ -3725,6 +3754,14 @@ def train(
                         _llm_routing_exploration_prior(
                             method_spec, llm_explorer, episode_guidance
                         )
+                    ),
+                    exploration_guidance_kind=(
+                        "routing_weights"
+                        if method_spec.method_id
+                        == "td3_dinkelbach_llm_explorer"
+                        and episode_guidance is not None
+                        and episode_guidance.get("routing_weights") is not None
+                        else None
                     ),
                     exploration_prior_weight=(
                         episode_guidance.get("routing_alpha", 0.0)
