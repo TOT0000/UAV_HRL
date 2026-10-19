@@ -26,13 +26,13 @@ import numpy as np
 
 LLM_EXPLORER_METHOD_ID = "td3_dinkelbach_llm_explorer"
 LLM_EXPLORER_MODEL = "gpt-4o-mini"
-LLM_EXPLORER_VERSION = "uav-hrl-llm-explorer-firstgen-v5"
-LLM_EXPLORER_PROMPT_VERSION = "uav-hrl-llm-explorer-prompts-v7"
+LLM_EXPLORER_VERSION = "uav-hrl-llm-explorer-firstgen-v6"
+LLM_EXPLORER_PROMPT_VERSION = "uav-hrl-llm-explorer-prompts-v8"
 LLM_EXPLORER_SUMMARY_VERSION = "complete-core-feedback-v4"
 LLM_EXPLORER_CASE_VERSION = "deterministic-diverse-cases-v1"
-LLM_EXPLORER_CACHE_VERSION = "episode-fixed-dual-guidance-cache-v4"
+LLM_EXPLORER_CACHE_VERSION = "episode-fixed-dual-guidance-cache-v5"
 LLM_EXPLORER_COMPRESSION_VERSION = LLM_EXPLORER_SUMMARY_VERSION
-LLM_EXPLORER_PRESENTATION_VERSION = "firstgen-columns-rows-3dp-v1"
+LLM_EXPLORER_PRESENTATION_VERSION = "firstgen-columns-rows-3dp-ms-v2"
 SHARED_ENVIRONMENT_DEFINITIONS_VERSION = "uav-hrl-llm-explorer-v2"
 LLM_EXPLORER_WARMUP_TRANSITIONS = 10_000
 LLM_EXPLORER_UPDATE_INTERVAL_EPISODES = 1
@@ -259,6 +259,58 @@ def first_gen_present_for_llm(
             for item in value
         ]
     raise TypeError(f"unsupported LLM presentation value: {type(value).__name__}")
+
+
+_FIRST_GEN_REPRESENTATIVE_SECONDS_TO_MS = {
+    "active_seconds": "active_service_ms",
+    "hol_remaining_deadline_s": "hol_remaining_deadline_ms",
+    "sr_hol_remaining_deadline_s": "sr_hol_remaining_deadline_ms",
+}
+_FIRST_GEN_REPRESENTATIVE_MS_FIELDS = frozenset(
+    _FIRST_GEN_REPRESENTATIVE_SECONDS_TO_MS.values()
+)
+
+
+def _first_gen_representative_cases_for_llm(value: Any) -> Any:
+    """Convert only known case durations/deadlines to ms in a detached copy."""
+
+    def convert(item: Any) -> Any:
+        if isinstance(item, Mapping):
+            converted = {}
+            for raw_key, raw_value in item.items():
+                key = str(raw_key)
+                destination = _FIRST_GEN_REPRESENTATIVE_SECONDS_TO_MS.get(key)
+                if destination is None:
+                    converted[key] = convert(raw_value)
+                    continue
+                if destination in item:
+                    raise ValueError(
+                        f"representative case contains both {key!r} and "
+                        f"{destination!r}"
+                    )
+                if raw_value is None or isinstance(raw_value, str):
+                    converted[destination] = raw_value
+                elif isinstance(raw_value, (int, float, np.integer, np.floating)):
+                    converted[destination] = _presentation_number(
+                        float(raw_value) * 1000.0,
+                        scientific_small_nonzero=True,
+                    )
+                else:
+                    raise TypeError(
+                        f"representative case {key!r} must be numeric, null, "
+                        "or an explicit status string"
+                    )
+            return converted
+        if isinstance(item, np.ndarray):
+            return [convert(child) for child in item.tolist()]
+        if isinstance(item, (list, tuple)):
+            return [convert(child) for child in item]
+        return item
+
+    return first_gen_present_for_llm(
+        convert(value),
+        preserve_precision_keys=_FIRST_GEN_REPRESENTATIVE_MS_FIELDS,
+    )
 
 
 def _semantic_guidance(guidance: dict[str, Any]) -> dict[str, Any]:
@@ -884,9 +936,6 @@ def _first_gen_routing_table(summary: Mapping[str, Any]) -> dict[str, Any]:
                 _numeric_summary_row(
                     link.get("current_geometry_expected_capacity_bps", {})
                 ),
-                _numeric_summary_row(
-                    link.get("fixed_maximum_capacity_normalizer_bps", {})
-                ),
                 link.get("capacity_context_latest"),
                 _numeric_summary_row(
                     link.get("neighbor_backlog_log_normalized", {})
@@ -959,7 +1008,6 @@ def _first_gen_routing_table(summary: Mapping[str, Any]) -> dict[str, Any]:
             "capacity_semantics": {
                 "current_geometry_expected_capacity_bps": "specified reference bandwidth and decision-time channel caches",
                 "actual_service": "post-sharing authoritative positive transmitted bits and completed hops",
-                "fixed_maximum_capacity_normalizer_bps": "normalization constant, never current capacity",
             },
             "numeric_summary_layout": [
                 "valid_sample_count", "mean", "min", "max"
@@ -993,7 +1041,6 @@ def _first_gen_routing_table(summary: Mapping[str, Any]) -> dict[str, Any]:
                 "action_index", "endpoint", "selection_reasons",
                 "legal_opportunity_count",
                 "current_geometry_expected_capacity_bps_summary",
-                "fixed_maximum_capacity_normalizer_bps_summary",
                 "capacity_context_latest",
                 "neighbor_backlog_log_normalized_summary",
                 "actual_transmitted_bits",
@@ -1031,7 +1078,7 @@ def compact_feedback_for_llm(previous: dict[str, Any]) -> dict[str, Any]:
             "routing_tables": _first_gen_routing_table(
                 previous.get("routing_core_summary", {})
             ),
-            "representative_cases": first_gen_present_for_llm(
+            "representative_cases": _first_gen_representative_cases_for_llm(
                 previous.get("representative_cases", [])
             ),
         }
@@ -3162,6 +3209,103 @@ def environment_constants_and_definitions(
     }
 
 
+def _first_gen_movement_penalty_contract() -> dict[str, Any]:
+    """Select the runtime-owned constraint contract for first-gen analysis."""
+
+    from experiment_config import task_potential_contract_metadata
+
+    contract = task_potential_contract_metadata()
+    weights = contract["constraint_penalty_weights"]
+    epsilon = contract["com_range"]["normalization_epsilon"]
+
+    def scoped_formula(
+        *, penalty: str, weight: str, population: str, definition: str
+    ) -> str:
+        if not definition.startswith("mean("):
+            raise RuntimeError(
+                f"unexpected {penalty} task-potential definition: {definition}"
+            )
+        expression = definition.replace("mean(", f"mean_over_{population}(", 1)
+        expression = (
+            expression.replace("d2D", "d")
+            .replace("roi_radius", "r")
+            .replace("distance_3d", "D_3D")
+        )
+        return f"{penalty} = {weight} * {expression}"
+
+    edge_distances = contract["c10"]["edge_distances"]
+    return {
+        "source_contract_version": contract["contract_version"],
+        "reward_form": contract["reward_form"],
+        "normalization_epsilon": epsilon,
+        "weights": {
+            "w_C9": weights["c9"],
+            "w_C10": weights["c10"],
+            "w_COM": weights["com_range"],
+        },
+        "symbols": {
+            "h": "UAV altitude minus assigned RoI altitude, m",
+            "d": "UAV-to-assigned-RoI horizontal distance, m",
+            "r": "assigned RoI radius, m",
+            "D_3D": "UAV-to-assigned-SR three-dimensional distance, m",
+            "R_com": "actual COM S2U communication range limit, m",
+            "R_com_value_m": contract["com_range"]["s2u_range_m"],
+            "b1": "verified VS-camera constant in camera_geometry_constants",
+            "b2": "verified VS-camera constant in camera_geometry_constants",
+            "d_L": edge_distances["d_left"],
+            "d_R": edge_distances["d_right"],
+            "epsilon": "normalization_epsilon above",
+        },
+        "C9": {
+            "formula": scoped_formula(
+                penalty="P_C9",
+                weight="w_C9",
+                population="S_C9",
+                definition=contract["c9"]["definition"],
+            ),
+            "population": contract["c9"]["population"],
+            "membership_and_validity": (
+                "Every currently assigned FOV UAV-RoI pair is included. The "
+                "canonical VS geometry supplies the clipped proximity value; "
+                "C9 model-range and capture validity are not membership "
+                "filters, and invalid inputs retain the canonical geometry's "
+                "returned proximity/status."
+            ),
+        },
+        "C10": {
+            "formula": scoped_formula(
+                penalty="P_C10",
+                weight="w_C10",
+                population="S_C10",
+                definition=contract["c10"]["definition"],
+            ),
+            "population": contract["c10"]["population"],
+            "membership_and_validity": (
+                "Only currently assigned FOV pairs with C9 model-range "
+                "validity, finite nonnegative d_L and d_R, and a finite "
+                "positive RoI radius are included."
+            ),
+        },
+        "COM": {
+            "formula": scoped_formula(
+                penalty="P_COM",
+                weight="w_COM",
+                population="S_COM",
+                definition=contract["com_range"]["definition"],
+            ),
+            "population": contract["com_range"]["population"],
+            "membership_and_validity": (
+                "Every currently assigned COM UAV-SR pair is included; "
+                "runtime requires a finite three-dimensional distance."
+            ),
+        },
+        "empty_population": (
+            "Each penalty mean uses only its own population; an empty "
+            "population contributes zero."
+        ),
+    }
+
+
 def environment_constants_and_definitions_first_gen(
     **kwargs: Any,
 ) -> dict[str, Any]:
@@ -3175,6 +3319,10 @@ def environment_constants_and_definitions_first_gen(
         REFERENCE_COM_BANDWIDTH_HZ,
         ROUTING_REWARD_BITS_PER_UNIT,
         TOTAL_COMMUNICATION_BANDWIDTH_HZ,
+    )
+    from Channel_model import (
+        reference_u2g_max_capacity_mbps,
+        reference_u2u_max_capacity_mbps,
     )
 
     base = environment_constants_and_definitions(**kwargs)
@@ -3195,6 +3343,31 @@ def environment_constants_and_definitions_first_gen(
         total_dynamic_fdma_bandwidth_hz=float(
             TOTAL_COMMUNICATION_BANDWIDTH_HZ
         ),
+        routing_state_normalization_constants={
+            "semantics": (
+                "Routing-state normalization constants; not current link "
+                "capacities or realized service rates."
+            ),
+            "configuration": {
+                "reference_system_bandwidth_hz": float(
+                    TOTAL_COMMUNICATION_BANDWIDTH_HZ
+                ),
+                "by_link_type_bps": {
+                    "U2U": float(
+                        reference_u2u_max_capacity_mbps(
+                            TOTAL_COMMUNICATION_BANDWIDTH_HZ
+                        )
+                        * 1e6
+                    ),
+                    "U2G": float(
+                        reference_u2g_max_capacity_mbps(
+                            TOTAL_COMMUNICATION_BANDWIDTH_HZ
+                        )
+                        * 1e6
+                    ),
+                },
+            },
+        },
         s2u_reference_bandwidth_hz=float(REFERENCE_COM_BANDWIDTH_HZ),
         propulsion={
             "model_id": PROPULSION_MODEL_ID,
@@ -3258,6 +3431,9 @@ def environment_constants_and_definitions_first_gen(
     base["movement_reward"]["penalty_denominators"] = (
         "each penalty is averaged over its own currently applicable service-pair "
         "set; an empty set contributes zero"
+    )
+    base["movement_reward"]["penalty_contract"] = (
+        _first_gen_movement_penalty_contract()
     )
     base["routing_reward"]["bits_per_reward_unit"] = float(
         ROUTING_REWARD_BITS_PER_UNIT
@@ -3325,12 +3501,7 @@ def first_gen_resolved_settings_and_dictionary(
                     }
                 },
                 "movement_reward_formula": movement_reward.get("formula"),
-                "constraint_weights": movement_reward.get(
-                    "constraint_weights"
-                ),
-                "penalty_denominators": movement_reward.get(
-                    "penalty_denominators"
-                ),
+                "penalty_contract": movement_reward.get("penalty_contract"),
             },
             "data_dictionary": {
                 "presentation_precision": (
@@ -3358,16 +3529,25 @@ def first_gen_resolved_settings_and_dictionary(
                 "capacity_types": {
                     "current_geometry_expected_capacity_bps": "decision-time expected link capacity at the stated reference bandwidth",
                     "actual_service": "post-sharing authoritative positive transmitted bits/completions",
-                    "fixed_maximum_capacity_normalizer_bps": "fixed observation normalizer, not current capacity",
                 },
+                "routing_state_normalization_constants": environment.get(
+                    "routing_state_normalization_constants"
+                ),
                 "wait_duration": (
                     "event-time duration in ms; slot-start HOL counts are observations, not durations"
                 ),
+                "representative_case_time_units": {
+                    "time_s": "absolute simulation time, seconds",
+                    "active_service_ms": "positive service duration, milliseconds",
+                    "hol_remaining_deadline_ms": "UAV HOL remaining deadline, milliseconds",
+                    "sr_hol_remaining_deadline_ms": "SR HOL remaining deadline, milliseconds",
+                },
                 "representative_limits": (
                     "at most three links per sender and eight episode cases; omissions do not imply illegality or absence"
                 ),
             },
-        }
+        },
+        preserve_precision_keys=frozenset({"normalization_epsilon"}),
     )
 
 
@@ -3399,6 +3579,18 @@ def first_gen_numerical_settings(
         1e-7,
         4.0 * np.finfo(np.float32).eps * max(1.0, abs(sigma)),
     )
+    analysis_dictionary = first_gen_resolved_settings_and_dictionary(
+        environment
+    )["data_dictionary"]
+    numerical_dictionary = {
+        key: value
+        for key, value in analysis_dictionary.items()
+        if key
+        not in {
+            "representative_case_time_units",
+            "routing_state_normalization_constants",
+        }
+    }
     # Numerical limits deliberately retain source precision.  This is separate
     # from the rounded observation presentation.
     return first_gen_present_for_llm(
@@ -3411,9 +3603,7 @@ def first_gen_numerical_settings(
             ),
             "routing_prior_value_bounds_inclusive": [0.0, 1.0],
             "routing_prior_row_sum_absolute_tolerance": 1e-6,
-            "coordinate_and_field_definitions": first_gen_resolved_settings_and_dictionary(
-                environment
-            )["data_dictionary"],
+            "coordinate_and_field_definitions": numerical_dictionary,
         },
         preserve_precision_keys=frozenset(
             {

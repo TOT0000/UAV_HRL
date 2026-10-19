@@ -1,3 +1,4 @@
+import copy
 import hashlib
 import json
 import shutil
@@ -30,6 +31,7 @@ from llm_explorer import (
     explorer_metadata,
     first_gen_movement_summary,
     first_gen_present_for_llm,
+    first_gen_resolved_settings_and_dictionary,
     first_gen_routing_summary,
     llm_explorer_path_preflight,
     masked_routing_exploration_distribution,
@@ -408,6 +410,110 @@ def test_first_generation_three_decimal_presentation_is_detached_and_typed():
     assert presented["lambda_EE_Mbit_per_J_used"] == 1.23e-05
     np.testing.assert_array_equal(
         array, np.array([1.23456, -0.000012345, 0.00049])
+    )
+
+
+def test_representative_case_durations_use_explicit_ms_fields_without_mutation():
+    previous = _previous_feedback()
+    previous["representative_cases"] = [
+        {
+            "kind": "short_service",
+            "time_s": 12.34567,
+            "active_seconds": 2.2838932352442498e-05,
+            "vector": np.array([1.23456, 2.34567]),
+        },
+        {
+            "kind": "longer_service",
+            "time_s": 13.0,
+            "active_seconds": 0.001298719,
+        },
+        {
+            "kind": "nested_hol",
+            "time_s": 14.0,
+            "queue_and_sensing": {
+                "uav_queue": {"hol_remaining_deadline_s": 2.2838932352442498e-05},
+                "com": {"sr_hol_remaining_deadline_s": 0.001298719},
+            },
+        },
+        {"kind": "true_zero", "time_s": 15.0, "active_seconds": 0.0},
+        {"kind": "tiny_nonzero", "time_s": 16.0, "active_seconds": 1e-10},
+        {"kind": "none", "time_s": 17.0, "active_seconds": None},
+        {
+            "kind": "unknown",
+            "time_s": 18.0,
+            "queue_and_sensing": {
+                "com": {"sr_hol_remaining_deadline_s": "unknown"}
+            },
+        },
+    ]
+    source = copy.deepcopy(previous["representative_cases"])
+
+    cases = compact_feedback_for_llm(previous)["representative_cases"]
+
+    assert cases[0]["time_s"] == 12.346
+    assert "time_ms" not in cases[0]
+    assert cases[0]["active_service_ms"] == 0.023
+    assert cases[1]["active_service_ms"] == 1.299
+    nested = cases[2]["queue_and_sensing"]
+    assert nested["uav_queue"]["hol_remaining_deadline_ms"] == 0.023
+    assert nested["com"]["sr_hol_remaining_deadline_ms"] == 1.299
+    assert cases[3]["active_service_ms"] == 0.0
+    assert cases[4]["active_service_ms"] == 1e-7
+    assert cases[5]["active_service_ms"] is None
+    assert (
+        cases[6]["queue_and_sensing"]["com"]["sr_hol_remaining_deadline_ms"]
+        == "unknown"
+    )
+    assert all("active_seconds" not in case for case in cases)
+    np.testing.assert_array_equal(
+        previous["representative_cases"][0]["vector"], source[0]["vector"]
+    )
+    assert previous["representative_cases"][0]["active_seconds"] == source[0]["active_seconds"]
+
+
+def test_first_gen_penalty_contract_and_capacity_normalizers_are_runtime_derived():
+    from Channel_model import (
+        reference_u2g_max_capacity_mbps,
+        reference_u2u_max_capacity_mbps,
+    )
+    from experiment_config import TOTAL_COMMUNICATION_BANDWIDTH_HZ
+
+    environment = environment_constants_and_definitions_first_gen(
+        episode_seconds=60,
+        routing_slot_seconds=0.25,
+    )
+    resolved = first_gen_resolved_settings_and_dictionary(environment)
+    penalties = resolved["camera_and_penalties"]["penalty_contract"]
+
+    assert penalties["C9"]["formula"] == (
+        "P_C9 = w_C9 * mean_over_S_C9(1 - clip(b1*h/(d+epsilon),0,1))"
+    )
+    assert penalties["C10"]["formula"] == (
+        "P_C10 = w_C10 * mean_over_S_C10(1 - clip(min(d_L,d_R)/(r+epsilon),0,1))"
+    )
+    assert penalties["COM"]["formula"] == (
+        "P_COM = w_COM * mean_over_S_COM(1 - clip(R_com/(D_3D+epsilon),0,1))"
+    )
+    assert penalties["weights"] == {"w_C9": 1.0, "w_C10": 1.0, "w_COM": 1.0}
+    assert penalties["normalization_epsilon"] == 1e-12
+    assert penalties["C9"]["population"] == "currently assigned FOV pairs"
+    assert "C9-valid" in penalties["C10"]["population"]
+    assert penalties["COM"]["population"] == "all currently assigned COM UAV-SR pairs"
+    assert "empty population contributes zero" in penalties["empty_population"]
+
+    normalizers = resolved["data_dictionary"][
+        "routing_state_normalization_constants"
+    ]
+    assert normalizers["semantics"] == (
+        "Routing-state normalization constants; not current link capacities "
+        "or realized service rates."
+    )
+    values = normalizers["configuration"]["by_link_type_bps"]
+    assert values["U2U"] == pytest.approx(
+        reference_u2u_max_capacity_mbps(TOTAL_COMMUNICATION_BANDWIDTH_HZ) * 1e6
+    )
+    assert values["U2G"] == pytest.approx(
+        reference_u2g_max_capacity_mbps(TOTAL_COMMUNICATION_BANDWIDTH_HZ) * 1e6
     )
 
 
@@ -924,8 +1030,15 @@ def test_real_size_compact_prompts_preserve_samples_and_fit_all_attempts(tmp_pat
     assert '"b2":' in client.calls[0]["prompt"]
     assert "horizontal_10_mps" in client.calls[0]["prompt"]
     assert '"n_r":' not in client.calls[0]["prompt"]
+    assert "P_C9 = w_C9 * mean_over_S_C9" in client.calls[0]["prompt"]
+    assert "P_C10 = w_C10 * mean_over_S_C10" in client.calls[0]["prompt"]
+    assert "P_COM = w_COM * mean_over_S_COM" in client.calls[0]["prompt"]
+    assert "Routing-state normalization constants" in client.calls[0]["prompt"]
+    assert "fixed_maximum_capacity_normalizer_bps" not in client.calls[0]["prompt"]
     assert "movement_and_service" not in client.calls[1]["prompt"].lower()
     assert "representative_cases" not in client.calls[1]["prompt"]
+    assert "P_C9 = w_C9" not in client.calls[1]["prompt"]
+    assert "Routing-state normalization constants" not in client.calls[1]["prompt"]
 
     compact = compact_feedback_for_llm(previous)
     assert len(compact["movement_and_service_tables"]["rows"]) == 16
@@ -961,6 +1074,16 @@ def test_real_size_compact_prompts_preserve_samples_and_fit_all_attempts(tmp_pat
         len(row[representative_links_index]) <= 3
         for row in compact["routing_tables"]["rows"]
     )
+    assert "fixed_maximum_capacity_normalizer_bps" not in json.dumps(
+        compact["routing_tables"]
+    )
+    link_layout = compact["routing_tables"]["representative_link_layout"]
+    assert "current_geometry_expected_capacity_bps_summary" in link_layout
+    assert "actual_allocated_service_capacity_bps_summary" in link_layout
+    assert "actual_active_service_ms" in link_layout
+    for row in compact["routing_tables"]["rows"]:
+        for link_row in row[representative_links_index]:
+            assert len(link_row) == len(link_layout)
     assert len(compact["representative_cases"]) == 8
     assert compact["previous_complete_guidance"]["td3_bias"]["shape"] == [16, 3]
     assert compact["previous_complete_guidance"]["routing_prior"]["shape"] == [16, 17]
@@ -1634,7 +1757,7 @@ def test_first_generation_versions_metadata_and_old_checkpoint_rejection(tmp_pat
     restored.load_state_dict(state)
     assert restored.state_dict()["schema_version"] == LLM_EXPLORER_VERSION
 
-    state["schema_version"] = "uav-hrl-llm-explorer-firstgen-v3"
+    state["schema_version"] = "uav-hrl-llm-explorer-firstgen-v5"
     with pytest.raises(Exception, match="checkpoint version is incompatible"):
         controller.load_state_dict(state)
 

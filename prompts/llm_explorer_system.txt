@@ -168,13 +168,13 @@ Interpret the data dictionary's distinctions between:
 - Requested bias, pre-projection Actor offset, movement-mask-qualified application, and final executed action.
 - Route preselection, actual packet use, positive transmitted bits, completed hops, and timely useful GS delivery.
 - Actual time with a HOL packet under WAIT and decision-boundary observation counts.
-- Current-geometry expected capacity, realized allocated service, and fixed capacity-normalization constants.
+- Current-geometry expected capacity, realized allocated service, and the centralized routing-state normalization constants. Those constants are not current link capacities or realized service rates.
 - Measured zero, an empty queue, an unassigned target, and unknown information.
 
 Zero TD3 control does not imply that a UAV was stationary. An empty queue at slot start does not imply that it provided no service during the slot.
 
 Current-episode information contains only observable UAVs, known RoIs/SRs, tasks, and links. Previous-episode targets and positions remain historical information rather than newly discovered current targets.
 
-General observation and summary values are rounded to at most three decimal places. The dictionary specifies units and precision exceptions. Historical guidance matrices are complete rounded references; their row sums may differ slightly from one, and a rounded zero may represent a small source value. Actual host guidance retains its original precision.
+General observation and summary values are rounded to at most three decimal places. Representative-case absolute time_s is in seconds, while explicit service durations and UAV/SR HOL remaining deadlines use milliseconds and _ms field names. The dictionary specifies units and precision exceptions; a very small nonzero duration may retain extra significant digits or scientific notation rather than become zero. Historical guidance matrices are complete rounded references; their row sums may differ slightly from one, and a rounded zero may represent a small source value. Actual host guidance retains its original precision.
 
 Provide testable exploration hypotheses and distinguish observations, hypotheses, and unknowns. When violation locations are unknown, retain that uncertainty.

@@ -41,9 +41,14 @@ request is checked with the `o200k_base` tokenizer against the 128,000-token
 context limit, including reserved output and a safety margin. Token budgets are
 saved beside each attempt. The payload contains filtered observable state and
 never serializes a scenario manifest or undiscovered RoI and SR ground truth.
-The first-generation controller schema is `uav-hrl-llm-explorer-firstgen-v5`,
-prompt schema is v7, summary schema is `complete-core-feedback-v4`, and cache
-schema is `episode-fixed-dual-guidance-cache-v4`. Slot-start HOL fields remain
+The first-generation controller schema is `uav-hrl-llm-explorer-firstgen-v6`,
+prompt schema is v8, summary schema is `complete-core-feedback-v4`, and cache
+schema is `episode-fixed-dual-guidance-cache-v5`. Representative-case service
+durations and HOL remaining deadlines use explicitly named millisecond fields,
+while absolute `time_s` remains in seconds. The analysis dictionary contains
+the runtime-owned C9/C10/COM formulas, populations, weights, and epsilon, plus
+one U2U/U2G routing-state-normalizer mapping instead of repeating constants in
+each representative link. Slot-start HOL fields remain
 observation counts; actual WAIT time is accumulated on the PacketEngine event
 clock and unavailable legacy values stay unknown. Movement feedback separates
 the requested matrix, Actor pre-projection offset, movement-mask-qualified

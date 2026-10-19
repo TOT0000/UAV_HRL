@@ -61,6 +61,7 @@ Shared columns and rows retain complete epsilon/greedy 17-action counts, complet
 {{REPRESENTATIVE_CASES}}
 
 At most eight cases cover normal service and major limitations, retaining relevant time, IDs, control branch, geometry, action, and service outcome.
+Absolute case time_s remains in seconds. Explicit service durations and UAV/SR HOL remaining deadlines are named with an _ms suffix and expressed in milliseconds. A very small nonzero duration may use extra significant digits or scientific notation so it cannot be confused with a true zero.
 
 [Requested analysis]
 
