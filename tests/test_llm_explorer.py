@@ -16,6 +16,8 @@ from HRL_task_aware import TrainingConfig, _select_routing_actions, train
 from llm_explorer import (
     FIRST_GEN_ROUTING_PRIOR_WEIGHT,
     LLM_EXPLORER_CACHE_VERSION,
+    LLM_EXPLORER_NUMERICAL_OUTPUT_PROTOCOL,
+    LLM_EXPLORER_NUMERICAL_STAGE,
     LLM_EXPLORER_PROMPT_VERSION,
     LLM_EXPLORER_SUMMARY_VERSION,
     LLM_EXPLORER_VERSION,
@@ -29,6 +31,7 @@ from llm_explorer import (
     environment_constants_and_definitions,
     environment_constants_and_definitions_first_gen,
     explorer_metadata,
+    first_gen_numerical_response_format,
     first_gen_movement_summary,
     first_gen_present_for_llm,
     first_gen_resolved_settings_and_dictionary,
@@ -723,6 +726,97 @@ def test_guidance_json_validation_rejects_bad_values(content, error_layer):
     assert error_layer in errors
 
 
+def test_guidance_parser_accepts_only_json_or_complete_outer_json_fence():
+    content = _guidance(0.1)
+    for wrapped in (content, f"  ```json\n{content}\n```  ", f"```\n{content}\n```"):
+        td3, routing, errors = parse_guidance_response(wrapped, 0.2)
+        assert errors == {}
+        assert td3 is not None and routing is not None
+
+    for invalid in (
+        f"Explanation before JSON.\n{content}",
+        f"```json\n{content}",
+        f"```javascript\n{content}\n```",
+    ):
+        td3, routing, errors = parse_guidance_response(invalid, 0.2)
+        assert td3 is None and routing is None
+        assert "invalid JSON" in errors["td3"]
+
+
+def test_probability_rows_with_gross_sums_are_rejected_with_actionable_details():
+    prior = [[1.0 / 17.0] * 17 for _ in range(16)]
+    prior[3] = [0.1] * 16 + [0.0]
+    prior[7] = [0.2] * 10 + [0.0] * 7
+    td3, routing, errors = parse_guidance_response(
+        _guidance(0.1, prior), sigma_episode_start=0.2
+    )
+    assert td3 is not None
+    assert routing is None
+    assert "row 3 (UAV 3)" in errors["routing"]
+    assert "sum=1.6" in errors["routing"]
+    assert "row 7 (UAV 7)" in errors["routing"]
+    assert "sum=2.0" in errors["routing"]
+    assert "absolute tolerance 0.000001" in errors["routing"]
+
+
+def test_matrix_shape_and_td3_bound_errors_identify_actual_uav_values():
+    wrong_shape = json.dumps(
+        {
+            "td3_bias": [[0.0, 0.0, 0.0]] * 15,
+            "routing_prior": [[1.0 / 17.0] * 17 for _ in range(16)],
+        }
+    )
+    td3, routing, errors = parse_guidance_response(wrong_shape, 0.2)
+    assert td3 is None and routing is not None
+    assert "expected shape [16,3]" in errors["td3"]
+    assert "actual shape=[15, 3]" in errors["td3"]
+
+    out_of_bounds = json.loads(_guidance(0.0))
+    out_of_bounds["td3_bias"][6][2] = 0.45
+    td3, routing, errors = parse_guidance_response(
+        json.dumps(out_of_bounds), 0.2
+    )
+    assert td3 is None and routing is not None
+    assert "UAV 6 vertical" in errors["td3"]
+    assert "value=0.45" in errors["td3"]
+    assert "[-0.2,0.2]" in errors["td3"]
+
+
+def test_uniform_eight_decimal_probability_rows_and_prompt_example_validate():
+    uniform = [[0.05882353] * 17 for _ in range(16)]
+    _, routing, errors = parse_guidance_response(_guidance(0.0, uniform), 0.2)
+    assert errors == {}
+    assert routing is not None
+    np.testing.assert_allclose(routing.sum(axis=1), 1.0, atol=1e-12)
+
+    prompt = (
+        Path(__file__).parents[1]
+        / "prompts"
+        / "llm_explorer_numerical_system.txt"
+    ).read_text(encoding="utf-8")
+    example = prompt[prompt.index('{\n  "td3_bias"') :].strip()
+    td3, routing, errors = parse_guidance_response(example, 0.2)
+    assert errors == {}
+    assert td3 is not None and routing is not None
+
+
+def test_first_gen_strict_response_schema_has_exact_matrix_contract():
+    response_format = first_gen_numerical_response_format()
+    assert response_format["type"] == "json_schema"
+    contract = response_format["json_schema"]
+    assert contract["strict"] is True
+    schema = contract["schema"]
+    assert schema["required"] == ["td3_bias", "routing_prior"]
+    assert schema["additionalProperties"] is False
+    td3 = schema["properties"]["td3_bias"]
+    routing = schema["properties"]["routing_prior"]
+    assert (td3["minItems"], td3["maxItems"]) == (16, 16)
+    assert (td3["items"]["minItems"], td3["items"]["maxItems"]) == (3, 3)
+    assert (routing["minItems"], routing["maxItems"]) == (16, 16)
+    assert (routing["items"]["minItems"], routing["items"]["maxItems"]) == (17, 17)
+    assert td3["items"]["items"] == routing["items"]["items"] == {"type": "number"}
+
+
 def test_warmup_has_no_calls_then_two_stage_guidance_at_transition_boundary(tmp_path):
     client = SequenceClient(["analysis", _guidance(0.1)])
     controller = LLMExplorerController(
@@ -748,6 +842,53 @@ def test_warmup_has_no_calls_then_two_stage_guidance_at_transition_boundary(tmp_
     assert "analysis" in client.calls[1]["prompt"]
     assert "unknown_no_applied_guidance" in client.calls[1]["prompt"]
     assert "[16, 17]" not in client.calls[1]["prompt"]
+    assert "response_format" not in client.calls[0]
+    assert client.calls[1]["response_format"] == first_gen_numerical_response_format()
+    assert "{{" not in client.calls[1]["system_prompt"]
+    assert "{{" not in client.calls[1]["prompt"]
+    episode_root = tmp_path / "llm_explorer" / "episode_000012"
+    analysis_metadata = json.loads(
+        (episode_root / "analysis" / "attempt_01" / "response_metadata.json").read_text()
+    )
+    numerical_metadata = json.loads(
+        (
+            episode_root
+            / LLM_EXPLORER_NUMERICAL_STAGE
+            / "attempt_01"
+            / "response_metadata.json"
+        ).read_text()
+    )
+    assert analysis_metadata["structured_output_sent"] is False
+    assert analysis_metadata["response_format"] is None
+    assert numerical_metadata["structured_output_sent"] is True
+    assert numerical_metadata["response_format"] == first_gen_numerical_response_format()
+
+
+def test_row_sum_retry_feedback_retains_independently_valid_td3_layer(tmp_path):
+    invalid = [[1.0 / 17.0] * 17 for _ in range(16)]
+    invalid[5] = [0.1] * 16 + [0.0]
+    client = SequenceClient(
+        [
+            "analysis",
+            _guidance(0.12, invalid),
+            _guidance(9.0),
+        ]
+    )
+    controller = LLMExplorerController(
+        run_directory=tmp_path,
+        run_identity={"run": "row-sum-retry"},
+        client=client,
+    )
+    controller.previous_episode_feedback = _previous_feedback()
+    result = _begin(controller)
+    assert not result["td3_fallback"] and not result["routing_fallback"]
+    assert result["td3_guidance_attempt"] == 1
+    assert result["routing_guidance_attempt"] == 2
+    assert result["td3_bias"][0, 0] == pytest.approx(0.12)
+    retry_prompt = client.calls[2]["prompt"]
+    assert "row 5 (UAV 5)" in retry_prompt
+    assert "sum=1.6" in retry_prompt
+    assert "return both complete matrices" in retry_prompt
 
 
 def test_partial_layer_retry_keeps_valid_first_layer_and_counts_retry(tmp_path):
@@ -836,6 +977,86 @@ def test_matching_saved_responses_replay_without_new_requests(tmp_path):
     assert replay.statistics["requests_total"] == 2
 
 
+def test_pre_v9_first_gen_checkpoint_state_migrates_without_reset(tmp_path):
+    source = LLMExplorerController(
+        run_directory=None,
+        run_identity={"run": "pre-v9-resume"},
+        client=SequenceClient([]),
+        rng_seed=91,
+    )
+    source.previous_episode_feedback = _previous_feedback()
+    source.active_guidance = {
+        "enabled": True,
+        "td3_bias": np.full((16, 3), 0.02, dtype=np.float32),
+        "routing_prior": np.full((16, 17), 1.0 / 17.0, dtype=np.float64),
+        "td3_fallback": False,
+        "routing_fallback": False,
+        "td3_reason": "llm_guidance",
+        "routing_reason": "llm_guidance",
+        "analysis_attempt": 1,
+        "td3_guidance_attempt": 1,
+        "routing_guidance_attempt": 1,
+        "reused": False,
+    }
+    source._request_records["old-request"] = {
+        "request_id": "old-request",
+        "stage": "analysis",
+        "success": True,
+        "retry_success": False,
+        "elapsed_seconds": 1.25,
+        "failure_category": None,
+        "usage": {"prompt_tokens": 10, "completion_tokens": 4, "total_tokens": 14},
+        "actual_model": "gpt-4o-mini",
+    }
+    source._fallback_records["3"] = {
+        "episode": 3,
+        "td3": False,
+        "routing": True,
+    }
+    source.statistics["routing_zero_legal_prior_mass_total"] = 7
+    state = source.state_dict()
+    state["config"]["prompt_version"] = "uav-hrl-llm-explorer-prompts-v8"
+    expected_rng = np.random.default_rng()
+    expected_rng.bit_generator.state = copy.deepcopy(state["rng_state"])
+    expected_next_random = expected_rng.random()
+
+    restored = LLMExplorerController(
+        run_directory=tmp_path,
+        run_identity={"run": "pre-v9-resume"},
+        client=SequenceClient([]),
+        rng_seed=0,
+    )
+    restored.load_state_dict(state)
+    assert restored.previous_episode_feedback == source.previous_episode_feedback
+    np.testing.assert_array_equal(
+        restored.active_guidance["td3_bias"], source.active_guidance["td3_bias"]
+    )
+    np.testing.assert_allclose(
+        restored.active_guidance["routing_prior"], source.active_guidance["routing_prior"]
+    )
+    assert restored.statistics["requests_total"] == 1
+    assert restored.statistics["fallback_episodes_total"] == 1
+    assert restored.statistics["routing_zero_legal_prior_mass_total"] == 7
+    assert restored.rng.random() == pytest.approx(expected_next_random)
+    migrated = restored.state_dict()
+    assert migrated["config"]["prompt_version"] == LLM_EXPLORER_PROMPT_VERSION
+    assert migrated["resume_protocol_migrations"][-1]["source_prompt_version"].endswith("v8")
+    assert migrated["resume_protocol_migrations"][-1]["target_numerical_output_protocol"] == LLM_EXPLORER_NUMERICAL_OUTPUT_PROTOCOL
+
+    reloaded = LLMExplorerController(
+        run_directory=None,
+        run_identity={"run": "pre-v9-resume"},
+        client=SequenceClient([]),
+    )
+    reloaded.load_state_dict(migrated)
+    assert reloaded.state_dict()["resume_protocol_migrations"] == migrated["resume_protocol_migrations"]
+
+    unsupported = copy.deepcopy(state)
+    unsupported["config"]["prompt_version"] = "unknown-prompt-version"
+    with pytest.raises(ValueError, match="checkpoint config is incompatible"):
+        reloaded.load_state_dict(unsupported)
+
+
 def test_old_first_generation_cache_identity_is_not_reused(tmp_path):
     first = LLMExplorerController(
         run_directory=tmp_path,
@@ -846,10 +1067,13 @@ def test_old_first_generation_cache_identity_is_not_reused(tmp_path):
     _begin(first)
 
     episode_root = tmp_path / "llm_explorer" / "episode_000168"
+    current_numerical = episode_root / LLM_EXPLORER_NUMERICAL_STAGE
+    legacy_numerical = episode_root / "numerical"
+    current_numerical.rename(legacy_numerical)
     identity_files = [
         episode_root / "episode_result.json",
         episode_root / "analysis" / "completed.json",
-        episode_root / "numerical" / "completed.json",
+        legacy_numerical / "completed.json",
     ]
     for path in identity_files:
         value = json.loads(path.read_text(encoding="utf-8"))
@@ -868,6 +1092,8 @@ def test_old_first_generation_cache_identity_is_not_reused(tmp_path):
     restored = _begin(replay)
     assert restored["reused"] is False
     assert len(client.calls) == 2
+    assert legacy_numerical.is_dir()
+    assert (episode_root / LLM_EXPLORER_NUMERICAL_STAGE / "completed.json").is_file()
 
 
 def test_numerical_template_change_invalidates_episode_result_only_as_needed(
@@ -1024,7 +1250,7 @@ def test_real_size_compact_prompts_preserve_samples_and_fit_all_attempts(tmp_pat
     assert len(client.calls) == 3
     assert client.calls[0]["system_prompt"] != client.calls[1]["system_prompt"]
     assert "[Evidence and observability]" in client.calls[0]["system_prompt"]
-    assert "[Response format]" in client.calls[1]["system_prompt"]
+    assert "[4. Output requirements and example]" in client.calls[1]["system_prompt"]
     assert "actual_hol_wait_duration_ms" in client.calls[0]["prompt"]
     assert '"b1":' in client.calls[0]["prompt"]
     assert '"b2":' in client.calls[0]["prompt"]
@@ -1105,9 +1331,9 @@ def test_real_size_compact_prompts_preserve_samples_and_fit_all_attempts(tmp_pat
     episode_root = tmp_path / "llm_explorer" / "episode_000168"
     assert (episode_root / "analysis" / "system_prompt.txt").read_text() == client.calls[0]["system_prompt"]
     assert (episode_root / "analysis" / "user_prompt.txt").read_text() == client.calls[0]["prompt"]
-    assert (episode_root / "numerical" / "system_prompt.txt").read_text() == client.calls[1]["system_prompt"]
-    assert (episode_root / "numerical" / "user_prompt.txt").read_text() == client.calls[1]["prompt"]
-    assert (episode_root / "numerical" / "attempt_02" / "prompt.txt").read_text() == client.calls[2]["prompt"]
+    assert (episode_root / LLM_EXPLORER_NUMERICAL_STAGE / "system_prompt.txt").read_text() == client.calls[1]["system_prompt"]
+    assert (episode_root / LLM_EXPLORER_NUMERICAL_STAGE / "user_prompt.txt").read_text() == client.calls[1]["prompt"]
+    assert (episode_root / LLM_EXPLORER_NUMERICAL_STAGE / "attempt_02" / "prompt.txt").read_text() == client.calls[2]["prompt"]
 
 
 def test_local_context_overflow_never_calls_api_or_retries_same_prompt(tmp_path):
@@ -1864,10 +2090,11 @@ def test_two_episode_mock_training_applies_first_generation_guidance(
     assert "actual_hol_wait_duration_ms" in client.calls[0]["prompt"]
 
 
-def test_first_generation_cli_train_evaluate_and_resume_without_llm_call(
+def test_first_generation_cli_evaluate_and_pre_v9_full_resume_migration(
     monkeypatch
 ):
     calls = []
+    original_mock_chat = DeterministicMockExplorerClient.chat
 
     def unexpected_chat(self, **kwargs):
         calls.append(kwargs)
@@ -1918,8 +2145,83 @@ def test_first_generation_cli_train_evaluate_and_resume_without_llm_call(
         assert all(metadata["evaluation_invariants"].values())
         assert calls == []
 
+        checkpoint_one = run_dir / "checkpoints" / "full" / "ep_0001"
+        checkpoint_path = checkpoint_one / "training_state.pt"
+        payload_one = torch.load(
+            checkpoint_path, map_location="cpu", weights_only=False
+        )
+        original_state = copy.deepcopy(payload_one["training_state"])
+        payload_one["training_state"]["llm_explorer_state"]["config"][
+            "prompt_version"
+        ] = "uav-hrl-llm-explorer-prompts-v8"
+        payload_one["training_state"]["llm_explorer_state"].pop(
+            "resume_protocol_migrations", None
+        )
+        torch.save(payload_one, checkpoint_path)
+
+        resolved_path = run_dir / "resolved_config.json"
+        resolved = json.loads(resolved_path.read_text(encoding="utf-8"))
+        resolved["llm_explorer"]["prompt_version"] = (
+            "uav-hrl-llm-explorer-prompts-v8"
+        )
+        resolved["llm_explorer"]["cache_version"] = (
+            "episode-fixed-dual-guidance-cache-v5"
+        )
+        resolved["llm_explorer"].pop("numerical_output_protocol", None)
+        resolved_path.write_text(
+            json.dumps(resolved, indent=2) + "\n", encoding="utf-8"
+        )
+
+        def capture_chat(self, **kwargs):
+            calls.append(kwargs)
+            return original_mock_chat(self, **kwargs)
+
+        original_begin_episode = LLMExplorerController.begin_episode
+
+        def begin_after_real_warmup(self, **kwargs):
+            kwargs["total_joint_transitions"] = max(
+                10_000, int(kwargs["total_joint_transitions"])
+            )
+            return original_begin_episode(self, **kwargs)
+
+        monkeypatch.setattr(DeterministicMockExplorerClient, "chat", capture_chat)
+        monkeypatch.setattr(
+            LLMExplorerController, "begin_episode", begin_after_real_warmup
+        )
         assert run_experiment_main(
             ["resume", str(run_dir), "--target-episodes", "2"]
         ) == 0
         assert (run_dir / "checkpoints" / "models" / "ep_0002").is_dir()
-        assert calls == []
+        assert len(calls) == 2
+        assert "response_format" not in calls[0]
+        assert calls[1]["response_format"] == first_gen_numerical_response_format()
+
+        migrated_resolved = json.loads(resolved_path.read_text(encoding="utf-8"))
+        assert migrated_resolved["llm_explorer"]["prompt_version"] == LLM_EXPLORER_PROMPT_VERSION
+        assert migrated_resolved["llm_explorer"]["cache_version"] == LLM_EXPLORER_CACHE_VERSION
+        assert migrated_resolved["llm_explorer"]["numerical_output_protocol"] == LLM_EXPLORER_NUMERICAL_OUTPUT_PROTOCOL
+        migration = migrated_resolved["llm_explorer_protocol_migration"]
+        assert migration["source_checkpoint"].endswith("ep_0001")
+        assert migration["source_checkpoint_episode"] == 1
+        assert migration["effective_episode"] == 2
+
+        checkpoint_two = run_dir / "checkpoints" / "full" / "ep_0002"
+        payload_two = torch.load(
+            checkpoint_two / "training_state.pt",
+            map_location="cpu",
+            weights_only=False,
+        )
+        state_two = payload_two["training_state"]
+        assert state_two["llm_explorer_state"]["config"]["prompt_version"] == LLM_EXPLORER_PROMPT_VERSION
+        assert state_two["llm_explorer_state"]["resume_protocol_migrations"][-1]["source_prompt_version"].endswith("v8")
+        assert state_two["training_history_rows"][:1] == original_state["training_history_rows"]
+        assert state_two["total_joint_transitions"] > original_state["total_joint_transitions"]
+        assert state_two["movement_noise_log"][:1] == original_state["movement_noise_log"]
+        assert state_two["routing_epsilon_log"][: len(original_state["routing_epsilon_log"])] == original_state["routing_epsilon_log"]
+
+        assert run_experiment_main(
+            ["resume", str(run_dir), "--target-episodes", "3"]
+        ) == 0
+        assert (run_dir / "checkpoints" / "full" / "ep_0003").is_dir()
+        reloaded_resolved = json.loads(resolved_path.read_text(encoding="utf-8"))
+        assert len(reloaded_resolved["llm_explorer_protocol_migration_history"]) == 1

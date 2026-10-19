@@ -79,9 +79,12 @@ from llm_potential import (
 from llm_explorer import (
     LLM_EXPLORER_CACHE_VERSION,
     LLM_EXPLORER_CASE_VERSION,
+    LLM_EXPLORER_METHOD_ID,
+    LLM_EXPLORER_NUMERICAL_OUTPUT_PROTOCOL,
     LLM_EXPLORER_PROMPT_VERSION,
     LLM_EXPLORER_SUMMARY_VERSION,
     LLM_EXPLORER_VERSION,
+    first_gen_resume_protocol_upgrade,
     llm_explorer_path_preflight,
 )
 from llm_explorer_v3 import (
@@ -795,6 +798,8 @@ def _training_run_provenance(resolved):
     for key in (
         "horizon_extension_provenance",
         "horizon_extension_history",
+        "llm_explorer_protocol_migration",
+        "llm_explorer_protocol_migration_history",
     ):
         if key in resolved:
             provenance[key] = resolved[key]
@@ -1092,6 +1097,9 @@ def run(args):
                 summary_version=LLM_EXPLORER_SUMMARY_VERSION,
                 case_selection_version=LLM_EXPLORER_CASE_VERSION,
                 cache_version=LLM_EXPLORER_CACHE_VERSION,
+                numerical_output_protocol=(
+                    LLM_EXPLORER_NUMERICAL_OUTPUT_PROTOCOL
+                ),
                 context_window_tokens=128000,
                 safety_margin_tokens=4096,
                 guidance_weight=1.0,
@@ -1159,14 +1167,20 @@ def _episode_directories(root):
 
 def run_resume(args):
     run_dir, resolved, method, manifest = _load_run_context(args.run_directory)
-    if method.llm_explorer_enabled and (
-        (resolved.get("llm_explorer") or {}).get("schema_version")
-        != _explorer_schema_version(method)
-    ):
-        raise ValueError(
-            "LLM explorer run uses an incompatible cache/checkpoint schema; "
-            "start a new run so old prompt identities and counters are not mixed"
-        )
+    explorer_protocol_upgrade = None
+    if method.llm_explorer_enabled:
+        if method.method_id == LLM_EXPLORER_METHOD_ID:
+            explorer_protocol_upgrade = first_gen_resume_protocol_upgrade(
+                resolved.get("llm_explorer") or {}
+            )
+        elif (
+            (resolved.get("llm_explorer") or {}).get("schema_version")
+            != _explorer_schema_version(method)
+        ):
+            raise ValueError(
+                "LLM explorer run uses an incompatible cache/checkpoint schema; "
+                "start a new run so old prompt identities and counters are not mixed"
+            )
     llm_artifact_dir, llm_identity, movement_state_dim = _llm_run_artifact(
         run_dir, resolved, method
     )
@@ -1427,7 +1441,36 @@ def run_resume(args):
             method, config
         ),
     )
-    if method.llm_explorer_state_rule_enabled:
+    if method.method_id == LLM_EXPLORER_METHOD_ID:
+        explorer_resolution = dict(resolved.get("llm_explorer") or {})
+        explorer_resolution.update(
+            prompt_version=LLM_EXPLORER_PROMPT_VERSION,
+            summary_version=LLM_EXPLORER_SUMMARY_VERSION,
+            case_selection_version=LLM_EXPLORER_CASE_VERSION,
+            cache_version=LLM_EXPLORER_CACHE_VERSION,
+            numerical_output_protocol=(
+                LLM_EXPLORER_NUMERICAL_OUTPUT_PROTOCOL
+            ),
+        )
+        resolved["llm_explorer"] = explorer_resolution
+        if explorer_protocol_upgrade is not None:
+            migration = {
+                **explorer_protocol_upgrade,
+                "source_checkpoint": str(Path(checkpoint).resolve()),
+                "source_checkpoint_episode": int(plan.resume_episode),
+                "effective_episode": int(plan.resume_episode) + 1,
+                "migrated_at": datetime.now(timezone.utc).isoformat(),
+                "migration_git_sha": invocation_git_sha,
+            }
+            history = list(
+                resolved.get("llm_explorer_protocol_migration_history") or ()
+            )
+            history.append(migration)
+            resolved.update(
+                llm_explorer_protocol_migration=migration,
+                llm_explorer_protocol_migration_history=history,
+            )
+    elif method.llm_explorer_state_rule_enabled:
         explorer_resolution = dict(resolved.get("llm_explorer") or {})
         explorer_resolution.update(
             prompt_version=LLM_STATE_RULE_PROMPT_VERSION,

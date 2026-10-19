@@ -27,12 +27,22 @@ import numpy as np
 LLM_EXPLORER_METHOD_ID = "td3_dinkelbach_llm_explorer"
 LLM_EXPLORER_MODEL = "gpt-4o-mini"
 LLM_EXPLORER_VERSION = "uav-hrl-llm-explorer-firstgen-v6"
-LLM_EXPLORER_PROMPT_VERSION = "uav-hrl-llm-explorer-prompts-v8"
+LLM_EXPLORER_PROMPT_VERSION = "uav-hrl-llm-explorer-prompts-v9"
 LLM_EXPLORER_SUMMARY_VERSION = "complete-core-feedback-v4"
 LLM_EXPLORER_CASE_VERSION = "deterministic-diverse-cases-v1"
-LLM_EXPLORER_CACHE_VERSION = "episode-fixed-dual-guidance-cache-v5"
+LLM_EXPLORER_CACHE_VERSION = "episode-fixed-dual-guidance-cache-v6"
 LLM_EXPLORER_COMPRESSION_VERSION = LLM_EXPLORER_SUMMARY_VERSION
 LLM_EXPLORER_PRESENTATION_VERSION = "firstgen-columns-rows-3dp-ms-v2"
+LLM_EXPLORER_NUMERICAL_OUTPUT_PROTOCOL = (
+    "chat-completions-strict-json-schema-v1"
+)
+LLM_EXPLORER_NUMERICAL_STAGE = "numerical_json_schema_v1"
+LLM_EXPLORER_COMPATIBLE_RESUME_PROMPT_VERSIONS = frozenset(
+    {"uav-hrl-llm-explorer-prompts-v8"}
+)
+LLM_EXPLORER_COMPATIBLE_RESUME_CACHE_VERSIONS = frozenset(
+    {"episode-fixed-dual-guidance-cache-v5"}
+)
 SHARED_ENVIRONMENT_DEFINITIONS_VERSION = "uav-hrl-llm-explorer-v2"
 LLM_EXPLORER_WARMUP_TRANSITIONS = 10_000
 LLM_EXPLORER_UPDATE_INTERVAL_EPISODES = 1
@@ -46,6 +56,96 @@ LLM_EXPLORER_CONTEXT_TOKENS = 128_000
 LLM_EXPLORER_SAFETY_MARGIN_TOKENS = 4_096
 LLM_EXPLORER_ENCODING = "o200k_base"
 WINDOWS_CONSERVATIVE_PATH_LIMIT = 240
+
+
+def first_gen_numerical_response_format() -> dict[str, Any]:
+    """Return the strict Chat Completions schema for first-gen guidance."""
+
+    number_row_3 = {
+        "type": "array",
+        "minItems": 3,
+        "maxItems": 3,
+        "items": {"type": "number"},
+    }
+    number_row_17 = {
+        "type": "array",
+        "minItems": 17,
+        "maxItems": 17,
+        "items": {"type": "number"},
+    }
+    return {
+        "type": "json_schema",
+        "json_schema": {
+            "name": "uav_hrl_first_gen_exploration_guidance",
+            "strict": True,
+            "schema": {
+                "type": "object",
+                "properties": {
+                    "td3_bias": {
+                        "type": "array",
+                        "minItems": 16,
+                        "maxItems": 16,
+                        "items": number_row_3,
+                    },
+                    "routing_prior": {
+                        "type": "array",
+                        "minItems": 16,
+                        "maxItems": 16,
+                        "items": number_row_17,
+                    },
+                },
+                "required": ["td3_bias", "routing_prior"],
+                "additionalProperties": False,
+            },
+        },
+    }
+
+
+def first_gen_resume_protocol_upgrade(
+    resolved_explorer: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    """Validate and describe the sole pre-v9 first-gen resume upgrade."""
+
+    source = dict(resolved_explorer or {})
+    if source.get("schema_version") != LLM_EXPLORER_VERSION:
+        raise ExplorerValidationError(
+            "LLM explorer run uses an incompatible checkpoint schema"
+        )
+    prompt_version = source.get("prompt_version")
+    cache_version = source.get("cache_version")
+    output_protocol = source.get("numerical_output_protocol")
+    if (
+        prompt_version == LLM_EXPLORER_PROMPT_VERSION
+        and cache_version == LLM_EXPLORER_CACHE_VERSION
+        and output_protocol == LLM_EXPLORER_NUMERICAL_OUTPUT_PROTOCOL
+    ):
+        return None
+    if (
+        prompt_version in LLM_EXPLORER_COMPATIBLE_RESUME_PROMPT_VERSIONS
+        and cache_version in LLM_EXPLORER_COMPATIBLE_RESUME_CACHE_VERSIONS
+        and output_protocol is None
+    ):
+        return {
+            "source_schema_version": source["schema_version"],
+            "target_schema_version": LLM_EXPLORER_VERSION,
+            "source_prompt_version": prompt_version,
+            "target_prompt_version": LLM_EXPLORER_PROMPT_VERSION,
+            "source_cache_version": cache_version,
+            "target_cache_version": LLM_EXPLORER_CACHE_VERSION,
+            "source_numerical_output_protocol": None,
+            "target_numerical_output_protocol": (
+                LLM_EXPLORER_NUMERICAL_OUTPUT_PROTOCOL
+            ),
+            "training_state_compatibility": (
+                "full_state_preserved_format_only_upgrade"
+            ),
+            "old_numerical_cache_reuse": False,
+        }
+    raise ExplorerValidationError(
+        "LLM explorer run has an unsupported prompt/cache/output protocol "
+        f"combination: prompt={prompt_version!r}, cache={cache_version!r}, "
+        f"output_protocol={output_protocol!r}"
+    )
 
 
 class ExplorerValidationError(ValueError):
@@ -1170,43 +1270,145 @@ def masked_routing_exploration_distribution(
     return mixed, zero_mass
 
 
-def validate_td3_bias(value: Any, sigma_episode_start: float) -> np.ndarray:
+def validate_td3_bias(
+    value: Any,
+    sigma_episode_start: float,
+    *,
+    detailed_errors: bool = False,
+) -> np.ndarray:
     if _contains_boolean(value):
         raise ExplorerValidationError("td3_bias must contain JSON numbers, not booleans")
-    bias = np.asarray(value, dtype=np.float64)
+    try:
+        bias = np.asarray(value, dtype=np.float64)
+    except (TypeError, ValueError) as exc:
+        if not detailed_errors:
+            raise
+        raise ExplorerValidationError(
+            "td3_bias: expected shape [16,3]; actual value is ragged or "
+            "non-numeric"
+        ) from exc
     sigma = float(sigma_episode_start)
     if not math.isfinite(sigma) or sigma < 0.0:
         raise ExplorerValidationError("sigma_episode_start must be finite and non-negative")
     if bias.shape != (NUM_UAV, 3):
-        raise ExplorerValidationError("td3_bias must have shape [16,3]")
+        if not detailed_errors:
+            raise ExplorerValidationError("td3_bias must have shape [16,3]")
+        raise ExplorerValidationError(
+            "td3_bias: expected shape [16,3]; "
+            f"actual shape={list(bias.shape)}"
+        )
     if not np.isfinite(bias).all():
-        raise ExplorerValidationError("td3_bias contains NaN or Infinity")
+        if not detailed_errors:
+            raise ExplorerValidationError("td3_bias contains NaN or Infinity")
+        indices = np.argwhere(~np.isfinite(bias))
+        details = "; ".join(
+            f"UAV {int(row)} component {int(column)} value={bias[row, column]!r}"
+            for row, column in indices[:8]
+        )
+        raise ExplorerValidationError(
+            f"td3_bias contains non-finite values: {details}"
+        )
     tolerance = max(
         1e-7,
         4.0 * np.finfo(np.float32).eps * max(1.0, abs(sigma)),
     )
-    if np.any(np.abs(bias) > sigma + tolerance):
+    invalid = np.argwhere(np.abs(bias) > sigma + tolerance)
+    if len(invalid):
+        if not detailed_errors:
+            raise ExplorerValidationError(
+                "td3_bias exceeds the episode-start behavior-noise sigma bound"
+            )
+        component_names = ("speed", "heading", "vertical")
+        details = "; ".join(
+            (
+                f"UAV {int(row)} {component_names[int(column)]}: "
+                f"value={float(bias[row, column])!r}; expected within "
+                f"[{-sigma!r},{sigma!r}] with validation tolerance "
+                f"{tolerance:.12g}"
+            )
+            for row, column in invalid[:8]
+        )
         raise ExplorerValidationError(
-            "td3_bias exceeds the episode-start behavior-noise sigma bound"
+            f"td3_bias out of bounds: {details}"
         )
     return bias.astype(np.float32)
 
 
-def validate_routing_prior(value: Any) -> np.ndarray:
+def validate_routing_prior(
+    value: Any, *, detailed_errors: bool = False
+) -> np.ndarray:
     if _contains_boolean(value):
         raise ExplorerValidationError(
             "routing_prior must contain JSON numbers, not booleans"
         )
-    prior = np.asarray(value, dtype=np.float64)
+    try:
+        prior = np.asarray(value, dtype=np.float64)
+    except (TypeError, ValueError) as exc:
+        if not detailed_errors:
+            raise
+        raise ExplorerValidationError(
+            "routing_prior: expected shape [16,17]; actual value is ragged "
+            "or non-numeric"
+        ) from exc
     if prior.shape != (NUM_UAV, ROUTING_ACTION_DIM):
-        raise ExplorerValidationError("routing_prior must have shape [16,17]")
+        if not detailed_errors:
+            raise ExplorerValidationError(
+                "routing_prior must have shape [16,17]"
+            )
+        raise ExplorerValidationError(
+            "routing_prior: expected shape [16,17]; "
+            f"actual shape={list(prior.shape)}"
+        )
     if not np.isfinite(prior).all():
-        raise ExplorerValidationError("routing_prior contains NaN or Infinity")
-    if np.any(prior < 0.0) or np.any(prior > 1.0):
-        raise ExplorerValidationError("routing_prior probabilities must be in [0,1]")
+        if not detailed_errors:
+            raise ExplorerValidationError(
+                "routing_prior contains NaN or Infinity"
+            )
+        indices = np.argwhere(~np.isfinite(prior))
+        details = "; ".join(
+            f"row {int(row)} (UAV {int(row)}) column {int(column)} value={prior[row, column]!r}"
+            for row, column in indices[:8]
+        )
+        raise ExplorerValidationError(
+            f"routing_prior contains non-finite values: {details}"
+        )
+    out_of_range = np.argwhere((prior < 0.0) | (prior > 1.0))
+    if len(out_of_range):
+        if not detailed_errors:
+            raise ExplorerValidationError(
+                "routing_prior probabilities must be in [0,1]"
+            )
+        details = "; ".join(
+            (
+                f"row {int(row)} (UAV {int(row)}) column {int(column)}: "
+                f"value={float(prior[row, column])!r}; expected within [0,1]"
+            )
+            for row, column in out_of_range[:8]
+        )
+        raise ExplorerValidationError(
+            f"routing_prior probability out of range: {details}"
+        )
     sums = prior.sum(axis=1)
-    if not np.allclose(sums, 1.0, rtol=0.0, atol=1e-6):
-        raise ExplorerValidationError("each routing_prior row must sum to 1")
+    invalid_rows = np.flatnonzero(
+        ~np.isclose(sums, 1.0, rtol=0.0, atol=1e-6)
+    )
+    if len(invalid_rows):
+        if not detailed_errors:
+            raise ExplorerValidationError(
+                "each routing_prior row must sum to 1"
+            )
+        details = " ".join(
+            (
+                f"routing_prior row {int(row)} (UAV {int(row)}): "
+                f"sum={float(sums[row])!r}; expected 1 within absolute "
+                "tolerance 0.000001."
+            )
+            for row in invalid_rows
+        )
+        raise ExplorerValidationError(
+            f"{details} Reallocate the probabilities in the invalid rows "
+            "and return both complete matrices."
+        )
     # Normalize only harmless floating-point row-sum drift accepted above.
     return prior / sums[:, None]
 
@@ -1219,6 +1421,21 @@ def _contains_boolean(value: Any) -> bool:
     return False
 
 
+def _strip_complete_json_code_fence(content: str) -> str:
+    """Remove only a complete outer plain/JSON Markdown fence."""
+
+    clean = str(content).strip()
+    if not clean.startswith("```") or not clean.endswith("```"):
+        return clean
+    newline = clean.find("\n")
+    if newline < 0:
+        return clean
+    header = clean[:newline].strip().lower()
+    if header not in {"```", "```json"}:
+        return clean
+    return clean[newline + 1 : -3].strip()
+
+
 def parse_guidance_response(
     content: str, sigma_episode_start: float
 ) -> tuple[np.ndarray | None, np.ndarray | None, dict[str, str]]:
@@ -1226,7 +1443,7 @@ def parse_guidance_response(
 
     errors: dict[str, str] = {}
     try:
-        value = json.loads(str(content))
+        value = json.loads(_strip_complete_json_code_fence(content))
     except (TypeError, json.JSONDecodeError) as exc:
         reason = f"invalid JSON: {type(exc).__name__}: {exc}"
         return None, None, {"td3": reason, "routing": reason}
@@ -1239,13 +1456,34 @@ def parse_guidance_response(
     if extra:
         reason = f"unexpected response fields: {extra}"
         return None, None, {"td3": reason, "routing": reason}
+    missing = sorted({"td3_bias", "routing_prior"}.difference(value))
+    for layer, field in (
+        ("td3", "td3_bias"),
+        ("routing", "routing_prior"),
+    ):
+        if field in missing:
+            errors[layer] = f"response is missing required field {field!r}"
     try:
-        td3_bias = validate_td3_bias(value.get("td3_bias"), sigma_episode_start)
+        td3_bias = (
+            None
+            if "td3" in errors
+            else validate_td3_bias(
+                value["td3_bias"],
+                sigma_episode_start,
+                detailed_errors=True,
+            )
+        )
     except (ExplorerValidationError, TypeError, ValueError) as exc:
         td3_bias = None
         errors["td3"] = str(exc)
     try:
-        routing_prior = validate_routing_prior(value.get("routing_prior"))
+        routing_prior = (
+            None
+            if "routing" in errors
+            else validate_routing_prior(
+                value["routing_prior"], detailed_errors=True
+            )
+        )
     except (ExplorerValidationError, TypeError, ValueError) as exc:
         routing_prior = None
         errors["routing"] = str(exc)
@@ -3668,7 +3906,7 @@ def llm_explorer_path_preflight(
         and not state_rule
     )
     stages = (
-        ("analysis", "numerical")
+        ("analysis", LLM_EXPLORER_NUMERICAL_STAGE)
         if first_generation_four_prompt_contract
         else ("analysis", "guidance")
     )
@@ -3804,7 +4042,7 @@ def llm_explorer_path_preflight(
 class DeterministicMockExplorerClient:
     """Offline client used by smoke tests; it performs no network requests."""
 
-    def chat(self, *, model: str, prompt: str, system_prompt: str, **_: Any) -> dict[str, Any]:
+    def chat(self, *, model: str, prompt: str, system_prompt: str, **kwargs: Any) -> dict[str, Any]:
         del system_prompt
         if "[Requested analysis]" in prompt:
             content = (
@@ -3829,6 +4067,14 @@ class DeterministicMockExplorerClient:
             "actual_model": model,
             "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
             "finish_reason": "stop",
+            "structured_output_sent": kwargs.get("response_format") is not None,
+            "request": {
+                **(
+                    {"response_format": kwargs["response_format"]}
+                    if kwargs.get("response_format") is not None
+                    else {}
+                )
+            },
         }
 
 
@@ -3874,6 +4120,7 @@ class LLMExplorerController:
         self._request_records: dict[str, dict[str, Any]] = {}
         self._fallback_records: dict[str, dict[str, Any]] = {}
         self._local_failure_records: dict[str, dict[str, Any]] = {}
+        self._resume_protocol_migrations: list[dict[str, Any]] = []
         self.statistics = self._empty_statistics()
         self._reconcile_durable_events()
 
@@ -4034,14 +4281,54 @@ class LLMExplorerController:
             "request_records": copy.deepcopy(self._request_records),
             "fallback_records": copy.deepcopy(self._fallback_records),
             "local_failure_records": copy.deepcopy(self._local_failure_records),
+            "resume_protocol_migrations": copy.deepcopy(
+                self._resume_protocol_migrations
+            ),
             "rng_state": copy.deepcopy(self.rng.bit_generator.state),
         }
 
     def load_state_dict(self, state: dict[str, Any]) -> None:
         if state.get("schema_version") != self.schema_version:
             raise ExplorerValidationError("LLM explorer checkpoint version is incompatible")
-        if state.get("config") != asdict(self.config):
-            raise ExplorerValidationError("LLM explorer checkpoint config is incompatible")
+        saved_config = state.get("config")
+        current_config = asdict(self.config)
+        protocol_upgrade = None
+        if saved_config != current_config:
+            if not isinstance(saved_config, dict):
+                raise ExplorerValidationError(
+                    "LLM explorer checkpoint config is incompatible"
+                )
+            source_prompt = saved_config.get("prompt_version")
+            saved_without_prompt = dict(saved_config)
+            current_without_prompt = dict(current_config)
+            saved_without_prompt.pop("prompt_version", None)
+            current_without_prompt.pop("prompt_version", None)
+            if not (
+                source_prompt
+                in LLM_EXPLORER_COMPATIBLE_RESUME_PROMPT_VERSIONS
+                and saved_without_prompt == current_without_prompt
+            ):
+                raise ExplorerValidationError(
+                    "LLM explorer checkpoint config is incompatible"
+                )
+            protocol_upgrade = {
+                "source_schema_version": state.get("schema_version"),
+                "target_schema_version": self.schema_version,
+                "source_prompt_version": source_prompt,
+                "target_prompt_version": self.config.prompt_version,
+                "source_cache_version": next(
+                    iter(LLM_EXPLORER_COMPATIBLE_RESUME_CACHE_VERSIONS)
+                ),
+                "target_cache_version": LLM_EXPLORER_CACHE_VERSION,
+                "source_numerical_output_protocol": None,
+                "target_numerical_output_protocol": (
+                    LLM_EXPLORER_NUMERICAL_OUTPUT_PROTOCOL
+                ),
+                "training_state_compatibility": (
+                    "full_state_preserved_format_only_upgrade"
+                ),
+                "old_numerical_cache_reuse": False,
+            }
         if state.get("run_identity") != self.run_identity:
             raise ExplorerValidationError("LLM explorer checkpoint run identity is incompatible")
         self.previous_episode_feedback = copy.deepcopy(state.get("previous_episode_feedback"))
@@ -4051,6 +4338,12 @@ class LLMExplorerController:
         self._local_failure_records.update(
             copy.deepcopy(state.get("local_failure_records") or {})
         )
+        self._resume_protocol_migrations = copy.deepcopy(
+            state.get("resume_protocol_migrations") or []
+        )
+        if protocol_upgrade is not None:
+            self._resume_protocol_migrations.append(protocol_upgrade)
+            self._event("resume_protocol_upgrade", **protocol_upgrade)
         saved_zero_mass = int(
             (state.get("statistics") or {}).get(
                 "routing_zero_legal_prior_mass_total", 0
@@ -4290,7 +4583,9 @@ class LLMExplorerController:
                     for key, value in prompt_components.items()
                     if key.startswith("analysis_")
                 }
-            elif stage in {"numerical", "guidance"}:
+            elif stage in {
+                "numerical", "guidance", LLM_EXPLORER_NUMERICAL_STAGE
+            }:
                 prompt_components = {
                     key: value
                     for key, value in prompt_components.items()
@@ -4300,6 +4595,9 @@ class LLMExplorerController:
                 summary_version=LLM_EXPLORER_SUMMARY_VERSION,
                 cache_version=LLM_EXPLORER_CACHE_VERSION,
                 presentation_version=LLM_EXPLORER_PRESENTATION_VERSION,
+                numerical_output_protocol=(
+                    LLM_EXPLORER_NUMERICAL_OUTPUT_PROTOCOL
+                ),
                 routing_epsilon_branch="100_percent_masked_llm_prior",
                 prompt_component_sha256=prompt_components,
             )
@@ -4700,6 +4998,14 @@ class LLMExplorerController:
                 "transport_completed": response.get("transport_completed"),
                 "done_received": response.get("done_received"),
                 "terminal_chunk_received": response.get("terminal_chunk_received"),
+                "structured_output_sent": response.get(
+                    "structured_output_sent", False
+                ),
+                "response_format": (
+                    (response.get("request") or {}).get("response_format")
+                    if isinstance(response.get("request"), dict)
+                    else response.get("response_format")
+                ),
             }
         )
 
@@ -4853,7 +5159,7 @@ class LLMExplorerController:
         accepted_td3 = accepted_routing = None
         td3_attempt = routing_attempt = None
         numerical_stage = (
-            "numerical"
+            LLM_EXPLORER_NUMERICAL_STAGE
             if self.schema_version == LLM_EXPLORER_VERSION
             else "guidance"
         )
@@ -4975,20 +5281,38 @@ class LLMExplorerController:
                         stage=numerical_stage,
                         attempt=attempt,
                     )
-                    response = self.client.chat(
-                        model=self.config.model,
-                        system_prompt=numerical_system_prompt,
-                        prompt=attempt_prompt,
-                        temperature=float(self.config.temperature),
-                        max_output_tokens=int(self.config.guidance_max_output_tokens),
-                        seed=self._stable_seed(
+                    request_arguments = {
+                        "model": self.config.model,
+                        "system_prompt": numerical_system_prompt,
+                        "prompt": attempt_prompt,
+                        "temperature": float(self.config.temperature),
+                        "max_output_tokens": int(
+                            self.config.guidance_max_output_tokens
+                        ),
+                        "seed": self._stable_seed(
                             episode_index=episode_index,
                             stage=numerical_stage,
                             attempt=attempt,
                             input_sha256=input_sha,
                         ),
-                        attempt_directory=(attempt_root or Path(".")),
+                        "attempt_directory": (attempt_root or Path(".")),
+                    }
+                    if self.schema_version == LLM_EXPLORER_VERSION:
+                        request_arguments["response_format"] = (
+                            first_gen_numerical_response_format()
+                        )
+                    response = self.client.chat(
+                        **request_arguments,
                     )
+                    response.setdefault(
+                        "structured_output_sent",
+                        "response_format" in request_arguments,
+                    )
+                    if "response_format" in request_arguments:
+                        response.setdefault(
+                            "response_format",
+                            request_arguments["response_format"],
+                        )
                 except KeyboardInterrupt:
                     raise
                 except Exception as exc:
@@ -5252,6 +5576,8 @@ def explorer_metadata(config: LLMExplorerConfig) -> dict[str, Any]:
         "case_selection_version": LLM_EXPLORER_CASE_VERSION,
         "cache_version": LLM_EXPLORER_CACHE_VERSION,
         "presentation_version": LLM_EXPLORER_PRESENTATION_VERSION,
+        "numerical_output_protocol": LLM_EXPLORER_NUMERICAL_OUTPUT_PROTOCOL,
+        "numerical_response_format": "strict_json_schema",
         "request_prompt_contract": (
             "analysis_system+analysis_user then independent_numerical_system+numerical_user"
         ),

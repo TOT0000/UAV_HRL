@@ -1,37 +1,28 @@
-Produce this episode's guidance using the complete analysis and current numerical specifications below.
+Produce this episode's numerical exploration guidance using the following information.
 
 [Complete first-stage analysis]
-
 {{ANALYSIS_STAGE_OUTPUT}}
 
-[Current numerical settings and necessary field definitions]
-
+[Current numerical settings and field definitions]
 {{CURRENT_NUMERICAL_SETTINGS_AND_DEFINITIONS}}
 
-These include sigma_episode_start and raw-bias bounds, epsilon, host validation tolerances, coordinate definitions, and meanings and units of the initial-state fields below.
+These include the current sigma_episode_start, bias bounds, epsilon, validation tolerances, and coordinate and state-field definitions and units.
 
 [Necessary current observable initial state]
-
 {{CURRENT_OBSERVABLE_INITIAL_STATE}}
 
-Initial roles and legal links may change within the episode. The requested guidance remains fixed for the episode.
+Initial task roles and legal links may change within the episode.
 
-[Previous complete 16x3 raw TD3 bias]
-
+[Previous complete TD3 bias]
 {{PREVIOUS_COMPLETE_TD3_BIAS}}
 
-[Previous complete 16x17 routing prior]
-
+[Previous complete routing prior]
 {{PREVIOUS_COMPLETE_ROUTING_PRIOR}}
 
-These are complete rounded references when history is known. Unavailable history is explicitly marked unknown.
-
 [Previous application and fallback summary]
-
 {{PREVIOUS_APPLICATION_STATUS}}
 
-[Local format-validation feedback; empty on the first attempt]
-
+[Validation feedback; empty on the first attempt]
 {{VALIDATION_FEEDBACK_OR_EMPTY}}
 
-Return complete JSON satisfying the system specifications and containing only td3_bias and routing_prior. When validation feedback is present, return both complete corrected matrices.
+Return complete JSON satisfying the system specifications. If validation feedback is present, correct the identified errors and still provide both complete matrices.

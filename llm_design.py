@@ -259,6 +259,7 @@ class LMStudioClient:
         max_output_tokens: int,
         seed: int,
         reasoning_effort: str | None = None,
+        response_format: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         messages = []
         if system_prompt is not None:
@@ -275,6 +276,8 @@ class LMStudioClient:
         }
         if reasoning_effort is not None:
             payload["reasoning_effort"] = str(reasoning_effort)
+        if response_format is not None:
+            payload["response_format"] = response_format
         return payload
 
     def _http_error_category(self, status: int) -> str:
@@ -348,6 +351,7 @@ class LMStudioClient:
         seed: int,
         attempt_directory: str | Path,
         reasoning_effort: str | None = None,
+        response_format: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         self.validate_configuration()
         payload = self._payload(
@@ -358,6 +362,7 @@ class LMStudioClient:
             max_output_tokens=max_output_tokens,
             seed=seed,
             reasoning_effort=reasoning_effort,
+            response_format=response_format,
         )
         attempt_directory = Path(attempt_directory)
         _write_json(attempt_directory / "request.json", payload)
@@ -480,7 +485,7 @@ class LMStudioClient:
             "adapter": adapter,
             "fallbacks": fallbacks,
             "seed_sent": True,
-            "structured_output_sent": False,
+            "structured_output_sent": response_format is not None,
             "transport_completed": streamed["transport_completed"],
             "done_received": streamed["done_received"],
             "terminal_chunk_received": streamed["terminal_chunk_received"],
@@ -531,6 +536,7 @@ class OpenAIClient(LMStudioClient):
         max_output_tokens: int,
         seed: int,
         reasoning_effort: str | None = None,
+        response_format: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         messages = []
         if system_prompt is not None:
@@ -547,6 +553,8 @@ class OpenAIClient(LMStudioClient):
         }
         if reasoning_effort is not None:
             payload["reasoning_effort"] = str(reasoning_effort)
+        if response_format is not None:
+            payload["response_format"] = response_format
         return payload
 
     def _http_error_category(self, status: int) -> str:

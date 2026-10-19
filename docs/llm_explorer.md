@@ -42,8 +42,14 @@ context limit, including reserved output and a safety margin. Token budgets are
 saved beside each attempt. The payload contains filtered observable state and
 never serializes a scenario manifest or undiscovered RoI and SR ground truth.
 The first-generation controller schema is `uav-hrl-llm-explorer-firstgen-v6`,
-prompt schema is v8, summary schema is `complete-core-feedback-v4`, and cache
-schema is `episode-fixed-dual-guidance-cache-v5`. Representative-case service
+prompt schema is v9, summary schema is `complete-core-feedback-v4`, and cache
+schema is `episode-fixed-dual-guidance-cache-v6`. The first-generation numerical
+Chat Completions request uses a strict JSON Schema for exactly one object with
+complete `[16,3]` and `[16,17]` numeric matrices. Host validation remains
+authoritative: probability rows must sum to one within `0.000001`, and grossly
+invalid rows are rejected rather than normalized. The parser accepts bare JSON
+or a complete outer plain/`json` Markdown fence, but does not extract JSON from
+explanatory text or repair truncated output. Representative-case service
 durations and HOL remaining deadlines use explicitly named millisecond fields,
 while absolute `time_s` remains in seconds. The analysis dictionary contains
 the runtime-owned C9/C10/COM formulas, populations, weights, and epsilon, plus
@@ -52,12 +58,14 @@ each representative link. Slot-start HOL fields remain
 observation counts; actual WAIT time is accumulated on the PacketEngine event
 clock and unavailable legacy values stay unknown. Movement feedback separates
 the requested matrix, Actor pre-projection offset, movement-mask-qualified
-application, and final projected/executed action. Older first-generation explorer
-checkpoints are rejected instead of mixing the former 80/20 behavior or
-inventing unavailable historical matrices. Numerical template hashes are part
-of the episode-result identity, so changing only the second-stage prompt cannot
-replay an old result. Start a new comparison run when migrating from an older
-first-generation explorer run.
+application, and final projected/executed action. Exact resume permits the known
+format-only v8/v5 first-generation protocol to move to v9/v6 without resetting
+the saved training, optimizer, replay, RNG, guidance, feedback, request, or
+fallback state. The migration and effective episode are recorded in resolved
+configuration and later checkpoints. Other old or unknown protocol combinations
+remain incompatible. Numerical template hashes and the output protocol are part
+of the cache identity, and the v9 numerical stage uses a versioned directory, so
+old numerical artifacts are preserved but never silently reused.
 
 ## PowerShell commands
 

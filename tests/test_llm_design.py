@@ -900,6 +900,75 @@ def test_lm_studio_request_streams_without_response_format(tmp_path, model):
     assert result["transport_completed"] is True
 
 
+def test_chat_clients_include_response_format_only_when_requested(monkeypatch):
+    schema = {
+        "type": "json_schema",
+        "json_schema": {
+            "name": "fixture",
+            "strict": True,
+            "schema": {
+                "type": "object",
+                "properties": {"value": {"type": "number"}},
+                "required": ["value"],
+                "additionalProperties": False,
+            },
+        },
+    }
+    common = {
+        "model": "gpt-4o-mini",
+        "prompt": "return json",
+        "system_prompt": "system",
+        "temperature": 0.2,
+        "max_output_tokens": 20,
+        "seed": 3,
+    }
+    lmstudio = LMStudioClient()
+    assert "response_format" not in lmstudio._payload(**common)
+    assert lmstudio._payload(**common, response_format=schema)["response_format"] == schema
+
+    monkeypatch.setenv("OPENAI_API_KEY", "fixture-key")
+    openai = OpenAIClient()
+    assert "response_format" not in openai._payload(**common)
+    assert openai._payload(**common, response_format=schema)["response_format"] == schema
+
+
+def test_openai_structured_response_format_is_saved_and_sent(tmp_path, monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "fixture-key")
+    schema = {
+        "type": "json_schema",
+        "json_schema": {
+            "name": "fixture",
+            "strict": True,
+            "schema": {
+                "type": "object",
+                "properties": {"value": {"type": "number"}},
+                "required": ["value"],
+                "additionalProperties": False,
+            },
+        },
+    }
+    chunks = [
+        b'data: {"model":"gpt-4o-mini","choices":[{"delta":{"content":"{\\"value\\":1}"},"finish_reason":"stop"}]}\n\n',
+        b"data: [DONE]\n\n",
+    ]
+    client = OpenAIStreamingClient(chunks, timeout=1, total_timeout=2)
+    result = client.chat(
+        model="gpt-4o-mini",
+        prompt="return json",
+        system_prompt="system",
+        temperature=0.2,
+        max_output_tokens=20,
+        seed=3,
+        attempt_directory=tmp_path,
+        response_format=schema,
+    )
+    saved = json.loads((tmp_path / "request.json").read_text())
+    sent = json.loads(client.sent_request.data.decode("utf-8"))
+    assert saved == sent == result["request"]
+    assert saved["response_format"] == schema
+    assert result["structured_output_sent"] is True
+
+
 def test_openai_request_uses_official_chat_parameters_and_redacts_key(
     tmp_path, monkeypatch
 ):
