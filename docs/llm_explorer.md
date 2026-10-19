@@ -16,32 +16,43 @@ The first guided episode begins only after 10,000 joint movement transitions
 have already completed and a previous episode is available. With the standard
 60-transition horizon this is episode 168. The implementation checks the
 transition count rather than the episode number. Each guided episode normally
-makes one analysis request and one guidance request to `gpt-4o-mini`. A stage
-is attempted at most twice; the underlying OpenAI client has retries disabled.
+makes one analysis request and one numerical request to `gpt-4o-mini`. The two
+requests use independent system and user prompts. The numerical request carries
+the complete analysis, exact current bounds, compact current state, application
+status, and complete rounded historical matrices; it does not repeat the large
+movement/routing tables, representative cases, or analysis system prompt. A
+stage is attempted at most twice; the underlying OpenAI client has retries
+disabled.
 
 Prompts, responses, validation results, usage, timings, and an append-only event
 journal are stored under `<run>/llm_explorer/`. Completed responses are reused
 only when the run/episode, complete input hash, model, prompt version, and
 configuration, summary, and cache identities all match. Final episode results are also cached for
-full success, partial success, and fallback outcomes. The request payload uses
-versioned complete episode aggregates for all 16 UAVs, all routing senders,
-authoritative event-time service, including WAIT-with-HOL interval unions and
-immutable S2U completion endpoints, and at most eight deterministic cases; raw
-training records retain their original precision. Every analysis, guidance, and retry
+full success, partial success, and fallback outcomes. The analysis payload uses
+versioned columns/rows aggregates for all 16 UAVs and all routing senders,
+complete 17-action counts, decision-time expected capacity, realized shared
+service, WAIT-with-HOL interval unions, immutable S2U completion endpoints, and
+at most eight deterministic cases. General LLM-input values use a detached
+at-most-three-decimal presentation; counts, IDs, booleans, validity, exact
+validation bounds, small non-zero multipliers, raw records, applied guidance,
+and checkpoint state keep their required semantics and precision. Every
+analysis, numerical, and retry
 request is checked with the `o200k_base` tokenizer against the 128,000-token
 context limit, including reserved output and a safety margin. Token budgets are
 saved beside each attempt. The payload contains filtered observable state and
 never serializes a scenario manifest or undiscovered RoI and SR ground truth.
-The first-generation controller schema is `uav-hrl-llm-explorer-firstgen-v4`,
-prompt schema is v6, summary schema is `complete-core-feedback-v3`, and cache
-schema is `episode-fixed-dual-guidance-cache-v3`. Slot-start HOL fields remain
+The first-generation controller schema is `uav-hrl-llm-explorer-firstgen-v5`,
+prompt schema is v7, summary schema is `complete-core-feedback-v4`, and cache
+schema is `episode-fixed-dual-guidance-cache-v4`. Slot-start HOL fields remain
 observation counts; actual WAIT time is accumulated on the PacketEngine event
 clock and unavailable legacy values stay unknown. Movement feedback separates
 the requested matrix, Actor pre-projection offset, movement-mask-qualified
 application, and final projected/executed action. Older first-generation explorer
 checkpoints are rejected instead of mixing the former 80/20 behavior or
-inventing unavailable historical matrices. Start a new comparison run when
-migrating from an older first-generation explorer run.
+inventing unavailable historical matrices. Numerical template hashes are part
+of the episode-result identity, so changing only the second-stage prompt cannot
+replay an old result. Start a new comparison run when migrating from an older
+first-generation explorer run.
 
 ## PowerShell commands
 

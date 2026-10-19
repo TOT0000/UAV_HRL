@@ -2597,6 +2597,13 @@ def train(
         if method_spec.llm_explorer_enabled
         else None
     )
+    if (
+        llm_explorer is not None
+        and method_spec.method_id == "td3_dinkelbach_llm_explorer"
+    ):
+        llm_explorer._configured_training_horizon_episodes = int(
+            config.total_episodes
+        )
     if llm_explorer_config is not None:
         experiment_identity["llm_explorer"] = (
             explorer_metadata_state_rule(llm_explorer_config)
@@ -3114,56 +3121,6 @@ def train(
         packet_engine.update_fov_ema(
             env, transition_marker=f"episode={episode},map_reset"
         )
-        episode_guidance = None
-        if llm_explorer is not None:
-            episode_sigma_start = movement_behavior_noise(
-                max(
-                    total_joint_transitions - config.warmup_joint_transitions,
-                    0,
-                ),
-                td3_schedule_decay,
-                evaluation=evaluation,
-            )
-            episode_routing_epsilon_start = (
-                0.0
-                if evaluation
-                else routing_lifecycle.epsilon(ddqn_schedule_decay)
-            )
-            episode_guidance = llm_explorer.begin_episode(
-                episode_index=episode,
-                total_joint_transitions=total_joint_transitions,
-                sigma_episode_start=episode_sigma_start,
-                routing_epsilon=episode_routing_epsilon_start,
-                current_observable_initial_state=(
-                    build_observable_initial_state_td3_only(env, packet_engine)
-                    if method_spec.llm_explorer_state_rule_enabled
-                    else build_observable_initial_state_td3_only(env, packet_engine)
-                    if method_spec.llm_explorer_td3_only_enabled
-                    else build_observable_initial_state_v3(env, packet_engine)
-                    if method_spec.llm_explorer_v3_enabled
-                    else build_observable_initial_state(env, packet_engine)
-                ),
-                environment_constants=(
-                    environment_definitions_state_rule
-                    if method_spec.llm_explorer_state_rule_enabled
-                    else environment_definitions_td3_only
-                    if method_spec.llm_explorer_td3_only_enabled
-                    else environment_definitions_v3
-                    if method_spec.llm_explorer_v3_enabled
-                    else environment_constants_and_definitions_first_gen
-                    if method_spec.method_id
-                    == "td3_dinkelbach_llm_explorer"
-                    else environment_constants_and_definitions
-                )(
-                    episode_seconds=config.episode_seconds,
-                    routing_slot_seconds=config.routing_slot_seconds,
-                    environment_width_m=env.env_width,
-                    environment_height_m=env.env_height,
-                    task_deadlines_seconds=resolved_evaluation[
-                        "task_deadlines_seconds"
-                    ],
-                ),
-            )
         scenario_entry = (
             scenario_manifest.episodes[episode]
             if scenario_manifest is not None
@@ -3186,6 +3143,60 @@ def train(
                 else float(scenario_rates.get("base_com_packets_per_second", 50.0))
             ),
         }
+        episode_guidance = None
+        if llm_explorer is not None:
+            episode_sigma_start = movement_behavior_noise(
+                max(
+                    total_joint_transitions - config.warmup_joint_transitions,
+                    0,
+                ),
+                td3_schedule_decay,
+                evaluation=evaluation,
+            )
+            episode_routing_epsilon_start = (
+                0.0
+                if evaluation
+                else routing_lifecycle.epsilon(ddqn_schedule_decay)
+            )
+            llm_environment_constants = (
+                environment_definitions_state_rule
+                if method_spec.llm_explorer_state_rule_enabled
+                else environment_definitions_td3_only
+                if method_spec.llm_explorer_td3_only_enabled
+                else environment_definitions_v3
+                if method_spec.llm_explorer_v3_enabled
+                else environment_constants_and_definitions_first_gen
+                if method_spec.method_id == "td3_dinkelbach_llm_explorer"
+                else environment_constants_and_definitions
+            )(
+                episode_seconds=config.episode_seconds,
+                routing_slot_seconds=config.routing_slot_seconds,
+                environment_width_m=env.env_width,
+                environment_height_m=env.env_height,
+                task_deadlines_seconds=resolved_evaluation[
+                    "task_deadlines_seconds"
+                ],
+            )
+            if method_spec.method_id == "td3_dinkelbach_llm_explorer":
+                llm_environment_constants[
+                    "resolved_traffic_rates_packets_per_second"
+                ] = dict(resolved_episode_rates)
+            episode_guidance = llm_explorer.begin_episode(
+                episode_index=episode,
+                total_joint_transitions=total_joint_transitions,
+                sigma_episode_start=episode_sigma_start,
+                routing_epsilon=episode_routing_epsilon_start,
+                current_observable_initial_state=(
+                    build_observable_initial_state_td3_only(env, packet_engine)
+                    if method_spec.llm_explorer_state_rule_enabled
+                    else build_observable_initial_state_td3_only(env, packet_engine)
+                    if method_spec.llm_explorer_td3_only_enabled
+                    else build_observable_initial_state_v3(env, packet_engine)
+                    if method_spec.llm_explorer_v3_enabled
+                    else build_observable_initial_state(env, packet_engine)
+                ),
+                environment_constants=llm_environment_constants,
+            )
         env.com_offered_rate_bps = (
             float(resolved_episode_rates["COM"]) * COM_PACKET_SIZE_BITS
         )
@@ -3748,6 +3759,8 @@ def train(
                     ),
                     record_current_expected_capacities=(
                         method_spec.llm_explorer_state_rule_enabled
+                        or method_spec.method_id
+                        == "td3_dinkelbach_llm_explorer"
                     ),
                 )
                 ddqn_action_selections += action_selections
@@ -4899,6 +4912,20 @@ def train(
                     ),
                     "routing_immediate_cost_sum": float(
                         episode_routing_immediate_cost_sum
+                    ),
+                    "c9_penalty_sum": float(episode_c9_penalty_sum),
+                    "c9_penalty_sample_count": int(
+                        episode_c9_penalty_samples
+                    ),
+                    "c10_penalty_sum": float(episode_c10_penalty_sum),
+                    "c10_penalty_sample_count": int(
+                        episode_c10_penalty_samples
+                    ),
+                    "com_range_penalty_sum": float(
+                        episode_com_range_penalty_sum
+                    ),
+                    "com_range_penalty_sample_count": int(
+                        episode_com_range_penalty_samples
                     ),
                     **(
                         {

@@ -29,6 +29,7 @@ from llm_explorer import (
     environment_constants_and_definitions_first_gen,
     explorer_metadata,
     first_gen_movement_summary,
+    first_gen_present_for_llm,
     first_gen_routing_summary,
     llm_explorer_path_preflight,
     masked_routing_exploration_distribution,
@@ -154,8 +155,44 @@ def _full_size_feedback():
                         ],
                         "movement_mask": uid % 4 != 0,
                         "actor_normalized_action": [0.1234567, -0.7654321, 0.0],
+                        "pre_projection_normalized_action": [0.1734567, -0.8154321, 0.01],
+                        "policy_projected_normalized_action": [0.1734567, -0.8154321, 0.01],
+                        "td3_guidance_active": True,
+                        "actor_pre_projection_llm_bias": [0.05, -0.05, 0.0],
+                        "td3_controlled_applied_llm_bias": (
+                            [0.05, -0.05, 0.0] if uid % 4 != 0 else None
+                        ),
                         "applied_llm_bias": [0.05, -0.05, 0.0],
                         "executed_normalized_action": [0.1734567, -0.8154321, 0.01],
+                        "movement_energy_j": 100.12345 + uid * 0.25,
+                        "service_observation": {
+                            "snapshot_available": True,
+                            "uav_queue": {
+                                "valid": True,
+                                "empty": False,
+                                "backlog_bits": 10_000.123 + uid * 100,
+                                "hol_present": True,
+                                "hol_remaining_deadline_s": 0.009876,
+                            },
+                            "fov": {
+                                "pair_valid": uid % 3 == 0,
+                                "capture_valid": uid % 3 == 0,
+                                "coverage_ratio": 0.812345,
+                                "image_quantity": 1.234567,
+                                "c9_margin_m": 12.34567,
+                                "c10_margin_m": -1.23456,
+                            },
+                            "com": {
+                                "target_valid": uid % 3 != 0,
+                                "sr_queue_valid": uid % 3 != 0,
+                                "sr_queue_empty": False,
+                                "sr_backlog_bits": 20_000.456 + uid * 100,
+                                "sr_hol_remaining_deadline_s": 0.008765,
+                                "s2u_link_valid": uid % 3 != 0,
+                                "s2u_in_range": uid % 2 == 0,
+                                "s2u_reference_capacity_mbps": 2.345678,
+                            },
+                        },
                     }
                     for uid in range(16)
                 ],
@@ -163,8 +200,9 @@ def _full_size_feedback():
         )
     names = routing_state_feature_names()
     routing = []
-    for index in range(100):
+    for index in range(240 * 16):
         sender = index % 16
+        slot = index // 16
         state = np.zeros(len(names), dtype=float)
         state[names.index(f"uav_id_one_hot[{sender}]")] = 1.0
         state[names.index("energy")] = 0.8
@@ -172,7 +210,7 @@ def _full_size_feedback():
         state[names.index("assigned_task_com")] = 1.0
         state[names.index("assigned_source_uav")] = 1.0
         state[names.index("position_x")] = 100.0 + sender
-        state[names.index("position_y")] = 200.0 + index
+        state[names.index("position_y")] = 200.0 + slot
         state[names.index("position_z")] = 0.4
         state[names.index("distance_to_ground_station")] = 0.6
         state[names.index("eta_to_ground_station")] = 0.5
@@ -191,13 +229,31 @@ def _full_size_feedback():
         routing.append(
             {
                 "decision_index": index,
-                "time_seconds": index * 0.25,
+                "time_seconds": slot * 0.25,
                 "sender_uav_id": sender,
                 "selected_action": 16 if index % 2 else sender,
                 "compact_routing_state": state.tolist(),
                 "legal_action_mask": [int(value) for value in legal],
-                "reference_capacity_bps_by_legal_action": {
+                "current_expected_capacity_bps_by_legal_action": {
                     str(action): 1_000_000.0 + action * 1000
+                    for action, is_legal in enumerate(legal)
+                    if is_legal
+                },
+                "maximum_reference_normalizer_bps_by_legal_action": {
+                    str(action): 9_000_000.0 + action * 1000
+                    for action, is_legal in enumerate(legal)
+                    if is_legal
+                },
+                "capacity_context_by_legal_action": {
+                    str(action): {
+                        "link_type": (
+                            "WAIT" if action == sender else "U2G" if action == 16 else "U2U"
+                        ),
+                        "reference_bandwidth_hz": (
+                            0.0 if action == sender else 10_000_000.0
+                        ),
+                        "distance_3d_m": 0.0 if action == sender else 100.0 + action,
+                    }
                     for action, is_legal in enumerate(legal)
                     if is_legal
                 },
@@ -219,11 +275,64 @@ def _full_size_feedback():
         },
         movement_records=movement,
         routing_records=routing,
-        slot_service_records=[],
+        slot_service_records=[
+            {
+                "time_seconds": slot * 0.25,
+                "slot_seconds": 0.25,
+                "actual_hol_wait_seconds_available": True,
+                "actual_hol_wait_seconds_by_sender": {
+                    str(sender): (0.01 if sender == slot % 16 else 0.0)
+                    for sender in range(16)
+                },
+                "packet_decision_uses": [
+                    {
+                        "packet_id": 50_000 + slot,
+                        "sender_uav_id": slot % 16,
+                        "selected_action": (slot + 1) % 16,
+                    }
+                ],
+                "transmitted_bits_by_link": {
+                    f"U2U:{slot % 16}->{(slot + 1) % 16}": 128.5 + slot
+                },
+                "active_links": [
+                    {
+                        "link_type": "U2U",
+                        "sender_id": slot % 16,
+                        "receiver_id": (slot + 1) % 16,
+                        "transmitted_bits": 128.5 + slot,
+                        "active_seconds": 0.001234,
+                        "capacity_bits_per_second": 2_345_678.9,
+                    }
+                ],
+                "completed_hops": (
+                    [
+                        {
+                            "link_type": "U2U",
+                            "sender_id": slot % 16,
+                            "receiver_id": (slot + 1) % 16,
+                            "packet_id": 50_000 + slot,
+                        }
+                    ]
+                    if slot % 2 == 0
+                    else []
+                ),
+                "global_routing_reward": 0.0,
+                "shared_reward_row_sum": 0.0,
+            }
+            for slot in range(240)
+        ],
         applied_guidance={
             "enabled": True,
-            "td3_bias": [[0.05, -0.05, 0.0] for _ in range(16)],
-            "routing_prior": [[1 / 17] * 17 for _ in range(16)],
+            "td3_bias": [
+                [0.001 * (uid + 1), -0.0007 * (uid + 1), 0.0003 * uid]
+                for uid in range(16)
+            ],
+            "routing_prior": [
+                (
+                    lambda weights: [value / sum(weights) for value in weights]
+                )([float(1 + ((action + uid) % 17)) for action in range(17)])
+                for uid in range(16)
+            ],
             "td3_fallback": False,
             "routing_fallback": False,
             "reused": False,
@@ -279,6 +388,57 @@ def test_prompt_renderer_does_not_reinterpret_inserted_braces():
     assert render_prompt("prefix {{VALUE}} suffix", {"VALUE": inserted}) == (
         f"prefix {inserted} suffix"
     )
+
+
+def test_first_generation_three_decimal_presentation_is_detached_and_typed():
+    array = np.array([1.23456, -0.000012345, 0.00049], dtype=np.float64)
+    source = {
+        "array": array,
+        "count": 7,
+        "flag": True,
+        "unknown": None,
+        "lambda_EE_Mbit_per_J_used": 0.000012345,
+    }
+    presented = first_gen_present_for_llm(source)
+
+    assert presented["array"] == [1.235, 0.0, 0.0]
+    assert presented["count"] == 7 and isinstance(presented["count"], int)
+    assert presented["flag"] is True
+    assert presented["unknown"] is None
+    assert presented["lambda_EE_Mbit_per_J_used"] == 1.23e-05
+    np.testing.assert_array_equal(
+        array, np.array([1.23456, -0.000012345, 0.00049])
+    )
+
+
+def test_rounded_history_is_reference_only_and_new_output_remains_strict():
+    previous = _previous_feedback()
+    source_prior = [[1.0 / 17.0] * 17 for _ in range(16)]
+    source_bias = [[0.123456, -0.012345, 0.0001234] for _ in range(16)]
+    previous["previous_complete_guidance"] = {
+        "td3_bias": {
+            "status": "known_applied_episode_guidance",
+            "shape": [16, 3],
+            "value": source_bias,
+        },
+        "routing_prior": {
+            "status": "known_applied_episode_guidance",
+            "shape": [16, 17],
+            "value": source_prior,
+        },
+    }
+    compact = compact_feedback_for_llm(previous)
+    displayed_prior = compact["previous_complete_guidance"]["routing_prior"][
+        "value"
+    ]
+
+    assert sum(displayed_prior[0]) == pytest.approx(1.003)
+    assert source_prior[0][0] == pytest.approx(1.0 / 17.0)
+    assert source_bias[0] == [0.123456, -0.012345, 0.0001234]
+    td3, routing, errors = parse_guidance_response(_guidance(0.123456), 0.2)
+    assert errors == {}
+    assert td3 is not None and routing is not None
+    assert routing[0].sum() == pytest.approx(1.0, abs=1e-12)
 
 
 def test_other_explorer_environment_and_system_prompts_match_parent_baseline():
@@ -583,7 +743,7 @@ def test_old_first_generation_cache_identity_is_not_reused(tmp_path):
     identity_files = [
         episode_root / "episode_result.json",
         episode_root / "analysis" / "completed.json",
-        episode_root / "guidance" / "completed.json",
+        episode_root / "numerical" / "completed.json",
     ]
     for path in identity_files:
         value = json.loads(path.read_text(encoding="utf-8"))
@@ -602,6 +762,43 @@ def test_old_first_generation_cache_identity_is_not_reused(tmp_path):
     restored = _begin(replay)
     assert restored["reused"] is False
     assert len(client.calls) == 2
+
+
+def test_numerical_template_change_invalidates_episode_result_only_as_needed(
+    tmp_path, monkeypatch
+):
+    first = LLMExplorerController(
+        run_directory=tmp_path,
+        run_identity={"run": "numerical-template-cache"},
+        client=SequenceClient(["cached analysis", _guidance(0.04)]),
+    )
+    first.previous_episode_feedback = _previous_feedback()
+    _begin(first)
+
+    replay_client = SequenceClient([_guidance(0.03)])
+    replay = LLMExplorerController(
+        run_directory=tmp_path,
+        run_identity={"run": "numerical-template-cache"},
+        client=replay_client,
+    )
+    replay.previous_episode_feedback = _previous_feedback()
+    templates = replay._templates()
+    revised_numerical_system = templates[2] + "\nNumerical cache identity revision."
+    monkeypatch.setattr(
+        replay,
+        "_templates",
+        lambda: (
+            templates[0], templates[1], revised_numerical_system, templates[3]
+        ),
+    )
+
+    result = _begin(replay)
+    assert len(replay_client.calls) == 1
+    assert replay_client.calls[0]["system_prompt"].endswith(
+        "Numerical cache identity revision."
+    )
+    assert result["td3_bias"][0, 0] == pytest.approx(0.03)
+    assert result["reused"] is False
 
 
 def test_stratified_routing_sampling_does_not_invent_decisions():
@@ -719,17 +916,52 @@ def test_real_size_compact_prompts_preserve_samples_and_fit_all_attempts(tmp_pat
     )
     assert not result["td3_fallback"] and not result["routing_fallback"]
     assert len(client.calls) == 3
-    assert "actual_hol_wait_time_seconds" in client.calls[0]["system_prompt"]
-    assert "slot-start hol fields" in client.calls[0]["system_prompt"].lower()
-    assert "actor_pre_projection_guidance_bias_normalized" in client.calls[0][
-        "prompt"
-    ]
-    assert "actual_hol_wait_time_seconds" in client.calls[0]["prompt"]
+    assert client.calls[0]["system_prompt"] != client.calls[1]["system_prompt"]
+    assert "[Evidence and observability]" in client.calls[0]["system_prompt"]
+    assert "[Response format]" in client.calls[1]["system_prompt"]
+    assert "actual_hol_wait_duration_ms" in client.calls[0]["prompt"]
+    assert '"b1":' in client.calls[0]["prompt"]
+    assert '"b2":' in client.calls[0]["prompt"]
+    assert "horizontal_10_mps" in client.calls[0]["prompt"]
+    assert '"n_r":' not in client.calls[0]["prompt"]
+    assert "movement_and_service" not in client.calls[1]["prompt"].lower()
+    assert "representative_cases" not in client.calls[1]["prompt"]
 
     compact = compact_feedback_for_llm(previous)
-    assert len(compact["uav_core_summary"]["by_uav"]) == 16
-    assert len(compact["routing_core_summary"]["by_sender"]) == 16
-    assert len(compact["representative_cases"]) <= 8
+    assert len(compact["movement_and_service_tables"]["rows"]) == 16
+    assert len(compact["routing_tables"]["rows"]) == 16
+    movement_columns = compact["movement_and_service_tables"]["columns"]
+    routing_columns = compact["routing_tables"]["columns"]
+    movement_decision_index = movement_columns.index("recorded_decision_count")
+    routing_decision_index = routing_columns.index("decision_count")
+    epsilon_counts_index = routing_columns.index(
+        "epsilon_exploration_action_counts_17"
+    )
+    greedy_counts_index = routing_columns.index("safe_q_greedy_action_counts_17")
+    legal_counts_index = routing_columns.index("legal_action_opportunity_counts_17")
+    representative_links_index = routing_columns.index(
+        "representative_links_maximum_3"
+    )
+    assert all(
+        row[movement_decision_index] == 60
+        for row in compact["movement_and_service_tables"]["rows"]
+    )
+    assert sum(
+        row[routing_decision_index]
+        for row in compact["routing_tables"]["rows"]
+    ) == 240 * 16
+    assert all(
+        len(row[epsilon_counts_index])
+        == len(row[greedy_counts_index])
+        == len(row[legal_counts_index])
+        == 17
+        for row in compact["routing_tables"]["rows"]
+    )
+    assert all(
+        len(row[representative_links_index]) <= 3
+        for row in compact["routing_tables"]["rows"]
+    )
+    assert len(compact["representative_cases"]) == 8
     assert compact["previous_complete_guidance"]["td3_bias"]["shape"] == [16, 3]
     assert compact["previous_complete_guidance"]["routing_prior"]["shape"] == [16, 17]
 
@@ -747,6 +979,12 @@ def test_real_size_compact_prompts_preserve_samples_and_fit_all_attempts(tmp_pat
     )
     assert len(budget_files) == 3
     assert all(json.loads(path.read_text())["fits"] for path in budget_files)
+    episode_root = tmp_path / "llm_explorer" / "episode_000168"
+    assert (episode_root / "analysis" / "system_prompt.txt").read_text() == client.calls[0]["system_prompt"]
+    assert (episode_root / "analysis" / "user_prompt.txt").read_text() == client.calls[0]["prompt"]
+    assert (episode_root / "numerical" / "system_prompt.txt").read_text() == client.calls[1]["system_prompt"]
+    assert (episode_root / "numerical" / "user_prompt.txt").read_text() == client.calls[1]["prompt"]
+    assert (episode_root / "numerical" / "attempt_02" / "prompt.txt").read_text() == client.calls[2]["prompt"]
 
 
 def test_local_context_overflow_never_calls_api_or_retries_same_prompt(tmp_path):
@@ -757,7 +995,9 @@ def test_local_context_overflow_never_calls_api_or_retries_same_prompt(tmp_path)
         client=client,
     )
     previous = _previous_feedback()
-    previous["episode_outcomes"]["oversized_observable_note"] = "超限0123456789" * 40_000
+    previous["representative_cases"] = [
+        {"kind": "oversized_observable_case", "note": "超限0123456789" * 40_000}
+    ]
     controller.previous_episode_feedback = previous
     result = _begin(controller)
     assert result["td3_fallback"] and result["routing_fallback"]
@@ -945,6 +1185,11 @@ def test_windows_path_preflight_includes_stream_and_atomic_temp_names(tmp_path):
     assert any("response_content.partial.txt" in path for path in paths)
     assert any(".response_metadata.json.tmp" in path for path in paths)
     assert any("token_budget.json" in path for path in paths)
+    assert any("numerical" in path for path in paths)
+    standard_root = llm_explorer_path_preflight(
+        Path(r"C:\uav_llm_runs"), maximum_episode=1500
+    )
+    assert standard_root["longest"]["characters"] <= 240
     unicode_report = llm_explorer_path_preflight(
         tmp_path / "中文 output root", maximum_episode=4000
     )
@@ -1026,8 +1271,9 @@ def test_numerical_prompt_contains_complete_known_matrices(tmp_path):
     _begin(controller)
     numerical = client.calls[1]["prompt"]
     assert "distinct complete analysis" in numerical
-    assert json.dumps(previous["previous_complete_guidance"]["td3_bias"], separators=(",", ":")) in numerical
-    assert json.dumps(previous["previous_complete_guidance"]["routing_prior"], separators=(",", ":")) in numerical
+    presented = compact_feedback_for_llm(previous)["previous_complete_guidance"]
+    assert json.dumps(presented["td3_bias"], separators=(",", ":")) in numerical
+    assert json.dumps(presented["routing_prior"], separators=(",", ":")) in numerical
 
 
 def test_movement_summary_uses_circular_heading_and_target_bearing():
@@ -1072,6 +1318,53 @@ def test_movement_summary_uses_circular_heading_and_target_bearing():
     ]
     assert abs(abs(bearing["circular_mean_rad"]) - np.pi) < 0.05
     assert bearing["resultant_length"] > 0.99
+
+
+def test_movement_summary_aligns_signed_heading_error_height_and_target_switches():
+    def record(time_s, *, task, kind, target_id, heading, relative):
+        rows = []
+        for uid in range(16):
+            active = uid == 0
+            rows.append(
+                {
+                    "uav_id": uid,
+                    "task_types": [task] if active else [],
+                    "movement_mask": active,
+                    "actor_normalized_action": [0.0, heading if active else 0.0, 0.0],
+                    "policy_projected_normalized_action": [0.0, heading if active else 0.0, 0.0],
+                    "executed_normalized_action": [0.0, heading if active else 0.0, 0.0],
+                    "observable_targets": (
+                        [{"kind": kind, "id": target_id, "relative_position_m": relative}]
+                        if active
+                        else []
+                    ),
+                    "service_observation": None,
+                    "movement_energy_j": 2.0,
+                }
+            )
+        return {"time_seconds": time_s, "uavs": rows}
+
+    summary, _ = first_gen_movement_summary(
+        [
+            record(0.0, task="FOV", kind="roi", target_id=1, heading=0.99, relative=[-1.0, 0.01, -20.0]),
+            record(1.0, task="COM", kind="sr", target_id=8, heading=-0.99, relative=[-1.0, -0.01, -5.0]),
+            record(2.0, task="FOV", kind="roi", target_id=2, heading=0.99, relative=[-1.0, 0.01, -30.0]),
+        ],
+        {"enabled": False, "td3_fallback": True},
+    )
+    uav = summary["by_uav"]["UAV_0"]
+    fov_all = uav["service_target_geometry"]["by_service"]["FOV"]
+    fov_td3 = uav["td3_controlled_service_target_geometry"]["by_service"]["FOV"]
+    com_td3 = uav["td3_controlled_service_target_geometry"]["by_service"]["COM"]
+
+    assert uav["role_decision_counts"] == {"COM": 1, "FOV": 2}
+    assert fov_all["relative_height_uav_minus_target_m"]["mean"] == 25.0
+    assert fov_all["observed_target_switch_count"] == 1
+    assert set(fov_td3["signed_heading_error_by_target"]) == {"1", "2"}
+    assert abs(fov_td3["signed_target_bearing_minus_actor_heading_rad"]["circular_mean_rad"]) < 0.05
+    assert abs(com_td3["signed_target_bearing_minus_actor_heading_rad"]["circular_mean_rad"]) < 0.05
+    assert uav["movement_energy_j"]["all_controllers_sum_j"] == 6.0
+    assert uav["movement_energy_j"]["td3_controlled_intervals_sum_j"] == 6.0
 
 
 def _first_gen_movement_record(
@@ -1259,7 +1552,13 @@ def test_routing_summary_separates_preselection_service_and_shared_reward():
                 "decision_branch": branch,
                 "legal_action_mask": [1, 1] + [0] * 14 + [1],
                 "compact_routing_state": state.tolist(),
-                "reference_capacity_bps_by_legal_action": {"0": 0.0, "1": 2e6, "16": 3e6},
+                "current_expected_capacity_bps_by_legal_action": {"0": 0.0, "1": 2e6, "16": 3e6},
+                "maximum_reference_normalizer_bps_by_legal_action": {"0": 0.0, "1": 9e6, "16": 8e6},
+                "capacity_context_by_legal_action": {
+                    "0": {"link_type": "WAIT", "reference_bandwidth_hz": 0.0},
+                    "1": {"link_type": "U2U", "reference_bandwidth_hz": 10e6},
+                    "16": {"link_type": "U2G", "reference_bandwidth_hz": 10e6},
+                },
                 "sender_total_backlog_bits": 100.0,
                 "hol_packet_id": 7,
                 "hol_remaining_deadline_seconds": 0.005,
@@ -1277,6 +1576,7 @@ def test_routing_summary_separates_preselection_service_and_shared_reward():
                     "link_type": "U2U",
                     "transmitted_bits": 50.0,
                     "active_seconds": 0.01,
+                    "capacity_bits_per_second": 1.5e6,
                 }
             ],
             "completed_hops": [],
@@ -1299,6 +1599,14 @@ def test_routing_summary_separates_preselection_service_and_shared_reward():
     assert sender["preselected_action_packet_use_counts_17"][1] == 1
     assert sender["actual_uav_service"]["transmitted_bits"] == 50.0
     assert sender["actual_uav_service"]["completed_hops"] == 0
+    actual_link = next(
+        link
+        for link in sender["representative_links_maximum_3"]
+        if link["action_index"] == 1
+    )
+    assert actual_link["current_geometry_expected_capacity_bps"]["mean"] == 2e6
+    assert actual_link["fixed_maximum_capacity_normalizer_bps"]["mean"] == 9e6
+    assert actual_link["actual_allocated_service_capacity_bps"]["mean"] == 1.5e6
     assert summary["global_shared_routing_reward"]["episode_sum_counting_each_slot_once"] == 0.005
     assert summary["global_shared_routing_reward"]["duplicated_reward_row_sum_diagnostic"] == 0.08
 
@@ -1309,6 +1617,7 @@ def test_first_generation_versions_metadata_and_old_checkpoint_rejection(tmp_pat
     assert metadata["prompt_version"] == LLM_EXPLORER_PROMPT_VERSION
     assert metadata["summary_version"] == LLM_EXPLORER_SUMMARY_VERSION
     assert metadata["cache_version"] == LLM_EXPLORER_CACHE_VERSION
+    assert "independent_numerical_system" in metadata["request_prompt_contract"]
     assert "100_percent" in metadata["routing_intervention"]
 
     controller = LLMExplorerController(
@@ -1429,7 +1738,7 @@ def test_two_episode_mock_training_applies_first_generation_guidance(
         item["bias_application_count"]
         for item in feedback["uav_core_summary"]["by_uav"].values()
     )
-    assert "actual_hol_wait_time_seconds" in client.calls[0]["prompt"]
+    assert "actual_hol_wait_duration_ms" in client.calls[0]["prompt"]
 
 
 def test_first_generation_cli_train_evaluate_and_resume_without_llm_call(

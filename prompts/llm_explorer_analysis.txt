@@ -1,57 +1,81 @@
-Provide concise movement- and routing-exploration recommendations for the current episode, traceable to the supplied evidence. Your complete analysis will be passed to a separate numerical-output request.
+Use the following data to propose a few evidence-supported movement and routing exploration recommendations for this episode. First identify the main limitations affecting timely useful delivery and energy, then choose guidance.
 
-[Current phase and observable initial state]
+[Current training phase and exploration bounds]
 
 {{PHASE_AND_EXPLORATION_SETTINGS}}
 
-{{CURRENT_OBSERVABLE_INITIAL_STATE}}
+These include the episode number, configured training horizon when available, warmup status, sigma_episode_start, epsilon, and raw-bias bounds.
 
 [Previous episode: global outcomes]
 
 {{EPISODE_OUTCOMES}}
 
-These include EE, timely useful GS bits, movement energy of all UAVs, FOV/COM generation and delivery, deadline violations and valid denominators, both learning rewards, costs, and multipliers.
+These include EE, timely useful GS bits, movement energy of all UAVs, separate FOV/COM generation and terminal outcomes, deadline numerators and denominators, necessary rewards/costs, lambda_EE, and lambda_cost.
 
-[Previous episode: guidance and application]
-
-Complete TD3 bias and routing prior:
+[Previous episode: complete guidance and application]
 
 {{PREVIOUS_COMPLETE_GUIDANCE}}
 
-Actual application, non-intervention, and fallback summary:
-
 {{PREVIOUS_APPLICATION_STATUS}}
 
-[Core movement and service summaries for all UAVs]
+Historical guidance includes the complete 16x3 raw TD3 bias and 16x17 routing prior, presented as rounded references. Unavailable history is explicitly marked unknown.
 
-{{UAV_CORE_SUMMARY}}
+[Current observable initial state]
 
-These include roles, TD3 control opportunities, the requested full bias, pre-projection Actor offsets, offsets actually added under the movement mask, final projected/executed actions, energy, target-relative directions/distances with valid sample counts and directional dispersion, and necessary sensing, access, and queue statistics.
+{{CURRENT_OBSERVABLE_INITIAL_STATE}}
 
-[Core routing summaries for all sender UAVs]
+This includes all UAV positions, roles, initial movement masks, queues, currently known RoIs/SRs, service relationships, and legal links. Undiscovered or unestablished information is unknown or unassigned.
 
-{{ROUTING_CORE_SUMMARY}}
+[Resolved settings, geometry constants, and data dictionary]
 
-These include all 17 action counts separated by epsilon-exploration and greedy branches, legal-action opportunities, actual service, slot-start HOL observation counts, event-time WAIT-with-HOL seconds, and zero-prior-mass fallbacks. Missing legacy event-time values are unavailable rather than zero.
+{{RESOLVED_SETTINGS_AND_DATA_DICTIONARY}}
 
-Each sender has at most three representative link profiles, with selection reasons, endpoints, reference capacity, neighbor backlog, and actual service. Other actions remain available for exploration.
+These supply the actual timing, traffic, deadlines, communication, camera, and action settings; C9/C10/COM penalty definitions; and each field's unit, valid denominator, and aggregation scope.
+
+Coordinate definitions are:
+- Relative position: target position minus UAV position.
+- Relative height h: UAV height minus target height.
+- Heading error: target bearing minus Actor horizontal heading, wrapped into [-pi,pi).
+- Direction summaries: circular mean, concentration, and valid sample count.
+
+[Movement power references]
+
+{{MOVEMENT_POWER_REFERENCE_POINTS}}
+
+These provide a few representative 3D velocities and powers, including hovering, horizontal movement, climbing, and descent.
+
+[Core movement and service data for all UAVs]
+
+{{MOVEMENT_AND_SERVICE_TABLES}}
+
+Shared columns and rows retain role counts, TD3 control and effective bias-application counts, TD3-scope Actor/executed actions, projection fractions, separately scoped energy sums, target-relative geometry and signed heading errors, sensing, access, queues, and deadlines. Role, target, sample-count, and validity scopes are explicit.
+
+[Core routing data for all sender UAVs]
+
+{{ROUTING_TABLES}}
+
+Shared columns and rows retain complete epsilon/greedy 17-action counts, complete legal opportunities, packet use, positive service, completed hops, event-time HOL WAIT duration, fallback counts, and up to three representative links per sender. Capacity fields state their type, bandwidth context, and valid observation count. An omitted link is not implied to be illegal or unused.
 
 [Representative cases]
 
 {{REPRESENTATIVE_CASES}}
 
-At most eight cases provide timestamps, IDs, control branches, relevant geometry, actions, and service evidence.
+At most eight cases cover normal service and major limitations, retaining relevant time, IDs, control branch, geometry, action, and service outcome.
 
 [Requested analysis]
 
-Return four short sections retaining the key evidence and decision rationale:
+Return four concise sections:
 
-1. Priority issues: Select at most two issues affecting EE or timely service. Give supporting values and denominators. Distinguish source generation, sensing, access, forwarding, waiting, deadline, and energy limitations.
+1. Priority limitations.
+Select at most two issues. Cite supporting values and valid denominators. Distinguish sensing, SR access, routing, WAIT, deadline, and energy limitations.
 
-2. TD3 recommendations: Identify the UAV IDs, speed/heading/vertical components, positive/negative/zero directions, and evidence for the adjustment magnitude. Consider actual control opportunities, Actor and target directions, service needs, and whether an episode-fixed bias is appropriate.
+2. TD3 recommendations.
+Identify UAV IDs, action components, signed bias directions, and magnitude evidence. For proposed changes, give a raw-bias value or a fraction of the current bound. Assess whether an episode-fixed offset is compatible with role and target-direction changes.
 
-3. Routing recommendations: Identify sender UAV IDs and GS/WAIT/destination UAV IDs whose probabilities should increase, decrease, or remain unchanged. Support recommendations using actual service and legal opportunities. Account for differences in encountered states and sample counts when comparing exploration and greedy outcomes.
+3. Routing recommendations.
+Use sender IDs and GS/WAIT/UAV_j names. For distributions to change, specify probabilities for important actions and how remaining mass should be allocated, so the next stage can construct numerical distributions.
 
-4. Expected effects and limitations: Explain the possible effects on delivered data, energy, and deadline violations, and identify hypotheses requiring further observation. For UAVs or actions not explicitly discussed, specify neutral guidance or evidence-supported reuse of historical distributions.
+4. Expected effects and limitations.
+Explain possible effects on useful delivery, energy, and deadline violations. Identify major unknowns and hypotheses requiring observation. Explicitly choose neutral guidance or evidence-supported historical reuse for unspecified entries.
 
-Prioritize a few concrete recommendations. Separate observed facts, hypotheses, and unknowns. Return the analysis summary in this stage; the next stage will generate the final numerical matrices.
+Neutral guidance means zero TD3 bias and a uniform 17-action routing prior. This stage returns the analysis and necessary numerical rationale. The next stage produces the complete matrices.

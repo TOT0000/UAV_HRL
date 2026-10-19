@@ -1,48 +1,37 @@
-Convert the following analysis into episode-fixed TD3 raw biases and routing priors. Use the action definitions and application rules in the shared system prompt.
+Produce this episode's guidance using the complete analysis and current numerical specifications below.
 
 [Complete first-stage analysis]
 
 {{ANALYSIS_STAGE_OUTPUT}}
 
-[Current phase, numerical bounds, and observable initial state]
+[Current numerical settings and necessary field definitions]
 
-{{PHASE_AND_EXPLORATION_SETTINGS}}
+{{CURRENT_NUMERICAL_SETTINGS_AND_DEFINITIONS}}
+
+These include sigma_episode_start and raw-bias bounds, epsilon, host validation tolerances, coordinate definitions, and meanings and units of the initial-state fields below.
+
+[Necessary current observable initial state]
 
 {{CURRENT_OBSERVABLE_INITIAL_STATE}}
 
-[Complete previous guidance and actual application]
+Initial roles and legal links may change within the episode. The requested guidance remains fixed for the episode.
 
-Previous complete 16×3 TD3 raw bias:
+[Previous complete 16x3 raw TD3 bias]
 
 {{PREVIOUS_COMPLETE_TD3_BIAS}}
 
-Previous complete 16×17 routing prior:
+[Previous complete 16x17 routing prior]
 
 {{PREVIOUS_COMPLETE_ROUTING_PRIOR}}
 
-Actual application and fallback summary:
+These are complete rounded references when history is known. Unavailable history is explicitly marked unknown.
+
+[Previous application and fallback summary]
 
 {{PREVIOUS_APPLICATION_STATUS}}
-
-[Global outcomes and representative cases for reference]
-
-{{CONCISE_OUTCOMES_AND_CASES}}
 
 [Local format-validation feedback; empty on the first attempt]
 
 {{VALIDATION_FEEDBACK_OR_EMPTY}}
 
-[Output contract]
-
-Return exactly one JSON object containing only td3_bias and routing_prior:
-
-- td3_bias: shape 16×3, ordered by UAV IDs 0–15, with columns speed, heading, and vertical. Every element must be a finite number within the current episode’s bounds [−sigma_episode_start, +sigma_episode_start].
-- routing_prior: shape 16×17, with sender UAV IDs as rows, UAV actions 0–15 as columns 0–15, and GS as column 16. Each sender’s own column represents WAIT. Every element must be within [0,1], and each row’s sum must differ from 1 by at most 1e-6.
-
-TD3 outputs are raw biases added directly to the Actor action. Routing outputs are distributions before the current legal-action mask is applied. The host handles projection, masking, renormalization, and fallback.
-
-Generate values following the directions and magnitude rationale in the analysis. TD3 components without sufficient evidence may be zero. Routing may use a uniform prior or a historical distribution whose reuse is explicitly supported by the analysis.
-
-When historical values are unknown, preserve that interpretation and choose fresh neutral guidance for this episode. Known historical values must still satisfy the current episode’s bounds.
-
-List every element of both matrices using fully evaluated JSON numbers. The response must contain only the JSON object. When validation feedback is supplied, return the complete corrected object.
+Return complete JSON satisfying the system specifications and containing only td3_bias and routing_prior. When validation feedback is present, return both complete corrected matrices.

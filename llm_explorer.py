@@ -26,12 +26,13 @@ import numpy as np
 
 LLM_EXPLORER_METHOD_ID = "td3_dinkelbach_llm_explorer"
 LLM_EXPLORER_MODEL = "gpt-4o-mini"
-LLM_EXPLORER_VERSION = "uav-hrl-llm-explorer-firstgen-v4"
-LLM_EXPLORER_PROMPT_VERSION = "uav-hrl-llm-explorer-prompts-v6"
-LLM_EXPLORER_SUMMARY_VERSION = "complete-core-feedback-v3"
+LLM_EXPLORER_VERSION = "uav-hrl-llm-explorer-firstgen-v5"
+LLM_EXPLORER_PROMPT_VERSION = "uav-hrl-llm-explorer-prompts-v7"
+LLM_EXPLORER_SUMMARY_VERSION = "complete-core-feedback-v4"
 LLM_EXPLORER_CASE_VERSION = "deterministic-diverse-cases-v1"
-LLM_EXPLORER_CACHE_VERSION = "episode-fixed-dual-guidance-cache-v3"
+LLM_EXPLORER_CACHE_VERSION = "episode-fixed-dual-guidance-cache-v4"
 LLM_EXPLORER_COMPRESSION_VERSION = LLM_EXPLORER_SUMMARY_VERSION
+LLM_EXPLORER_PRESENTATION_VERSION = "firstgen-columns-rows-3dp-v1"
 SHARED_ENVIRONMENT_DEFINITIONS_VERSION = "uav-hrl-llm-explorer-v2"
 LLM_EXPLORER_WARMUP_TRANSITIONS = 10_000
 LLM_EXPLORER_UPDATE_INTERVAL_EPISODES = 1
@@ -183,6 +184,81 @@ def _round_optional(value: Any, digits: int) -> Any:
         raise ValueError("LLM compact input contains a non-finite number")
     rounded = round(numeric, int(digits))
     return 0.0 if rounded == 0.0 else rounded
+
+
+def _presentation_number(
+    value: float,
+    *,
+    preserve_precision: bool = False,
+    scientific_small_nonzero: bool = False,
+) -> float:
+    """Format a detached LLM-input number without changing simulator state."""
+
+    numeric = float(value)
+    if not math.isfinite(numeric):
+        raise ValueError("LLM presentation contains a non-finite number")
+    if preserve_precision:
+        return numeric
+    if (
+        scientific_small_nonzero
+        and numeric != 0.0
+        and abs(numeric) < 0.0005
+    ):
+        # Small multipliers such as lambda_EE remain visibly non-zero. JSON
+        # uses exponent notation for the actual magnitudes encountered here.
+        presented = float(f"{numeric:.3g}")
+    else:
+        presented = round(numeric, 3)
+    return 0.0 if presented == 0.0 else presented
+
+
+def first_gen_present_for_llm(
+    value: Any,
+    *,
+    preserve_precision_keys: frozenset[str] = frozenset(),
+    _key: str = "",
+) -> Any:
+    """Return a first-generation-only, at-most-3-decimal presentation copy.
+
+    Counts, IDs, booleans, status strings, and nulls keep their native types.
+    No shared serializer or source ndarray/dictionary is mutated.
+    """
+
+    if value is None or isinstance(value, (str, bool, np.bool_)):
+        return bool(value) if isinstance(value, np.bool_) else value
+    if isinstance(value, (int, np.integer)) and not isinstance(value, bool):
+        return int(value)
+    if isinstance(value, (float, np.floating)):
+        return _presentation_number(
+            float(value),
+            preserve_precision=_key in preserve_precision_keys,
+            scientific_small_nonzero="lambda" in _key.lower(),
+        )
+    if isinstance(value, np.ndarray):
+        return first_gen_present_for_llm(
+            value.tolist(),
+            preserve_precision_keys=preserve_precision_keys,
+            _key=_key,
+        )
+    if isinstance(value, Mapping):
+        return {
+            str(key): first_gen_present_for_llm(
+                item,
+                preserve_precision_keys=preserve_precision_keys,
+                _key=str(key),
+            )
+            for key, item in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [
+            first_gen_present_for_llm(
+                item,
+                preserve_precision_keys=preserve_precision_keys,
+                _key=_key,
+            )
+            for item in value
+        ]
+    raise TypeError(f"unsupported LLM presentation value: {type(value).__name__}")
 
 
 def _semantic_guidance(guidance: dict[str, Any]) -> dict[str, Any]:
@@ -403,27 +479,559 @@ def _compact_routing_records(records: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def _summary_seconds_to_ms(summary: Mapping[str, Any]) -> dict[str, Any]:
+    result = _json_clone(summary)
+    for key in ("mean", "min", "max"):
+        if result.get(key) is not None:
+            result[key] = float(result[key]) * 1000.0
+    return result
+
+
+def _first_gen_outcome_payload(
+    metrics: Mapping[str, Any], service: Mapping[str, Any]
+) -> dict[str, Any]:
+    tasks = []
+    for task in ("fov", "com"):
+        eligible = int(metrics.get(f"{task}_generated_packets", 0) or 0)
+        admission = int(metrics.get(f"{task}_sr_admission_drop_packets", 0) or 0)
+        source_generated = eligible + admission
+        on_time = int(metrics.get(f"{task}_on_time_delivered_packets", 0) or 0)
+        late = int(metrics.get(f"{task}_late_delivered_packets", 0) or 0)
+        expired = int(metrics.get(f"{task}_expired_dropped_packets", 0) or 0)
+        terminal = on_time + late + expired + admission
+        tasks.append(
+            [
+                task.upper(), source_generated, eligible, on_time, late,
+                expired, admission, max(source_generated - terminal, 0),
+            ]
+        )
+    return {
+        "objective": {
+            "energy_efficiency_bits_per_j": metrics.get(
+                "energy_efficiency_bit_per_j"
+            ),
+            "timely_useful_gs_delivery_bits": metrics.get(
+                "timely_useful_delivery_bits"
+            ),
+            "all_uav_all_controller_movement_energy_sum_j": metrics.get(
+                "movement_energy_j"
+            ),
+        },
+        "task_packet_outcomes": {
+            "columns": [
+                "task_type", "source_generated_packets",
+                "qos_eligible_generated_packets",
+                "on_time_gs_delivered_packets", "late_gs_delivered_packets",
+                "expired_dropped_packets", "sr_admission_drop_packets",
+                "unresolved_packets_at_episode_finalization",
+            ],
+            "rows": tasks,
+        },
+        "deadline_constraints": {
+            "system": {
+                "violation_numerator_packets": metrics.get(
+                    "system_qos_violation_count"
+                ),
+                "eligible_denominator_packets": metrics.get(
+                    "system_qos_eligible_packets"
+                ),
+                "violation_probability": metrics.get(
+                    "system_qos_violation_probability"
+                ),
+                "occurrence_location": (
+                    "unknown_not_recorded_as_a_reliable_stage_or_hop"
+                ),
+            },
+            "routing_decision_chain": {
+                "violation_numerator_packets": metrics.get(
+                    "routing_stage_violation_count"
+                ),
+                "eligible_denominator_packets": metrics.get(
+                    "routing_stage_eligible_packets"
+                ),
+                "location_scope": "packets with routing decision-chain attribution; no hop location inferred",
+            },
+        },
+        "learning_signals": {
+            "td3_original_cumulative_reward": metrics.get(
+                "td3_original_cumulative_reward"
+            ),
+            "safe_ddqn_original_cumulative_reward": metrics.get(
+                "safe_ddqn_original_cumulative_reward"
+            ),
+            "routing_immediate_cost_sum": metrics.get(
+                "routing_immediate_cost_sum"
+            ),
+            "lambda_EE_Mbit_per_J_used": metrics.get(
+                "lambda_EE_Mbit_per_J_used"
+            ),
+            "lambda_cost_used": metrics.get("lambda_cost_used"),
+            "lambda_cost_after_episode": metrics.get(
+                "lambda_cost_after_episode"
+            ),
+            "movement_penalty_columns": [
+                "penalty_name", "episode_sum", "applicable_pair_sample_count"
+            ],
+            "movement_penalty_rows": [
+                [
+                    "C9", metrics.get("c9_penalty_sum"),
+                    metrics.get("c9_penalty_sample_count"),
+                ],
+                [
+                    "C10", metrics.get("c10_penalty_sum"),
+                    metrics.get("c10_penalty_sample_count"),
+                ],
+                [
+                    "COM_access_range",
+                    metrics.get("com_range_penalty_sum"),
+                    metrics.get("com_range_penalty_sample_count"),
+                ],
+            ],
+        },
+        "timely_bits_by_task": {
+            "fov_generated_raw_bits": metrics.get("fov_generated_raw_bits"),
+            "fov_raw_bits": metrics.get("fov_timely_delivered_raw_bits"),
+            "fov_coverage_weighted_useful_bits": metrics.get(
+                "fov_timely_useful_bits"
+            ),
+            "fov_mean_capture_coverage": metrics.get(
+                "fov_mean_capture_coverage"
+            ),
+            "fov_zero_coverage_packet_count": metrics.get(
+                "fov_zero_coverage_packet_count"
+            ),
+            "com_bits": metrics.get("com_timely_delivered_bits"),
+            "recorded_slot_sum_alignment": service.get(
+                "recorded_slot_sum_matches_authoritative_episode_total"
+            ),
+        },
+    }
+
+
+def _first_gen_guidance_reference(value: Mapping[str, Any]) -> dict[str, Any]:
+    td3 = _json_clone(value.get("td3_bias", {}))
+    routing = _json_clone(value.get("routing_prior", {}))
+    for item, label in (
+        (td3, "complete rounded 16x3 reference; source guidance is unchanged"),
+        (
+            routing,
+            "complete rounded 16x17 reference; rounded rows may not sum to 1 and rounded zero may be a small source value",
+        ),
+    ):
+        item["presentation_semantics"] = label
+    return first_gen_present_for_llm({"td3_bias": td3, "routing_prior": routing})
+
+
+def _numeric_summary_row(value: Mapping[str, Any]) -> list[Any]:
+    return [
+        value.get("valid_sample_count", 0),
+        value.get("mean"),
+        value.get("min"),
+        value.get("max"),
+    ]
+
+
+def _circular_summary_row(value: Mapping[str, Any]) -> list[Any]:
+    return [
+        value.get("valid_sample_count", 0),
+        value.get("circular_mean_rad"),
+        value.get("resultant_length"),
+        value.get("circular_variance"),
+        value.get("mean_direction_status"),
+    ]
+
+
+def _component_summary_row(value: Mapping[str, Any]) -> list[list[Any]]:
+    return [
+        _numeric_summary_row(value.get(component, {}))
+        for component in ("speed", "heading", "vertical")
+    ]
+
+
+def _service_geometry_row(value: Mapping[str, Any]) -> list[Any]:
+    relative = value.get("relative_position_target_minus_uav_m", {})
+    return [
+        value.get("target_id_observation_counts", {}),
+        value.get("observed_target_switch_count", 0),
+        _numeric_summary_row(relative.get("x", {})),
+        _numeric_summary_row(relative.get("y", {})),
+        _numeric_summary_row(relative.get("z", {})),
+        _numeric_summary_row(value.get("relative_height_uav_minus_target_m", {})),
+        _numeric_summary_row(value.get("horizontal_distance_m", {})),
+        _numeric_summary_row(value.get("distance_3d_m", {})),
+        _circular_summary_row(value.get("bearing_xy_rad", {})),
+    ]
+
+
+def _controlled_geometry_row(value: Mapping[str, Any]) -> list[Any]:
+    return [
+        _numeric_summary_row(value.get("distance_3d_m", {})),
+        _circular_summary_row(value.get("bearing_xy_rad", {})),
+        _circular_summary_row(
+            value.get("signed_target_bearing_minus_actor_heading_rad", {})
+        ),
+        {
+            str(target): _circular_summary_row(summary)
+            for target, summary in value.get(
+                "signed_heading_error_by_target", {}
+            ).items()
+        },
+    ]
+
+
+def _first_gen_movement_table(summary: Mapping[str, Any]) -> dict[str, Any]:
+    columns = [
+        "uav_id", "role_counts_Search_FOV_COM_Hovering_unassigned",
+        "recorded_decision_count", "td3_controlled_decision_count",
+        "effective_bias_application_count",
+        "requested_episode_fixed_raw_bias_norm_speed_heading_vertical",
+        "actor_pre_projection_guidance_bias_component_summaries",
+        "movement_mask_qualified_added_bias_component_summaries",
+        "actor_action_norm_td3_only_component_summaries",
+        "executed_action_norm_td3_only_component_summaries",
+        "actor_heading_circular_rad_td3_only",
+        "executed_heading_circular_rad_td3_only",
+        "host_projection_count_fraction_and_environment_adjustment_count_fraction",
+        "movement_energy_all_sum_j_td3_sum_j_all_n_td3_n",
+        "FOV_all_controller_target_geometry",
+        "COM_all_controller_target_geometry",
+        "FOV_td3_controlled_target_geometry_and_heading_error",
+        "COM_td3_controlled_target_geometry_and_heading_error",
+        "uav_queue_valid_empty_backlog_hol_no_hol_hol_deadline_ms",
+        "fov_valid_capture_coverage_image_quantity_c9_m_c10_m",
+        "com_target_sr_queue_empty_backlog_hol_ms_s2u_valid_in_range_capacity_Mbps",
+    ]
+    rows = []
+    by_uav = summary.get("by_uav", {})
+    for uav_id in range(NUM_UAV):
+        item = by_uav.get(f"UAV_{uav_id}", {})
+        energy = item.get("movement_energy_j", {})
+        roles = item.get("role_decision_counts", {})
+        service = item.get("service_target_geometry", {}).get(
+            "by_service", {}
+        )
+        controlled_service = item.get(
+            "td3_controlled_service_target_geometry", {}
+        ).get("by_service", {})
+        queue = item.get("uav_queue", {})
+        fov = item.get("fov_sensing", {})
+        com = item.get("com_access", {})
+        rows.append(
+            [
+                uav_id,
+                [
+                    roles.get(role, 0)
+                    for role in ("Search", "FOV", "COM", "Hovering", "unassigned")
+                ],
+                item.get("recorded_decision_count", 0),
+                item.get("td3_controlled_decision_count", 0),
+                item.get("bias_application_count", 0),
+                item.get("requested_episode_fixed_raw_bias_normalized"),
+                _component_summary_row(
+                    item.get("actor_pre_projection_guidance_bias_normalized", {})
+                ),
+                _component_summary_row(
+                    item.get("actually_added_bias_normalized", {})
+                ),
+                _component_summary_row(
+                    item.get("actor_action_normalized_td3_controlled_only", {})
+                ),
+                _component_summary_row(
+                    item.get(
+                        "actual_executed_action_normalized_td3_controlled_only", {}
+                    )
+                ),
+                _circular_summary_row(
+                    item.get("actor_heading_circular_rad_td3_controlled_only", {})
+                ),
+                _circular_summary_row(
+                    item.get(
+                        "actual_executed_heading_circular_rad_td3_controlled_only", {}
+                    )
+                ),
+                [
+                    item.get("host_action_projection_decision_count", 0),
+                    item.get("host_action_projection_fraction_of_recorded_decisions"),
+                    item.get("environment_adjusted_decision_count", 0),
+                    item.get("environment_adjusted_fraction_of_recorded_decisions"),
+                ],
+                [
+                    energy.get("all_controllers_sum_j"),
+                    energy.get("td3_controlled_intervals_sum_j"),
+                    energy.get("all_controllers", {}).get("valid_sample_count", 0),
+                    energy.get("td3_controlled_intervals", {}).get("valid_sample_count", 0),
+                ],
+                _service_geometry_row(service.get("FOV", {})),
+                _service_geometry_row(service.get("COM", {})),
+                _controlled_geometry_row(controlled_service.get("FOV", {})),
+                _controlled_geometry_row(controlled_service.get("COM", {})),
+                [
+                    queue.get("valid_observation_count", 0),
+                    queue.get("empty_observation_count", 0),
+                    _numeric_summary_row(queue.get("backlog_bits", {})),
+                    queue.get("hol_present_count", 0),
+                    queue.get("no_hol_count", 0),
+                    _numeric_summary_row(
+                        _summary_seconds_to_ms(
+                            queue.get("hol_remaining_deadline_s", {})
+                        )
+                    ),
+                ],
+                [
+                    fov.get("valid_geometry_observation_count", 0),
+                    fov.get("capture_valid_count", 0),
+                    _numeric_summary_row(fov.get("coverage_ratio", {})),
+                    _numeric_summary_row(fov.get("image_quantity", {})),
+                    _numeric_summary_row(fov.get("c9_margin_m", {})),
+                    _numeric_summary_row(fov.get("c10_margin_m", {})),
+                ],
+                [
+                    com.get("target_valid_observation_count", 0),
+                    com.get("sr_queue_valid_observation_count", 0),
+                    com.get("sr_queue_empty_observation_count", 0),
+                    _numeric_summary_row(com.get("sr_backlog_bits", {})),
+                    _numeric_summary_row(
+                        _summary_seconds_to_ms(
+                            com.get("sr_hol_remaining_deadline_s", {})
+                        )
+                    ),
+                    com.get("s2u_link_valid_observation_count", 0),
+                    com.get("s2u_in_range_observation_count", 0),
+                    _numeric_summary_row(
+                        com.get("s2u_reference_capacity_mbps", {})
+                    ),
+                ],
+            ]
+        )
+    return first_gen_present_for_llm(
+        {
+            "scope": summary.get("scope"),
+            "numeric_summary_layout": [
+                "valid_sample_count", "mean", "min", "max"
+            ],
+            "circular_summary_layout": [
+                "valid_sample_count", "circular_mean_rad",
+                "resultant_length", "circular_variance", "status",
+            ],
+            "component_order": ["speed", "heading", "vertical"],
+            "service_geometry_layout": [
+                "target_id_observation_counts", "target_switch_count",
+                "relative_x_m", "relative_y_m", "relative_z_target_minus_uav_m",
+                "relative_height_uav_minus_target_m", "horizontal_distance_m",
+                "distance_3d_m", "target_bearing_circular_rad",
+            ],
+            "td3_geometry_layout": [
+                "distance_3d_m", "target_bearing_circular_rad",
+                "signed_target_bearing_minus_actor_heading_circular_rad",
+                "signed_heading_error_by_target",
+            ],
+            "columns": columns,
+            "rows": rows,
+        }
+    )
+
+
+def _first_gen_routing_table(summary: Mapping[str, Any]) -> dict[str, Any]:
+    columns = [
+        "sender_uav_id", "decision_count",
+        "epsilon_exploration_action_counts_17",
+        "safe_q_greedy_action_counts_17",
+        "legal_action_opportunity_counts_17",
+        "preselected_action_packet_use_counts_17",
+        "actual_uav_service_bits_ms_hops_allocated_capacity",
+        "s2u_access_bits_ms_packets_observations_capacity",
+        "slot_start_queue_and_hol_counts_and_summaries",
+        "actual_hol_wait_duration_ms",
+        "zero_legal_prior_mass_fallback_count",
+        "representative_links_maximum_3",
+    ]
+    rows = []
+    by_sender = summary.get("by_sender", {})
+    for sender in range(NUM_UAV):
+        item = by_sender.get(f"UAV_{sender}", {})
+        wait = _json_clone(item.get("actual_hol_wait_time_seconds", {}))
+        for source, destination in (
+            ("episode_sum_seconds", "episode_sum_ms"),
+            ("observed_partial_sum_seconds", "observed_partial_sum_ms"),
+        ):
+            value = wait.pop(source, None)
+            wait[destination] = None if value is None else float(value) * 1000.0
+        hol = _summary_seconds_to_ms(
+            item.get("hol_remaining_deadline_s", {})
+        )
+        links = _json_clone(item.get("representative_links_maximum_3", []))
+        for link in links:
+            if link.get("actual_active_service_seconds") is not None:
+                link["actual_active_service_ms"] = (
+                    float(link.pop("actual_active_service_seconds")) * 1000.0
+                )
+        actual = _json_clone(item.get("actual_uav_service", {}))
+        if actual.get("active_service_seconds") is not None:
+            actual["active_service_ms"] = (
+                float(actual.pop("active_service_seconds")) * 1000.0
+            )
+        access = _json_clone(item.get("s2u_access_received", {}))
+        if access.get("active_service_seconds") is not None:
+            access["active_service_ms"] = (
+                float(access.pop("active_service_seconds")) * 1000.0
+            )
+        link_rows = [
+            [
+                link.get("action_index"),
+                link.get("endpoint"),
+                link.get("selection_reasons", []),
+                link.get("legal_opportunity_count", 0),
+                _numeric_summary_row(
+                    link.get("current_geometry_expected_capacity_bps", {})
+                ),
+                _numeric_summary_row(
+                    link.get("fixed_maximum_capacity_normalizer_bps", {})
+                ),
+                link.get("capacity_context_latest"),
+                _numeric_summary_row(
+                    link.get("neighbor_backlog_log_normalized", {})
+                ),
+                link.get("actual_transmitted_bits", 0.0),
+                _numeric_summary_row(
+                    link.get("actual_allocated_service_capacity_bps", {})
+                ),
+                link.get("actual_active_service_ms", 0.0),
+                link.get("completed_hop_count", 0),
+                link.get("active_link_observation_count", 0),
+            ]
+            for link in links
+        ]
+        rows.append(
+            [
+                sender,
+                item.get("decision_count", 0),
+                item.get("epsilon_exploration_action_counts_17", [0] * 17),
+                item.get("safe_q_greedy_action_counts_17", [0] * 17),
+                item.get("legal_action_opportunity_counts_17", [0] * 17),
+                item.get("preselected_action_packet_use_counts_17", [0] * 17),
+                [
+                    actual.get("transmitted_bits", 0.0),
+                    actual.get("active_service_ms", 0.0),
+                    actual.get("completed_hops", 0),
+                    _numeric_summary_row(
+                        actual.get("allocated_service_capacity_bps", {})
+                    ),
+                ],
+                [
+                    access.get("transmitted_bits", 0.0),
+                    access.get("active_service_ms", 0.0),
+                    access.get("completed_packets", 0),
+                    access.get("active_link_observation_count", 0),
+                    access.get("allocated_service_capacity_bps_mean"),
+                    access.get(
+                        "allocated_service_capacity_valid_observation_count", 0
+                    ),
+                ],
+                [
+                    _numeric_summary_row(
+                        item.get("slot_start_sender_backlog_bits", {})
+                    ),
+                    item.get("slot_start_backlog_positive_count", 0),
+                    item.get("slot_start_backlog_zero_count", 0),
+                    item.get("slot_start_backlog_unknown_count", 0),
+                    item.get("slot_start_hol_present_count", 0),
+                    item.get("slot_start_no_hol_count", 0),
+                    item.get("slot_start_hol_presence_unknown_count", 0),
+                    _numeric_summary_row(hol),
+                    item.get("slot_start_hol_wait_selected_count", 0),
+                ],
+                [
+                    wait.get("status"),
+                    wait.get("episode_sum_ms"),
+                    wait.get("observed_partial_sum_ms"),
+                    wait.get("valid_slot_count", 0),
+                    wait.get("unavailable_slot_count", 0),
+                    wait.get("positive_wait_slot_count", 0),
+                ],
+                item.get("zero_legal_prior_mass_fallback_count", 0),
+                link_rows,
+            ]
+        )
+    return first_gen_present_for_llm(
+        {
+            "scope": summary.get("scope"),
+            "action_columns": "0..15 UAV actions; 16 GS; sender column WAIT",
+            "capacity_semantics": {
+                "current_geometry_expected_capacity_bps": "specified reference bandwidth and decision-time channel caches",
+                "actual_service": "post-sharing authoritative positive transmitted bits and completed hops",
+                "fixed_maximum_capacity_normalizer_bps": "normalization constant, never current capacity",
+            },
+            "numeric_summary_layout": [
+                "valid_sample_count", "mean", "min", "max"
+            ],
+            "actual_service_layout": [
+                "transmitted_bits", "active_service_ms", "completed_hops",
+                "allocated_service_capacity_bps_summary",
+            ],
+            "s2u_access_layout": [
+                "transmitted_bits", "active_service_ms", "completed_packets",
+                "active_link_observation_count",
+                "allocated_service_capacity_bps_mean",
+                "allocated_capacity_valid_observation_count",
+            ],
+            "slot_start_queue_hol_layout": [
+                "backlog_bits_summary", "backlog_positive_count",
+                "backlog_zero_count", "backlog_unknown_count",
+                "hol_present_count", "no_hol_count",
+                "hol_presence_unknown_count", "hol_remaining_deadline_ms_summary",
+                "wait_selected_with_slot_start_hol_count",
+            ],
+            "actual_hol_wait_duration_ms_layout": [
+                "status", "episode_sum_ms", "observed_partial_sum_ms",
+                "valid_slot_count", "unavailable_slot_count",
+                "positive_wait_slot_count",
+            ],
+            "actual_hol_wait_duration_ms_semantics": (
+                "event-time union where fixed slot action was WAIT and an actual UAV HOL existed; non-WAIT no-service intervals excluded"
+            ),
+            "representative_link_layout": [
+                "action_index", "endpoint", "selection_reasons",
+                "legal_opportunity_count",
+                "current_geometry_expected_capacity_bps_summary",
+                "fixed_maximum_capacity_normalizer_bps_summary",
+                "capacity_context_latest",
+                "neighbor_backlog_log_normalized_summary",
+                "actual_transmitted_bits",
+                "actual_allocated_service_capacity_bps_summary",
+                "actual_active_service_ms", "completed_hop_count",
+                "active_link_observation_count",
+            ],
+            "columns": columns,
+            "rows": rows,
+        }
+    )
+
+
 def compact_feedback_for_llm(previous: dict[str, Any]) -> dict[str, Any]:
-    """Create an LLM-only copy without changing stored training diagnostics."""
+    """Create a first-generation LLM-only copy of stored diagnostics."""
 
     if previous.get("summary_version") == LLM_EXPLORER_SUMMARY_VERSION:
+        service = previous.get("actual_slot_service_summary", {})
         return {
-            "compression_version": LLM_EXPLORER_COMPRESSION_VERSION,
-            "episode_outcomes": _json_clone(previous.get("episode_outcomes", {})),
-            "previous_complete_guidance": _json_clone(
+            "presentation_version": LLM_EXPLORER_PRESENTATION_VERSION,
+            "episode_outcomes": first_gen_present_for_llm(
+                _first_gen_outcome_payload(
+                    previous.get("episode_outcomes", {}), service
+                )
+            ),
+            "previous_complete_guidance": _first_gen_guidance_reference(
                 previous.get("previous_complete_guidance", {})
             ),
-            "previous_application_status": _json_clone(
+            "previous_application_status": first_gen_present_for_llm(
                 previous.get("previous_application_status", {})
             ),
-            "uav_core_summary": _json_clone(previous.get("uav_core_summary", {})),
-            "routing_core_summary": _json_clone(
+            "movement_and_service_tables": _first_gen_movement_table(
+                previous.get("uav_core_summary", {})
+            ),
+            "routing_tables": _first_gen_routing_table(
                 previous.get("routing_core_summary", {})
             ),
-            "actual_slot_service_summary": _json_clone(
-                previous.get("actual_slot_service_summary", {})
-            ),
-            "representative_cases": _json_clone(
+            "representative_cases": first_gen_present_for_llm(
                 previous.get("representative_cases", [])
             ),
         }
@@ -826,12 +1434,23 @@ def first_gen_movement_summary(
         td3_controlled_actor_rows: list[list[float]] = []
         projected_rows: list[list[float]] = []
         executed_rows: list[list[float]] = []
+        td3_controlled_projected_rows: list[list[float]] = []
+        td3_controlled_executed_rows: list[list[float]] = []
         actor_bias_rows: list[list[float]] = []
         applied_rows: list[list[float]] = []
         energy_all: list[float] = []
         energy_td3: list[float] = []
         energy_other: list[float] = []
         target_distances: dict[str, list[float]] = {"FOV": [], "COM": []}
+        target_horizontal_distances: dict[str, list[float]] = {
+            "FOV": [], "COM": []
+        }
+        target_relative_positions: dict[str, list[list[float]]] = {
+            "FOV": [], "COM": []
+        }
+        target_relative_heights: dict[str, list[float]] = {
+            "FOV": [], "COM": []
+        }
         target_bearings: dict[str, list[float]] = {"FOV": [], "COM": []}
         controlled_target_distances: dict[str, list[float]] = {
             "FOV": [], "COM": []
@@ -839,10 +1458,23 @@ def first_gen_movement_summary(
         controlled_target_bearings: dict[str, list[float]] = {
             "FOV": [], "COM": []
         }
+        controlled_heading_errors: dict[str, list[float]] = {
+            "FOV": [], "COM": []
+        }
+        controlled_heading_errors_by_target: dict[
+            str, dict[str, list[float]]
+        ] = {"FOV": {}, "COM": {}}
+        target_id_counts: dict[str, Counter[str]] = {
+            "FOV": Counter(), "COM": Counter()
+        }
+        last_target_id: dict[str, str | None] = {"FOV": None, "COM": None}
+        target_switch_counts: Counter[str] = Counter()
         queue_backlog: list[float] = []
         hol_deadlines: list[float] = []
         coverage: list[float] = []
         image_quantity: list[float] = []
+        c9_margins: list[float] = []
+        c10_margins: list[float] = []
         sr_backlog: list[float] = []
         sr_hol_deadlines: list[float] = []
         s2u_capacity: list[float] = []
@@ -871,6 +1503,13 @@ def first_gen_movement_summary(
                         destination.append(array.tolist())
                         if field == "actor_normalized_action" and controlled:
                             td3_controlled_actor_rows.append(array.tolist())
+                        elif (
+                            field == "policy_projected_normalized_action"
+                            and controlled
+                        ):
+                            td3_controlled_projected_rows.append(array.tolist())
+                        elif field == "executed_normalized_action" and controlled:
+                            td3_controlled_executed_rows.append(array.tolist())
             guidance_active_at_decision = bool(
                 item.get("td3_guidance_active", requested is not None)
             ) and requested is not None
@@ -924,20 +1563,49 @@ def first_gen_movement_summary(
                 if math.isfinite(value):
                     energy_all.append(value)
                     (energy_td3 if controlled else energy_other).append(value)
+            actor_at_decision = item.get("actor_normalized_action")
+            actor_array = None
+            if actor_at_decision is not None:
+                candidate = np.asarray(actor_at_decision, dtype=np.float64)
+                if candidate.shape == (3,) and np.isfinite(candidate).all():
+                    actor_array = candidate
             for target in item.get("observable_targets", []):
                 relative = np.asarray(target.get("relative_position_m", []), dtype=float)
                 if relative.shape != (3,) or not np.isfinite(relative).all():
                     continue
                 kind = "FOV" if str(target.get("kind")) == "roi" else "COM"
+                target_id = str(target.get("id", "unknown"))
+                target_id_counts[kind][target_id] += 1
+                if (
+                    last_target_id[kind] is not None
+                    and last_target_id[kind] != target_id
+                ):
+                    target_switch_counts[kind] += 1
+                last_target_id[kind] = target_id
+                horizontal_distance = float(np.linalg.norm(relative[:2]))
+                bearing = float(math.atan2(relative[1], relative[0]))
                 target_distances[kind].append(float(np.linalg.norm(relative)))
-                target_bearings[kind].append(float(math.atan2(relative[1], relative[0])))
+                target_horizontal_distances[kind].append(horizontal_distance)
+                target_relative_positions[kind].append(relative.tolist())
+                # Stored relative position is target minus UAV.  The FOV
+                # equations define h as UAV altitude minus target altitude.
+                target_relative_heights[kind].append(float(-relative[2]))
+                target_bearings[kind].append(bearing)
                 if controlled:
                     controlled_target_distances[kind].append(
                         float(np.linalg.norm(relative))
                     )
-                    controlled_target_bearings[kind].append(
-                        float(math.atan2(relative[1], relative[0]))
-                    )
+                    controlled_target_bearings[kind].append(bearing)
+                    if actor_array is not None:
+                        actor_heading = math.pi * float(actor_array[1])
+                        signed_error = (
+                            (bearing - actor_heading + math.pi)
+                            % (2.0 * math.pi)
+                        ) - math.pi
+                        controlled_heading_errors[kind].append(signed_error)
+                        controlled_heading_errors_by_target[kind].setdefault(
+                            target_id, []
+                        ).append(signed_error)
             observation = item.get("service_observation")
             if isinstance(observation, Mapping) and observation.get("snapshot_available"):
                 counts["service_snapshot_available_decisions"] += 1
@@ -957,6 +1625,10 @@ def first_gen_movement_summary(
                     counts["fov_geometry_valid_decisions"] += 1
                     coverage.append(float(fov.get("coverage_ratio", 0.0)))
                     image_quantity.append(float(fov.get("image_quantity", 0.0)))
+                    if fov.get("c9_margin_m") is not None:
+                        c9_margins.append(float(fov["c9_margin_m"]))
+                    if fov.get("c10_margin_m") is not None:
+                        c10_margins.append(float(fov["c10_margin_m"]))
                     counts["fov_capture_valid_decisions"] += int(
                         bool(fov.get("capture_valid"))
                     )
@@ -1040,14 +1712,35 @@ def first_gen_movement_summary(
             "policy_projected_action_normalized_all_decisions": _component_summary(
                 projected_rows
             ),
+            "policy_projected_action_normalized_td3_controlled_only": _component_summary(
+                td3_controlled_projected_rows
+            ),
             "actual_executed_action_normalized_all_controllers": _component_summary(
                 executed_rows
+            ),
+            "actual_executed_action_normalized_td3_controlled_only": _component_summary(
+                td3_controlled_executed_rows
+            ),
+            "actual_executed_heading_circular_rad_td3_controlled_only": _circular_summary(
+                [math.pi * row[1] for row in td3_controlled_executed_rows]
             ),
             "actual_executed_heading_circular_rad_all_controllers": _circular_summary(
                 [math.pi * row[1] for row in executed_rows]
             ),
             "host_action_projection_decision_count": int(counts["host_action_projection_decisions"]),
             "environment_adjusted_decision_count": int(counts["environment_adjusted_decisions"]),
+            "host_action_projection_fraction_of_recorded_decisions": (
+                float(counts["host_action_projection_decisions"])
+                / float(counts["recorded_decisions"])
+                if counts["recorded_decisions"]
+                else None
+            ),
+            "environment_adjusted_fraction_of_recorded_decisions": (
+                float(counts["environment_adjusted_decisions"])
+                / float(counts["recorded_decisions"])
+                if counts["recorded_decisions"]
+                else None
+            ),
             "requested_episode_fixed_raw_bias_normalized": (
                 None if requested is None else requested[uav_id].round(7).tolist()
             ),
@@ -1065,6 +1758,9 @@ def first_gen_movement_summary(
             "bias_application_count": len(applied_rows),
             "guidance_fallback": bool(guidance.get("td3_fallback", True)),
             "movement_energy_j": {
+                "all_controllers_sum_j": float(math.fsum(energy_all)),
+                "td3_controlled_intervals_sum_j": float(math.fsum(energy_td3)),
+                "other_controller_intervals_sum_j": float(math.fsum(energy_other)),
                 "all_controllers": _numeric_summary(energy_all, 4),
                 "td3_controlled_intervals": _numeric_summary(energy_td3, 4),
                 "other_controller_intervals": _numeric_summary(energy_other, 4),
@@ -1073,6 +1769,25 @@ def first_gen_movement_summary(
                 "scope": "all movement controllers and recorded intervals",
                 "by_service": {
                     kind: {
+                        "target_id_observation_counts": dict(
+                            sorted(target_id_counts[kind].items())
+                        ),
+                        "observed_target_switch_count": int(
+                            target_switch_counts[kind]
+                        ),
+                        "relative_position_target_minus_uav_m": {
+                            component: _numeric_summary(
+                                [row[index] for row in target_relative_positions[kind]],
+                                4,
+                            )
+                            for index, component in enumerate(("x", "y", "z"))
+                        },
+                        "relative_height_uav_minus_target_m": _numeric_summary(
+                            target_relative_heights[kind], 4
+                        ),
+                        "horizontal_distance_m": _numeric_summary(
+                            target_horizontal_distances[kind], 4
+                        ),
                         "distance_3d_m": _numeric_summary(target_distances[kind], 4),
                         "bearing_xy_rad": _circular_summary(target_bearings[kind]),
                     }
@@ -1089,6 +1804,15 @@ def first_gen_movement_summary(
                         "bearing_xy_rad": _circular_summary(
                             controlled_target_bearings[kind]
                         ),
+                        "signed_target_bearing_minus_actor_heading_rad": (
+                            _circular_summary(controlled_heading_errors[kind])
+                        ),
+                        "signed_heading_error_by_target": {
+                            target_id: _circular_summary(values)
+                            for target_id, values in sorted(
+                                controlled_heading_errors_by_target[kind].items()
+                            )
+                        },
                     }
                     for kind in ("FOV", "COM")
                 },
@@ -1106,6 +1830,8 @@ def first_gen_movement_summary(
                 "capture_valid_count": int(counts["fov_capture_valid_decisions"]),
                 "coverage_ratio": _numeric_summary(coverage),
                 "image_quantity": _numeric_summary(image_quantity),
+                "c9_margin_m": _numeric_summary(c9_margins, 4),
+                "c10_margin_m": _numeric_summary(c10_margins, 4),
             },
             "com_access": {
                 "target_valid_observation_count": int(
@@ -1343,6 +2069,9 @@ def first_gen_routing_summary(
     by_uav_service: dict[int, dict[int, Counter[str]]] = {
         sender: {} for sender in range(NUM_UAV)
     }
+    allocated_capacity_by_sender_action: dict[
+        int, dict[int, list[float]]
+    ] = {sender: {} for sender in range(NUM_UAV)}
     access_received: dict[int, Counter[str]] = {
         sender: Counter() for sender in range(NUM_UAV)
     }
@@ -1389,16 +2118,34 @@ def first_gen_routing_summary(
             receiver = int(link.get("receiver_id", -1))
             bits = float(link.get("transmitted_bits", 0.0))
             active_seconds = float(link.get("active_seconds", 0.0))
+            raw_allocated_capacity = link.get("capacity_bits_per_second")
+            allocated_capacity = (
+                float(raw_allocated_capacity)
+                if raw_allocated_capacity is not None
+                and math.isfinite(float(raw_allocated_capacity))
+                else None
+            )
             if link_type == "S2U" and 0 <= receiver < NUM_UAV:
                 access_received[receiver]["bits"] += bits
                 access_received[receiver]["active_seconds"] += active_seconds
                 access_received[receiver]["link_observations"] += 1
+                if allocated_capacity is not None:
+                    access_received[receiver][
+                        "allocated_capacity_bps_sum"
+                    ] += allocated_capacity
+                    access_received[receiver][
+                        "allocated_capacity_observations"
+                    ] += 1
             elif link_type in {"U2U", "U2G"} and 0 <= sender < NUM_UAV:
                 action = 16 if link_type == "U2G" else receiver
                 counters = by_uav_service[sender].setdefault(action, Counter())
                 counters["transmitted_bits"] += bits
                 counters["active_seconds"] += active_seconds
                 counters["active_link_observations"] += 1
+                if allocated_capacity is not None:
+                    allocated_capacity_by_sender_action[sender].setdefault(
+                        action, []
+                    ).append(allocated_capacity)
                 service_cases.append(
                     {
                         "domain": "routing",
@@ -1445,7 +2192,13 @@ def first_gen_routing_summary(
             for branch in ("epsilon_exploration", "safe_q_greedy")
         }
         legal_counts = [0] * ROUTING_ACTION_DIM
-        reference_capacity: dict[int, list[float]] = {
+        expected_capacity: dict[int, list[float]] = {
+            action: [] for action in range(ROUTING_ACTION_DIM)
+        }
+        fixed_capacity_normalizer: dict[int, list[float]] = {
+            action: [] for action in range(ROUTING_ACTION_DIM)
+        }
+        capacity_context: dict[int, list[dict[str, Any]]] = {
             action: [] for action in range(ROUTING_ACTION_DIM)
         }
         neighbor_backlog: dict[int, list[float]] = {
@@ -1485,12 +2238,35 @@ def first_gen_routing_summary(
             counts["zero_prior_mass_fallback"] += int(
                 bool(record.get("zero_legal_prior_mass_fallback", False))
             )
-            raw_capacities = record.get("reference_capacity_bps_by_legal_action")
+            raw_capacities = record.get(
+                "current_expected_capacity_bps_by_legal_action"
+            )
             if isinstance(raw_capacities, Mapping):
+                counts["current_expected_capacity_record_count"] += 1
                 for key, value in raw_capacities.items():
                     index = int(key)
                     if 0 <= index < ROUTING_ACTION_DIM and math.isfinite(float(value)):
-                        reference_capacity[index].append(float(value))
+                        expected_capacity[index].append(float(value))
+            else:
+                counts["current_expected_capacity_unavailable_count"] += 1
+            raw_normalizers = record.get(
+                "maximum_reference_normalizer_bps_by_legal_action",
+                record.get("reference_capacity_bps_by_legal_action"),
+            )
+            if isinstance(raw_normalizers, Mapping):
+                for key, value in raw_normalizers.items():
+                    index = int(key)
+                    if 0 <= index < ROUTING_ACTION_DIM and math.isfinite(float(value)):
+                        fixed_capacity_normalizer[index].append(float(value))
+            raw_contexts = record.get("capacity_context_by_legal_action")
+            if isinstance(raw_contexts, Mapping):
+                for key, value in raw_contexts.items():
+                    index = int(key)
+                    if (
+                        0 <= index < ROUTING_ACTION_DIM
+                        and isinstance(value, Mapping)
+                    ):
+                        capacity_context[index].append(_json_clone(value))
             try:
                 named = _routing_state_named_values(record["compact_routing_state"])
             except (KeyError, TypeError, ValueError):
@@ -1545,8 +2321,8 @@ def first_gen_routing_summary(
                 alternatives,
                 key=lambda value: (
                     legal_counts[value],
-                    np.mean(reference_capacity[value])
-                    if reference_capacity[value]
+                    np.mean(expected_capacity[value])
+                    if expected_capacity[value]
                     else -1.0,
                     -value,
                 ),
@@ -1561,9 +2337,25 @@ def first_gen_routing_summary(
                     "endpoint": "WAIT" if action == sender else "GS" if action == 16 else f"UAV_{action}",
                     "selection_reasons": selection_reasons,
                     "legal_opportunity_count": int(legal_counts[action]),
-                    "reference_capacity_bps": _numeric_summary(reference_capacity[action], 2),
+                    "current_geometry_expected_capacity_bps": _numeric_summary(
+                        expected_capacity[action], 2
+                    ),
+                    "fixed_maximum_capacity_normalizer_bps": _numeric_summary(
+                        fixed_capacity_normalizer[action], 2
+                    ),
+                    "capacity_context_latest": (
+                        capacity_context[action][-1]
+                        if capacity_context[action]
+                        else None
+                    ),
                     "neighbor_backlog_log_normalized": _numeric_summary(neighbor_backlog[action]),
                     "actual_transmitted_bits": float(actual["transmitted_bits"]),
+                    "actual_allocated_service_capacity_bps": _numeric_summary(
+                        allocated_capacity_by_sender_action[sender].get(
+                            action, []
+                        ),
+                        2,
+                    ),
                     "actual_active_service_seconds": float(actual["active_seconds"]),
                     "completed_hop_count": int(actual["completed_hops"]),
                     "active_link_observation_count": int(actual["active_link_observations"]),
@@ -1627,6 +2419,12 @@ def first_gen_routing_summary(
                 ),
             },
             "zero_legal_prior_mass_fallback_count": int(counts["zero_prior_mass_fallback"]),
+            "current_expected_capacity_observation_count": int(
+                counts["current_expected_capacity_record_count"]
+            ),
+            "current_expected_capacity_unavailable_count": int(
+                counts["current_expected_capacity_unavailable_count"]
+            ),
             "preselected_action_packet_use_count": int(packet_use_counts[sender]),
             "preselected_action_packet_use_counts_17": [
                 int(packet_use_counts_by_action[sender][action])
@@ -1636,6 +2434,16 @@ def first_gen_routing_summary(
                 "transmitted_bits": float(sum(values["transmitted_bits"] for values in service.values())),
                 "active_service_seconds": float(sum(values["active_seconds"] for values in service.values())),
                 "completed_hops": int(sum(values["completed_hops"] for values in service.values())),
+                "allocated_service_capacity_bps": _numeric_summary(
+                    [
+                        value
+                        for values in allocated_capacity_by_sender_action[
+                            sender
+                        ].values()
+                        for value in values
+                    ],
+                    2,
+                ),
             },
             "s2u_access_received": {
                 "transmitted_bits": float(access_received[sender]["bits"]),
@@ -1647,6 +2455,27 @@ def first_gen_routing_summary(
                 ),
                 "active_link_observation_count": int(
                     access_received[sender]["link_observations"]
+                ),
+                "allocated_service_capacity_bps_mean": (
+                    float(
+                        access_received[sender][
+                            "allocated_capacity_bps_sum"
+                        ]
+                    )
+                    / int(
+                        access_received[sender][
+                            "allocated_capacity_observations"
+                        ]
+                    )
+                    if access_received[sender][
+                        "allocated_capacity_observations"
+                    ]
+                    else None
+                ),
+                "allocated_service_capacity_valid_observation_count": int(
+                    access_received[sender][
+                        "allocated_capacity_observations"
+                    ]
                 ),
             },
             "representative_links_maximum_3": representative_links,
@@ -1816,6 +2645,37 @@ def build_observable_initial_state(env: Any, packet_engine: Any) -> dict[str, An
             )
         return result
 
+    def observable_uav(uav_id: int, uav: Any) -> dict[str, Any]:
+        tasks = safe_tasks(uav_id)
+        legal_actions = None
+        if hasattr(env, "get_routing_action_mask") and hasattr(
+            packet_engine, "get_effective_action_mask"
+        ):
+            physical = np.asarray(
+                env.get_routing_action_mask(uav_id), dtype=bool
+            )
+            effective = np.asarray(
+                packet_engine.get_effective_action_mask(
+                    env, uav_id, physical
+                ),
+                dtype=bool,
+            )
+            legal_actions = [
+                int(action) for action in np.flatnonzero(effective)
+            ]
+        return {
+            "uav_id": int(uav_id),
+            "position_m": [float(uav.x_u), float(uav.y_u), float(uav.z_u)],
+            "remaining_energy_j": float(uav.energy),
+            "battery_percent": float(uav.battery),
+            "tasks": tasks,
+            "movement_mask": any(
+                task["task_type"] in {"FOV", "COM"} for task in tasks
+            ),
+            "queue_backlog_bits": float(backlog.get(uav_id, 0.0)),
+            "legal_routing_action_indices": legal_actions,
+        }
+
     backlog = getattr(packet_engine, "backlog_bits", {})
     value = {
         "observation_time": "episode_start_before_first_movement_or_routing_action",
@@ -1840,14 +2700,7 @@ def build_observable_initial_state(env: Any, packet_engine: Any) -> dict[str, An
             for sr_id, sr in sorted(observable_srs.items())
         ],
         "uavs": [
-            {
-                "uav_id": int(uav_id),
-                "position_m": [float(uav.x_u), float(uav.y_u), float(uav.z_u)],
-                "remaining_energy_j": float(uav.energy),
-                "battery_percent": float(uav.battery),
-                "tasks": safe_tasks(int(uav_id)),
-                "queue_backlog_bits": float(backlog.get(uav_id, 0.0)),
-            }
+            observable_uav(int(uav_id), uav)
             for uav_id, uav in sorted(env.uav_dict.items())
         ],
         "ground_station": {
@@ -1856,6 +2709,65 @@ def build_observable_initial_state(env: Any, packet_engine: Any) -> dict[str, An
         },
     }
     return _json_clone(value)
+
+
+def first_gen_initial_state_payload(state: Mapping[str, Any]) -> dict[str, Any]:
+    """Present the observable episode-start state with shared columns."""
+
+    uav_columns = [
+        "uav_id", "position_m_xyz", "remaining_energy_j", "battery_percent",
+        "tasks", "initial_movement_mask", "queue_backlog_bits",
+        "legal_routing_action_indices",
+    ]
+    uav_rows = [
+        [
+            item.get("uav_id"), item.get("position_m"),
+            item.get("remaining_energy_j"), item.get("battery_percent"),
+            item.get("tasks", []), item.get("movement_mask"),
+            item.get("queue_backlog_bits"),
+            item.get("legal_routing_action_indices"),
+        ]
+        for item in state.get("uavs", [])
+        if isinstance(item, Mapping)
+    ]
+    return first_gen_present_for_llm(
+        {
+            "observation_time": state.get("observation_time"),
+            "observability": {
+                "hidden_roi_count_disclosed": state.get(
+                    "hidden_roi_count_disclosed", False
+                ),
+                "configured_roi_count_range": state.get(
+                    "configured_roi_count_range"
+                ),
+            },
+            "ground_station": state.get("ground_station"),
+            "known_roi_columns": [
+                "roi_id", "position_m_xyz", "radius_m", "discovered"
+            ],
+            "known_roi_rows": [
+                [
+                    item.get("roi_id"), item.get("position_m"),
+                    item.get("radius_m"), item.get("discovered"),
+                ]
+                for item in state.get("known_rois", [])
+                if isinstance(item, Mapping)
+            ],
+            "observable_sr_columns": [
+                "sr_id", "position_m_xyz", "assigned_roi_id", "arrived"
+            ],
+            "observable_sr_rows": [
+                [
+                    item.get("sr_id"), item.get("position_m"),
+                    item.get("assigned_roi_id"), item.get("arrived"),
+                ]
+                for item in state.get("observable_sr_teams", [])
+                if isinstance(item, Mapping)
+            ],
+            "uav_columns": uav_columns,
+            "uav_rows": uav_rows,
+        }
+    )
 
 
 def build_movement_decision_record(
@@ -2357,6 +3269,163 @@ def environment_constants_and_definitions_first_gen(
     return base
 
 
+def first_gen_resolved_settings_and_dictionary(
+    environment: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Select verified first-generation settings without rotor derivations."""
+
+    visual = environment.get("visual_sensing", {})
+    movement_reward = environment.get("movement_reward", {})
+    return first_gen_present_for_llm(
+        {
+            "resolved_settings": {
+                "uav_count": environment.get("num_uav"),
+                "uav_id_range_inclusive": environment.get(
+                    "uav_id_range_inclusive"
+                ),
+                "gs_action_index": environment.get(
+                    "ground_station_action_index"
+                ),
+                "operating_area_m": environment.get("operating_area_m"),
+                "uav_altitude_bounds_m": environment.get(
+                    "uav_altitude_bounds_m"
+                ),
+                "episode_duration_s": environment.get("episode_seconds"),
+                "movement_interval_s": environment.get(
+                    "movement_interval_seconds"
+                ),
+                "routing_slot_s": environment.get("routing_slot_seconds"),
+                "fading_block_s": 0.005,
+                "communication_range_3d_m_inclusive": environment.get(
+                    "communication_range_3d_m_inclusive"
+                ),
+                "total_dynamic_fdma_bandwidth_hz": environment.get(
+                    "total_dynamic_fdma_bandwidth_hz"
+                ),
+                "s2u_reference_bandwidth_hz": environment.get(
+                    "s2u_reference_bandwidth_hz"
+                ),
+                "traffic_rates_packets_per_second": environment.get(
+                    "resolved_traffic_rates_packets_per_second",
+                    environment.get("traffic_defaults_packets_per_second"),
+                ),
+                "task_deadlines_s": environment.get(
+                    "task_deadlines_seconds"
+                ),
+                "com_packet_bits": environment.get("com_packet_bits"),
+                "fov_packet_bits": environment.get("fov_packet_bits"),
+            },
+            "camera_and_penalties": {
+                "camera_geometry_constants": {
+                    key: value
+                    for key, value in visual.items()
+                    if key in {
+                        "b1", "b2", "camera_b1", "camera_b2",
+                        "packet_size", "c9", "c10",
+                    }
+                },
+                "movement_reward_formula": movement_reward.get("formula"),
+                "constraint_weights": movement_reward.get(
+                    "constraint_weights"
+                ),
+                "penalty_denominators": movement_reward.get(
+                    "penalty_denominators"
+                ),
+            },
+            "data_dictionary": {
+                "presentation_precision": (
+                    "general observations and summaries use at most three decimal places; counts, IDs, booleans, status, validity, and null remain typed"
+                ),
+                "small_nonzero": (
+                    "small non-zero values may use scientific notation; validity and threshold decisions were made from source precision before presentation"
+                ),
+                "historical_guidance": (
+                    "complete rounded reference only; rounded prior rows may not sum to one and displayed zero may represent a small source value; source guidance and checkpoints remain unchanged"
+                ),
+                "unknown_empty_zero": environment.get("validity"),
+                "coordinates": {
+                    "relative_position": "target position minus UAV position, m",
+                    "relative_height": "UAV height minus target height, m",
+                    "heading_error": "target bearing minus Actor horizontal heading, wrapped to [-pi,pi), rad",
+                    "direction_summary": "circular mean, resultant length/concentration, circular variance, and valid sample count",
+                },
+                "movement_scope": (
+                    "Actor/executed TD3-only columns include only movement_mask=true decisions; all-controller energy is separately labeled"
+                ),
+                "routing_actions": (
+                    "indices 0..15 are UAV actions, index 16 is GS, and the sender's own index is WAIT"
+                ),
+                "capacity_types": {
+                    "current_geometry_expected_capacity_bps": "decision-time expected link capacity at the stated reference bandwidth",
+                    "actual_service": "post-sharing authoritative positive transmitted bits/completions",
+                    "fixed_maximum_capacity_normalizer_bps": "fixed observation normalizer, not current capacity",
+                },
+                "wait_duration": (
+                    "event-time duration in ms; slot-start HOL counts are observations, not durations"
+                ),
+                "representative_limits": (
+                    "at most three links per sender and eight episode cases; omissions do not imply illegality or absence"
+                ),
+            },
+        }
+    )
+
+
+def first_gen_power_reference_points(
+    environment: Mapping[str, Any],
+) -> dict[str, Any]:
+    propulsion = environment.get("propulsion", {})
+    return first_gen_present_for_llm(
+        {
+            "model_id": propulsion.get("model_id"),
+            "formula_scope": propulsion.get("formula_scope"),
+            "columns": ["reference_motion", "velocity_mps_xyz", "power_w"],
+            "rows": [
+                ["hover", [0.0, 0.0, 0.0], propulsion.get("reference_power_w", {}).get("hover_0_0_0_w")],
+                ["horizontal_5_mps", [5.0, 0.0, 0.0], propulsion.get("reference_power_w", {}).get("horizontal_5_mps_w")],
+                ["horizontal_10_mps", [10.0, 0.0, 0.0], propulsion.get("reference_power_w", {}).get("horizontal_10_mps_w")],
+                ["climb_2_mps", [0.0, 0.0, 2.0], propulsion.get("reference_power_w", {}).get("vertical_up_2_mps_w")],
+                ["descent_2_mps", [0.0, 0.0, -2.0], propulsion.get("reference_power_w", {}).get("vertical_down_2_mps_w")],
+            ],
+        }
+    )
+
+
+def first_gen_numerical_settings(
+    settings: Mapping[str, Any], environment: Mapping[str, Any]
+) -> dict[str, Any]:
+    sigma = float(settings["sigma_episode_start"])
+    tolerance = max(
+        1e-7,
+        4.0 * np.finfo(np.float32).eps * max(1.0, abs(sigma)),
+    )
+    # Numerical limits deliberately retain source precision.  This is separate
+    # from the rounded observation presentation.
+    return first_gen_present_for_llm(
+        {
+            "sigma_episode_start": sigma,
+            "raw_td3_bias_bounds_inclusive": [-sigma, sigma],
+            "td3_host_validation_tolerance": tolerance,
+            "routing_epsilon_at_episode_start": settings.get(
+                "routing_epsilon_at_episode_start"
+            ),
+            "routing_prior_value_bounds_inclusive": [0.0, 1.0],
+            "routing_prior_row_sum_absolute_tolerance": 1e-6,
+            "coordinate_and_field_definitions": first_gen_resolved_settings_and_dictionary(
+                environment
+            )["data_dictionary"],
+        },
+        preserve_precision_keys=frozenset(
+            {
+                "sigma_episode_start",
+                "raw_td3_bias_bounds_inclusive",
+                "td3_host_validation_tolerance",
+                "routing_prior_row_sum_absolute_tolerance",
+            }
+        ),
+    )
+
+
 def render_prompt(template: str, replacements: dict[str, Any]) -> str:
     """Literal one-pass placeholder substitution; JSON braces are never parsed."""
 
@@ -2402,7 +3471,17 @@ def llm_explorer_path_preflight(
 
     run_root = Path(run_directory).resolve()
     episode = f"episode_{max(1, int(maximum_episode)):06d}"
-    stages = ("analysis", "guidance")
+    first_generation_four_prompt_contract = (
+        str(artifact_directory) == "llm_explorer"
+        and not named_routing
+        and not td3_only
+        and not state_rule
+    )
+    stages = (
+        ("analysis", "numerical")
+        if first_generation_four_prompt_contract
+        else ("analysis", "guidance")
+    )
     stage_files = (
         "system_prompt.txt", "user_prompt.txt", "identity.json",
         "completed.json", "token_budget.json", ".completed.json.tmp",
@@ -2827,13 +3906,14 @@ class LLMExplorerController:
             result["routing_prior"] = validate_routing_prior(result["routing_prior"])
         return result
 
-    def _templates(self) -> tuple[str, str, str]:
+    def _templates(self) -> tuple[str, str, str, str]:
         prompt_root = Path(__file__).resolve().parent / "prompts"
         return tuple(
             (prompt_root / name).read_text(encoding="utf-8")
             for name in (
                 "llm_explorer_system.txt",
                 "llm_explorer_analysis.txt",
+                "llm_explorer_numerical_system.txt",
                 "llm_explorer_guidance.txt",
             )
         )
@@ -2841,6 +3921,8 @@ class LLMExplorerController:
     def _render_system_prompt(
         self, template: str, environment_constants: dict[str, Any]
     ) -> str:
+        if "{{SETTINGS_AND_DATA_DEFINITIONS}}" not in template:
+            return str(template)
         return render_prompt(
             template,
             {"SETTINGS_AND_DATA_DEFINITIONS": environment_constants},
@@ -2854,10 +3936,17 @@ class LLMExplorerController:
     ) -> dict[str, Any]:
         return {
             "upcoming_episode": getattr(self, "_upcoming_episode", None),
+            "configured_training_horizon_episodes": getattr(
+                self, "_configured_training_horizon_episodes", None
+            ),
             "total_joint_transitions": getattr(
                 self, "_total_joint_transitions", None
             ),
             "warmup_joint_transitions": self.config.warmup_joint_transitions,
+            "warmup_complete": bool(
+                int(getattr(self, "_total_joint_transitions", 0))
+                >= int(self.config.warmup_joint_transitions)
+            ),
             "activation_uses_actual_joint_transition_count": True,
             "sigma_episode_start": float(sigma_episode_start),
             "td3_bias_bounds": [
@@ -2886,10 +3975,11 @@ class LLMExplorerController:
         current_observable_initial_state: dict[str, Any],
         settings: dict[str, Any],
     ) -> dict[str, Any]:
-        del environment_constants
         return {
             "PHASE_AND_EXPLORATION_SETTINGS": settings,
-            "CURRENT_OBSERVABLE_INITIAL_STATE": current_observable_initial_state,
+            "CURRENT_OBSERVABLE_INITIAL_STATE": first_gen_initial_state_payload(
+                current_observable_initial_state
+            ),
             "EPISODE_OUTCOMES": previous["episode_outcomes"],
             "PREVIOUS_COMPLETE_GUIDANCE": previous[
                 "previous_complete_guidance"
@@ -2897,13 +3987,18 @@ class LLMExplorerController:
             "PREVIOUS_APPLICATION_STATUS": previous[
                 "previous_application_status"
             ],
-            "UAV_CORE_SUMMARY": previous["uav_core_summary"],
-            "ROUTING_CORE_SUMMARY": {
-                "routing_decisions": previous["routing_core_summary"],
-                "actual_slot_service": previous[
-                    "actual_slot_service_summary"
-                ],
-            },
+            "RESOLVED_SETTINGS_AND_DATA_DICTIONARY": (
+                first_gen_resolved_settings_and_dictionary(
+                    environment_constants
+                )
+            ),
+            "MOVEMENT_POWER_REFERENCE_POINTS": first_gen_power_reference_points(
+                environment_constants
+            ),
+            "MOVEMENT_AND_SERVICE_TABLES": previous[
+                "movement_and_service_tables"
+            ],
+            "ROUTING_TABLES": previous["routing_tables"],
             "REPRESENTATIVE_CASES": previous["representative_cases"],
         }
 
@@ -2945,20 +4040,17 @@ class LLMExplorerController:
         guidance = previous["previous_complete_guidance"]
         return {
             "ANALYSIS_STAGE_OUTPUT": analysis,
-            "PHASE_AND_EXPLORATION_SETTINGS": settings,
-            "CURRENT_OBSERVABLE_INITIAL_STATE": current_observable_initial_state,
+            "CURRENT_NUMERICAL_SETTINGS_AND_DEFINITIONS": (
+                first_gen_numerical_settings(settings, environment_constants)
+            ),
+            "CURRENT_OBSERVABLE_INITIAL_STATE": first_gen_initial_state_payload(
+                current_observable_initial_state
+            ),
             "PREVIOUS_COMPLETE_TD3_BIAS": guidance["td3_bias"],
             "PREVIOUS_COMPLETE_ROUTING_PRIOR": guidance["routing_prior"],
             "PREVIOUS_APPLICATION_STATUS": previous[
                 "previous_application_status"
             ],
-            "CONCISE_OUTCOMES_AND_CASES": {
-                "episode_outcomes": previous["episode_outcomes"],
-                "actual_slot_service": previous[
-                    "actual_slot_service_summary"
-                ],
-                "representative_cases": previous["representative_cases"],
-            },
             "VALIDATION_FEEDBACK_OR_EMPTY": (
                 validation_feedback
                 or "No local format-validation feedback is present."
@@ -2995,10 +4087,31 @@ class LLMExplorerController:
             "config_sha256": _sha256_text(_canonical_json(asdict(self.config))),
         }
         if self.schema_version == LLM_EXPLORER_VERSION:
+            templates = self._templates()
+            prompt_components = {
+                "analysis_system": _sha256_text(templates[0]),
+                "analysis_user": _sha256_text(templates[1]),
+                "numerical_system": _sha256_text(templates[2]),
+                "numerical_user": _sha256_text(templates[3]),
+            }
+            if stage == "analysis":
+                prompt_components = {
+                    key: value
+                    for key, value in prompt_components.items()
+                    if key.startswith("analysis_")
+                }
+            elif stage in {"numerical", "guidance"}:
+                prompt_components = {
+                    key: value
+                    for key, value in prompt_components.items()
+                    if key.startswith("numerical_")
+                }
             identity.update(
                 summary_version=LLM_EXPLORER_SUMMARY_VERSION,
                 cache_version=LLM_EXPLORER_CACHE_VERSION,
+                presentation_version=LLM_EXPLORER_PRESENTATION_VERSION,
                 routing_epsilon_branch="100_percent_masked_llm_prior",
+                prompt_component_sha256=prompt_components,
             )
         return identity
 
@@ -3459,9 +4572,26 @@ class LLMExplorerController:
             self.active_guidance = self._unguided("no_previous_episode_feedback")
             return self.active_guidance
 
-        system_template, analysis_template, guidance_template = self._templates()
-        system_template = self._render_system_prompt(
-            system_template, environment_constants
+        templates = self._templates()
+        if len(templates) == 3:
+            # Other explorer methods retain their established shared-system
+            # three-template request contract.
+            analysis_system_template, analysis_template, guidance_template = templates
+            numerical_system_template = analysis_system_template
+        elif len(templates) == 4:
+            (
+                analysis_system_template,
+                analysis_template,
+                numerical_system_template,
+                guidance_template,
+            ) = templates
+        else:  # pragma: no cover - subclass contract guard
+            raise ValueError("LLM explorer templates must contain 3 or 4 entries")
+        analysis_system_prompt = self._render_system_prompt(
+            analysis_system_template, environment_constants
+        )
+        numerical_system_prompt = self._render_system_prompt(
+            numerical_system_template, environment_constants
         )
         settings = self._exploration_settings(
             sigma_episode_start=sigma_episode_start,
@@ -3469,7 +4599,7 @@ class LLMExplorerController:
         )
         previous = self._compact_feedback(self.previous_episode_feedback)
         analysis_prompt = self._render_analysis_prompt(
-            system_prompt=system_template,
+            system_prompt=analysis_system_prompt,
             analysis_template=analysis_template,
             previous=previous,
             environment_constants=environment_constants,
@@ -3479,7 +4609,7 @@ class LLMExplorerController:
         episode_identity = self._cache_identity(
             episode_index=episode_index,
             stage="episode_result",
-            system_prompt=system_template,
+            system_prompt=analysis_system_prompt,
             user_prompt=analysis_prompt,
         )
         replayed = self._load_episode_result(
@@ -3498,7 +4628,7 @@ class LLMExplorerController:
         analysis, analysis_attempt, analysis_reused = self._request(
             episode_index=episode_index,
             stage="analysis",
-            system_prompt=system_template,
+            system_prompt=analysis_system_prompt,
             user_prompt=analysis_prompt,
             max_output_tokens=self.config.analysis_max_output_tokens,
             validate=analysis_validator,
@@ -3532,14 +4662,23 @@ class LLMExplorerController:
         # survives a retry for only the missing layer.
         accepted_td3 = accepted_routing = None
         td3_attempt = routing_attempt = None
-        stage_root = self._stage_root(episode_index, "guidance")
+        numerical_stage = (
+            "numerical"
+            if self.schema_version == LLM_EXPLORER_VERSION
+            else "guidance"
+        )
+        stage_root = self._stage_root(episode_index, numerical_stage)
         identity = self._cache_identity(
             episode_index=episode_index,
-            stage="guidance",
-            system_prompt=system_template,
+            stage=numerical_stage,
+            system_prompt=numerical_system_prompt,
             user_prompt=guidance_prompt,
         )
-        cached = self._load_cached(episode_index=episode_index, stage="guidance", identity=identity)
+        cached = self._load_cached(
+            episode_index=episode_index,
+            stage=numerical_stage,
+            identity=identity,
+        )
         guidance_reused = False
         if cached is not None:
             td3, routing, errors = self._parse_guidance_response(
@@ -3565,13 +4704,15 @@ class LLMExplorerController:
             if stage_root is not None:
                 try:
                     stage_root.mkdir(parents=True, exist_ok=True)
-                    (stage_root / "system_prompt.txt").write_text(system_template, encoding="utf-8")
+                    (stage_root / "system_prompt.txt").write_text(
+                        numerical_system_prompt, encoding="utf-8"
+                    )
                     (stage_root / "user_prompt.txt").write_text(guidance_prompt, encoding="utf-8")
                     _atomic_json(stage_root / "identity.json", identity)
                 except OSError as exc:
                     self._record_local_failure(
                         episode_index=episode_index,
-                        stage="guidance",
+                        stage=numerical_stage,
                         attempt=0,
                         category="artifact_write",
                         reason=f"stage setup: {type(exc).__name__}: {exc}",
@@ -3587,7 +4728,7 @@ class LLMExplorerController:
                     except OSError as exc:
                         self._record_local_failure(
                             episode_index=episode_index,
-                            stage="guidance",
+                            stage=numerical_stage,
                             attempt=attempt,
                             category="artifact_write",
                             reason=f"attempt directory: {type(exc).__name__}: {exc}",
@@ -3609,9 +4750,9 @@ class LLMExplorerController:
                 try:
                     self._prompt_budget(
                         episode_index=episode_index,
-                        stage="guidance",
+                        stage=numerical_stage,
                         attempt=attempt,
-                        system_prompt=system_template,
+                        system_prompt=numerical_system_prompt,
                         user_prompt=attempt_prompt,
                         max_output_tokens=self.config.guidance_max_output_tokens,
                         attempt_root=attempt_root,
@@ -3620,7 +4761,7 @@ class LLMExplorerController:
                     feedback = str(exc)
                     print(
                         f"[LLM explorer] episode={episode_index + 1} "
-                        f"stage={self._stage_display_name('guidance')} "
+                        f"stage={self._stage_display_name(numerical_stage)} "
                         f"local_preflight_failed reason={exc} retry=false "
                         f"requests_total={self.statistics['requests_total']} "
                         f"failed_attempts_total={self.statistics['failed_attempts_total']} "
@@ -3630,27 +4771,29 @@ class LLMExplorerController:
                     break
                 started = time.monotonic()
                 response: dict[str, Any] = {}
-                input_sha = _sha256_text(system_template + "\n" + attempt_prompt)
+                input_sha = _sha256_text(
+                    numerical_system_prompt + "\n" + attempt_prompt
+                )
                 request_id = (
-                    f"ep{episode_index + 1}:guidance:a{attempt}:{input_sha[:16]}:"
+                    f"ep{episode_index + 1}:{numerical_stage}:a{attempt}:{input_sha[:16]}:"
                     f"{uuid.uuid4().hex}"
                 )
                 try:
                     self._ensure_client()
                     self._before_request(
                         episode_index=episode_index,
-                        stage="guidance",
+                        stage=numerical_stage,
                         attempt=attempt,
                     )
                     response = self.client.chat(
                         model=self.config.model,
-                        system_prompt=system_template,
+                        system_prompt=numerical_system_prompt,
                         prompt=attempt_prompt,
                         temperature=float(self.config.temperature),
                         max_output_tokens=int(self.config.guidance_max_output_tokens),
                         seed=self._stable_seed(
                             episode_index=episode_index,
-                            stage="guidance",
+                            stage=numerical_stage,
                             attempt=attempt,
                             input_sha256=input_sha,
                         ),
@@ -3664,7 +4807,7 @@ class LLMExplorerController:
                     reason = f"{type(exc).__name__}: {exc}"
                     self._record_attempt(
                         episode_index,
-                        "guidance",
+                        numerical_stage,
                         attempt,
                         False,
                         reason,
@@ -3677,7 +4820,7 @@ class LLMExplorerController:
                     feedback = reason
                     print(
                         f"[LLM explorer] episode={episode_index + 1} "
-                        f"stage={self._stage_display_name('guidance')} "
+                        f"stage={self._stage_display_name(numerical_stage)} "
                         f"attempt={attempt} failed reason={reason} "
                         f"retry={str(attempt < self.config.max_attempts).lower()} "
                         f"requests_total={self.statistics['requests_total']} "
@@ -3728,7 +4871,7 @@ class LLMExplorerController:
                     category = "response_incomplete"
                 self._record_attempt(
                     episode_index,
-                    "guidance",
+                    numerical_stage,
                     attempt,
                     success,
                     reason,
@@ -3780,7 +4923,7 @@ class LLMExplorerController:
                     except OSError as exc:
                         self._record_local_failure(
                             episode_index=episode_index,
-                            stage="guidance",
+                            stage=numerical_stage,
                             attempt=attempt,
                             category="artifact_write",
                             reason=f"response artifacts: {type(exc).__name__}: {exc}",
@@ -3790,7 +4933,7 @@ class LLMExplorerController:
                 feedback = reason or "unknown validation error"
                 print(
                     f"[LLM explorer] episode={episode_index + 1} "
-                    f"stage={self._stage_display_name('guidance')} "
+                    f"stage={self._stage_display_name(numerical_stage)} "
                     f"attempt={attempt} failed category={category} reason={feedback} "
                     f"retry={str(attempt < self.config.max_attempts).lower()} "
                     f"requests_total={self.statistics['requests_total']} "
@@ -3918,6 +5061,10 @@ def explorer_metadata(config: LLMExplorerConfig) -> dict[str, Any]:
         "summary_version": LLM_EXPLORER_SUMMARY_VERSION,
         "case_selection_version": LLM_EXPLORER_CASE_VERSION,
         "cache_version": LLM_EXPLORER_CACHE_VERSION,
+        "presentation_version": LLM_EXPLORER_PRESENTATION_VERSION,
+        "request_prompt_contract": (
+            "analysis_system+analysis_user then independent_numerical_system+numerical_user"
+        ),
         "model": config.model,
         "warmup_joint_transitions": config.warmup_joint_transitions,
         "update_interval_episodes": config.update_interval_episodes,
