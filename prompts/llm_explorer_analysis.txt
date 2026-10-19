@@ -1,54 +1,57 @@
-Perform the analysis stage.
+Provide concise movement- and routing-exploration recommendations for the current episode, traceable to the supplied evidence. Your complete analysis will be passed to a separate numerical-output request.
 
-Analyze the previous training episode and recommend exploration directions for the upcoming episode. The update interval is K=1. Your analysis will be passed to a separate guidance stage that produces fixed TD3 biases and Safe-DDQN routing priors for this episode.
+[Current phase and observable initial state]
 
-1. Verified environment constants and input-field definitions
+{{PHASE_AND_EXPLORATION_SETTINGS}}
 
-{{ENVIRONMENT_CONSTANTS_AND_FIELD_DEFINITIONS_JSON}}
+{{CURRENT_OBSERVABLE_INITIAL_STATE}}
 
-2. Previous-episode metrics
+[Previous episode: global outcomes]
 
-{{PREVIOUS_EPISODE_METRICS_JSON}}
+{{EPISODE_OUTCOMES}}
 
-3. Previous-episode movement states and actions
+These include EE, timely useful GS bits, movement energy of all UAVs, FOV/COM generation and delivery, deadline violations and valid denominators, both learning rewards, costs, and multipliers.
 
-{{PREVIOUS_MOVEMENT_SAMPLES_JSON}}
+[Previous episode: guidance and application]
 
-4. Previous-episode stratified routing states and actions
+Complete TD3 bias and routing prior:
 
-{{PREVIOUS_ROUTING_SAMPLES_JSON}}
+{{PREVIOUS_COMPLETE_GUIDANCE}}
 
-5. Full previous-episode behavior statistics
+Actual application, non-intervention, and fallback summary:
 
-{{PREVIOUS_FULL_EPISODE_STATISTICS_JSON}}
+{{PREVIOUS_APPLICATION_STATUS}}
 
-6. Previously applied exploration guidance and fallback status
+[Core movement and service summaries for all UAVs]
 
-{{PREVIOUS_APPLIED_GUIDANCE_JSON}}
+{{UAV_CORE_SUMMARY}}
 
-7. Current observable initial state
+These include roles, TD3 control opportunities, Actor and executed actions, bias application, energy, target-relative directions/distances with valid sample counts and directional dispersion, and necessary sensing, access, and queue statistics.
 
-{{CURRENT_OBSERVABLE_INITIAL_STATE_JSON}}
+[Core routing summaries for all sender UAVs]
 
-8. Current exploration settings
+{{ROUTING_CORE_SUMMARY}}
 
-{{CURRENT_EXPLORATION_SETTINGS_JSON}}
+These include all 17 action counts separated by epsilon-exploration and greedy branches, legal-action opportunities, actual service, HOL waiting, and zero-prior-mass fallbacks.
 
-Provide a concise analysis with these sections:
+Each sender has at most three representative link profiles, with selection reasons, endpoints, reference capacity, neighbor backlog, and actual service. Other actions remain available for exploration.
 
-A. Movement observations
-Identify observed patterns related to service geometry, acquisition, links, and energy. Distinguish warmup random behavior, Actor behavior, and possible exploration-bias effects. Reference relevant IDs, samples, or statistics.
+[Representative cases]
 
-B. Routing observations
-Identify patterns involving next hops, WAIT, link service, queues, deadlines, and downstream delivery. Use full-episode statistics for actual frequencies and identify exploration versus greedy evidence.
+{{REPRESENTATIVE_CASES}}
 
-C. Joint interpretation
-Describe possible mismatches between acquisition, SR uploads, forwarding, and timely GS delivery. Separate facts from explanations.
+At most eight cases provide timestamps, IDs, control branches, relevant geometry, actions, and service evidence.
 
-D. Exploration recommendations
-For TD3, identify UAVs and dimensions for positive, negative, or neutral bias. For routing, identify senders and actions whose prior preference could increase, decrease, or remain uniform. State supporting data or mechanism. Account for role changes and fixed episode-level guidance.
+[Requested analysis]
 
-E. Limitations
-Identify missing information, conflicting evidence, and conclusions not established by the data.
+Return four short sections retaining the key evidence and decision rationale:
 
-Keep the visible analysis concise, normally within 600 English words. Do not output final matrices in this stage.
+1. Priority issues: Select at most two issues affecting EE or timely service. Give supporting values and denominators. Distinguish source generation, sensing, access, forwarding, waiting, deadline, and energy limitations.
+
+2. TD3 recommendations: Identify the UAV IDs, speed/heading/vertical components, positive/negative/zero directions, and evidence for the adjustment magnitude. Consider actual control opportunities, Actor and target directions, service needs, and whether an episode-fixed bias is appropriate.
+
+3. Routing recommendations: Identify sender UAV IDs and GS/WAIT/destination UAV IDs whose probabilities should increase, decrease, or remain unchanged. Support recommendations using actual service and legal opportunities. Account for differences in encountered states and sample counts when comparing exploration and greedy outcomes.
+
+4. Expected effects and limitations: Explain the possible effects on delivered data, energy, and deadline violations, and identify hypotheses requiring further observation. For UAVs or actions not explicitly discussed, specify neutral guidance or evidence-supported reuse of historical distributions.
+
+Prioritize a few concrete recommendations. Separate observed facts, hypotheses, and unknowns. Return the analysis summary in this stage; the next stage will generate the final numerical matrices.

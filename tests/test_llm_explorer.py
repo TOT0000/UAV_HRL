@@ -8,12 +8,23 @@ import torch
 
 from DDQN import DDQN
 from experiment_config import METHOD_REGISTRY, MethodSpec
+from HRL_task_aware import TrainingConfig, _select_routing_actions, train
 from llm_explorer import (
+    FIRST_GEN_ROUTING_PRIOR_WEIGHT,
+    LLM_EXPLORER_CACHE_VERSION,
+    LLM_EXPLORER_PROMPT_VERSION,
+    LLM_EXPLORER_SUMMARY_VERSION,
+    LLM_EXPLORER_VERSION,
     LLMExplorerConfig,
     LLMExplorerController,
+    assemble_first_gen_feedback,
     build_observable_initial_state,
     compact_feedback_for_llm,
     compact_routing_record,
+    environment_constants_and_definitions,
+    explorer_metadata,
+    first_gen_movement_summary,
+    first_gen_routing_summary,
     llm_explorer_path_preflight,
     masked_routing_exploration_distribution,
     parse_guidance_response,
@@ -62,14 +73,34 @@ class SequenceClient:
 
 def _previous_feedback():
     return {
-        "metrics": {
+        "schema_version": LLM_EXPLORER_VERSION,
+        "summary_version": LLM_EXPLORER_SUMMARY_VERSION,
+        "episode_outcomes": {
             "energy_efficiency_bit_per_j": 1.0,
             "td3_original_cumulative_reward": 2.0,
             "safe_ddqn_original_cumulative_reward": 3.0,
         },
-        "movement_decisions": [],
-        "routing_samples": [],
-        "full_episode_statistics": {"routing": {"total_real_decisions": 0}},
+        "previous_complete_guidance": {
+            "td3_bias": {
+                "status": "unknown_no_applied_guidance",
+                "reason": "warmup",
+                "value": None,
+            },
+            "routing_prior": {
+                "status": "unknown_no_applied_guidance",
+                "reason": "warmup",
+                "value": None,
+            },
+        },
+        "previous_application_status": {
+            "guidance_enabled": False,
+            "td3_fallback": True,
+            "routing_fallback": True,
+        },
+        "uav_core_summary": {"by_uav": {}},
+        "routing_core_summary": {"by_sender": {}},
+        "actual_slot_service_summary": {"slot_count": 0},
+        "representative_cases": [],
         "applied_guidance": {
             "enabled": False,
             "td3_reason": "warmup",
@@ -161,19 +192,16 @@ def _full_size_feedback():
                 "zero_legal_prior_mass_fallback": False,
             }
         )
-    return {
-        "metrics": {
+    return assemble_first_gen_feedback(
+        metrics={
             "energy_efficiency_bit_per_j": 1234.56789,
             "td3_original_cumulative_reward": 2.5,
             "safe_ddqn_original_cumulative_reward": 3.5,
         },
-        "movement_decisions": movement,
-        "routing_samples": routing,
-        "full_episode_statistics": {
-            "movement_decision_count": 60,
-            "routing_sample_count": 100,
-        },
-        "applied_guidance": {
+        movement_records=movement,
+        routing_records=routing,
+        slot_service_records=[],
+        applied_guidance={
             "enabled": True,
             "td3_bias": [[0.05, -0.05, 0.0] for _ in range(16)],
             "routing_prior": [[1 / 17] * 17 for _ in range(16)],
@@ -181,7 +209,7 @@ def _full_size_feedback():
             "routing_fallback": False,
             "reused": False,
         },
-    }
+    )
 
 
 def _begin(
@@ -234,27 +262,33 @@ def test_prompt_renderer_does_not_reinterpret_inserted_braces():
     )
 
 
-def test_mask_then_normalize_then_80_20_mix_and_edge_cases():
+def test_mask_then_normalize_uses_100_percent_prior_and_edge_cases():
     prior = np.zeros(17)
     prior[3] = 3.0
     prior[5] = 1.0
     mask = np.zeros(17, dtype=bool)
     mask[[3, 5]] = True
-    distribution, zero_mass = masked_routing_exploration_distribution(prior, mask)
+    distribution, zero_mass = masked_routing_exploration_distribution(
+        prior, mask, prior_weight=FIRST_GEN_ROUTING_PRIOR_WEIGHT
+    )
     assert not zero_mass
-    np.testing.assert_allclose(distribution[[3, 5]], [0.7, 0.3])
+    np.testing.assert_allclose(distribution[[3, 5]], [0.75, 0.25])
     assert distribution.sum() == pytest.approx(1.0)
     assert np.all(distribution[~mask] == 0.0)
 
     distribution, zero_mass = masked_routing_exploration_distribution(
-        np.eye(1, 17, 2).ravel(), mask
+        np.eye(1, 17, 2).ravel(),
+        mask,
+        prior_weight=FIRST_GEN_ROUTING_PRIOR_WEIGHT,
     )
     assert zero_mass
     np.testing.assert_allclose(distribution[[3, 5]], [0.5, 0.5])
 
     single = np.zeros(17, dtype=bool)
     single[16] = True
-    distribution, _ = masked_routing_exploration_distribution(prior, single)
+    distribution, _ = masked_routing_exploration_distribution(
+        prior, single, prior_weight=FIRST_GEN_ROUTING_PRIOR_WEIGHT
+    )
     assert distribution[16] == pytest.approx(1.0)
 
 
@@ -361,6 +395,10 @@ def test_warmup_has_no_calls_then_two_stage_guidance_at_transition_boundary(tmp_
     assert len(client.calls) == 2
     assert all(call["model"] == "gpt-4o-mini" for call in client.calls)
     assert all("system_prompt" in call for call in client.calls)
+    assert "[Complete first-stage analysis]" in client.calls[1]["prompt"]
+    assert "analysis" in client.calls[1]["prompt"]
+    assert "unknown_no_applied_guidance" in client.calls[1]["prompt"]
+    assert "[16, 17]" not in client.calls[1]["prompt"]
 
 
 def test_partial_layer_retry_keeps_valid_first_layer_and_counts_retry(tmp_path):
@@ -557,29 +595,20 @@ def test_real_size_compact_prompts_preserve_samples_and_fit_all_attempts(tmp_pat
     result = _begin(
         controller,
         current_state=current_state,
-        environment_constants={
-            "episode_seconds": 60,
-            "routing_slot_seconds": 0.25,
-            "operating_area_m": {"width": 1000.0, "height": 1000.0},
-            "validity": {
-                "unknown": "not observed",
-                "zero": "observed numeric zero",
-                "empty_queue": "observed zero backlog",
-                "unassigned": "no target",
-            },
-        },
+        environment_constants=environment_constants_and_definitions(
+            episode_seconds=60,
+            routing_slot_seconds=0.25,
+        ),
     )
     assert not result["td3_fallback"] and not result["routing_fallback"]
     assert len(client.calls) == 3
 
     compact = compact_feedback_for_llm(previous)
-    assert len(compact["movement"]["decision_rows"]) == 60
-    assert len(compact["movement"]["uav_rows"]) == 60 * 16
-    assert len(compact["routing"]["rows"]) == 100
-    assert [row[1] for row in compact["movement"]["uav_rows"][:16]] == list(range(16))
-    assert compact["movement"]["uav_rows"][0][9] is not None
-    assert compact["movement"]["uav_rows"][0][10] is not None
-    assert compact["movement"]["uav_rows"][0][11] is not None
+    assert len(compact["uav_core_summary"]["by_uav"]) == 16
+    assert len(compact["routing_core_summary"]["by_sender"]) == 16
+    assert len(compact["representative_cases"]) <= 8
+    assert compact["previous_complete_guidance"]["td3_bias"]["shape"] == [16, 3]
+    assert compact["previous_complete_guidance"]["routing_prior"]["shape"] == [16, 17]
 
     for call in client.calls:
         budget = prompt_token_budget(
@@ -605,7 +634,7 @@ def test_local_context_overflow_never_calls_api_or_retries_same_prompt(tmp_path)
         client=client,
     )
     previous = _previous_feedback()
-    previous["metrics"]["oversized_observable_note"] = "超限0123456789" * 40_000
+    previous["episode_outcomes"]["oversized_observable_note"] = "超限0123456789" * 40_000
     controller.previous_episode_feedback = previous
     result = _begin(controller)
     assert result["td3_fallback"] and result["routing_fallback"]
@@ -803,3 +832,238 @@ def test_windows_path_preflight_includes_stream_and_atomic_temp_names(tmp_path):
             maximum_episode=4000,
             windows_limit=180,
         )
+
+
+def test_first_generation_training_path_passes_full_prior_weight():
+    class CaptureAgent:
+        def __init__(self):
+            self.weights = []
+
+        def select_action(self, *args, **kwargs):
+            self.weights.append(kwargs.get("exploration_prior_weight", 0.8))
+            legal = np.asarray(args[2], dtype=bool)
+            action = int(np.flatnonzero(legal)[0])
+            return action, {
+                "decision_branch": "epsilon_exploration",
+                "zero_legal_prior_mass_fallback": False,
+                "exploration_distribution": None,
+            }
+
+    agent = CaptureAgent()
+    states = {0: np.zeros(4)}
+    masks = {0: np.asarray([True] + [False] * 16)}
+    _select_routing_actions(
+        agent,
+        states,
+        masks,
+        epsilon=1.0,
+        exploration_prior=np.ones((16, 17)),
+        exploration_prior_weight=FIRST_GEN_ROUTING_PRIOR_WEIGHT,
+    )
+    assert agent.weights == [1.0]
+
+
+def test_guidance_remains_eligible_after_episode_600(tmp_path):
+    client = SequenceClient(["analysis after 600", _guidance(0.0)])
+    controller = LLMExplorerController(
+        run_directory=tmp_path,
+        run_identity={"run": "after-600"},
+        client=client,
+    )
+    controller.previous_episode_feedback = _previous_feedback()
+    result = _begin(controller, episode_index=600, transitions=50_000)
+    assert result["enabled"]
+    assert len(client.calls) == 2
+
+
+def test_numerical_prompt_contains_complete_known_matrices(tmp_path):
+    prior = np.zeros((16, 17), dtype=float)
+    for sender in range(16):
+        prior[sender, (sender + 1) % 16] = 1.0
+    previous = _previous_feedback()
+    previous["previous_complete_guidance"] = {
+        "td3_bias": {
+            "status": "known_applied_episode_guidance",
+            "shape": [16, 3],
+            "value": [[0.01 * uid, 0.0, 0.0] for uid in range(16)],
+        },
+        "routing_prior": {
+            "status": "known_applied_episode_guidance",
+            "shape": [16, 17],
+            "value": prior.tolist(),
+        },
+    }
+    client = SequenceClient(["distinct complete analysis", _guidance(0.0)])
+    controller = LLMExplorerController(
+        run_directory=tmp_path,
+        run_identity={"run": "complete-history"},
+        client=client,
+    )
+    controller.previous_episode_feedback = previous
+    _begin(controller)
+    numerical = client.calls[1]["prompt"]
+    assert "distinct complete analysis" in numerical
+    assert json.dumps(previous["previous_complete_guidance"]["td3_bias"], separators=(",", ":")) in numerical
+    assert json.dumps(previous["previous_complete_guidance"]["routing_prior"], separators=(",", ":")) in numerical
+
+
+def test_movement_summary_uses_circular_heading_and_target_bearing():
+    def row(heading, relative):
+        uavs = []
+        for uid in range(16):
+            uavs.append(
+                {
+                    "uav_id": uid,
+                    "task_types": ["FOV"] if uid == 0 else [],
+                    "movement_mask": uid == 0,
+                    "actor_normalized_action": [0.0, heading if uid == 0 else 0.0, 0.0],
+                    "policy_projected_normalized_action": [0.0, heading if uid == 0 else 0.0, 0.0],
+                    "executed_normalized_action": [0.0, heading if uid == 0 else 0.0, 0.0],
+                    "applied_llm_bias": [0.0, 0.0, 0.0] if uid == 0 else None,
+                    "observable_targets": (
+                        [{"kind": "roi", "id": 1, "relative_position_m": relative}]
+                        if uid == 0
+                        else []
+                    ),
+                    "service_observation": None,
+                    "movement_energy_j": 1.0,
+                }
+            )
+        return {"time_seconds": len(relative), "uavs": uavs}
+
+    summary, _ = first_gen_movement_summary(
+        [row(0.99, [-1.0, 0.01, 0.0]), row(-0.99, [-1.0, -0.01, 0.0])],
+        {"enabled": False, "td3_fallback": True},
+    )
+    uav = summary["by_uav"]["UAV_0"]
+    assert abs(abs(uav["actor_heading_circular_rad"]["circular_mean_rad"]) - np.pi) < 0.05
+    bearing = uav["service_target_geometry"]["FOV"]["bearing_xy_rad"]
+    assert abs(abs(bearing["circular_mean_rad"]) - np.pi) < 0.05
+    assert bearing["resultant_length"] > 0.99
+
+
+def test_routing_summary_separates_preselection_service_and_shared_reward():
+    names = routing_state_feature_names()
+    state = np.zeros(len(names), dtype=float)
+    records = []
+    for branch, action in (("epsilon_exploration", 1), ("safe_q_greedy", 0)):
+        records.append(
+            {
+                "time_seconds": len(records) * 0.25,
+                "sender_uav_id": 0,
+                "selected_action": action,
+                "decision_branch": branch,
+                "legal_action_mask": [1, 1] + [0] * 14 + [1],
+                "compact_routing_state": state.tolist(),
+                "reference_capacity_bps_by_legal_action": {"0": 0.0, "1": 2e6, "16": 3e6},
+                "sender_total_backlog_bits": 100.0,
+                "hol_packet_id": 7,
+                "hol_remaining_deadline_seconds": 0.005,
+                "zero_legal_prior_mass_fallback": False,
+            }
+        )
+    slots = [
+        {
+            "time_seconds": 0.0,
+            "slot_seconds": 0.25,
+            "active_links": [
+                {
+                    "sender_id": 0,
+                    "receiver_id": 1,
+                    "link_type": "U2U",
+                    "transmitted_bits": 50.0,
+                    "active_seconds": 0.01,
+                }
+            ],
+            "completed_hops": [],
+            "packet_decision_uses": [
+                {
+                    "packet_id": 7,
+                    "sender_uav_id": 0,
+                    "selected_action": 1,
+                }
+            ],
+            "global_routing_reward": 0.005,
+            "shared_reward_row_sum": 0.08,
+        }
+    ]
+    summary, _ = first_gen_routing_summary(records, slots)
+    sender = summary["by_sender"]["UAV_0"]
+    assert sender["epsilon_exploration_action_counts_17"][1] == 1
+    assert sender["safe_q_greedy_action_counts_17"][0] == 1
+    assert sender["preselected_action_packet_use_count"] == 1
+    assert sender["preselected_action_packet_use_counts_17"][1] == 1
+    assert sender["actual_uav_service"]["transmitted_bits"] == 50.0
+    assert sender["actual_uav_service"]["completed_hops"] == 0
+    assert summary["global_shared_routing_reward"]["episode_sum_counting_each_slot_once"] == 0.005
+    assert summary["global_shared_routing_reward"]["duplicated_reward_row_sum_diagnostic"] == 0.08
+
+
+def test_first_generation_versions_metadata_and_old_checkpoint_rejection(tmp_path):
+    metadata = explorer_metadata(LLMExplorerConfig())
+    assert metadata["schema_version"] == LLM_EXPLORER_VERSION
+    assert metadata["prompt_version"] == LLM_EXPLORER_PROMPT_VERSION
+    assert metadata["summary_version"] == LLM_EXPLORER_SUMMARY_VERSION
+    assert metadata["cache_version"] == LLM_EXPLORER_CACHE_VERSION
+    assert "100_percent" in metadata["routing_intervention"]
+
+    controller = LLMExplorerController(
+        run_directory=tmp_path,
+        run_identity={"run": "version"},
+        client=SequenceClient([]),
+    )
+    state = controller.state_dict()
+    restored = LLMExplorerController(
+        run_directory=tmp_path / "restored",
+        run_identity={"run": "version"},
+        client=SequenceClient([]),
+    )
+    restored.load_state_dict(state)
+    assert restored.state_dict()["schema_version"] == LLM_EXPLORER_VERSION
+
+    state["schema_version"] = "uav-hrl-llm-explorer-v2"
+    with pytest.raises(Exception, match="checkpoint version is incompatible"):
+        controller.load_state_dict(state)
+
+
+def test_first_generation_observers_do_not_change_warmup_training_result():
+    def config():
+        return TrainingConfig(
+            total_episodes=1,
+            mode="smoke",
+            episode_seconds=1,
+            warmup_joint_transitions=0,
+            routing_warmup_transitions=1,
+            batch_size=1,
+            enable_model_checkpoints=False,
+            enable_full_resume=False,
+            enable_plots=False,
+            enable_csv=False,
+            run_directory=None,
+            random_seed=20261019,
+        )
+
+    baseline = train(
+        config(), method_spec=MethodSpec.parse("td3_dinkelbach")
+    )["episode_metrics"][0]
+    first_generation = train(
+        config(),
+        method_spec=MethodSpec.parse("td3_dinkelbach_llm_explorer"),
+        llm_explorer_mock=True,
+    )["episode_metrics"][0]
+    for key in (
+        "routing_reward_total",
+        "existing_movement_reward",
+        "combined_movement_reward",
+        "total_timely_useful_bits",
+        "total_mobility_energy_j",
+        "routing_cost_sum",
+        "system_qos_eligible_packets",
+        "system_qos_violation_count",
+        "movement_base_reward_sum",
+        "movement_final_reward_sum",
+        "routing_wait_count",
+        "partial_transmission_count",
+        "coverage",
+    ):
+        assert first_generation[key] == pytest.approx(baseline[key])

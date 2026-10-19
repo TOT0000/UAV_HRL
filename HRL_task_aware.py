@@ -158,10 +158,12 @@ from llm_potential import (
 from llm_explorer import (
     LLMExplorerConfig,
     LLMExplorerController,
+    FIRST_GEN_ROUTING_PRIOR_WEIGHT,
     build_movement_decision_record,
     build_observable_initial_state,
     environment_constants_and_definitions,
     explorer_metadata,
+    first_gen_slot_service_record,
     llm_explorer_path_preflight,
 )
 from llm_explorer_v3 import (
@@ -813,6 +815,7 @@ def _run_routing_slot(
     zero_prior_mass_callback=None,
     routing_decision_observer=None,
     routing_slot_observer=None,
+    first_gen_slot_service_observer=False,
     record_current_expected_capacities=False,
 ):
     del routing_masks
@@ -1034,7 +1037,15 @@ def _run_routing_slot(
     )
     if routing_slot_observer is not None:
         routing_slot_observer(
-            state_rule_slot_service_record(
+            first_gen_slot_service_record(
+                slot_result,
+                pre_slot_violations=pre_slot_violations,
+                current_time=current_time,
+                slot_seconds=step_time,
+                preselected_actions_by_sender=next_hops,
+            )
+            if first_gen_slot_service_observer
+            else state_rule_slot_service_record(
                 slot_result,
                 pre_slot_violations=pre_slot_violations,
                 current_time=current_time,
@@ -3503,6 +3514,18 @@ def train(
                         else None
                     ),
                     noise_std=behavior_noise,
+                    auxiliary_snapshot=(
+                        current_auxiliary_snapshot
+                        if method_spec.method_id
+                        == "td3_dinkelbach_llm_explorer"
+                        else None
+                    ),
+                    action_diagnostics=(
+                        movement_action_diagnostics
+                        if method_spec.method_id
+                        == "td3_dinkelbach_llm_explorer"
+                        else None
+                    ),
                 )
                 if (
                     method_spec.llm_explorer_state_rule_enabled
@@ -3683,6 +3706,9 @@ def train(
                         episode_guidance.get("routing_alpha", 0.0)
                         if method_spec.llm_explorer_v3_enabled
                         and episode_guidance is not None
+                        else FIRST_GEN_ROUTING_PRIOR_WEIGHT
+                        if method_spec.method_id
+                        == "td3_dinkelbach_llm_explorer"
                         else 0.8
                     ),
                     zero_prior_mass_callback=(
@@ -3699,7 +3725,13 @@ def train(
                     routing_slot_observer=(
                         llm_explorer.record_slot_service
                         if method_spec.llm_explorer_state_rule_enabled
+                        or method_spec.method_id
+                        == "td3_dinkelbach_llm_explorer"
                         else None
+                    ),
+                    first_gen_slot_service_observer=(
+                        method_spec.method_id
+                        == "td3_dinkelbach_llm_explorer"
                     ),
                     record_current_expected_capacities=(
                         method_spec.llm_explorer_state_rule_enabled
@@ -4894,6 +4926,8 @@ def train(
                             ),
                         }
                         if method_spec.llm_explorer_state_rule_enabled
+                        or method_spec.method_id
+                        == "td3_dinkelbach_llm_explorer"
                         else {}
                     ),
                 },

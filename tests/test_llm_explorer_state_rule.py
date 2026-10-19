@@ -12,7 +12,12 @@ from Packet_scheduler_v1 import PacketEngine
 from Simulator import Simulator
 from experiment_config import MethodSpec
 from HRL_task_aware import TrainingConfig, _llm_routing_exploration_prior, train
-from llm_explorer import ExplorerValidationError, PromptBudgetError, llm_explorer_path_preflight
+from llm_explorer import (
+    ExplorerValidationError,
+    PromptBudgetError,
+    first_gen_slot_service_record,
+    llm_explorer_path_preflight,
+)
 from llm_explorer_state_rule import (
     STATE_RULE_SCHEMA_VERSION,
     build_runtime_feature_rows,
@@ -909,6 +914,25 @@ def _serve_sr_only_slot(*, capacity_mbps, size_bits, deadline_seconds):
     return engine, packet, result
 
 
+def _serve_sr_then_forward_to_gs_in_same_slot():
+    env = OneUavEventEnvironment(capacity_mbps=1.0)
+    engine = PacketEngine(
+        1,
+        task_deadlines_seconds={"FOV": 1.0, "COM": 1.0},
+    )
+    packet = engine.create_sr_packet(0, 100_000.0, generation_time=0.0)
+    packet["s2u_receiver"] = 0
+    result = engine.serve_event_driven_slot(
+        env,
+        {0: env.GS_ID},
+        0.0,
+        observed_hol_by_sender={0: None},
+        observed_backlog_bits_by_sender={0: 0.0},
+        effective_masks_by_sender={0: np.asarray([True, True])},
+    )
+    return packet, result
+
+
 def test_real_packet_engine_zero_capacity_expiry_is_not_actual_service():
     _, packet, result = _serve_sr_only_slot(
         capacity_mbps=0.0,
@@ -962,6 +986,58 @@ def test_real_packet_engine_partial_s2u_bits_count_without_hop_completion():
     summary = slot_service_summary([record])
     assert summary["slots_with_actual_transmission_observed"] == 1
     assert summary["slots_with_no_starting_uav_hol_but_actual_service"] == 1
+
+
+def test_first_generation_record_preserves_real_same_slot_and_partial_service():
+    _, packet, completed = _serve_sr_only_slot(
+        capacity_mbps=1.0,
+        size_bits=100_000.0,
+        deadline_seconds=1.0,
+    )
+    record = first_gen_slot_service_record(
+        completed, current_time=0.0, slot_seconds=0.25
+    )
+    assert record["start_of_slot_nonempty_sender_ids"] == []
+    assert record["had_actual_transmission"] is True
+    assert record["positive_transmission_bits"] == pytest.approx(100_000.0)
+    assert record["completed_hops"][0]["packet_id"] == packet["id"]
+    assert record["completed_hops"][0]["link_type"] == "S2U"
+
+    _, _, partial = _serve_sr_only_slot(
+        capacity_mbps=1.0,
+        size_bits=1_000_000.0,
+        deadline_seconds=1.0,
+    )
+    partial_record = first_gen_slot_service_record(
+        partial, current_time=0.0, slot_seconds=0.25
+    )
+    assert partial_record["positive_transmission_bits"] == pytest.approx(250_000.0)
+    assert partial_record["completed_hops"] == []
+    summary = slot_service_summary([record])
+    assert summary["slots_with_actual_transmission_observed"] == 1
+    assert summary["slots_with_no_starting_uav_hol_but_actual_service"] == 1
+
+
+def test_first_generation_records_empty_start_then_same_slot_forwarding():
+    packet, result = _serve_sr_then_forward_to_gs_in_same_slot()
+    record = first_gen_slot_service_record(
+        result,
+        current_time=0.0,
+        slot_seconds=0.25,
+        preselected_actions_by_sender={0: 1},
+    )
+    assert record["start_of_slot_nonempty_sender_ids"] == []
+    assert record["had_actual_transmission"] is True
+    assert record["positive_transmission_bits"] == pytest.approx(200_000.0)
+    assert [hop["link_type"] for hop in record["completed_hops"]] == [
+        "S2U",
+        "U2G",
+    ]
+    assert record["completed_hops"][1]["packet_id"] == packet["id"]
+    summary = slot_service_summary([record])
+    assert summary["slots_with_no_starting_uav_hol_but_actual_service"] == 1
+    assert summary["s2u_completed_packets"] == 1
+    assert summary["gs_delivery_outcomes"] == 1
 
 
 def test_real_packet_engine_slot_delivery_uses_nested_outcome_and_fov_useful_bits():

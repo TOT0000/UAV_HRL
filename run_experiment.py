@@ -76,7 +76,14 @@ from llm_potential import (
     copy_potential_artifact,
     load_run_artifact as load_potential_run_artifact,
 )
-from llm_explorer import LLM_EXPLORER_VERSION, llm_explorer_path_preflight
+from llm_explorer import (
+    LLM_EXPLORER_CACHE_VERSION,
+    LLM_EXPLORER_CASE_VERSION,
+    LLM_EXPLORER_PROMPT_VERSION,
+    LLM_EXPLORER_SUMMARY_VERSION,
+    LLM_EXPLORER_VERSION,
+    llm_explorer_path_preflight,
+)
 from llm_explorer_v3 import (
     LLM_EXPLORER_V3_ANNEAL_END_EPISODE,
     LLM_EXPLORER_V3_CASE_VERSION,
@@ -1078,6 +1085,23 @@ def run(args):
                 annealing_end_episode=LLM_EXPLORER_V3_ANNEAL_END_EPISODE,
                 input_hard_limit_tokens=LLM_EXPLORER_V3_MAX_INPUT_TOKENS,
                 routing_alpha="0.8 * w",
+            )
+        else:
+            resolved["llm_explorer"].update(
+                prompt_version=LLM_EXPLORER_PROMPT_VERSION,
+                summary_version=LLM_EXPLORER_SUMMARY_VERSION,
+                case_selection_version=LLM_EXPLORER_CASE_VERSION,
+                cache_version=LLM_EXPLORER_CACHE_VERSION,
+                context_window_tokens=128000,
+                safety_margin_tokens=4096,
+                guidance_weight=1.0,
+                annealing_end_episode=None,
+                td3_guidance="episode_fixed_raw_bias_added_once",
+                routing_guidance="episode_fixed_16x17_prior",
+                routing_intervention=(
+                    "epsilon_branch_100_percent_masked_renormalized_prior; "
+                    "legal_uniform_only_on_zero_legal_mass"
+                ),
             )
     _write_json_atomic(run_dir / "resolved_config.json", resolved)
     write_run_status(run_dir, "RUNNING")

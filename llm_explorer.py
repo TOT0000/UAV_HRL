@@ -15,6 +15,8 @@ import math
 import os
 import time
 import uuid
+from collections import Counter
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Callable
@@ -24,14 +26,18 @@ import numpy as np
 
 LLM_EXPLORER_METHOD_ID = "td3_dinkelbach_llm_explorer"
 LLM_EXPLORER_MODEL = "gpt-4o-mini"
-LLM_EXPLORER_VERSION = "uav-hrl-llm-explorer-v2"
-LLM_EXPLORER_PROMPT_VERSION = "uav-hrl-llm-explorer-prompts-v4"
-LLM_EXPLORER_COMPRESSION_VERSION = "compact-observable-tables-v1"
+LLM_EXPLORER_VERSION = "uav-hrl-llm-explorer-firstgen-v3"
+LLM_EXPLORER_PROMPT_VERSION = "uav-hrl-llm-explorer-prompts-v5"
+LLM_EXPLORER_SUMMARY_VERSION = "complete-core-feedback-v2"
+LLM_EXPLORER_CASE_VERSION = "deterministic-diverse-cases-v1"
+LLM_EXPLORER_CACHE_VERSION = "episode-fixed-dual-guidance-cache-v2"
+LLM_EXPLORER_COMPRESSION_VERSION = LLM_EXPLORER_SUMMARY_VERSION
 LLM_EXPLORER_WARMUP_TRANSITIONS = 10_000
 LLM_EXPLORER_UPDATE_INTERVAL_EPISODES = 1
 LLM_EXPLORER_MAX_ATTEMPTS = 2
+# Retained for the separately versioned annealed v3 method.
 ROUTING_PRIOR_WEIGHT = 0.8
-ROUTING_UNIFORM_WEIGHT = 0.2
+FIRST_GEN_ROUTING_PRIOR_WEIGHT = 1.0
 NUM_UAV = 16
 ROUTING_ACTION_DIM = 17
 LLM_EXPLORER_CONTEXT_TOKENS = 128_000
@@ -399,6 +405,27 @@ def _compact_routing_records(records: list[dict[str, Any]]) -> dict[str, Any]:
 def compact_feedback_for_llm(previous: dict[str, Any]) -> dict[str, Any]:
     """Create an LLM-only copy without changing stored training diagnostics."""
 
+    if previous.get("summary_version") == LLM_EXPLORER_SUMMARY_VERSION:
+        return {
+            "compression_version": LLM_EXPLORER_COMPRESSION_VERSION,
+            "episode_outcomes": _json_clone(previous.get("episode_outcomes", {})),
+            "previous_complete_guidance": _json_clone(
+                previous.get("previous_complete_guidance", {})
+            ),
+            "previous_application_status": _json_clone(
+                previous.get("previous_application_status", {})
+            ),
+            "uav_core_summary": _json_clone(previous.get("uav_core_summary", {})),
+            "routing_core_summary": _json_clone(
+                previous.get("routing_core_summary", {})
+            ),
+            "actual_slot_service_summary": _json_clone(
+                previous.get("actual_slot_service_summary", {})
+            ),
+            "representative_cases": _json_clone(
+                previous.get("representative_cases", [])
+            ),
+        }
     return {
         "compression_version": LLM_EXPLORER_COMPRESSION_VERSION,
         "metrics": _json_clone(previous.get("metrics", {})),
@@ -654,6 +681,853 @@ def routing_action_statistics(records: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def _numeric_summary(values: list[float], digits: int = 6) -> dict[str, Any]:
+    clean = np.asarray([float(value) for value in values], dtype=np.float64)
+    clean = clean[np.isfinite(clean)]
+    if clean.size == 0:
+        return {"valid_sample_count": 0, "mean": None, "min": None, "max": None}
+    return {
+        "valid_sample_count": int(clean.size),
+        "mean": round(float(clean.mean()), digits),
+        "min": round(float(clean.min()), digits),
+        "max": round(float(clean.max()), digits),
+    }
+
+
+def _component_summary(rows: list[list[float]]) -> dict[str, Any]:
+    columns = ("speed", "heading", "vertical")
+    if not rows:
+        return {name: _numeric_summary([]) for name in columns}
+    values = np.asarray(rows, dtype=np.float64).reshape(-1, 3)
+    return {
+        name: _numeric_summary(values[:, index].tolist())
+        for index, name in enumerate(columns)
+    }
+
+
+def _circular_summary(radians: list[float]) -> dict[str, Any]:
+    clean = np.asarray(radians, dtype=np.float64)
+    clean = clean[np.isfinite(clean)]
+    if clean.size == 0:
+        return {
+            "valid_sample_count": 0,
+            "circular_mean_rad": None,
+            "resultant_length": None,
+            "circular_variance": None,
+            "mean_direction_status": "unknown_no_valid_samples",
+        }
+    resultant = np.mean(np.exp(1j * clean))
+    length = float(abs(resultant))
+    representative = length >= 0.1
+    return {
+        "valid_sample_count": int(clean.size),
+        "circular_mean_rad": (
+            round(float(np.angle(resultant)), 6) if representative else None
+        ),
+        "resultant_length": round(length, 6),
+        "circular_variance": round(1.0 - length, 6),
+        "mean_direction_status": (
+            "representative" if representative else "dispersed_mean_not_representative"
+        ),
+    }
+
+
+def _select_representative_cases(
+    cases: list[dict[str, Any]], maximum: int = 8
+) -> list[dict[str, Any]]:
+    """Choose deterministic domain/kind/UAV/time-diverse real observations."""
+
+    candidates = [_json_clone(case) for case in cases if isinstance(case, dict)]
+    if not candidates or int(maximum) <= 0:
+        return []
+    times = [
+        float(case["time_s"])
+        for case in candidates
+        if isinstance(case.get("time_s"), (int, float))
+        and math.isfinite(float(case["time_s"]))
+    ]
+    low = min(times) if times else None
+    high = max(times) if times else None
+
+    def segment(case: Mapping[str, Any]) -> int | None:
+        if low is None or high is None or not isinstance(
+            case.get("time_s"), (int, float)
+        ):
+            return None
+        value = float(case["time_s"])
+        if not math.isfinite(value):
+            return None
+        return 0 if high == low else min(2, int(3.0 * (value - low) / (high - low)))
+
+    def entity(case: Mapping[str, Any]) -> str:
+        value = case.get("uav_id", case.get("sender_uav_id", "unknown"))
+        return str(value)
+
+    def canonical(index: int) -> tuple[Any, ...]:
+        case = candidates[index]
+        return (
+            str(case.get("domain", "")),
+            str(case.get("kind", "")),
+            entity(case),
+            float(case.get("time_s", math.inf)),
+            _canonical_json(case),
+        )
+
+    remaining = set(range(len(candidates)))
+    selected: list[int] = []
+    seen_domains: set[str] = set()
+    seen_kinds: set[str] = set()
+    seen_entities: set[str] = set()
+    seen_segments: set[int] = set()
+    while remaining and len(selected) < int(maximum):
+        def rank(index: int) -> tuple[int, ...]:
+            case = candidates[index]
+            time_segment = segment(case)
+            return (
+                int(str(case.get("domain")) not in seen_domains),
+                int(str(case.get("kind")) not in seen_kinds),
+                int(entity(case) not in seen_entities),
+                int(time_segment is not None and time_segment not in seen_segments),
+            )
+
+        best = max(rank(index) for index in remaining)
+        chosen = min(
+            (index for index in remaining if rank(index) == best), key=canonical
+        )
+        selected.append(chosen)
+        remaining.remove(chosen)
+        case = candidates[chosen]
+        seen_domains.add(str(case.get("domain")))
+        seen_kinds.add(str(case.get("kind")))
+        seen_entities.add(entity(case))
+        time_segment = segment(case)
+        if time_segment is not None:
+            seen_segments.add(time_segment)
+    return [candidates[index] for index in selected]
+
+
+def first_gen_movement_summary(
+    records: list[dict[str, Any]], guidance: Mapping[str, Any]
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """Summarize every UAV and retain directional service evidence."""
+
+    requested = None
+    if bool(guidance.get("enabled")) and not bool(guidance.get("td3_fallback", True)):
+        value = np.asarray(guidance.get("td3_bias"), dtype=np.float64)
+        if value.shape == (NUM_UAV, 3) and np.isfinite(value).all():
+            requested = value
+    by_uav: dict[str, Any] = {}
+    cases: list[dict[str, Any]] = []
+    totals = Counter()
+    for uav_id in range(NUM_UAV):
+        roles: Counter[str] = Counter()
+        actor_rows: list[list[float]] = []
+        projected_rows: list[list[float]] = []
+        executed_rows: list[list[float]] = []
+        applied_rows: list[list[float]] = []
+        energy_all: list[float] = []
+        energy_td3: list[float] = []
+        energy_other: list[float] = []
+        target_distances: dict[str, list[float]] = {"FOV": [], "COM": []}
+        target_bearings: dict[str, list[float]] = {"FOV": [], "COM": []}
+        queue_backlog: list[float] = []
+        hol_deadlines: list[float] = []
+        coverage: list[float] = []
+        image_quantity: list[float] = []
+        sr_backlog: list[float] = []
+        sr_hol_deadlines: list[float] = []
+        s2u_capacity: list[float] = []
+        counts = Counter()
+        for record in records:
+            rows = record.get("uavs", [])
+            if uav_id >= len(rows) or not isinstance(rows[uav_id], Mapping):
+                counts["missing_uav_record"] += 1
+                continue
+            item = rows[uav_id]
+            tasks = [str(task) for task in item.get("task_types", [])]
+            roles.update(tasks or ["unassigned"])
+            controlled = bool(item.get("movement_mask", False))
+            counts["recorded_decisions"] += 1
+            counts["td3_controlled_decisions"] += int(controlled)
+            counts["other_controller_decisions"] += int(not controlled)
+            for field, destination in (
+                ("actor_normalized_action", actor_rows),
+                ("policy_projected_normalized_action", projected_rows),
+                ("executed_normalized_action", executed_rows),
+                ("applied_llm_bias", applied_rows),
+            ):
+                value = item.get(field)
+                if value is not None:
+                    array = np.asarray(value, dtype=np.float64)
+                    if array.shape == (3,) and np.isfinite(array).all():
+                        destination.append(array.tolist())
+            pre = item.get("pre_projection_normalized_action")
+            projected = item.get("policy_projected_normalized_action")
+            if pre is not None and projected is not None:
+                pre_array = np.asarray(pre, dtype=np.float64)
+                projected_array = np.asarray(projected, dtype=np.float64)
+                if pre_array.shape == projected_array.shape == (3,):
+                    counts["host_action_projection_decisions"] += int(
+                        not np.allclose(pre_array, projected_array, atol=1e-8)
+                    )
+            final = item.get("executed_normalized_action")
+            if projected is not None and final is not None:
+                projected_array = np.asarray(projected, dtype=np.float64)
+                final_array = np.asarray(final, dtype=np.float64)
+                if projected_array.shape == final_array.shape == (3,):
+                    counts["environment_adjusted_decisions"] += int(
+                        not np.allclose(projected_array, final_array, atol=1e-8)
+                    )
+            if item.get("movement_energy_j") is not None:
+                value = float(item["movement_energy_j"])
+                if math.isfinite(value):
+                    energy_all.append(value)
+                    (energy_td3 if controlled else energy_other).append(value)
+            for target in item.get("observable_targets", []):
+                relative = np.asarray(target.get("relative_position_m", []), dtype=float)
+                if relative.shape != (3,) or not np.isfinite(relative).all():
+                    continue
+                kind = "FOV" if str(target.get("kind")) == "roi" else "COM"
+                target_distances[kind].append(float(np.linalg.norm(relative)))
+                target_bearings[kind].append(float(math.atan2(relative[1], relative[0])))
+            observation = item.get("service_observation")
+            if isinstance(observation, Mapping) and observation.get("snapshot_available"):
+                counts["service_snapshot_available_decisions"] += 1
+                queue = observation.get("uav_queue")
+                if isinstance(queue, Mapping) and queue.get("valid"):
+                    counts["queue_valid_decisions"] += 1
+                    queue_backlog.append(float(queue.get("backlog_bits", 0.0)))
+                    counts["queue_empty_decisions"] += int(bool(queue.get("empty")))
+                    if queue.get("hol_present"):
+                        counts["hol_present_decisions"] += 1
+                        if queue.get("hol_remaining_deadline_s") is not None:
+                            hol_deadlines.append(float(queue["hol_remaining_deadline_s"]))
+                    else:
+                        counts["no_hol_decisions"] += 1
+                fov = observation.get("fov")
+                if isinstance(fov, Mapping) and fov.get("pair_valid"):
+                    counts["fov_geometry_valid_decisions"] += 1
+                    coverage.append(float(fov.get("coverage_ratio", 0.0)))
+                    image_quantity.append(float(fov.get("image_quantity", 0.0)))
+                    counts["fov_capture_valid_decisions"] += int(
+                        bool(fov.get("capture_valid"))
+                    )
+                com = observation.get("com")
+                if isinstance(com, Mapping) and com.get("target_valid"):
+                    counts["com_target_valid_decisions"] += 1
+                    if com.get("sr_queue_valid"):
+                        counts["com_sr_queue_valid_decisions"] += 1
+                        sr_backlog.append(float(com.get("sr_backlog_bits", 0.0)))
+                        counts["com_sr_queue_empty_decisions"] += int(
+                            bool(com.get("sr_queue_empty"))
+                        )
+                        if com.get("sr_hol_remaining_deadline_s") is not None:
+                            sr_hol_deadlines.append(
+                                float(com["sr_hol_remaining_deadline_s"])
+                            )
+                    if com.get("s2u_link_valid"):
+                        counts["s2u_link_valid_decisions"] += 1
+                        counts["s2u_in_range_decisions"] += int(
+                            bool(com.get("s2u_in_range"))
+                        )
+                        s2u_capacity.append(
+                            float(com.get("s2u_reference_capacity_mbps", 0.0))
+                        )
+            role = (
+                "dual_fov_com"
+                if {"FOV", "COM"}.issubset(set(tasks))
+                else "fov"
+                if "FOV" in tasks
+                else "com"
+                if "COM" in tasks
+                else "other"
+            )
+            cases.append(
+                {
+                    "domain": "movement",
+                    "kind": f"movement_{role}_{'td3' if controlled else 'other_controller'}",
+                    "time_s": record.get("time_seconds"),
+                    "uav_id": uav_id,
+                    "roles": tasks,
+                    "movement_mask": controlled,
+                    "actor_action": item.get("actor_normalized_action"),
+                    "applied_bias": item.get("applied_llm_bias"),
+                    "executed_action": item.get("executed_normalized_action"),
+                    "observable_targets": item.get("observable_targets", []),
+                    "queue_and_sensing": observation,
+                }
+            )
+        totals.update(counts)
+        by_uav[f"UAV_{uav_id}"] = {
+            "role_decision_counts": dict(sorted(roles.items())),
+            "recorded_decision_count": int(counts["recorded_decisions"]),
+            "td3_controlled_decision_count": int(counts["td3_controlled_decisions"]),
+            "other_controller_decision_count": int(counts["other_controller_decisions"]),
+            "actor_action_normalized": _component_summary(actor_rows),
+            "actor_heading_circular_rad": _circular_summary(
+                [math.pi * row[1] for row in actor_rows]
+            ),
+            "policy_projected_action_normalized": _component_summary(projected_rows),
+            "actual_executed_action_normalized": _component_summary(executed_rows),
+            "actual_executed_heading_circular_rad": _circular_summary(
+                [math.pi * row[1] for row in executed_rows]
+            ),
+            "host_action_projection_decision_count": int(counts["host_action_projection_decisions"]),
+            "environment_adjusted_decision_count": int(counts["environment_adjusted_decisions"]),
+            "requested_episode_fixed_raw_bias_normalized": (
+                None if requested is None else requested[uav_id].round(7).tolist()
+            ),
+            "actually_added_bias_normalized": _component_summary(applied_rows),
+            "bias_application_count": len(applied_rows),
+            "guidance_fallback": bool(guidance.get("td3_fallback", True)),
+            "movement_energy_j": {
+                "all_controllers": _numeric_summary(energy_all, 4),
+                "td3_controlled_intervals": _numeric_summary(energy_td3, 4),
+                "other_controller_intervals": _numeric_summary(energy_other, 4),
+            },
+            "service_target_geometry": {
+                kind: {
+                    "distance_3d_m": _numeric_summary(target_distances[kind], 4),
+                    "bearing_xy_rad": _circular_summary(target_bearings[kind]),
+                }
+                for kind in ("FOV", "COM")
+            },
+            "uav_queue": {
+                "valid_observation_count": int(counts["queue_valid_decisions"]),
+                "empty_observation_count": int(counts["queue_empty_decisions"]),
+                "backlog_bits": _numeric_summary(queue_backlog, 2),
+                "hol_present_count": int(counts["hol_present_decisions"]),
+                "no_hol_count": int(counts["no_hol_decisions"]),
+                "hol_remaining_deadline_s": _numeric_summary(hol_deadlines, 6),
+            },
+            "fov_sensing": {
+                "valid_geometry_observation_count": int(counts["fov_geometry_valid_decisions"]),
+                "capture_valid_count": int(counts["fov_capture_valid_decisions"]),
+                "coverage_ratio": _numeric_summary(coverage),
+                "image_quantity": _numeric_summary(image_quantity),
+            },
+            "com_access": {
+                "target_valid_observation_count": int(
+                    counts["com_target_valid_decisions"]
+                ),
+                "sr_queue_valid_observation_count": int(
+                    counts["com_sr_queue_valid_decisions"]
+                ),
+                "sr_queue_empty_observation_count": int(
+                    counts["com_sr_queue_empty_decisions"]
+                ),
+                "sr_backlog_bits": _numeric_summary(sr_backlog, 2),
+                "sr_hol_remaining_deadline_s": _numeric_summary(
+                    sr_hol_deadlines, 6
+                ),
+                "s2u_link_valid_observation_count": int(
+                    counts["s2u_link_valid_decisions"]
+                ),
+                "s2u_in_range_observation_count": int(
+                    counts["s2u_in_range_decisions"]
+                ),
+                "s2u_reference_capacity_mbps": _numeric_summary(
+                    s2u_capacity, 6
+                ),
+            },
+        }
+    return {
+        "scope": "complete episode; every recorded one-second movement boundary; all 16 UAVs",
+        "units_and_validity": {
+            "actions_and_bias": "normalized action units",
+            "direction": "radians with circular statistics; null mean can indicate dispersed evidence",
+            "energy": "joules; all-controller and TD3-only scopes are separate",
+            "unknown": "null with zero valid_sample_count; observed numeric zero remains zero",
+        },
+        "totals": dict(totals),
+        "by_uav": by_uav,
+    }, _select_representative_cases(cases, maximum=4)
+
+
+def first_gen_slot_service_record(
+    slot_result: Mapping[str, Any],
+    *,
+    pre_slot_violations: list[dict[str, Any]] | tuple[dict[str, Any], ...] = (),
+    current_time: float,
+    slot_seconds: float,
+    preselected_actions_by_sender: Mapping[int, int] | None = None,
+) -> dict[str, Any]:
+    """Retain authoritative positive-bit service and endpoint completions."""
+
+    from llm_state_rule_explorer import state_rule_slot_service_record
+
+    record = state_rule_slot_service_record(
+        slot_result,
+        pre_slot_violations=pre_slot_violations,
+        current_time=current_time,
+    )
+    completed_hops: list[dict[str, Any]] = []
+    for packet in slot_result.get("s2u_arrivals", ()):
+        if not isinstance(packet, Mapping):
+            continue
+        hops = packet.get("per_hop", [])
+        hop = hops[-1] if hops and isinstance(hops[-1], Mapping) else {}
+        completed_hops.append(
+            {
+                "link_type": "S2U",
+                "sender_id": hop.get("from"),
+                "receiver_id": hop.get("to"),
+                "packet_id": packet.get("id"),
+            }
+        )
+    for arrival in slot_result.get("relay_arrivals", ()):
+        if isinstance(arrival, Mapping):
+            completed_hops.append(
+                {
+                    "link_type": "U2U",
+                    "sender_id": arrival.get("sender"),
+                    "receiver_id": arrival.get("receiver"),
+                    "packet_id": arrival.get("packet_id"),
+                }
+            )
+    delivered_packet_ids: set[int] = set()
+    for outcome in slot_result.get("outcomes", ()):
+        if not isinstance(outcome, Mapping) or not isinstance(
+            outcome.get("packet"), Mapping
+        ):
+            continue
+        packet = outcome["packet"]
+        terminal = str(packet.get("terminal_outcome", ""))
+        if terminal not in {"on_time_delivered", "late_delivered"}:
+            continue
+        packet_id = int(outcome.get("packet_id", packet.get("id")))
+        if packet_id in delivered_packet_ids:
+            continue
+        delivered_packet_ids.add(packet_id)
+        hops = packet.get("per_hop", [])
+        hop = hops[-1] if hops and isinstance(hops[-1], Mapping) else {}
+        completed_hops.append(
+            {
+                "link_type": "U2G",
+                "sender_id": hop.get("from", outcome.get("attributed_sender")),
+                "receiver_id": hop.get("to", 16),
+                "packet_id": packet_id,
+                "terminal_outcome": terminal,
+            }
+        )
+    record.update(
+        slot_seconds=float(slot_seconds),
+        completed_hops=completed_hops,
+        packet_decision_uses=[
+            {
+                "packet_id": int(item["packet_id"]),
+                "sender_uav_id": int(item["sender_uav_id"]),
+                "selected_action": (
+                    int(
+                        preselected_actions_by_sender[
+                            int(item["sender_uav_id"])
+                        ]
+                    )
+                    if preselected_actions_by_sender is not None
+                    and int(item["sender_uav_id"])
+                    in preselected_actions_by_sender
+                    else None
+                ),
+            }
+            for item in slot_result.get("packet_decision_uses", ())
+            if isinstance(item, Mapping)
+            and item.get("packet_id") is not None
+            and item.get("sender_uav_id") is not None
+        ],
+        global_routing_reward=float(slot_result.get("global_routing_reward", 0.0)),
+        shared_reward_row_sum=float(slot_result.get("shared_reward_row_sum", 0.0)),
+    )
+    return _json_clone(record)
+
+
+def first_gen_routing_summary(
+    records: list[dict[str, Any]],
+    slot_records: list[dict[str, Any]],
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """Summarize all senders, branches, legal opportunities, and service."""
+
+    by_uav_service: dict[int, dict[int, Counter[str]]] = {
+        sender: {} for sender in range(NUM_UAV)
+    }
+    access_received: dict[int, Counter[str]] = {
+        sender: Counter() for sender in range(NUM_UAV)
+    }
+    packet_use_counts: Counter[int] = Counter()
+    packet_use_counts_by_action: dict[int, Counter[int]] = {
+        sender: Counter() for sender in range(NUM_UAV)
+    }
+    service_cases: list[dict[str, Any]] = []
+    slot_seconds_values: list[float] = []
+    for slot in slot_records:
+        slot_seconds = float(slot.get("slot_seconds", 0.25))
+        slot_seconds_values.append(slot_seconds)
+        for use in slot.get("packet_decision_uses", []):
+            if isinstance(use, Mapping):
+                sender = int(use["sender_uav_id"])
+                packet_use_counts[sender] += 1
+                action = use.get("selected_action")
+                if action is not None and 0 <= int(action) < ROUTING_ACTION_DIM:
+                    packet_use_counts_by_action[sender][int(action)] += 1
+        for link in slot.get("active_links", []):
+            if not isinstance(link, Mapping):
+                continue
+            link_type = str(link.get("link_type", "unknown"))
+            sender = int(link.get("sender_id", -1))
+            receiver = int(link.get("receiver_id", -1))
+            bits = float(link.get("transmitted_bits", 0.0))
+            active_seconds = float(link.get("active_seconds", 0.0))
+            if link_type == "S2U" and 0 <= receiver < NUM_UAV:
+                access_received[receiver]["bits"] += bits
+                access_received[receiver]["active_seconds"] += active_seconds
+                access_received[receiver]["link_observations"] += 1
+            elif link_type in {"U2U", "U2G"} and 0 <= sender < NUM_UAV:
+                action = 16 if link_type == "U2G" else receiver
+                counters = by_uav_service[sender].setdefault(action, Counter())
+                counters["transmitted_bits"] += bits
+                counters["active_seconds"] += active_seconds
+                counters["active_link_observations"] += 1
+                service_cases.append(
+                    {
+                        "domain": "routing",
+                        "kind": "positive_actual_service",
+                        "time_s": slot.get("time_seconds"),
+                        "sender_uav_id": sender,
+                        "selected_action": action,
+                        "link_type": link_type,
+                        "transmitted_bits": bits,
+                        "active_seconds": active_seconds,
+                    }
+                )
+        for hop in slot.get("completed_hops", []):
+            if not isinstance(hop, Mapping):
+                continue
+            link_type = str(hop.get("link_type"))
+            if link_type == "S2U":
+                receiver = hop.get("receiver_id")
+                if isinstance(receiver, (int, float)) and 0 <= int(receiver) < NUM_UAV:
+                    access_received[int(receiver)]["completed_packets"] += 1
+                continue
+            sender = hop.get("sender_id")
+            receiver = hop.get("receiver_id")
+            if not isinstance(sender, (int, float)) or not 0 <= int(sender) < NUM_UAV:
+                continue
+            action = 16 if link_type == "U2G" else int(receiver)
+            by_uav_service[int(sender)].setdefault(action, Counter())[
+                "completed_hops"
+            ] += 1
+
+    default_slot_seconds = (
+        float(np.median(slot_seconds_values)) if slot_seconds_values else 0.25
+    )
+    by_sender: dict[str, Any] = {}
+    decision_cases: list[dict[str, Any]] = []
+    for sender in range(NUM_UAV):
+        sender_records = [
+            record
+            for record in records
+            if int(record.get("sender_uav_id", -1)) == sender
+        ]
+        branch_counts = {
+            branch: [0] * ROUTING_ACTION_DIM
+            for branch in ("epsilon_exploration", "safe_q_greedy")
+        }
+        legal_counts = [0] * ROUTING_ACTION_DIM
+        reference_capacity: dict[int, list[float]] = {
+            action: [] for action in range(ROUTING_ACTION_DIM)
+        }
+        neighbor_backlog: dict[int, list[float]] = {
+            action: [] for action in range(ROUTING_ACTION_DIM)
+        }
+        sender_backlogs: list[float] = []
+        hol_deadlines: list[float] = []
+        counts = Counter()
+        for record in sender_records:
+            action = int(record["selected_action"])
+            branch = str(record.get("decision_branch", "unknown"))
+            if branch in branch_counts:
+                branch_counts[branch][action] += 1
+            mask = np.asarray(record.get("legal_action_mask", []), dtype=bool)
+            if mask.shape == (ROUTING_ACTION_DIM,):
+                for legal_action in np.flatnonzero(mask):
+                    legal_counts[int(legal_action)] += 1
+            backlog = record.get("sender_total_backlog_bits")
+            if backlog is not None and math.isfinite(float(backlog)):
+                sender_backlogs.append(float(backlog))
+                counts["slot_start_backlog_positive"] += int(float(backlog) > 0.0)
+                counts["slot_start_backlog_zero"] += int(float(backlog) == 0.0)
+            else:
+                counts["slot_start_backlog_unknown"] += 1
+            if "hol_packet_id" not in record:
+                counts["hol_presence_unknown"] += 1
+            elif record.get("hol_packet_id") is None:
+                counts["no_hol"] += 1
+            else:
+                counts["hol_present"] += 1
+                if record.get("hol_remaining_deadline_seconds") is not None:
+                    hol_deadlines.append(
+                        float(record["hol_remaining_deadline_seconds"])
+                    )
+                if action == sender:
+                    counts["hol_wait_action"] += 1
+            counts["zero_prior_mass_fallback"] += int(
+                bool(record.get("zero_legal_prior_mass_fallback", False))
+            )
+            raw_capacities = record.get("reference_capacity_bps_by_legal_action")
+            if isinstance(raw_capacities, Mapping):
+                for key, value in raw_capacities.items():
+                    index = int(key)
+                    if 0 <= index < ROUTING_ACTION_DIM and math.isfinite(float(value)):
+                        reference_capacity[index].append(float(value))
+            try:
+                named = _routing_state_named_values(record["compact_routing_state"])
+            except (KeyError, TypeError, ValueError):
+                named = {}
+            for legal_action in np.flatnonzero(mask) if mask.shape == (ROUTING_ACTION_DIM,) else ():
+                key = f"next_hop_backlog[{int(legal_action)}]"
+                if key in named:
+                    neighbor_backlog[int(legal_action)].append(float(named[key]))
+            if bool(record.get("zero_legal_prior_mass_fallback", False)) or (
+                record.get("hol_packet_id") is not None and action == sender
+            ):
+                decision_cases.append(
+                    {
+                        "domain": "routing",
+                        "kind": (
+                            "zero_legal_prior_mass_fallback"
+                            if record.get("zero_legal_prior_mass_fallback")
+                            else "wait_with_hol"
+                        ),
+                        "time_s": record.get("time_seconds"),
+                        "sender_uav_id": sender,
+                        "branch": branch,
+                        "selected_action": action,
+                        "sender_backlog_bits": backlog,
+                        "hol_remaining_deadline_s": record.get(
+                            "hol_remaining_deadline_seconds"
+                        ),
+                    }
+                )
+        service = by_uav_service[sender]
+        reasons: dict[int, list[str]] = {}
+        if legal_counts[16] > 0:
+            reasons.setdefault(16, []).append("observable_GS_link")
+        positive_actions = [
+            action
+            for action, values in service.items()
+            if float(values["transmitted_bits"]) > 0.0
+        ]
+        if positive_actions:
+            action = max(
+                positive_actions,
+                key=lambda value: (float(service[value]["transmitted_bits"]), -value),
+            )
+            reasons.setdefault(action, []).append("highest_actual_service_bits")
+        alternatives = [
+            action
+            for action in range(ROUTING_ACTION_DIM)
+            if legal_counts[action] > 0 and action not in reasons
+        ]
+        if alternatives:
+            action = max(
+                alternatives,
+                key=lambda value: (
+                    legal_counts[value],
+                    np.mean(reference_capacity[value])
+                    if reference_capacity[value]
+                    else -1.0,
+                    -value,
+                ),
+            )
+            reasons.setdefault(action, []).append("most_observed_legal_alternative")
+        representative_links = []
+        for action, selection_reasons in list(reasons.items())[:3]:
+            actual = service.get(action, Counter())
+            representative_links.append(
+                {
+                    "action_index": action,
+                    "endpoint": "WAIT" if action == sender else "GS" if action == 16 else f"UAV_{action}",
+                    "selection_reasons": selection_reasons,
+                    "legal_opportunity_count": int(legal_counts[action]),
+                    "reference_capacity_bps": _numeric_summary(reference_capacity[action], 2),
+                    "neighbor_backlog_log_normalized": _numeric_summary(neighbor_backlog[action]),
+                    "actual_transmitted_bits": float(actual["transmitted_bits"]),
+                    "actual_active_service_seconds": float(actual["active_seconds"]),
+                    "completed_hop_count": int(actual["completed_hops"]),
+                    "active_link_observation_count": int(actual["active_link_observations"]),
+                }
+            )
+        by_sender[f"UAV_{sender}"] = {
+            "action_index_semantics": "0..15 UAV actions, sender index WAIT, 16 GS",
+            "decision_count": len(sender_records),
+            "epsilon_exploration_action_counts_17": branch_counts["epsilon_exploration"],
+            "safe_q_greedy_action_counts_17": branch_counts["safe_q_greedy"],
+            "legal_action_opportunity_counts_17": legal_counts,
+            "slot_start_sender_backlog_bits": _numeric_summary(sender_backlogs, 2),
+            "slot_start_backlog_positive_count": int(counts["slot_start_backlog_positive"]),
+            "slot_start_backlog_zero_count": int(counts["slot_start_backlog_zero"]),
+            "slot_start_backlog_unknown_count": int(counts["slot_start_backlog_unknown"]),
+            "hol_present_count": int(counts["hol_present"]),
+            "no_hol_count": int(counts["no_hol"]),
+            "hol_presence_unknown_count": int(counts["hol_presence_unknown"]),
+            "hol_remaining_deadline_s": _numeric_summary(hol_deadlines, 6),
+            "hol_present_observed_seconds": round(float(counts["hol_present"]) * default_slot_seconds, 6),
+            "hol_wait_action_seconds": round(float(counts["hol_wait_action"]) * default_slot_seconds, 6),
+            "zero_legal_prior_mass_fallback_count": int(counts["zero_prior_mass_fallback"]),
+            "preselected_action_packet_use_count": int(packet_use_counts[sender]),
+            "preselected_action_packet_use_counts_17": [
+                int(packet_use_counts_by_action[sender][action])
+                for action in range(ROUTING_ACTION_DIM)
+            ],
+            "actual_uav_service": {
+                "transmitted_bits": float(sum(values["transmitted_bits"] for values in service.values())),
+                "active_service_seconds": float(sum(values["active_seconds"] for values in service.values())),
+                "completed_hops": int(sum(values["completed_hops"] for values in service.values())),
+            },
+            "s2u_access_received": {
+                "transmitted_bits": float(access_received[sender]["bits"]),
+                "active_service_seconds": float(
+                    access_received[sender]["active_seconds"]
+                ),
+                "completed_packets": int(
+                    access_received[sender]["completed_packets"]
+                ),
+                "active_link_observation_count": int(
+                    access_received[sender]["link_observations"]
+                ),
+            },
+            "representative_links_maximum_3": representative_links,
+        }
+    return {
+        "scope": "complete episode routing decisions and authoritative PacketEngine event-time service",
+        "slot_duration_seconds": default_slot_seconds,
+        "global_shared_routing_reward": {
+            "episode_sum_counting_each_slot_once": float(
+                math.fsum(
+                    float(slot.get("global_routing_reward", 0.0))
+                    for slot in slot_records
+                )
+            ),
+            "duplicated_reward_row_sum_diagnostic": float(
+                math.fsum(
+                    float(slot.get("shared_reward_row_sum", 0.0))
+                    for slot in slot_records
+                )
+            ),
+            "aggregation_rule": "the episode learning-signal total uses the global slot reward once, not the per-UAV row sum",
+        },
+        "service_semantics": {
+            "preselection": "selected action at slot start",
+            "packet_use": "a packet was joined to the sender decision",
+            "actual_transmission": "positive authoritative transmitted bits, including partial hops",
+            "completed_hop": "full S2U, U2U, or U2G hop completion",
+            "gs_delivery": "terminal GS outcome, separate from relay service",
+        },
+        "by_sender": by_sender,
+    }, _select_representative_cases(decision_cases + service_cases, maximum=4)
+
+
+def _complete_previous_guidance(guidance: Mapping[str, Any]) -> dict[str, Any]:
+    td3_known = bool(guidance.get("enabled")) and not bool(
+        guidance.get("td3_fallback", True)
+    )
+    routing_known = bool(guidance.get("enabled")) and not bool(
+        guidance.get("routing_fallback", True)
+    )
+    return {
+        "td3_bias": (
+            {
+                "status": "known_applied_episode_guidance",
+                "shape": [NUM_UAV, 3],
+                "value": np.asarray(guidance["td3_bias"], dtype=float).tolist(),
+            }
+            if td3_known and guidance.get("td3_bias") is not None
+            else {
+                "status": "unknown_no_applied_guidance",
+                "reason": guidance.get("td3_reason"),
+                "value": None,
+            }
+        ),
+        "routing_prior": (
+            {
+                "status": "known_applied_episode_guidance",
+                "shape": [NUM_UAV, ROUTING_ACTION_DIM],
+                "value": np.asarray(guidance["routing_prior"], dtype=float).tolist(),
+            }
+            if routing_known and guidance.get("routing_prior") is not None
+            else {
+                "status": "unknown_no_applied_guidance",
+                "reason": guidance.get("routing_reason"),
+                "value": None,
+            }
+        ),
+    }
+
+
+def assemble_first_gen_feedback(
+    *,
+    metrics: Mapping[str, Any],
+    movement_records: list[dict[str, Any]],
+    routing_records: list[dict[str, Any]],
+    slot_service_records: list[dict[str, Any]],
+    applied_guidance: Mapping[str, Any],
+) -> dict[str, Any]:
+    movement, movement_cases = first_gen_movement_summary(
+        movement_records, applied_guidance
+    )
+    routing, routing_cases = first_gen_routing_summary(
+        routing_records, slot_service_records
+    )
+    from llm_state_rule_explorer import slot_service_summary
+
+    service = slot_service_summary(slot_service_records, metrics)
+    application = {
+        "guidance_enabled": bool(applied_guidance.get("enabled", False)),
+        "td3_fallback": bool(applied_guidance.get("td3_fallback", True)),
+        "routing_fallback": bool(applied_guidance.get("routing_fallback", True)),
+        "td3_reason": applied_guidance.get("td3_reason"),
+        "routing_reason": applied_guidance.get("routing_reason"),
+        "movement_action_source_counts": dict(
+            sorted(
+                Counter(
+                    str(record.get("action_source", "unknown"))
+                    for record in movement_records
+                ).items()
+            )
+        ),
+        "td3_bias_application_count": int(
+            sum(
+                item.get("applied_llm_bias") is not None
+                for record in movement_records
+                for item in record.get("uavs", [])
+            )
+        ),
+        "routing_zero_legal_prior_mass_fallback_count": int(
+            sum(
+                bool(record.get("zero_legal_prior_mass_fallback", False))
+                for record in routing_records
+            )
+        ),
+    }
+    return {
+        "schema_version": LLM_EXPLORER_VERSION,
+        "summary_version": LLM_EXPLORER_SUMMARY_VERSION,
+        "case_selection_version": LLM_EXPLORER_CASE_VERSION,
+        "episode_outcomes": _json_clone(metrics),
+        "previous_complete_guidance": _complete_previous_guidance(
+            applied_guidance
+        ),
+        "previous_application_status": application,
+        "uav_core_summary": movement,
+        "routing_core_summary": routing,
+        "actual_slot_service_summary": service,
+        "representative_cases": _select_representative_cases(
+            movement_cases + routing_cases, maximum=8
+        ),
+        "case_semantics": "deterministic illustrations only; complete summaries provide denominators",
+        "applied_guidance": _semantic_guidance(dict(applied_guidance)),
+    }
+
+
 def build_observable_initial_state(env: Any, packet_engine: Any) -> dict[str, Any]:
     """Build episode-start input without serializing hidden RoIs or SRs."""
 
@@ -740,6 +1614,8 @@ def build_movement_decision_record(
     actor_action: Any = None,
     applied_bias: Any = None,
     noise_std: float | None = None,
+    auxiliary_snapshot: Mapping[str, Any] | None = None,
+    action_diagnostics: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Capture only information observable at this exact decision time."""
 
@@ -751,6 +1627,43 @@ def build_movement_decision_record(
     actions = np.asarray(executed_action, dtype=float).reshape(NUM_UAV, 3)
     actors = None if actor_action is None else np.asarray(actor_action, dtype=float).reshape(NUM_UAV, 3)
     biases = None if applied_bias is None else np.asarray(applied_bias, dtype=float).reshape(NUM_UAV, 3)
+    pre_projection = None
+    if isinstance(action_diagnostics, Mapping) and action_diagnostics.get(
+        "pre_projection_action"
+    ) is not None:
+        pre_projection = np.asarray(
+            action_diagnostics["pre_projection_action"], dtype=float
+        ).reshape(NUM_UAV, 3)
+
+    snapshot_valid = bool(
+        isinstance(auxiliary_snapshot, Mapping)
+        and np.asarray(
+            auxiliary_snapshot.get("snapshot_valid", [False]), dtype=bool
+        ).reshape(-1)[0]
+    )
+
+    def snapshot_value(name: str, index: int, *, default: Any = None) -> Any:
+        if not snapshot_valid or name not in auxiliary_snapshot:
+            return default
+        values = np.asarray(auxiliary_snapshot[name])
+        if values.ndim == 0 or index >= len(values):
+            return default
+        value = values[index]
+        if np.asarray(value).ndim:
+            return np.asarray(value).tolist()
+        return value.item() if hasattr(value, "item") else value
+
+    def snapshot_matrix_value(
+        name: str, row: int, column: int, *, default: Any = None
+    ) -> Any:
+        if not snapshot_valid or name not in auxiliary_snapshot:
+            return default
+        values = np.asarray(auxiliary_snapshot[name])
+        if values.ndim < 2 or row >= values.shape[0] or column >= values.shape[1]:
+            return default
+        value = values[row, column]
+        return value.item() if hasattr(value, "item") else value
+
     for uav_id, uav in sorted(env.uav_dict.items()):
         targets = []
         task_types = []
@@ -786,6 +1699,166 @@ def build_movement_decision_record(
                                 ],
                             }
                         )
+        service_observation = None
+        if snapshot_valid:
+            queue_valid = bool(snapshot_value("uav_queue_valid", uav_id, default=False))
+            hol_valid = bool(snapshot_value("uav_hol_valid", uav_id, default=False))
+            fov_valid = bool(snapshot_value("vs_pair_valid", uav_id, default=False))
+            com_target_ids = [
+                int(target["id"])
+                for target in targets
+                if str(target.get("kind")) == "sr"
+            ]
+            sr_row = None
+            if com_target_ids:
+                sr_ids = np.asarray(auxiliary_snapshot.get("sr_id", []), dtype=int)
+                matches = np.flatnonzero(sr_ids == com_target_ids[0])
+                if matches.size:
+                    candidate = int(matches[0])
+                    if bool(snapshot_value("sr_observable", candidate, default=False)):
+                        sr_row = candidate
+            sr_queue_valid = bool(
+                sr_row is not None
+                and snapshot_value("sr_queue_valid", sr_row, default=False)
+            )
+            s2u_valid = bool(
+                sr_row is not None
+                and snapshot_matrix_value(
+                    "s2u_link_valid", sr_row, uav_id, default=False
+                )
+            )
+            service_observation = {
+                "snapshot_available": True,
+                "uav_queue": {
+                    "valid": queue_valid,
+                    "empty": (
+                        bool(snapshot_value("uav_queue_empty", uav_id))
+                        if queue_valid
+                        else None
+                    ),
+                    "backlog_bits": (
+                        float(snapshot_value("uav_backlog_bits", uav_id))
+                        if queue_valid
+                        else None
+                    ),
+                    "fov_backlog_bits": (
+                        float(snapshot_value("uav_vs_backlog_bits", uav_id))
+                        if queue_valid
+                        else None
+                    ),
+                    "com_backlog_bits": (
+                        float(snapshot_value("uav_com_backlog_bits", uav_id))
+                        if queue_valid
+                        else None
+                    ),
+                    "hol_present": hol_valid,
+                    "hol_type_code": (
+                        int(snapshot_value("uav_hol_type", uav_id))
+                        if hol_valid
+                        else None
+                    ),
+                    "hol_remaining_deadline_s": (
+                        float(
+                            snapshot_value(
+                                "uav_hol_remaining_deadline_s", uav_id
+                            )
+                        )
+                        if hol_valid
+                        else None
+                    ),
+                },
+                "fov": {
+                    "pair_valid": fov_valid,
+                    "coverage_ratio": (
+                        float(snapshot_value("vs_coverage_ratio", uav_id))
+                        if fov_valid
+                        else None
+                    ),
+                    "image_quantity": (
+                        float(snapshot_value("vs_image_quantity", uav_id))
+                        if fov_valid
+                        else None
+                    ),
+                    "c9_margin_m": (
+                        float(snapshot_value("vs_c9_margin_m", uav_id))
+                        if fov_valid
+                        else None
+                    ),
+                    "c10_geometry_valid": (
+                        bool(snapshot_value("vs_c10_geometry_valid", uav_id))
+                        if fov_valid
+                        else None
+                    ),
+                    "c10_margin_m": (
+                        float(snapshot_value("vs_c10_margin_m", uav_id))
+                        if fov_valid
+                        and bool(
+                            snapshot_value(
+                                "vs_c10_geometry_valid", uav_id, default=False
+                            )
+                        )
+                        else None
+                    ),
+                    "capture_valid": (
+                        bool(snapshot_value("vs_capture_valid", uav_id))
+                        if fov_valid
+                        else None
+                    ),
+                },
+                "com": {
+                    "target_valid": sr_row is not None,
+                    "sr_id": None if sr_row is None else com_target_ids[0],
+                    "sr_queue_valid": sr_queue_valid,
+                    "sr_queue_empty": (
+                        bool(snapshot_value("sr_queue_empty", sr_row))
+                        if sr_queue_valid
+                        else None
+                    ),
+                    "sr_backlog_bits": (
+                        float(snapshot_value("sr_backlog_bits", sr_row))
+                        if sr_queue_valid
+                        else None
+                    ),
+                    "sr_packet_count": (
+                        int(snapshot_value("sr_packet_count", sr_row))
+                        if sr_queue_valid
+                        else None
+                    ),
+                    "sr_hol_remaining_deadline_s": (
+                        float(
+                            snapshot_value(
+                                "sr_hol_remaining_deadline_s", sr_row
+                            )
+                        )
+                        if sr_queue_valid
+                        and bool(
+                            snapshot_value(
+                                "sr_hol_deadline_valid", sr_row, default=False
+                            )
+                        )
+                        else None
+                    ),
+                    "s2u_link_valid": s2u_valid,
+                    "s2u_in_range": (
+                        bool(
+                            snapshot_matrix_value(
+                                "s2u_in_range", sr_row, uav_id
+                            )
+                        )
+                        if s2u_valid
+                        else None
+                    ),
+                    "s2u_reference_capacity_mbps": (
+                        float(
+                            snapshot_matrix_value(
+                                "s2u_reference_capacity_mbps", sr_row, uav_id
+                            )
+                        )
+                        if s2u_valid
+                        else None
+                    ),
+                },
+            }
         uavs.append(
             {
                 "uav_id": int(uav_id),
@@ -794,9 +1867,16 @@ def build_movement_decision_record(
                 "task_types": task_types,
                 "observable_targets": targets,
                 "movement_mask": bool(mask[uav_id]),
+                "pre_projection_normalized_action": (
+                    None
+                    if pre_projection is None
+                    else pre_projection[uav_id].tolist()
+                ),
+                "policy_projected_normalized_action": actions[uav_id].tolist(),
                 "executed_normalized_action": actions[uav_id].tolist(),
                 "actor_normalized_action": None if actors is None else actors[uav_id].tolist(),
                 "applied_llm_bias": None if biases is None else biases[uav_id].tolist(),
+                "service_observation": service_observation,
             }
         )
     return _json_clone(
@@ -821,21 +1901,36 @@ def environment_constants_and_definitions(
     task_deadlines_seconds: dict[str, float] | None = None,
 ) -> dict[str, Any]:
     from experiment_config import (
+        COM_PACKET_RATE_PER_SECOND,
         COM_PACKET_SIZE_BITS,
         COMMUNICATION_RANGE_M,
         MOVEMENT_CONSTRAINT_WEIGHT_C10,
         MOVEMENT_CONSTRAINT_WEIGHT_C9,
         MOVEMENT_CONSTRAINT_WEIGHT_COM,
+        PROPULSION_MODEL_ID,
+        PROPULSION_PARAMETERS,
+        REFERENCE_COM_BANDWIDTH_HZ,
+        ROUTING_REWARD_BITS_PER_UNIT,
         SAFE_DDQN_ETA_C,
         SAFE_DDQN_QOS_TARGET_PROBABILITY,
+        TOTAL_COMMUNICATION_BANDWIDTH_HZ,
     )
+    from Energy_model import EnergyConsumptionModel
     from visual_sensing import visual_sensing_metadata
 
     visual = visual_sensing_metadata()
+    energy_model = EnergyConsumptionModel(E_max=1.0, N_u=NUM_UAV)
+    propulsion_references = {
+        "hover_0_0_0_w": energy_model.propulsion_power((0.0, 0.0, 0.0)),
+        "horizontal_5_mps_w": energy_model.propulsion_power((5.0, 0.0, 0.0)),
+        "horizontal_10_mps_w": energy_model.propulsion_power((10.0, 0.0, 0.0)),
+        "vertical_up_2_mps_w": energy_model.propulsion_power((0.0, 0.0, 2.0)),
+        "vertical_down_2_mps_w": energy_model.propulsion_power((0.0, 0.0, -2.0)),
+    }
     return {
         "schema_version": LLM_EXPLORER_VERSION,
         "num_uav": NUM_UAV,
-        "uav_ids": [0, 15],
+        "uav_id_range_inclusive": [0, 15],
         "ground_station_action_index": 16,
         "configured_roi_count_range": [2, 8],
         "operating_area_m": {
@@ -853,11 +1948,23 @@ def environment_constants_and_definitions(
             for key, value in (task_deadlines_seconds or {"FOV": 0.015, "COM": 0.010}).items()
         },
         "packet_generation_model": "fixed intervals from effective configured rates; events are invisible before generation",
-        "routing_decision_model": "all UAVs preselect one physically legal next hop at each 0.25 s slot start and hold it for the slot",
+        "routing_decision_model": (
+            "all UAVs preselect one physically legal next hop at each "
+            f"{float(routing_slot_seconds):g} s slot start and hold it for the slot"
+        ),
         "packet_service_model": "event-time full-packet store-and-forward; completed packets may traverse multiple hops in one slot",
         "bandwidth_model": "dynamic equal-FDMA over currently serviceable S2U/U2U/U2G links; empty preselection reserves no bandwidth",
         "fading_model": "5 ms gain blocks; service completion and next-hop start may be finer than 5 ms",
+        "traffic_defaults_packets_per_second": {
+            "FOV": 5.0,
+            "COM": float(COM_PACKET_RATE_PER_SECOND),
+        },
         "com_packet_bits": float(COM_PACKET_SIZE_BITS),
+        "fov_packet_bits": visual["packet_size"],
+        "total_dynamic_fdma_bandwidth_hz": float(
+            TOTAL_COMMUNICATION_BANDWIDTH_HZ
+        ),
+        "s2u_reference_bandwidth_hz": float(REFERENCE_COM_BANDWIDTH_HZ),
         "action_decode": {
             "horizontal_speed_mps": "5 * (speed_scalar + 1)",
             "absolute_heading_rad": "pi * heading_scalar",
@@ -872,9 +1979,14 @@ def environment_constants_and_definitions(
                 "c10": float(MOVEMENT_CONSTRAINT_WEIGHT_C10),
                 "com_range": float(MOVEMENT_CONSTRAINT_WEIGHT_COM),
             },
+            "penalty_denominators": (
+                "each penalty is averaged over its own currently applicable "
+                "service-pair set; an empty set contributes zero"
+            ),
         },
         "routing_reward": {
             "formula": "slot timely useful bits delivered to GS / 10000",
+            "bits_per_reward_unit": float(ROUTING_REWARD_BITS_PER_UNIT),
             "unit": "1 reward per decimal 10 kbit",
             "sharing": "the same global slot reward is stored in every UAV routing transition; episode routing reward sums each slot once",
             "zero_and_bounds": "zero when no timely useful GS delivery; no clipping or dynamic normalization",
@@ -883,6 +1995,41 @@ def environment_constants_and_definitions(
             "score": "Q_reward - lambda_cost * Q_cost",
             "qos_target_probability": float(SAFE_DDQN_QOS_TARGET_PROBABILITY),
             "lambda_cost_step_size": float(SAFE_DDQN_ETA_C),
+            "lambda_cost_update": (
+                "episode-end update from global eligible and violated packet "
+                "counts; target is the configured QoS probability"
+            ),
+        },
+        "propulsion": {
+            "model_id": PROPULSION_MODEL_ID,
+            "formula_scope": "P(actual projected 3-D velocity); E=P*delta_t",
+            "parameters": dict(PROPULSION_PARAMETERS),
+            "reference_power_w": propulsion_references,
+            "reference_duration_s": 1.0,
+        },
+        "feedback_dictionary": {
+            "timely_useful_delivery_bits": (
+                "authoritative EE numerator: complete on-time GS delivery; "
+                "FOV physical bits weighted by capture coverage and COM bits full"
+            ),
+            "generated_and_terminal_packet_counts": (
+                "FOV and COM are separate; eligible/violated counts retain the "
+                "PacketEngine terminal-outcome definitions"
+            ),
+            "movement_energy_j": "all UAVs and all movement controllers, including hover",
+            "routing_reward_episode_sum": "global shared reward counted once per slot",
+            "branch_action_counts": "17-entry arrays in action-index order; sender index is WAIT",
+            "legal_action_opportunities": "decision-time effective-mask counts, not service counts",
+            "actual_service": "positive PacketEngine transmission bits and completion events",
+            "circular_direction": (
+                "bearing means use atan2 and circular resultant length; a null "
+                "mean denotes absent or directionally dispersed samples"
+            ),
+            "representative_links": (
+                "at most three deterministic profiles per sender; omitted links "
+                "are not implied illegal or unused"
+            ),
+            "representative_cases": "at most eight deterministic illustrations; not frequency estimates",
         },
         "visual_sensing": visual,
         "validity": {
@@ -1074,13 +2221,12 @@ class DeterministicMockExplorerClient:
 
     def chat(self, *, model: str, prompt: str, system_prompt: str, **_: Any) -> dict[str, Any]:
         del system_prompt
-        if "Perform the analysis stage" in prompt:
+        if "[Requested analysis]" in prompt:
             content = (
-                "A. Movement observations\nOffline neutral mock analysis.\n"
-                "B. Routing observations\nNo directional evidence.\n"
-                "C. Joint interpretation\nPreserve baseline exploration.\n"
-                "D. Exploration recommendations\nUse neutral guidance.\n"
-                "E. Limitations\nMock response; no live model inference."
+                "1. Priority issues\nNo reliable issue in offline mock data.\n"
+                "2. TD3 recommendations\nUse neutral raw biases.\n"
+                "3. Routing recommendations\nUse neutral priors.\n"
+                "4. Expected effects and limitations\nNo live model inference."
             )
         else:
             content = json.dumps(
@@ -1139,6 +2285,7 @@ class LLMExplorerController:
         self.active_guidance = self._unguided("not_started")
         self.movement_records: list[dict[str, Any]] = []
         self.routing_records: list[dict[str, Any]] = []
+        self.slot_service_records: list[dict[str, Any]] = []
         self._request_records: dict[str, dict[str, Any]] = {}
         self._fallback_records: dict[str, dict[str, Any]] = {}
         self._local_failure_records: dict[str, dict[str, Any]] = {}
@@ -1378,8 +2525,10 @@ class LLMExplorerController:
     def _render_system_prompt(
         self, template: str, environment_constants: dict[str, Any]
     ) -> str:
-        del environment_constants
-        return template
+        return render_prompt(
+            template,
+            {"SETTINGS_AND_DATA_DEFINITIONS": environment_constants},
+        )
 
     def _compact_feedback(self, previous: dict[str, Any]) -> dict[str, Any]:
         return compact_feedback_for_llm(previous)
@@ -1388,11 +2537,28 @@ class LLMExplorerController:
         self, *, sigma_episode_start: float, routing_epsilon: float
     ) -> dict[str, Any]:
         return {
+            "upcoming_episode": getattr(self, "_upcoming_episode", None),
+            "total_joint_transitions": getattr(
+                self, "_total_joint_transitions", None
+            ),
+            "warmup_joint_transitions": self.config.warmup_joint_transitions,
+            "activation_uses_actual_joint_transition_count": True,
             "sigma_episode_start": float(sigma_episode_start),
+            "td3_bias_bounds": [
+                -float(sigma_episode_start),
+                float(sigma_episode_start),
+            ],
             "routing_epsilon_at_episode_start": float(routing_epsilon),
-            "routing_prior_mix": {"llm_after_mask": 0.8, "legal_uniform": 0.2},
+            "routing_epsilon_schedule": "unchanged host schedule",
+            "routing_epsilon_branch": (
+                "100% masked and renormalized LLM prior; legal-uniform only "
+                "when legal prior mass is zero"
+            ),
             "bias_units": "normalized action units",
             "guidance_fixed_for_episode": True,
+            "guidance_weight": 1.0,
+            "annealing_end_episode": None,
+            "episode_600_cutoff": False,
             "update_interval_episodes": 1,
         }
 
@@ -1404,17 +2570,25 @@ class LLMExplorerController:
         current_observable_initial_state: dict[str, Any],
         settings: dict[str, Any],
     ) -> dict[str, Any]:
+        del environment_constants
         return {
-            "ENVIRONMENT_CONSTANTS_AND_FIELD_DEFINITIONS_JSON": environment_constants,
-            "PREVIOUS_EPISODE_METRICS_JSON": previous["metrics"],
-            "PREVIOUS_MOVEMENT_SAMPLES_JSON": previous["movement"],
-            "PREVIOUS_ROUTING_SAMPLES_JSON": previous["routing"],
-            "PREVIOUS_FULL_EPISODE_STATISTICS_JSON": previous[
-                "full_episode_statistics"
+            "PHASE_AND_EXPLORATION_SETTINGS": settings,
+            "CURRENT_OBSERVABLE_INITIAL_STATE": current_observable_initial_state,
+            "EPISODE_OUTCOMES": previous["episode_outcomes"],
+            "PREVIOUS_COMPLETE_GUIDANCE": previous[
+                "previous_complete_guidance"
             ],
-            "PREVIOUS_APPLIED_GUIDANCE_JSON": previous["applied_guidance"],
-            "CURRENT_OBSERVABLE_INITIAL_STATE_JSON": current_observable_initial_state,
-            "CURRENT_EXPLORATION_SETTINGS_JSON": settings,
+            "PREVIOUS_APPLICATION_STATUS": previous[
+                "previous_application_status"
+            ],
+            "UAV_CORE_SUMMARY": previous["uav_core_summary"],
+            "ROUTING_CORE_SUMMARY": {
+                "routing_decisions": previous["routing_core_summary"],
+                "actual_slot_service": previous[
+                    "actual_slot_service_summary"
+                ],
+            },
+            "REPRESENTATIVE_CASES": previous["representative_cases"],
         }
 
     def _render_analysis_prompt(
@@ -1427,8 +2601,7 @@ class LLMExplorerController:
         current_observable_initial_state: dict[str, Any],
         settings: dict[str, Any],
     ) -> str:
-        del system_prompt
-        return render_prompt(
+        prompt = render_prompt(
             analysis_template,
             self._analysis_replacements(
                 previous=previous,
@@ -1437,6 +2610,11 @@ class LLMExplorerController:
                 settings=settings,
             ),
         )
+        # The complete core summaries are already compact aggregates.  Cases
+        # and representative links have finite caps, so no content is silently
+        # truncated here; the normal prompt preflight owns any overflow.
+        del system_prompt
+        return prompt
 
     def _guidance_replacements(
         self,
@@ -1448,13 +2626,27 @@ class LLMExplorerController:
         settings: dict[str, Any],
         validation_feedback: str,
     ) -> dict[str, Any]:
+        guidance = previous["previous_complete_guidance"]
         return {
             "ANALYSIS_STAGE_OUTPUT": analysis,
-            "ENVIRONMENT_CONSTANTS_AND_FIELD_DEFINITIONS_JSON": environment_constants,
-            "CURRENT_OBSERVABLE_INITIAL_STATE_JSON": current_observable_initial_state,
-            "CURRENT_EXPLORATION_SETTINGS_JSON": settings,
-            "PREVIOUS_APPLIED_GUIDANCE_JSON": previous["applied_guidance"],
-            "VALIDATION_FEEDBACK_OR_EMPTY": validation_feedback,
+            "PHASE_AND_EXPLORATION_SETTINGS": settings,
+            "CURRENT_OBSERVABLE_INITIAL_STATE": current_observable_initial_state,
+            "PREVIOUS_COMPLETE_TD3_BIAS": guidance["td3_bias"],
+            "PREVIOUS_COMPLETE_ROUTING_PRIOR": guidance["routing_prior"],
+            "PREVIOUS_APPLICATION_STATUS": previous[
+                "previous_application_status"
+            ],
+            "CONCISE_OUTCOMES_AND_CASES": {
+                "episode_outcomes": previous["episode_outcomes"],
+                "actual_slot_service": previous[
+                    "actual_slot_service_summary"
+                ],
+                "representative_cases": previous["representative_cases"],
+            },
+            "VALIDATION_FEEDBACK_OR_EMPTY": (
+                validation_feedback
+                or "No local format-validation feedback is present."
+            ),
         }
 
     def _parse_guidance_response(
@@ -1477,7 +2669,7 @@ class LLMExplorerController:
     def _cache_identity(
         self, *, episode_index: int, stage: str, system_prompt: str, user_prompt: str
     ) -> dict[str, Any]:
-        return {
+        identity = {
             "run_identity": self.run_identity,
             "episode_index": int(episode_index),
             "stage": str(stage),
@@ -1486,6 +2678,13 @@ class LLMExplorerController:
             "prompt_version": self.config.prompt_version,
             "config_sha256": _sha256_text(_canonical_json(asdict(self.config))),
         }
+        if self.schema_version == LLM_EXPLORER_VERSION:
+            identity.update(
+                summary_version=LLM_EXPLORER_SUMMARY_VERSION,
+                cache_version=LLM_EXPLORER_CACHE_VERSION,
+                routing_epsilon_branch="100_percent_masked_llm_prior",
+            )
+        return identity
 
     def _stable_seed(
         self, *, episode_index: int, stage: str, attempt: int, input_sha256: str
@@ -1930,6 +3129,9 @@ class LLMExplorerController:
     ) -> dict[str, Any]:
         self.movement_records = []
         self.routing_records = []
+        self.slot_service_records = []
+        self._upcoming_episode = int(episode_index) + 1
+        self._total_joint_transitions = int(total_joint_transitions)
         routing_guidance_required = self._routing_guidance_required()
         if self.evaluation:
             self.active_guidance = self._unguided("evaluation_disabled")
@@ -2357,38 +3559,35 @@ class LLMExplorerController:
         copied.setdefault("decision_index", len(self.routing_records))
         self.routing_records.append(copied)
 
+    def record_slot_service(self, record: dict[str, Any]) -> None:
+        self.slot_service_records.append(_json_clone(record))
+
     def complete_episode(self, *, episode_index: int, metrics: dict[str, Any]) -> None:
-        samples = stratified_routing_samples(self.routing_records, maximum=100)
-        self.previous_episode_feedback = _json_clone(
-            {
-                "episode_index": int(episode_index),
-                "metrics": metrics,
-                "movement_decisions": self.movement_records,
-                "routing_samples": samples,
-                "full_episode_statistics": {
-                    "movement_decision_count": len(self.movement_records),
-                    "routing": routing_action_statistics(self.routing_records),
-                    "routing_sample_count": len(samples),
-                    "routing_sampling": "sender quota then uniform over each sender timeline",
-                },
-                "applied_guidance": self._serializable_guidance(self.active_guidance),
-                "guidance_execution": {
-                    "reused": bool(self.active_guidance.get("reused", False)),
-                    "cache_source": self.active_guidance.get("cache_source"),
-                },
-            }
+        feedback = assemble_first_gen_feedback(
+            metrics=metrics,
+            movement_records=self.movement_records,
+            routing_records=self.routing_records,
+            slot_service_records=self.slot_service_records,
+            applied_guidance=self._serializable_guidance(self.active_guidance),
         )
-        self.previous_episode_feedback["applied_guidance"] = _semantic_guidance(
-            self.active_guidance
-        )
+        self.previous_episode_feedback = _json_clone(feedback)
         if self.root is not None:
             episode_root = self.root / f"episode_{episode_index + 1:06d}"
-            _atomic_json(episode_root / "feedback.json", self.previous_episode_feedback)
+            _atomic_json(
+                episode_root / "feedback.json",
+                {
+                    **feedback,
+                    "movement_decisions": self.movement_records,
+                    "routing_decisions": self.routing_records,
+                    "slot_service_records": self.slot_service_records,
+                },
+            )
             _atomic_json(self.root / "state.json", self.state_dict())
         print(
             f"[LLM explorer] episode={episode_index + 1} summary "
             f"movement_samples={len(self.movement_records)} routing_decisions={len(self.routing_records)} "
-            f"routing_samples={len(samples)} requests_total={self.statistics['requests_total']} "
+            f"routing_slots={len(self.slot_service_records)} cases={len(feedback['representative_cases'])} "
+            f"requests_total={self.statistics['requests_total']} "
             f"failed_attempts_total={self.statistics['failed_attempts_total']} "
             f"fallback_episodes_total={self.statistics['fallback_episodes_total']}",
             flush=True,
@@ -2398,13 +3597,21 @@ class LLMExplorerController:
 def explorer_metadata(config: LLMExplorerConfig) -> dict[str, Any]:
     return {
         "schema_version": LLM_EXPLORER_VERSION,
+        "method_id": LLM_EXPLORER_METHOD_ID,
         "prompt_version": config.prompt_version,
+        "summary_version": LLM_EXPLORER_SUMMARY_VERSION,
+        "case_selection_version": LLM_EXPLORER_CASE_VERSION,
+        "cache_version": LLM_EXPLORER_CACHE_VERSION,
         "model": config.model,
         "warmup_joint_transitions": config.warmup_joint_transitions,
         "update_interval_episodes": config.update_interval_episodes,
         "max_attempts_per_stage": config.max_attempts,
         "request_timeout_seconds": config.request_timeout_seconds,
-        "td3_intervention": "episode_fixed_mean_bias_before_action_projection",
-        "routing_intervention": "epsilon_branch_0.8_masked_prior_plus_0.2_legal_uniform",
+        "context_window_tokens": config.context_window_tokens,
+        "safety_margin_tokens": config.safety_margin_tokens,
+        "td3_intervention": "episode_fixed_raw_bias_added_once_with_original_gaussian_before_projection",
+        "routing_intervention": "epsilon_branch_100_percent_masked_renormalized_prior; legal_uniform_only_on_zero_legal_mass",
+        "guidance_weight": 1.0,
+        "annealing_end_episode": None,
         "evaluation_calls_llm": False,
     }
