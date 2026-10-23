@@ -626,7 +626,14 @@ def build_parser():
         "evaluate", help="evaluate one checkpoint inferred from a run directory"
     )
     evaluate.add_argument("run_directory")
-    evaluate.add_argument("--checkpoint-episode", type=int, default=FORMAL_CHECKPOINT_EPISODE)
+    evaluate.add_argument(
+        "--checkpoint-episode",
+        type=int,
+        help=(
+            f"checkpoint episode for learned methods (default: "
+            f"{FORMAL_CHECKPOINT_EPISODE}); not applicable to pure-random methods"
+        ),
+    )
     evaluate.add_argument("--episodes", type=int)
     evaluate.add_argument("--episode-seconds", type=int)
     evaluate.add_argument("--manifest-seed", type=int)
@@ -1605,6 +1612,13 @@ def _write_evaluation_plots(output_dir, rows):
 
 def run_evaluate(args):
     run_dir, resolved, method, training_manifest = _load_run_context(args.run_directory)
+    checkpoint_required = bool(method.learns_movement or method.learns_routing)
+    explicit_checkpoint_episode = args.checkpoint_episode is not None
+    if explicit_checkpoint_episode and not checkpoint_required:
+        raise ValueError(
+            f"{method.method_id} learns neither movement nor routing; "
+            "--checkpoint-episode is not applicable"
+        )
     llm_artifact_dir, llm_identity, movement_state_dim = _llm_run_artifact(
         run_dir, resolved, method
     )
@@ -1618,10 +1632,22 @@ def run_evaluate(args):
         training_manifest_path,
         training_manifest,
     )
-    checkpoint_episode = int(args.checkpoint_episode)
-    if checkpoint_episode <= 0:
+    checkpoint_episode = (
+        int(
+            FORMAL_CHECKPOINT_EPISODE
+            if args.checkpoint_episode is None
+            else args.checkpoint_episode
+        )
+        if checkpoint_required
+        else None
+    )
+    if checkpoint_required and checkpoint_episode <= 0:
         raise ValueError("checkpoint episode must be positive")
-    checkpoint = run_dir / "checkpoints" / "models" / f"ep_{checkpoint_episode:04d}"
+    checkpoint = (
+        run_dir / "checkpoints" / "models" / f"ep_{checkpoint_episode:04d}"
+        if checkpoint_required
+        else None
+    )
     evaluation_episodes = (
         int(args.episodes)
         if args.episodes is not None
@@ -1650,43 +1676,48 @@ def run_evaluate(args):
         manifest, episode_count=evaluation_episodes
     )
     expected_training_config = dict(resolved["training_config"])
-    _, calibration = load_com_capacity_reference()
-    inspected = inspect_model_checkpoint(
-        checkpoint,
-        movement_state_dim=movement_state_dim,
-        joint_action_dim=JOINT_ACTION_DIM,
-        routing_state_dim=ROUTING_STATE_DIM,
-        td3_gamma=1.0,
-        ddqn_gamma=0.99,
-        calibration=calibration,
-        expected_experiment_metadata={
-            "method_spec_fingerprint": method.compatible_fingerprints,
-            "training_seed": int(resolved["seed"]),
-            **(
-                {"llm_artifact_identity": llm_identity}
-                if llm_identity is not None
-                else {}
-            ),
-            **(
-                {"potential_artifact_identity": potential_identity}
-                if potential_identity is not None
-                else {}
-            ),
-        },
-        expected_completed_episodes=checkpoint_episode,
-        expected_formal_config=expected_training_config,
-        current_training_manifest=training_manifest,
-        current_training_manifest_segments=training_manifest_segments,
-        training_run_directory=run_dir,
-        require_episode_directory=True,
-        movement_agent_kind=method.agent,
-    )
-    if llm_identity is not None:
-        load_run_artifact(checkpoint, llm_identity)
-    if potential_identity is not None:
-        load_potential_run_artifact(checkpoint, potential_identity)
+    inspected = None
+    if checkpoint_required:
+        _, calibration = load_com_capacity_reference()
+        inspected = inspect_model_checkpoint(
+            checkpoint,
+            movement_state_dim=movement_state_dim,
+            joint_action_dim=JOINT_ACTION_DIM,
+            routing_state_dim=ROUTING_STATE_DIM,
+            td3_gamma=1.0,
+            ddqn_gamma=0.99,
+            calibration=calibration,
+            expected_experiment_metadata={
+                "method_spec_fingerprint": method.compatible_fingerprints,
+                "training_seed": int(resolved["seed"]),
+                **(
+                    {"llm_artifact_identity": llm_identity}
+                    if llm_identity is not None
+                    else {}
+                ),
+                **(
+                    {"potential_artifact_identity": potential_identity}
+                    if potential_identity is not None
+                    else {}
+                ),
+            },
+            expected_completed_episodes=checkpoint_episode,
+            expected_formal_config=expected_training_config,
+            current_training_manifest=training_manifest,
+            current_training_manifest_segments=training_manifest_segments,
+            training_run_directory=run_dir,
+            require_episode_directory=True,
+            movement_agent_kind=method.agent,
+        )
+        if llm_identity is not None:
+            load_run_artifact(checkpoint, llm_identity)
+        if potential_identity is not None:
+            load_potential_run_artifact(checkpoint, potential_identity)
     output_dir = _create_unique_leaf(
-        run_dir / "evaluation" / f"ep_{checkpoint_episode}", "eval"
+        run_dir
+        / "evaluation"
+        / (f"ep_{checkpoint_episode}" if checkpoint_required else "no_checkpoint"),
+        "eval",
     )
     manifest.save(output_dir / "scenario_manifest.json")
     config = TrainingConfig(
@@ -1707,10 +1738,16 @@ def run_evaluate(args):
         scenario_manifest=manifest,
         method_spec=method,
         evaluation=True,
-        checkpoint_dir=checkpoint,
-        expected_checkpoint_episodes=checkpoint_episode,
-        expected_checkpoint_formal_config=expected_training_config,
-        expected_checkpoint_training_manifest=training_manifest,
+        checkpoint_dir=checkpoint if checkpoint_required else None,
+        expected_checkpoint_episodes=(
+            checkpoint_episode if checkpoint_required else None
+        ),
+        expected_checkpoint_formal_config=(
+            expected_training_config if checkpoint_required else None
+        ),
+        expected_checkpoint_training_manifest=(
+            training_manifest if checkpoint_required else None
+        ),
         llm_artifact_dir=llm_artifact_dir,
         potential_artifact_dir=potential_artifact_dir,
         llm_worker_timeout=float(
@@ -1731,28 +1768,51 @@ def run_evaluate(args):
     )
     formal_evaluation = bool(
         not args.smoke
-        and checkpoint_episode == FORMAL_CHECKPOINT_EPISODE
+        and (
+            not checkpoint_required
+            or checkpoint_episode == FORMAL_CHECKPOINT_EPISODE
+        )
         and evaluation_episodes
         == FORMAL_EXPERIMENT_DEFAULTS["evaluation_episodes_per_trained_seed"]
         and episode_seconds == FORMAL_EXPERIMENT_DEFAULTS["episode_seconds"]
     )
     metadata = {
         **result["run_metadata"],
-        "checkpoint": str(checkpoint.resolve()),
+        "source_run_directory": str(run_dir),
+        "source_run_method_id": method.method_id,
+        "checkpoint_required": checkpoint_required,
+        "checkpoint": str(checkpoint.resolve()) if checkpoint_required else None,
+        "checkpoint_path": (
+            str(checkpoint.resolve()) if checkpoint_required else None
+        ),
         "checkpoint_episode": checkpoint_episode,
-        **inspected["horizon_compatibility"],
+        **(inspected["horizon_compatibility"] if inspected is not None else {}),
         "evaluation_invariants": result["evaluation_invariants"],
         "evaluation_manifest": str((output_dir / "scenario_manifest.json").resolve()),
         "evaluation_run_directory": str(output_dir),
         "formal_evaluation": formal_evaluation,
         "smoke_evaluation": bool(args.smoke),
+        "evaluation_purpose": (
+            "formal_checkpoint_evaluation"
+            if formal_evaluation and checkpoint_required
+            else "formal_random_policy_baseline_evaluation"
+            if formal_evaluation
+            else "diagnostic_checkpoint_evaluation"
+            if checkpoint_required
+            else "diagnostic_random_policy_baseline_evaluation"
+        ),
+        "no_checkpoint_reason": (
+            None
+            if checkpoint_required
+            else "method learns neither movement nor routing; no neural checkpoint state exists"
+        ),
         "training_manifest_segments": training_manifest_segments,
         "checkpoint_training_manifest_segment": resolve_training_manifest_segment(
             run_dir,
             training_manifest_segments,
             checkpoint_episode,
             current_total_episodes=int(resolved["training_config"]["total_episodes"]),
-        ),
+        ) if checkpoint_required else None,
     }
     paths = write_evaluation_outputs(
         output_dir,

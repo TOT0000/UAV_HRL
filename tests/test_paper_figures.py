@@ -32,6 +32,7 @@ from paper_figures import (
     IncompatiblePaperRunError,
     PaperFigureSpecError,
     _build_violation,
+    _normalize_deadline_display_artifacts,
     build_paper_figures,
     causal_trailing_average,
     normalize_episode_ee,
@@ -84,6 +85,38 @@ class EpisodeEnergyEfficiencyTest(unittest.TestCase):
 
 
 class PooledMetricTest(unittest.TestCase):
+    def test_legacy_deadline_seconds_are_converted_once_to_milliseconds(self):
+        metadata = {
+            "points": [
+                {
+                    "point_id": "com_deadline_0.01s",
+                    "swept_task": "COM",
+                    "x_value": 0.01,
+                    "x_unit": "seconds",
+                }
+            ]
+        }
+        aggregates = [
+            {
+                "point_id": "com_deadline_0.01s",
+                "x_value": 0.01,
+                "x_unit": "seconds",
+            }
+        ]
+        provenance = [{"point_id": "com_deadline_0.01s"}]
+        _normalize_deadline_display_artifacts(
+            metadata, aggregates, provenance
+        )
+        _normalize_deadline_display_artifacts(
+            metadata, aggregates, provenance
+        )
+        for record in (metadata["points"][0], aggregates[0]):
+            self.assertEqual(record["point_id"], "com_deadline_10ms")
+            self.assertEqual(record["x_value"], 10.0)
+            self.assertEqual(record["x_unit"], "ms")
+            self.assertEqual(record["simulation_value_seconds"], 0.01)
+        self.assertEqual(provenance[0]["point_id"], "com_deadline_10ms")
+
     def test_delay_and_violation_pool_counts_not_episode_averages(self):
         base = {
             "timely_goodput_mbits": 2.0,
@@ -127,9 +160,9 @@ class PooledMetricTest(unittest.TestCase):
         aggregate_rows = []
         for method in methods:
             for swept_task in ("COM", "FOV"):
-                for threshold in (0.5, 1.0, 1.5, 2.0, 2.5, 3.0):
+                for threshold in (5.0, 10.0, 15.0, 20.0, 25.0, 30.0):
                     point_id = (
-                        f"{swept_task.lower()}_deadline_{threshold:g}s"
+                        f"{swept_task.lower()}_deadline_{threshold:g}ms"
                     )
                     aggregate_rows.extend(
                         (
@@ -158,6 +191,20 @@ class PooledMetricTest(unittest.TestCase):
         runs = {
             method: {
                 "evaluation_dir": "synthetic",
+                "metadata": {
+                    "points": [
+                        {
+                            "point_id": (
+                                f"{swept_task.lower()}_deadline_{threshold:g}ms"
+                            ),
+                            "x_value": threshold,
+                            "x_unit": "ms",
+                            "swept_task": swept_task,
+                        }
+                        for swept_task in ("COM", "FOV")
+                        for threshold in (5.0, 10.0, 15.0, 20.0, 25.0, 30.0)
+                    ]
+                },
                 "aggregate_rows": [
                     row for row in aggregate_rows if row["method_id"] == method
                 ],
@@ -372,7 +419,9 @@ class SyntheticFigureBuildTest(unittest.TestCase):
             else:
                 rates = {"FOV": float(point["x_value"]), "COM": 50.0}
         elif suite == "task_type_delay_violation_vs_target_delay":
-            deadlines[point["swept_task"]] = float(point["x_value"])
+            deadlines[point["swept_task"]] = float(
+                point["simulation_value_seconds"]
+            )
         return {
             "traffic_rates_packets_per_second": rates,
             "task_deadlines_seconds": deadlines,

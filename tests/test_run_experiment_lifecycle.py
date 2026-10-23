@@ -16,6 +16,86 @@ from Simulator import Simulator
 
 
 class SimpleRunnerLifecycleIntegrationTest(unittest.TestCase):
+    def test_pure_random_basic_evaluate_uses_no_checkpoint_path(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output = Path(temp_dir) / "results"
+            self.assertEqual(
+                main(
+                    [
+                        "kkm_random_action_random_routing",
+                        "--smoke",
+                        "--roi-count",
+                        "2",
+                        "--seed",
+                        "20260817",
+                        "--output-root",
+                        str(output),
+                    ]
+                ),
+                0,
+            )
+            run_dir = next(
+                (output / "kkm_random_action_random_routing").iterdir()
+            )
+            self.assertFalse((run_dir / "checkpoints" / "models").exists())
+
+            with mock.patch(
+                "run_experiment.inspect_model_checkpoint",
+                side_effect=AssertionError("must not inspect a checkpoint"),
+            ) as inspect_checkpoint, mock.patch(
+                "HRL_task_aware.load_model_checkpoint",
+                side_effect=AssertionError("must not load a checkpoint"),
+            ) as load_checkpoint:
+                self.assertEqual(main(["evaluate", str(run_dir), "--smoke"]), 0)
+            inspect_checkpoint.assert_not_called()
+            load_checkpoint.assert_not_called()
+
+            evaluation_root = run_dir / "evaluation"
+            self.assertFalse((evaluation_root / "ep_1500").exists())
+            evaluation_dir = next((evaluation_root / "no_checkpoint").iterdir())
+            metadata = json.loads(
+                (evaluation_dir / "run_metadata.json").read_text(encoding="utf-8")
+            )
+            self.assertFalse(metadata["checkpoint_required"])
+            self.assertEqual(metadata["source_run_directory"], str(run_dir))
+            self.assertEqual(
+                metadata["source_run_method_id"],
+                "kkm_random_action_random_routing",
+            )
+            self.assertIsNone(metadata["checkpoint"])
+            self.assertIsNone(metadata["checkpoint_path"])
+            self.assertIsNone(metadata["checkpoint_episode"])
+            self.assertIsNone(metadata["checkpoint_training_manifest_segment"])
+            self.assertFalse(metadata["formal_evaluation"])
+            self.assertEqual(
+                metadata["evaluation_purpose"],
+                "diagnostic_random_policy_baseline_evaluation",
+            )
+            self.assertIn("no neural checkpoint", metadata["no_checkpoint_reason"])
+
+            with self.assertRaisesRegex(ValueError, "not applicable"):
+                main(
+                    [
+                        "evaluate",
+                        str(run_dir),
+                        "--checkpoint-episode",
+                        "1",
+                        "--smoke",
+                    ]
+                )
+
+    def test_partially_random_methods_still_require_checkpoints(self):
+        from experiment_config import MethodSpec
+
+        routing_learner = MethodSpec.parse("random_action")
+        movement_learner = MethodSpec.parse("td3_dinkelbach_random_routing")
+        self.assertFalse(routing_learner.learns_movement)
+        self.assertTrue(routing_learner.learns_routing)
+        self.assertTrue(movement_learner.learns_movement)
+        self.assertFalse(movement_learner.learns_routing)
+        for method in (routing_learner, movement_learner):
+            self.assertTrue(method.learns_movement or method.learns_routing)
+
     def test_safe_ddqn_training_diagnostics_use_formal_warmups_and_resume(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             output = Path(temp_dir) / "results"

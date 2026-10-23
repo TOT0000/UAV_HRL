@@ -86,8 +86,17 @@ ARRIVAL_RATE_SWEEPS = {
     "COM": {"values": (50.0, 100.0, 150.0, 200.0), "fixed": {"FOV": 5.0}},
     "FOV": {"values": (10.0, 20.0, 30.0, 40.0), "fixed": {"COM": 50.0}},
 }
-DEADLINE_SWEEP_SECONDS = (0.5, 1.0, 1.5, 2.0, 2.5, 3.0)
-DEADLINE_SWEEP_INJECTION_CUTOFF_SECONDS = 57.0
+DEADLINE_SWEEP_SECONDS = (0.005, 0.010, 0.015, 0.020, 0.025, 0.030)
+DEADLINE_SWEEP_DISPLAY_MILLISECONDS = tuple(
+    value * 1000.0 for value in DEADLINE_SWEEP_SECONDS
+)
+DEADLINE_SWEEP_INJECTION_CUTOFF_SECONDS = (
+    float(FORMAL_EXPERIMENT_DEFAULTS["episode_seconds"])
+    - max(
+        max(DEADLINE_SWEEP_SECONDS),
+        max(float(value) for value in PRODUCTION_TASK_DEADLINE_SECONDS.values()),
+    )
+)
 
 _FIXED_ROI_METHODS = tuple(
     dict.fromkeys(
@@ -148,6 +157,10 @@ _EVALUATION_METHOD_BASELINES = {
     "td3_dinkelbach_llm": "td3_dinkelbach",
     "td3_dinkelbach_llm_search": "td3_dinkelbach",
     "td3_dinkelbach_llm_train_search": "td3_dinkelbach",
+    "td3_dinkelbach_llm_explorer": "td3_dinkelbach",
+    "td3_dinkelbach_llm_explorer_v3": "td3_dinkelbach",
+    "td3_dinkelbach_llm_explorer_td3_only": "td3_dinkelbach",
+    "td3_dinkelbach_llm_explorer_state_rule": "td3_dinkelbach",
 }
 
 
@@ -275,45 +288,45 @@ def evaluation_sweep_points(
         return tuple(points)
     if kind == "deadline":
         defaults = validate_production_deadlines()
-        if deadline_seconds is None:
-            sweep_seconds = DEADLINE_SWEEP_SECONDS
-            injection_cutoff_seconds = (
-                DEADLINE_SWEEP_INJECTION_CUTOFF_SECONDS
+        sweep_seconds = (
+            DEADLINE_SWEEP_SECONDS
+            if deadline_seconds is None
+            else _validate_deadline_seconds(deadline_seconds)
+        )
+        horizon_seconds = float(
+            FORMAL_EXPERIMENT_DEFAULTS["episode_seconds"]
+            if episode_seconds is None
+            else episode_seconds
+        )
+        if not math.isfinite(horizon_seconds) or horizon_seconds <= 0.0:
+            raise ValueError(
+                "episode_seconds must be finite and greater than zero for "
+                "deadline_seconds"
             )
-        else:
-            sweep_seconds = _validate_deadline_seconds(deadline_seconds)
-            if episode_seconds is None:
-                raise ValueError(
-                    "episode_seconds is required for custom deadline_seconds"
-                )
-            horizon_seconds = float(episode_seconds)
-            if not math.isfinite(horizon_seconds) or horizon_seconds <= 0.0:
-                raise ValueError(
-                    "episode_seconds must be finite and greater than zero for "
-                    "custom deadline_seconds"
-                )
-            max_required_deadline = max(
-                max(sweep_seconds),
-                defaults["FOV"],
-                defaults["COM"],
+        max_required_deadline = max(
+            max(sweep_seconds),
+            defaults["FOV"],
+            defaults["COM"],
+        )
+        if max_required_deadline >= horizon_seconds:
+            raise ValueError(
+                "maximum required deadline must be less than episode_seconds: "
+                f"deadline={max_required_deadline:g}, "
+                f"episode_seconds={horizon_seconds:g}"
             )
-            if max_required_deadline >= horizon_seconds:
-                raise ValueError(
-                    "maximum required deadline must be less than episode_seconds: "
-                    f"deadline={max_required_deadline:g}, "
-                    f"episode_seconds={horizon_seconds:g}"
-                )
-            injection_cutoff_seconds = (
-                horizon_seconds - max_required_deadline
-            )
+        injection_cutoff_seconds = horizon_seconds - max_required_deadline
         points = []
         for task_type in ("COM", "FOV"):
             for value in sweep_seconds:
+                display_milliseconds = value * 1000.0
                 deadlines = dict(defaults)
                 deadlines[task_type] = value
                 points.append(
                     {
-                        "point_id": f"{task_type.lower()}_deadline_{value:g}s",
+                        "point_id": (
+                            f"{task_type.lower()}_deadline_"
+                            f"{display_milliseconds:g}ms"
+                        ),
                         "overrides": {
                             "fov_deadline_seconds": deadlines["FOV"],
                             "com_deadline_seconds": deadlines["COM"],
@@ -321,8 +334,10 @@ def evaluation_sweep_points(
                         },
                         "swept_task": task_type,
                         "display_task": "VS" if task_type == "FOV" else "COM",
-                        "x_value": value,
-                        "x_unit": "seconds",
+                        "x_value": display_milliseconds,
+                        "x_unit": "ms",
+                        "simulation_value_seconds": value,
+                        "simulation_unit": "seconds",
                     }
                 )
         return tuple(points)
@@ -1019,6 +1034,19 @@ def run_paper_evaluation(
                         "llm_worker_timeout_seconds", 60.0
                     )
                 ),
+                llm_explorer_model=(
+                    (context.get("resolved") or {}).get("llm_explorer") or {}
+                ).get("model", "gpt-4o-mini"),
+                llm_explorer_timeout=float(
+                    (
+                        (context.get("resolved") or {}).get("llm_explorer")
+                        or {}
+                    ).get("request_timeout_seconds", 60.0)
+                ),
+                # Evaluation controllers stay offline and return disabled
+                # guidance; this flag must never mirror a training run's
+                # live/mock client configuration.
+                llm_explorer_mock=False,
             )
         diagnostic_outputs = write_packet_routing_diagnostic_artifacts(
             point_dir,
@@ -1074,6 +1102,10 @@ def run_paper_evaluation(
             "checkpoint_path": (
                 str(context["checkpoint"]) if checkpoint_required else None
             ),
+            "evaluation_invariants": result["evaluation_invariants"],
+            "evaluation_state_fingerprints": result[
+                "evaluation_state_fingerprints"
+            ],
             "roi_count": (
                 int(fixed_num_gt) if fixed_num_gt is not None else None
             ),
@@ -1267,6 +1299,10 @@ def run_paper_evaluation(
                 "checkpoint_path": (
                     str(context["checkpoint"]) if checkpoint_required else None
                 ),
+                "evaluation_invariants": result["evaluation_invariants"],
+                "evaluation_state_fingerprints": result[
+                    "evaluation_state_fingerprints"
+                ],
                 "roi_count": (
                     int(fixed_num_gt) if fixed_num_gt is not None else None
                 ),
@@ -1382,6 +1418,31 @@ def run_paper_evaluation(
         "evaluation_seed": context["training_seed"],
         "manifest_seed": requested_manifest_seed,
         "evaluation_episodes_per_point": resolved_episodes,
+        **(
+            {
+                "deadline_sweep": {
+                    "simulation_values_seconds": [
+                        float(point["simulation_value_seconds"])
+                        for point in points
+                        if point["swept_task"] == "COM"
+                    ],
+                    "display_values_milliseconds": [
+                        float(point["x_value"])
+                        for point in points
+                        if point["swept_task"] == "COM"
+                    ],
+                    "simulation_unit": "seconds",
+                    "display_unit": "ms",
+                    "packet_injection_cutoff_seconds": float(
+                        points[0]["overrides"][
+                            "packet_injection_cutoff_seconds"
+                        ]
+                    ),
+                }
+            }
+            if definition["kind"] == "deadline"
+            else {}
+        ),
         **(
             {
                 "search_diagnostics_enabled": True,

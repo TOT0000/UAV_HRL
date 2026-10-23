@@ -244,7 +244,18 @@ def _expected_resolved_overrides(suite, point):
             "com_rate_packets_per_second": rates["COM"],
         }
     elif suite == "task_type_delay_violation_vs_target_delay":
-        value = float(point["x_value"])
+        if "simulation_value_seconds" in point:
+            value = float(point["simulation_value_seconds"])
+        elif point.get("x_unit") == "seconds":
+            # Compatibility with evaluation artifacts written before the
+            # millisecond display contract was introduced.
+            value = float(point["x_value"])
+        elif point.get("x_unit") == "ms":
+            value = float(point["x_value"]) / 1000.0
+        else:
+            raise IncompatiblePaperRunError(
+                "deadline point has an unsupported or missing x_unit"
+            )
         if point["swept_task"] not in deadlines:
             raise IncompatiblePaperRunError("deadline point has an invalid swept_task")
         deadlines[point["swept_task"]] = value
@@ -264,6 +275,67 @@ def _expected_resolved_overrides(suite, point):
         },
     }
     return flat, expected
+
+
+def _normalize_deadline_display_artifacts(metadata, aggregate_rows, point_provenance):
+    """Normalize explicit legacy seconds to the current millisecond display."""
+
+    point_id_map = {}
+    for point, provenance in zip(metadata["points"], point_provenance):
+        seconds = (
+            float(point["simulation_value_seconds"])
+            if "simulation_value_seconds" in point
+            else float(point["x_value"])
+            if point.get("x_unit") == "seconds"
+            else float(point["x_value"]) / 1000.0
+            if point.get("x_unit") == "ms"
+            else None
+        )
+        if seconds is None:
+            raise IncompatiblePaperRunError(
+                "deadline point has an unsupported or missing x_unit"
+            )
+        display_milliseconds = seconds * 1000.0
+        old_point_id = point["point_id"]
+        new_point_id = (
+            f"{point['swept_task'].lower()}_deadline_"
+            f"{display_milliseconds:g}ms"
+        )
+        point_id_map[old_point_id] = new_point_id
+        point.update(
+            point_id=new_point_id,
+            x_value=display_milliseconds,
+            x_unit="ms",
+            simulation_value_seconds=seconds,
+            simulation_unit="seconds",
+        )
+        provenance["point_id"] = new_point_id
+    for row in aggregate_rows:
+        old_point_id = row.get("point_id")
+        if old_point_id not in point_id_map:
+            raise IncompatiblePaperRunError(
+                f"deadline aggregate has an unknown point_id: {old_point_id}"
+            )
+        seconds = (
+            float(row["simulation_value_seconds"])
+            if "simulation_value_seconds" in row
+            else float(row["x_value"])
+            if row.get("x_unit") == "seconds"
+            else float(row["x_value"]) / 1000.0
+            if row.get("x_unit") == "ms"
+            else None
+        )
+        if seconds is None:
+            raise IncompatiblePaperRunError(
+                "deadline aggregate has an unsupported or missing x_unit"
+            )
+        row.update(
+            point_id=point_id_map[old_point_id],
+            x_value=seconds * 1000.0,
+            x_unit="ms",
+            simulation_value_seconds=seconds,
+            simulation_unit="seconds",
+        )
 
 
 def _validate_manifest_point(point, metadata, suite):
@@ -741,6 +813,10 @@ def _resolve_evaluation_run(method_id, entry, spec_dir, expected_suite):
     if not isinstance(aggregate_rows, list) or not aggregate_rows:
         raise PaperFigureSpecError(f"evaluation aggregate is empty: {aggregate_path}")
     _validate_aggregate_layers(evaluation_dir, metadata, aggregate_rows)
+    if expected_suite == "task_type_delay_violation_vs_target_delay":
+        _normalize_deadline_display_artifacts(
+            metadata, aggregate_rows, point_provenance
+        )
     return {
         "evaluation_dir": evaluation_dir,
         "metadata": metadata,
@@ -995,9 +1071,20 @@ def _resolve_suite_runs(spec, spec_path, suite, methods):
         (point.get("point_id"), point.get("x_value"), point.get("x_unit"))
         for point in next(iter(runs.values()))["metadata"]["points"]
     )
-    if actual != expected:
+    accepted = (expected,)
+    if suite == "task_type_delay_violation_vs_target_delay":
+        # Legacy artifacts swept 0.5--3.0 seconds.  They remain readable, but
+        # are normalized above to 500--3000 ms rather than relabeled as 0.5--3 ms.
+        accepted += (
+            tuple(
+                (f"{task.lower()}_deadline_{value:g}ms", value, "ms")
+                for task in ("COM", "FOV")
+                for value in (500.0, 1000.0, 1500.0, 2000.0, 2500.0, 3000.0)
+            ),
+        )
+    if actual not in accepted:
         raise IncompatiblePaperRunError(
-            f"{suite} sweep contract mismatch: expected={expected}, found={actual}"
+            f"{suite} sweep contract mismatch: expected one of {accepted}, found={actual}"
         )
     return runs
 
@@ -1020,9 +1107,9 @@ def _expected_sweep_signature(suite):
         )
     if suite == "task_type_delay_violation_vs_target_delay":
         return tuple(
-            (f"{task.lower()}_deadline_{value:g}s", value, "seconds")
+            (f"{task.lower()}_deadline_{value:g}ms", value, "ms")
             for task in ("COM", "FOV")
-            for value in (0.5, 1.0, 1.5, 2.0, 2.5, 3.0)
+            for value in (5.0, 10.0, 15.0, 20.0, 25.0, 30.0)
         )
     raise PaperFigureSpecError(f"no sweep contract for semantic suite: {suite}")
 
@@ -1541,10 +1628,10 @@ def _build_violation(spec, spec_path, output_dir, git_sha):
     figure_id = "task_type_delay_violation_vs_target_delay"
     methods = tuple(PAPER_METHOD_MAPPINGS[figure_id])
     runs = _resolve_suite_runs(spec, spec_path, figure_id, methods)
-    point_ids = tuple(
-        f"{task.lower()}_deadline_{value:g}s"
-        for task in ("COM", "FOV")
-        for value in (0.5, 1.0, 1.5, 2.0, 2.5, 3.0)
+    reference_points = next(iter(runs.values()))["metadata"]["points"]
+    point_ids = tuple(point["point_id"] for point in reference_points)
+    x_values = tuple(
+        sorted({float(point["x_value"]) for point in reference_points})
     )
     rows = _metric_rows(
         runs,
@@ -1585,10 +1672,10 @@ def _build_violation(spec, spec_path, output_dir, git_sha):
                 label=f"{style['label']} ({task_label})",
             )
             plotted.extend({**row, "display_name": style["label"], "plot_value": (row["value"] if row["value"] and row["value"] > 0 else None), "log_zero_omitted": row["value"] == 0} for row in selected)
-    axis.set_xlabel("Delay threshold (s)")
+    axis.set_xlabel("Delay threshold (ms)")
     axis.set_ylabel("Delay Violation Probability")
     axis.set_yscale("log")
-    axis.set_xticks((0.5, 1.0, 1.5, 2.0, 2.5, 3.0))
+    axis.set_xticks(x_values)
     axis.grid(True, which="both", linestyle="--", alpha=0.5)
     axis.legend(ncol=2, loc="lower left", fontsize="small")
     figure.tight_layout()
@@ -1604,6 +1691,8 @@ def _build_violation(spec, spec_path, output_dir, git_sha):
                 "(FOV eligible packets + COM eligible packets) across episodes"
             ),
             "zero_probability_log_handling": "omitted as non-representable on log scale; no epsilon fabricated",
+            "deadline_display_unit": "ms",
+            "deadline_simulation_unit": "seconds",
             "git_sha": git_sha,
         },
     )

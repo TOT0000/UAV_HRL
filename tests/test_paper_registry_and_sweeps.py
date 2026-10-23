@@ -1,4 +1,7 @@
 import math
+import json
+from pathlib import Path
+import tempfile
 import unittest
 from unittest import mock
 
@@ -10,11 +13,13 @@ from experiment_config import (
 )
 from paper_evaluation import (
     ARRIVAL_RATE_SWEEPS,
+    DEADLINE_SWEEP_DISPLAY_MILLISECONDS,
     DEADLINE_SWEEP_INJECTION_CUTOFF_SECONDS,
     DEADLINE_SWEEP_SECONDS,
     FIXED_ROI_VALUES,
     PAPER_EVALUATION_SUITES,
     TRAJECTORY_SNAPSHOT_SECONDS,
+    evaluation_method_supported,
     evaluation_sweep_points,
     run_paper_evaluation,
 )
@@ -31,6 +36,8 @@ from run_paper_evaluation import (
     build_parser as build_evaluation_parser,
     main as run_evaluation_main,
 )
+from run_experiment import main as run_experiment_main
+from scenario_manifest import generate_manifest
 
 
 EXPECTED_SEMANTIC_FIGURES = (
@@ -168,14 +175,39 @@ class PaperSweepContractTest(unittest.TestCase):
     def test_deadline_and_fixed_roi_contracts(self):
         points = evaluation_sweep_points("task_type_delay_violation_vs_target_delay")
         self.assertEqual(len(points), 12)
-        self.assertEqual(DEADLINE_SWEEP_SECONDS, (0.5, 1.0, 1.5, 2.0, 2.5, 3.0))
-        self.assertEqual(DEADLINE_SWEEP_INJECTION_CUTOFF_SECONDS, 57.0)
+        self.assertEqual(
+            DEADLINE_SWEEP_SECONDS,
+            (0.005, 0.010, 0.015, 0.020, 0.025, 0.030),
+        )
+        self.assertEqual(
+            DEADLINE_SWEEP_DISPLAY_MILLISECONDS,
+            (5.0, 10.0, 15.0, 20.0, 25.0, 30.0),
+        )
+        self.assertEqual(DEADLINE_SWEEP_INJECTION_CUTOFF_SECONDS, 59.97)
         self.assertEqual(
             {
                 point["overrides"]["packet_injection_cutoff_seconds"]
                 for point in points
             },
-            {57.0},
+            {59.97},
+        )
+        com = [point for point in points if point["swept_task"] == "COM"]
+        fov = [point for point in points if point["swept_task"] == "FOV"]
+        self.assertEqual(
+            tuple(point["x_value"] for point in com),
+            DEADLINE_SWEEP_DISPLAY_MILLISECONDS,
+        )
+        self.assertEqual(
+            tuple(point["simulation_value_seconds"] for point in fov),
+            DEADLINE_SWEEP_SECONDS,
+        )
+        self.assertEqual(
+            {point["overrides"]["fov_deadline_seconds"] for point in com},
+            {0.015},
+        )
+        self.assertEqual(
+            {point["overrides"]["com_deadline_seconds"] for point in fov},
+            {0.010},
         )
         self.assertEqual(FIXED_ROI_VALUES, tuple(range(2, 9)))
         self.assertEqual(
@@ -196,14 +228,20 @@ class PaperSweepContractTest(unittest.TestCase):
     def test_custom_deadline_sweep_preserves_order_and_opposite_defaults(self):
         points = evaluation_sweep_points(
             "task_type_delay_violation_vs_target_delay",
-            deadline_seconds=(1, 2, 4, 5),
-            episode_seconds=60,
+            deadline_seconds=(0.007, 0.011, 0.019, 0.023),
+            episode_seconds=45,
         )
         self.assertEqual(len(points), 8)
         com = [point for point in points if point["swept_task"] == "COM"]
         fov = [point for point in points if point["swept_task"] == "FOV"]
-        self.assertEqual(tuple(point["x_value"] for point in com), (1.0, 2.0, 4.0, 5.0))
-        self.assertEqual(tuple(point["x_value"] for point in fov), (1.0, 2.0, 4.0, 5.0))
+        self.assertEqual(
+            tuple(point["x_value"] for point in com),
+            (7.0, 11.0, 19.0, 23.0),
+        )
+        self.assertEqual(
+            tuple(point["simulation_value_seconds"] for point in fov),
+            (0.007, 0.011, 0.019, 0.023),
+        )
         self.assertEqual(
             {point["overrides"]["fov_deadline_seconds"] for point in com},
             {0.015},
@@ -217,10 +255,11 @@ class PaperSweepContractTest(unittest.TestCase):
                 point["overrides"]["packet_injection_cutoff_seconds"]
                 for point in points
             },
-            {55.0},
+            {44.977},
         )
         for point in points:
-            self.assertEqual(point["x_unit"], "seconds")
+            self.assertEqual(point["x_unit"], "ms")
+            self.assertEqual(point["simulation_unit"], "seconds")
             self.assertIn("fov_deadline_seconds", point["overrides"])
             self.assertIn("com_deadline_seconds", point["overrides"])
 
@@ -249,6 +288,99 @@ class PaperSweepContractTest(unittest.TestCase):
                 deadline_seconds=(1, 5),
                 episode_seconds=5,
             )
+
+    def test_llm_explorer_methods_are_explicitly_eligible_without_changing_defaults(self):
+        explorer_methods = (
+            "td3_dinkelbach_llm_explorer",
+            "td3_dinkelbach_llm_explorer_v3",
+            "td3_dinkelbach_llm_explorer_td3_only",
+            "td3_dinkelbach_llm_explorer_state_rule",
+        )
+        suites = (
+            "task_type_delay_vs_arrival_rate",
+            "task_type_delay_violation_vs_target_delay",
+            "uav_trajectory_snapshots",
+        )
+        for method_id in explorer_methods:
+            for suite in suites:
+                with self.subTest(method=method_id, suite=suite):
+                    self.assertTrue(evaluation_method_supported(method_id, suite))
+                    self.assertNotIn(
+                        method_id,
+                        PAPER_EVALUATION_SUITES[suite]["methods"],
+                    )
+
+    def test_llm_explorer_trajectory_path_completes_offline_with_real_identity(self):
+        method_id = "td3_dinkelbach_llm_explorer_v3"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            training_root = root / "training"
+            self.assertEqual(
+                run_experiment_main(
+                    [
+                        method_id,
+                        "--llm-explorer-mock",
+                        "--episodes",
+                        "1",
+                        "--episode-seconds",
+                        "1",
+                        "--checkpoint-interval",
+                        "1",
+                        "--roi-count",
+                        "2",
+                        "--seed",
+                        "20260817",
+                        "--output-root",
+                        str(training_root),
+                    ]
+                ),
+                0,
+            )
+            run_dir = next((training_root / method_id).iterdir())
+            manifest = generate_manifest("test", 20260818, 1, num_gt=2)
+            manifest_path = root / "trajectory_manifest.json"
+            manifest.save(manifest_path)
+            output = root / "trajectory_evaluation"
+            with mock.patch(
+                "paper_evaluation.TRAJECTORY_SNAPSHOT_SECONDS", (1.0,)
+            ), mock.patch(
+                "llm_design.OpenAIClient",
+                side_effect=AssertionError("evaluation must not create a live client"),
+            ):
+                result = run_paper_evaluation(
+                    method_id,
+                    run_directory=run_dir,
+                    suite="uav_trajectory_snapshots",
+                    manifest_path=manifest_path,
+                    episodes=1,
+                    episode_seconds=1,
+                    checkpoint_episode=1,
+                    target_uav_id=0,
+                    output_directory=output,
+                )
+            self.assertEqual(result["method_id"], method_id)
+            self.assertEqual(
+                result["points"][0]["scenario_ids"],
+                [entry["scenario_id"] for entry in manifest.episodes],
+            )
+            point_dir = output / "trajectory"
+            artifacts = json.loads(
+                (point_dir / "trajectory_artifacts.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(len(artifacts), 1)
+            self.assertEqual(artifacts[0]["method_id"], method_id)
+            self.assertEqual(artifacts[0]["target_uav_id"], 0)
+            self.assertEqual(artifacts[0]["requested_times_seconds"], [1.0])
+            self.assertEqual(
+                artifacts[0]["scenario_manifest_hash"], manifest.content_hash
+            )
+            self.assertTrue(artifacts[0]["checkpoint_path"].endswith("ep_0001"))
+            point_metadata = json.loads(
+                (point_dir / "run_metadata.json").read_text(encoding="utf-8")
+            )
+            self.assertTrue(all(point_metadata["evaluation_invariants"].values()))
 
     def test_run_api_rejects_invalid_deadline_before_loading_checkpoint(self):
         with mock.patch("paper_evaluation._load_training_run") as load_run:

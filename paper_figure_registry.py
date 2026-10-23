@@ -354,7 +354,7 @@ FIGURE_REGISTRY = MappingProxyType(
             "screenshot_reference": "log-y line chart; screenshot 2026-08-21 223119",
             "subplots": [1, 1],
             "methods": PAPER_METHOD_MAPPINGS["task_type_delay_violation_vs_target_delay"],
-            "intentional_changes": ["deadline threshold is displayed in seconds (0.5 through 3.0)"],
+            "intentional_changes": ["deadline threshold is displayed in milliseconds (5 through 30 ms)"],
         },
         "task_type_delay_vs_number_of_rois": {
             "output_stem": "Task_type_delay_Vs_number_of_RoIs",

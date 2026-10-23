@@ -174,8 +174,11 @@ class QosAndCheckpointContractTest(unittest.TestCase):
                 FORMAL_EXPERIMENT_DEFAULTS["episode_seconds"],
             )
         )
-        self.assertEqual(DEADLINE_SWEEP_SECONDS, (0.5, 1.0, 1.5, 2.0, 2.5, 3.0))
-        self.assertEqual(DEADLINE_SWEEP_INJECTION_CUTOFF_SECONDS, 57.0)
+        self.assertEqual(
+            DEADLINE_SWEEP_SECONDS,
+            (0.005, 0.010, 0.015, 0.020, 0.025, 0.030),
+        )
+        self.assertEqual(DEADLINE_SWEEP_INJECTION_CUTOFF_SECONDS, 59.97)
 
     def test_schema_21_and_90d_current_schema_are_rejected(self):
         self.assertEqual(CHECKPOINT_SCHEMA_VERSION, 35)
