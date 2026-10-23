@@ -26,6 +26,7 @@ from paper_figure_registry import (
     PLOT_STYLES,
     resolve_figure_ids,
 )
+from paper_evaluation import evaluation_method_supported
 from paper_metrics import (
     ENVIRONMENT_SIZE_AGGREGATE_CONTRACT_VERSION,
     PAPER_AGGREGATE_SCHEMA_VERSION,
@@ -277,31 +278,162 @@ def _expected_resolved_overrides(suite, point):
     return flat, expected
 
 
+def _finite_positive_number(value, *, context):
+    try:
+        result = float(value)
+    except (TypeError, ValueError) as exc:
+        raise IncompatiblePaperRunError(f"{context} must be numeric") from exc
+    if not math.isfinite(result):
+        raise IncompatiblePaperRunError(f"{context} must be finite")
+    if result <= 0.0:
+        raise IncompatiblePaperRunError(f"{context} must be greater than zero")
+    return result
+
+
+def _deadline_seconds(record, *, context):
+    """Read an explicitly unit-tagged deadline without magnitude guessing."""
+
+    simulation_seconds = None
+    if "simulation_value_seconds" in record:
+        if record.get("simulation_unit", "seconds") != "seconds":
+            raise IncompatiblePaperRunError(
+                f"{context} has contradictory simulation_unit; expected seconds"
+            )
+        simulation_seconds = _finite_positive_number(
+            record["simulation_value_seconds"],
+            context=f"{context} simulation_value_seconds",
+        )
+
+    x_seconds = None
+    if "x_value" in record:
+        x_value = _finite_positive_number(
+            record["x_value"], context=f"{context} x_value"
+        )
+        x_unit = record.get("x_unit")
+        if x_unit == "seconds":
+            x_seconds = x_value
+        elif x_unit == "ms":
+            x_seconds = x_value / 1000.0
+        else:
+            raise IncompatiblePaperRunError(
+                f"{context} has an unsupported or missing x_unit: {x_unit!r}"
+            )
+
+    if simulation_seconds is None and x_seconds is None:
+        raise IncompatiblePaperRunError(
+            f"{context} lacks an explicit deadline value and unit"
+        )
+    if (
+        simulation_seconds is not None
+        and x_seconds is not None
+        and not math.isclose(simulation_seconds, x_seconds, rel_tol=1e-12, abs_tol=1e-15)
+    ):
+        raise IncompatiblePaperRunError(
+            f"{context} has contradictory seconds and display values"
+        )
+    return simulation_seconds if simulation_seconds is not None else x_seconds
+
+
+def _validate_deadline_sweep_metadata(metadata):
+    points = metadata["points"]
+    by_task = {"COM": [], "FOV": []}
+    seen = set()
+    for point in points:
+        task = point.get("swept_task")
+        if task not in by_task:
+            raise IncompatiblePaperRunError(
+                f"deadline point has an invalid swept_task: {task!r}"
+            )
+        seconds = _deadline_seconds(
+            point, context=f"deadline point {point.get('point_id')!r}"
+        )
+        key = (task, seconds)
+        if key in seen:
+            raise IncompatiblePaperRunError(
+                f"deadline sweep contains duplicate point: task={task}, seconds={seconds:g}"
+            )
+        seen.add(key)
+        by_task[task].append(seconds)
+
+    canonical = tuple(sorted(by_task["COM"]))
+    if not canonical or tuple(sorted(by_task["FOV"])) != canonical:
+        raise IncompatiblePaperRunError(
+            "deadline sweep must contain identical non-empty COM and FOV point sets"
+        )
+
+    sweep = metadata.get("deadline_sweep")
+    if sweep is not None:
+        if not isinstance(sweep, dict):
+            raise IncompatiblePaperRunError("deadline_sweep metadata must be an object")
+        if sweep.get("simulation_unit") != "seconds" or sweep.get("display_unit") != "ms":
+            raise IncompatiblePaperRunError(
+                "deadline_sweep metadata must explicitly use seconds for simulation and ms for display"
+            )
+        seconds_values = tuple(
+            _finite_positive_number(value, context="deadline_sweep simulation value")
+            for value in sweep.get("simulation_values_seconds", ())
+        )
+        display_values = tuple(
+            _finite_positive_number(value, context="deadline_sweep display value")
+            for value in sweep.get("display_values_milliseconds", ())
+        )
+        if not seconds_values or len(set(seconds_values)) != len(seconds_values):
+            raise IncompatiblePaperRunError(
+                "deadline_sweep simulation values must be non-empty and contain no duplicates"
+            )
+        if len(display_values) != len(seconds_values) or len(set(display_values)) != len(display_values):
+            raise IncompatiblePaperRunError(
+                "deadline_sweep display values must match simulation values without duplicates"
+            )
+        if any(
+            not math.isclose(milliseconds, seconds * 1000.0, rel_tol=1e-12, abs_tol=1e-12)
+            for seconds, milliseconds in zip(seconds_values, display_values)
+        ):
+            raise IncompatiblePaperRunError(
+                "deadline_sweep seconds and millisecond values are contradictory"
+            )
+        if tuple(sorted(seconds_values)) != canonical:
+            raise IncompatiblePaperRunError(
+                "deadline_sweep metadata does not match its point metadata"
+            )
+        cutoff = _finite_positive_number(
+            sweep.get("packet_injection_cutoff_seconds"),
+            context="deadline_sweep packet_injection_cutoff_seconds",
+        )
+        point_cutoffs = {
+            float(point["resolved_overrides"]["packet_injection_cutoff_seconds"])
+            for point in points
+        }
+        if len(point_cutoffs) != 1 or not math.isclose(
+            cutoff, next(iter(point_cutoffs)), rel_tol=1e-12, abs_tol=1e-12
+        ):
+            raise IncompatiblePaperRunError(
+                "deadline_sweep injection cutoff does not match resolved point overrides"
+            )
+    return canonical
+
+
 def _normalize_deadline_display_artifacts(metadata, aggregate_rows, point_provenance):
-    """Normalize explicit legacy seconds to the current millisecond display."""
+    """Normalize explicit seconds to ms in loaded copies, once and losslessly."""
 
     point_id_map = {}
+    normalized_ids = set()
     for point, provenance in zip(metadata["points"], point_provenance):
-        seconds = (
-            float(point["simulation_value_seconds"])
-            if "simulation_value_seconds" in point
-            else float(point["x_value"])
-            if point.get("x_unit") == "seconds"
-            else float(point["x_value"]) / 1000.0
-            if point.get("x_unit") == "ms"
-            else None
+        seconds = _deadline_seconds(
+            point, context=f"deadline point {point.get('point_id')!r}"
         )
-        if seconds is None:
-            raise IncompatiblePaperRunError(
-                "deadline point has an unsupported or missing x_unit"
-            )
         display_milliseconds = seconds * 1000.0
         old_point_id = point["point_id"]
         new_point_id = (
             f"{point['swept_task'].lower()}_deadline_"
             f"{display_milliseconds:g}ms"
         )
-        point_id_map[old_point_id] = new_point_id
+        if new_point_id in normalized_ids:
+            raise IncompatiblePaperRunError(
+                f"deadline sweep normalizes to duplicate point_id: {new_point_id}"
+            )
+        normalized_ids.add(new_point_id)
+        point_id_map[old_point_id] = (new_point_id, seconds)
         point.update(
             point_id=new_point_id,
             x_value=display_milliseconds,
@@ -316,21 +448,16 @@ def _normalize_deadline_display_artifacts(metadata, aggregate_rows, point_proven
             raise IncompatiblePaperRunError(
                 f"deadline aggregate has an unknown point_id: {old_point_id}"
             )
-        seconds = (
-            float(row["simulation_value_seconds"])
-            if "simulation_value_seconds" in row
-            else float(row["x_value"])
-            if row.get("x_unit") == "seconds"
-            else float(row["x_value"]) / 1000.0
-            if row.get("x_unit") == "ms"
-            else None
+        seconds = _deadline_seconds(
+            row, context=f"deadline aggregate {old_point_id!r}"
         )
-        if seconds is None:
+        new_point_id, point_seconds = point_id_map[old_point_id]
+        if not math.isclose(seconds, point_seconds, rel_tol=1e-12, abs_tol=1e-15):
             raise IncompatiblePaperRunError(
-                "deadline aggregate has an unsupported or missing x_unit"
+                f"deadline aggregate value disagrees with point metadata: {old_point_id}"
             )
         row.update(
-            point_id=point_id_map[old_point_id],
+            point_id=new_point_id,
             x_value=seconds * 1000.0,
             x_unit="ms",
             simulation_value_seconds=seconds,
@@ -760,6 +887,12 @@ def _resolve_evaluation_run(method_id, entry, spec_dir, expected_suite):
     points = metadata.get("points")
     if not isinstance(points, list) or not points:
         raise PaperFigureSpecError(f"evaluation has no point metadata: {evaluation_dir}")
+    if expected_suite == "task_type_delay_violation_vs_target_delay":
+        for point in points:
+            _deadline_seconds(
+                point,
+                context=f"deadline point {point.get('point_id')!r}",
+            )
     for point in points:
         if bool(point.get("checkpoint_required")) != checkpoint_required:
             raise IncompatiblePaperRunError(
@@ -887,6 +1020,11 @@ def _emit(figure_id, figure, output_dir, rows, resolved, json_value=None):
         "axes_count": len(axes),
         "axes_titles": [axis.get_title() for axis in axes],
         "axes_title_positions": [list(axis.title.get_position()) for axis in axes],
+        "axes_x_ticks": [axis.get_xticks().tolist() for axis in axes],
+        "axes_x_tick_labels": [
+            [label.get_text() for label in axis.get_xticklabels()] for axis in axes
+        ],
+        "axes_legend_labels": [axis.get_legend_handles_labels()[1] for axis in axes],
     }
     if render_contract["axes_count"] != 1:
         raise PaperFigureSpecError(
@@ -945,6 +1083,101 @@ def _evaluation_entries(spec, suite):
     if not isinstance(groups, dict) or not isinstance(groups.get(suite), dict):
         raise PaperFigureSpecError(f"paper spec must contain evaluation_runs.{suite}")
     return groups[suite]
+
+
+def _validate_figure_method_selection_keys(spec):
+    selections = spec.get("figure_methods")
+    if selections is None:
+        return
+    if not isinstance(selections, dict):
+        raise PaperFigureSpecError("figure_methods must be an object")
+    selectable = {
+        "uav_trajectory_snapshots",
+        "task_type_delay_vs_arrival_rate",
+        "task_type_delay_violation_vs_target_delay",
+        *(
+            figure_id
+            for figure_id in FIGURE_REGISTRY
+            if figure_id.startswith("uav_trajectory_t_")
+            or figure_id
+            in {
+                "com_task_delay_vs_arrival_rate",
+                "vs_task_delay_vs_arrival_rate",
+            }
+        ),
+    }
+    unsupported = sorted(set(selections).difference(selectable))
+    if unsupported:
+        raise PaperFigureSpecError(
+            f"figure_methods contains unknown or unsupported figure keys: {unsupported}"
+        )
+
+
+def _selected_figure_methods(
+    spec,
+    *,
+    figure_id,
+    suite,
+    defaults,
+    single=False,
+):
+    """Resolve an optional per-figure method selection while preserving defaults."""
+
+    selections = spec.get("figure_methods")
+    if selections is None:
+        methods = tuple(defaults)
+        source = "registry_default"
+    else:
+        if not isinstance(selections, dict):
+            raise PaperFigureSpecError("figure_methods must be an object")
+        selection_key = figure_id if figure_id in selections else suite if suite in selections else None
+        if selection_key is None:
+            methods = tuple(defaults)
+            source = "registry_default"
+        else:
+            raw = selections[selection_key]
+            if isinstance(raw, str):
+                methods = (raw,)
+            elif isinstance(raw, list) and all(isinstance(item, str) for item in raw):
+                methods = tuple(raw)
+            else:
+                raise PaperFigureSpecError(
+                    f"figure_methods.{selection_key} must be a method string or an ordered list of method strings"
+                )
+            source = f"figure_methods.{selection_key}"
+    if not methods:
+        raise PaperFigureSpecError(f"{figure_id} must select at least one method")
+    if len(set(methods)) != len(methods):
+        raise PaperFigureSpecError(f"{figure_id} method selection contains duplicates")
+    if single and len(methods) != 1:
+        raise PaperFigureSpecError(
+            f"{figure_id} requires exactly one selected method; found={list(methods)}"
+        )
+    for method_id in methods:
+        try:
+            MethodSpec.parse(method_id)
+        except ValueError as exc:
+            raise PaperFigureSpecError(
+                f"{figure_id} selected an unknown method {method_id!r}: {exc}"
+            ) from exc
+        if not evaluation_method_supported(method_id, suite):
+            raise PaperFigureSpecError(
+                f"method {method_id!r} is not applicable to {figure_id} ({suite})"
+            )
+        if method_id not in PLOT_STYLES.get(figure_id, {}) and suite != "uav_trajectory_snapshots":
+            raise PaperFigureSpecError(
+                f"method {method_id!r} has no plot style for {figure_id}"
+            )
+    return methods, source
+
+
+def _selected_method_label(figure_id, method_id, *, selection_source):
+    if selection_source == "registry_default":
+        mapping = PAPER_METHOD_MAPPINGS[figure_id]
+        if isinstance(mapping, dict):
+            return next(label for label, value in mapping.items() if value == method_id)
+        return PLOT_STYLES[figure_id][method_id]["label"]
+    return METHOD_DISPLAY_NAMES[method_id]
 
 
 def _validate_training_compatibility(runs):
@@ -1037,6 +1270,50 @@ def _build_training(spec, spec_path, output_dir, git_sha):
     )
 
 
+def _comparison_point_signature(run, suite):
+    metadata_points = run["metadata"]["points"]
+    provenance_points = run["point_provenance"]
+    if len(metadata_points) != len(provenance_points):
+        raise IncompatiblePaperRunError(
+            f"{suite} point metadata and provenance lengths differ"
+        )
+    records = []
+    seen_point_ids = set()
+    for point, provenance in zip(metadata_points, provenance_points):
+        point_id = point.get("point_id")
+        if point_id in seen_point_ids:
+            raise IncompatiblePaperRunError(
+                f"{suite} contains duplicate point_id: {point_id!r}"
+            )
+        seen_point_ids.add(point_id)
+        key = (
+            (point.get("swept_task"), float(point["simulation_value_seconds"]))
+            if suite == "task_type_delay_violation_vs_target_delay"
+            else (point_id, point.get("x_value"), point.get("x_unit"))
+        )
+        records.append(
+            (
+                key,
+                provenance["manifest_hash"],
+                tuple(provenance["scenario_ids"]),
+                provenance["evaluation_episode_count"],
+                provenance["evaluation_horizon_seconds"],
+                provenance["evaluation_seed"],
+                provenance["manifest_seed"],
+                provenance["num_uav"],
+                json.dumps(
+                    provenance["resolved_overrides"],
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    allow_nan=False,
+                ),
+            )
+        )
+    if suite == "task_type_delay_violation_vs_target_delay":
+        records.sort(key=lambda record: (record[0][0], record[0][1]))
+    return tuple(records)
+
+
 def _resolve_suite_runs(spec, spec_path, suite, methods):
     entries = _evaluation_entries(spec, suite)
     missing = set(methods).difference(entries)
@@ -1048,44 +1325,25 @@ def _resolve_suite_runs(spec, spec_path, suite, methods):
     }
     reference = None
     for method, run in runs.items():
-        points = tuple(
-            (
-                point["point_id"],
-                point["manifest_hash"],
-                tuple(point["scenario_ids"]),
-                point["evaluation_episode_count"],
-                point["evaluation_horizon_seconds"],
-                point["evaluation_seed"],
-                point["num_uav"],
-            )
-            for point in run["point_provenance"]
-        )
+        points = _comparison_point_signature(run, suite)
         if reference is None:
             reference = points
         elif points != reference:
             raise IncompatiblePaperRunError(
-                f"{suite} methods do not share identical sweep points and manifests; mismatch={method}"
+                f"{suite} methods do not share identical sweep points, manifests, seeds, horizons, and resolved overrides; mismatch={method}"
             )
-    expected = _expected_sweep_signature(suite)
-    actual = tuple(
-        (point.get("point_id"), point.get("x_value"), point.get("x_unit"))
-        for point in next(iter(runs.values()))["metadata"]["points"]
-    )
-    accepted = (expected,)
     if suite == "task_type_delay_violation_vs_target_delay":
-        # Legacy artifacts swept 0.5--3.0 seconds.  They remain readable, but
-        # are normalized above to 500--3000 ms rather than relabeled as 0.5--3 ms.
-        accepted += (
-            tuple(
-                (f"{task.lower()}_deadline_{value:g}ms", value, "ms")
-                for task in ("COM", "FOV")
-                for value in (500.0, 1000.0, 1500.0, 2000.0, 2500.0, 3000.0)
-            ),
+        _validate_deadline_sweep_metadata(next(iter(runs.values()))["metadata"])
+    else:
+        expected = _expected_sweep_signature(suite)
+        actual = tuple(
+            (point.get("point_id"), point.get("x_value"), point.get("x_unit"))
+            for point in next(iter(runs.values()))["metadata"]["points"]
         )
-    if actual not in accepted:
-        raise IncompatiblePaperRunError(
-            f"{suite} sweep contract mismatch: expected one of {accepted}, found={actual}"
-        )
+        if actual != expected:
+            raise IncompatiblePaperRunError(
+                f"{suite} sweep contract mismatch: expected={expected}, found={actual}"
+            )
     return runs
 
 
@@ -1469,16 +1727,26 @@ def render_standalone_trajectory_source(source):
 
 def _build_trajectory(spec, spec_path, output_dir, git_sha, figure_id):
     suite = "uav_trajectory_snapshots"
-    method = "td3_dinkelbach"
+    methods, selection_source = _selected_figure_methods(
+        spec,
+        figure_id=figure_id,
+        suite=suite,
+        defaults=FIGURE_REGISTRY[figure_id]["methods"],
+        single=True,
+    )
+    method = methods[0]
     runs = _resolve_suite_runs(spec, spec_path, suite, (method,))
     run = runs[method]
-    target_uav_id = spec.get("target_uav_id")
-    if target_uav_id is None:
-        raise PaperFigureSpecError("paper spec requires target_uav_id")
     metadata_target = run["metadata"].get("target_uav_id")
-    if int(metadata_target) != int(target_uav_id):
+    if metadata_target is None:
         raise IncompatiblePaperRunError(
-            f"trajectory target mismatch: spec={target_uav_id}, evaluation={metadata_target}"
+            f"selected trajectory evaluation for {method} lacks target_uav_id"
+        )
+    target_uav_id = int(metadata_target)
+    spec_target = spec.get("target_uav_id")
+    if spec_target is not None and int(spec_target) != target_uav_id:
+        raise IncompatiblePaperRunError(
+            f"trajectory target mismatch: spec={spec_target}, evaluation={metadata_target}"
         )
     points = run["metadata"].get("points", [])
     if len(points) != 1:
@@ -1542,6 +1810,8 @@ def _build_trajectory(spec, spec_path, output_dir, git_sha, figure_id):
         rows,
         {
             "source_spec": str(spec_path),
+            "selected_methods": [method],
+            "method_selection_source": selection_source,
             "method_to_evaluation_run": _run_mapping(runs),
             "target_uav_id": int(target_uav_id),
             "scenario_id": artifact["scenario_id"],
@@ -1564,7 +1834,12 @@ def _build_trajectory(spec, spec_path, output_dir, git_sha, figure_id):
 def _build_arrival(spec, spec_path, output_dir, git_sha, figure_id):
     suite = "task_type_delay_vs_arrival_rate"
     mapping = PAPER_METHOD_MAPPINGS[figure_id]
-    methods = tuple(mapping.values())
+    methods, selection_source = _selected_figure_methods(
+        spec,
+        figure_id=figure_id,
+        suite=suite,
+        defaults=tuple(mapping.values()),
+    )
     runs = _resolve_suite_runs(spec, spec_path, suite, methods)
     task_type = FIGURE_REGISTRY[figure_id]["task_type"]
     x_values = (
@@ -1587,7 +1862,10 @@ def _build_arrival(spec, spec_path, output_dir, git_sha, figure_id):
     plotted = []
     positions = np.arange(len(x_values), dtype=float)
     width = 0.22
-    for method_index, (label, method) in enumerate(mapping.items()):
+    for method_index, method in enumerate(methods):
+        label = _selected_method_label(
+            figure_id, method, selection_source=selection_source
+        )
         selected = {
             float(row["x_value"]): row
             for row in rows
@@ -1598,7 +1876,8 @@ def _build_arrival(spec, spec_path, output_dir, git_sha, figure_id):
             for x in x_values
         ]
         style = PLOT_STYLES[figure_id][method]
-        axis.bar(positions + (method_index - 1) * width, values, width, color=style["color"], label=label)
+        offset = (method_index - (len(methods) - 1) / 2.0) * width
+        axis.bar(positions + offset, values, width, color=style["color"], label=label)
         plotted.extend({**selected[x], "display_name": label, "plot_value_milliseconds": (None if selected[x]["value"] is None else selected[x]["value"] * 1000.0)} for x in x_values)
     title = "COM task" if task_type == "COM" else "VS task"
     axis.set_xticks(positions, [f"{value:g}" for value in x_values])
@@ -1612,6 +1891,11 @@ def _build_arrival(spec, spec_path, output_dir, git_sha, figure_id):
         figure_id, figure, output_dir, plotted,
         {
             "source_spec": str(spec_path),
+            "selected_methods": list(methods),
+            "method_selection_source": selection_source,
+            "selected_method_styles": {
+                method: PLOT_STYLES[figure_id][method] for method in methods
+            },
             "method_to_evaluation_run": _run_mapping(runs),
             **_validated_provenance(runs),
             "aggregation": "pooled delivered-delay numerator / pooled delivered-packet denominator",
@@ -1626,7 +1910,12 @@ def _build_arrival(spec, spec_path, output_dir, git_sha, figure_id):
 
 def _build_violation(spec, spec_path, output_dir, git_sha):
     figure_id = "task_type_delay_violation_vs_target_delay"
-    methods = tuple(PAPER_METHOD_MAPPINGS[figure_id])
+    methods, selection_source = _selected_figure_methods(
+        spec,
+        figure_id=figure_id,
+        suite=figure_id,
+        defaults=tuple(PAPER_METHOD_MAPPINGS[figure_id]),
+    )
     runs = _resolve_suite_runs(spec, spec_path, figure_id, methods)
     reference_points = next(iter(runs.values()))["metadata"]["points"]
     point_ids = tuple(point["point_id"] for point in reference_points)
@@ -1648,6 +1937,9 @@ def _build_violation(spec, spec_path, output_dir, git_sha):
     plotted = []
     for method in methods:
         style = PLOT_STYLES[figure_id][method]
+        display_name = _selected_method_label(
+            figure_id, method, selection_source=selection_source
+        )
         for task_type in ("FOV", "COM"):
             selected = sorted(
                 (
@@ -1669,9 +1961,9 @@ def _build_violation(spec, spec_path, output_dir, git_sha):
                 color=style["color"], marker=style["marker"], linewidth=2.5,
                 linestyle="-" if task_type == "FOV" else "--",
                 markerfacecolor=style["color"] if task_type == "FOV" else "none",
-                label=f"{style['label']} ({task_label})",
+                label=f"{display_name} ({task_label})",
             )
-            plotted.extend({**row, "display_name": style["label"], "plot_value": (row["value"] if row["value"] and row["value"] > 0 else None), "log_zero_omitted": row["value"] == 0} for row in selected)
+            plotted.extend({**row, "display_name": display_name, "plot_value": (row["value"] if row["value"] and row["value"] > 0 else None), "log_zero_omitted": row["value"] == 0} for row in selected)
     axis.set_xlabel("Delay threshold (ms)")
     axis.set_ylabel("Delay Violation Probability")
     axis.set_yscale("log")
@@ -1683,6 +1975,11 @@ def _build_violation(spec, spec_path, output_dir, git_sha):
         figure_id, figure, output_dir, plotted,
         {
             "source_spec": str(spec_path),
+            "selected_methods": list(methods),
+            "method_selection_source": selection_source,
+            "selected_method_styles": {
+                method: PLOT_STYLES[figure_id][method] for method in methods
+            },
             "method_to_evaluation_run": _run_mapping(runs),
             **_validated_provenance(runs),
             "aggregate_schema_version": PAPER_AGGREGATE_SCHEMA_VERSION,
@@ -1755,6 +2052,7 @@ def build_paper_figures(spec_path, figure="all", output_root="results/paper_figu
     spec = _read_json(spec_path)
     if not isinstance(spec, dict):
         raise PaperFigureSpecError("paper spec root must be an object")
+    _validate_figure_method_selection_keys(spec)
     git_sha = _git_sha()
     build_started = datetime.now(timezone.utc).isoformat()
     output_dir = _unique_output_directory(output_root, git_sha)

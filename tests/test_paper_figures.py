@@ -26,13 +26,19 @@ from paper_evaluation import (
     evaluation_sweep_points,
 )
 from paper_metrics import ENVIRONMENT_SIZE_AGGREGATE_CONTRACT_VERSION
-from paper_figure_registry import FIGURE_REGISTRY, PAPER_METHOD_MAPPINGS
+from paper_figure_registry import (
+    FIGURE_REGISTRY,
+    METHOD_DISPLAY_NAMES,
+    PAPER_METHOD_MAPPINGS,
+    PLOT_STYLES,
+)
 from paper_figures import (
     AmbiguousPaperRunError,
     IncompatiblePaperRunError,
     PaperFigureSpecError,
     _build_violation,
     _normalize_deadline_display_artifacts,
+    _selected_figure_methods,
     build_paper_figures,
     causal_trailing_average,
     normalize_episode_ee,
@@ -52,6 +58,12 @@ from training_checkpoint import (
 TRAINING_SEED = 20260817
 EVALUATION_EPISODES = 3
 EVALUATION_HORIZON_SECONDS = 60
+LLM_EXPLORER_METHODS = (
+    "td3_dinkelbach_llm_explorer",
+    "td3_dinkelbach_llm_explorer_v3",
+    "td3_dinkelbach_llm_explorer_td3_only",
+    "td3_dinkelbach_llm_explorer_state_rule",
+)
 
 
 class EpisodeEnergyEfficiencyTest(unittest.TestCase):
@@ -89,21 +101,21 @@ class PooledMetricTest(unittest.TestCase):
         metadata = {
             "points": [
                 {
-                    "point_id": "com_deadline_0.01s",
+                    "point_id": "com_deadline_0.5s",
                     "swept_task": "COM",
-                    "x_value": 0.01,
+                    "x_value": 0.5,
                     "x_unit": "seconds",
                 }
             ]
         }
         aggregates = [
             {
-                "point_id": "com_deadline_0.01s",
-                "x_value": 0.01,
+                "point_id": "com_deadline_0.5s",
+                "x_value": 0.5,
                 "x_unit": "seconds",
             }
         ]
-        provenance = [{"point_id": "com_deadline_0.01s"}]
+        provenance = [{"point_id": "com_deadline_0.5s"}]
         _normalize_deadline_display_artifacts(
             metadata, aggregates, provenance
         )
@@ -111,11 +123,11 @@ class PooledMetricTest(unittest.TestCase):
             metadata, aggregates, provenance
         )
         for record in (metadata["points"][0], aggregates[0]):
-            self.assertEqual(record["point_id"], "com_deadline_10ms")
-            self.assertEqual(record["x_value"], 10.0)
+            self.assertEqual(record["point_id"], "com_deadline_500ms")
+            self.assertEqual(record["x_value"], 500.0)
             self.assertEqual(record["x_unit"], "ms")
-            self.assertEqual(record["simulation_value_seconds"], 0.01)
-        self.assertEqual(provenance[0]["point_id"], "com_deadline_10ms")
+            self.assertEqual(record["simulation_value_seconds"], 0.5)
+        self.assertEqual(provenance[0]["point_id"], "com_deadline_500ms")
 
     def test_delay_and_violation_pool_counts_not_episode_averages(self):
         base = {
@@ -420,7 +432,7 @@ class SyntheticFigureBuildTest(unittest.TestCase):
                 rates = {"FOV": float(point["x_value"]), "COM": 50.0}
         elif suite == "task_type_delay_violation_vs_target_delay":
             deadlines[point["swept_task"]] = float(
-                point["simulation_value_seconds"]
+                point.get("simulation_value_seconds", point["x_value"])
             )
         return {
             "traffic_rates_packets_per_second": rates,
@@ -548,7 +560,16 @@ class SyntheticFigureBuildTest(unittest.TestCase):
             **provenance,
         }
 
-    def _write_evaluation_run(self, root, suite, method_id, training_runs):
+    def _write_evaluation_run(
+        self,
+        root,
+        suite,
+        method_id,
+        training_runs,
+        *,
+        deadline_seconds=None,
+        legacy_deadline_units=False,
+    ):
         evaluation_dir = root / "evaluations" / suite / method_id
         evaluation_dir.mkdir(parents=True)
         method = MethodSpec.parse(method_id)
@@ -618,7 +639,34 @@ class SyntheticFigureBuildTest(unittest.TestCase):
                 "evaluation_git_sha": "synthetic-evaluation-sha",
             }
         )
-        points = list(evaluation_sweep_points(suite))
+        points = list(
+            evaluation_sweep_points(
+                suite,
+                deadline_seconds=(
+                    deadline_seconds
+                    if suite == "task_type_delay_violation_vs_target_delay"
+                    else None
+                ),
+            )
+        )
+        if suite == "task_type_delay_violation_vs_target_delay" and legacy_deadline_units:
+            points = [
+                {
+                    key: value
+                    for key, value in point.items()
+                    if key not in {"simulation_value_seconds", "simulation_unit"}
+                }
+                for point in points
+            ]
+            for point in points:
+                seconds = float(point["x_value"]) / 1000.0
+                point.update(
+                    point_id=(
+                        f"{point['swept_task'].lower()}_deadline_{seconds:g}s"
+                    ),
+                    x_value=seconds,
+                    x_unit="seconds",
+                )
         metadata_points = []
         all_aggregates = []
         for index, point in enumerate(points):
@@ -746,12 +794,73 @@ class SyntheticFigureBuildTest(unittest.TestCase):
                 else None
             ),
             "target_uav_id": 0 if suite == "uav_trajectory_snapshots" else None,
+            **(
+                {
+                    "deadline_sweep": {
+                        "simulation_values_seconds": [
+                            float(point["simulation_value_seconds"])
+                            for point in points
+                            if point["swept_task"] == "COM"
+                        ],
+                        "display_values_milliseconds": [
+                            float(point["x_value"])
+                            for point in points
+                            if point["swept_task"] == "COM"
+                        ],
+                        "simulation_unit": "seconds",
+                        "display_unit": "ms",
+                        "packet_injection_cutoff_seconds": float(
+                            points[0]["overrides"][
+                                "packet_injection_cutoff_seconds"
+                            ]
+                        ),
+                    }
+                }
+                if suite == "task_type_delay_violation_vs_target_delay"
+                and not legacy_deadline_units
+                else {}
+            ),
             "points": metadata_points,
         }
         (evaluation_dir / "paper_evaluation_metadata.json").write_text(
             json.dumps(metadata), encoding="utf-8"
         )
         return evaluation_dir
+
+    def _selected_evaluation_spec(
+        self,
+        root,
+        suite,
+        methods,
+        *,
+        figure_methods=None,
+        deadline_seconds=None,
+    ):
+        training_runs = {}
+        evaluations = {}
+        for method_id in methods:
+            training_runs[method_id], _ = self._write_training_run(root, method_id)
+            evaluations[method_id] = self._write_evaluation_run(
+                root,
+                suite,
+                method_id,
+                training_runs,
+                deadline_seconds=deadline_seconds,
+            )
+        value = {
+            "target_uav_id": 0,
+            "evaluation_runs": {
+                suite: {
+                    method: {"evaluation_dir": str(path)}
+                    for method, path in evaluations.items()
+                }
+            },
+        }
+        if figure_methods is not None:
+            value["figure_methods"] = figure_methods
+        spec = root / "paper_runs.json"
+        spec.write_text(json.dumps(value), encoding="utf-8")
+        return spec, training_runs, evaluations
 
     def _fixture(self, root):
         convergence_methods = tuple(
@@ -831,6 +940,42 @@ class SyntheticFigureBuildTest(unittest.TestCase):
                 resolved = json.loads((output / f"{stem}_resolved_spec.json").read_text(encoding="utf-8"))
                 self.assertEqual(resolved["semantic_figure_id"], figure_id)
                 self.assertEqual(resolved["render_contract"]["axes_count"], 1)
+                if figure_id.startswith("uav_trajectory_t_"):
+                    self.assertEqual(resolved["selected_methods"], ["td3_dinkelbach"])
+                    self.assertEqual(
+                        resolved["method_selection_source"], "registry_default"
+                    )
+                elif figure_id in {
+                    "com_task_delay_vs_arrival_rate",
+                    "vs_task_delay_vs_arrival_rate",
+                }:
+                    self.assertEqual(
+                        resolved["selected_methods"],
+                        list(PAPER_METHOD_MAPPINGS[figure_id].values()),
+                    )
+                    self.assertEqual(
+                        resolved["render_contract"]["axes_legend_labels"][0],
+                        list(PAPER_METHOD_MAPPINGS[figure_id]),
+                    )
+                    self.assertEqual(
+                        resolved["selected_method_styles"],
+                        {
+                            method: PLOT_STYLES[figure_id][method]
+                            for method in PAPER_METHOD_MAPPINGS[figure_id].values()
+                        },
+                    )
+                elif figure_id == "task_type_delay_violation_vs_target_delay":
+                    self.assertEqual(
+                        resolved["selected_methods"],
+                        list(PAPER_METHOD_MAPPINGS[figure_id]),
+                    )
+                    self.assertEqual(
+                        resolved["selected_method_styles"],
+                        {
+                            method: PLOT_STYLES[figure_id][method]
+                            for method in PAPER_METHOD_MAPPINGS[figure_id]
+                        },
+                    )
                 for provenance in resolved[
                     "method_to_checkpoint_provenance"
                 ].values():
@@ -856,6 +1001,334 @@ class SyntheticFigureBuildTest(unittest.TestCase):
                 self.assertFalse((output / f"{forbidden}.pdf").exists())
             build_metadata = json.loads((output / "paper_figure_build.json").read_text(encoding="utf-8"))
             self.assertEqual(len(build_metadata["semantic_figures"]), 12)
+
+    def test_all_llm_explorer_methods_are_explicitly_selectable_and_styled(self):
+        figures = (
+            "uav_trajectory_t_10s",
+            "com_task_delay_vs_arrival_rate",
+            "task_type_delay_violation_vs_target_delay",
+        )
+        suites = (
+            "uav_trajectory_snapshots",
+            "task_type_delay_vs_arrival_rate",
+            "task_type_delay_violation_vs_target_delay",
+        )
+        for method_id in LLM_EXPLORER_METHODS:
+            self.assertIn(method_id, METHOD_DISPLAY_NAMES)
+            for figure_id, suite in zip(figures, suites):
+                with self.subTest(method=method_id, figure=figure_id):
+                    methods, source = _selected_figure_methods(
+                        {"figure_methods": {figure_id: method_id}},
+                        figure_id=figure_id,
+                        suite=suite,
+                        defaults=FIGURE_REGISTRY[figure_id]["methods"],
+                        single=figure_id.startswith("uav_trajectory_t_"),
+                    )
+                    self.assertEqual(methods, (method_id,))
+                    self.assertEqual(source, f"figure_methods.{figure_id}")
+                    if not figure_id.startswith("uav_trajectory_t_"):
+                        self.assertIn(method_id, PLOT_STYLES[figure_id])
+
+    def test_llm_only_trajectory_uses_selected_source_end_to_end(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            method = "td3_dinkelbach_llm_explorer_v3"
+            figure_id = "uav_trajectory_t_10s"
+            spec, training, evaluations = self._selected_evaluation_spec(
+                root,
+                "uav_trajectory_snapshots",
+                (method,),
+                figure_methods={figure_id: method},
+            )
+            result = build_paper_figures(
+                spec, figure=figure_id, output_root=root / "output"
+            )
+            output = Path(result["output_directory"])
+            stem = FIGURE_REGISTRY[figure_id]["output_stem"]
+            source = json.loads((output / f"{stem}.json").read_text(encoding="utf-8"))
+            resolved = json.loads(
+                (output / f"{stem}_resolved_spec.json").read_text(encoding="utf-8")
+            )
+            metadata = json.loads(
+                (
+                    evaluations[method] / "paper_evaluation_metadata.json"
+                ).read_text(encoding="utf-8")
+            )
+            artifact = json.loads(
+                (
+                    evaluations[method]
+                    / "trajectory"
+                    / "trajectory_artifacts.json"
+                ).read_text(encoding="utf-8")
+            )[0]
+            checkpoint = training[method] / "checkpoints" / "models" / "ep_1500"
+            self.assertTrue((output / f"{stem}.png").is_file())
+            self.assertEqual(source["method_key"], method)
+            self.assertEqual(source["target_uav_id"], metadata["target_uav_id"])
+            self.assertEqual(source["scenario_id"], artifact["scenario_id"])
+            self.assertEqual(
+                source["scenario_manifest_hash"], artifact["scenario_manifest_hash"]
+            )
+            self.assertEqual(Path(source["checkpoint_path"]), checkpoint.resolve())
+            self.assertEqual(source["requested_time_seconds"], 10.0)
+            self.assertEqual(source["actual_time_seconds"], 10.0)
+            self.assertEqual(resolved["selected_methods"], [method])
+            self.assertEqual(
+                set(resolved["method_to_evaluation_run"]), {method}
+            )
+
+    def test_ours_and_llm_arrival_plot_records_legend_and_sources(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            figure_id = "com_task_delay_vs_arrival_rate"
+            methods = ("td3_dinkelbach", "td3_dinkelbach_llm_explorer")
+            spec, _, evaluations = self._selected_evaluation_spec(
+                root,
+                "task_type_delay_vs_arrival_rate",
+                methods,
+                figure_methods={figure_id: list(methods)},
+            )
+            result = build_paper_figures(
+                spec, figure=figure_id, output_root=root / "output"
+            )
+            output = Path(result["output_directory"])
+            stem = FIGURE_REGISTRY[figure_id]["output_stem"]
+            rows = json.loads((output / f"{stem}.json").read_text(encoding="utf-8"))
+            resolved = json.loads(
+                (output / f"{stem}_resolved_spec.json").read_text(encoding="utf-8")
+            )
+            self.assertTrue((output / f"{stem}.png").is_file())
+            self.assertEqual({row["method_id"] for row in rows}, set(methods))
+            self.assertEqual(
+                resolved["render_contract"]["axes_legend_labels"][0],
+                [METHOD_DISPLAY_NAMES[method] for method in methods],
+            )
+            self.assertEqual(
+                resolved["render_contract"]["axes_x_tick_labels"][0],
+                ["50", "100", "150", "200"],
+            )
+            self.assertEqual(resolved["selected_methods"], list(methods))
+            self.assertEqual(
+                resolved["method_to_evaluation_run"],
+                {method: str(evaluations[method].resolve()) for method in methods},
+            )
+
+    def test_custom_deadline_points_render_sorted_ticks_for_ours_and_llm(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            figure_id = "task_type_delay_violation_vs_target_delay"
+            methods = ("td3_dinkelbach", "td3_dinkelbach_llm_explorer_state_rule")
+            spec, _, evaluations = self._selected_evaluation_spec(
+                root,
+                figure_id,
+                methods,
+                figure_methods={figure_id: list(methods)},
+                deadline_seconds=(0.020, 0.005, 0.010),
+            )
+            result = build_paper_figures(
+                spec, figure=figure_id, output_root=root / "output"
+            )
+            output = Path(result["output_directory"])
+            stem = FIGURE_REGISTRY[figure_id]["output_stem"]
+            rows = json.loads((output / f"{stem}.json").read_text(encoding="utf-8"))
+            resolved = json.loads(
+                (output / f"{stem}_resolved_spec.json").read_text(encoding="utf-8")
+            )
+            self.assertTrue((output / f"{stem}.png").is_file())
+            self.assertEqual(
+                sorted({float(row["x_value"]) for row in rows}),
+                [5.0, 10.0, 20.0],
+            )
+            self.assertEqual(
+                resolved["render_contract"]["axes_x_ticks"][0],
+                [5.0, 10.0, 20.0],
+            )
+            self.assertEqual({row["method_id"] for row in rows}, set(methods))
+            self.assertEqual(
+                resolved["render_contract"]["axes_legend_labels"][0],
+                [
+                    f"{METHOD_DISPLAY_NAMES[method]} ({task})"
+                    for method in methods
+                    for task in ("VS", "COM")
+                ],
+            )
+            self.assertEqual(
+                resolved["method_to_evaluation_run"],
+                {method: str(evaluations[method].resolve()) for method in methods},
+            )
+
+    def test_legacy_second_deadline_results_render_as_milliseconds(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            suite = "task_type_delay_violation_vs_target_delay"
+            method = "td3_dinkelbach"
+            training_run, _ = self._write_training_run(root, method)
+            evaluation = self._write_evaluation_run(
+                root,
+                suite,
+                method,
+                {method: training_run},
+                deadline_seconds=(0.5, 1.0, 2.0),
+                legacy_deadline_units=True,
+            )
+            spec = root / "paper_runs.json"
+            spec.write_text(
+                json.dumps(
+                    {
+                        "figure_methods": {suite: method},
+                        "evaluation_runs": {
+                            suite: {method: {"evaluation_dir": str(evaluation)}}
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            result = build_paper_figures(
+                spec, figure=suite, output_root=root / "output"
+            )
+            output = Path(result["output_directory"])
+            stem = FIGURE_REGISTRY[suite]["output_stem"]
+            rows = json.loads((output / f"{stem}.json").read_text(encoding="utf-8"))
+            resolved = json.loads(
+                (output / f"{stem}_resolved_spec.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(
+                sorted({float(row["x_value"]) for row in rows}),
+                [500.0, 1000.0, 2000.0],
+            )
+            self.assertEqual(
+                resolved["render_contract"]["axes_x_ticks"][0],
+                [500.0, 1000.0, 2000.0],
+            )
+
+    def test_method_selection_errors_are_clear_and_missing_methods_stay_optional(self):
+        figure_id = "com_task_delay_vs_arrival_rate"
+        with self.assertRaisesRegex(PaperFigureSpecError, "unknown method"):
+            _selected_figure_methods(
+                {"figure_methods": {figure_id: "not-a-method"}},
+                figure_id=figure_id,
+                suite="task_type_delay_vs_arrival_rate",
+                defaults=(),
+            )
+        with self.assertRaisesRegex(PaperFigureSpecError, "not applicable"):
+            _selected_figure_methods(
+                {"figure_methods": {figure_id: "random_assignment_td3_dinkelbach"}},
+                figure_id=figure_id,
+                suite="task_type_delay_vs_arrival_rate",
+                defaults=(),
+            )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            spec, _, _ = self._selected_evaluation_spec(
+                root,
+                "task_type_delay_vs_arrival_rate",
+                ("td3_dinkelbach",),
+                figure_methods={figure_id: "td3_dinkelbach_llm_explorer"},
+            )
+            with self.assertRaisesRegex(
+                PaperFigureSpecError,
+                r"evaluation_runs\.task_type_delay_vs_arrival_rate lacks methods.*llm_explorer",
+            ):
+                build_paper_figures(
+                    spec, figure=figure_id, output_root=root / "output"
+                )
+
+    def test_deadline_normalization_rejects_unknown_contradictory_and_bad_values(self):
+        cases = (
+            ({"x_value": 5.0, "x_unit": "ticks"}, "unsupported or missing x_unit"),
+            ({"x_value": float("nan"), "x_unit": "ms"}, "must be finite"),
+            ({"x_value": 0.0, "x_unit": "ms"}, "greater than zero"),
+            (
+                {
+                    "x_value": 5.0,
+                    "x_unit": "ms",
+                    "simulation_value_seconds": 0.010,
+                    "simulation_unit": "seconds",
+                },
+                "contradictory seconds and display values",
+            ),
+        )
+        for fields, message in cases:
+            with self.subTest(fields=fields):
+                metadata = {
+                    "points": [
+                        {
+                            "point_id": "com_deadline_test",
+                            "swept_task": "COM",
+                            **fields,
+                        }
+                    ]
+                }
+                aggregates = [{"point_id": "com_deadline_test", **fields}]
+                with self.assertRaisesRegex(IncompatiblePaperRunError, message):
+                    _normalize_deadline_display_artifacts(
+                        metadata,
+                        aggregates,
+                        [{"point_id": "com_deadline_test"}],
+                    )
+
+        duplicate = {
+            "points": [
+                {
+                    "point_id": point_id,
+                    "swept_task": "COM",
+                    "x_value": 5.0,
+                    "x_unit": "ms",
+                }
+                for point_id in ("first", "second")
+            ]
+        }
+        with self.assertRaisesRegex(IncompatiblePaperRunError, "duplicate point_id"):
+            _normalize_deadline_display_artifacts(
+                duplicate,
+                [],
+                [{"point_id": "first"}, {"point_id": "second"}],
+            )
+
+    def test_deadline_comparison_rejects_different_custom_point_sets(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            suite = "task_type_delay_violation_vs_target_delay"
+            methods = ("td3_dinkelbach", "td3_dinkelbach_llm_explorer")
+            training_runs = {}
+            evaluations = {}
+            for method in methods:
+                training_runs[method], _ = self._write_training_run(root, method)
+            evaluations[methods[0]] = self._write_evaluation_run(
+                root,
+                suite,
+                methods[0],
+                training_runs,
+                deadline_seconds=(0.005, 0.010, 0.020),
+            )
+            evaluations[methods[1]] = self._write_evaluation_run(
+                root,
+                suite,
+                methods[1],
+                training_runs,
+                deadline_seconds=(0.005, 0.010),
+            )
+            spec = root / "paper_runs.json"
+            spec.write_text(
+                json.dumps(
+                    {
+                        "figure_methods": {suite: list(methods)},
+                        "evaluation_runs": {
+                            suite: {
+                                method: {"evaluation_dir": str(path)}
+                                for method, path in evaluations.items()
+                            }
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(
+                IncompatiblePaperRunError, "do not share identical sweep points"
+            ):
+                build_paper_figures(
+                    spec, figure=suite, output_root=root / "output"
+                )
 
     def test_deprecated_family_alias_expands_without_composite(self):
         with tempfile.TemporaryDirectory() as temp_dir:
