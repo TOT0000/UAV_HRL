@@ -148,14 +148,22 @@ class MovementConstraintPenaltyTest(unittest.TestCase):
         for method_id in METHOD_REGISTRY:
             method = MethodSpec.parse(method_id)
             config = comparison_method_configuration(method)
-            expected = 1.0 if method.task_potential_enabled else 0.0
+            expected = {
+                "c9": 1.0 if method.task_potential_enabled else 0.0,
+                "c10": (
+                    1.0
+                    if method.task_potential_enabled and method.c10_penalty_enabled
+                    else 0.0
+                ),
+                "com_range": 1.0 if method.task_potential_enabled else 0.0,
+            }
             self.assertEqual(
                 set(config["movement_constraint_penalty_weights"].values()),
                 {1.0},
             )
             self.assertEqual(
-                set(config["effective_movement_constraint_penalty_weights"].values()),
-                {expected},
+                config["effective_movement_constraint_penalty_weights"],
+                expected,
             )
 
 

@@ -112,6 +112,7 @@ class CentralizedDDPG:
         beta_com=TASK_POTENTIAL_BETA_COM,
         reward_mode="dinkelbach",
         task_potential_enabled=True,
+        c10_penalty_enabled=True,
     ):
         (
             state,
@@ -130,6 +131,7 @@ class CentralizedDDPG:
             beta_com=beta_com,
             reward_mode=reward_mode,
             task_potential_enabled=task_potential_enabled,
+            c10_penalty_enabled=c10_penalty_enabled,
             include_movement_masks=True,
         )
         state = state.to(device)

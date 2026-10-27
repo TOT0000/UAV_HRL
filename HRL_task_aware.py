@@ -83,6 +83,7 @@ from experiment_config import (
     movement_agent_configuration,
     comparison_method_configuration,
     routing_agent_configuration,
+    resolve_method_training_config,
 )
 from movement_agents import create_movement_agent, sample_random_joint_action
 from observation_strategy import (
@@ -1385,6 +1386,7 @@ def _interval_reward(
     constraint_penalties,
     reward_mode="dinkelbach",
     task_potential_enabled=True,
+    c10_penalty_enabled=True,
     ratio_objective_reward=0.0,
 ):
     if reward_mode == "dinkelbach":
@@ -1395,15 +1397,26 @@ def _interval_reward(
             objective = 0.0
     else:
         raise ValueError(f"unsupported reward mode: {reward_mode}")
-    penalty = float(bool(task_potential_enabled)) * sum(
-        float(constraint_penalties[name])
-        for name in (
-            "c9_penalty_mean",
-            "c10_penalty_mean",
-            "com_range_penalty_mean",
-        )
+    penalty = _movement_constraint_penalty_total(
+        constraint_penalties,
+        task_potential_enabled=task_potential_enabled,
+        c10_penalty_enabled=c10_penalty_enabled,
     )
     return float(objective - penalty)
+
+
+def _movement_constraint_penalty_total(
+    constraint_penalties,
+    *,
+    task_potential_enabled=True,
+    c10_penalty_enabled=True,
+):
+    if not task_potential_enabled:
+        return 0.0
+    names = ["c9_penalty_mean", "com_range_penalty_mean"]
+    if c10_penalty_enabled:
+        names.insert(1, "c10_penalty_mean")
+    return float(sum(float(constraint_penalties[name]) for name in names))
 
 
 def _is_checkpoint_episode(completed_episode, total_episodes, every):
@@ -2217,6 +2230,7 @@ def train(
         for key, value in method_spec.to_dict().items()
         if key != "method_id"
     })
+    config = resolve_method_training_config(config, method_spec)
     if not method_spec.llm_explorer_enabled and (
         llm_explorer_mock or llm_explorer_client is not None
     ):
@@ -4018,6 +4032,7 @@ def train(
                 constraint_penalties,
                 reward_mode=method_spec.reward_mode,
                 task_potential_enabled=method_spec.task_potential_enabled,
+                c10_penalty_enabled=method_spec.c10_penalty_enabled,
                 ratio_objective_reward=ratio_objective_reward,
             )
             rnd_record = None
@@ -4044,13 +4059,10 @@ def train(
             ) + (
                 rnd_record["weighted_bonus"] if rnd_record is not None else 0.0
             )
-            applied_penalty = float(method_spec.task_potential_enabled) * sum(
-                constraint_penalties[name]
-                for name in (
-                    "c9_penalty_mean",
-                    "c10_penalty_mean",
-                    "com_range_penalty_mean",
-                )
+            applied_penalty = _movement_constraint_penalty_total(
+                constraint_penalties,
+                task_potential_enabled=method_spec.task_potential_enabled,
+                c10_penalty_enabled=method_spec.c10_penalty_enabled,
             )
             base_movement_reward = interval_reward + applied_penalty
             episode_reward += combined_movement_reward
@@ -4209,6 +4221,7 @@ def train(
                     beta_com=config.beta_com,
                     reward_mode=method_spec.reward_mode,
                     task_potential_enabled=method_spec.task_potential_enabled,
+                    c10_penalty_enabled=method_spec.c10_penalty_enabled,
                     **update_kwargs,
                 )
                 if rnd_explorer is not None:

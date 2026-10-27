@@ -154,6 +154,8 @@ PAPER_EVALUATION_SUITES = {
 # baseline is eligible, without changing any suite's default method list.
 _EVALUATION_METHOD_BASELINES = {
     "td3_dinkelbach_ddqn": "td3_dinkelbach_dqn",
+    "td3_dinkelbach_wo_c10_penalty": "td3_dinkelbach",
+    "td3_dinkelbach_interval_200": "td3_dinkelbach",
     "td3_dinkelbach_llm": "td3_dinkelbach",
     "td3_dinkelbach_llm_search": "td3_dinkelbach",
     "td3_dinkelbach_llm_train_search": "td3_dinkelbach",

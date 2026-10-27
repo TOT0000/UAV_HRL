@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 import hashlib
 import json
 import math
@@ -299,18 +299,23 @@ def validate_task_potential_weights():
     return {"C9": (1.0,), "C10": (1.0,), "COM": (1.0,)}
 
 
-def task_potential_contract_metadata():
+def task_potential_contract_metadata(c10_penalty_enabled=True):
     """Return the shared reward/config/checkpoint auxiliary-reward contract."""
 
     validate_task_potential_weights()
-    return {
+    c10_penalty_enabled = bool(c10_penalty_enabled)
+    metadata = {
         "contract_version": TASK_POTENTIAL_CONTRACT_VERSION,
         "constraint_penalty_weights": {
             "c9": MOVEMENT_CONSTRAINT_WEIGHT_C9,
             "c10": MOVEMENT_CONSTRAINT_WEIGHT_C10,
             "com_range": MOVEMENT_CONSTRAINT_WEIGHT_COM,
         },
-        "reward_form": "base_reward - P_C9 - P_C10 - P_COM",
+        "reward_form": (
+            "base_reward - P_C9 - P_C10 - P_COM"
+            if c10_penalty_enabled
+            else "base_reward - P_C9 - P_COM"
+        ),
         "aggregation": "mean over currently assigned pairs of each task type",
         "normalization_by_episode_steps": False,
         "no_task_potential": "all three constraint-penalty reward weights are zero",
@@ -341,6 +346,9 @@ def task_potential_contract_metadata():
         },
         "evaluation_uses_training_path": True,
     }
+    if not c10_penalty_enabled:
+        metadata["c10"]["reward_penalty_enabled"] = False
+    return metadata
 
 
 validate_task_potential_weights()
@@ -360,6 +368,24 @@ _METHOD_DEFINITIONS = {
         "movement": "centralized_td3",
         "reward_mode": "dinkelbach",
         "label": "TD3 + Dinkelbach",
+    },
+    "td3_dinkelbach_wo_c10_penalty": {
+        **_COMMON_METHOD,
+        "agent": "td3",
+        "movement": "centralized_td3",
+        "reward_mode": "dinkelbach",
+        "c10_penalty_enabled": False,
+        "dinkelbach_update_interval_episodes": 50,
+        "label": "TD3-Dinkelbach w/o C10 Penalty",
+    },
+    "td3_dinkelbach_interval_200": {
+        **_COMMON_METHOD,
+        "agent": "td3",
+        "movement": "centralized_td3",
+        "reward_mode": "dinkelbach",
+        "c10_penalty_enabled": True,
+        "dinkelbach_update_interval_episodes": 200,
+        "label": "TD3-Dinkelbach (200-Episode Lambda Update)",
     },
     "td3_dinkelbach_rnd_collect": {
         **_COMMON_METHOD,
@@ -556,6 +582,7 @@ _METHOD_DEFINITIONS = {
         "label": "TD3 + Dinkelbach + state-dependent LLM TD3 exploration rule",
     },
 }
+_DEFAULT_DINKELBACH_UPDATE_INTERVAL_EPISODES = 50
 METHOD_REGISTRY = MappingProxyType(_METHOD_DEFINITIONS)
 _LEGACY_METHOD_IDS = frozenset(
     {
@@ -636,6 +663,29 @@ class MethodSpec:
     @property
     def learns_routing(self) -> bool:
         return self.routing in {"safe_ddqn", "dqn", "ddqn"}
+
+    @property
+    def c10_penalty_enabled(self) -> bool:
+        """Whether the computed C10 auxiliary value enters the movement reward."""
+
+        definition = METHOD_REGISTRY[self.method_id]
+        return bool(definition.get("c10_penalty_enabled", True))
+
+    @property
+    def dinkelbach_update_interval_episodes(self) -> int:
+        """Resolve the method-owned Dinkelbach cadence without changing legacy IDs."""
+
+        return int(
+            METHOD_REGISTRY[self.method_id].get(
+                "dinkelbach_update_interval_episodes",
+                _DEFAULT_DINKELBACH_UPDATE_INTERVAL_EPISODES,
+            )
+        )
+
+    @property
+    def dinkelbach_update_interval_overridden(self) -> bool:
+        definition = METHOD_REGISTRY[self.method_id]
+        return "dinkelbach_update_interval_episodes" in definition
 
     @property
     def potential_enabled(self) -> bool:
@@ -1003,9 +1053,30 @@ def routing_agent_configuration(method_spec: MethodSpec, training_config=None) -
     }
 
 
+def resolve_method_training_config(config, method_spec: MethodSpec):
+    """Apply only method-owned runtime overrides to a TrainingConfig value."""
+
+    method_spec = MethodSpec.parse(method_spec.method_id)
+    if not method_spec.dinkelbach_update_interval_overridden:
+        return config
+    if isinstance(config, dict):
+        resolved = dict(config)
+        resolved["dinkelbach_update_interval_episodes"] = (
+            method_spec.dinkelbach_update_interval_episodes
+        )
+        return resolved
+    return replace(
+        config,
+        dinkelbach_update_interval_episodes=(
+            method_spec.dinkelbach_update_interval_episodes
+        ),
+    )
+
+
 def effective_training_config(config, method_spec: MethodSpec) -> dict:
     """Serialize formal config with method-specific movement settings resolved."""
 
+    config = resolve_method_training_config(config, method_spec)
     values = asdict(config) if not isinstance(config, dict) else dict(config)
     movement = movement_agent_configuration(method_spec, config)
     values["policy_delay"] = movement["policy_delay"]
@@ -1024,7 +1095,12 @@ def effective_training_config(config, method_spec: MethodSpec) -> dict:
     }
     values["movement_constraint_penalty_weights"] = configured_coefficients
     values["effective_movement_constraint_penalty_weights"] = {
-        name: coefficient if method_spec.task_potential_enabled else 0.0
+        name: (
+            coefficient
+            if method_spec.task_potential_enabled
+            and (name != "c10" or method_spec.c10_penalty_enabled)
+            else 0.0
+        )
         for name, coefficient in configured_coefficients.items()
     }
     return values
@@ -1059,7 +1135,7 @@ def comparison_method_configuration(method_spec: MethodSpec) -> dict:
         "c10": MOVEMENT_CONSTRAINT_WEIGHT_C10,
         "com_range": MOVEMENT_CONSTRAINT_WEIGHT_COM,
     }
-    return {
+    configuration = {
         "assignment_strategy": method_spec.assignment,
         "assignment_rounds": int(method_spec.assignment_rounds),
         "movement_policy": method_spec.agent,
@@ -1068,10 +1144,17 @@ def comparison_method_configuration(method_spec: MethodSpec) -> dict:
         "task_observation_mode": method_spec.task_observation,
         "task_potential_enabled": bool(method_spec.task_potential_enabled),
         "task_potential_contract_version": TASK_POTENTIAL_CONTRACT_VERSION,
-        "task_potential_configuration": task_potential_contract_metadata(),
+        "task_potential_configuration": task_potential_contract_metadata(
+            method_spec.c10_penalty_enabled
+        ),
         "movement_constraint_penalty_weights": configured_coefficients,
         "effective_movement_constraint_penalty_weights": {
-            name: coefficient if method_spec.task_potential_enabled else 0.0
+            name: (
+                coefficient
+                if method_spec.task_potential_enabled
+                and (name != "c10" or method_spec.c10_penalty_enabled)
+                else 0.0
+            )
             for name, coefficient in configured_coefficients.items()
         },
         "movement_replay_contract_version": MOVEMENT_REPLAY_CONTRACT_VERSION,
@@ -1255,3 +1338,10 @@ def comparison_method_configuration(method_spec: MethodSpec) -> dict:
             PRODUCTION_PACKET_INJECTION_CUTOFF_SECONDS
         ),
     }
+    if method_spec.method_id == "td3_dinkelbach_wo_c10_penalty":
+        configuration["c10_penalty_enabled"] = False
+    if method_spec.dinkelbach_update_interval_overridden:
+        configuration["dinkelbach_update_interval_episodes"] = (
+            method_spec.dinkelbach_update_interval_episodes
+        )
+    return configuration

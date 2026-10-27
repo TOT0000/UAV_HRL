@@ -75,6 +75,10 @@ NEW_METHODS = (
 )
 EXPECTED_METHODS = (
     (EXISTING_METHODS[0],)
+    + (
+        "td3_dinkelbach_wo_c10_penalty",
+        "td3_dinkelbach_interval_200",
+    )
     + ("td3_dinkelbach_rnd_collect",)
     + LLM_METHODS
     + EXISTING_METHODS[1:]
@@ -228,6 +232,34 @@ class ControlledMethodRegistryTest(unittest.TestCase):
                 if spec.reward_mode == "ratio":
                     self.assertEqual(result["dinkelbach_update_count"], 0)
                     self.assertIsNone(result["lambda"])
+                if key == "td3_dinkelbach_wo_c10_penalty":
+                    self.assertFalse(metadata["c10_penalty_enabled"])
+                    self.assertEqual(
+                        metadata["effective_movement_constraint_penalty_weights"],
+                        {"c9": 1.0, "c10": 0.0, "com_range": 1.0},
+                    )
+                    self.assertEqual(
+                        result["dinkelbach_state"][
+                            "dinkelbach_update_interval_episodes"
+                        ],
+                        50,
+                    )
+                    for metric in (
+                        "c10_penalty_sum",
+                        "c10_penalty_mean",
+                        "c10_penalty_sample_count",
+                    ):
+                        self.assertIn(metric, result["episode_metrics"][0])
+                if key == "td3_dinkelbach_interval_200":
+                    self.assertEqual(
+                        metadata["dinkelbach_update_interval_episodes"], 200
+                    )
+                    self.assertEqual(
+                        result["dinkelbach_state"][
+                            "dinkelbach_update_interval_episodes"
+                        ],
+                        200,
+                    )
 
     def test_new_methods_resolve_orthogonal_strategies(self):
         expected = {

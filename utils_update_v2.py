@@ -375,6 +375,7 @@ class ReplayBufferJoint:
         beta_com=TASK_POTENTIAL_BETA_COM,
         reward_mode="dinkelbach",
         task_potential_enabled=True,
+        c10_penalty_enabled=True,
         llm_reward_beta=0.0,
         potential_shaping_enabled=False,
     ):
@@ -390,11 +391,12 @@ class ReplayBufferJoint:
             raise ValueError(f"unsupported reward mode: {reward_mode}")
         del not_done, gamma, beta_search, beta_vs, beta_com
         penalty_scale = 1.0 if task_potential_enabled else 0.0
-        reward = objective - penalty_scale * (
-            self.c9_penalty[indices]
-            + self.c10_penalty[indices]
-            + self.com_range_penalty[indices]
+        constraint_penalty = (
+            self.c9_penalty[indices] + self.com_range_penalty[indices]
         )
+        if c10_penalty_enabled:
+            constraint_penalty = constraint_penalty + self.c10_penalty[indices]
+        reward = objective - penalty_scale * constraint_penalty
         beta = float(llm_reward_beta)
         if beta != 0.0:
             if not self.record_llm_reward:
@@ -416,6 +418,7 @@ class ReplayBufferJoint:
         beta_com=TASK_POTENTIAL_BETA_COM,
         reward_mode="dinkelbach",
         task_potential_enabled=True,
+        c10_penalty_enabled=True,
         include_movement_masks=False,
         llm_reward_beta=0.0,
         potential_shaping_enabled=False,
@@ -432,6 +435,7 @@ class ReplayBufferJoint:
             beta_com=beta_com,
             reward_mode=reward_mode,
             task_potential_enabled=task_potential_enabled,
+            c10_penalty_enabled=c10_penalty_enabled,
             llm_reward_beta=llm_reward_beta,
             potential_shaping_enabled=potential_shaping_enabled,
         )
