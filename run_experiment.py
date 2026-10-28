@@ -80,7 +80,6 @@ from llm_explorer import (
     LLM_EXPLORER_CACHE_VERSION,
     LLM_EXPLORER_CASE_VERSION,
     LLM_EXPLORER_GUIDANCE_MAX_OUTPUT_TOKENS,
-    LLM_EXPLORER_METHOD_ID,
     LLM_EXPLORER_NUMERICAL_OUTPUT_PROTOCOL,
     LLM_EXPLORER_PROMPT_VERSION,
     LLM_EXPLORER_SUMMARY_VERSION,
@@ -578,6 +577,15 @@ def build_parser():
             )
         if method.llm_explorer_enabled:
             method_parser.add_argument(
+                "--llm-explorer-log-mode",
+                choices=("compact", "full"),
+                default=None,
+                help=(
+                    "Explorer artifact storage mode; defaults to compact for the "
+                    "w/o-C10 Explorer and full for existing Explorer methods"
+                ),
+            )
+            method_parser.add_argument(
                 "--llm-explorer-model",
                 default="gpt-4o-mini",
                 help="exploration-guidance model (default: gpt-4o-mini)",
@@ -1046,6 +1054,11 @@ def run(args):
         resolved["potential_artifact_path"] = "potential_artifact"
         resolved["llm_worker_timeout_seconds"] = float(args.llm_worker_timeout)
     if method.llm_explorer_enabled:
+        log_mode = (
+            str(args.llm_explorer_log_mode)
+            if args.llm_explorer_log_mode is not None
+            else method.default_llm_explorer_log_mode
+        )
         resolved["llm_explorer"] = {
             "schema_version": _explorer_schema_version(method),
             "model": str(args.llm_explorer_model),
@@ -1053,6 +1066,7 @@ def run(args):
             "mock": bool(args.llm_explorer_mock),
             "warmup_joint_transitions": 10000,
             "update_interval_episodes": 1,
+            "log_mode": log_mode,
         }
         if method.llm_explorer_state_rule_enabled:
             resolved["llm_explorer"].update(
@@ -1147,6 +1161,9 @@ def run(args):
             ),
             llm_explorer_timeout=getattr(args, "llm_explorer_timeout", 60.0),
             llm_explorer_mock=getattr(args, "llm_explorer_mock", False),
+            llm_explorer_log_mode=(
+                resolved.get("llm_explorer") or {}
+            ).get("log_mode", method.default_llm_explorer_log_mode),
         )
         resolved.update(
             status="COMPLETED",
@@ -1182,7 +1199,7 @@ def run_resume(args):
     run_dir, resolved, method, manifest = _load_run_context(args.run_directory)
     explorer_protocol_upgrade = None
     if method.llm_explorer_enabled:
-        if method.method_id == LLM_EXPLORER_METHOD_ID:
+        if method.llm_explorer_first_gen_enabled:
             explorer_protocol_upgrade = first_gen_resume_protocol_upgrade(
                 resolved.get("llm_explorer") or {}
             )
@@ -1454,7 +1471,7 @@ def run_resume(args):
             method, config
         ),
     )
-    if method.method_id == LLM_EXPLORER_METHOD_ID:
+    if method.llm_explorer_first_gen_enabled:
         explorer_resolution = dict(resolved.get("llm_explorer") or {})
         explorer_resolution.update(
             prompt_version=LLM_EXPLORER_PROMPT_VERSION,
@@ -1560,6 +1577,9 @@ def run_resume(args):
             ),
             llm_explorer_mock=bool(
                 (resolved.get("llm_explorer") or {}).get("mock", False)
+            ),
+            llm_explorer_log_mode=(resolved.get("llm_explorer") or {}).get(
+                "log_mode", method.default_llm_explorer_log_mode
             ),
         )
         resolved.update(
@@ -1765,6 +1785,9 @@ def run_evaluate(args):
         # Evaluation never creates a client or calls the LLM, regardless of
         # the training run's mock/live setting.
         llm_explorer_mock=False,
+        llm_explorer_log_mode=(resolved.get("llm_explorer") or {}).get(
+            "log_mode", method.default_llm_explorer_log_mode
+        ),
     )
     formal_evaluation = bool(
         not args.smoke

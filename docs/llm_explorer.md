@@ -1,5 +1,52 @@
 # LLM-guided TD3 and safe-DDQN exploration
 
+## Original Explorer without the C10 reward penalty
+
+`td3_dinkelbach_llm_explorer_wo_c10_penalty` is the independent combination
+of `td3_dinkelbach_wo_c10_penalty` and the original (first-generation)
+LLM-Explorer. Relative to `td3_dinkelbach_wo_c10_penalty`, its only algorithmic
+change is the original episode-fixed TD3 bias and safe-DDQN epsilon-branch
+routing guidance. Relative to `td3_dinkelbach_llm_explorer`, its only
+algorithmic change is that the computed C10 value is not subtracted from the
+movement reward. C10 geometry, validity, observations, feedback, statistics,
+and evaluation metrics remain real and are explicitly described to the LLM as
+diagnostics rather than a reward term. It retains K-KM, centralized TD3,
+safe-DDQN, lambda initial value zero, and the 50-episode ratio-of-block-sums
+Dinkelbach update.
+
+The method has its own registry identity, fingerprint, run directory, and
+checkpoint identity. Checkpoints from either parent method cannot be used for
+exact resume.
+
+All Explorer methods accept `--llm-explorer-log-mode compact|full`. Existing
+Explorer methods default to `full`; the new w/o-C10 method defaults to
+`compact`. Full mode retains the complete per-episode movement, routing, slot
+service, and successful-stream diagnostics. Compact mode preserves canonical
+training history, resolved configuration, manifests, lifecycle status,
+summaries and representative cases, applied guidance/fallback state, final
+analysis and numerical responses, validation/token/model/timing/retry data,
+failed-request diagnostics, caches/journals, checkpoints, replay/optimizer
+state, and RNG state. It omits the large raw per-episode decision arrays and
+removes successful-call chunk streams and partial files after a validated final
+response is durable. This is storage-only: prompt construction, case selection,
+guidance, behavior actions, rewards, and learning are unchanged.
+
+`--output-root` is the only output-root option. Each run is created below
+`<output-root>\<method-id>\<unique-run-id>` without reusing an existing leaf.
+Model checkpoints remain every configured interval and are all retained;
+full-resume checkpoints use the same interval and keep the latest two. The
+canonical history and summaries serve evaluation/analysis, while full-resume
+checkpoints plus the Explorer cache/journal serve exact continuation.
+
+Formal 1,500-episode PowerShell command:
+
+```powershell
+& "C:\Users\user\anaconda3\envs\LLM_HRL\python.exe" .\run_experiment.py td3_dinkelbach_llm_explorer_wo_c10_penalty --episodes 1500 --seed 20260817 --checkpoint-interval 50 --llm-explorer-log-mode compact --output-root D:\UAV_HRL_results
+```
+
+To retain complete diagnostics, change only
+`--llm-explorer-log-mode compact` to `--llm-explorer-log-mode full`.
+
 `td3_dinkelbach_llm_explorer` is an additive comparison method based on
 `td3_dinkelbach`. It keeps the same observations, rewards, constraints,
 Dinkelbach lifecycle, replay buffers, networks, optimizers, task assignment,

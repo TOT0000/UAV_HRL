@@ -1,6 +1,7 @@
 # Manifest-driven comparison experiments
 
-The additive `td3_dinkelbach_llm_explorer` and isolated compact/annealed
+The additive `td3_dinkelbach_llm_explorer`, independent
+`td3_dinkelbach_llm_explorer_wo_c10_penalty`, and isolated compact/annealed
 `td3_dinkelbach_llm_explorer_v3` comparison methods and their live,
 resume, evaluation, and offline-smoke commands are documented in
 `docs/llm_explorer.md`.

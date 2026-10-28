@@ -3642,12 +3642,14 @@ def environment_constants_and_definitions(
     }
 
 
-def _first_gen_movement_penalty_contract() -> dict[str, Any]:
+def _first_gen_movement_penalty_contract(
+    c10_penalty_enabled: bool = True,
+) -> dict[str, Any]:
     """Select the runtime-owned constraint contract for first-gen analysis."""
 
     from experiment_config import task_potential_contract_metadata
 
-    contract = task_potential_contract_metadata()
+    contract = task_potential_contract_metadata(c10_penalty_enabled)
     weights = contract["constraint_penalty_weights"]
     epsilon = contract["com_range"]["normalization_epsilon"]
 
@@ -3713,6 +3715,12 @@ def _first_gen_movement_penalty_contract() -> dict[str, Any]:
                 definition=contract["c10"]["definition"],
             ),
             "population": contract["c10"]["population"],
+            "reward_penalty_enabled": bool(c10_penalty_enabled),
+            "role": (
+                "reward_penalty_and_diagnostic"
+                if c10_penalty_enabled
+                else "diagnostic_only_not_subtracted_from_movement_reward"
+            ),
             "membership_and_validity": (
                 "Only currently assigned FOV pairs with C9 model-range "
                 "validity, finite nonnegative d_L and d_R, and a finite "
@@ -3740,7 +3748,7 @@ def _first_gen_movement_penalty_contract() -> dict[str, Any]:
 
 
 def environment_constants_and_definitions_first_gen(
-    **kwargs: Any,
+    *, c10_penalty_enabled: bool = True, **kwargs: Any,
 ) -> dict[str, Any]:
     """Add rich definitions only to the first-generation dual-guidance method."""
 
@@ -3759,6 +3767,25 @@ def environment_constants_and_definitions_first_gen(
     )
 
     base = environment_constants_and_definitions(**kwargs)
+    c10_penalty_enabled = bool(c10_penalty_enabled)
+    configured_c10_weight = float(
+        base["movement_reward"]["constraint_weights"]["c10"]
+    )
+    base["movement_reward"].update(
+        formula=(
+            "timely_Mbit - lambda_EE_Mbit_per_J * movement_J - P_C9 - "
+            "P_C10 - P_COM"
+            if c10_penalty_enabled
+            else "timely_Mbit - lambda_EE_Mbit_per_J * movement_J - P_C9 - P_COM"
+        ),
+        c10_penalty_enabled=c10_penalty_enabled,
+        configured_constraint_weights={
+            **base["movement_reward"]["constraint_weights"]
+        },
+    )
+    base["movement_reward"]["constraint_weights"]["c10"] = (
+        configured_c10_weight if c10_penalty_enabled else 0.0
+    )
     energy_model = EnergyConsumptionModel(E_max=1.0, N_u=NUM_UAV)
     routing_slot_seconds = float(base["routing_slot_seconds"])
     base.update(
@@ -3866,7 +3893,7 @@ def environment_constants_and_definitions_first_gen(
         "set; an empty set contributes zero"
     )
     base["movement_reward"]["penalty_contract"] = (
-        _first_gen_movement_penalty_contract()
+        _first_gen_movement_penalty_contract(c10_penalty_enabled)
     )
     base["routing_reward"]["bits_per_reward_unit"] = float(
         ROUTING_REWARD_BITS_PER_UNIT
@@ -4313,10 +4340,14 @@ class LLMExplorerController:
         mock: bool = False,
         rng_seed: int = 0,
         lazy_client: bool = False,
+        log_mode: str = "full",
     ) -> None:
         self.config = config or FirstGenLLMExplorerConfig()
         self.run_identity = _json_clone(run_identity)
         self.evaluation = bool(evaluation)
+        self.log_mode = str(log_mode).strip().lower()
+        if self.log_mode not in {"compact", "full"}:
+            raise ValueError("LLM Explorer log mode must be 'compact' or 'full'")
         self.root = (
             None
             if run_directory is None
@@ -4494,6 +4525,7 @@ class LLMExplorerController:
     def state_dict(self) -> dict[str, Any]:
         return {
             "schema_version": self.schema_version,
+            "log_mode": self.log_mode,
             "config": asdict(self.config),
             "run_identity": copy.deepcopy(self.run_identity),
             "previous_episode_feedback": copy.deepcopy(self.previous_episode_feedback),
@@ -4511,6 +4543,11 @@ class LLMExplorerController:
     def load_state_dict(self, state: dict[str, Any]) -> None:
         if state.get("schema_version") != self.schema_version:
             raise ExplorerValidationError("LLM explorer checkpoint version is incompatible")
+        saved_log_mode = str(state.get("log_mode", "full")).strip().lower()
+        if saved_log_mode not in {"compact", "full"}:
+            raise ExplorerValidationError(
+                "LLM explorer checkpoint log mode is invalid"
+            )
         saved_config = state.get("config")
         current_config = asdict(self.config)
         protocol_upgrade = None
@@ -4597,6 +4634,66 @@ class LLMExplorerController:
         self._rebuild_statistics()
         if state.get("rng_state") is not None:
             self.rng.bit_generator.state = copy.deepcopy(state["rng_state"])
+
+    def _feedback_artifact(
+        self,
+        feedback: Mapping[str, Any],
+        *,
+        include_slot_service_records: bool = True,
+    ) -> dict[str, Any]:
+        """Build storage-only feedback without changing the next LLM input."""
+
+        payload = {**_json_clone(feedback), "log_mode": self.log_mode}
+        if self.log_mode == "full":
+            payload.update(
+                movement_decisions=_json_clone(self.movement_records),
+                routing_decisions=_json_clone(self.routing_records),
+            )
+            if include_slot_service_records:
+                payload["slot_service_records"] = _json_clone(
+                    self.slot_service_records
+                )
+        else:
+            payload["omitted_raw_record_counts"] = {
+                "movement_decisions": len(self.movement_records),
+                "routing_decisions": len(self.routing_records),
+                "slot_service_records": len(self.slot_service_records),
+            }
+        return payload
+
+    def _compact_success_artifacts(self, episode_root: Path) -> None:
+        """Drop only redundant files from locally validated successful calls."""
+
+        if self.log_mode != "compact" or not episode_root.is_dir():
+            return
+        redundant_names = {
+            "prompt.txt",
+            "request.json",
+            "response.txt",
+            "response_content.partial.txt",
+            "reasoning.partial.txt",
+            "stream_events.jsonl",
+        }
+        for completed_path in episode_root.rglob("completed.json"):
+            try:
+                completed = json.loads(completed_path.read_text(encoding="utf-8"))
+                attempt = int(completed["attempt"])
+            except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+                continue
+            attempt_root = completed_path.parent / f"attempt_{attempt:02d}"
+            for name in redundant_names:
+                path = attempt_root / name
+                try:
+                    if path.is_file():
+                        path.unlink()
+                except OSError as exc:
+                    self._record_local_failure(
+                        episode_index=max(int(episode_root.name.rsplit("_", 1)[-1]) - 1, 0),
+                        stage=completed_path.parent.name,
+                        attempt=attempt,
+                        category="artifact_write",
+                        reason=f"compact artifact pruning: {type(exc).__name__}: {exc}",
+                    )
 
     @staticmethod
     def _serializable_guidance(guidance: dict[str, Any]) -> dict[str, Any]:
@@ -5829,14 +5926,10 @@ class LLMExplorerController:
             episode_root = self.root / f"episode_{episode_index + 1:06d}"
             _atomic_json(
                 episode_root / "feedback.json",
-                {
-                    **feedback,
-                    "movement_decisions": self.movement_records,
-                    "routing_decisions": self.routing_records,
-                    "slot_service_records": self.slot_service_records,
-                },
+                self._feedback_artifact(feedback),
             )
             _atomic_json(self.root / "state.json", self.state_dict())
+            self._compact_success_artifacts(episode_root)
         print(
             f"[LLM explorer] episode={episode_index + 1} summary "
             f"movement_samples={len(self.movement_records)} routing_decisions={len(self.routing_records)} "

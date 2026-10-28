@@ -160,6 +160,9 @@ _EVALUATION_METHOD_BASELINES = {
     "td3_dinkelbach_llm_search": "td3_dinkelbach",
     "td3_dinkelbach_llm_train_search": "td3_dinkelbach",
     "td3_dinkelbach_llm_explorer": "td3_dinkelbach",
+    "td3_dinkelbach_llm_explorer_wo_c10_penalty": (
+        "td3_dinkelbach_wo_c10_penalty"
+    ),
     "td3_dinkelbach_llm_explorer_v3": "td3_dinkelbach",
     "td3_dinkelbach_llm_explorer_td3_only": "td3_dinkelbach",
     "td3_dinkelbach_llm_explorer_state_rule": "td3_dinkelbach",
@@ -172,10 +175,16 @@ def evaluation_method_supported(method_id, suite):
     suite = resolve_evaluation_suite(suite)
     methods = PAPER_EVALUATION_SUITES[suite]["methods"]
     method_id = str(method_id)
-    return (
-        method_id in methods
-        or _EVALUATION_METHOD_BASELINES.get(method_id) in methods
-    )
+    seen = set()
+    while method_id not in seen:
+        if method_id in methods:
+            return True
+        seen.add(method_id)
+        baseline = _EVALUATION_METHOD_BASELINES.get(method_id)
+        if baseline is None:
+            break
+        method_id = baseline
+    return False
 
 DEPRECATED_SUITE_ALIASES = {
     "fig2_convergence": "training_ee_vs_episode",

@@ -11,8 +11,18 @@ import pytest
 import torch
 
 from DDQN import DDQN
-from experiment_config import METHOD_REGISTRY, MethodSpec
-from HRL_task_aware import TrainingConfig, _select_routing_actions, train
+from experiment_config import (
+    METHOD_REGISTRY,
+    MethodSpec,
+    comparison_method_configuration,
+    task_potential_contract_metadata,
+)
+from HRL_task_aware import (
+    TrainingConfig,
+    _interval_reward,
+    _select_routing_actions,
+    train,
+)
 from llm_explorer import (
     FIRST_GEN_ROUTING_PRIOR_WEIGHT,
     LLM_EXPLORER_CACHE_VERSION,
@@ -62,7 +72,7 @@ from llm_state_rule_explorer import (
     LLMStateRuleController,
     environment_definitions_state_rule,
 )
-from run_experiment import main as run_experiment_main
+from run_experiment import build_parser, main as run_experiment_main
 from scenario_manifest import generate_manifest
 from td3 import TD3
 
@@ -383,8 +393,9 @@ def _begin(
 
 def test_registry_appends_explorer_without_using_legacy_llm_flag():
     assert "td3_dinkelbach_llm_explorer" in METHOD_REGISTRY
-    assert tuple(METHOD_REGISTRY)[-4:] == (
+    assert tuple(METHOD_REGISTRY)[-5:] == (
         "td3_dinkelbach_llm_explorer",
+        "td3_dinkelbach_llm_explorer_wo_c10_penalty",
         "td3_dinkelbach_llm_explorer_v3",
         "td3_dinkelbach_llm_explorer_td3_only",
         "td3_dinkelbach_llm_explorer_state_rule",
@@ -397,6 +408,395 @@ def test_registry_appends_explorer_without_using_legacy_llm_flag():
     assert method.agent == baseline.agent == "td3"
     assert method.routing == baseline.routing == "safe_ddqn"
     assert method.reward_mode == baseline.reward_mode == "dinkelbach"
+
+
+def test_no_c10_first_gen_explorer_is_isolated_and_only_adds_dual_guidance():
+    method = MethodSpec.parse(
+        "td3_dinkelbach_llm_explorer_wo_c10_penalty"
+    )
+    no_c10 = MethodSpec.parse("td3_dinkelbach_wo_c10_penalty")
+    original = MethodSpec.parse("td3_dinkelbach_llm_explorer")
+
+    assert method.llm_explorer_first_gen_enabled
+    assert method.llm_explorer_enabled and not method.llm_enabled
+    assert not method.c10_penalty_enabled
+    assert method.dinkelbach_update_interval_episodes == 50
+    assert method.default_llm_explorer_log_mode == "compact"
+    assert original.default_llm_explorer_log_mode == "full"
+    assert method.fingerprint not in {
+        no_c10.fingerprint,
+        original.fingerprint,
+    }
+
+    method_config = comparison_method_configuration(method)
+    baseline_config = comparison_method_configuration(no_c10)
+    for key in (
+        "assignment_strategy",
+        "assignment_rounds",
+        "movement_policy",
+        "movement_objective",
+        "routing_policy",
+        "task_observation_mode",
+        "task_potential_enabled",
+        "c10_penalty_enabled",
+        "dinkelbach_update_interval_episodes",
+        "effective_movement_constraint_penalty_weights",
+    ):
+        assert method_config[key] == baseline_config[key]
+
+
+def test_no_c10_reward_difference_and_diagnostics_remain_real():
+    penalties = {
+        "c9_penalty_mean": 0.2,
+        "c10_penalty_mean": 0.35,
+        "com_range_penalty_mean": 0.1,
+    }
+    with_c10 = _interval_reward(2.0, 4.0, 0.25, penalties)
+    without_c10 = _interval_reward(
+        2.0, 4.0, 0.25, penalties, c10_penalty_enabled=False
+    )
+    assert without_c10 - with_c10 == pytest.approx(
+        penalties["c10_penalty_mean"]
+    )
+
+    contract = task_potential_contract_metadata(False)
+    assert contract["c10"]["reward_penalty_enabled"] is False
+    assert "definition" in contract["c10"]
+    assert "edge_distances" in contract["c10"]
+    assert contract["c10"]["population"]
+
+
+def test_first_gen_prompt_reward_contract_tracks_c10_setting():
+    kwargs = {"episode_seconds": 60, "routing_slot_seconds": 0.25}
+    enabled = environment_constants_and_definitions_first_gen(
+        **kwargs, c10_penalty_enabled=True
+    )
+    disabled = environment_constants_and_definitions_first_gen(
+        **kwargs, c10_penalty_enabled=False
+    )
+
+    assert "- P_C10" in enabled["movement_reward"]["formula"]
+    assert "P_C10" not in disabled["movement_reward"]["formula"]
+    assert enabled["movement_reward"]["constraint_weights"]["c10"] == 1.0
+    assert disabled["movement_reward"]["constraint_weights"]["c10"] == 0.0
+    assert disabled["movement_reward"]["configured_constraint_weights"]["c10"] == 1.0
+    c10 = disabled["movement_reward"]["penalty_contract"]["C10"]
+    assert c10["reward_penalty_enabled"] is False
+    assert c10["role"] == "diagnostic_only_not_subtracted_from_movement_reward"
+
+    prompts = {}
+    for name, environment in (("enabled", enabled), ("disabled", disabled)):
+        client = SequenceClient(["analysis", _guidance(0.01)])
+        controller = LLMExplorerController(
+            run_directory=None,
+            run_identity={"method_id": f"prompt-test-{name}"},
+            client=client,
+        )
+        controller.previous_episode_feedback = _previous_feedback()
+        _begin(controller, environment_constants=environment)
+        prompts[name] = client.calls[0]["prompt"]
+    assert enabled["movement_reward"]["formula"] in prompts["enabled"]
+    assert disabled["movement_reward"]["formula"] in prompts["disabled"]
+    assert "diagnostic_only_not_subtracted_from_movement_reward" in prompts["disabled"]
+
+
+def test_explorer_log_mode_cli_defaults_and_explicit_override():
+    parser = build_parser()
+    new_args = parser.parse_args(
+        ["td3_dinkelbach_llm_explorer_wo_c10_penalty", "--smoke"]
+    )
+    old_args = parser.parse_args(["td3_dinkelbach_llm_explorer", "--smoke"])
+    explicit = parser.parse_args(
+        [
+            "td3_dinkelbach_llm_explorer_v3",
+            "--smoke",
+            "--llm-explorer-log-mode",
+            "compact",
+        ]
+    )
+    assert new_args.llm_explorer_log_mode is None
+    assert new_args.method.default_llm_explorer_log_mode == "compact"
+    assert old_args.method.default_llm_explorer_log_mode == "full"
+    assert explicit.llm_explorer_log_mode == "compact"
+
+
+class ArtifactSequenceClient(SequenceClient):
+    """Test client that leaves the same redundant files as a streamed call."""
+
+    def chat(self, **kwargs):
+        attempt = Path(kwargs["attempt_directory"])
+        attempt.mkdir(parents=True, exist_ok=True)
+        for name in (
+            "request.json",
+            "stream_events.jsonl",
+            "response_content.partial.txt",
+            "reasoning.partial.txt",
+        ):
+            (attempt / name).write_text("x" * 4096, encoding="utf-8")
+        return super().chat(**kwargs)
+
+
+def test_compact_and_full_preserve_inputs_guidance_and_cache_but_reduce_storage(
+    tmp_path,
+):
+    initial_feedback = _previous_feedback()
+    responses = [RuntimeError("transient"), "analysis final", _guidance(0.02)]
+    controllers = {}
+    clients = {}
+    for mode in ("full", "compact"):
+        client = ArtifactSequenceClient(copy.deepcopy(responses))
+        controller = LLMExplorerController(
+            run_directory=tmp_path / mode,
+            run_identity={"method_id": "storage-equivalence", "seed": 7},
+            client=client,
+            log_mode=mode,
+        )
+        controller.previous_episode_feedback = copy.deepcopy(initial_feedback)
+        guidance = _begin(controller)
+        controller.complete_episode(episode_index=167, metrics={"episode": 168})
+        controllers[mode] = (controller, guidance)
+        clients[mode] = client
+
+    def semantic_calls(client):
+        return [
+            {key: value for key, value in call.items() if key != "attempt_directory"}
+            for call in client.calls
+        ]
+
+    assert semantic_calls(clients["compact"]) == semantic_calls(clients["full"])
+    assert controllers["compact"][0].previous_episode_feedback == (
+        controllers["full"][0].previous_episode_feedback
+    )
+    assert controllers["compact"][0]._serializable_guidance(
+        controllers["compact"][1]
+    ) == controllers["full"][0]._serializable_guidance(
+        controllers["full"][1]
+    )
+
+    compact_feedback = json.loads(
+        (
+            tmp_path
+            / "compact"
+            / "llm_explorer"
+            / "episode_000168"
+            / "feedback.json"
+        ).read_text(encoding="utf-8")
+    )
+    full_feedback = json.loads(
+        (
+            tmp_path
+            / "full"
+            / "llm_explorer"
+            / "episode_000168"
+            / "feedback.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert "movement_decisions" not in compact_feedback
+    assert "routing_decisions" not in compact_feedback
+    assert "slot_service_records" not in compact_feedback
+    assert "omitted_raw_record_counts" in compact_feedback
+    assert "movement_decisions" in full_feedback
+
+    compact_episode = (
+        tmp_path / "compact" / "llm_explorer" / "episode_000168"
+    )
+    failed_attempt = compact_episode / "analysis" / "attempt_01"
+    successful_attempt = compact_episode / "analysis" / "attempt_02"
+    assert (failed_attempt / "stream_events.jsonl").is_file()
+    assert not (successful_attempt / "stream_events.jsonl").exists()
+    assert (compact_episode / "analysis" / "completed.json").is_file()
+    assert (compact_episode / "episode_result.json").is_file()
+
+    def footprint(root):
+        files = [path for path in root.rglob("*") if path.is_file()]
+        return len(files), sum(path.stat().st_size for path in files)
+
+    compact_footprint = footprint(tmp_path / "compact")
+    full_footprint = footprint(tmp_path / "full")
+    assert compact_footprint[0] < full_footprint[0]
+    assert compact_footprint[1] < full_footprint[1]
+
+    replay_client = ArtifactSequenceClient([])
+    replay = LLMExplorerController(
+        run_directory=tmp_path / "compact",
+        run_identity={"method_id": "storage-equivalence", "seed": 7},
+        client=replay_client,
+        log_mode="compact",
+    )
+    replay.previous_episode_feedback = copy.deepcopy(initial_feedback)
+    replayed = _begin(replay)
+    assert replayed["reused"] is True
+    assert replay_client.calls == []
+
+    state = controllers["compact"][0].state_dict()
+    assert state["log_mode"] == "compact"
+    restored = LLMExplorerController(
+        run_directory=None,
+        run_identity={"method_id": "storage-equivalence", "seed": 7},
+        evaluation=True,
+        log_mode="full",
+    )
+    restored.load_state_dict(state)
+    assert restored.previous_episode_feedback == state["previous_episode_feedback"]
+    legacy = copy.deepcopy(state)
+    legacy.pop("log_mode")
+    restored.load_state_dict(legacy)
+
+
+def test_no_c10_explorer_compact_cli_output_and_full_checkpoint(
+    monkeypatch, request
+):
+    import HRL_task_aware
+    import run_experiment
+
+    preflight = lambda *args, **kwargs: {"test_path_preflight": True}
+    monkeypatch.setattr(run_experiment, "llm_explorer_path_preflight", preflight)
+    monkeypatch.setattr(HRL_task_aware, "llm_explorer_path_preflight", preflight)
+    output_root = Path(".test-c10-output")
+    request.addfinalizer(lambda: shutil.rmtree(output_root, ignore_errors=True))
+    method_id = "td3_dinkelbach_llm_explorer_wo_c10_penalty"
+    assert run_experiment_main(
+        [
+            method_id,
+            "--episodes",
+            "1",
+            "--episode-seconds",
+            "1",
+            "--checkpoint-interval",
+            "1",
+            "--roi-count",
+            "2",
+            "--seed",
+            "20260817",
+            "--output-root",
+            str(output_root),
+            "--llm-explorer-mock",
+        ]
+    ) == 0
+    run_dir = next((output_root / method_id).iterdir())
+    resolved = json.loads(
+        (run_dir / "resolved_config.json").read_text(encoding="utf-8")
+    )
+    assert resolved["method"] == method_id
+    assert resolved["c10_penalty_enabled"] is False
+    assert resolved["training_config"]["c10_penalty_enabled"] is False
+    assert resolved["llm_explorer"]["log_mode"] == "compact"
+    assert Path(resolved["run_directory"]).parent == (
+        output_root / method_id
+    ).resolve()
+
+    checkpoint = run_dir / "checkpoints" / "full" / "ep_0001"
+    payload = torch.load(
+        checkpoint / "training_state.pt", map_location="cpu", weights_only=False
+    )
+    explorer_state = payload["training_state"]["llm_explorer_state"]
+    assert explorer_state["log_mode"] == "compact"
+    assert explorer_state["run_identity"]["method_id"] == method_id
+
+    assert (run_dir / "checkpoints" / "models" / "ep_0001").is_dir()
+    assert checkpoint.is_dir()
+    assert payload["formal_config"]["model_checkpoint_every"] == 1
+    assert payload["formal_config"]["full_resume_every"] == 1
+    assert payload["formal_config"]["full_resume_keep_last"] == 2
+
+
+def test_compact_and_full_short_training_are_algorithmically_identical(
+    tmp_path, monkeypatch
+):
+    import HRL_task_aware
+
+    original_begin = LLMExplorerController.begin_episode
+    original_record_builder = HRL_task_aware.build_movement_decision_record
+    active_mode = {"value": None}
+    action_records = {"compact": [], "full": []}
+
+    def begin_after_simulated_warmup(self, **kwargs):
+        kwargs["total_joint_transitions"] = max(
+            int(kwargs["total_joint_transitions"]), 10_000
+        )
+        return original_begin(self, **kwargs)
+
+    def capture_record(*args, **kwargs):
+        record = original_record_builder(*args, **kwargs)
+        action_records[active_mode["value"]].append(copy.deepcopy(record))
+        return record
+
+    monkeypatch.setattr(
+        LLMExplorerController, "begin_episode", begin_after_simulated_warmup
+    )
+    monkeypatch.setattr(
+        HRL_task_aware, "build_movement_decision_record", capture_record
+    )
+
+    results = {}
+    clients = {}
+    for mode in ("compact", "full"):
+        active_mode["value"] = mode
+        client = SequenceClient(["analysis final", _guidance(0.02)])
+        clients[mode] = client
+        results[mode] = train(
+            TrainingConfig(
+                total_episodes=2,
+                mode="smoke",
+                episode_seconds=1,
+                warmup_joint_transitions=0,
+                routing_warmup_transitions=1,
+                batch_size=1,
+                enable_model_checkpoints=False,
+                enable_full_resume=False,
+                enable_plots=False,
+                enable_csv=False,
+                run_directory=str(tmp_path / mode),
+                random_seed=20260817,
+            ),
+            scenario_manifest=generate_manifest(
+                "train", 20260817, 2, num_gt=2
+            ),
+            method_spec=MethodSpec.parse(
+                "td3_dinkelbach_llm_explorer_wo_c10_penalty"
+            ),
+            llm_explorer_client=client,
+            llm_explorer_log_mode=mode,
+        )
+
+    assert action_records["compact"] == action_records["full"]
+    assert results["compact"]["episode_metrics"] == results["full"][
+        "episode_metrics"
+    ]
+    assert results["compact"]["training_history_rows"] == results["full"][
+        "training_history_rows"
+    ]
+    for key in (
+        "critic_updates",
+        "actor_updates",
+        "ddqn_action_selections",
+        "ddqn_training_updates",
+        "dinkelbach_update_count",
+        "lambda",
+        "lambda_cost",
+    ):
+        assert results["compact"][key] == results["full"][key]
+
+    def semantic_requests(client):
+        return [
+            {
+                key: value
+                for key, value in call.items()
+                if key not in {"attempt_directory", "seed"}
+            }
+            for call in client.calls
+        ]
+
+    assert semantic_requests(clients["compact"]) == semantic_requests(
+        clients["full"]
+    )
+    compact_guidance = results["compact"]["llm_explorer"]["state"][
+        "active_guidance"
+    ]
+    full_guidance = results["full"]["llm_explorer"]["state"][
+        "active_guidance"
+    ]
+    assert compact_guidance == full_guidance
 
 
 def test_prompt_renderer_does_not_reinterpret_inserted_braces():

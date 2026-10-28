@@ -85,6 +85,7 @@ EXPECTED_METHODS = (
     + NEW_METHODS
     + (
         "td3_dinkelbach_llm_explorer",
+        "td3_dinkelbach_llm_explorer_wo_c10_penalty",
         "td3_dinkelbach_llm_explorer_v3",
         "td3_dinkelbach_llm_explorer_td3_only",
         "td3_dinkelbach_llm_explorer_state_rule",

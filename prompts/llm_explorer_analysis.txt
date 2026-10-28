@@ -30,7 +30,7 @@ This includes all UAV positions, roles, initial movement masks, queues, currentl
 
 {{RESOLVED_SETTINGS_AND_DATA_DICTIONARY}}
 
-These supply the actual timing, traffic, deadlines, communication, camera, and action settings; C9/C10/COM penalty definitions; and each field's unit, valid denominator, and aggregation scope.
+These supply the actual timing, traffic, deadlines, communication, camera, and action settings; the effective movement-reward formula and penalty weights; C9/COM penalty definitions; the C10 geometry/diagnostic definition and whether it is actually subtracted from reward; and each field's unit, valid denominator, and aggregation scope.
 
 Coordinate definitions are:
 - Relative position: target position minus UAV position.

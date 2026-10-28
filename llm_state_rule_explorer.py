@@ -2048,14 +2048,10 @@ class LLMStateRuleController(LLMExplorerController):
             episode_root = self.root / f"episode_{episode_index + 1:06d}"
             _atomic_json(
                 episode_root / "feedback.json",
-                {
-                    **feedback,
-                    "movement_decisions": self.movement_records,
-                    "routing_decisions": self.routing_records,
-                    "slot_service_records": self.slot_service_records,
-                },
+                self._feedback_artifact(feedback),
             )
             _atomic_json(self.root / "state.json", self.state_dict())
+            self._compact_success_artifacts(episode_root)
         print(
             f"[LLM state rule] episode={episode_index + 1} summary "
             f"controlled={feedback['movement_and_rule_application_summaries']['totals'].get('controlled_decisions', 0)} "

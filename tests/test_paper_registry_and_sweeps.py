@@ -58,7 +58,7 @@ EXPECTED_SEMANTIC_FIGURES = (
 
 class PaperMethodRegistryTest(unittest.TestCase):
     def test_registry_contains_the_exact_methods(self):
-        self.assertEqual(len(METHOD_REGISTRY), 28)
+        self.assertEqual(len(METHOD_REGISTRY), 29)
         self.assertIn("td3_dinkelbach_llm", METHOD_REGISTRY)
         self.assertIn("td3_dinkelbach_llm_search", METHOD_REGISTRY)
         self.assertIn("td3_dinkelbach_llm_train_search", METHOD_REGISTRY)
@@ -95,7 +95,7 @@ class PaperMethodRegistryTest(unittest.TestCase):
             else:
                 self.assertIsNone(resolved["safe_ddqn_qos_target_probability"])
                 self.assertIsNone(resolved["safe_ddqn_eta_c"])
-        self.assertEqual(safe_method_count, 23)
+        self.assertEqual(safe_method_count, 24)
 
     def test_td3_and_ddpg_hyperparameters_are_explicit_and_unchanged(self):
         td3 = movement_agent_configuration(MethodSpec.parse("td3_dinkelbach"))
@@ -292,6 +292,7 @@ class PaperSweepContractTest(unittest.TestCase):
     def test_llm_explorer_methods_are_explicitly_eligible_without_changing_defaults(self):
         explorer_methods = (
             "td3_dinkelbach_llm_explorer",
+            "td3_dinkelbach_llm_explorer_wo_c10_penalty",
             "td3_dinkelbach_llm_explorer_v3",
             "td3_dinkelbach_llm_explorer_td3_only",
             "td3_dinkelbach_llm_explorer_state_rule",

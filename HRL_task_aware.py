@@ -239,7 +239,7 @@ def _llm_routing_exploration_prior(method_spec, explorer, guidance):
     ):
         return None
     if (
-        method_spec.method_id == "td3_dinkelbach_llm_explorer"
+        method_spec.llm_explorer_first_gen_enabled
         and guidance.get("routing_weights") is not None
     ):
         return guidance.get("routing_weights")
@@ -2217,6 +2217,7 @@ def train(
     llm_explorer_timeout=60.0,
     llm_explorer_mock=False,
     llm_explorer_client=None,
+    llm_explorer_log_mode=None,
 ):
     if config is None:
         raise ValueError(
@@ -2232,7 +2233,9 @@ def train(
     })
     config = resolve_method_training_config(config, method_spec)
     if not method_spec.llm_explorer_enabled and (
-        llm_explorer_mock or llm_explorer_client is not None
+        llm_explorer_mock
+        or llm_explorer_client is not None
+        or llm_explorer_log_mode is not None
     ):
         raise ValueError(
             "LLM explorer client settings are valid only for "
@@ -2632,6 +2635,11 @@ def train(
             client=llm_explorer_client,
             evaluation=evaluation,
             mock=bool(llm_explorer_mock),
+            log_mode=(
+                method_spec.default_llm_explorer_log_mode
+                if llm_explorer_log_mode is None
+                else str(llm_explorer_log_mode)
+            ),
             rng_seed=(
                 (0 if config.random_seed is None else int(config.random_seed))
                 ^ 0x4C4C4D45
@@ -2642,7 +2650,7 @@ def train(
     )
     if (
         llm_explorer is not None
-        and method_spec.method_id == "td3_dinkelbach_llm_explorer"
+        and method_spec.llm_explorer_first_gen_enabled
     ):
         llm_explorer._configured_training_horizon_episodes = int(
             config.total_episodes
@@ -2657,6 +2665,12 @@ def train(
             if method_spec.llm_explorer_v3_enabled
             else explorer_metadata(llm_explorer_config)
         )
+        experiment_identity["llm_explorer"]["log_mode"] = (
+            method_spec.default_llm_explorer_log_mode
+            if llm_explorer_log_mode is None
+            else str(llm_explorer_log_mode)
+        )
+        experiment_identity["llm_explorer"]["method_id"] = method_spec.method_id
     if rnd_explorer is not None:
         experiment_identity["rnd"] = rnd_explorer.metadata()
         experiment_identity["rnd"]["checkpoint_episodes"] = (
@@ -3209,7 +3223,7 @@ def train(
                 else environment_definitions_v3
                 if method_spec.llm_explorer_v3_enabled
                 else environment_constants_and_definitions_first_gen
-                if method_spec.method_id == "td3_dinkelbach_llm_explorer"
+                if method_spec.llm_explorer_first_gen_enabled
                 else environment_constants_and_definitions
             )(
                 episode_seconds=config.episode_seconds,
@@ -3219,8 +3233,13 @@ def train(
                 task_deadlines_seconds=resolved_evaluation[
                     "task_deadlines_seconds"
                 ],
+                **(
+                    {"c10_penalty_enabled": method_spec.c10_penalty_enabled}
+                    if method_spec.llm_explorer_first_gen_enabled
+                    else {}
+                ),
             )
-            if method_spec.method_id == "td3_dinkelbach_llm_explorer":
+            if method_spec.llm_explorer_first_gen_enabled:
                 llm_environment_constants[
                     "resolved_traffic_rates_packets_per_second"
                 ] = dict(resolved_episode_rates)
@@ -3575,22 +3594,19 @@ def train(
                         else None
                     ),
                     td3_guidance_active=(
-                        method_spec.method_id
-                        == "td3_dinkelbach_llm_explorer"
+                        method_spec.llm_explorer_first_gen_enabled
                         and bool(episode_guidance.get("enabled", False))
                         and not bool(episode_guidance.get("td3_fallback", True))
                     ),
                     noise_std=behavior_noise,
                     auxiliary_snapshot=(
                         current_auxiliary_snapshot
-                        if method_spec.method_id
-                        == "td3_dinkelbach_llm_explorer"
+                        if method_spec.llm_explorer_first_gen_enabled
                         else None
                     ),
                     action_diagnostics=(
                         movement_action_diagnostics
-                        if method_spec.method_id
-                        == "td3_dinkelbach_llm_explorer"
+                        if method_spec.llm_explorer_first_gen_enabled
                         else None
                     ),
                 )
@@ -3771,8 +3787,7 @@ def train(
                     ),
                     exploration_guidance_kind=(
                         "routing_weights"
-                        if method_spec.method_id
-                        == "td3_dinkelbach_llm_explorer"
+                        if method_spec.llm_explorer_first_gen_enabled
                         and episode_guidance is not None
                         and episode_guidance.get("routing_weights") is not None
                         else None
@@ -3782,8 +3797,7 @@ def train(
                         if method_spec.llm_explorer_v3_enabled
                         and episode_guidance is not None
                         else FIRST_GEN_ROUTING_PRIOR_WEIGHT
-                        if method_spec.method_id
-                        == "td3_dinkelbach_llm_explorer"
+                        if method_spec.llm_explorer_first_gen_enabled
                         else 0.8
                     ),
                     zero_prior_mass_callback=(
@@ -3800,18 +3814,15 @@ def train(
                     routing_slot_observer=(
                         llm_explorer.record_slot_service
                         if method_spec.llm_explorer_state_rule_enabled
-                        or method_spec.method_id
-                        == "td3_dinkelbach_llm_explorer"
+                        or method_spec.llm_explorer_first_gen_enabled
                         else None
                     ),
                     first_gen_slot_service_observer=(
-                        method_spec.method_id
-                        == "td3_dinkelbach_llm_explorer"
+                        method_spec.llm_explorer_first_gen_enabled
                     ),
                     record_current_expected_capacities=(
                         method_spec.llm_explorer_state_rule_enabled
-                        or method_spec.method_id
-                        == "td3_dinkelbach_llm_explorer"
+                        or method_spec.llm_explorer_first_gen_enabled
                     ),
                 )
                 ddqn_action_selections += action_selections
@@ -5016,8 +5027,7 @@ def train(
                             ),
                         }
                         if method_spec.llm_explorer_state_rule_enabled
-                        or method_spec.method_id
-                        == "td3_dinkelbach_llm_explorer"
+                        or method_spec.llm_explorer_first_gen_enabled
                         else {}
                     ),
                 },
@@ -5443,15 +5453,19 @@ def train(
         "llm_artifact_identity": copy.deepcopy(llm_identity),
         "llm_explorer": (
             {
-                "configuration": (
-                    explorer_metadata_state_rule(llm_explorer_config)
-                    if method_spec.llm_explorer_state_rule_enabled
-                    else explorer_metadata_td3_only(llm_explorer_config)
-                    if method_spec.llm_explorer_td3_only_enabled
-                    else explorer_metadata_v3(llm_explorer_config)
-                    if method_spec.llm_explorer_v3_enabled
-                    else explorer_metadata(llm_explorer_config)
-                ),
+                "configuration": {
+                    **(
+                        explorer_metadata_state_rule(llm_explorer_config)
+                        if method_spec.llm_explorer_state_rule_enabled
+                        else explorer_metadata_td3_only(llm_explorer_config)
+                        if method_spec.llm_explorer_td3_only_enabled
+                        else explorer_metadata_v3(llm_explorer_config)
+                        if method_spec.llm_explorer_v3_enabled
+                        else explorer_metadata(llm_explorer_config)
+                    ),
+                    "log_mode": llm_explorer.log_mode,
+                    "method_id": method_spec.method_id,
+                },
                 "statistics": copy.deepcopy(llm_explorer.statistics),
                 "state": llm_explorer.state_dict(),
             }

@@ -1517,13 +1517,12 @@ class LLMExplorerV3Controller(LLMExplorerController):
             episode_root = self.root / f"episode_{episode_index + 1:06d}"
             _atomic_json(
                 episode_root / "feedback.json",
-                {
-                    **summary_feedback,
-                    "movement_decisions": self.movement_records,
-                    "routing_decisions": self.routing_records,
-                },
+                self._feedback_artifact(
+                    summary_feedback, include_slot_service_records=False
+                ),
             )
             _atomic_json(self.root / "state.json", self.state_dict())
+            self._compact_success_artifacts(episode_root)
         print(
             f"[LLM explorer v3] episode={episode_index + 1} "
             f"w={self.active_guidance.get('annealing_weight', 0.0):.6f} "

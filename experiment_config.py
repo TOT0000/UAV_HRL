@@ -560,6 +560,18 @@ _METHOD_DEFINITIONS = {
         "reward_mode": "dinkelbach",
         "label": "TD3 + Dinkelbach + LLM-guided TD3/safe-DDQN exploration",
     },
+    "td3_dinkelbach_llm_explorer_wo_c10_penalty": {
+        **_COMMON_METHOD,
+        "agent": "td3",
+        "movement": "centralized_td3",
+        "reward_mode": "dinkelbach",
+        "c10_penalty_enabled": False,
+        "dinkelbach_update_interval_episodes": 50,
+        "label": (
+            "TD3-Dinkelbach w/o C10 Penalty + LLM-guided "
+            "TD3/safe-DDQN exploration"
+        ),
+    },
     "td3_dinkelbach_llm_explorer_v3": {
         **_COMMON_METHOD,
         "agent": "td3",
@@ -699,10 +711,28 @@ class MethodSpec:
 
         return self.method_id in {
             "td3_dinkelbach_llm_explorer",
+            "td3_dinkelbach_llm_explorer_wo_c10_penalty",
             "td3_dinkelbach_llm_explorer_v3",
             "td3_dinkelbach_llm_explorer_td3_only",
             "td3_dinkelbach_llm_explorer_state_rule",
         }
+
+    @property
+    def llm_explorer_first_gen_enabled(self) -> bool:
+        """Methods using the original dual-guidance Explorer protocol."""
+
+        return self.method_id in {
+            "td3_dinkelbach_llm_explorer",
+            "td3_dinkelbach_llm_explorer_wo_c10_penalty",
+        }
+
+    @property
+    def default_llm_explorer_log_mode(self) -> str | None:
+        if not self.llm_explorer_enabled:
+            return None
+        if self.method_id == "td3_dinkelbach_llm_explorer_wo_c10_penalty":
+            return "compact"
+        return "full"
 
     @property
     def llm_explorer_v3_enabled(self) -> bool:
@@ -1338,7 +1368,7 @@ def comparison_method_configuration(method_spec: MethodSpec) -> dict:
             PRODUCTION_PACKET_INJECTION_CUTOFF_SECONDS
         ),
     }
-    if method_spec.method_id == "td3_dinkelbach_wo_c10_penalty":
+    if not method_spec.c10_penalty_enabled:
         configuration["c10_penalty_enabled"] = False
     if method_spec.dinkelbach_update_interval_overridden:
         configuration["dinkelbach_update_interval_episodes"] = (

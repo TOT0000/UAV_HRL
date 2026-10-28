@@ -74,7 +74,7 @@ margin_C10 = min(d_L,d_R) - r.
 
 A nonnegative margin satisfies the image-geometry scale condition.
 
-Actual sensing validity also includes positive relative altitude and valid camera-projection rays. Use the supplied capture_valid observation. C10 is a soft reward penalty rather than a packet-generation switch.
+Actual sensing validity also includes positive relative altitude and valid camera-projection rays. Use the supplied capture_valid observation. C10 geometry is always computed and observed for diagnostics; the supplied movement_reward.c10_penalty_enabled and movement_reward.formula state whether its soft penalty is actually subtracted from reward. C10 is never a packet-generation switch.
 
 Let footprint denote the camera projection on the RoI plane:
 
@@ -101,7 +101,7 @@ Hovering consumes energy, and power is not simply linear in speed. The input pro
 
 The original TD3 reward is:
 
-r_move = B_timely,Mbit - lambda_EE*E_move,J - P_C9 - P_C10 - P_COM.
+Use the exact r_move formula supplied in SETTINGS_AND_DATA_DEFINITIONS.movement_reward.formula. It explicitly states whether P_C10 is subtracted for this method.
 
 lambda_EE uses Mbit/J. The three penalties reflect C9, C10, and COM access-distance conditions. Each is averaged over its own applicable service-pair population; an empty population contributes zero. The input supplies the actual definitions and values.
 
