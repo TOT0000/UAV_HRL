@@ -165,7 +165,9 @@ from llm_explorer import (
     build_observable_initial_state,
     environment_constants_and_definitions,
     environment_constants_and_definitions_first_gen,
+    environment_constants_and_definitions_first_gen_no_c10,
     explorer_metadata,
+    first_gen_prompt_version,
     first_gen_slot_service_record,
     llm_explorer_path_preflight,
 )
@@ -2573,6 +2575,7 @@ def train(
             else FirstGenLLMExplorerConfig(
                 model=str(llm_explorer_model),
                 request_timeout_seconds=float(llm_explorer_timeout),
+                prompt_version=first_gen_prompt_version(method_spec.method_id),
             )
         )
         if method_spec.llm_explorer_enabled
@@ -2663,7 +2666,7 @@ def train(
             if method_spec.llm_explorer_td3_only_enabled
             else explorer_metadata_v3(llm_explorer_config)
             if method_spec.llm_explorer_v3_enabled
-            else explorer_metadata(llm_explorer_config)
+            else explorer_metadata(llm_explorer_config, method_spec.method_id)
         )
         experiment_identity["llm_explorer"]["log_mode"] = (
             method_spec.default_llm_explorer_log_mode
@@ -3222,6 +3225,9 @@ def train(
                 if method_spec.llm_explorer_td3_only_enabled
                 else environment_definitions_v3
                 if method_spec.llm_explorer_v3_enabled
+                else environment_constants_and_definitions_first_gen_no_c10
+                if method_spec.method_id
+                == "td3_dinkelbach_llm_explorer_wo_c10_penalty"
                 else environment_constants_and_definitions_first_gen
                 if method_spec.llm_explorer_first_gen_enabled
                 else environment_constants_and_definitions
@@ -3233,11 +3239,6 @@ def train(
                 task_deadlines_seconds=resolved_evaluation[
                     "task_deadlines_seconds"
                 ],
-                **(
-                    {"c10_penalty_enabled": method_spec.c10_penalty_enabled}
-                    if method_spec.llm_explorer_first_gen_enabled
-                    else {}
-                ),
             )
             if method_spec.llm_explorer_first_gen_enabled:
                 llm_environment_constants[
@@ -5461,7 +5462,9 @@ def train(
                         if method_spec.llm_explorer_td3_only_enabled
                         else explorer_metadata_v3(llm_explorer_config)
                         if method_spec.llm_explorer_v3_enabled
-                        else explorer_metadata(llm_explorer_config)
+                        else explorer_metadata(
+                            llm_explorer_config, method_spec.method_id
+                        )
                     ),
                     "log_mode": llm_explorer.log_mode,
                     "method_id": method_spec.method_id,

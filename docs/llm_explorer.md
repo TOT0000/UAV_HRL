@@ -18,21 +18,40 @@ The method has its own registry identity, fingerprint, run directory, and
 checkpoint identity. Checkpoints from either parent method cannot be used for
 exact resume.
 
+The original method keeps its pre-ablation `prompts-v10` templates and original
+C10-enabled environment payload byte-for-byte. The no-C10 method uses the
+separate `prompts-v10-no-c10-v1` / `cache-v7-no-c10-v1` identities. Its
+observations, summaries, cases, and numerical protocol are unchanged; only the
+movement-reward formula and explicit C10 diagnostic-only status differ. A
+no-C10 checkpoint created by commit `615f7bf` is recognized as the earlier
+mislabelled form and may migrate its training state, but its old guidance cache
+is not reused under the new identity. An original-method run created by that
+commit is refused for exact resume because its `prompts-v10` metadata does not
+reliably identify the modified shared template. Existing original checkpoints
+from the earlier supported prompt protocols retain their migration path.
+
 All Explorer methods accept `--llm-explorer-log-mode compact|full`. Existing
 Explorer methods default to `full`; the new w/o-C10 method defaults to
 `compact`. Full mode retains the complete per-episode movement, routing, slot
 service, and successful-stream diagnostics. Compact mode preserves canonical
 training history, resolved configuration, manifests, lifecycle status,
 summaries and representative cases, applied guidance/fallback state, final
-analysis and numerical responses, validation/token/model/timing/retry data,
-failed-request diagnostics, caches/journals, checkpoints, replay/optimizer
-state, and RNG state. It omits the large raw per-episode decision arrays and
-removes successful-call chunk streams and partial files after a validated final
-response is durable. This is storage-only: prompt construction, case selection,
+analysis and numerical responses, each successful request's exact raw final
+`response.txt` (including original numeric precision), validation/token/model/
+timing/retry data, failed-request diagnostics, caches/journals, checkpoints,
+replay/optimizer state, and RNG state. It omits the large raw per-episode
+decision arrays and
+removes successful-call chunk streams, repeated partial content, and request
+copies only after both the raw final response and validated recovery/cache data
+are durable. This is storage-only: prompt construction, case selection,
 guidance, behavior actions, rewards, and learning are unchanged.
 
 `--output-root` is the only output-root option. Each run is created below
 `<output-root>\<method-id>\<unique-run-id>` without reusing an existing leaf.
+Before training or any real LLM request, the runner checks the actual generated
+run name and deepest Explorer artifact against a conservative 240-character
+Windows limit. Use a short root such as `D:\UAV_HRL_results`; the repository's
+deep default `results` path is not guaranteed to pass on every checkout.
 Model checkpoints remain every configured interval and are all retained;
 full-resume checkpoints use the same interval and keep the latest two. The
 canonical history and summaries serve evaluation/analysis, while full-resume
@@ -41,7 +60,7 @@ checkpoints plus the Explorer cache/journal serve exact continuation.
 Formal 1,500-episode PowerShell command:
 
 ```powershell
-& "C:\Users\user\anaconda3\envs\LLM_HRL\python.exe" .\run_experiment.py td3_dinkelbach_llm_explorer_wo_c10_penalty --episodes 1500 --seed 20260817 --checkpoint-interval 50 --llm-explorer-log-mode compact --output-root D:\UAV_HRL_results
+& "C:\Users\user\anaconda3\envs\LLM_HRL\python.exe" .\run_experiment.py td3_dinkelbach_llm_explorer_wo_c10_penalty --episodes 1500 --seed 20260817 --checkpoint-interval 50 --llm-explorer-log-mode compact --output-root "D:\UAV_HRL_results"
 ```
 
 To retain complete diagnostics, change only

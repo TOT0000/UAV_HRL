@@ -1,6 +1,7 @@
 import copy
 import hashlib
 import json
+import os
 import shutil
 import tempfile
 from pathlib import Path
@@ -26,6 +27,9 @@ from HRL_task_aware import (
 from llm_explorer import (
     FIRST_GEN_ROUTING_PRIOR_WEIGHT,
     LLM_EXPLORER_CACHE_VERSION,
+    LLM_EXPLORER_NO_C10_CACHE_VERSION,
+    LLM_EXPLORER_NO_C10_METHOD_ID,
+    LLM_EXPLORER_NO_C10_PROMPT_VERSION,
     LLM_EXPLORER_NUMERICAL_OUTPUT_PROTOCOL,
     LLM_EXPLORER_NUMERICAL_STAGE,
     LLM_EXPLORER_PROMPT_VERSION,
@@ -41,7 +45,9 @@ from llm_explorer import (
     compact_routing_record,
     environment_constants_and_definitions,
     environment_constants_and_definitions_first_gen,
+    environment_constants_and_definitions_first_gen_no_c10,
     explorer_metadata,
+    first_gen_resume_protocol_upgrade,
     first_gen_numerical_response_format,
     first_gen_movement_summary,
     first_gen_present_for_llm,
@@ -72,7 +78,10 @@ from llm_state_rule_explorer import (
     LLMStateRuleController,
     environment_definitions_state_rule,
 )
-from run_experiment import build_parser, main as run_experiment_main
+from run_experiment import (
+    build_parser,
+    main as run_experiment_main,
+)
 from scenario_manifest import generate_manifest
 from td3 import TD3
 
@@ -466,14 +475,46 @@ def test_no_c10_reward_difference_and_diagnostics_remain_real():
     assert contract["c10"]["population"]
 
 
-def test_first_gen_prompt_reward_contract_tracks_c10_setting():
+def test_original_first_gen_prompt_and_environment_match_parent_commit():
+    prompt_root = Path(__file__).resolve().parents[1] / "prompts"
+    expected_parent_sha256 = {
+        "llm_explorer_system.txt": (
+            "ee2555c419536fa101f304abbe8c3310e27b9fa26f94a6b06f5975b43cf7d540"
+        ),
+        "llm_explorer_analysis.txt": (
+            "719ed1a4acc5d917b9ab350a2bbe09ae9ecb8552c4d2b506c3f423c19c9bbefe"
+        ),
+    }
+    for name, expected in expected_parent_sha256.items():
+        normalized = (prompt_root / name).read_text(encoding="utf-8")
+        assert hashlib.sha256(normalized.encode("utf-8")).hexdigest() == expected
+
+    environment = environment_constants_and_definitions_first_gen(
+        episode_seconds=60, routing_slot_seconds=0.25
+    )
+    serialized = json.dumps(
+        environment,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+    # Fixed snapshot generated from parent 01b5c385, not from another current
+    # renderer invocation.
+    assert hashlib.sha256(serialized.encode("utf-8")).hexdigest() == (
+        "b8d2ee5e78f7b728ed72b37b2bf722d33648b60f410f969aec22d6167e2f5d74"
+    )
+    assert set(environment["movement_reward"]) == {
+        "formula",
+        "constraint_weights",
+        "penalty_denominators",
+        "penalty_contract",
+    }
+
+
+def test_first_gen_prompt_reward_contract_tracks_c10_setting_only():
     kwargs = {"episode_seconds": 60, "routing_slot_seconds": 0.25}
-    enabled = environment_constants_and_definitions_first_gen(
-        **kwargs, c10_penalty_enabled=True
-    )
-    disabled = environment_constants_and_definitions_first_gen(
-        **kwargs, c10_penalty_enabled=False
-    )
+    enabled = environment_constants_and_definitions_first_gen(**kwargs)
+    disabled = environment_constants_and_definitions_first_gen_no_c10(**kwargs)
 
     assert "- P_C10" in enabled["movement_reward"]["formula"]
     assert "P_C10" not in disabled["movement_reward"]["formula"]
@@ -484,20 +525,122 @@ def test_first_gen_prompt_reward_contract_tracks_c10_setting():
     assert c10["reward_penalty_enabled"] is False
     assert c10["role"] == "diagnostic_only_not_subtracted_from_movement_reward"
 
+    normalized_disabled = copy.deepcopy(disabled)
+    normalized_reward = normalized_disabled["movement_reward"]
+    normalized_reward["formula"] = enabled["movement_reward"]["formula"]
+    normalized_reward["constraint_weights"]["c10"] = 1.0
+    normalized_reward.pop("c10_penalty_enabled")
+    normalized_reward.pop("configured_constraint_weights")
+    normalized_contract = normalized_reward["penalty_contract"]
+    normalized_contract["reward_form"] = enabled["movement_reward"][
+        "penalty_contract"
+    ]["reward_form"]
+    normalized_contract["weights"]["w_C10"] = 1.0
+    normalized_contract["C10"].pop("reward_penalty_enabled")
+    normalized_contract["C10"].pop("role")
+    assert normalized_disabled == enabled
+
+    controllers = {}
     prompts = {}
-    for name, environment in (("enabled", enabled), ("disabled", disabled)):
+    for name, environment, method_id, prompt_version in (
+        (
+            "enabled",
+            enabled,
+            "td3_dinkelbach_llm_explorer",
+            LLM_EXPLORER_PROMPT_VERSION,
+        ),
+        (
+            "disabled",
+            disabled,
+            LLM_EXPLORER_NO_C10_METHOD_ID,
+            LLM_EXPLORER_NO_C10_PROMPT_VERSION,
+        ),
+    ):
         client = SequenceClient(["analysis", _guidance(0.01)])
         controller = LLMExplorerController(
             run_directory=None,
-            run_identity={"method_id": f"prompt-test-{name}"},
+            run_identity={"method_id": method_id},
+            config=FirstGenLLMExplorerConfig(prompt_version=prompt_version),
             client=client,
         )
         controller.previous_episode_feedback = _previous_feedback()
         _begin(controller, environment_constants=environment)
-        prompts[name] = client.calls[0]["prompt"]
-    assert enabled["movement_reward"]["formula"] in prompts["enabled"]
-    assert disabled["movement_reward"]["formula"] in prompts["disabled"]
-    assert "diagnostic_only_not_subtracted_from_movement_reward" in prompts["disabled"]
+        controllers[name] = controller
+        prompts[name] = client.calls[0]
+    assert enabled["movement_reward"]["formula"] in prompts["enabled"]["prompt"]
+    assert disabled["movement_reward"]["formula"] in prompts["disabled"]["prompt"]
+    assert "diagnostic_only_not_subtracted_from_movement_reward" in (
+        prompts["disabled"]["prompt"]
+    )
+
+    previous = compact_feedback_for_llm(_previous_feedback())
+    settings = controllers["enabled"]._exploration_settings(
+        sigma_episode_start=0.1, routing_epsilon=0.2
+    )
+    state = {"known_rois": [], "uavs": []}
+    original_parts = controllers["enabled"]._analysis_replacements(
+        previous=previous,
+        environment_constants=enabled,
+        current_observable_initial_state=state,
+        settings=settings,
+    )
+    no_c10_parts = controllers["disabled"]._analysis_replacements(
+        previous=previous,
+        environment_constants=disabled,
+        current_observable_initial_state=state,
+        settings=settings,
+    )
+    assert original_parts.keys() == no_c10_parts.keys()
+    for key in original_parts:
+        if key != "RESOLVED_SETTINGS_AND_DATA_DICTIONARY":
+            assert original_parts[key] == no_c10_parts[key]
+
+    original_templates = controllers["enabled"]._templates()
+    no_c10_templates = controllers["disabled"]._templates()
+    assert original_templates[2:] == no_c10_templates[2:]
+    assert "C10 is a soft reward penalty" in original_templates[0]
+    assert "C10 geometry is always computed" in no_c10_templates[0]
+    assert prompts["enabled"]["system_prompt"] != prompts["disabled"]["system_prompt"]
+
+
+def test_first_gen_protocol_metadata_checkpoint_and_cache_are_method_isolated():
+    original_config = FirstGenLLMExplorerConfig()
+    no_c10_config = FirstGenLLMExplorerConfig(
+        prompt_version=LLM_EXPLORER_NO_C10_PROMPT_VERSION
+    )
+    original_metadata = explorer_metadata(original_config)
+    no_c10_metadata = explorer_metadata(
+        no_c10_config, LLM_EXPLORER_NO_C10_METHOD_ID
+    )
+    assert original_metadata["prompt_version"] == LLM_EXPLORER_PROMPT_VERSION
+    assert original_metadata["cache_version"] == LLM_EXPLORER_CACHE_VERSION
+    assert no_c10_metadata["prompt_version"] == LLM_EXPLORER_NO_C10_PROMPT_VERSION
+    assert no_c10_metadata["cache_version"] == LLM_EXPLORER_NO_C10_CACHE_VERSION
+
+    original = LLMExplorerController(
+        run_directory=None,
+        run_identity={"method_id": "td3_dinkelbach_llm_explorer"},
+        config=original_config,
+        evaluation=True,
+    )
+    no_c10 = LLMExplorerController(
+        run_directory=None,
+        run_identity={"method_id": LLM_EXPLORER_NO_C10_METHOD_ID},
+        config=no_c10_config,
+        evaluation=True,
+    )
+    original_identity = original._cache_identity(
+        episode_index=1, stage="analysis", system_prompt="s", user_prompt="u"
+    )
+    no_c10_identity = no_c10._cache_identity(
+        episode_index=1, stage="analysis", system_prompt="s", user_prompt="u"
+    )
+    assert original_identity != no_c10_identity
+    assert original.state_dict()["prompt_contract"] != no_c10.state_dict()[
+        "prompt_contract"
+    ]
+    with pytest.raises(ValueError, match="incompatible"):
+        no_c10.load_state_dict(original.state_dict())
 
 
 def test_explorer_log_mode_cli_defaults_and_explicit_override():
@@ -604,6 +747,16 @@ def test_compact_and_full_preserve_inputs_guidance_and_cache_but_reduce_storage(
     successful_attempt = compact_episode / "analysis" / "attempt_02"
     assert (failed_attempt / "stream_events.jsonl").is_file()
     assert not (successful_attempt / "stream_events.jsonl").exists()
+    assert (successful_attempt / "response.txt").read_text(
+        encoding="utf-8"
+    ) == "analysis final"
+    numerical_response = (
+        compact_episode
+        / LLM_EXPLORER_NUMERICAL_STAGE
+        / "attempt_01"
+        / "response.txt"
+    )
+    assert numerical_response.read_text(encoding="utf-8") == _guidance(0.02)
     assert (compact_episode / "analysis" / "completed.json").is_file()
     assert (compact_episode / "episode_result.json").is_file()
 
@@ -643,16 +796,154 @@ def test_compact_and_full_preserve_inputs_guidance_and_cache_but_reduce_storage(
     restored.load_state_dict(legacy)
 
 
-def test_no_c10_explorer_compact_cli_output_and_full_checkpoint(
-    monkeypatch, request
+def test_compact_preserves_exact_raw_responses_and_merged_attempt_provenance(
+    tmp_path,
 ):
-    import HRL_task_aware
-    import run_experiment
+    precise_td3 = "0.01234567890123456789"
+    precise_routing = "1.00000000000000022204"
+    # JSON has no repetition operator; construct it without a float round-trip.
+    td3_rows = "[" + ",".join(
+        [f"[{precise_td3},0,0]" for _ in range(16)]
+    ) + "]"
+    routing_rows = "[" + ",".join(
+        ["[" + ",".join([precise_routing] * 17) + "]" for _ in range(16)]
+    ) + "]"
+    attempt_one = f'{{"td3_bias":{td3_rows},"routing_weights":[[1]]}}'
+    attempt_two = f'{{"td3_bias":[[0]],"routing_weights":{routing_rows}}}'
+    client = SequenceClient(["analysis exact", attempt_one, attempt_two])
+    controller = LLMExplorerController(
+        run_directory=tmp_path,
+        run_identity={"method_id": "raw-response-trace"},
+        client=client,
+        log_mode="compact",
+    )
+    controller.previous_episode_feedback = _previous_feedback()
+    guidance = _begin(controller)
+    controller.complete_episode(episode_index=167, metrics={"episode": 168})
 
-    preflight = lambda *args, **kwargs: {"test_path_preflight": True}
-    monkeypatch.setattr(run_experiment, "llm_explorer_path_preflight", preflight)
-    monkeypatch.setattr(HRL_task_aware, "llm_explorer_path_preflight", preflight)
-    output_root = Path(".test-c10-output")
+    stage = (
+        tmp_path
+        / "llm_explorer"
+        / "episode_000168"
+        / LLM_EXPLORER_NUMERICAL_STAGE
+    )
+    assert (stage / "attempt_01" / "response.txt").read_text(
+        encoding="utf-8"
+    ) == attempt_one
+    assert (stage / "attempt_02" / "response.txt").read_text(
+        encoding="utf-8"
+    ) == attempt_two
+    completed = json.loads((stage / "completed.json").read_text(encoding="utf-8"))
+    assert completed["td3_source_attempt"] == 1
+    assert completed["routing_source_attempt"] == 2
+    assert guidance["td3_guidance_attempt"] == 1
+    assert guidance["routing_guidance_attempt"] == 2
+    assert precise_td3 in attempt_one
+    assert precise_routing in attempt_two
+    assert completed["content"] not in {attempt_one, attempt_two}
+
+    replay_client = SequenceClient([])
+    replay = LLMExplorerController(
+        run_directory=tmp_path,
+        run_identity={"method_id": "raw-response-trace"},
+        client=replay_client,
+        log_mode="compact",
+    )
+    replay.previous_episode_feedback = _previous_feedback()
+    replayed = _begin(replay)
+    assert replayed["reused"] is True
+    assert replay_client.calls == []
+
+
+@pytest.mark.parametrize(
+    ("controller_type", "config"),
+    (
+        (LLMExplorerController, FirstGenLLMExplorerConfig()),
+        (LLMExplorerV3Controller, LLMExplorerV3Config()),
+        (LLMExplorerTD3OnlyController, LLMExplorerTD3OnlyConfig()),
+        (LLMStateRuleController, LLMStateRuleConfig()),
+    ),
+)
+def test_all_compact_explorer_variants_keep_success_response(
+    tmp_path, controller_type, config
+):
+    controller = controller_type(
+        run_directory=tmp_path / controller_type.__name__,
+        run_identity={"variant": controller_type.__name__},
+        config=config,
+        evaluation=True,
+        log_mode="compact",
+    )
+    episode = controller.root / "episode_000001"
+    stage = episode / "analysis"
+    attempt = stage / "attempt_01"
+    attempt.mkdir(parents=True)
+    raw = "raw final response 0.12345678901234567890"
+    (attempt / "response.txt").write_text(raw, encoding="utf-8")
+    (attempt / "response_content.partial.txt").write_text(raw, encoding="utf-8")
+    (attempt / "stream_events.jsonl").write_text("chunk", encoding="utf-8")
+    (stage / "completed.json").write_text(
+        json.dumps({"attempt": 1}), encoding="utf-8"
+    )
+    controller._compact_success_artifacts(episode)
+    assert (attempt / "response.txt").read_text(encoding="utf-8") == raw
+    assert not (attempt / "response_content.partial.txt").exists()
+    assert not (attempt / "stream_events.jsonl").exists()
+
+
+def test_compact_does_not_prune_raw_response_when_completed_write_fails(
+    tmp_path, monkeypatch
+):
+    import llm_explorer
+
+    original_atomic_json = llm_explorer._atomic_json
+
+    def fail_completed(path, value):
+        if Path(path).name == "completed.json":
+            raise OSError("simulated completed write failure")
+        return original_atomic_json(path, value)
+
+    monkeypatch.setattr(llm_explorer, "_atomic_json", fail_completed)
+    client = ArtifactSequenceClient(["analysis raw", _guidance(0.03)])
+    controller = LLMExplorerController(
+        run_directory=tmp_path,
+        run_identity={"method_id": "write-failure"},
+        client=client,
+        log_mode="compact",
+    )
+    controller.previous_episode_feedback = _previous_feedback()
+    _begin(controller)
+    controller.complete_episode(episode_index=167, metrics={"episode": 168})
+    episode = tmp_path / "llm_explorer" / "episode_000168"
+    assert (episode / "analysis" / "attempt_01" / "response.txt").read_text(
+        encoding="utf-8"
+    ) == "analysis raw"
+    assert (
+        episode
+        / LLM_EXPLORER_NUMERICAL_STAGE
+        / "attempt_01"
+        / "response.txt"
+    ).read_text(encoding="utf-8") == _guidance(0.03)
+    assert not (episode / "analysis" / "completed.json").exists()
+
+    guarded_stage = episode / "guarded"
+    guarded_attempt = guarded_stage / "attempt_01"
+    guarded_attempt.mkdir(parents=True)
+    (guarded_attempt / "response_content.partial.txt").write_text(
+        "only available raw content", encoding="utf-8"
+    )
+    (guarded_stage / "completed.json").write_text(
+        json.dumps({"attempt": 1}), encoding="utf-8"
+    )
+    controller._compact_success_artifacts(episode)
+    assert (guarded_attempt / "response_content.partial.txt").read_text(
+        encoding="utf-8"
+    ) == "only available raw content"
+
+
+def test_no_c10_explorer_compact_cli_output_and_full_checkpoint(request):
+    output_root = Path(tempfile.gettempdir()) / f"u{os.getpid()}"
+    output_root.mkdir(exist_ok=False)
     request.addfinalizer(lambda: shutil.rmtree(output_root, ignore_errors=True))
     method_id = "td3_dinkelbach_llm_explorer_wo_c10_penalty"
     assert run_experiment_main(
@@ -681,6 +972,19 @@ def test_no_c10_explorer_compact_cli_output_and_full_checkpoint(
     assert resolved["c10_penalty_enabled"] is False
     assert resolved["training_config"]["c10_penalty_enabled"] is False
     assert resolved["llm_explorer"]["log_mode"] == "compact"
+    assert resolved["llm_explorer"]["prompt_version"] == (
+        LLM_EXPLORER_NO_C10_PROMPT_VERSION
+    )
+    assert resolved["llm_explorer"]["cache_version"] == (
+        LLM_EXPLORER_NO_C10_CACHE_VERSION
+    )
+    preflight = json.loads(
+        (run_dir / "llm_explorer_path_preflight.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert preflight["longest"]["characters"] <= 240
+    assert preflight["native_windows_verified"] is (os.name == "nt")
     assert Path(resolved["run_directory"]).parent == (
         output_root / method_id
     ).resolve()
@@ -692,6 +996,9 @@ def test_no_c10_explorer_compact_cli_output_and_full_checkpoint(
     explorer_state = payload["training_state"]["llm_explorer_state"]
     assert explorer_state["log_mode"] == "compact"
     assert explorer_state["run_identity"]["method_id"] == method_id
+    assert explorer_state["config"]["prompt_version"] == (
+        LLM_EXPLORER_NO_C10_PROMPT_VERSION
+    )
 
     assert (run_dir / "checkpoints" / "models" / "ep_0001").is_dir()
     assert checkpoint.is_dir()
@@ -1466,6 +1773,7 @@ def test_pre_v9_first_gen_checkpoint_state_migrates_without_reset(tmp_path):
     }
     source.statistics["routing_zero_legal_prior_mass_total"] = 7
     state = source.state_dict()
+    state.pop("prompt_contract")
     state["config"]["prompt_version"] = "uav-hrl-llm-explorer-prompts-v8"
     state["config"]["guidance_max_output_tokens"] = 5_000
     expected_rng = np.random.default_rng()
@@ -1996,6 +2304,18 @@ def test_windows_path_preflight_includes_stream_and_atomic_temp_names(tmp_path):
         Path(r"C:\uav_llm_runs"), maximum_episode=1500
     )
     assert standard_root["longest"]["characters"] <= 240
+    method_id = "td3_dinkelbach_llm_explorer_wo_c10_penalty"
+    windows_run = (
+        Path(r"D:\UAV_HRL_results")
+        / method_id
+        / "run-seed20260817-615f7bf-20261029T000000000000Z-12345678"
+    )
+    windows_report = llm_explorer_path_preflight(
+        windows_run, maximum_episode=1500
+    )
+    assert windows_report["longest"]["characters"] <= 240
+    assert "episode_001500" in windows_report["longest"]["absolute_path"]
+    assert windows_report["native_windows_verified"] is (os.name == "nt")
     unicode_report = llm_explorer_path_preflight(
         tmp_path / "中文 output root", maximum_episode=4000
     )
@@ -2006,6 +2326,38 @@ def test_windows_path_preflight_includes_stream_and_atomic_temp_names(tmp_path):
             maximum_episode=4000,
             windows_limit=180,
         )
+
+
+def test_overlong_explorer_path_fails_before_client_or_training_request(tmp_path):
+    class BombClient:
+        def __init__(self):
+            self.calls = []
+
+        def chat(self, **kwargs):
+            self.calls.append(kwargs)
+            raise AssertionError("LLM must not be called after path preflight failure")
+
+    client = BombClient()
+    too_deep = tmp_path / ("long-segment-" * 14)
+    with pytest.raises(ValueError, match="shorter --output-root"):
+        train(
+            TrainingConfig(
+                total_episodes=1,
+                mode="smoke",
+                episode_seconds=1,
+                enable_model_checkpoints=False,
+                enable_full_resume=False,
+                enable_plots=False,
+                enable_csv=False,
+                run_directory=str(too_deep),
+                random_seed=1,
+            ),
+            method_spec=MethodSpec.parse(
+                "td3_dinkelbach_llm_explorer_wo_c10_penalty"
+            ),
+            llm_explorer_client=client,
+        )
+    assert client.calls == []
 
 
 def test_first_generation_training_path_passes_full_prior_weight():
@@ -2485,6 +2837,80 @@ def test_first_generation_versions_metadata_and_old_checkpoint_rejection(tmp_pat
         controller.load_state_dict(state)
 
 
+def test_first_gen_checkpoint_compatibility_distinguishes_615_prompt_contracts():
+    no_c10_identity = {
+        "method_id": LLM_EXPLORER_NO_C10_METHOD_ID,
+        "training_source_git_sha": "615f7bf9db68132a3c7005f83c36e645af614db2",
+    }
+    no_c10 = LLMExplorerController(
+        run_directory=None,
+        run_identity=no_c10_identity,
+        config=FirstGenLLMExplorerConfig(
+            prompt_version=LLM_EXPLORER_NO_C10_PROMPT_VERSION
+        ),
+        evaluation=True,
+    )
+    legacy_no_c10 = no_c10.state_dict()
+    legacy_no_c10["config"]["prompt_version"] = LLM_EXPLORER_PROMPT_VERSION
+    legacy_no_c10.pop("prompt_contract")
+    no_c10.load_state_dict(legacy_no_c10)
+    migration = no_c10.state_dict()["resume_protocol_migrations"][-1]
+    assert migration["source_prompt_contract"].startswith("615f7bf")
+    assert migration["old_numerical_cache_reuse"] is False
+
+    upgrade = first_gen_resume_protocol_upgrade(
+        {
+            "schema_version": LLM_EXPLORER_VERSION,
+            "prompt_version": LLM_EXPLORER_PROMPT_VERSION,
+            "cache_version": LLM_EXPLORER_CACHE_VERSION,
+            "numerical_output_protocol": LLM_EXPLORER_NUMERICAL_OUTPUT_PROTOCOL,
+            "guidance_max_output_tokens": 8_000,
+        },
+        method_id=LLM_EXPLORER_NO_C10_METHOD_ID,
+        source_git_sha="615f7bf9db68",
+    )
+    assert upgrade["target_prompt_version"] == LLM_EXPLORER_NO_C10_PROMPT_VERSION
+    assert upgrade["target_cache_version"] == LLM_EXPLORER_NO_C10_CACHE_VERSION
+    assert upgrade["old_numerical_cache_reuse"] is False
+
+    original_identity = {
+        "method_id": "td3_dinkelbach_llm_explorer",
+        "training_source_git_sha": "615f7bf9db68132a3c7005f83c36e645af614db2",
+    }
+    original = LLMExplorerController(
+        run_directory=None,
+        run_identity=original_identity,
+        evaluation=True,
+    )
+    ambiguous = original.state_dict()
+    ambiguous.pop("prompt_contract")
+    with pytest.raises(ValueError, match="ambiguous prompt-v10"):
+        original.load_state_dict(ambiguous)
+    with pytest.raises(ValueError, match="exact resume is refused"):
+        first_gen_resume_protocol_upgrade(
+            {
+                "schema_version": LLM_EXPLORER_VERSION,
+                "prompt_version": LLM_EXPLORER_PROMPT_VERSION,
+                "cache_version": LLM_EXPLORER_CACHE_VERSION,
+                "numerical_output_protocol": LLM_EXPLORER_NUMERICAL_OUTPUT_PROTOCOL,
+                "guidance_max_output_tokens": 8_000,
+            },
+            method_id="td3_dinkelbach_llm_explorer",
+            source_git_sha="615f7bf9db68",
+        )
+
+    parent_identity = {
+        "method_id": "td3_dinkelbach_llm_explorer",
+        "training_source_git_sha": "01b5c385a14039debeec0fcb633c73bd86d8c09c",
+    }
+    parent = LLMExplorerController(
+        run_directory=None, run_identity=parent_identity, evaluation=True
+    )
+    parent_state = parent.state_dict()
+    parent_state.pop("prompt_contract")
+    parent.load_state_dict(parent_state)
+
+
 def test_first_generation_observers_do_not_change_warmup_training_result():
     def config():
         return TrainingConfig(
@@ -2656,6 +3082,9 @@ def test_first_generation_cli_evaluate_and_pre_v9_full_resume_migration(
         ] = 5_000
         payload_one["training_state"]["llm_explorer_state"].pop(
             "resume_protocol_migrations", None
+        )
+        payload_one["training_state"]["llm_explorer_state"].pop(
+            "prompt_contract", None
         )
         torch.save(payload_one, checkpoint_path)
 

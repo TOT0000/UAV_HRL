@@ -28,9 +28,18 @@ LLM_EXPLORER_METHOD_ID = "td3_dinkelbach_llm_explorer"
 LLM_EXPLORER_MODEL = "gpt-4o-mini"
 LLM_EXPLORER_VERSION = "uav-hrl-llm-explorer-firstgen-v6"
 LLM_EXPLORER_PROMPT_VERSION = "uav-hrl-llm-explorer-prompts-v10"
+LLM_EXPLORER_NO_C10_METHOD_ID = (
+    "td3_dinkelbach_llm_explorer_wo_c10_penalty"
+)
+LLM_EXPLORER_NO_C10_PROMPT_VERSION = (
+    "uav-hrl-llm-explorer-prompts-v10-no-c10-v1"
+)
 LLM_EXPLORER_SUMMARY_VERSION = "complete-core-feedback-v4"
 LLM_EXPLORER_CASE_VERSION = "deterministic-diverse-cases-v1"
 LLM_EXPLORER_CACHE_VERSION = "episode-fixed-dual-guidance-cache-v7"
+LLM_EXPLORER_NO_C10_CACHE_VERSION = (
+    "episode-fixed-dual-guidance-cache-v7-no-c10-v1"
+)
 LLM_EXPLORER_COMPRESSION_VERSION = LLM_EXPLORER_SUMMARY_VERSION
 LLM_EXPLORER_PRESENTATION_VERSION = "firstgen-columns-rows-3dp-ms-v2"
 LLM_EXPLORER_NUMERICAL_OUTPUT_PROTOCOL = (
@@ -67,6 +76,30 @@ LLM_EXPLORER_CONTEXT_TOKENS = 128_000
 LLM_EXPLORER_SAFETY_MARGIN_TOKENS = 4_096
 LLM_EXPLORER_ENCODING = "o200k_base"
 WINDOWS_CONSERVATIVE_PATH_LIMIT = 240
+
+
+def first_gen_prompt_version(method_id: str) -> str:
+    return (
+        LLM_EXPLORER_NO_C10_PROMPT_VERSION
+        if str(method_id) == LLM_EXPLORER_NO_C10_METHOD_ID
+        else LLM_EXPLORER_PROMPT_VERSION
+    )
+
+
+def first_gen_cache_version(method_id: str) -> str:
+    return (
+        LLM_EXPLORER_NO_C10_CACHE_VERSION
+        if str(method_id) == LLM_EXPLORER_NO_C10_METHOD_ID
+        else LLM_EXPLORER_CACHE_VERSION
+    )
+
+
+def _cache_version_for_prompt(prompt_version: str) -> str:
+    return (
+        LLM_EXPLORER_NO_C10_CACHE_VERSION
+        if str(prompt_version) == LLM_EXPLORER_NO_C10_PROMPT_VERSION
+        else LLM_EXPLORER_CACHE_VERSION
+    )
 
 
 def first_gen_numerical_response_format() -> dict[str, Any]:
@@ -114,8 +147,12 @@ def first_gen_numerical_response_format() -> dict[str, Any]:
 
 def first_gen_resume_protocol_upgrade(
     resolved_explorer: Mapping[str, Any],
+    *,
+    method_id: str = LLM_EXPLORER_METHOD_ID,
+    source_git_sha: str | None = None,
+    verified_protocol_migration: Mapping[str, Any] | None = None,
 ) -> dict[str, Any] | None:
-    """Validate and describe a known pre-v10 first-gen protocol upgrade."""
+    """Validate a first-gen protocol without conflating prompt contracts."""
 
     source = dict(resolved_explorer or {})
     if source.get("schema_version") != LLM_EXPLORER_VERSION:
@@ -126,27 +163,75 @@ def first_gen_resume_protocol_upgrade(
     cache_version = source.get("cache_version")
     output_protocol = source.get("numerical_output_protocol")
     guidance_budget = int(source.get("guidance_max_output_tokens", 5_000))
+    target_prompt_version = first_gen_prompt_version(method_id)
+    target_cache_version = first_gen_cache_version(method_id)
+    source_git = str(source_git_sha or "")
+    migration = dict(verified_protocol_migration or {})
+    has_verified_original_migration = (
+        migration.get("source_prompt_version")
+        in {"uav-hrl-llm-explorer-prompts-v8", "uav-hrl-llm-explorer-prompts-v9"}
+        and migration.get("target_prompt_version") == LLM_EXPLORER_PROMPT_VERSION
+        and migration.get("old_numerical_cache_reuse") is False
+    )
     if (
-        prompt_version == LLM_EXPLORER_PROMPT_VERSION
-        and cache_version == LLM_EXPLORER_CACHE_VERSION
+        str(method_id) == LLM_EXPLORER_METHOD_ID
+        and prompt_version == LLM_EXPLORER_PROMPT_VERSION
+        and source_git.startswith("615f7bf")
+        and not has_verified_original_migration
+    ):
+        raise ExplorerValidationError(
+            "original LLM explorer run was created by 615f7bf with prompt-v10 "
+            "metadata but modified shared templates; its exact prompt contract "
+            "cannot be proven compatible, so exact resume is refused"
+        )
+    if (
+        prompt_version == target_prompt_version
+        and cache_version == target_cache_version
         and output_protocol == LLM_EXPLORER_NUMERICAL_OUTPUT_PROTOCOL
         and guidance_budget == LLM_EXPLORER_GUIDANCE_MAX_OUTPUT_TOKENS
     ):
         return None
+    if (
+        str(method_id) == LLM_EXPLORER_NO_C10_METHOD_ID
+        and prompt_version == LLM_EXPLORER_PROMPT_VERSION
+        and cache_version == LLM_EXPLORER_CACHE_VERSION
+        and output_protocol == LLM_EXPLORER_NUMERICAL_OUTPUT_PROTOCOL
+        and guidance_budget == LLM_EXPLORER_GUIDANCE_MAX_OUTPUT_TOKENS
+    ):
+        return {
+            "source_schema_version": source["schema_version"],
+            "target_schema_version": LLM_EXPLORER_VERSION,
+            "source_prompt_version": prompt_version,
+            "target_prompt_version": target_prompt_version,
+            "source_cache_version": cache_version,
+            "target_cache_version": target_cache_version,
+            "source_prompt_contract": (
+                "615f7bf_shared_templates_with_no_c10_environment"
+            ),
+            "target_prompt_contract": "method_aware_no_c10_v1",
+            "template_content_compatibility": (
+                "same_no_c10_text_and_environment_payload"
+            ),
+            "training_state_compatibility": "full_state_preserved_reidentified_protocol",
+            "old_numerical_cache_reuse": False,
+        }
     source_profile = (
         prompt_version,
         cache_version,
         output_protocol,
         guidance_budget,
     )
-    if source_profile in LLM_EXPLORER_COMPATIBLE_RESUME_PROTOCOLS:
+    if (
+        str(method_id) == LLM_EXPLORER_METHOD_ID
+        and source_profile in LLM_EXPLORER_COMPATIBLE_RESUME_PROTOCOLS
+    ):
         return {
             "source_schema_version": source["schema_version"],
             "target_schema_version": LLM_EXPLORER_VERSION,
             "source_prompt_version": prompt_version,
-            "target_prompt_version": LLM_EXPLORER_PROMPT_VERSION,
+            "target_prompt_version": target_prompt_version,
             "source_cache_version": cache_version,
-            "target_cache_version": LLM_EXPLORER_CACHE_VERSION,
+            "target_cache_version": target_cache_version,
             "source_numerical_output_protocol": output_protocol,
             "target_numerical_output_protocol": (
                 LLM_EXPLORER_NUMERICAL_OUTPUT_PROTOCOL
@@ -3642,14 +3727,12 @@ def environment_constants_and_definitions(
     }
 
 
-def _first_gen_movement_penalty_contract(
-    c10_penalty_enabled: bool = True,
-) -> dict[str, Any]:
+def _first_gen_movement_penalty_contract() -> dict[str, Any]:
     """Select the runtime-owned constraint contract for first-gen analysis."""
 
     from experiment_config import task_potential_contract_metadata
 
-    contract = task_potential_contract_metadata(c10_penalty_enabled)
+    contract = task_potential_contract_metadata()
     weights = contract["constraint_penalty_weights"]
     epsilon = contract["com_range"]["normalization_epsilon"]
 
@@ -3715,12 +3798,6 @@ def _first_gen_movement_penalty_contract(
                 definition=contract["c10"]["definition"],
             ),
             "population": contract["c10"]["population"],
-            "reward_penalty_enabled": bool(c10_penalty_enabled),
-            "role": (
-                "reward_penalty_and_diagnostic"
-                if c10_penalty_enabled
-                else "diagnostic_only_not_subtracted_from_movement_reward"
-            ),
             "membership_and_validity": (
                 "Only currently assigned FOV pairs with C9 model-range "
                 "validity, finite nonnegative d_L and d_R, and a finite "
@@ -3748,7 +3825,7 @@ def _first_gen_movement_penalty_contract(
 
 
 def environment_constants_and_definitions_first_gen(
-    *, c10_penalty_enabled: bool = True, **kwargs: Any,
+    **kwargs: Any,
 ) -> dict[str, Any]:
     """Add rich definitions only to the first-generation dual-guidance method."""
 
@@ -3767,25 +3844,6 @@ def environment_constants_and_definitions_first_gen(
     )
 
     base = environment_constants_and_definitions(**kwargs)
-    c10_penalty_enabled = bool(c10_penalty_enabled)
-    configured_c10_weight = float(
-        base["movement_reward"]["constraint_weights"]["c10"]
-    )
-    base["movement_reward"].update(
-        formula=(
-            "timely_Mbit - lambda_EE_Mbit_per_J * movement_J - P_C9 - "
-            "P_C10 - P_COM"
-            if c10_penalty_enabled
-            else "timely_Mbit - lambda_EE_Mbit_per_J * movement_J - P_C9 - P_COM"
-        ),
-        c10_penalty_enabled=c10_penalty_enabled,
-        configured_constraint_weights={
-            **base["movement_reward"]["constraint_weights"]
-        },
-    )
-    base["movement_reward"]["constraint_weights"]["c10"] = (
-        configured_c10_weight if c10_penalty_enabled else 0.0
-    )
     energy_model = EnergyConsumptionModel(E_max=1.0, N_u=NUM_UAV)
     routing_slot_seconds = float(base["routing_slot_seconds"])
     base.update(
@@ -3893,7 +3951,7 @@ def environment_constants_and_definitions_first_gen(
         "set; an empty set contributes zero"
     )
     base["movement_reward"]["penalty_contract"] = (
-        _first_gen_movement_penalty_contract(c10_penalty_enabled)
+        _first_gen_movement_penalty_contract()
     )
     base["routing_reward"]["bits_per_reward_unit"] = float(
         ROUTING_REWARD_BITS_PER_UNIT
@@ -3901,6 +3959,37 @@ def environment_constants_and_definitions_first_gen(
     base["safe_ddqn"]["lambda_cost_update"] = (
         "episode-end update from global eligible and violated packet counts; "
         "target is the configured QoS probability"
+    )
+    return base
+
+
+def environment_constants_and_definitions_first_gen_no_c10(
+    **kwargs: Any,
+) -> dict[str, Any]:
+    """Render the no-C10 reward contract without changing observed inputs."""
+
+    from experiment_config import task_potential_contract_metadata
+
+    base = environment_constants_and_definitions_first_gen(**kwargs)
+    configured_weights = dict(base["movement_reward"]["constraint_weights"])
+    base["movement_reward"].update(
+        formula=(
+            "timely_Mbit - lambda_EE_Mbit_per_J * movement_J - P_C9 - P_COM"
+        ),
+        c10_penalty_enabled=False,
+        configured_constraint_weights=configured_weights,
+    )
+    base["movement_reward"]["constraint_weights"]["c10"] = 0.0
+
+    disabled_contract = task_potential_contract_metadata(False)
+    penalty_contract = base["movement_reward"]["penalty_contract"]
+    penalty_contract["reward_form"] = disabled_contract["reward_form"]
+    penalty_contract["weights"]["w_C10"] = disabled_contract[
+        "constraint_penalty_weights"
+    ]["c10"]
+    penalty_contract["C10"].update(
+        reward_penalty_enabled=False,
+        role="diagnostic_only_not_subtracted_from_movement_reward",
     )
     return base
 
@@ -4527,6 +4616,11 @@ class LLMExplorerController:
             "schema_version": self.schema_version,
             "log_mode": self.log_mode,
             "config": asdict(self.config),
+            **(
+                {"prompt_contract": self._prompt_contract_identity()}
+                if self.schema_version == LLM_EXPLORER_VERSION
+                else {}
+            ),
             "run_identity": copy.deepcopy(self.run_identity),
             "previous_episode_feedback": copy.deepcopy(self.previous_episode_feedback),
             "active_guidance": self._serializable_guidance(self.active_guidance),
@@ -4566,14 +4660,25 @@ class LLMExplorerController:
             current_without_prompt.pop("prompt_version", None)
             saved_without_prompt.pop("guidance_max_output_tokens", None)
             current_without_prompt.pop("guidance_max_output_tokens", None)
-            if not (
+            legacy_original_upgrade = (
                 source_prompt in {
                     "uav-hrl-llm-explorer-prompts-v8",
                     "uav-hrl-llm-explorer-prompts-v9",
                 }
+                and self.config.prompt_version == LLM_EXPLORER_PROMPT_VERSION
                 and source_budget == 5_000
                 and saved_without_prompt == current_without_prompt
-            ):
+            )
+            legacy_no_c10_reidentification = (
+                self.run_identity.get("method_id")
+                == LLM_EXPLORER_NO_C10_METHOD_ID
+                and source_prompt == LLM_EXPLORER_PROMPT_VERSION
+                and self.config.prompt_version
+                == LLM_EXPLORER_NO_C10_PROMPT_VERSION
+                and source_budget == LLM_EXPLORER_GUIDANCE_MAX_OUTPUT_TOKENS
+                and saved_without_prompt == current_without_prompt
+            )
+            if not (legacy_original_upgrade or legacy_no_c10_reidentification):
                 raise ExplorerValidationError(
                     "LLM explorer checkpoint config is incompatible"
                 )
@@ -4583,13 +4688,19 @@ class LLMExplorerController:
                 "source_prompt_version": source_prompt,
                 "target_prompt_version": self.config.prompt_version,
                 "source_cache_version": (
-                    "episode-fixed-dual-guidance-cache-v5"
+                    LLM_EXPLORER_CACHE_VERSION
+                    if legacy_no_c10_reidentification
+                    else "episode-fixed-dual-guidance-cache-v5"
                     if source_prompt.endswith("v8")
                     else "episode-fixed-dual-guidance-cache-v6"
                 ),
-                "target_cache_version": LLM_EXPLORER_CACHE_VERSION,
+                "target_cache_version": _cache_version_for_prompt(
+                    self.config.prompt_version
+                ),
                 "source_numerical_output_protocol": (
-                    None
+                    LLM_EXPLORER_NUMERICAL_OUTPUT_PROTOCOL
+                    if legacy_no_c10_reidentification
+                    else None
                     if source_prompt.endswith("v8")
                     else "chat-completions-strict-json-schema-v1"
                 ),
@@ -4607,6 +4718,38 @@ class LLMExplorerController:
                 ),
                 "old_numerical_cache_reuse": False,
             }
+            if legacy_no_c10_reidentification:
+                protocol_upgrade.update(
+                    source_prompt_contract=(
+                        "615f7bf_shared_templates_with_no_c10_environment"
+                    ),
+                    target_prompt_contract="method_aware_no_c10_v1",
+                    template_content_compatibility=(
+                        "same_no_c10_text_and_environment_payload"
+                    ),
+                )
+        saved_prompt_contract = state.get("prompt_contract")
+        if (
+            self.schema_version == LLM_EXPLORER_VERSION
+            and saved_prompt_contract is not None
+            and saved_prompt_contract != self._prompt_contract_identity()
+        ):
+            raise ExplorerValidationError(
+                "LLM explorer checkpoint prompt template fingerprint is incompatible"
+            )
+        if (
+            saved_prompt_contract is None
+            and self.run_identity.get("method_id") == LLM_EXPLORER_METHOD_ID
+            and isinstance(saved_config, dict)
+            and saved_config.get("prompt_version") == LLM_EXPLORER_PROMPT_VERSION
+            and str(self.run_identity.get("training_source_git_sha") or "").startswith(
+                "615f7bf"
+            )
+        ):
+            raise ExplorerValidationError(
+                "original LLM explorer checkpoint from 615f7bf has ambiguous "
+                "prompt-v10 template content and cannot be resumed exactly"
+            )
         if state.get("run_identity") != self.run_identity:
             raise ExplorerValidationError("LLM explorer checkpoint run identity is incompatible")
         self.previous_episode_feedback = copy.deepcopy(state.get("previous_episode_feedback"))
@@ -4666,10 +4809,13 @@ class LLMExplorerController:
 
         if self.log_mode != "compact" or not episode_root.is_dir():
             return
+        try:
+            episode_index = max(0, int(episode_root.name.rsplit("_", 1)[1]) - 1)
+        except (IndexError, ValueError):
+            episode_index = 0
         redundant_names = {
             "prompt.txt",
             "request.json",
-            "response.txt",
             "response_content.partial.txt",
             "reasoning.partial.txt",
             "stream_events.jsonl",
@@ -4681,6 +4827,29 @@ class LLMExplorerController:
             except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
                 continue
             attempt_root = completed_path.parent / f"attempt_{attempt:02d}"
+            raw_response = attempt_root / "response.txt"
+            try:
+                if not raw_response.is_file():
+                    self._record_local_failure(
+                        episode_index=episode_index,
+                        stage=completed_path.parent.name,
+                        attempt=attempt,
+                        category="artifact_write",
+                        reason=(
+                            "compact cleanup skipped: durable raw final "
+                            "response.txt is missing"
+                        ),
+                    )
+                    continue
+            except OSError as exc:
+                self._record_local_failure(
+                    episode_index=episode_index,
+                    stage=completed_path.parent.name,
+                    attempt=attempt,
+                    category="artifact_write",
+                    reason=f"compact cleanup raw response check: {exc}",
+                )
+                continue
             for name in redundant_names:
                 path = attempt_root / name
                 try:
@@ -4746,7 +4915,7 @@ class LLMExplorerController:
 
     def _templates(self) -> tuple[str, str, str, str]:
         prompt_root = Path(__file__).resolve().parent / "prompts"
-        return tuple(
+        templates = tuple(
             (prompt_root / name).read_text(encoding="utf-8")
             for name in (
                 "llm_explorer_system.txt",
@@ -4755,6 +4924,78 @@ class LLMExplorerController:
                 "llm_explorer_guidance.txt",
             )
         )
+        if self.config.prompt_version != LLM_EXPLORER_NO_C10_PROMPT_VERSION:
+            return templates
+        system, analysis, numerical_system, guidance = templates
+        system_replacements = {
+            (
+                "Actual sensing validity also includes positive relative altitude "
+                "and valid camera-projection rays. Use the supplied capture_valid "
+                "observation. C10 is a soft reward penalty rather than a "
+                "packet-generation switch."
+            ): (
+                "Actual sensing validity also includes positive relative altitude "
+                "and valid camera-projection rays. Use the supplied capture_valid "
+                "observation. C10 geometry is always computed and observed for "
+                "diagnostics; the supplied movement_reward.c10_penalty_enabled and "
+                "movement_reward.formula state whether its soft penalty is actually "
+                "subtracted from reward. C10 is never a packet-generation switch."
+            ),
+            (
+                "r_move = B_timely,Mbit - lambda_EE*E_move,J - P_C9 - P_C10 "
+                "- P_COM."
+            ): (
+                "Use the exact r_move formula supplied in "
+                "SETTINGS_AND_DATA_DEFINITIONS.movement_reward.formula. It "
+                "explicitly states whether P_C10 is subtracted for this method."
+            ),
+        }
+        for original, replacement in system_replacements.items():
+            if system.count(original) != 1:
+                raise RuntimeError(
+                    "original first-gen prompt changed without updating the "
+                    "no-C10 method-aware renderer"
+                )
+            system = system.replace(original, replacement)
+        original_analysis = (
+            "These supply the actual timing, traffic, deadlines, communication, "
+            "camera, and action settings; C9/C10/COM penalty definitions; and "
+            "each field's unit, valid denominator, and aggregation scope."
+        )
+        no_c10_analysis = (
+            "These supply the actual timing, traffic, deadlines, communication, "
+            "camera, and action settings; the effective movement-reward formula "
+            "and penalty weights; C9/COM penalty definitions; the C10 geometry/"
+            "diagnostic definition and whether it is actually subtracted from "
+            "reward; and each field's unit, valid denominator, and aggregation "
+            "scope."
+        )
+        if analysis.count(original_analysis) != 1:
+            raise RuntimeError(
+                "original first-gen analysis prompt changed without updating the "
+                "no-C10 method-aware renderer"
+            )
+        return (
+            system,
+            analysis.replace(original_analysis, no_c10_analysis),
+            numerical_system,
+            guidance,
+        )
+
+    def _prompt_contract_identity(self) -> dict[str, Any]:
+        templates = self._templates()
+        return {
+            "prompt_version": self.config.prompt_version,
+            "cache_version": _cache_version_for_prompt(
+                self.config.prompt_version
+            ),
+            "component_sha256": {
+                "analysis_system": _sha256_text(templates[0]),
+                "analysis_user": _sha256_text(templates[1]),
+                "numerical_system": _sha256_text(templates[2]),
+                "numerical_user": _sha256_text(templates[3]),
+            },
+        }
 
     def _render_system_prompt(
         self, template: str, environment_constants: dict[str, Any]
@@ -4952,7 +5193,9 @@ class LLMExplorerController:
                 }
             identity.update(
                 summary_version=LLM_EXPLORER_SUMMARY_VERSION,
-                cache_version=LLM_EXPLORER_CACHE_VERSION,
+                cache_version=_cache_version_for_prompt(
+                    self.config.prompt_version
+                ),
                 presentation_version=LLM_EXPLORER_PRESENTATION_VERSION,
                 numerical_output_protocol=(
                     LLM_EXPLORER_NUMERICAL_OUTPUT_PROTOCOL
@@ -5941,14 +6184,17 @@ class LLMExplorerController:
         )
 
 
-def explorer_metadata(config: LLMExplorerConfig) -> dict[str, Any]:
+def explorer_metadata(
+    config: LLMExplorerConfig,
+    method_id: str = LLM_EXPLORER_METHOD_ID,
+) -> dict[str, Any]:
     return {
         "schema_version": LLM_EXPLORER_VERSION,
-        "method_id": LLM_EXPLORER_METHOD_ID,
+        "method_id": str(method_id),
         "prompt_version": config.prompt_version,
         "summary_version": LLM_EXPLORER_SUMMARY_VERSION,
         "case_selection_version": LLM_EXPLORER_CASE_VERSION,
-        "cache_version": LLM_EXPLORER_CACHE_VERSION,
+        "cache_version": _cache_version_for_prompt(config.prompt_version),
         "presentation_version": LLM_EXPLORER_PRESENTATION_VERSION,
         "numerical_output_protocol": LLM_EXPLORER_NUMERICAL_OUTPUT_PROTOCOL,
         "numerical_response_format": "strict_json_schema",

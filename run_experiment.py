@@ -77,14 +77,14 @@ from llm_potential import (
     load_run_artifact as load_potential_run_artifact,
 )
 from llm_explorer import (
-    LLM_EXPLORER_CACHE_VERSION,
     LLM_EXPLORER_CASE_VERSION,
     LLM_EXPLORER_GUIDANCE_MAX_OUTPUT_TOKENS,
     LLM_EXPLORER_NUMERICAL_OUTPUT_PROTOCOL,
-    LLM_EXPLORER_PROMPT_VERSION,
     LLM_EXPLORER_SUMMARY_VERSION,
     LLM_EXPLORER_VERSION,
     first_gen_resume_protocol_upgrade,
+    first_gen_cache_version,
+    first_gen_prompt_version,
     llm_explorer_path_preflight,
 )
 from llm_explorer_v3 import (
@@ -1114,11 +1114,13 @@ def run(args):
                 routing_alpha="0.8 * w",
             )
         else:
+            prompt_version = first_gen_prompt_version(method.method_id)
             resolved["llm_explorer"].update(
-                prompt_version=LLM_EXPLORER_PROMPT_VERSION,
+                method_id=method.method_id,
+                prompt_version=prompt_version,
                 summary_version=LLM_EXPLORER_SUMMARY_VERSION,
                 case_selection_version=LLM_EXPLORER_CASE_VERSION,
-                cache_version=LLM_EXPLORER_CACHE_VERSION,
+                cache_version=first_gen_cache_version(method.method_id),
                 numerical_output_protocol=(
                     LLM_EXPLORER_NUMERICAL_OUTPUT_PROTOCOL
                 ),
@@ -1201,7 +1203,14 @@ def run_resume(args):
     if method.llm_explorer_enabled:
         if method.llm_explorer_first_gen_enabled:
             explorer_protocol_upgrade = first_gen_resume_protocol_upgrade(
-                resolved.get("llm_explorer") or {}
+                resolved.get("llm_explorer") or {},
+                method_id=method.method_id,
+                source_git_sha=resolved.get(
+                    "initial_training_git_sha", resolved.get("git_sha")
+                ),
+                verified_protocol_migration=resolved.get(
+                    "llm_explorer_protocol_migration"
+                ),
             )
         elif (
             (resolved.get("llm_explorer") or {}).get("schema_version")
@@ -1474,10 +1483,11 @@ def run_resume(args):
     if method.llm_explorer_first_gen_enabled:
         explorer_resolution = dict(resolved.get("llm_explorer") or {})
         explorer_resolution.update(
-            prompt_version=LLM_EXPLORER_PROMPT_VERSION,
+            method_id=method.method_id,
+            prompt_version=first_gen_prompt_version(method.method_id),
             summary_version=LLM_EXPLORER_SUMMARY_VERSION,
             case_selection_version=LLM_EXPLORER_CASE_VERSION,
-            cache_version=LLM_EXPLORER_CACHE_VERSION,
+            cache_version=first_gen_cache_version(method.method_id),
             numerical_output_protocol=(
                 LLM_EXPLORER_NUMERICAL_OUTPUT_PROTOCOL
             ),
