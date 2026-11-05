@@ -40,7 +40,10 @@ from experiment_config import (
 )
 from visual_sensing import VISUAL_SENSING_CONTRACT_VERSION, visual_sensing_metadata
 from HRL_task_aware import TrainingConfig, train
-from Packet_scheduler_v1 import TASK_DEADLINE_SECONDS
+from Packet_scheduler_v1 import (
+    PACKET_DEADLINE_POLICY_CONTINUE,
+    TASK_DEADLINE_SECONDS,
+)
 from packet_outcome_artifacts import (
     PACKET_OUTCOME_ARTIFACT_SCHEMA_VERSION,
     PACKET_OUTCOME_MODE_DISABLED,
@@ -1006,6 +1009,7 @@ def run_paper_evaluation(
                 scenario_manifest=manifest,
                 method_spec=method,
                 evaluation=True,
+                formal_evaluation=True,
                 checkpoint_dir=context["checkpoint"],
                 expected_checkpoint_episodes=(
                     context["checkpoint_episode"] if checkpoint_required else None
@@ -1393,6 +1397,17 @@ def run_paper_evaluation(
             )
         },
         "semantic_suite": suite,
+        "formal_evaluation": True,
+        "packet_deadline_policy": PACKET_DEADLINE_POLICY_CONTINUE,
+        "packet_delivery_accounting_schema_version": (
+            "complete-gs-delivery-timely-late-useful-bits-v1"
+        ),
+        "primary_energy_efficiency_definition": (
+            "(timely useful bits + late complete useful bits) / UAV movement energy"
+        ),
+        "timely_energy_efficiency_definition": (
+            "timely useful bits / UAV movement energy"
+        ),
         "method_id": method.method_id,
         "method_spec": method.to_dict(),
         "training_run": str(context["run_dir"]) if context["run_dir"] else None,
@@ -1569,7 +1584,8 @@ def run_paper_evaluation(
                 "raw eligible packets across episodes; ALL pools FOV+COM"
             ),
             "energy_efficiency": (
-                "per-seed sum timely useful Mbit / sum mobility J; "
+                "per-seed sum complete useful Mbit (timely plus late) / "
+                "sum mobility J; "
                 "zero denominator is missing; valid seed values are equally weighted"
             ),
             **(

@@ -226,6 +226,10 @@ class BlockServiceCursor:
 
 
 
+PACKET_DEADLINE_POLICY_DROP = "drop_at_target_delay_v1"
+PACKET_DEADLINE_POLICY_CONTINUE = "continue_until_episode_end_v1"
+
+
 class PacketEngine:
     # Private equivalence/benchmark hook. Production always uses the index;
     # tests can select the retained linear reference path without a CLI or a
@@ -243,6 +247,7 @@ class PacketEngine:
         task_deadlines_seconds=None,
         injection_cutoff_seconds=EPISODE_INJECTION_CUTOFF_SECONDS,
         enable_packet_diagnostic_artifacts=False,
+        packet_deadline_policy=PACKET_DEADLINE_POLICY_DROP,
     ):
         self.step_time = float(step_time)
         if not np.isclose(
@@ -252,6 +257,15 @@ class PacketEngine:
         self.num_UAV = num_uav
         self.enable_packet_diagnostic_artifacts = bool(
             enable_packet_diagnostic_artifacts
+        )
+        if packet_deadline_policy not in {
+            PACKET_DEADLINE_POLICY_DROP,
+            PACKET_DEADLINE_POLICY_CONTINUE,
+        }:
+            raise ValueError(f"unsupported packet deadline policy: {packet_deadline_policy}")
+        self.packet_deadline_policy = str(packet_deadline_policy)
+        self.allow_late_delivery = (
+            self.packet_deadline_policy == PACKET_DEADLINE_POLICY_CONTINUE
         )
         deadlines = dict(TASK_DEADLINE_SECONDS)
         if task_deadlines_seconds is not None:
@@ -350,6 +364,11 @@ class PacketEngine:
         self.fov_zero_coverage_packet_count = 0
         self.com_timely_delivered_bits = 0.0
         self.total_timely_useful_bits = 0.0
+        self.fov_late_delivered_raw_bits = 0.0
+        self.fov_late_useful_bits = 0.0
+        self.com_late_delivered_bits = 0.0
+        self.total_late_useful_bits = 0.0
+        self.total_all_useful_bits = 0.0
         self.wait_actions = 0
         self.deadline_drops = 0
         self.link_slot_budget_violations = 0
@@ -512,6 +531,8 @@ class PacketEngine:
         """Return the nearest live deadline without changing packet state."""
 
         self._deadline_index_counters["nearest_deadline_queries"] += 1
+        if self.allow_late_delivery:
+            return float("inf")
         if self._deadline_index_enabled:
             return self._peek_packet_deadline()
         active_packets = self.get_active_packets()
@@ -1532,6 +1553,8 @@ class PacketEngine:
 
         current_time = float(current_time)
         self._deadline_index_counters["expiration_checks"] += 1
+        if self.allow_late_delivery:
+            return []
         if (
             self._deadline_index_enabled
             and not self._queue_cleanup_pending
@@ -1924,7 +1947,10 @@ class PacketEngine:
                 pkt["s2u_service_start_time"] = None
                 pkt["s2u_queue_delay_s"] = 0.0
                 deadline_abs = float(pkt["deadline_abs"])
-                if completion_time >= deadline_abs - PACKET_EPS:
+                if (
+                    not self.allow_late_delivery
+                    and completion_time >= deadline_abs - PACKET_EPS
+                ):
                     event = self._mark_deadline_violation(
                         pkt,
                         completion_time,
@@ -2057,6 +2083,11 @@ class PacketEngine:
             "fov_timely_delivered_raw_bits": 0.0,
             "fov_timely_useful_bits": 0.0,
             "com_timely_delivered_bits": 0.0,
+            "fov_late_delivered_raw_bits": 0.0,
+            "fov_late_useful_bits": 0.0,
+            "com_late_delivered_bits": 0.0,
+            "total_late_useful_bits": 0.0,
+            "total_all_useful_bits": 0.0,
             "raw_final_hop_bits": 0.0,
             "transmitted_bits_by_link": {},
             "relay_arrivals": [],
@@ -2214,35 +2245,13 @@ class PacketEngine:
                             - float(pkt.get("generation_time", completion_time)),
                             0.0,
                         ) * 1e3
-                        timely_delivery = completion_time <= (
-                            deadline_abs + PACKET_EPS
+                        timely_delivery = self._delivery_is_timely(
+                            completion_time, deadline_abs
                         )
                         if timely_delivery:
-                            if not pkt.get("timely_goodput_counted", False):
-                                physical_bits = float(pkt["size_bits"])
-                                task_type = self._task_norm(pkt["task_type"])
-                                if task_type == "FOV":
-                                    coverage = sanitize_capture_coverage_ratio(
-                                        pkt.get("capture_coverage_ratio", 0.0)
-                                    )
-                                    useful_bits = physical_bits * coverage
-                                    self.fov_timely_delivered_raw_bits += physical_bits
-                                    self.fov_timely_useful_bits += useful_bits
-                                    result[
-                                        "fov_timely_delivered_raw_bits"
-                                    ] += physical_bits
-                                    result["fov_timely_useful_bits"] += useful_bits
-                                else:
-                                    useful_bits = physical_bits
-                                    self.com_timely_delivered_bits += physical_bits
-                                    result["com_timely_delivered_bits"] += physical_bits
-                                pkt["timely_goodput_counted"] = True
-                                pkt["timely_delivered_raw_bits"] = physical_bits
-                                pkt["timely_useful_bits"] = useful_bits
-                                self.total_timely_useful_bits += useful_bits
-                                self.timely_goodput_bits += useful_bits
-                                result["total_timely_useful_bits"] += useful_bits
-                                result["timely_goodput_bits"] += useful_bits
+                            self._count_complete_gs_delivery(
+                                pkt, result, timely=True
+                            )
                             self.total_delivered += 1
                             task_type = self._task_norm(pkt["task_type"])
                             if task_type == "FOV":
@@ -2264,6 +2273,10 @@ class PacketEngine:
                                 }
                             )
                         else:
+                            if self.allow_late_delivery:
+                                self._count_complete_gs_delivery(
+                                    pkt, result, timely=False
+                                )
                             violation = self._mark_deadline_violation(
                                 pkt,
                                 completion_time,
@@ -2283,7 +2296,7 @@ class PacketEngine:
                                         "packet": pkt,
                                     }
                                 )
-                    elif (
+                    elif self.allow_late_delivery or (
                         completion_time + PACKET_EPS < deadline_abs
                         and deadline_abs > slot_end + PACKET_EPS
                     ):
@@ -2646,6 +2659,11 @@ class PacketEngine:
             "fov_timely_delivered_raw_bits": 0.0,
             "fov_timely_useful_bits": 0.0,
             "com_timely_delivered_bits": 0.0,
+            "fov_late_delivered_raw_bits": 0.0,
+            "fov_late_useful_bits": 0.0,
+            "com_late_delivered_bits": 0.0,
+            "total_late_useful_bits": 0.0,
+            "total_all_useful_bits": 0.0,
             "raw_final_hop_bits": 0.0,
             "transmitted_bits_by_link": defaultdict(float),
             "relay_arrivals": [],
@@ -2669,6 +2687,64 @@ class PacketEngine:
             "violated": True,
             "packet": event["packet"],
         }
+
+    @staticmethod
+    def _delivery_is_timely(completion_time, deadline_abs):
+        return float(completion_time) <= float(
+            deadline_abs
+        ) + event_time_tolerance_seconds(completion_time, deadline_abs)
+
+    def _count_complete_gs_delivery(self, pkt, result, *, timely):
+        """Count one complete GS delivery without using partial final-hop bits."""
+
+        if pkt.get("complete_gs_delivery_counted", False):
+            return
+        physical_bits = float(pkt["size_bits"])
+        task_type = self._task_norm(pkt["task_type"])
+        if task_type == "FOV":
+            coverage = sanitize_capture_coverage_ratio(
+                pkt.get("capture_coverage_ratio", 0.0)
+            )
+            useful_bits = physical_bits * coverage
+        else:
+            useful_bits = physical_bits
+
+        pkt["complete_gs_delivery_counted"] = True
+        pkt["delivered_raw_bits"] = physical_bits
+        pkt["delivered_useful_bits"] = useful_bits
+        self.total_all_useful_bits += useful_bits
+        result["total_all_useful_bits"] += useful_bits
+
+        if timely:
+            pkt["timely_goodput_counted"] = True
+            pkt["timely_delivered_raw_bits"] = physical_bits
+            pkt["timely_useful_bits"] = useful_bits
+            self.total_timely_useful_bits += useful_bits
+            self.timely_goodput_bits += useful_bits
+            result["total_timely_useful_bits"] += useful_bits
+            result["timely_goodput_bits"] += useful_bits
+            if task_type == "FOV":
+                self.fov_timely_delivered_raw_bits += physical_bits
+                self.fov_timely_useful_bits += useful_bits
+                result["fov_timely_delivered_raw_bits"] += physical_bits
+                result["fov_timely_useful_bits"] += useful_bits
+            else:
+                self.com_timely_delivered_bits += physical_bits
+                result["com_timely_delivered_bits"] += physical_bits
+            return
+
+        pkt["late_delivered_raw_bits"] = physical_bits
+        pkt["late_useful_bits"] = useful_bits
+        self.total_late_useful_bits += useful_bits
+        result["total_late_useful_bits"] += useful_bits
+        if task_type == "FOV":
+            self.fov_late_delivered_raw_bits += physical_bits
+            self.fov_late_useful_bits += useful_bits
+            result["fov_late_delivered_raw_bits"] += physical_bits
+            result["fov_late_useful_bits"] += useful_bits
+        else:
+            self.com_late_delivered_bits += physical_bits
+            result["com_late_delivered_bits"] += physical_bits
 
     def _event_complete_s2u(self, pkt, sr_id, receiver, completion_time, result):
         queue = self.sr_queues[int(sr_id)]
@@ -2779,9 +2855,10 @@ class PacketEngine:
             0.0,
         ) * 1e3
         deadline_abs = float(pkt.get("deadline_abs", float("inf")))
-        if float(completion_time) > deadline_abs + event_time_tolerance_seconds(
-            completion_time, deadline_abs
-        ):
+        timely_delivery = self._delivery_is_timely(completion_time, deadline_abs)
+        if not timely_delivery:
+            if self.allow_late_delivery:
+                self._count_complete_gs_delivery(pkt, result, timely=False)
             violation = self._mark_deadline_violation(
                 pkt,
                 completion_time,
@@ -2795,28 +2872,7 @@ class PacketEngine:
                 )
             return
 
-        if not pkt.get("timely_goodput_counted", False):
-            physical_bits = float(pkt["size_bits"])
-            if task_type == "FOV":
-                coverage = sanitize_capture_coverage_ratio(
-                    pkt.get("capture_coverage_ratio", 0.0)
-                )
-                useful_bits = physical_bits * coverage
-                self.fov_timely_delivered_raw_bits += physical_bits
-                self.fov_timely_useful_bits += useful_bits
-                result["fov_timely_delivered_raw_bits"] += physical_bits
-                result["fov_timely_useful_bits"] += useful_bits
-            else:
-                useful_bits = physical_bits
-                self.com_timely_delivered_bits += physical_bits
-                result["com_timely_delivered_bits"] += physical_bits
-            pkt["timely_goodput_counted"] = True
-            pkt["timely_delivered_raw_bits"] = physical_bits
-            pkt["timely_useful_bits"] = useful_bits
-            self.total_timely_useful_bits += useful_bits
-            self.timely_goodput_bits += useful_bits
-            result["total_timely_useful_bits"] += useful_bits
-            result["timely_goodput_bits"] += useful_bits
+        self._count_complete_gs_delivery(pkt, result, timely=True)
         self.total_delivered += 1
         if task_type == "FOV":
             self.fov_delivered += 1
@@ -3182,6 +3238,8 @@ class PacketEngine:
             diagnostic["settled"] = True
 
         def append_expirations(moment):
+            if self.allow_late_delivery:
+                return
             # Outcome rows snapshot diagnostics inside mark_packet_done().
             # Settle a current-slot S2U opportunity before that snapshot when
             # the deadline itself terminates the HOL packet.
@@ -4132,6 +4190,14 @@ class PacketEngine:
                     pkt.get("timely_delivered_raw_bits", 0.0)
                 ),
                 "timely_useful_bits": float(pkt.get("timely_useful_bits", 0.0)),
+                "late_delivered_raw_bits": float(
+                    pkt.get("late_delivered_raw_bits", 0.0)
+                ),
+                "late_useful_bits": float(pkt.get("late_useful_bits", 0.0)),
+                "delivered_raw_bits": float(pkt.get("delivered_raw_bits", 0.0)),
+                "delivered_useful_bits": float(
+                    pkt.get("delivered_useful_bits", 0.0)
+                ),
                 "delivered_to_gs": delivered_to_gs,
                 "qos_eligible": bool(pkt.get("qos_eligible", False)),
                 "routing_eligible": bool(pkt.get("routing_eligible", False)),
@@ -4235,6 +4301,18 @@ class PacketEngine:
                             self.fov_timely_delivered_raw_bits
                         ),
                         "timely_useful_bits": float(self.fov_timely_useful_bits),
+                        "late_delivered_raw_bits": float(
+                            self.fov_late_delivered_raw_bits
+                        ),
+                        "late_useful_bits": float(self.fov_late_useful_bits),
+                        "all_delivered_raw_bits": float(
+                            self.fov_timely_delivered_raw_bits
+                            + self.fov_late_delivered_raw_bits
+                        ),
+                        "all_useful_bits": float(
+                            self.fov_timely_useful_bits
+                            + self.fov_late_useful_bits
+                        ),
                         "mean_capture_coverage": (
                             float(self.fov_capture_coverage_sum)
                             / int(self.fov_capture_coverage_count)
@@ -4249,6 +4327,13 @@ class PacketEngine:
             else:
                 result[task_type]["timely_delivered_bits"] = float(
                     self.com_timely_delivered_bits
+                )
+                result[task_type]["late_delivered_bits"] = float(
+                    self.com_late_delivered_bits
+                )
+                result[task_type]["all_delivered_bits"] = float(
+                    self.com_timely_delivered_bits
+                    + self.com_late_delivered_bits
                 )
         return result
 
@@ -4393,6 +4478,11 @@ class PacketEngine:
         self.fov_zero_coverage_packet_count = 0
         self.com_timely_delivered_bits = 0.0
         self.total_timely_useful_bits = 0.0
+        self.fov_late_delivered_raw_bits = 0.0
+        self.fov_late_useful_bits = 0.0
+        self.com_late_delivered_bits = 0.0
+        self.total_late_useful_bits = 0.0
+        self.total_all_useful_bits = 0.0
         self.wait_actions = 0
         self.deadline_drops = 0
         self.link_slot_budget_violations = 0

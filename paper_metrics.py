@@ -14,7 +14,7 @@ from evaluation_aggregation import (
 PAPER_EE_EPSILON_J = 1e-12
 AGGREGATE_REL_TOL = 1e-12
 AGGREGATE_ABS_TOL = 1e-15
-PAPER_AGGREGATE_SCHEMA_VERSION = "uav-hrl-paper-aggregate-v5"
+PAPER_AGGREGATE_SCHEMA_VERSION = "uav-hrl-paper-aggregate-v6"
 CANONICAL_AGGREGATE_ROWS = (
     ("energy_efficiency_mbit_per_j", None),
     ("average_e2e_delay_seconds", "FOV"),
@@ -376,7 +376,9 @@ def aggregate_paper_point_metrics(
         "fixed_num_gt": point.get("fixed_num_gt"),
         "swept_task": point.get("swept_task"),
         "evaluation_episode_count": len(rows),
-        "ee_numerator_definition": "total timely useful Mbit",
+        "ee_numerator_definition": (
+            "total complete useful Mbit (timely plus late delivery)"
+        ),
         "fov_coverage_snapshot_timing": "packet generation/capture time",
     }
     if include_environment_size_metrics:

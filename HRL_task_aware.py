@@ -28,6 +28,8 @@ from dinkelbach_blocks import (
 from Packet_scheduler_v1 import (
     EPISODE_INJECTION_CUTOFF_SECONDS,
     PACKET_ENGINE_CHECKPOINT_SCHEMA_VERSION,
+    PACKET_DEADLINE_POLICY_CONTINUE,
+    PACKET_DEADLINE_POLICY_DROP,
     PacketEngine,
     TASK_DEADLINE_SECONDS,
 )
@@ -1652,6 +1654,7 @@ def _experiment_identity(
     config,
     *,
     evaluation=False,
+    formal_evaluation=False,
     rng_contract_metadata=None,
 ):
     comparison = comparison_method_configuration(method_spec)
@@ -1681,6 +1684,18 @@ def _experiment_identity(
         ),
         "evaluation_episode_count": (
             int(config.total_episodes) if evaluation else None
+        ),
+        **(
+            {
+                "formal_evaluation": bool(formal_evaluation),
+                "packet_deadline_policy": (
+                    PACKET_DEADLINE_POLICY_CONTINUE
+                    if formal_evaluation
+                    else PACKET_DEADLINE_POLICY_DROP
+                ),
+            }
+            if evaluation
+            else {}
         ),
         "episode_horizon_seconds": int(config.episode_seconds),
         "movement_interval_seconds": MOVEMENT_INTERVAL_SECONDS,
@@ -2193,6 +2208,7 @@ def train(
     scenario_manifest=None,
     method_spec=None,
     evaluation=False,
+    formal_evaluation=False,
     checkpoint_dir=None,
     expected_checkpoint_episodes=None,
     expected_checkpoint_formal_config=None,
@@ -2227,6 +2243,9 @@ def train(
             "formal_training_config(total_episodes)"
         )
     method_spec = method_spec or MethodSpec()
+    formal_evaluation = bool(formal_evaluation)
+    if formal_evaluation and not evaluation:
+        raise ValueError("formal_evaluation requires evaluation=True")
     # Reconstructing validates even subclasses or deserialized specifications.
     MethodSpec(**{
         key: value
@@ -2443,6 +2462,11 @@ def train(
         enable_packet_diagnostic_artifacts=(
             packet_outcome_mode != PACKET_OUTCOME_MODE_DISABLED
         ),
+        packet_deadline_policy=(
+            PACKET_DEADLINE_POLICY_CONTINUE
+            if formal_evaluation
+            else PACKET_DEADLINE_POLICY_DROP
+        ),
     )
     llm_runtime = None
     if llm_design is not None:
@@ -2550,6 +2574,7 @@ def train(
         config.random_seed,
         config,
         evaluation=evaluation,
+        formal_evaluation=formal_evaluation,
         rng_contract_metadata=rng_streams.metadata(),
     )
     llm_explorer_config = (
@@ -4391,6 +4416,15 @@ def train(
         total_timely_useful_bits = float(
             packet_engine.total_timely_useful_bits
         )
+        total_late_useful_bits = float(packet_engine.total_late_useful_bits)
+        total_all_useful_bits = float(packet_engine.total_all_useful_bits)
+        if not np.isclose(
+            total_all_useful_bits,
+            total_timely_useful_bits + total_late_useful_bits,
+            rtol=1e-12,
+            atol=max(1e-9, 32.0 * np.spacing(max(total_all_useful_bits, 1.0))),
+        ):
+            raise AssertionError("all useful bits diverged from timely plus late bits")
         if not np.isclose(
             packet_engine.timely_goodput_bits,
             total_timely_useful_bits,
@@ -4519,6 +4553,11 @@ def train(
                         + "\n"
                     )
         raw_final_hop_mbits = float(packet_engine.raw_final_hop_bits) / 1e6
+        total_late_useful_mbits = total_late_useful_bits / 1e6
+        total_all_useful_mbits = total_all_useful_bits / 1e6
+        primary_ee_useful_mbits = (
+            total_all_useful_mbits if formal_evaluation else timely_goodput_mbits
+        )
         dinkelbach_event = None
         if not evaluation and method_spec.uses_dinkelbach:
             dinkelbach_event = dinkelbach_state.record_episode(
@@ -4779,6 +4818,8 @@ def train(
                 "num_GT": int(env.num_GT),
                 "timely_goodput_mbits": timely_goodput_mbits,
                 "total_timely_useful_mbits": total_timely_useful_bits / 1e6,
+                "total_late_useful_mbits": total_late_useful_mbits,
+                "total_all_useful_mbits": total_all_useful_mbits,
                 "fov_generated_raw_bits": float(
                     packet_engine.fov_generated_raw_bits
                 ),
@@ -4801,10 +4842,27 @@ def train(
                     packet_engine.com_timely_delivered_bits
                 ),
                 "total_timely_useful_bits": total_timely_useful_bits,
+                "fov_late_delivered_raw_bits": float(
+                    packet_engine.fov_late_delivered_raw_bits
+                ),
+                "fov_late_useful_bits": float(
+                    packet_engine.fov_late_useful_bits
+                ),
+                "com_late_delivered_bits": float(
+                    packet_engine.com_late_delivered_bits
+                ),
+                "total_late_useful_bits": total_late_useful_bits,
+                "total_all_useful_bits": total_all_useful_bits,
                 "raw_final_hop_mbits": raw_final_hop_mbits,
                 "total_mobility_energy_j": float(episode_energy),
                 "energy_efficiency_mbit_per_j": safe_energy_efficiency(
+                    primary_ee_useful_mbits, episode_energy
+                ),
+                "timely_energy_efficiency_mbit_per_j": safe_energy_efficiency(
                     timely_goodput_mbits, episode_energy
+                ),
+                "all_energy_efficiency_mbit_per_j": safe_energy_efficiency(
+                    total_all_useful_mbits, episode_energy
                 ),
                 "fov_timely_delivered_packets": int(packet_engine.fov_delivered),
                 "com_timely_delivered_packets": int(packet_engine.com_delivered),
@@ -5611,6 +5669,11 @@ def train(
         ),
         "com_timely_delivered_bits": packet_engine.com_timely_delivered_bits,
         "total_timely_useful_bits": packet_engine.total_timely_useful_bits,
+        "fov_late_delivered_raw_bits": packet_engine.fov_late_delivered_raw_bits,
+        "fov_late_useful_bits": packet_engine.fov_late_useful_bits,
+        "com_late_delivered_bits": packet_engine.com_late_delivered_bits,
+        "total_late_useful_bits": packet_engine.total_late_useful_bits,
+        "total_all_useful_bits": packet_engine.total_all_useful_bits,
         "timely_delivered_packets": packet_engine.total_delivered,
         "deadline_violated_packets": packet_engine.total_violated,
         "routing_wait_actions": packet_engine.wait_actions,
@@ -5831,6 +5894,26 @@ def train(
             "evaluation_overrides": (
                 resolved_evaluation if evaluation else None
             ),
+            "formal_evaluation": bool(formal_evaluation),
+            "packet_deadline_policy": packet_engine.packet_deadline_policy,
+            "packet_delivery_accounting_schema_version": (
+                "complete-gs-delivery-timely-late-useful-bits-v1"
+            ),
+            "packet_deadline_policy_definition": (
+                "target delay classifies timely versus late delivery; packets "
+                "continue unchanged until complete delivery, a non-time limit, "
+                "or episode-end settlement"
+                if formal_evaluation
+                else "unfinished packets terminate at target delay"
+            ),
+            "primary_energy_efficiency_definition": (
+                "(timely useful bits + late complete useful bits) / UAV movement energy"
+                if formal_evaluation
+                else "timely useful bits / UAV movement energy"
+            ),
+            "timely_energy_efficiency_definition": (
+                "timely useful bits / UAV movement energy"
+            ),
             "packet_metric_definition": (
                 {
                     "average_e2e_delay": (
@@ -5842,6 +5925,13 @@ def train(
                         "(generated FOV + every activated COM); missing when zero eligible"
                     ),
                     "sr_admission_drop": "excluded from numerator and denominator",
+                    "late_delivery": (
+                        "complete GS delivery after target delay; one delay violation"
+                    ),
+                    "useful_bits": (
+                        "complete FOV size times capture coverage or complete COM size; "
+                        "partial final-hop bits excluded"
+                    ),
                     "terminal_outcomes_mutually_exclusive": True,
                 }
                 if evaluation

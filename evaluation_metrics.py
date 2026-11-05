@@ -51,6 +51,8 @@ METRIC_COLUMNS = (
     "num_GT",
     "timely_goodput_mbits",
     "total_timely_useful_mbits",
+    "total_late_useful_mbits",
+    "total_all_useful_mbits",
     "fov_generated_raw_bits",
     "fov_timely_delivered_raw_bits",
     "fov_timely_useful_bits",
@@ -58,9 +60,16 @@ METRIC_COLUMNS = (
     "fov_zero_coverage_packet_count",
     "com_timely_delivered_bits",
     "total_timely_useful_bits",
+    "fov_late_delivered_raw_bits",
+    "fov_late_useful_bits",
+    "com_late_delivered_bits",
+    "total_late_useful_bits",
+    "total_all_useful_bits",
     "raw_final_hop_mbits",
     "total_mobility_energy_j",
     "energy_efficiency_mbit_per_j",
+    "timely_energy_efficiency_mbit_per_j",
+    "all_energy_efficiency_mbit_per_j",
     "fov_timely_delivered_packets",
     "com_timely_delivered_packets",
     "fov_deadline_violations",
@@ -119,7 +128,7 @@ OPTIONAL_METRIC_COLUMNS = {
 }
 
 GENERIC_CROSS_SEED_ARTIFACT_SCHEMA_VERSION = (
-    "uav-hrl-generic-cross-seed-aggregate-v3"
+    "uav-hrl-generic-cross-seed-aggregate-v4"
 )
 
 # Every per-episode metric must opt in to exactly one generic aggregation path.
@@ -128,6 +137,8 @@ DESCRIPTIVE_EPISODE_METRIC_COLUMNS = (
     "num_GT",
     "timely_goodput_mbits",
     "total_timely_useful_mbits",
+    "total_late_useful_mbits",
+    "total_all_useful_mbits",
     "fov_generated_raw_bits",
     "fov_timely_delivered_raw_bits",
     "fov_timely_useful_bits",
@@ -135,8 +146,15 @@ DESCRIPTIVE_EPISODE_METRIC_COLUMNS = (
     "fov_zero_coverage_packet_count",
     "com_timely_delivered_bits",
     "total_timely_useful_bits",
+    "fov_late_delivered_raw_bits",
+    "fov_late_useful_bits",
+    "com_late_delivered_bits",
+    "total_late_useful_bits",
+    "total_all_useful_bits",
     "raw_final_hop_mbits",
     "total_mobility_energy_j",
+    "timely_energy_efficiency_mbit_per_j",
+    "all_energy_efficiency_mbit_per_j",
     "fov_timely_delivered_packets",
     "com_timely_delivered_packets",
     "fov_deadline_violations",
@@ -381,6 +399,22 @@ def summarize_training_seeds(episode_rows):
         summary["energy_efficiency_mbit_per_j"] = canonical[
             ("energy_efficiency_mbit_per_j", None)
         ]
+        energy_sum = sum(float(row["total_mobility_energy_j"]) for row in rows)
+        timely_sum = sum(float(row["total_timely_useful_mbits"]) for row in rows)
+        all_sum = sum(
+            float(
+                row["total_timely_useful_mbits"]
+                if row.get("total_all_useful_mbits") in (None, "")
+                else row["total_all_useful_mbits"]
+            )
+            for row in rows
+        )
+        summary["timely_energy_efficiency_mbit_per_j"] = (
+            timely_sum / energy_sum if energy_sum > 0.0 else None
+        )
+        summary["all_energy_efficiency_mbit_per_j"] = (
+            all_sum / energy_sum if energy_sum > 0.0 else None
+        )
         summary["fov_average_e2e_delay_seconds"] = canonical[
             ("average_e2e_delay_seconds", "FOV")
         ]
@@ -861,6 +895,29 @@ def _read_episode_csvs(input_dir):
     for path in sorted(Path(input_dir).glob("**/per_episode.csv")):
         with path.open("r", encoding="utf-8", newline="") as handle:
             for row in csv.DictReader(handle):
+                if "total_late_useful_mbits" not in row:
+                    row.update(
+                        {
+                            "total_late_useful_mbits": 0.0,
+                            "total_all_useful_mbits": row.get(
+                                "total_timely_useful_mbits",
+                                row.get("timely_goodput_mbits"),
+                            ),
+                            "fov_late_delivered_raw_bits": 0.0,
+                            "fov_late_useful_bits": 0.0,
+                            "com_late_delivered_bits": 0.0,
+                            "total_late_useful_bits": 0.0,
+                            "total_all_useful_bits": row.get(
+                                "total_timely_useful_bits"
+                            ),
+                            "timely_energy_efficiency_mbit_per_j": row.get(
+                                "energy_efficiency_mbit_per_j"
+                            ),
+                            "all_energy_efficiency_mbit_per_j": row.get(
+                                "energy_efficiency_mbit_per_j"
+                            ),
+                        }
+                    )
                 rows.append(row)
     if not rows:
         raise FileNotFoundError(
@@ -881,6 +938,7 @@ def run_evaluation_command(args):
             scenario_manifest=preflight["manifest"],
             method_spec=preflight["method"],
             evaluation=True,
+            formal_evaluation=True,
             checkpoint_dir=args.checkpoint,
             expected_checkpoint_episodes=FORMAL_EXPERIMENT_DEFAULTS[
                 "training_episodes_per_seed"

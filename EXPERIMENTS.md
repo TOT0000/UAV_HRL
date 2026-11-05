@@ -893,10 +893,25 @@ to `packet_outcomes.jsonl`, flushing one complete episode before starting the
 next. The in-memory all-episode artifact field remains disabled. Every JSONL
 record contains `scenario_id`, the episode packet summary, the original raw
 `packet_outcomes`, and
-`artifact_schema_version=uav-hrl-packet-outcomes-jsonl-v3`. The collection
+`artifact_schema_version=uav-hrl-packet-outcomes-jsonl-v7`. The collection
 mode, artifact schema, output path, and written episode count are recorded in
 metadata. Writer/open/serialization errors fail the evaluation, and the stream
 is closed on both successful and exceptional exits.
+
+Formal evaluation uses `packet_deadline_policy=continue_until_episode_end_v1`.
+The target delay still classifies a complete GS delivery as on-time or late,
+and a late delivery counts as one delay violation, but the packet keeps its
+normal FIFO position and may continue over S2U/U2U/U2G links until delivery or
+episode-end settlement. Queue capacity, hop limits, and other non-time limits
+remain active. Training and non-formal sampling retain the original
+`drop_at_target_delay_v1` policy. The primary evaluation EE and paper EE plots
+use all completely delivered useful bits (on-time plus late) divided by UAV
+movement energy. Per-episode outputs also retain
+`timely_energy_efficiency_mbit_per_j`, `total_timely_useful_bits`,
+`total_late_useful_bits`, and `total_all_useful_bits`; fields containing
+`timely` never include late delivery. FOV useful bits in both classes use the
+coverage snapshot frozen at packet capture, while partial final-hop traffic is
+excluded from both EE numerators.
 
 The canonical evaluation suites are `training_ee_vs_episode`,
 `uav_trajectory_snapshots`, `task_type_delay_vs_arrival_rate`,

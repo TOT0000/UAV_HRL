@@ -20,8 +20,6 @@ from communication_contract import (
     MAX_3D_COMMUNICATION_DISTANCE_M,
     validate_communication_range_aliases,
 )
-from evaluation_aggregation import EVALUATION_AGGREGATION_SCHEMA_VERSION
-
 from Channel_model import (
     CHANNEL_ENVIRONMENT_CONTRACT_VERSION,
     CHANNEL_FAIRNESS_CONTRACT_VERSION,
@@ -230,6 +228,11 @@ PACKET_SERVICE_CONTRACT_VERSION = (
 )
 QOS_AGGREGATE_CONTRACT_VERSION = (
     "canonical-single-result-seed-ratio-of-sums-student-t-v3"
+)
+# This field is embedded in model/full checkpoints. Formal evaluation now has
+# a separate runtime aggregation schema and must not invalidate trained models.
+CHECKPOINT_EVALUATION_AGGREGATION_SCHEMA_VERSION = (
+    "canonical-useful-goodput-service-only-v4"
 )
 ROUTING_REWARD_CONTRACT_VERSION = (
     "shared-slot-timely-useful-gs-bits-per-10000-v9"
@@ -1314,7 +1317,7 @@ def comparison_method_configuration(method_spec: MethodSpec) -> dict:
         ),
         "qos_aggregate_contract_version": QOS_AGGREGATE_CONTRACT_VERSION,
         "evaluation_aggregation_schema_version": (
-            EVALUATION_AGGREGATION_SCHEMA_VERSION
+            CHECKPOINT_EVALUATION_AGGREGATION_SCHEMA_VERSION
         ),
         "routing_reward_contract_version": ROUTING_REWARD_CONTRACT_VERSION,
         "routing_reward_formula": (

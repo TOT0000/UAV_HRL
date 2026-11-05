@@ -9,7 +9,7 @@ from scipy.stats import t as student_t
 
 
 EVALUATION_AGGREGATION_SCHEMA_VERSION = (
-    "canonical-useful-goodput-service-only-v4"
+    "canonical-complete-useful-goodput-service-only-v5"
 )
 
 CANONICAL_METRICS = (
@@ -74,7 +74,7 @@ def aggregate_episode_rows_by_seed(episode_rows, *, seed_field="training_seed"):
         grouped.setdefault(seed, []).append(row)
     output = []
     for seed, rows in sorted(grouped.items()):
-        timely = 0.0
+        primary_useful = 0.0
         for row in rows:
             alias = _row_number(row, "timely_goodput_mbits")
             useful = (
@@ -86,12 +86,22 @@ def aggregate_episode_rows_by_seed(episode_rows, *, seed_field="training_seed"):
                 raise ValueError(
                     "timely_goodput_mbits must alias total_timely_useful_mbits"
                 )
-            timely += useful
+            late = (
+                0.0
+                if row.get("total_late_useful_mbits") in (None, "")
+                else _row_number(row, "total_late_useful_mbits")
+            )
+            all_useful = (
+                useful
+                if row.get("total_all_useful_mbits") in (None, "")
+                else _row_number(row, "total_all_useful_mbits")
+            )
+            primary_useful += all_useful
         energy = sum(_row_number(row, "total_mobility_energy_j") for row in rows)
         seed_rows = [
             _ratio_row(
                 "energy_efficiency_mbit_per_j", None,
-                timely, energy, "Mbit", "J", "Mbit/J",
+                primary_useful, energy, "Mbit", "J", "Mbit/J",
             )
         ]
         violation_sums = {}

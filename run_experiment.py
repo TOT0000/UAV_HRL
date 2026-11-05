@@ -1768,6 +1768,7 @@ def run_evaluate(args):
         scenario_manifest=manifest,
         method_spec=method,
         evaluation=True,
+        formal_evaluation=True,
         checkpoint_dir=checkpoint if checkpoint_required else None,
         expected_checkpoint_episodes=(
             checkpoint_episode if checkpoint_required else None

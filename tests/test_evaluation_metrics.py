@@ -14,6 +14,9 @@ from evaluation_metrics import (
 from evaluation_aggregation import canonical_aggregation
 from experiment_config import MethodSpec
 from HRL_task_aware import TrainingConfig, train
+from Packet_scheduler_v1 import (
+    PACKET_DEADLINE_POLICY_CONTINUE,
+)
 from scenario_manifest import generate_manifest
 
 
@@ -96,6 +99,43 @@ class EvaluationMetricTest(unittest.TestCase):
             self.assertNotIn("NaN", Path(paths["per_episode_jsonl"]).read_text())
             self.assertNotIn("Infinity", Path(paths["per_episode_jsonl"]).read_text())
 
+    def test_primary_ee_uses_complete_timely_plus_late_bits(self):
+        row = self._row(11, "a", 1.0)
+        row["total_timely_useful_mbits"] = 1.0
+        row["timely_goodput_mbits"] = 1.0
+        row["total_late_useful_mbits"] = 2.0
+        row["total_all_useful_mbits"] = 3.0
+        row["total_mobility_energy_j"] = 2.0
+
+        per_seed, cross_seed = canonical_aggregation([row])
+        energy = next(
+            item
+            for item in per_seed
+            if item["metric"] == "energy_efficiency_mbit_per_j"
+        )
+        summary = summarize_training_seeds([row])[0]
+
+        self.assertEqual(energy["numerator"], 3.0)
+        self.assertEqual(energy["value"], 1.5)
+        self.assertEqual(summary["timely_energy_efficiency_mbit_per_j"], 0.5)
+        self.assertEqual(summary["all_energy_efficiency_mbit_per_j"], 1.5)
+        self.assertEqual(cross_seed[0]["per_seed_numerators"], [3.0])
+
+    def test_old_rows_without_late_fields_keep_timely_ee_semantics(self):
+        row = self._row(11, "legacy", 2.0)
+        for field in (
+            "total_late_useful_mbits",
+            "total_all_useful_mbits",
+        ):
+            row.pop(field)
+        per_seed, _cross_seed = canonical_aggregation([row])
+        energy = next(
+            item
+            for item in per_seed
+            if item["metric"] == "energy_efficiency_mbit_per_j"
+        )
+        self.assertEqual(energy["numerator"], 2.0)
+
     def test_no_checkpoint_baseline_preserves_null_provenance(self):
         row = self._row(11, "a", 0.0)
         row["training_manifest_hash"] = None
@@ -143,6 +183,9 @@ class EvaluationModeIntegrationTest(unittest.TestCase):
             checkpoint_dinkelbach_state = checkpoint_metadata["experiment"][
                 "dinkelbach_state"
             ]
+            self.assertNotIn(
+                "packet_deadline_policy", checkpoint_metadata["experiment"]
+            )
             checkpoint_constraint_state = checkpoint_metadata[
                 "routing_agent_configuration"
             ]
@@ -165,6 +208,7 @@ class EvaluationModeIntegrationTest(unittest.TestCase):
                 scenario_manifest=evaluation_manifest,
                 method_spec=method,
                 evaluation=True,
+                formal_evaluation=True,
                 checkpoint_dir=checkpoint_dir,
             )
 
@@ -193,6 +237,10 @@ class EvaluationModeIntegrationTest(unittest.TestCase):
             evaluation_manifest.episodes[0]["scenario_id"],
         )
         metadata = result["run_metadata"]
+        self.assertTrue(metadata["formal_evaluation"])
+        self.assertEqual(
+            metadata["packet_deadline_policy"], PACKET_DEADLINE_POLICY_CONTINUE
+        )
         self.assertEqual(
             metadata["training_manifest_hash"], train_manifest.content_hash
         )
@@ -218,6 +266,45 @@ class EvaluationModeIntegrationTest(unittest.TestCase):
         )
         self.assertTrue(metadata["checkpoint_metadata_path"].endswith("metadata.json"))
         self.assertEqual(len(metadata["checkpoint_metadata_fingerprint"]), 64)
+
+    def test_formal_evaluation_uses_explicit_continue_policy_for_random_baseline(self):
+        method = MethodSpec.parse("kkm_random_action_random_routing")
+        manifest = generate_manifest("test", 9917, 1)
+        result = train(
+            TrainingConfig(
+                total_episodes=1,
+                mode="custom",
+                episode_seconds=1,
+                routing_slot_seconds=0.25,
+                warmup_joint_transitions=0,
+                batch_size=1,
+                enable_model_checkpoints=False,
+                enable_full_resume=False,
+                enable_plots=False,
+                enable_csv=False,
+                random_seed=9917,
+            ),
+            scenario_manifest=manifest,
+            method_spec=method,
+            evaluation=True,
+            formal_evaluation=True,
+        )
+
+        metadata = result["run_metadata"]
+        self.assertTrue(metadata["formal_evaluation"])
+        self.assertEqual(
+            metadata["packet_deadline_policy"],
+            PACKET_DEADLINE_POLICY_CONTINUE,
+        )
+        row = result["episode_metrics"][0]
+        self.assertAlmostEqual(
+            row["total_all_useful_bits"],
+            row["total_timely_useful_bits"] + row["total_late_useful_bits"],
+        )
+        self.assertEqual(
+            row["energy_efficiency_mbit_per_j"],
+            row["all_energy_efficiency_mbit_per_j"],
+        )
 
 
 if __name__ == "__main__":

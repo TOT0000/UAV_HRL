@@ -7,6 +7,7 @@ import Packet_scheduler_v1 as packet_scheduler
 from Channel_model import FADING_BLOCK_SECONDS, FADING_BLOCKS_PER_ROUTING_SLOT
 from Packet_scheduler_v1 import (
     COM_PACKET_SIZE_BITS,
+    PACKET_DEADLINE_POLICY_CONTINUE,
     PACKET_EPS,
     PacketEngine,
     TASK_DEADLINE_SECONDS,
@@ -311,6 +312,137 @@ def test_exact_deadline_completion_wins_but_later_packet_expires_immediately():
     _, nextafter_boundary, _ = run(np.nextafter(100.0, float("inf")))
     assert nextafter_boundary["terminal_outcome"] == "on_time_delivered"
     assert nextafter_boundary["timely_goodput_counted"] is True
+
+
+def test_formal_policy_counts_exact_deadline_as_timely_and_all_useful():
+    env = EventCapacityEnvironment(1)
+    engine = PacketEngine(
+        1,
+        task_deadlines_seconds={"FOV": 0.015, "COM": 0.001},
+        packet_deadline_policy=PACKET_DEADLINE_POLICY_CONTINUE,
+    )
+    packet = engine.create_packet(0, "COM", 100.0, 0.0)
+
+    result = engine.serve_event_driven_slot(
+        env,
+        _actions(env.GS_ID),
+        0.0,
+        observed_hol_by_sender={0: packet},
+        observed_backlog_bits_by_sender={0: 100.0},
+    )
+
+    assert packet["terminal_outcome"] == "on_time_delivered"
+    assert result["total_timely_useful_bits"] == pytest.approx(100.0)
+    assert result["total_late_useful_bits"] == 0.0
+    assert result["total_all_useful_bits"] == pytest.approx(100.0)
+
+
+def test_formal_policy_allows_late_multihop_delivery_and_counts_one_violation():
+    env = EventCapacityEnvironment(2)
+    env.SR_teams = [SimpleNamespace(id=0, assigned_gt_id=0)]
+    env.multi_tasks[0] = [
+        {"task_type": "COM", "target_obj_id": 0, "target_id": 0}
+    ]
+    engine = PacketEngine(
+        2,
+        task_deadlines_seconds={"FOV": 0.015, "COM": 0.0015},
+        packet_deadline_policy=PACKET_DEADLINE_POLICY_CONTINUE,
+    )
+    packet = engine.create_sr_packet(0, 100.0, generation_time=0.0)
+
+    result = engine.serve_event_driven_slot(
+        env,
+        _actions(1, env.GS_ID),
+        0.0,
+        observed_hol_by_sender={0: None, 1: None},
+        observed_backlog_bits_by_sender={0: 0.0, 1: 0.0},
+    )
+
+    assert packet["terminal_outcome"] == "late_delivered"
+    assert [hop["link_type"] for hop in packet["per_hop"]] == [
+        "S2U",
+        "U2U",
+        "U2G",
+    ]
+    assert result["total_timely_useful_bits"] == 0.0
+    assert result["total_late_useful_bits"] == pytest.approx(100.0)
+    assert result["total_all_useful_bits"] == pytest.approx(100.0)
+    assert engine.total_violated == 1
+    assert engine.packet_metric_summary()["COM"]["violation_packets"] == 1
+
+
+def test_formal_policy_partial_delivery_at_episode_end_adds_no_useful_bits():
+    env = EventCapacityEnvironment(1)
+    engine = PacketEngine(
+        1,
+        task_deadlines_seconds={"FOV": 0.015, "COM": 0.001},
+        packet_deadline_policy=PACKET_DEADLINE_POLICY_CONTINUE,
+    )
+    packet = engine.create_packet(0, "COM", 100_000.0, 0.0)
+
+    engine.serve_event_driven_slot(
+        env,
+        _actions(env.GS_ID),
+        0.0,
+        observed_hol_by_sender={0: packet},
+        observed_backlog_bits_by_sender={0: packet["size_bits"]},
+    )
+    assert 0.0 < engine.raw_final_hop_bits < packet["size_bits"]
+    assert engine.total_all_useful_bits == 0.0
+
+    engine.finalize_episode(0.25)
+    assert packet["terminal_outcome"] == "expired_dropped"
+    assert engine.total_all_useful_bits == 0.0
+
+
+def test_formal_policy_late_fov_keeps_capture_coverage_weight():
+    env = EventCapacityEnvironment(1)
+    engine = PacketEngine(
+        1,
+        task_deadlines_seconds={"FOV": 0.0005, "COM": 0.010},
+        packet_deadline_policy=PACKET_DEADLINE_POLICY_CONTINUE,
+    )
+    packet = engine.create_packet(0, "FOV", 100.0, 0.0)
+    packet["capture_coverage_ratio"] = 0.25
+
+    result = engine.serve_event_driven_slot(
+        env,
+        _actions(env.GS_ID),
+        0.0,
+        observed_hol_by_sender={0: packet},
+        observed_backlog_bits_by_sender={0: 100.0},
+    )
+
+    assert packet["terminal_outcome"] == "late_delivered"
+    assert result["fov_late_delivered_raw_bits"] == pytest.approx(100.0)
+    assert result["fov_late_useful_bits"] == pytest.approx(25.0)
+    assert result["total_all_useful_bits"] == pytest.approx(25.0)
+
+
+def test_formal_policy_keeps_fifo_order_after_head_packet_becomes_late():
+    env = EventCapacityEnvironment(1)
+    engine = PacketEngine(
+        1,
+        task_deadlines_seconds={"FOV": 0.015, "COM": 0.001},
+        packet_deadline_policy=PACKET_DEADLINE_POLICY_CONTINUE,
+    )
+    first = engine.create_packet(0, "COM", 20_000.0, 0.0)
+    second = engine.create_packet(0, "COM", 1_000.0, 0.0)
+
+    result = engine.serve_event_driven_slot(
+        env,
+        _actions(env.GS_ID),
+        0.0,
+        observed_hol_by_sender={0: first},
+        observed_backlog_bits_by_sender={0: 21_000.0},
+    )
+
+    assert [row["packet_id"] for row in result["outcomes"]] == [
+        first["id"],
+        second["id"],
+    ]
+    assert first["finish_time"] < second["finish_time"]
+    assert first["terminal_outcome"] == second["terminal_outcome"] == "late_delivered"
 
 
 def test_empty_preselected_links_reserve_no_bandwidth():

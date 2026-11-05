@@ -23,11 +23,12 @@ from experiment_config import (
 )
 from paper_evaluation import run_paper_evaluation
 from paper_metrics import validate_canonical_aggregate_rows
+from Packet_scheduler_v1 import PACKET_DEADLINE_POLICY_CONTINUE
 from scenario_manifest import generate_manifest
 from training_checkpoint import CHECKPOINT_HORIZON_COMPATIBILITY_FIELDS
 
 
-CHECKPOINT_ROI_SWEEP_SCHEMA_VERSION = "uav-hrl-checkpoint-roi-sweep-v2"
+CHECKPOINT_ROI_SWEEP_SCHEMA_VERSION = "uav-hrl-checkpoint-roi-sweep-v3"
 SUMMARY_FIELDS = (
     "method_id",
     "training_run_id",
@@ -48,6 +49,9 @@ SUMMARY_FIELDS = (
     "manifest_seed",
     "manifest_hash",
     "energy_efficiency_bit_per_joule",
+    "timely_energy_efficiency_bit_per_joule",
+    "all_useful_bits",
+    "late_useful_bits",
     "timely_useful_bits",
     "timely_useful_goodput_bps",
     "propulsion_energy_j",
@@ -62,10 +66,19 @@ SUMMARY_FIELDS = (
 )
 METRIC_FIELD_MAPPING = {
     "energy_efficiency_bit_per_joule": (
-        "canonical energy_efficiency_mbit_per_j row value multiplied by 1e6"
+        "canonical EE_all row value multiplied by 1e6"
+    ),
+    "timely_energy_efficiency_bit_per_joule": (
+        "sum timely useful bits / canonical mobility-energy denominator"
+    ),
+    "all_useful_bits": (
+        "canonical EE_all numerator multiplied by 1e6"
+    ),
+    "late_useful_bits": (
+        "sum of complete late-delivery useful bits"
     ),
     "timely_useful_bits": (
-        "canonical energy-efficiency numerator total_timely_useful_mbits multiplied by 1e6"
+        "sum of complete timely-delivery useful bits"
     ),
     "timely_useful_goodput_bps": (
         "timely_useful_bits / (evaluation_episode_count * episode_seconds)"
@@ -416,7 +429,19 @@ def _completed_summary(point, result):
         if row["metric"] == "violation_probability"
         and row["task_type"] == "ALL"
     )
-    timely_bits = float(energy["numerator"]) * 1e6
+    all_bits = float(energy["numerator"]) * 1e6
+    has_complete_delivery_fields = all(
+        row.get("total_timely_useful_bits") not in (None, "")
+        and row.get("total_late_useful_bits") not in (None, "")
+        for row in rows
+    )
+    if has_complete_delivery_fields:
+        timely_bits = sum(float(row["total_timely_useful_bits"]) for row in rows)
+        late_bits = sum(float(row["total_late_useful_bits"]) for row in rows)
+    else:
+        # Pre-policy artifacts used the canonical EE numerator for timely bits.
+        timely_bits = all_bits
+        late_bits = 0.0
     mobility_joules = float(energy["denominator"])
     horizon_seconds = (
         point["evaluation_episode_count"] * point["episode_seconds"]
@@ -432,6 +457,11 @@ def _completed_summary(point, result):
             for field in TRAINING_CHECKPOINT_EVALUATION_FIELDS
         },
         "energy_efficiency_bit_per_joule": float(energy["value"]) * 1e6,
+        "timely_energy_efficiency_bit_per_joule": (
+            timely_bits / mobility_joules if mobility_joules > 0.0 else None
+        ),
+        "all_useful_bits": all_bits,
+        "late_useful_bits": late_bits,
         "timely_useful_bits": timely_bits,
         "timely_useful_goodput_bps": timely_bits / horizon_seconds,
         "propulsion_energy_j": mobility_joules,
@@ -454,6 +484,14 @@ def _metadata(plan, point_statuses, *, status, failure=None):
     return {
         **public,
         "status": status,
+        "formal_evaluation": True,
+        "packet_deadline_policy": PACKET_DEADLINE_POLICY_CONTINUE,
+        "primary_energy_efficiency_definition": (
+            "(timely useful bits + late complete useful bits) / UAV movement energy"
+        ),
+        "timely_energy_efficiency_definition": (
+            "timely useful bits / UAV movement energy"
+        ),
         "completed_point_count": sum(
             value == "COMPLETED" for value in point_statuses
         ),
