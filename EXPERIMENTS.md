@@ -254,7 +254,10 @@ Relay diagnostics artifact.
   overlap ratio as `capture_coverage_ratio`, clipped to `[0,1]`. The full physical
   `size_bits` remains the queue, service, and partial-hop load.
   Timely FOV useful bits are `size_bits * capture_coverage_ratio`; timely COM
-  useful bits are the full `size_bits`; late packets contribute zero useful bits
+  useful bits are the full `size_bits`. Training still drops unfinished packets
+  at the target delay. Formal evaluation instead allows unchanged service after
+  the target delay and counts a late complete delivery only in the all-delivery
+  useful-bit numerator
 - Search coverage is sampled and committed at every 0.25-second routing
   subslot. Search, COM-only, and Hovering UAVs are nadir Search coverage
   contributors; FOV and FOV+COM UAVs use the VS camera and contribute no Search
@@ -823,7 +826,7 @@ schema, valid/missing seed counts, and CI provenance. The paper path consumes
 only these canonical rows.
 
 Generic `cross_seed_summary.csv` and `.json` use the independent
-`uav-hrl-generic-cross-seed-aggregate-v3` artifact schema. They combine the six
+`uav-hrl-generic-cross-seed-aggregate-v4` artifact schema. They combine the six
 `canonical_ratio` rows with 32 `descriptive_seed_mean` diagnostics. Descriptive
 statistics first take the episode arithmetic mean within each training seed,
 then give each valid seed equal weight with seed-level sample SD and Student-t
@@ -912,6 +915,19 @@ movement energy. Per-episode outputs also retain
 `timely` never include late delivery. FOV useful bits in both classes use the
 coverage snapshot frozen at packet capture, while partial final-hop traffic is
 excluded from both EE numerators.
+`routing_wait_seconds` records actual held-Wait time through the end of each
+routing slot, including time after the target delay under the formal continued-
+delivery policy. A late complete delivery increments the eligible delay-
+violation count once but does not increment `deadline_drops`.
+
+Per-episode rows and run metadata persist both `packet_deadline_policy` and
+`primary_energy_efficiency_definition_id`. Aggregation rejects unknown or mixed
+policy/EE identities and verifies, with floating-point tolerance, that complete
+useful bits equal timely plus late useful bits. Historical CSVs without the new
+complete-delivery columns remain identified as deadline-drop/timely-EE data;
+compatibility backfills do not relabel them. Current paper plotting accepts only
+the v6 continued-delivery/complete-EE format. Historical v5 paper results must
+be redrawn with the corresponding legacy plotting code.
 
 The canonical evaluation suites are `training_ee_vs_episode`,
 `uav_trajectory_snapshots`, `task_type_delay_vs_arrival_rate`,
@@ -1138,8 +1154,10 @@ deadline is swept. Across seeds, valid seed ratios are equally weighted with a
 Student-t interval. A delay with no
 delivered packets, or violation probability with no eligible packets, is
 `null` with `missing=true`. EE
-comparison points use each seed's summed timely useful Mbit divided by summed mobility
-joules, followed by the same equal-weight cross-seed rule.
+comparison points use each seed's summed complete useful Mbit (timely plus late
+complete delivery) divided by summed mobility joules, followed by the same
+equal-weight cross-seed rule. Timely EE remains available separately in the
+per-episode and seed-summary artifacts.
 
 Every non-trajectory point retains the following six canonical aggregate rows,
 keyed by `(method_id, point_id, metric, task_type)`:

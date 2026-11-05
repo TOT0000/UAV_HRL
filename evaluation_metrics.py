@@ -31,8 +31,14 @@ from scenario_manifest import (
 from training_checkpoint import inspect_model_checkpoint
 from evaluation_aggregation import (
     CANONICAL_METRICS,
+    COMPLETE_EE_DEFINITION,
+    CONTINUED_PACKET_DEADLINE_POLICY,
     EVALUATION_AGGREGATION_SCHEMA_VERSION,
+    EVALUATION_SEMANTIC_FIELDS,
+    LEGACY_PACKET_DEADLINE_POLICY,
+    TIMELY_EE_DEFINITION,
     canonical_aggregation,
+    resolve_episode_evaluation_semantics,
 )
 
 
@@ -45,6 +51,7 @@ IDENTITY_COLUMNS = (
     "training_manifest_hash",
     "checkpoint_completed_episodes",
     "checkpoint_metadata_fingerprint",
+    *EVALUATION_SEMANTIC_FIELDS,
 )
 
 METRIC_COLUMNS = (
@@ -279,6 +286,7 @@ SEED_SUMMARY_IDENTITY_COLUMNS = (
     "training_seed",
     "checkpoint_completed_episodes",
     "checkpoint_metadata_fingerprint",
+    *EVALUATION_SEMANTIC_FIELDS,
     "evaluation_episode_count",
 )
 
@@ -348,6 +356,8 @@ def _optional_text(value):
 
 
 def summarize_training_seeds(episode_rows):
+    episode_rows = list(episode_rows)
+    resolve_episode_evaluation_semantics(episode_rows)
     grouped = {}
     for row in episode_rows:
         key = (
@@ -358,6 +368,8 @@ def summarize_training_seeds(episode_rows):
             int(row["training_seed"]),
             _optional_int(row["checkpoint_completed_episodes"]),
             _optional_text(row["checkpoint_metadata_fingerprint"]),
+            str(row["packet_deadline_policy"]),
+            str(row["primary_energy_efficiency_definition_id"]),
         )
         grouped.setdefault(key, []).append(row)
 
@@ -371,6 +383,8 @@ def summarize_training_seeds(episode_rows):
             training_seed,
             checkpoint_completed_episodes,
             checkpoint_metadata_fingerprint,
+            packet_deadline_policy,
+            primary_energy_efficiency_definition_id,
         ) = key
         summary = {
             "method_id": method_id,
@@ -380,6 +394,10 @@ def summarize_training_seeds(episode_rows):
             "training_seed": training_seed,
             "checkpoint_completed_episodes": checkpoint_completed_episodes,
             "checkpoint_metadata_fingerprint": checkpoint_metadata_fingerprint,
+            "packet_deadline_policy": packet_deadline_policy,
+            "primary_energy_efficiency_definition_id": (
+                primary_energy_efficiency_definition_id
+            ),
             "evaluation_episode_count": len(rows),
         }
         for metric in METRIC_COLUMNS:
@@ -702,6 +720,7 @@ def validate_formal_aggregation_rows(
         "formal_checkpoint_episode"
     ],
 ):
+    resolve_episode_evaluation_semantics(episode_rows)
     if int(expected_seed_count) <= 0 or int(expected_episodes_per_seed) <= 0:
         raise ValueError("expected seed and episode counts must be positive")
     missing = [
@@ -822,6 +841,27 @@ def write_evaluation_outputs(
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     run_metadata = dict(run_metadata)
+    episode_rows = [dict(row) for row in episode_rows]
+    packet_policy, ee_definition = resolve_episode_evaluation_semantics(
+        episode_rows
+    )
+    metadata_policy = run_metadata.get("packet_deadline_policy")
+    metadata_ee = run_metadata.get("primary_energy_efficiency_definition_id")
+    if metadata_policy not in (None, "", packet_policy):
+        raise ValueError(
+            "run metadata packet policy conflicts with episode rows: "
+            f"metadata={metadata_policy!r}, rows={packet_policy!r}"
+        )
+    if metadata_ee not in (None, "", ee_definition):
+        raise ValueError(
+            "run metadata primary EE definition conflicts with episode rows: "
+            f"metadata={metadata_ee!r}, rows={ee_definition!r}"
+        )
+    run_metadata["packet_deadline_policy"] = packet_policy
+    run_metadata["primary_energy_efficiency_definition_id"] = ee_definition
+    run_metadata["evaluation_aggregation_schema_version"] = (
+        EVALUATION_AGGREGATION_SCHEMA_VERSION
+    )
     episode_fields = (*EPISODE_COLUMNS, *tuple(episode_context_columns))
     if len(episode_fields) != len(set(episode_fields)):
         raise ValueError("episode output columns must be unique")
@@ -893,9 +933,86 @@ def write_evaluation_outputs(
 def _read_episode_csvs(input_dir):
     rows = []
     for path in sorted(Path(input_dir).glob("**/per_episode.csv")):
+        metadata_path = path.parent / "run_metadata.json"
+        metadata = {}
+        if metadata_path.is_file():
+            try:
+                metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as exc:
+                raise ValueError(
+                    f"{metadata_path}: cannot read evaluation run metadata"
+                ) from exc
+        metadata_policy = metadata.get("packet_deadline_policy")
+        metadata_ee = metadata.get("primary_energy_efficiency_definition_id")
+        if metadata_ee in (None, ""):
+            prose = metadata.get("primary_energy_efficiency_definition")
+            if prose == "(timely useful bits + late complete useful bits) / UAV movement energy":
+                metadata_ee = COMPLETE_EE_DEFINITION
+            elif prose == "timely useful bits / UAV movement energy":
+                metadata_ee = TIMELY_EE_DEFINITION
         with path.open("r", encoding="utf-8", newline="") as handle:
-            for row in csv.DictReader(handle):
-                if "total_late_useful_mbits" not in row:
+            reader = csv.DictReader(handle)
+            fieldnames = set(reader.fieldnames or ())
+            has_complete_columns = set(
+                (
+                    "total_late_useful_mbits",
+                    "total_all_useful_mbits",
+                    "total_late_useful_bits",
+                    "total_all_useful_bits",
+                )
+            ).issubset(fieldnames)
+            has_any_complete_column = bool(
+                fieldnames.intersection(
+                    {
+                        "total_late_useful_mbits",
+                        "total_all_useful_mbits",
+                        "total_late_useful_bits",
+                        "total_all_useful_bits",
+                    }
+                )
+            )
+            for row in reader:
+                row["_source_path"] = str(path.resolve())
+                csv_policy = row.get("packet_deadline_policy")
+                csv_ee = row.get("primary_energy_efficiency_definition_id")
+                if (
+                    csv_policy not in (None, "")
+                    and metadata_policy not in (None, "")
+                    and csv_policy != metadata_policy
+                ):
+                    raise ValueError(
+                        f"{path}: per-episode packet policy conflicts with "
+                        f"{metadata_path}: csv={csv_policy!r}, "
+                        f"metadata={metadata_policy!r}"
+                    )
+                if (
+                    csv_ee not in (None, "")
+                    and metadata_ee not in (None, "")
+                    and csv_ee != metadata_ee
+                ):
+                    raise ValueError(
+                        f"{path}: per-episode EE definition conflicts with "
+                        f"{metadata_path}: csv={csv_ee!r}, metadata={metadata_ee!r}"
+                    )
+                row_policy = csv_policy or metadata_policy
+                row_ee = (
+                    csv_ee or metadata_ee
+                )
+                if row_policy in (None, "") and row_ee in (None, ""):
+                    if has_complete_columns:
+                        row_policy = CONTINUED_PACKET_DEADLINE_POLICY
+                        row_ee = COMPLETE_EE_DEFINITION
+                    elif not has_any_complete_column:
+                        row_policy = LEGACY_PACKET_DEADLINE_POLICY
+                        row_ee = TIMELY_EE_DEFINITION
+                    else:
+                        raise ValueError(
+                            f"{path}: evaluation packet policy cannot be identified "
+                            "from partial complete-useful columns"
+                        )
+                row["packet_deadline_policy"] = row_policy
+                row["primary_energy_efficiency_definition_id"] = row_ee
+                if row_policy == LEGACY_PACKET_DEADLINE_POLICY:
                     row.update(
                         {
                             "total_late_useful_mbits": 0.0,
@@ -923,6 +1040,7 @@ def _read_episode_csvs(input_dir):
         raise FileNotFoundError(
             f"no per_episode.csv files found under {Path(input_dir)}"
         )
+    resolve_episode_evaluation_semantics(rows)
     return rows
 
 

@@ -235,6 +235,15 @@ class CanonicalArtifactSourceContractTest(unittest.TestCase):
         }
         for metric in METRIC_COLUMNS:
             row.setdefault(metric, 0.0)
+        row.update(
+            {
+                "total_late_useful_mbits": 0.0,
+                "total_all_useful_mbits": float(eligible),
+                "total_timely_useful_bits": float(eligible) * 1e6,
+                "total_late_useful_bits": 0.0,
+                "total_all_useful_bits": float(eligible) * 1e6,
+            }
+        )
         return row
 
     def test_generic_and_paper_serialize_the_same_canonical_statistics(self):
@@ -302,6 +311,14 @@ class CanonicalArtifactSourceContractTest(unittest.TestCase):
         for index, row in enumerate(rows, start=1):
             for metric in DESCRIPTIVE_EPISODE_METRIC_COLUMNS:
                 row[metric] = float(index)
+            row["total_all_useful_mbits"] = (
+                row["total_timely_useful_mbits"]
+                + row["total_late_useful_mbits"]
+            )
+            row["total_all_useful_bits"] = (
+                row["total_timely_useful_bits"]
+                + row["total_late_useful_bits"]
+            )
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             input_dir = root / "input" / "seed-results"
@@ -349,7 +366,7 @@ class CanonicalArtifactSourceContractTest(unittest.TestCase):
         self.assertEqual(len(csv_rows), expected_rows)
         self.assertEqual(
             aggregation_metadata["generic_cross_seed_artifact_schema_version"],
-            "uav-hrl-generic-cross-seed-aggregate-v3",
+            "uav-hrl-generic-cross-seed-aggregate-v4",
         )
         kind_counts = {
             kind: sum(row["aggregation_kind"] == kind for row in generic_rows)

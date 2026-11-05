@@ -60,6 +60,11 @@ def _canonical_row(*, useful_mbits, energy_j, seed=1):
         "training_seed": seed,
         "timely_goodput_mbits": useful_mbits,
         "total_timely_useful_mbits": useful_mbits,
+        "total_late_useful_mbits": 0.0,
+        "total_all_useful_mbits": useful_mbits,
+        "total_timely_useful_bits": useful_mbits * 1e6,
+        "total_late_useful_bits": 0.0,
+        "total_all_useful_bits": useful_mbits * 1e6,
         "total_mobility_energy_j": energy_j,
     }
     for task in ("fov", "com"):

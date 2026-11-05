@@ -1475,7 +1475,7 @@ class PacketEngine:
             )
         return ordered
 
-    def _count_violation(self, pkt):
+    def _count_violation(self, pkt, *, dropped=True):
         if not bool(pkt.get("qos_eligible", False)):
             raise AssertionError("non-QoS packet cannot count as a violation")
         if pkt.get("violation_counted", False):
@@ -1483,7 +1483,8 @@ class PacketEngine:
         pkt["violation_counted"] = True
         task_type = self._task_norm(pkt.get("task_type", "COM"))
         self.total_violated += 1
-        self.deadline_drops += 1
+        if dropped:
+            self.deadline_drops += 1
         if task_type == "FOV":
             self.fov_violated += 1
         else:
@@ -1502,7 +1503,7 @@ class PacketEngine:
         remove_from_queue=True,
         reason="deadline",
     ):
-        if not self._count_violation(pkt):
+        if not self._count_violation(pkt, dropped=(reason != "late_delivered")):
             return None
         task_type = self._task_norm(pkt.get("task_type", "COM"))
         fallback_owner = pkt.get("current", -1) if sender is None else sender
@@ -3030,9 +3031,13 @@ class PacketEngine:
                     env=env,
                     effective_mask=effective_masks.get(sender),
                     wait_seconds=max(
-                        min(
-                            slot_end,
-                            float(pkt.get("deadline_abs", slot_end)),
+                        (
+                            slot_end
+                            if self.allow_late_delivery
+                            else min(
+                                slot_end,
+                                float(pkt.get("deadline_abs", slot_end)),
+                            )
                         )
                         - float(event_clock[0]),
                         0.0,

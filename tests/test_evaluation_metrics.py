@@ -1,3 +1,4 @@
+import csv
 import json
 import math
 import tempfile
@@ -6,12 +7,19 @@ from pathlib import Path
 
 from evaluation_metrics import (
     METRIC_COLUMNS,
+    _read_episode_csvs,
     canonical_cross_seed_artifact_rows,
     safe_energy_efficiency,
     summarize_training_seeds,
     write_evaluation_outputs,
 )
 from evaluation_aggregation import canonical_aggregation
+from evaluation_aggregation import (
+    COMPLETE_EE_DEFINITION,
+    CONTINUED_PACKET_DEADLINE_POLICY,
+    LEGACY_PACKET_DEADLINE_POLICY,
+    TIMELY_EE_DEFINITION,
+)
 from experiment_config import MethodSpec
 from HRL_task_aware import TrainingConfig, train
 from Packet_scheduler_v1 import (
@@ -33,6 +41,18 @@ class EvaluationMetricTest(unittest.TestCase):
             "checkpoint_metadata_fingerprint": f"checkpoint-{training_seed}",
         }
         row.update({metric: float(value) for metric in METRIC_COLUMNS})
+        row.update(
+            {
+                "packet_deadline_policy": CONTINUED_PACKET_DEADLINE_POLICY,
+                "primary_energy_efficiency_definition_id": COMPLETE_EE_DEFINITION,
+                "total_timely_useful_mbits": float(value),
+                "total_late_useful_mbits": 0.0,
+                "total_all_useful_mbits": float(value),
+                "total_timely_useful_bits": float(value) * 1e6,
+                "total_late_useful_bits": 0.0,
+                "total_all_useful_bits": float(value) * 1e6,
+            }
+        )
         # Canonical EE is computed from raw per-seed numerator/denominator sums.
         row["timely_goodput_mbits"] = float(value)
         row["total_mobility_energy_j"] = 1.0
@@ -105,6 +125,9 @@ class EvaluationMetricTest(unittest.TestCase):
         row["timely_goodput_mbits"] = 1.0
         row["total_late_useful_mbits"] = 2.0
         row["total_all_useful_mbits"] = 3.0
+        row["total_timely_useful_bits"] = 1e6
+        row["total_late_useful_bits"] = 2e6
+        row["total_all_useful_bits"] = 3e6
         row["total_mobility_energy_j"] = 2.0
 
         per_seed, cross_seed = canonical_aggregation([row])
@@ -126,8 +149,12 @@ class EvaluationMetricTest(unittest.TestCase):
         for field in (
             "total_late_useful_mbits",
             "total_all_useful_mbits",
+            "total_late_useful_bits",
+            "total_all_useful_bits",
         ):
             row.pop(field)
+        row["packet_deadline_policy"] = LEGACY_PACKET_DEADLINE_POLICY
+        row["primary_energy_efficiency_definition_id"] = TIMELY_EE_DEFINITION
         per_seed, _cross_seed = canonical_aggregation([row])
         energy = next(
             item
@@ -135,6 +162,103 @@ class EvaluationMetricTest(unittest.TestCase):
             if item["metric"] == "energy_efficiency_mbit_per_j"
         )
         self.assertEqual(energy["numerator"], 2.0)
+
+    def test_mixed_old_and_new_evaluation_policies_are_rejected_with_paths(self):
+        current = self._row(11, "current", 2.0)
+        current["_source_path"] = "new/per_episode.csv"
+        legacy = self._row(12, "legacy", 2.0)
+        legacy["packet_deadline_policy"] = LEGACY_PACKET_DEADLINE_POLICY
+        legacy["primary_energy_efficiency_definition_id"] = TIMELY_EE_DEFINITION
+        legacy["_source_path"] = "old/per_episode.csv"
+
+        with self.assertRaisesRegex(
+            ValueError, "mixed evaluation policies.*new/per_episode.csv.*old/per_episode.csv"
+        ):
+            canonical_aggregation([current, legacy])
+
+    def test_complete_useful_bit_conservation_is_required(self):
+        row = self._row(11, "bad", 1.0)
+        row["_source_path"] = "bad/per_episode.csv"
+        row["total_all_useful_bits"] = 2.0
+
+        with self.assertRaisesRegex(
+            ValueError, "bad/per_episode.csv.*complete useful bits is not conserved"
+        ):
+            canonical_aggregation([row])
+
+    def test_csv_reader_preserves_legacy_identity_and_rejects_mixed_paths(self):
+        current = self._row(11, "current", 2.0)
+        legacy = self._row(12, "legacy", 2.0)
+        for field in (
+            "packet_deadline_policy",
+            "primary_energy_efficiency_definition_id",
+            "total_late_useful_mbits",
+            "total_all_useful_mbits",
+            "total_late_useful_bits",
+            "total_all_useful_bits",
+        ):
+            legacy.pop(field)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            for name, row in (("old", legacy), ("new", current)):
+                directory = root / name
+                directory.mkdir()
+                with (directory / "per_episode.csv").open(
+                    "w", encoding="utf-8", newline=""
+                ) as handle:
+                    writer = csv.DictWriter(handle, fieldnames=tuple(row))
+                    writer.writeheader()
+                    writer.writerow(row)
+
+            old_rows = _read_episode_csvs(root / "old")
+            self.assertEqual(
+                old_rows[0]["packet_deadline_policy"],
+                LEGACY_PACKET_DEADLINE_POLICY,
+            )
+            old_ee = next(
+                item
+                for item in canonical_aggregation(old_rows)[0]
+                if item["metric"] == "energy_efficiency_mbit_per_j"
+            )
+            self.assertEqual(old_ee["numerator"], 2.0)
+
+            with self.assertRaisesRegex(
+                ValueError, "mixed evaluation policies.*new.*per_episode.csv.*old.*per_episode.csv|mixed evaluation policies.*old.*per_episode.csv.*new.*per_episode.csv"
+            ):
+                _read_episode_csvs(root)
+
+    def test_csv_reader_recognizes_pre_fix_current_metadata_without_ids(self):
+        row = self._row(11, "current", 2.0)
+        row.pop("packet_deadline_policy")
+        row.pop("primary_energy_efficiency_definition_id")
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            with (root / "per_episode.csv").open(
+                "w", encoding="utf-8", newline=""
+            ) as handle:
+                writer = csv.DictWriter(handle, fieldnames=tuple(row))
+                writer.writeheader()
+                writer.writerow(row)
+            (root / "run_metadata.json").write_text(
+                json.dumps(
+                    {
+                        "packet_deadline_policy": CONTINUED_PACKET_DEADLINE_POLICY,
+                        "primary_energy_efficiency_definition": (
+                            "(timely useful bits + late complete useful bits) / "
+                            "UAV movement energy"
+                        ),
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            loaded = _read_episode_csvs(root)
+
+        self.assertEqual(
+            loaded[0]["primary_energy_efficiency_definition_id"],
+            COMPLETE_EE_DEFINITION,
+        )
 
     def test_no_checkpoint_baseline_preserves_null_provenance(self):
         row = self._row(11, "a", 0.0)

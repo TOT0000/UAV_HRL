@@ -10,15 +10,17 @@ from pathlib import Path
 
 PACKET_OUTCOME_ARTIFACT_SCHEMA_VERSION = "uav-hrl-packet-outcomes-jsonl-v7"
 PACKET_ROUTING_DIAGNOSTIC_CONTRACT_VERSION = (
-    "uav-hrl-packet-routing-diagnostics-v5"
+    "uav-hrl-packet-routing-diagnostics-v6"
 )
 PACKET_ROUTING_DIAGNOSTIC_DEFINITIONS = {
     "routing_wait_definition": (
         "routing_decision_slot_count increments once when a routing-eligible "
         "packet becomes sender HOL and is affected by that slot's held action; "
         "routing_wait_slot_count increments when that decision selects receiver "
-        "== sender, and routing_wait_seconds adds only the actual remaining "
-        "time until packet deadline or slot end"
+        "== sender, and routing_wait_seconds adds the actual remaining time "
+        "until slot end; legacy deadline-drop execution stops at the target "
+        "delay, while continued-delivery formal evaluation also counts wait "
+        "time after the target delay"
     ),
     "routing_wait_decomposition_definition": (
         "voluntary Wait means selected receiver == sender while at least one "

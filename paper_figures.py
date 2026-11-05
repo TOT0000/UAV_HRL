@@ -745,24 +745,33 @@ def _validate_aggregate_layers(evaluation_dir, metadata, top_rows):
                 suite_contract_version=metadata.get(
                     "suite_aggregate_contract_version"
                 ),
+                source_path=aggregate_path,
             )
             episode_rows = _read_point_episode_rows(point, method_id=method_id)
-            recomputed = aggregate_paper_point_metrics(
-                method_id,
-                suite,
-                point,
-                episode_rows,
-                include_environment_size_metrics=(
-                    bool(metadata.get("suite_aggregate_contract_version"))
-                )
-                if suite == "environment_size"
-                else None,
-                environment_size_contract_version=(
-                    metadata.get("suite_aggregate_contract_version")
+            try:
+                recomputed = aggregate_paper_point_metrics(
+                    method_id,
+                    suite,
+                    point,
+                    episode_rows,
+                    include_environment_size_metrics=(
+                        bool(metadata.get("suite_aggregate_contract_version"))
+                    )
                     if suite == "environment_size"
-                    else None
-                ),
-            )
+                    else None,
+                    environment_size_contract_version=(
+                        metadata.get("suite_aggregate_contract_version")
+                        if suite == "environment_size"
+                        else None
+                    ),
+                )
+            except (KeyError, TypeError, ValueError) as exc:
+                raise ValueError(
+                    "point-level/per-episode mismatch: "
+                    f"method={method_id}, point={point_id}, "
+                    f"source={point.get('per_episode_jsonl') or point.get('output_directory')}: "
+                    f"{exc}"
+                ) from exc
             compare_aggregate_collections(
                 recomputed,
                 point_rows,

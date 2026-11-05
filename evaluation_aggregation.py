@@ -12,6 +12,21 @@ EVALUATION_AGGREGATION_SCHEMA_VERSION = (
     "canonical-complete-useful-goodput-service-only-v5"
 )
 
+LEGACY_PACKET_DEADLINE_POLICY = "drop_at_target_delay_v1"
+CONTINUED_PACKET_DEADLINE_POLICY = "continue_until_episode_end_v1"
+TIMELY_EE_DEFINITION = "timely_useful_bits_per_mobility_energy_v1"
+COMPLETE_EE_DEFINITION = "complete_useful_bits_per_mobility_energy_v1"
+EVALUATION_SEMANTIC_FIELDS = (
+    "packet_deadline_policy",
+    "primary_energy_efficiency_definition_id",
+)
+_COMPLETE_USEFUL_FIELDS = (
+    "total_late_useful_mbits",
+    "total_all_useful_mbits",
+    "total_late_useful_bits",
+    "total_all_useful_bits",
+)
+
 CANONICAL_METRICS = (
     ("energy_efficiency_mbit_per_j", None),
     ("average_e2e_delay_seconds", "FOV"),
@@ -41,6 +56,84 @@ def _row_count(row, key):
     return int(number)
 
 
+def _source_name(row):
+    return str(row.get("_source_path") or "<in-memory episode row>")
+
+
+def _inferred_semantics(row):
+    policy = row.get("packet_deadline_policy")
+    ee_definition = row.get("primary_energy_efficiency_definition_id")
+    present = [row.get(field) not in (None, "") for field in _COMPLETE_USEFUL_FIELDS]
+    if policy in (None, "") and ee_definition in (None, ""):
+        if all(present):
+            return CONTINUED_PACKET_DEADLINE_POLICY, COMPLETE_EE_DEFINITION
+        if not any(present):
+            return LEGACY_PACKET_DEADLINE_POLICY, TIMELY_EE_DEFINITION
+        raise ValueError(
+            f"{_source_name(row)}: evaluation packet policy cannot be identified; "
+            "complete-useful fields are only partially present"
+        )
+    if policy in (None, "") or ee_definition in (None, ""):
+        raise ValueError(
+            f"{_source_name(row)}: evaluation packet policy and primary EE "
+            "definition must both be identified"
+        )
+    return str(policy), str(ee_definition)
+
+
+def _validate_complete_useful_conservation(row):
+    source = _source_name(row)
+    missing = [field for field in _COMPLETE_USEFUL_FIELDS if row.get(field) in (None, "")]
+    if missing:
+        raise ValueError(
+            f"{source}: continued-delivery evaluation row is missing fields: {missing}"
+        )
+    for suffix, abs_tol in (("mbits", 1e-12), ("bits", 1e-6)):
+        timely = _row_number(row, f"total_timely_useful_{suffix}")
+        late = _row_number(row, f"total_late_useful_{suffix}")
+        complete = _row_number(row, f"total_all_useful_{suffix}")
+        if not math.isclose(
+            complete, timely + late, rel_tol=1e-9, abs_tol=abs_tol
+        ):
+            raise ValueError(
+                f"{source}: complete useful {suffix} is not conserved: "
+                f"all={complete}, timely={timely}, late={late}"
+            )
+
+
+def resolve_episode_evaluation_semantics(episode_rows):
+    """Validate and return the one packet-policy/EE identity in a batch."""
+
+    rows = list(episode_rows)
+    if not rows:
+        raise ValueError("evaluation aggregation requires at least one episode row")
+    identities = {}
+    for row in rows:
+        policy, ee_definition = _inferred_semantics(row)
+        expected = {
+            LEGACY_PACKET_DEADLINE_POLICY: TIMELY_EE_DEFINITION,
+            CONTINUED_PACKET_DEADLINE_POLICY: COMPLETE_EE_DEFINITION,
+        }.get(policy)
+        if expected is None or ee_definition != expected:
+            raise ValueError(
+                f"{_source_name(row)}: unsupported or inconsistent evaluation "
+                f"semantics: packet_policy={policy!r}, ee_definition={ee_definition!r}"
+            )
+        if policy == CONTINUED_PACKET_DEADLINE_POLICY:
+            _validate_complete_useful_conservation(row)
+        row["packet_deadline_policy"] = policy
+        row["primary_energy_efficiency_definition_id"] = ee_definition
+        identities.setdefault((policy, ee_definition), set()).add(_source_name(row))
+    if len(identities) != 1:
+        conflicts = "; ".join(
+            f"policy={policy}, ee_definition={definition}, "
+            f"paths={sorted(paths)}"
+            for (policy, definition), paths in sorted(identities.items())
+        )
+        raise ValueError(f"mixed evaluation policies cannot be aggregated: {conflicts}")
+    return next(iter(identities))
+
+
 def _ratio_row(metric, task_type, numerator, denominator, numerator_unit, denominator_unit, value_unit):
     numerator = float(numerator)
     denominator = float(denominator)
@@ -68,6 +161,8 @@ def _ratio_row(metric, task_type, numerator, denominator, numerator_unit, denomi
 def aggregate_episode_rows_by_seed(episode_rows, *, seed_field="training_seed"):
     """Compute one ratio-of-sums value per trained-policy seed."""
 
+    episode_rows = list(episode_rows)
+    packet_policy, ee_definition = resolve_episode_evaluation_semantics(episode_rows)
     grouped = {}
     for row in episode_rows:
         seed = int(row.get(seed_field, 0))
@@ -86,17 +181,10 @@ def aggregate_episode_rows_by_seed(episode_rows, *, seed_field="training_seed"):
                 raise ValueError(
                     "timely_goodput_mbits must alias total_timely_useful_mbits"
                 )
-            late = (
-                0.0
-                if row.get("total_late_useful_mbits") in (None, "")
-                else _row_number(row, "total_late_useful_mbits")
-            )
-            all_useful = (
-                useful
-                if row.get("total_all_useful_mbits") in (None, "")
-                else _row_number(row, "total_all_useful_mbits")
-            )
-            primary_useful += all_useful
+            if ee_definition == COMPLETE_EE_DEFINITION:
+                primary_useful += _row_number(row, "total_all_useful_mbits")
+            else:
+                primary_useful += useful
         energy = sum(_row_number(row, "total_mobility_energy_j") for row in rows)
         seed_rows = [
             _ratio_row(
@@ -151,6 +239,8 @@ def aggregate_episode_rows_by_seed(episode_rows, *, seed_field="training_seed"):
         for row in seed_rows:
             row["training_seed"] = seed
             row["evaluation_episode_count"] = len(rows)
+            row["packet_deadline_policy"] = packet_policy
+            row["primary_energy_efficiency_definition_id"] = ee_definition
         output.extend(seed_rows)
     return output
 

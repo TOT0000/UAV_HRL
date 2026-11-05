@@ -368,7 +368,49 @@ def test_formal_policy_allows_late_multihop_delivery_and_counts_one_violation():
     assert result["total_late_useful_bits"] == pytest.approx(100.0)
     assert result["total_all_useful_bits"] == pytest.approx(100.0)
     assert engine.total_violated == 1
+    assert engine.deadline_drops == 0
     assert engine.packet_metric_summary()["COM"]["violation_packets"] == 1
+
+
+def test_formal_policy_counts_two_full_wait_slots_before_late_delivery_once():
+    env = EventCapacityEnvironment(1)
+    engine = PacketEngine(
+        1,
+        step_time=0.25,
+        task_deadlines_seconds={"FOV": 0.015, "COM": 0.10},
+        packet_deadline_policy=PACKET_DEADLINE_POLICY_CONTINUE,
+        enable_packet_diagnostic_artifacts=True,
+    )
+    packet = engine.create_packet(0, "COM", 100.0, 0.0)
+    mask = np.asarray([True, True], dtype=bool)
+
+    for slot_start in (0.0, 0.25):
+        result = engine.serve_event_driven_slot(
+            env,
+            _actions(0),
+            slot_start,
+            observed_hol_by_sender={0: packet},
+            observed_backlog_bits_by_sender={0: packet["rem_bits"]},
+            effective_masks_by_sender={0: mask},
+        )
+        assert result["total_all_useful_bits"] == 0.0
+
+    result = engine.serve_event_driven_slot(
+        env,
+        _actions(env.GS_ID),
+        0.50,
+        observed_hol_by_sender={0: packet},
+        observed_backlog_bits_by_sender={0: packet["rem_bits"]},
+        effective_masks_by_sender={0: mask},
+    )
+
+    assert packet["terminal_outcome"] == "late_delivered"
+    assert packet["routing_wait_seconds"] == pytest.approx(0.50)
+    assert engine.total_violated == 1
+    assert engine.deadline_drops == 0
+    assert result["total_timely_useful_bits"] == 0.0
+    assert result["total_late_useful_bits"] == pytest.approx(100.0)
+    assert engine.total_all_useful_bits == pytest.approx(100.0)
 
 
 def test_formal_policy_partial_delivery_at_episode_end_adds_no_useful_bits():

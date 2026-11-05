@@ -44,7 +44,7 @@ class PaperPacketMetricTest(unittest.TestCase):
         self.assertAlmostEqual(summary["COM"]["average_e2e_delay_seconds"], 1.2)
         self.assertEqual(summary["COM"]["violation_probability"], 1.0)
         self.assertEqual(engine.total_violated, 4)
-        self.assertEqual(engine.deadline_drops, 4)
+        self.assertEqual(engine.deadline_drops, 3)
 
     def test_no_delivered_packet_is_missing_not_fake_zero(self):
         engine = PacketEngine(num_uav=16)

@@ -608,6 +608,12 @@ class CheckpointRoiBatchPlanTest(unittest.TestCase):
                 {
                     "num_GT": roi,
                     "timely_goodput_mbits": 1.0,
+                    "total_timely_useful_mbits": 1.0,
+                    "total_late_useful_mbits": 0.0,
+                    "total_all_useful_mbits": 1.0,
+                    "total_timely_useful_bits": 1e6,
+                    "total_late_useful_bits": 0.0,
+                    "total_all_useful_bits": 1e6,
                     "total_mobility_energy_j": 5.0,
                     "fov_delivered_packets": 0,
                     "fov_delivered_e2e_delay_sum_seconds": 0.0,

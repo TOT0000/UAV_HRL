@@ -5,9 +5,12 @@ from __future__ import annotations
 import math
 
 from evaluation_aggregation import (
+    COMPLETE_EE_DEFINITION,
+    CONTINUED_PACKET_DEADLINE_POLICY,
     EVALUATION_AGGREGATION_SCHEMA_VERSION,
     aggregate_seed_metric_rows,
     canonical_aggregation,
+    resolve_episode_evaluation_semantics,
 )
 
 
@@ -359,6 +362,20 @@ def aggregate_paper_point_metrics(
             f"paper evaluation point has no episode rows: method={method_id}, "
             f"point={point.get('point_id')}"
         )
+    packet_policy, ee_definition = resolve_episode_evaluation_semantics(rows)
+    if (
+        packet_policy != CONTINUED_PACKET_DEADLINE_POLICY
+        or ee_definition != COMPLETE_EE_DEFINITION
+    ):
+        sources = sorted(
+            {str(row.get("_source_path") or "<in-memory episode row>") for row in rows}
+        )
+        raise ValueError(
+            "current paper aggregation requires continued-delivery/complete-useful "
+            f"EE input; paths={sources}, packet_policy={packet_policy!r}, "
+            f"ee_definition={ee_definition!r}. Legacy deadline-drop/timely-EE "
+            "results must use the legacy v5 paper tool."
+        )
     if include_environment_size_metrics is None:
         include_environment_size_metrics = suite == "environment_size"
     include_environment_size_metrics = bool(include_environment_size_metrics)
@@ -368,6 +385,8 @@ def aggregate_paper_point_metrics(
         )
     common = {
         "aggregate_schema_version": PAPER_AGGREGATE_SCHEMA_VERSION,
+        "packet_deadline_policy": packet_policy,
+        "primary_energy_efficiency_definition_id": ee_definition,
         "semantic_suite": str(suite),
         "method_id": str(method_id),
         "point_id": str(point["point_id"]),
@@ -586,8 +605,23 @@ def validate_canonical_aggregate_rows(
     *,
     suite=None,
     suite_contract_version=None,
+    source_path=None,
 ):
     rows = list(rows)
+    advertised_schema_versions = {
+        str(row.get("aggregate_schema_version"))
+        for row in rows
+        if row.get("aggregate_schema_version") not in (None, "")
+    }
+    if advertised_schema_versions != {PAPER_AGGREGATE_SCHEMA_VERSION}:
+        source = str(source_path or "<in-memory aggregate rows>")
+        raise ValueError(
+            f"{source}: incompatible paper aggregate format: expected "
+            f"{PAPER_AGGREGATE_SCHEMA_VERSION!r}, found "
+            f"{sorted(advertised_schema_versions)!r}; legacy v5 results use the "
+            "timely-EE/deadline-drop policy and must be redrawn with the legacy "
+            "paper plotting tool"
+        )
     if suite is None:
         suites = {
             str(row.get("semantic_suite"))
@@ -635,13 +669,19 @@ def validate_canonical_aggregate_rows(
         metric = row.get("metric")
         task_type = row.get("task_type")
         identity = _identity(method_id, point_id, metric, task_type)
+        _require_value(str(method_id), row.get("method_id"), "method_id", identity)
         _require_value(
-            PAPER_AGGREGATE_SCHEMA_VERSION,
-            row.get("aggregate_schema_version"),
-            "aggregate_schema_version",
+            CONTINUED_PACKET_DEADLINE_POLICY,
+            row.get("packet_deadline_policy"),
+            "packet_deadline_policy",
             identity,
         )
-        _require_value(str(method_id), row.get("method_id"), "method_id", identity)
+        _require_value(
+            COMPLETE_EE_DEFINITION,
+            row.get("primary_energy_efficiency_definition_id"),
+            "primary_energy_efficiency_definition_id",
+            identity,
+        )
         _require_value(str(point_id), row.get("point_id"), "point_id", identity)
         pair = (metric, task_type)
         if pair not in expected_pairs:

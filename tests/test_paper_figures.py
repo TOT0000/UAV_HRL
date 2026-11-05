@@ -133,6 +133,12 @@ class PooledMetricTest(unittest.TestCase):
     def test_delay_and_violation_pool_counts_not_episode_averages(self):
         base = {
             "timely_goodput_mbits": 2.0,
+            "total_timely_useful_mbits": 2.0,
+            "total_late_useful_mbits": 0.0,
+            "total_all_useful_mbits": 2.0,
+            "total_timely_useful_bits": 2e6,
+            "total_late_useful_bits": 0.0,
+            "total_all_useful_bits": 2e6,
             "total_mobility_energy_j": 4.0,
             "fov_delivered_packets": 1,
             "fov_delivered_e2e_delay_sum_seconds": 1.0,
@@ -402,6 +408,12 @@ class SyntheticFigureBuildTest(unittest.TestCase):
                     "episode": episode + 1,
                     "training_seed": TRAINING_SEED,
                     "timely_goodput_mbits": 2.0 + point_index + method_offset / 10,
+                    "total_timely_useful_mbits": 2.0 + point_index + method_offset / 10,
+                    "total_late_useful_mbits": 0.0,
+                    "total_all_useful_mbits": 2.0 + point_index + method_offset / 10,
+                    "total_timely_useful_bits": (2.0 + point_index + method_offset / 10) * 1e6,
+                    "total_late_useful_bits": 0.0,
+                    "total_all_useful_bits": (2.0 + point_index + method_offset / 10) * 1e6,
                     "total_mobility_energy_j": 4.0 + episode,
                     "fov_delivered_packets": fov_delivered,
                     "fov_delivered_e2e_delay_sum_seconds": fov_delivered

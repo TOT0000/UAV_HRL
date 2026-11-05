@@ -51,6 +51,10 @@ from centralized_movement import (
 from com_capacity_calibration import load_com_capacity_reference
 from exploration_schedules import movement_behavior_noise
 from evaluation_metrics import safe_energy_efficiency
+from evaluation_aggregation import (
+    COMPLETE_EE_DEFINITION,
+    TIMELY_EE_DEFINITION,
+)
 from experiment_config import (
     COM_SESSION_LIFECYCLE_VERSION,
     COM_PACKET_SIZE_BITS,
@@ -4815,6 +4819,12 @@ def train(
                 "checkpoint_metadata_fingerprint": checkpoint_provenance.get(
                     "checkpoint_metadata_fingerprint"
                 ),
+                "packet_deadline_policy": packet_engine.packet_deadline_policy,
+                "primary_energy_efficiency_definition_id": (
+                    COMPLETE_EE_DEFINITION
+                    if formal_evaluation
+                    else TIMELY_EE_DEFINITION
+                ),
                 "num_GT": int(env.num_GT),
                 "timely_goodput_mbits": timely_goodput_mbits,
                 "total_timely_useful_mbits": total_timely_useful_bits / 1e6,
@@ -5456,8 +5466,8 @@ def train(
         )
         deadline_counter_consistent = (
             packet_engine.total_violated
-            == packet_engine.deadline_drops
             == packet_engine.fov_violated + packet_engine.com_violated
+            and 0 <= packet_engine.deadline_drops <= packet_engine.total_violated
         )
         if not backlog_invariant_passed:
             raise AssertionError("incremental backlog invariant failed")
@@ -5910,6 +5920,11 @@ def train(
                 "(timely useful bits + late complete useful bits) / UAV movement energy"
                 if formal_evaluation
                 else "timely useful bits / UAV movement energy"
+            ),
+            "primary_energy_efficiency_definition_id": (
+                COMPLETE_EE_DEFINITION
+                if formal_evaluation
+                else TIMELY_EE_DEFINITION
             ),
             "timely_energy_efficiency_definition": (
                 "timely useful bits / UAV movement energy"

@@ -17,6 +17,12 @@ class CanonicalPaperAggregateValidationTest(unittest.TestCase):
         return [
             {
                 "timely_goodput_mbits": 3.0,
+                "total_timely_useful_mbits": 3.0,
+                "total_late_useful_mbits": 0.0,
+                "total_all_useful_mbits": 3.0,
+                "total_timely_useful_bits": 3e6,
+                "total_late_useful_bits": 0.0,
+                "total_all_useful_bits": 3e6,
                 "total_mobility_energy_j": 6.0,
                 "fov_delivered_packets": fov_delivered,
                 "fov_delivered_e2e_delay_sum_seconds": 0.5 if fov_delivered else 0.0,
@@ -173,6 +179,21 @@ class CanonicalPaperAggregateValidationTest(unittest.TestCase):
         self.assertEqual(probabilities["FOV"], 0.0)
         self.assertEqual(probabilities["COM"], 1.0)
         self.assertEqual(probabilities["ALL"], 0.9)
+
+    def test_legacy_v5_rows_are_rejected_with_source_and_format_guidance(self):
+        rows = self._rows()
+        for row in rows:
+            row["aggregate_schema_version"] = "uav-hrl-paper-aggregate-v5"
+
+        with self.assertRaisesRegex(
+            ValueError, "old/results.json.*legacy v5.*legacy paper plotting tool"
+        ):
+            validate_canonical_aggregate_rows(
+                rows,
+                self.method,
+                self.point["point_id"],
+                source_path="old/results.json",
+            )
 
 
 if __name__ == "__main__":
