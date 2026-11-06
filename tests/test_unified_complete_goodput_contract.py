@@ -1,7 +1,16 @@
+import tempfile
+from pathlib import Path
+from unittest import mock
+
 import numpy as np
 import pytest
 
-from HRL_task_aware import _interval_reward, _movement_complete_useful_bits
+from HRL_task_aware import (
+    TrainingConfig,
+    _interval_reward,
+    _movement_complete_useful_bits,
+    train,
+)
 from experiment_config import METHOD_REGISTRY, MethodSpec, comparison_method_configuration
 from llm_explorer import (
     LLM_EXPLORER_CALL_SCHEDULE_VERSION,
@@ -168,3 +177,106 @@ def test_every_learning_method_disables_c10_but_keeps_diagnostics():
     assert reward["penalty_contract"]["C10"]["role"] == (
         "diagnostic_only_not_subtracted_from_movement_reward"
     )
+
+
+def _diagnostic_penalties():
+    return {
+        "c9_penalty_sum": 0.1,
+        "c9_penalty_mean": 0.1,
+        "c9_sample_count": 1,
+        "c10_penalty_sum": 0.9,
+        "c10_penalty_mean": 0.9,
+        "c10_sample_count": 1,
+        "com_range_penalty_sum": 0.2,
+        "com_range_penalty_mean": 0.2,
+        "com_range_sample_count": 1,
+        "c9_satisfied_pair_count": 0,
+        "c9_violated_pair_count": 1,
+        "c10_satisfied_pair_count": 0,
+        "c10_violated_pair_count": 1,
+        "com_in_range_pair_count": 0,
+        "com_out_of_range_pair_count": 1,
+    }
+
+
+def _complete_delivery_slot(
+    env,
+    packet_engine,
+    ddqn,
+    routing_buffer,
+    routing_masks,
+    current_time,
+    done,
+    delay_bound_steps,
+    violation_stats,
+    epsilon,
+    **kwargs,
+):
+    del (
+        ddqn,
+        routing_buffer,
+        routing_masks,
+        done,
+        delay_bound_steps,
+        violation_stats,
+        epsilon,
+        kwargs,
+    )
+    env.current_time = float(current_time)
+    packet_engine.com_timely_delivered_bits += 250_000.0
+    packet_engine.total_timely_useful_bits += 250_000.0
+    packet_engine.timely_goodput_bits += 250_000.0
+    packet_engine.com_late_delivered_bits += 500_000.0
+    packet_engine.total_late_useful_bits += 500_000.0
+    packet_engine.total_all_useful_bits += 750_000.0
+    # Only the timely quarter-Mbit contributes to the routing reward.
+    return 750_000.0, 25.0, 0, []
+
+
+@pytest.mark.parametrize("method_id", ["td3_dinkelbach", "ddpg_dinkelbach"])
+def test_normal_training_entry_replays_complete_goodput_and_keeps_c10_diagnostic(
+    method_id,
+):
+    with tempfile.TemporaryDirectory() as temp_dir:
+        checkpoint_root = Path(temp_dir) / "checkpoints"
+        config = TrainingConfig(
+            total_episodes=1,
+            mode="custom",
+            episode_seconds=1,
+            warmup_joint_transitions=10_000,
+            batch_size=1,
+            checkpoint_root=str(checkpoint_root),
+            full_resume_every=1,
+            enable_model_checkpoints=False,
+            enable_full_resume=True,
+            enable_plots=False,
+            enable_csv=False,
+            random_seed=20260817,
+        )
+        with mock.patch(
+            "HRL_task_aware._run_routing_slot",
+            side_effect=_complete_delivery_slot,
+        ), mock.patch(
+            "HRL_task_aware.movement_constraint_penalties",
+            side_effect=lambda env: _diagnostic_penalties(),
+        ):
+            result = train(
+                config,
+                method_spec=MethodSpec.parse(method_id),
+            )
+
+        assert result["joint_replay_size"] == 1
+        assert result["total_timely_useful_bits"] == pytest.approx(1_000_000.0)
+        assert result["total_late_useful_bits"] == pytest.approx(2_000_000.0)
+        assert result["total_all_useful_bits"] == pytest.approx(3_000_000.0)
+        episode = result["episode_metrics"][0]
+        assert episode["total_all_useful_bits"] / 1e6 == pytest.approx(3.0)
+        assert episode["c10_penalty_mean"] == pytest.approx(0.9)
+        assert episode["movement_base_reward_sum"] == pytest.approx(3.0)
+        assert episode["movement_final_reward_sum"] == pytest.approx(2.7)
+
+        with np.load(
+            checkpoint_root / "full" / "ep_0001" / "joint_replay.npz"
+        ) as replay:
+            assert float(replay["delivered_mbits"][0, 0]) == pytest.approx(3.0)
+            assert float(replay["c10_penalty"][0, 0]) == pytest.approx(0.9)

@@ -1253,8 +1253,8 @@ def _base_metadata(
     if reward_mode == "ratio":
         metadata["movement_objective"] = {
             "objective_unit": "bit_per_j",
-            "numerator": "episode timely useful bits",
-            "denominator": "episode mobility energy joules",
+            "numerator": "sum of episode complete useful bits",
+            "denominator": "sum of episode mobility energy joules",
             "semantics": "terminal-only ratio of sums",
         }
     if kind == "td3":

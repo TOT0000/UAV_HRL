@@ -69,8 +69,8 @@ def causal_trailing_average(values, window=50):
     return _causal_trailing_average(values, window=window)
 
 
-def paper_energy_efficiency(timely_goodput_mbits, mobility_energy_j):
-    return _paper_energy_efficiency(timely_goodput_mbits, mobility_energy_j)
+def paper_energy_efficiency(complete_goodput_mbits, mobility_energy_j):
+    return _paper_energy_efficiency(complete_goodput_mbits, mobility_energy_j)
 
 
 def normalize_episode_ee(method_id, history_rows, window=50):
@@ -1272,7 +1272,7 @@ def _build_training(spec, spec_path, output_dir, git_sha):
                 }
                 for method, run in runs.items()
             },
-            "metric_definition": "episode timely delivered Mbit * 1e6 / max(episode mobility J, 1e-12 J)",
+            "metric_definition": "episode timely plus late complete useful Mbit (total_all_useful_mbits) * 1e6 / max(episode mobility J, 1e-12 J)",
             "trailing_average_definition": "causal mean over max(1,e-49)..e",
             "git_sha": git_sha,
         },

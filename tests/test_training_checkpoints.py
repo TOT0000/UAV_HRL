@@ -34,6 +34,12 @@ from HRL_task_aware import (
     formal_training_config,
     parse_training_config,
 )
+from llm_explorer import (
+    DeterministicMockExplorerClient,
+    FirstGenLLMExplorerConfig,
+    LLMExplorerController,
+    environment_constants_and_definitions_first_gen,
+)
 from centralized_movement import JOINT_ACTION_DIM, MOVEMENT_STATE_DIM
 from td3 import TD3
 from routing_lifecycle import RoutingLearnerLifecycle
@@ -549,7 +555,13 @@ class FullResumeCheckpointTest(unittest.TestCase):
         self.assertIn("allowed_tolerance=0", str(raised.exception))
 
     def _preflight_checkpoint(
-        self, root, *, planned=1, completed=1, packet_state=None
+        self,
+        root,
+        *,
+        planned=1,
+        completed=1,
+        packet_state=None,
+        llm_explorer_state=None,
     ):
         td3, ddqn, joint, routing = self._components()
         calibration = {"seed": 77, "c_ref_com": 10.0}
@@ -578,6 +590,10 @@ class FullResumeCheckpointTest(unittest.TestCase):
         }
         if packet_state is not None:
             training_state["packet_engine_state"] = copy.deepcopy(packet_state)
+        if llm_explorer_state is not None:
+            training_state["llm_explorer_state"] = copy.deepcopy(
+                llm_explorer_state
+            )
         manifest = generate_manifest("train", 77, planned)
         manifest.save(Path(root) / "scenario_manifest.json")
         checkpoint_dir = Path(root) / "checkpoints" / "full" / f"ep_{completed:04d}"
@@ -615,6 +631,144 @@ class FullResumeCheckpointTest(unittest.TestCase):
             "manifest": manifest,
             "training_state": training_state,
         }
+
+    def test_ratio_checkpoint_metadata_uses_complete_useful_bits(self):
+        td3, ddqn, _, _ = self._components()
+        method = MethodSpec.parse("td3_ratio")
+        config = formal_training_config(1, random_seed=77)
+        formal_config = effective_training_config(config, method)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            checkpoint_dir = Path(temp_dir) / "models" / "ep_0001"
+            save_model_checkpoint(
+                checkpoint_dir,
+                episode=0,
+                td3=td3,
+                ddqn=ddqn,
+                movement_state_dim=MOVEMENT_STATE_DIM,
+                joint_action_dim=JOINT_ACTION_DIM,
+                routing_state_dim=ROUTING_STATE_DIM,
+                calibration={"seed": 77, "c_ref_com": 10.0},
+                routing_lifecycle_state=_empty_routing_lifecycle(),
+                experiment_metadata={
+                    "method_id": method.method_id,
+                    "method_spec": method.to_dict(),
+                    "training_seed": 77,
+                    "git_sha": "fixture-sha",
+                    "formal_config": formal_config,
+                },
+            )
+            metadata = json.loads(
+                (checkpoint_dir / "metadata.json").read_text(encoding="utf-8")
+            )
+        self.assertEqual(
+            metadata["movement_objective"],
+            {
+                "objective_unit": "bit_per_j",
+                "numerator": "sum of episode complete useful bits",
+                "denominator": "sum of episode mobility energy joules",
+                "semantics": "terminal-only ratio of sums",
+            },
+        )
+
+    def test_full_resume_preserves_llm_schedule_and_latest_feedback(self):
+        run_identity = {"method_id": "td3_dinkelbach_llm_explorer"}
+        explorer_config = FirstGenLLMExplorerConfig()
+        source = LLMExplorerController(
+            run_directory=None,
+            run_identity=run_identity,
+            config=explorer_config,
+            client=DeterministicMockExplorerClient(),
+        )
+        source.active_guidance = {
+            **source._unguided("checkpoint_fixture"),
+            "enabled": True,
+            "td3_bias": np.ones((16, 3), dtype=np.float32),
+            "routing_weights": np.ones((16, 17), dtype=np.float64),
+        }
+        source.complete_episode(
+            episode_index=500,
+            metrics={
+                "episode": 501,
+                "energy_efficiency_bit_per_j": 501.0,
+                "td3_original_cumulative_reward": 0.0,
+                "safe_ddqn_original_cumulative_reward": 0.0,
+            },
+        )
+
+        class RecordingMockClient(DeterministicMockExplorerClient):
+            def __init__(self):
+                self.calls = []
+
+            def chat(self, **kwargs):
+                self.calls.append(copy.deepcopy(kwargs))
+                return super().chat(**kwargs)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            fixture = self._preflight_checkpoint(
+                temp_dir,
+                planned=503,
+                completed=501,
+                llm_explorer_state=source.state_dict(),
+            )
+            td3, ddqn, joint, routing = self._components()
+            restored = load_full_resume_checkpoint(
+                fixture["checkpoint_dir"],
+                td3=td3,
+                ddqn=ddqn,
+                joint_replay=joint,
+                routing_replay=routing,
+                movement_state_dim=MOVEMENT_STATE_DIM,
+                joint_action_dim=JOINT_ACTION_DIM,
+                routing_state_dim=ROUTING_STATE_DIM,
+                calibration=fixture["calibration"],
+                expected_formal_config=fixture["formal_config"],
+                current_training_manifest=fixture["manifest"],
+            )
+
+            client = RecordingMockClient()
+            controller = LLMExplorerController(
+                run_directory=None,
+                run_identity=run_identity,
+                config=explorer_config,
+                client=client,
+            )
+            controller.load_state_dict(
+                restored["training_state"]["llm_explorer_state"]
+            )
+            environment = environment_constants_and_definitions_first_gen(
+                episode_seconds=60,
+                routing_slot_seconds=0.25,
+            )
+            common = {
+                "total_joint_transitions": 10_000,
+                "sigma_episode_start": 0.2,
+                "routing_epsilon": 0.5,
+                "current_observable_initial_state": {
+                    "known_rois": [],
+                    "uavs": [],
+                },
+                "environment_constants": environment,
+            }
+            skipped = controller.begin_episode(episode_index=501, **common)
+            self.assertEqual(skipped["td3_reason"], "schedule_skip")
+            self.assertEqual(np.count_nonzero(skipped["td3_bias"]), 0)
+            self.assertIsNone(skipped["routing_weights"])
+            self.assertEqual(client.calls, [])
+
+            controller.complete_episode(
+                episode_index=501,
+                metrics={
+                    "episode": 502,
+                    "energy_efficiency_bit_per_j": 50_250.5,
+                    "td3_original_cumulative_reward": 2.5,
+                    "safe_ddqn_original_cumulative_reward": 3.5,
+                },
+            )
+            guidance = controller.begin_episode(episode_index=502, **common)
+            self.assertTrue(guidance["enabled"])
+            self.assertFalse(guidance["td3_fallback"])
+            self.assertEqual(len(client.calls), 2)
+            self.assertIn("50250.5", client.calls[0]["prompt"])
 
     def test_large_roundoff_state_full_checkpoint_save_load_is_lossless(self):
         state = _large_roundoff_useful_goodput_training_state()

@@ -75,15 +75,44 @@ class EpisodeEnergyEfficiencyTest(unittest.TestCase):
         self.assertEqual(averaged[49], sum(range(1, 51)) / 50)
         self.assertEqual(averaged[50], sum(range(2, 52)) / 50)
 
-    def test_adapter_uses_episode_bits_and_energy_not_reward(self):
+    def test_adapter_uses_all_complete_bits_for_raw_smooth_and_export(self):
         rows = [
-            {"method_id": "td3_dinkelbach", "episode": 1, "reward": 999.0, "timely_goodput_mbits": 2.0, "mobility_energy_j": 4.0},
-            {"method_id": "td3_dinkelbach", "episode": 2, "reward": -999.0, "timely_goodput_mbits": 9.0, "mobility_energy_j": 3.0},
+            {
+                "method_id": "td3_dinkelbach",
+                "episode": 1,
+                "reward": 999.0,
+                "timely_goodput_mbits": 1.0,
+                "total_timely_useful_mbits": 1.0,
+                "total_late_useful_mbits": 2.0,
+                "total_all_useful_mbits": 3.0,
+                "mobility_energy_j": 100_000.0,
+            },
+            {
+                "method_id": "td3_dinkelbach",
+                "episode": 2,
+                "reward": -999.0,
+                "timely_goodput_mbits": 2.0,
+                "total_timely_useful_mbits": 2.0,
+                "total_late_useful_mbits": 2.0,
+                "total_all_useful_mbits": 4.0,
+                "mobility_energy_j": 100_000.0,
+            },
         ]
         normalized = normalize_episode_ee("td3_dinkelbach", rows)
         self.assertEqual(
             [row["raw_energy_efficiency_bit_per_j"] for row in normalized],
-            [500000.0, 3000000.0],
+            [30.0, 40.0],
+        )
+        self.assertEqual(
+            [
+                row["trailing_50_energy_efficiency_bit_per_j"]
+                for row in normalized
+            ],
+            [30.0, 35.0],
+        )
+        self.assertEqual(
+            [row["total_all_useful_mbits"] for row in normalized],
+            [3.0, 4.0],
         )
         self.assertNotIn("reward", normalized[0])
 
@@ -94,6 +123,22 @@ class EpisodeEnergyEfficiencyTest(unittest.TestCase):
             normalize_episode_ee(
                 "td3_dinkelbach",
                 [{"episode": 1, "timely_goodput_mbits": 1.0}],
+            )
+
+    def test_new_training_ee_refuses_to_fall_back_to_timely_delivery(self):
+        with self.assertRaisesRegex(
+            PaperFigureSpecError, "requires total_all_useful_mbits"
+        ):
+            normalize_episode_ee(
+                "td3_dinkelbach",
+                [
+                    {
+                        "episode": 1,
+                        "timely_goodput_mbits": 1.0,
+                        "total_timely_useful_mbits": 1.0,
+                        "mobility_energy_j": 100_000.0,
+                    }
+                ],
             )
 
 
@@ -384,6 +429,11 @@ class SyntheticFigureBuildTest(unittest.TestCase):
                     "episode": episode,
                     "reward": 1e9,
                     "timely_goodput_mbits": episode * (1.0 + len(method_id) / 100),
+                    "total_timely_useful_mbits": episode
+                    * (1.0 + len(method_id) / 100),
+                    "total_late_useful_mbits": episode * 0.5,
+                    "total_all_useful_mbits": episode
+                    * (1.5 + len(method_id) / 100),
                     "mobility_energy_j": 2.0,
                 }
                 for episode in range(1, 1501)
@@ -938,6 +988,31 @@ class SyntheticFigureBuildTest(unittest.TestCase):
             self.assertNotEqual(result["output_directory"], second["output_directory"])
             self.assertEqual(tuple(result["semantic_figures"]), tuple(FIGURE_REGISTRY))
             self.assertEqual(len(result["semantic_figures"]), 12)
+            training_output = Path(second["output_directory"])
+            training_stem = FIGURE_REGISTRY["training_ee_vs_episode"][
+                "output_stem"
+            ]
+            with (training_output / f"{training_stem}.csv").open(
+                encoding="utf-8", newline=""
+            ) as handle:
+                training_rows = list(csv.DictReader(handle))
+            first_training_row = training_rows[0]
+            self.assertAlmostEqual(
+                float(first_training_row["raw_energy_efficiency_bit_per_j"]),
+                float(first_training_row["total_all_useful_mbits"])
+                * 1e6
+                / float(first_training_row["mobility_energy_j"]),
+            )
+            training_resolved = json.loads(
+                (
+                    training_output
+                    / f"{training_stem}_resolved_spec.json"
+                ).read_text(encoding="utf-8")
+            )
+            self.assertIn(
+                "total_all_useful_mbits",
+                training_resolved["metric_definition"],
+            )
             output = Path(result["output_directory"])
             expected_titles = {
                 "task_assignment_ee_vs_number_of_rois": "Task-assignment strategies",

@@ -321,7 +321,7 @@ FIGURE_REGISTRY = MappingProxyType(
             "methods": PAPER_METHOD_MAPPINGS["training_ee_vs_episode"],
             "aggregation": "50-episode causal trailing mean",
             "intentional_changes": [
-                "reward is replaced with independent episode timely-bit/mobility-energy EE",
+                "reward is replaced with independent episode complete-useful-bit/mobility-energy EE",
                 "Drive hard-coded y arrays are never used",
             ],
         },

@@ -281,13 +281,13 @@ def causal_trailing_average(values, window=50):
     return result
 
 
-def paper_energy_efficiency(timely_goodput_mbits, mobility_energy_j):
-    """Production paper adapter: timely useful Mbit per mobility joule."""
+def paper_energy_efficiency(complete_goodput_mbits, mobility_energy_j):
+    """Production paper adapter: all complete useful Mbit per mobility joule."""
 
-    numerator = float(timely_goodput_mbits)
+    numerator = float(complete_goodput_mbits)
     denominator = float(mobility_energy_j)
     if not math.isfinite(numerator) or numerator < 0.0:
-        raise ValueError("timely useful goodput must be finite and non-negative")
+        raise ValueError("complete useful goodput must be finite and non-negative")
     if not math.isfinite(denominator) or denominator < 0.0:
         raise ValueError("mobility energy must be finite and non-negative")
     value = numerator / max(denominator, PAPER_EE_EPSILON_J)
@@ -307,22 +307,36 @@ def normalize_episode_ee(method_id, history_rows, window=50):
     for row in ordered:
         try:
             timely_mbits = row["timely_goodput_mbits"]
+            all_complete_mbits = row["total_all_useful_mbits"]
             mobility_joules = row["mobility_energy_j"]
         except KeyError as exc:
             raise ValueError(
-                f"{method_id} training history lacks production EE inputs"
+                f"{method_id} training history lacks production EE input "
+                f"{exc.args[0]!r}; new training EE requires "
+                "total_all_useful_mbits and never falls back to timely delivery"
             ) from exc
-        useful_mbits = row.get("total_timely_useful_mbits", timely_mbits)
+        timely_useful_mbits = row.get("total_timely_useful_mbits", timely_mbits)
         if not math.isclose(
             float(timely_mbits),
-            float(useful_mbits),
+            float(timely_useful_mbits),
             rel_tol=0.0,
             abs_tol=1e-12,
         ):
             raise ValueError(
-                f"{method_id} timely-goodput alias differs from useful numerator"
+                f"{method_id} timely-goodput alias differs from timely useful diagnostic"
             )
-        raw_mbit.append(paper_energy_efficiency(useful_mbits, mobility_joules))
+        if "total_late_useful_mbits" in row and not math.isclose(
+            float(all_complete_mbits),
+            float(timely_useful_mbits) + float(row["total_late_useful_mbits"]),
+            rel_tol=1e-12,
+            abs_tol=1e-12,
+        ):
+            raise ValueError(
+                f"{method_id} complete useful Mbit differs from timely plus late"
+            )
+        raw_mbit.append(
+            paper_energy_efficiency(all_complete_mbits, mobility_joules)
+        )
     raw_bits = [value * 1e6 for value in raw_mbit]
     averaged = causal_trailing_average(raw_bits, window=window)
     return [
@@ -335,6 +349,16 @@ def normalize_episode_ee(method_id, history_rows, window=50):
                     "total_timely_useful_mbits", source["timely_goodput_mbits"]
                 )
             ),
+            **(
+                {
+                    "total_late_useful_mbits": float(
+                        source["total_late_useful_mbits"]
+                    )
+                }
+                if "total_late_useful_mbits" in source
+                else {}
+            ),
+            "total_all_useful_mbits": float(source["total_all_useful_mbits"]),
             "mobility_energy_j": float(source["mobility_energy_j"]),
             "raw_energy_efficiency_bit_per_j": raw_value,
             "trailing_50_energy_efficiency_bit_per_j": average,
