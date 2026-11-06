@@ -70,7 +70,7 @@ class DinkelbachBlockUpdateTest(unittest.TestCase):
         self.assertFalse(first["dinkelbach_lambda_updated"])
         self.assertEqual(second["dinkelbach_lambda_after_episode"], 1.0)
         self.assertNotEqual(second["dinkelbach_lambda_after_episode"], 5.0)
-        self.assertEqual(second["dinkelbach_block_timely_mbits_so_far"], 10.0)
+        self.assertEqual(second["dinkelbach_block_complete_mbits_so_far"], 10.0)
         self.assertEqual(second["dinkelbach_block_energy_joules_so_far"], 10.0)
 
     def test_invalid_energy_never_produces_non_finite_lambda(self):
@@ -111,7 +111,7 @@ class DinkelbachBlockUpdateTest(unittest.TestCase):
         self.assertEqual(state.update_count, 1)
         self.assertEqual(state.block_index, 2)
         self.assertEqual(state.block_completed_episodes, 25)
-        self.assertEqual(state.block_timely_delivered_mbits, 25.0)
+        self.assertEqual(state.block_complete_delivered_mbits, 25.0)
         self.assertEqual(state.block_mobility_energy_joules, 50.0)
 
 

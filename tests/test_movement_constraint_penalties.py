@@ -141,7 +141,7 @@ class MovementConstraintPenaltyTest(unittest.TestCase):
             5.0, 2.0, 1.0, penalties,
             reward_mode="dinkelbach", task_potential_enabled=False,
         )
-        self.assertAlmostEqual(enabled, 2.4)
+        self.assertAlmostEqual(enabled, 2.6)
         self.assertAlmostEqual(disabled, 3.0)
 
     def test_all_methods_publish_fixed_penalty_weights(self):

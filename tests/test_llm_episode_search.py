@@ -204,7 +204,7 @@ def test_lambda_can_be_explicit_or_derived_from_last_100_used_values(tmp_path):
                 dinkelbach_update_status="fixture",
                 dinkelbach_block_index=1,
                 dinkelbach_block_episode=episode,
-                dinkelbach_block_timely_mbits_so_far=0.0,
+                dinkelbach_block_complete_mbits_so_far=0.0,
                 dinkelbach_block_energy_joules_so_far=float(episode),
             )
         )

@@ -112,7 +112,7 @@ class CentralizedDDPG:
         beta_com=TASK_POTENTIAL_BETA_COM,
         reward_mode="dinkelbach",
         task_potential_enabled=True,
-        c10_penalty_enabled=True,
+        c10_penalty_enabled=False,
     ):
         (
             state,

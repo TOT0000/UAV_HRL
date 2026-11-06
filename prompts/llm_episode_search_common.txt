@@ -43,9 +43,9 @@ Moving a packet to another UAV does not restart its deadline.
 
 The primary objective is episode energy efficiency:
 
-EE = sum_t B_timely,t / sum_t E_movement,t
+EE = sum_t B_complete,t / sum_t E_movement,t
 
-B_timely,t is useful data delivered to the GS within its deadline. E_movement,t is movement energy of all UAVs. Acquisition and intermediate forwarding contribute to the task when the data subsequently reaches the GS on time.
+B_complete,t is useful data completely delivered to the GS, whether timely or late. E_movement,t is movement energy of all UAVs. Late complete delivery remains a deadline violation; partial or unfinished data contributes zero.
 
 The system also tracks end-to-end deadline violations. Interpret these together with useful delivery volume and energy use.
 
@@ -65,7 +65,7 @@ Sensing geometry determines whether the UAV position, altitude, and camera footp
 
 {{VISUAL_SENSING_SPEC}}
 
-VS packets are generated when capture is valid and must subsequently reach the GS within their deadline.
+VS packets are generated when capture is valid. Reaching the GS within the deadline is timely; late packets remain queued and may still complete before episode end.
 
 Communication:
 For communication nodes a and b,
@@ -104,7 +104,7 @@ s_aug = concat(s_original, f)
 r_extra = sum_k w_k * f_k
 r_total = r_base + beta * r_extra
 
-r_base = B_timely_Mbit - lambda * E_movement_J - P_C9 - P_C10 - P_COM
+r_base = B_complete_Mbit - lambda * E_movement_J - P_C9 - P_COM
 
 {{BASE_REWARD_SPEC}}
 
@@ -128,7 +128,7 @@ Each candidate contains candidate_id, design_summary, features (name, descriptio
 
 The host first checks execution and numeric validity. For each complete recorded episode i:
 
-EE_i = sum_t B_timely_i,t / sum_t E_movement_i,t
+EE_i = sum_t B_complete_i,t / sum_t E_movement_i,t
 G_i = sum_t r_total_i,t
 
 G_i is undiscounted. The pre-training score measures whether higher-EE episodes receive higher G_i.

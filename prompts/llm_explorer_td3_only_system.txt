@@ -8,11 +8,11 @@ Task allocation, original rewards, network updates, safety costs, and action-val
 
 Objective:
 
-Increase useful data delivered to the ground station before its deadline per joule of movement energy.
+Increase useful data completely delivered to the ground station, timely or late, per joule of movement energy. Late delivery remains a deadline violation.
 
-Consider timely delivery and movement energy together. Lower energy with substantially lower timely delivery, or increased collection without timely GS delivery, does not necessarily improve EE.
+Consider complete GS delivery and movement energy together. Lower energy with substantially lower complete delivery, or increased collection without complete GS delivery, does not necessarily improve EE. Late complete delivery counts in EE but remains a delay violation.
 
-Generated data, collected data, and relay-hop throughput are not equivalent to timely GS delivery.
+Generated data, collected data, partial transmission, and relay-hop throughput are not equivalent to complete GS delivery.
 
 Movement reward, routing reward, and episode EE are different signals and must not be treated as interchangeable.
 

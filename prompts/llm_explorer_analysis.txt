@@ -1,4 +1,4 @@
-Use the following data to propose a few evidence-supported movement and routing exploration recommendations for this episode. First identify the main limitations affecting timely useful delivery and energy, then choose guidance.
+Use the following data to propose a few evidence-supported movement and routing exploration recommendations for this episode. First identify the main limitations affecting complete useful delivery and energy, then choose guidance.
 
 [Current training phase and exploration bounds]
 
@@ -10,7 +10,7 @@ These include the episode number, configured training horizon when available, wa
 
 {{EPISODE_OUTCOMES}}
 
-These include EE, timely useful GS bits, movement energy of all UAVs, separate FOV/COM generation and terminal outcomes, deadline numerators and denominators, necessary rewards/costs, lambda_EE, and lambda_cost.
+These include primary EE, timely, late, and all complete useful GS bits, movement energy of all UAVs, separate FOV/COM generation and terminal outcomes, deadline numerators and denominators, necessary rewards/costs, lambda_EE, and lambda_cost.
 
 [Previous episode: complete guidance and application]
 
@@ -68,7 +68,7 @@ Absolute case time_s remains in seconds. Explicit service durations and UAV/SR H
 Use the previous episode's outcomes and behavior statistics, together with the current observable initial state, to propose exploration guidance for this episode. Return four concise sections:
 
 1. Priority limitations
-Select at most two main issues affecting timely useful delivery or energy. Support your assessment with values and valid denominators, distinguishing sensing, SR access, routing, WAIT, deadline, and energy limitations.
+Select at most two main issues affecting complete useful delivery or energy. Support your assessment with values and valid denominators, distinguishing timely and late completion, sensing, SR access, routing, WAIT, deadline, and energy limitations.
 
 2. TD3 recommendations
 Identify UAV IDs, action components, signed bias directions, and evidence for their magnitudes. Express magnitudes as raw bias values or fractions of the current sigma bound. Consider whether an episode-fixed offset remains appropriate as roles and target directions change.

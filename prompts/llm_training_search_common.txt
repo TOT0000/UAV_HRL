@@ -45,9 +45,9 @@ Moving a packet to another UAV does not restart its deadline.
 
 The primary objective is episode energy efficiency:
 
-EE = sum_t B_timely,t / sum_t E_movement,t
+EE = sum_t B_complete,t / sum_t E_movement,t
 
-B_timely,t is useful data delivered to the GS within its deadline.
+B_complete,t is useful data completely delivered to the GS, whether timely or late. Late delivery remains a violation; partial or unfinished data contributes zero.
 E_movement,t is movement energy of all UAVs.
 
 Acquisition and intermediate forwarding contribute to the task when the data subsequently reaches the GS on time.
@@ -74,7 +74,7 @@ Capture conditions, coverage, data generation, and penalties:
 
 {{VISUAL_SENSING_CODE}}
 
-VS packets are generated when capture is valid and must subsequently reach the GS within their deadline.
+VS packets are generated when capture is valid. Reaching the GS within the deadline is timely; late packets remain queued and may still complete before episode end.
 
 For communication nodes a and b:
 
@@ -142,9 +142,9 @@ r_extra = sum_k w_k * f_k
 r_total = r_base + beta * r_extra
 
 r_base =
-B_timely_Mbit
+B_complete_Mbit
 - lambda * E_movement_J
-- P_C9 - P_C10 - P_COM
+- P_C9 - P_COM
 
 {{BASE_REWARD_SPEC}}
 
@@ -210,7 +210,7 @@ The checkpoint at episode {{TRAIN_EPISODES}} is evaluated on the same {{EVALUATI
 
 For evaluation episode i:
 
-EE_i = sum_t B_timely_i,t / sum_t E_movement_i,t
+EE_i = sum_t B_complete_i,t / sum_t E_movement_i,t
 
 The candidate score is:
 
@@ -230,11 +230,11 @@ The candidate with the highest historical mean evaluation EE is the reference fo
 
 Connect the task to the environment:
 - Identify relevant UAVs, service targets, queues, and links.
-- Determine how TD3 movement affects data acquisition, timely delivery, and movement energy.
+- Determine how TD3 movement affects data acquisition, complete delivery, timely QoS, and movement energy.
 - Select corresponding observations with appropriate units and validity conditions.
 
 Translate the objective into design considerations:
-- Deliver useful data to the GS within its deadline.
+- Deliver useful data completely to the GS, while improving timely completion when possible.
 - Balance movement energy against useful delivery.
 - Coordinate sensing and source uploads with subsequent relay service.
 

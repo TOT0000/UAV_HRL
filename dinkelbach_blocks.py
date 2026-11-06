@@ -6,11 +6,11 @@ from dataclasses import dataclass
 import math
 
 
-DINKELBACH_BLOCK_STATE_SCHEMA_VERSION = 1
+DINKELBACH_BLOCK_STATE_SCHEMA_VERSION = 2
 DINKELBACH_INITIAL_LAMBDA = 0.0
 DINKELBACH_UPDATE_INTERVAL_EPISODES = 50
 DINKELBACH_UPDATE_RULE = "ratio_of_block_sums"
-DINKELBACH_NUMERATOR_UNIT = "timely_useful_mbits"
+DINKELBACH_NUMERATOR_UNIT = "complete_useful_mbits"
 DINKELBACH_DENOMINATOR_UNIT = "mobility_energy_joules"
 
 DINKELBACH_CONFIG_FIELDS = (
@@ -28,7 +28,7 @@ DINKELBACH_TRAINING_STATE_FIELDS = (
     "dinkelbach_update_interval_episodes",
     "dinkelbach_block_index",
     "dinkelbach_block_completed_episodes",
-    "dinkelbach_block_timely_delivered_mbits",
+    "dinkelbach_block_complete_delivered_mbits",
     "dinkelbach_block_mobility_energy_joules",
     "dinkelbach_update_count",
     "dinkelbach_block_inputs_valid",
@@ -89,7 +89,7 @@ class DinkelbachBlockState:
     update_interval_episodes: int = DINKELBACH_UPDATE_INTERVAL_EPISODES
     block_index: int = 1
     block_completed_episodes: int = 0
-    block_timely_delivered_mbits: float = 0.0
+    block_complete_delivered_mbits: float = 0.0
     block_mobility_energy_joules: float = 0.0
     update_count: int = 0
     block_inputs_valid: bool = True
@@ -139,8 +139,8 @@ class DinkelbachBlockState:
             block_completed_episodes=int(
                 training_state["dinkelbach_block_completed_episodes"]
             ),
-            block_timely_delivered_mbits=float(
-                training_state["dinkelbach_block_timely_delivered_mbits"]
+            block_complete_delivered_mbits=float(
+                training_state["dinkelbach_block_complete_delivered_mbits"]
             ),
             block_mobility_energy_joules=float(
                 training_state["dinkelbach_block_mobility_energy_joules"]
@@ -170,8 +170,8 @@ class DinkelbachBlockState:
         finite_values = {
             "current_dinkelbach_lambda": self.current_lambda,
             "dinkelbach_initial_lambda": self.initial_lambda,
-            "dinkelbach_block_timely_delivered_mbits": (
-                self.block_timely_delivered_mbits
+            "dinkelbach_block_complete_delivered_mbits": (
+                self.block_complete_delivered_mbits
             ),
             "dinkelbach_block_mobility_energy_joules": (
                 self.block_mobility_energy_joules
@@ -218,8 +218,8 @@ class DinkelbachBlockState:
             "dinkelbach_block_completed_episodes": int(
                 self.block_completed_episodes
             ),
-            "dinkelbach_block_timely_delivered_mbits": float(
-                self.block_timely_delivered_mbits
+            "dinkelbach_block_complete_delivered_mbits": float(
+                self.block_complete_delivered_mbits
             ),
             "dinkelbach_block_mobility_energy_joules": float(
                 self.block_mobility_energy_joules
@@ -229,17 +229,17 @@ class DinkelbachBlockState:
             "dinkelbach_last_update_status": str(self.last_update_status),
         }
 
-    def record_episode(self, timely_delivered_mbits, mobility_energy_joules):
+    def record_episode(self, complete_delivered_mbits, mobility_energy_joules):
         lambda_used = float(self.current_lambda)
         block_index = int(self.block_index)
         block_episode = int(self.block_completed_episodes) + 1
-        timely = float(timely_delivered_mbits)
+        complete = float(complete_delivered_mbits)
         energy = float(mobility_energy_joules)
 
-        if math.isfinite(timely) and timely >= 0.0:
-            candidate = self.block_timely_delivered_mbits + timely
+        if math.isfinite(complete) and complete >= 0.0:
+            candidate = self.block_complete_delivered_mbits + complete
             if math.isfinite(candidate):
-                self.block_timely_delivered_mbits = candidate
+                self.block_complete_delivered_mbits = candidate
             else:
                 self.block_inputs_valid = False
         else:
@@ -256,7 +256,7 @@ class DinkelbachBlockState:
             self.block_inputs_valid = False
 
         self.block_completed_episodes = block_episode
-        block_timely = float(self.block_timely_delivered_mbits)
+        block_complete = float(self.block_complete_delivered_mbits)
         block_energy = float(self.block_mobility_energy_joules)
         updated = False
         completed = block_episode == self.update_interval_episodes
@@ -271,7 +271,7 @@ class DinkelbachBlockState:
             elif block_energy <= 0.0:
                 status = "invalid_denominator"
             else:
-                ratio = block_timely / block_energy
+                ratio = block_complete / block_energy
                 if math.isfinite(ratio):
                     self.current_lambda = float(ratio)
                     self.update_count += 1
@@ -282,7 +282,7 @@ class DinkelbachBlockState:
             self.last_update_status = status
             self.block_index += 1
             self.block_completed_episodes = 0
-            self.block_timely_delivered_mbits = 0.0
+            self.block_complete_delivered_mbits = 0.0
             self.block_mobility_energy_joules = 0.0
             self.block_inputs_valid = True
 
@@ -293,7 +293,7 @@ class DinkelbachBlockState:
             "dinkelbach_update_status": status,
             "dinkelbach_block_index": block_index,
             "dinkelbach_block_episode": block_episode,
-            "dinkelbach_block_timely_mbits_so_far": block_timely,
+            "dinkelbach_block_complete_mbits_so_far": block_complete,
             "dinkelbach_block_energy_joules_so_far": block_energy,
             "dinkelbach_block_completed": bool(completed),
         }

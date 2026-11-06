@@ -26,19 +26,19 @@ import numpy as np
 
 LLM_EXPLORER_METHOD_ID = "td3_dinkelbach_llm_explorer"
 LLM_EXPLORER_MODEL = "gpt-4o-mini"
-LLM_EXPLORER_VERSION = "uav-hrl-llm-explorer-firstgen-v6"
-LLM_EXPLORER_PROMPT_VERSION = "uav-hrl-llm-explorer-prompts-v10"
+LLM_EXPLORER_VERSION = "uav-hrl-llm-explorer-firstgen-v7"
+LLM_EXPLORER_PROMPT_VERSION = "uav-hrl-llm-explorer-prompts-v11-complete-ee-no-c10"
 LLM_EXPLORER_NO_C10_METHOD_ID = (
     "td3_dinkelbach_llm_explorer_wo_c10_penalty"
 )
 LLM_EXPLORER_NO_C10_PROMPT_VERSION = (
-    "uav-hrl-llm-explorer-prompts-v10-no-c10-v1"
+    "uav-hrl-llm-explorer-prompts-v11-complete-ee-no-c10-variant-v1"
 )
 LLM_EXPLORER_SUMMARY_VERSION = "complete-core-feedback-v4"
 LLM_EXPLORER_CASE_VERSION = "deterministic-diverse-cases-v1"
-LLM_EXPLORER_CACHE_VERSION = "episode-fixed-dual-guidance-cache-v7"
+LLM_EXPLORER_CACHE_VERSION = "episode-fixed-dual-guidance-cache-v8-complete-ee"
 LLM_EXPLORER_NO_C10_CACHE_VERSION = (
-    "episode-fixed-dual-guidance-cache-v7-no-c10-v1"
+    "episode-fixed-dual-guidance-cache-v8-complete-ee-no-c10-variant-v1"
 )
 LLM_EXPLORER_COMPRESSION_VERSION = LLM_EXPLORER_SUMMARY_VERSION
 LLM_EXPLORER_PRESENTATION_VERSION = "firstgen-columns-rows-3dp-ms-v2"
@@ -47,25 +47,11 @@ LLM_EXPLORER_NUMERICAL_OUTPUT_PROTOCOL = (
 )
 LLM_EXPLORER_NUMERICAL_STAGE = "numerical_routing_weights_v2"
 LLM_EXPLORER_GUIDANCE_MAX_OUTPUT_TOKENS = 8_000
-LLM_EXPLORER_COMPATIBLE_RESUME_PROTOCOLS = frozenset(
-    {
-        (
-            "uav-hrl-llm-explorer-prompts-v8",
-            "episode-fixed-dual-guidance-cache-v5",
-            None,
-            5_000,
-        ),
-        (
-            "uav-hrl-llm-explorer-prompts-v9",
-            "episode-fixed-dual-guidance-cache-v6",
-            "chat-completions-strict-json-schema-v1",
-            5_000,
-        ),
-    }
-)
+LLM_EXPLORER_COMPATIBLE_RESUME_PROTOCOLS = frozenset()
 SHARED_ENVIRONMENT_DEFINITIONS_VERSION = "uav-hrl-llm-explorer-v2"
 LLM_EXPLORER_WARMUP_TRANSITIONS = 10_000
 LLM_EXPLORER_UPDATE_INTERVAL_EPISODES = 1
+LLM_EXPLORER_CALL_SCHEDULE_VERSION = "global-episode-piecewise-1-2-4-v1"
 LLM_EXPLORER_MAX_ATTEMPTS = 2
 # Retained for the separately versioned annealed v3 method.
 ROUTING_PRIOR_WEIGHT = 0.8
@@ -76,6 +62,19 @@ LLM_EXPLORER_CONTEXT_TOKENS = 128_000
 LLM_EXPLORER_SAFETY_MARGIN_TOKENS = 4_096
 LLM_EXPLORER_ENCODING = "o200k_base"
 WINDOWS_CONSERVATIVE_PATH_LIMIT = 240
+
+
+def llm_explorer_call_scheduled(global_episode_number: int) -> bool:
+    """Return whether a post-warmup first-gen episode requests fresh guidance."""
+
+    episode = int(global_episode_number)
+    if episode <= 0:
+        raise ValueError("global episode number must be positive")
+    if episode <= 500:
+        return True
+    if episode <= 1000:
+        return (episode - 501) % 2 == 0
+    return (episode - 1001) % 4 == 0
 
 
 def first_gen_prompt_version(method_id: str) -> str:
@@ -276,6 +275,7 @@ class LLMExplorerConfig:
     context_window_tokens: int = LLM_EXPLORER_CONTEXT_TOKENS
     safety_margin_tokens: int = LLM_EXPLORER_SAFETY_MARGIN_TOKENS
     tokenizer_encoding: str = LLM_EXPLORER_ENCODING
+    call_schedule_version: str = LLM_EXPLORER_CALL_SCHEDULE_VERSION
 
     def __post_init__(self) -> None:
         if self.model != LLM_EXPLORER_MODEL:
@@ -299,6 +299,8 @@ class LLMExplorerConfig:
             raise ValueError("LLM explorer token safety margin is too small")
         if str(self.tokenizer_encoding) != LLM_EXPLORER_ENCODING:
             raise ValueError("LLM explorer must use the o200k_base tokenizer")
+        if str(self.call_schedule_version) != LLM_EXPLORER_CALL_SCHEDULE_VERSION:
+            raise ValueError("unsupported LLM explorer call schedule")
 
 
 @dataclass(frozen=True)
@@ -782,6 +784,12 @@ def _first_gen_outcome_payload(
             ),
             "timely_useful_gs_delivery_bits": metrics.get(
                 "timely_useful_delivery_bits"
+            ),
+            "late_useful_gs_delivery_bits": metrics.get(
+                "late_useful_delivery_bits"
+            ),
+            "all_complete_useful_gs_delivery_bits": metrics.get(
+                "all_complete_useful_delivery_bits"
             ),
             "all_uav_all_controller_movement_energy_sum_j": metrics.get(
                 "movement_energy_j"
@@ -3699,13 +3707,22 @@ def environment_constants_and_definitions(
             "heading_domain": "periodic [-1,1)",
         },
         "movement_reward": {
-            "formula": "timely_Mbit - lambda_EE_Mbit_per_J * movement_J - P_C9 - P_C10 - P_COM",
+            "formula": "complete_Mbit - lambda_EE_Mbit_per_J * movement_J - P_C9 - P_COM",
+            "complete_Mbit": (
+                "timely complete useful Mbit plus late complete useful Mbit delivered to GS"
+            ),
+            "c10_penalty_enabled": False,
             "constraint_weights": {
                 "c9": float(MOVEMENT_CONSTRAINT_WEIGHT_C9),
-                "c10": float(MOVEMENT_CONSTRAINT_WEIGHT_C10),
+                "c10": 0.0,
                 "com_range": float(MOVEMENT_CONSTRAINT_WEIGHT_COM),
             },
+            "configured_c10_diagnostic_weight": float(MOVEMENT_CONSTRAINT_WEIGHT_C10),
         },
+        "packet_deadline_policy": (
+            "target delay classifies timely versus late; packets continue with unchanged "
+            "queue priority until complete GS delivery, a non-time drop, or episode end"
+        ),
         "routing_reward": {
             "formula": "slot timely useful bits delivered to GS / 10000",
             "unit": "1 reward per decimal 10 kbit",
@@ -3758,7 +3775,7 @@ def _first_gen_movement_penalty_contract() -> dict[str, Any]:
         "normalization_epsilon": epsilon,
         "weights": {
             "w_C9": weights["c9"],
-            "w_C10": weights["c10"],
+            "w_C10": 0.0,
             "w_COM": weights["com_range"],
         },
         "symbols": {
@@ -3803,6 +3820,8 @@ def _first_gen_movement_penalty_contract() -> dict[str, Any]:
                 "validity, finite nonnegative d_L and d_R, and a finite "
                 "positive RoI radius are included."
             ),
+            "reward_penalty_enabled": False,
+            "role": "diagnostic_only_not_subtracted_from_movement_reward",
         },
         "COM": {
             "formula": scoped_formula(
@@ -3902,8 +3921,14 @@ def environment_constants_and_definitions_first_gen(
         },
         feedback_dictionary={
             "timely_useful_delivery_bits": (
-                "authoritative EE numerator: complete on-time GS delivery; "
+                "complete on-time GS delivery; retained separately from the primary numerator; "
                 "FOV physical bits weighted by capture coverage and COM bits full"
+            ),
+            "late_useful_delivery_bits": (
+                "complete GS delivery after target delay using the same FOV/COM useful-bit rules"
+            ),
+            "all_complete_useful_delivery_bits": (
+                "authoritative EE and movement-reward numerator: timely plus late complete useful bits"
             ),
             "generated_and_terminal_packet_counts": (
                 "FOV and COM are separate; eligible/violated counts retain the "
@@ -3974,7 +3999,7 @@ def environment_constants_and_definitions_first_gen_no_c10(
     configured_weights = dict(base["movement_reward"]["constraint_weights"])
     base["movement_reward"].update(
         formula=(
-            "timely_Mbit - lambda_EE_Mbit_per_J * movement_J - P_C9 - P_COM"
+            "complete_Mbit - lambda_EE_Mbit_per_J * movement_J - P_C9 - P_COM"
         ),
         c10_penalty_enabled=False,
         configured_constraint_weights=configured_weights,
@@ -4924,63 +4949,10 @@ class LLMExplorerController:
                 "llm_explorer_guidance.txt",
             )
         )
-        if self.config.prompt_version != LLM_EXPLORER_NO_C10_PROMPT_VERSION:
-            return templates
-        system, analysis, numerical_system, guidance = templates
-        system_replacements = {
-            (
-                "Actual sensing validity also includes positive relative altitude "
-                "and valid camera-projection rays. Use the supplied capture_valid "
-                "observation. C10 is a soft reward penalty rather than a "
-                "packet-generation switch."
-            ): (
-                "Actual sensing validity also includes positive relative altitude "
-                "and valid camera-projection rays. Use the supplied capture_valid "
-                "observation. C10 geometry is always computed and observed for "
-                "diagnostics; the supplied movement_reward.c10_penalty_enabled and "
-                "movement_reward.formula state whether its soft penalty is actually "
-                "subtracted from reward. C10 is never a packet-generation switch."
-            ),
-            (
-                "r_move = B_timely,Mbit - lambda_EE*E_move,J - P_C9 - P_C10 "
-                "- P_COM."
-            ): (
-                "Use the exact r_move formula supplied in "
-                "SETTINGS_AND_DATA_DEFINITIONS.movement_reward.formula. It "
-                "explicitly states whether P_C10 is subtracted for this method."
-            ),
-        }
-        for original, replacement in system_replacements.items():
-            if system.count(original) != 1:
-                raise RuntimeError(
-                    "original first-gen prompt changed without updating the "
-                    "no-C10 method-aware renderer"
-                )
-            system = system.replace(original, replacement)
-        original_analysis = (
-            "These supply the actual timing, traffic, deadlines, communication, "
-            "camera, and action settings; C9/C10/COM penalty definitions; and "
-            "each field's unit, valid denominator, and aggregation scope."
-        )
-        no_c10_analysis = (
-            "These supply the actual timing, traffic, deadlines, communication, "
-            "camera, and action settings; the effective movement-reward formula "
-            "and penalty weights; C9/COM penalty definitions; the C10 geometry/"
-            "diagnostic definition and whether it is actually subtracted from "
-            "reward; and each field's unit, valid denominator, and aggregation "
-            "scope."
-        )
-        if analysis.count(original_analysis) != 1:
-            raise RuntimeError(
-                "original first-gen analysis prompt changed without updating the "
-                "no-C10 method-aware renderer"
-            )
-        return (
-            system,
-            analysis.replace(original_analysis, no_c10_analysis),
-            numerical_system,
-            guidance,
-        )
+        # Both first-generation method IDs now share the same complete-goodput,
+        # no-C10 reward semantics.  Their prompt/cache versions remain distinct
+        # so old and new runs can never share guidance artifacts.
+        return templates
 
     def _prompt_contract_identity(self) -> dict[str, Any]:
         templates = self._templates()
@@ -5668,12 +5640,36 @@ class LLMExplorerController:
         routing_guidance_required = self._routing_guidance_required()
         if self.evaluation:
             self.active_guidance = self._unguided("evaluation_disabled")
+            self._event(
+                "episode_guidance_skipped",
+                episode=self._upcoming_episode,
+                reason="evaluation_disabled",
+            )
             return self.active_guidance
         if int(total_joint_transitions) < int(self.config.warmup_joint_transitions):
             self.active_guidance = self._unguided("warmup")
+            self._event(
+                "episode_guidance_skipped",
+                episode=self._upcoming_episode,
+                reason="warmup",
+            )
+            return self.active_guidance
+        if not llm_explorer_call_scheduled(self._upcoming_episode):
+            self.active_guidance = self._unguided("schedule_skip")
+            self._event(
+                "episode_guidance_skipped",
+                episode=self._upcoming_episode,
+                reason="schedule_skip",
+                call_schedule_version=self.config.call_schedule_version,
+            )
             return self.active_guidance
         if self.previous_episode_feedback is None:
             self.active_guidance = self._unguided("no_previous_episode_feedback")
+            self._event(
+                "episode_guidance_skipped",
+                episode=self._upcoming_episode,
+                reason="no_previous_episode_feedback",
+            )
             return self.active_guidance
 
         templates = self._templates()
@@ -6204,6 +6200,14 @@ def explorer_metadata(
         "model": config.model,
         "warmup_joint_transitions": config.warmup_joint_transitions,
         "update_interval_episodes": config.update_interval_episodes,
+        "call_schedule_version": config.call_schedule_version,
+        "call_schedule": {
+            "episodes_1_to_500": "every_episode",
+            "episodes_501_to_1000": "501_503_through_999",
+            "episodes_1001_and_later": "1001_plus_multiples_of_4",
+            "warmup_and_previous_feedback_requirements_unchanged": True,
+            "skipped_episode_reuses_guidance": False,
+        },
         "max_attempts_per_stage": config.max_attempts,
         "request_timeout_seconds": config.request_timeout_seconds,
         "context_window_tokens": config.context_window_tokens,

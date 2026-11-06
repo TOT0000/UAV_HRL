@@ -45,14 +45,14 @@ All UAVs preselect one physically legal next hop per 0.25 s routing slot and hol
 
 Changing a packet's current node does not restart its deadline.
 
-The task objective is energy-efficient timely delivery:
+The movement objective is energy-efficient complete delivery, while deadlines retain their QoS meaning:
 
-EE = sum_t B_timely,t / sum_t E_movement,t
+EE = sum_t B_complete,t / sum_t E_movement,t
 
-B_timely,t is useful data delivered to the GS within its deadline during interval t.
+B_complete,t is useful data completely delivered to the GS during interval t, whether timely or late. Late delivery remains a violation; partial or unfinished data contributes zero.
 E_movement,t is the movement energy of all UAVs during interval t.
 
-Data acquisition and intermediate forwarding contribute to the task through subsequent timely GS delivery. Consider useful delivery, movement energy, and end-to-end deadline violations together.
+Data acquisition and intermediate forwarding contribute to the task through subsequent complete GS delivery. Consider useful delivery, movement energy, and end-to-end deadline violations together.
 
 2. Quantitative relationships and environment implementation
 
@@ -154,7 +154,7 @@ The host applies the following terminal and bootstrap convention:
 
 The original reward is:
 
-r_base = B_timely_Mbit - lambda * E_movement_J - P_C9 - P_C10 - P_COM
+r_base = B_complete_Mbit - lambda * E_movement_J - P_C9 - P_COM
 
 {{BASE_REWARD_SPEC}}
 
@@ -218,7 +218,7 @@ Each valid, distinct candidate is trained from scratch under the same settings.
 
 Candidates are compared using mean episode EE on the same fixed evaluation scenarios:
 
-mean_EE = (1/N) * sum_i (B_timely_episode_i / E_movement_episode_i)
+mean_EE = (1/N) * sum_i (B_complete_episode_i / E_movement_episode_i)
 
 The candidate with the highest historical evaluation mean EE is the reference for subsequent revisions.
 

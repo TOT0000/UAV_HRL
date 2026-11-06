@@ -8,7 +8,7 @@ Training phase and exploration settings:
 Verified previous-episode metrics:
 {{EPISODE_METRICS}}
 
-Prioritize EE, timely GS-delivered data, movement energy, and important QoS metrics.
+Prioritize EE, timely plus late complete GS-delivered data, movement energy, and important QoS metrics.
 
 Interpret each metric according to its supplied definition. Do not treat movement reward or routing reward as EE.
 
@@ -58,7 +58,7 @@ Identify a few important observations using explicit UAV IDs and supplied statis
 2. Movement recommendations:
 For UAVs with supporting evidence, identify whether speed, heading, or vertical should receive a positive, negative, or neutral raw bias.
 
-Explain how the direction could improve timely delivery, service conditions, or movement energy, and why it is suitable as an episode-fixed exploration tendency.
+Explain how the direction could improve complete delivery, timely QoS, service conditions, or movement energy, and why it is suitable as an episode-fixed exploration tendency.
 
 If a direction is useful only in a local situation, explain the limitation and consider a smaller or neutral bias. Do not force intervention for every UAV.
 

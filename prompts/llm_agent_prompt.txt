@@ -10,7 +10,7 @@ Task assignment determines service roles and targets. TD3 controls eligible UAV 
 
 A movement eligibility mask identifies which UAVs TD3 controls; data-validity flags identify which observations are meaningful. These have different purposes.
 
-The objective is to increase timely delivered data per unit of movement energy while considering end-to-end deadline violations. Data acquisition or intermediate forwarding alone does not count as delivery to the GS. Movement affects sensing geometry, upload and forwarding capacity, queues, and energy consumption.
+The objective is to increase timely or late complete GS delivery per unit of movement energy. Late delivery remains a deadline violation. Partial delivery and intermediate forwarding do not count. Movement affects sensing geometry, capacity, queues, and energy.
 
 The authoritative environment specification below provides timing, geometry conditions, packet deadlines, reward definitions, and available observations:
 {{ENVIRONMENT_AND_INPUT_CONTRACT}}
@@ -29,8 +29,8 @@ s_aug = concatenate(s_original, f)
 r_extra = dot(reward_weights, f)
 r_total = r_base + beta * r_extra
 
-r_base = B_timely_Mbit - lambda * E_movement_J
-         - P_C9 - P_C10 - P_COM
+r_base = B_complete_Mbit - lambda * E_movement_J
+         - P_C9 - P_COM
 
 Reward weights may be any finite positive, negative, or zero values. The host does not normalize them, and neither r_extra nor r_total is restricted to [-1,1]. A feature may have zero reward weight while still contributing to the augmented state. Every intermediate and final numeric result must remain finite.
 

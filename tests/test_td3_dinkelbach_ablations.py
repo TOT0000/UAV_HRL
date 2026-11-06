@@ -70,19 +70,7 @@ class AblationRegistryAndConfigurationTest(unittest.TestCase):
         no_c10 = effective_training_config(self.config, self.no_c10)
         interval_200 = effective_training_config(self.config, self.interval_200)
 
-        self.assertEqual(
-            _leaf_differences(baseline, no_c10),
-            {
-                ("c10_penalty_enabled",),
-                ("effective_movement_constraint_penalty_weights", "c10"),
-                ("task_potential_configuration", "reward_form"),
-                (
-                    "task_potential_configuration",
-                    "c10",
-                    "reward_penalty_enabled",
-                ),
-            },
-        )
+        self.assertEqual(_leaf_differences(baseline, no_c10), set())
         self.assertEqual(
             _leaf_differences(baseline, interval_200),
             {("dinkelbach_update_interval_episodes",)},
@@ -96,7 +84,7 @@ class AblationRegistryAndConfigurationTest(unittest.TestCase):
         self.assertEqual(interval_200["dinkelbach_update_interval_episodes"], 200)
         self.assertEqual(
             interval_200["effective_movement_constraint_penalty_weights"]["c10"],
-            1.0,
+            0.0,
         )
         self.assertEqual(
             movement_agent_configuration(self.base),
@@ -236,7 +224,7 @@ class DinkelbachIntervalAblationTest(unittest.TestCase):
         self.assertEqual(state.update_count, 7)
         self.assertEqual(state.block_index, 8)
         self.assertEqual(state.block_completed_episodes, 100)
-        self.assertEqual(state.block_timely_delivered_mbits, 100.0)
+        self.assertEqual(state.block_complete_delivered_mbits, 100.0)
         self.assertEqual(state.block_mobility_energy_joules, 200.0)
 
     def test_partial_block_resume_preserves_state_and_rejects_interval_mismatch(self):

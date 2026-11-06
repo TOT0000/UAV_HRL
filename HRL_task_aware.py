@@ -29,7 +29,6 @@ from Packet_scheduler_v1 import (
     EPISODE_INJECTION_CUTOFF_SECONDS,
     PACKET_ENGINE_CHECKPOINT_SCHEMA_VERSION,
     PACKET_DEADLINE_POLICY_CONTINUE,
-    PACKET_DEADLINE_POLICY_DROP,
     PacketEngine,
     TASK_DEADLINE_SECONDS,
 )
@@ -53,7 +52,6 @@ from exploration_schedules import movement_behavior_noise
 from evaluation_metrics import safe_energy_efficiency
 from evaluation_aggregation import (
     COMPLETE_EE_DEFINITION,
-    TIMELY_EE_DEFINITION,
 )
 from experiment_config import (
     COM_SESSION_LIFECYCLE_VERSION,
@@ -1158,11 +1156,29 @@ def _run_routing_slot(
                 )
     selected_links = list(slot_result.get("active_links", []))
     return (
-        float(slot_result["timely_goodput_bits"]),
+        # Movement learning uses every complete GS delivery.  The routing
+        # reward beside it intentionally remains timely-only.
+        _movement_complete_useful_bits(slot_result),
         float(slot_result["global_routing_reward"]),
         len(next_hops),
         selected_links,
     )
+
+
+def _movement_complete_useful_bits(slot_result):
+    """Validate and return the slot numerator used by movement learning."""
+
+    timely = float(slot_result["total_timely_useful_bits"])
+    late = float(slot_result["total_late_useful_bits"])
+    complete = float(slot_result["total_all_useful_bits"])
+    if not np.isclose(
+        complete,
+        timely + late,
+        rtol=1e-12,
+        atol=max(1e-9, 32.0 * np.spacing(max(abs(complete), 1.0))),
+    ):
+        raise AssertionError("slot complete useful bits diverged from timely plus late")
+    return complete
 
 
 def _select_routing_actions(
@@ -1394,7 +1410,7 @@ def _interval_reward(
     constraint_penalties,
     reward_mode="dinkelbach",
     task_potential_enabled=True,
-    c10_penalty_enabled=True,
+    c10_penalty_enabled=False,
     ratio_objective_reward=0.0,
 ):
     if reward_mode == "dinkelbach":
@@ -1417,7 +1433,7 @@ def _movement_constraint_penalty_total(
     constraint_penalties,
     *,
     task_potential_enabled=True,
-    c10_penalty_enabled=True,
+    c10_penalty_enabled=False,
 ):
     if not task_potential_enabled:
         return 0.0
@@ -1459,7 +1475,7 @@ def _inactive_dinkelbach_event(episode):
         "dinkelbach_update_status": "disabled_for_reward_mode",
         "dinkelbach_block_index": None,
         "dinkelbach_block_episode": None,
-        "dinkelbach_block_timely_mbits_so_far": None,
+        "dinkelbach_block_complete_mbits_so_far": None,
         "dinkelbach_block_energy_joules_so_far": None,
         "dinkelbach_block_completed": False,
     }
@@ -1689,18 +1705,9 @@ def _experiment_identity(
         "evaluation_episode_count": (
             int(config.total_episodes) if evaluation else None
         ),
-        **(
-            {
-                "formal_evaluation": bool(formal_evaluation),
-                "packet_deadline_policy": (
-                    PACKET_DEADLINE_POLICY_CONTINUE
-                    if formal_evaluation
-                    else PACKET_DEADLINE_POLICY_DROP
-                ),
-            }
-            if evaluation
-            else {}
-        ),
+        "formal_evaluation": bool(formal_evaluation) if evaluation else False,
+        "packet_deadline_policy": PACKET_DEADLINE_POLICY_CONTINUE,
+        "primary_energy_efficiency_definition_id": COMPLETE_EE_DEFINITION,
         "episode_horizon_seconds": int(config.episode_seconds),
         "movement_interval_seconds": MOVEMENT_INTERVAL_SECONDS,
         "routing_slot_seconds": float(config.routing_slot_seconds),
@@ -1760,6 +1767,14 @@ def _experiment_identity(
                     "plus timely COM physical size"
                 ),
             },
+            "total_late_useful_bits": {
+                "unit": "bit",
+                "definition": "late complete FOV/COM useful bits delivered to GS",
+            },
+            "total_all_useful_bits": {
+                "unit": "bit",
+                "definition": "timely plus late complete useful bits delivered to GS",
+            },
             "fov_generated_raw_bits": {"unit": "bit"},
             "fov_timely_delivered_raw_bits": {"unit": "bit"},
             "fov_timely_useful_bits": {"unit": "bit"},
@@ -1775,14 +1790,14 @@ def _experiment_identity(
         "movement_objective_definition": (
             {
                 "objective_unit": "bit_per_j",
-                "numerator": "sum of episode timely useful bits",
+                "numerator": "sum of episode complete useful bits",
                 "denominator": "sum of episode mobility energy joules",
                 "semantics": "terminal-only ratio of sums",
             }
             if method_spec.reward_mode == "ratio"
             else {
                 "objective_unit": "Mbit_minus_lambda_Mbit_per_J_times_J",
-                "numerator": "timely useful Mbit",
+                "numerator": "complete useful Mbit",
                 "semantics": "Dinkelbach residual",
             }
         ),
@@ -2466,11 +2481,7 @@ def train(
         enable_packet_diagnostic_artifacts=(
             packet_outcome_mode != PACKET_OUTCOME_MODE_DISABLED
         ),
-        packet_deadline_policy=(
-            PACKET_DEADLINE_POLICY_CONTINUE
-            if formal_evaluation
-            else PACKET_DEADLINE_POLICY_DROP
-        ),
+        packet_deadline_policy=PACKET_DEADLINE_POLICY_CONTINUE,
     )
     llm_runtime = None
     if llm_design is not None:
@@ -4559,13 +4570,11 @@ def train(
         raw_final_hop_mbits = float(packet_engine.raw_final_hop_bits) / 1e6
         total_late_useful_mbits = total_late_useful_bits / 1e6
         total_all_useful_mbits = total_all_useful_bits / 1e6
-        primary_ee_useful_mbits = (
-            total_all_useful_mbits if formal_evaluation else timely_goodput_mbits
-        )
+        primary_ee_useful_mbits = total_all_useful_mbits
         dinkelbach_event = None
         if not evaluation and method_spec.uses_dinkelbach:
             dinkelbach_event = dinkelbach_state.record_episode(
-                timely_goodput_mbits,
+                total_all_useful_mbits,
                 episode_energy,
             )
             lambda_ee = float(dinkelbach_state.current_lambda)
@@ -4820,11 +4829,7 @@ def train(
                     "checkpoint_metadata_fingerprint"
                 ),
                 "packet_deadline_policy": packet_engine.packet_deadline_policy,
-                "primary_energy_efficiency_definition_id": (
-                    COMPLETE_EE_DEFINITION
-                    if formal_evaluation
-                    else TIMELY_EE_DEFINITION
-                ),
+                "primary_energy_efficiency_definition_id": COMPLETE_EE_DEFINITION,
                 "num_GT": int(env.num_GT),
                 "timely_goodput_mbits": timely_goodput_mbits,
                 "total_timely_useful_mbits": total_timely_useful_bits / 1e6,
@@ -5010,11 +5015,13 @@ def train(
                 episode_index=episode,
                 metrics={
                     "energy_efficiency_bit_per_j": (
-                        total_timely_useful_bits / float(episode_energy)
+                        total_all_useful_bits / float(episode_energy)
                         if float(episode_energy) > 0.0
                         else 0.0
                     ),
                     "timely_useful_delivery_bits": total_timely_useful_bits,
+                    "late_useful_delivery_bits": total_late_useful_bits,
+                    "all_complete_useful_delivery_bits": total_all_useful_bits,
                     "movement_energy_j": float(episode_energy),
                     "td3_original_cumulative_reward": float(
                         episode_existing_movement_reward
@@ -5126,6 +5133,8 @@ def train(
                     reward=episode_reward,
                     timely_goodput_mbits=timely_goodput_mbits,
                     total_timely_useful_mbits=timely_goodput_mbits,
+                    total_late_useful_mbits=total_late_useful_mbits,
+                    total_all_useful_mbits=total_all_useful_mbits,
                     mobility_energy_j=episode_energy,
                     eligible_packet_count=episode_system_eligible_packet_count,
                     delay_violation_count=int(episode_system_violation_count),
@@ -5173,6 +5182,8 @@ def train(
             f"routing_reward={episode_routing_reward:.6f} "
             f"raw_final_bits={packet_engine.raw_final_hop_bits:.0f} "
             f"timely_bits={packet_engine.timely_goodput_bits:.0f} "
+            f"late_bits={packet_engine.total_late_useful_bits:.0f} "
+            f"all_complete_bits={packet_engine.total_all_useful_bits:.0f} "
             f"wait={packet_engine.wait_actions} partial={packet_engine.partial_transmissions} "
             f"deadline_drops={packet_engine.deadline_drops} "
             f"critic_updates={movement_agent.num_critic_update_iteration} "
@@ -5187,7 +5198,7 @@ def train(
             )
             + (
                 f" original_reward={episode_existing_movement_reward:.6f}"
-                f" ee={safe_energy_efficiency(timely_goodput_mbits, episode_energy):.9f}"
+                f" ee={safe_energy_efficiency(total_all_useful_mbits, episode_energy):.9f}"
                 f" rnd_bonus_mean={np.mean(episode_rnd_normalized_bonuses):.6f}"
                 f" rnd_bonus_max={np.max(episode_rnd_normalized_bonuses):.6f}"
                 f" predictor_loss={rnd_explorer.last_predictor_loss}"
@@ -5207,8 +5218,8 @@ def train(
                 f"[Dinkelbach block "
                 f"{dinkelbach_event['dinkelbach_block_index']}]\n"
                 f"episodes={first_episode}-{episode + 1}\n"
-                f"timely_mbits="
-                f"{dinkelbach_event['dinkelbach_block_timely_mbits_so_far']:.9f}\n"
+                f"complete_mbits="
+                f"{dinkelbach_event['dinkelbach_block_complete_mbits_so_far']:.9f}\n"
                 f"mobility_energy_j="
                 f"{dinkelbach_event['dinkelbach_block_energy_joules_so_far']:.9f}\n"
                 f"lambda_old={dinkelbach_event['dinkelbach_lambda_used']:.12g}\n"
@@ -5913,19 +5924,11 @@ def train(
                 "target delay classifies timely versus late delivery; packets "
                 "continue unchanged until complete delivery, a non-time limit, "
                 "or episode-end settlement"
-                if formal_evaluation
-                else "unfinished packets terminate at target delay"
             ),
             "primary_energy_efficiency_definition": (
                 "(timely useful bits + late complete useful bits) / UAV movement energy"
-                if formal_evaluation
-                else "timely useful bits / UAV movement energy"
             ),
-            "primary_energy_efficiency_definition_id": (
-                COMPLETE_EE_DEFINITION
-                if formal_evaluation
-                else TIMELY_EE_DEFINITION
-            ),
+            "primary_energy_efficiency_definition_id": COMPLETE_EE_DEFINITION,
             "timely_energy_efficiency_definition": (
                 "timely useful bits / UAV movement energy"
             ),

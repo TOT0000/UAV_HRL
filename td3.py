@@ -353,7 +353,7 @@ class TD3():
         beta_com=TASK_POTENTIAL_BETA_COM,
         reward_mode="dinkelbach",
         task_potential_enabled=True,
-        c10_penalty_enabled=True,
+        c10_penalty_enabled=False,
         llm_reward_beta=0.0,
         potential_shaping_enabled=False,
         intrinsic_reward_fn=None,

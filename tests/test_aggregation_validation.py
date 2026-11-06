@@ -24,6 +24,16 @@ class FormalAggregationValidationTest(unittest.TestCase):
                 row.update({metric: 1.0 for metric in METRIC_COLUMNS})
                 row.update(
                     {
+                        "packet_deadline_policy": "continue_until_episode_end_v1",
+                        "primary_energy_efficiency_definition_id": (
+                            "complete_useful_bits_per_mobility_energy_v1"
+                        ),
+                        "total_timely_useful_mbits": 1.0,
+                        "total_late_useful_mbits": 1.0,
+                        "total_all_useful_mbits": 2.0,
+                        "total_timely_useful_bits": 1.0,
+                        "total_late_useful_bits": 1.0,
+                        "total_all_useful_bits": 2.0,
                         "com_delivered_e2e_delay_sum_seconds": 1.0,
                         "com_delivered_packets": 1,
                         "com_eligible_packets": 1,

@@ -75,7 +75,7 @@ from scenario_manifest import ScenarioManifest
 
 
 SEARCH_RUN_SCHEMA_VERSION = "uav-hrl-llm-potential-search-run-v1"
-SEARCH_PROMPT_VERSION = "uav-hrl-llm-potential-search-prompt-v4"
+SEARCH_PROMPT_VERSION = "uav-hrl-llm-potential-search-prompt-v5-complete-ee-no-c10"
 LEGACY_PROMPT_VERSION = "uav-hrl-llm-potential-search-prompt-v1"
 SUPPORTED_LEGACY_PROMPT_VERSIONS = {
     "uav-hrl-llm-potential-search-prompt-v0",

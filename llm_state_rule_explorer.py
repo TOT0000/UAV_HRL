@@ -46,7 +46,7 @@ from llm_explorer_state_rule import (
 
 LLM_STATE_RULE_METHOD_ID = "td3_dinkelbach_llm_explorer_state_rule"
 LLM_STATE_RULE_VERSION = "uav-hrl-llm-state-rule-explorer-v2"
-LLM_STATE_RULE_PROMPT_VERSION = "uav-hrl-llm-state-rule-prompts-v3"
+LLM_STATE_RULE_PROMPT_VERSION = "uav-hrl-llm-state-rule-prompts-v4-complete-ee-no-c10"
 LLM_STATE_RULE_SUMMARY_VERSION = "state-rule-observed-service-summary-v3"
 LLM_STATE_RULE_CACHE_VERSION = "state-rule-complete-input-cache-v3"
 LLM_STATE_RULE_ANALYSIS_OUTPUT_TOKENS = 4096
@@ -804,6 +804,12 @@ def state_rule_slot_service_record(
         "total_timely_useful_bits": float(
             slot_result.get("total_timely_useful_bits", 0.0)
         ),
+        "total_late_useful_bits": float(
+            slot_result.get("total_late_useful_bits", 0.0)
+        ),
+        "total_all_useful_bits": float(
+            slot_result.get("total_all_useful_bits", 0.0)
+        ),
         "fov_timely_delivered_raw_bits": float(
             slot_result.get("fov_timely_delivered_raw_bits", 0.0)
         ),
@@ -871,6 +877,8 @@ def slot_service_summary(
         totals["same_slot_multi_hop_packets"] += int(record.get("same_slot_multi_hop_packets", 0))
         for key in (
             "total_timely_useful_bits",
+            "total_late_useful_bits",
+            "total_all_useful_bits",
             "fov_timely_delivered_raw_bits",
             "fov_timely_useful_bits",
             "com_timely_delivered_bits",
@@ -930,11 +938,21 @@ def slot_service_summary(
             for task in ("fov", "com")
         ) if metrics else None,
         "total_timely_useful_bits": metric_number("timely_useful_delivery_bits"),
+        "total_late_useful_bits": metric_number("late_useful_delivery_bits"),
+        "total_all_useful_bits": metric_number(
+            "all_complete_useful_delivery_bits"
+        ),
         "fov_timely_delivered_raw_bits": metric_number(
             "fov_timely_delivered_raw_bits"
         ),
         "fov_timely_useful_bits": metric_number("fov_timely_useful_bits"),
         "com_timely_delivered_bits": metric_number("com_timely_delivered_bits"),
+    }
+    authoritative = {
+        key: value
+        for key, value in authoritative.items()
+        if value is not None
+        or key not in {"total_late_useful_bits", "total_all_useful_bits"}
     }
     observed_for_alignment = {
         key: float(totals[key])
@@ -942,6 +960,8 @@ def slot_service_summary(
             "on_time_gs_delivery_packets",
             "late_gs_delivery_packets",
             "total_timely_useful_bits",
+            "total_late_useful_bits",
+            "total_all_useful_bits",
             "fov_timely_delivered_raw_bits",
             "fov_timely_useful_bits",
             "com_timely_delivered_bits",

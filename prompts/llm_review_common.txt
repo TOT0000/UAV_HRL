@@ -50,12 +50,12 @@ The deadline continues across queue changes and relay hops.
 
 The task seeks higher energy efficiency and fewer end-to-end deadline violations:
 
-EE = sum_t B_timely,t / sum_t E_movement,t
+EE = sum_t B_complete,t / sum_t E_movement,t
 
-B_timely,t is useful data delivered to the GS within its deadline during interval t.
+B_complete,t is useful data completely delivered to the GS during interval t, whether timely or late. Late delivery remains a violation; partial or unfinished data contributes zero.
 E_movement,t is movement energy of all UAVs during interval t.
 
-EE uses totals over the entire episode. Data acquisition and intermediate forwarding contribute to the delivery process; only timely GS delivery contributes to B_timely.
+EE uses totals over the entire episode. Data acquisition and intermediate forwarding contribute to the delivery process; only complete GS delivery contributes to B_complete.
 
 Assess energy use and deadline violations together with useful delivery volume. Reduced service can lower energy consumption or traffic load while also reducing task achievement.
 
@@ -78,7 +78,7 @@ The capture conditions, coverage/image-quality calculations, VS data-volume calc
 
 {{VISUAL_SENSING_SPEC}}
 
-VS packets are generated when capture is valid and subsequently require timely delivery to the GS.
+VS packets are generated when capture is valid. Timely GS delivery satisfies QoS; a late packet remains eligible for service and complete-delivery goodput until episode end.
 
 For communication nodes a and b:
 
@@ -156,11 +156,11 @@ r_total = r_base + beta * r_extra
 The original state is preserved.
 
 r_base =
-B_timely_Mbit
+B_complete_Mbit
 - lambda * E_movement_J
-- P_C9 - P_C10 - P_COM
+- P_C9 - P_COM
 
-B_timely_Mbit and E_movement_J are outcomes over the subsequent movement interval, measured in Mbit and J. Penalties follow the definitions above. The training procedure manages lambda.
+B_complete_Mbit and E_movement_J are outcomes over the subsequent movement interval, measured in Mbit and J. C10 remains a geometry/diagnostic input but is not a movement-reward penalty. The training procedure manages lambda.
 
 beta = {{BETA}}
 

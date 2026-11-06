@@ -40,9 +40,9 @@ End-to-end deadlines are 15 ms for VS and 10 ms for COM.
 
 The objective is higher energy efficiency and fewer end-to-end deadline violations:
 
-EE = sum_t B_timely,t / sum_t E_movement,t
+EE = sum_t B_complete,t / sum_t E_movement,t
 
-B_timely,t: useful data delivered to the GS within deadline during interval t.
+B_complete,t: useful data fully delivered to GS, timely or late. Late remains a violation; incomplete data does not count.
 E_movement,t: movement energy of all UAVs during interval t.
 The sums cover the entire episode.
 
@@ -136,11 +136,11 @@ r_extra = sum_k w_k * f_k
 r_total = r_base + beta * r_extra
 
 r_base =
-B_timely_Mbit - lambda * E_movement_J
-- P_C9 - P_C10 - P_COM
+B_complete_Mbit - lambda * E_movement_J
+- P_C9 - P_COM
 
 The original state is preserved.
-B_timely_Mbit, E_movement_J, and penalties are subsequent-interval outcomes.
+B_complete_Mbit, E_movement_J, and penalties are subsequent-interval outcomes. C10 is diagnostic-only.
 lambda is managed by training.
 beta = {{BETA}}
 
@@ -155,7 +155,7 @@ Complete the following checks before submitting a candidate:
 Identify the UAV, target, queue, or link represented by each input you use, together with its units, validity conditions, and entity relationships. Establish how TD3 movement can affect these quantities through the system workflow.
 
 (2) Connect task requirements to features.
-Use timely delivery, movement energy, and end-to-end deadline requirements to select observations and computations that help distinguish conditions relevant to movement decisions. Consider relationships and trade-offs among sensing, uploading, and subsequent delivery to the GS.
+Use complete delivery, movement energy, and deadlines to select observations and computations relevant to movement decisions. Consider sensing, uploading, and GS delivery trade-offs.
 
 (3) Verify formulas and reward direction.
 For each feature, confirm that the implemented formula measures what its description states. For each nonzero weight, check how w_k * f_k changes as relevant inputs vary and what behavior that change encourages. Incorporate the conditions needed for its task benefit into the computation.

@@ -181,7 +181,7 @@ class QosAndCheckpointContractTest(unittest.TestCase):
         self.assertEqual(DEADLINE_SWEEP_INJECTION_CUTOFF_SECONDS, 59.97)
 
     def test_schema_21_and_90d_current_schema_are_rejected(self):
-        self.assertEqual(CHECKPOINT_SCHEMA_VERSION, 35)
+        self.assertEqual(CHECKPOINT_SCHEMA_VERSION, 36)
         with self.assertRaisesRegex(RuntimeError, "must be retrained"):
             _validate_checkpoint_schema({"checkpoint_schema_version": 21})
         with self.assertRaisesRegex(RuntimeError, "GS-progress"):

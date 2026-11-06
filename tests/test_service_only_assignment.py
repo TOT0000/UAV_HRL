@@ -59,7 +59,7 @@ def test_service_only_observation_potential_and_checkpoint_contracts():
     assert MOVEMENT_STATE_DIM == 531
     assert len(names) == MOVEMENT_STATE_DIM
     assert not any("relay" in name.lower() for name in names)
-    assert CHECKPOINT_SCHEMA_VERSION == 35
+    assert CHECKPOINT_SCHEMA_VERSION == 36
     assert "service-only" in ASSIGNMENT_CONTRACT_VERSION
 
     env = Simulator(16)
@@ -79,7 +79,7 @@ def test_reward_contains_only_base_and_current_constraints():
             "com_range_penalty_mean": 0.3,
         },
     )
-    assert reward == pytest.approx(2.9)
+    assert reward == pytest.approx(3.1)
     assert "beta_relay" not in inspect.signature(
         ReplayBufferJoint._reward_numpy
     ).parameters

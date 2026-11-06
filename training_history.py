@@ -23,6 +23,8 @@ TRAINING_HISTORY_COLUMNS = (
     "reward",
     "timely_goodput_mbits",
     "total_timely_useful_mbits",
+    "total_late_useful_mbits",
+    "total_all_useful_mbits",
     "mobility_energy_j",
     "energy_efficiency_mbit_per_j",
     "dinkelbach_lambda_used",
@@ -31,7 +33,7 @@ TRAINING_HISTORY_COLUMNS = (
     "dinkelbach_update_status",
     "dinkelbach_block_index",
     "dinkelbach_block_episode",
-    "dinkelbach_block_timely_mbits_so_far",
+    "dinkelbach_block_complete_mbits_so_far",
     "dinkelbach_block_energy_joules_so_far",
     "eligible_packet_count",
     "delay_violation_count",
@@ -51,11 +53,13 @@ FLOAT_COLUMNS = (
     "reward",
     "timely_goodput_mbits",
     "total_timely_useful_mbits",
+    "total_late_useful_mbits",
+    "total_all_useful_mbits",
     "mobility_energy_j",
     "energy_efficiency_mbit_per_j",
     "dinkelbach_lambda_used",
     "dinkelbach_lambda_after_episode",
-    "dinkelbach_block_timely_mbits_so_far",
+    "dinkelbach_block_complete_mbits_so_far",
     "dinkelbach_block_energy_joules_so_far",
     "delay_violation_probability",
     "system_violation_probability",
@@ -80,7 +84,7 @@ BOOLEAN_COLUMNS = ("dinkelbach_lambda_updated",)
 
 STRING_COLUMNS = ("dinkelbach_update_status",)
 
-TRAINING_HISTORY_SCHEMA_VERSION = 7
+TRAINING_HISTORY_SCHEMA_VERSION = 8
 TRAINING_HISTORY_CSV = "training_history.csv"
 TRAINING_HISTORY_JSONL = "training_history.jsonl"
 TRAINING_HISTORY_COMMIT = "training_history_commit.json"
@@ -113,6 +117,8 @@ def build_training_history_row(
     reward,
     timely_goodput_mbits,
     total_timely_useful_mbits=None,
+    total_late_useful_mbits=0.0,
+    total_all_useful_mbits=None,
     mobility_energy_j,
     dinkelbach_lambda_used,
     dinkelbach_lambda_after_episode,
@@ -120,7 +126,7 @@ def build_training_history_row(
     dinkelbach_update_status,
     dinkelbach_block_index,
     dinkelbach_block_episode,
-    dinkelbach_block_timely_mbits_so_far,
+    dinkelbach_block_complete_mbits_so_far,
     dinkelbach_block_energy_joules_so_far,
     dinkelbach_block_completed=None,
     eligible_packet_count=0,
@@ -142,6 +148,19 @@ def build_training_history_row(
         if total_timely_useful_mbits is None
         else float(total_timely_useful_mbits)
     )
+    total_late_useful_mbits = float(total_late_useful_mbits)
+    total_all_useful_mbits = (
+        total_timely_useful_mbits + total_late_useful_mbits
+        if total_all_useful_mbits is None
+        else float(total_all_useful_mbits)
+    )
+    if not math.isclose(
+        total_all_useful_mbits,
+        total_timely_useful_mbits + total_late_useful_mbits,
+        rel_tol=1e-12,
+        abs_tol=max(1e-12, 32.0 * math.ulp(max(total_all_useful_mbits, 1.0))),
+    ):
+        raise ValueError("complete useful Mbits must equal timely plus late")
     mobility_energy_j = float(mobility_energy_j)
     system_eligible_packets = (
         int(eligible_packet_count)
@@ -164,9 +183,11 @@ def build_training_history_row(
         "reward": float(reward),
         "timely_goodput_mbits": timely_goodput_mbits,
         "total_timely_useful_mbits": total_timely_useful_mbits,
+        "total_late_useful_mbits": total_late_useful_mbits,
+        "total_all_useful_mbits": total_all_useful_mbits,
         "mobility_energy_j": mobility_energy_j,
         "energy_efficiency_mbit_per_j": safe_energy_efficiency(
-            timely_goodput_mbits, mobility_energy_j
+            total_all_useful_mbits, mobility_energy_j
         ),
         "dinkelbach_lambda_used": dinkelbach_lambda_used,
         "dinkelbach_lambda_after_episode": dinkelbach_lambda_after_episode,
@@ -176,7 +197,7 @@ def build_training_history_row(
         "dinkelbach_update_status": str(dinkelbach_update_status),
         "dinkelbach_block_index": dinkelbach_block_index,
         "dinkelbach_block_episode": dinkelbach_block_episode,
-        "dinkelbach_block_timely_mbits_so_far": dinkelbach_block_timely_mbits_so_far,
+        "dinkelbach_block_complete_mbits_so_far": dinkelbach_block_complete_mbits_so_far,
         "dinkelbach_block_energy_joules_so_far": dinkelbach_block_energy_joules_so_far,
         "eligible_packet_count": int(eligible_packet_count),
         "delay_violation_count": int(delay_violation_count),
@@ -209,7 +230,7 @@ def normalize_training_history_row(row):
         "dinkelbach_lambda_after_episode",
         "dinkelbach_block_index",
         "dinkelbach_block_episode",
-        "dinkelbach_block_timely_mbits_so_far",
+        "dinkelbach_block_complete_mbits_so_far",
         "dinkelbach_block_energy_joules_so_far",
         "delay_violation_probability",
         "system_violation_probability",
@@ -288,6 +309,18 @@ def validate_training_history(rows, identity):
         ):
             raise ValueError(
                 "training history timely_goodput_mbits must alias total timely useful Mbit"
+            )
+        if not math.isclose(
+            row["total_all_useful_mbits"],
+            row["total_timely_useful_mbits"] + row["total_late_useful_mbits"],
+            rel_tol=1e-12,
+            abs_tol=max(
+                1e-12,
+                32.0 * math.ulp(max(row["total_all_useful_mbits"], 1.0)),
+            ),
+        ):
+            raise ValueError(
+                "training history complete useful Mbits must equal timely plus late"
             )
         if (
             row["eligible_packet_count"] != row["system_eligible_packets"]

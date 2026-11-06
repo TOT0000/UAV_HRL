@@ -115,7 +115,8 @@ from dinkelbach_blocks import (
     dinkelbach_config_metadata,
 )
 
-CHECKPOINT_SCHEMA_VERSION = 35
+CHECKPOINT_SCHEMA_VERSION = 36
+PRE_UNIFIED_COMPLETE_GOODPUT_CHECKPOINT_SCHEMA_VERSION = 35
 PRE_SHARED_GOODPUT_REWARD_CHECKPOINT_SCHEMA_VERSION = 34
 PRE_EVENT_TIME_SERVICE_CHECKPOINT_SCHEMA_VERSION = 33
 PRE_PACKET_PATH_COST_CHECKPOINT_SCHEMA_VERSION = 32
@@ -136,7 +137,7 @@ PRE_MOVEMENT_MASK_CHECKPOINT_SCHEMA_VERSION = 3
 LEGACY_DINKELBACH_CHECKPOINT_SCHEMA_VERSION = 2
 MODEL_CHECKPOINT_TYPE = "model-only"
 FULL_CHECKPOINT_TYPE = "full-resume"
-FULL_RESUME_LOGGING_SCHEMA_VERSION = 2
+FULL_RESUME_LOGGING_SCHEMA_VERSION = 3
 
 FULL_RESUME_LOGGING_STATE_FIELDS = (
     "full_resume_logging_schema_version",
@@ -291,6 +292,10 @@ FORMAL_CORE_CONFIG_FIELDS = (
     "fov_packet_generation_contract_version",
     "timely_useful_goodput_contract_version",
     "timely_goodput_definition",
+    "late_useful_goodput_definition",
+    "complete_useful_goodput_definition",
+    "movement_goodput_definition",
+    "packet_deadline_policy",
     "fov_coverage_snapshot_timing",
     "fov_physical_packet_bits_coverage_weighted",
     "com_session_lifecycle_version",
@@ -1543,6 +1548,13 @@ def _checkpoint_uses_dinkelbach(metadata):
 def _validate_checkpoint_schema(metadata):
     schema = metadata.get("checkpoint_schema_version")
     if schema != CHECKPOINT_SCHEMA_VERSION:
+        if schema == PRE_UNIFIED_COMPLETE_GOODPUT_CHECKPOINT_SCHEMA_VERSION:
+            raise RuntimeError(
+                "checkpoint schema v35 used deadline-drop/timely-goodput movement "
+                "training and may include C10 movement penalties. The unified "
+                "late-delivery/complete-goodput/no-C10 contract requires training "
+                "from scratch"
+            )
         if schema == PRE_SHARED_GOODPUT_REWARD_CHECKPOINT_SCHEMA_VERSION:
             raise RuntimeError(
                 "checkpoint schema v34 contains sender-local shaped routing "

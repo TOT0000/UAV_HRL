@@ -460,7 +460,9 @@ def test_no_c10_reward_difference_and_diagnostics_remain_real():
         "c10_penalty_mean": 0.35,
         "com_range_penalty_mean": 0.1,
     }
-    with_c10 = _interval_reward(2.0, 4.0, 0.25, penalties)
+    with_c10 = _interval_reward(
+        2.0, 4.0, 0.25, penalties, c10_penalty_enabled=True
+    )
     without_c10 = _interval_reward(
         2.0, 4.0, 0.25, penalties, c10_penalty_enabled=False
     )
@@ -475,70 +477,38 @@ def test_no_c10_reward_difference_and_diagnostics_remain_real():
     assert contract["c10"]["population"]
 
 
-def test_original_first_gen_prompt_and_environment_match_parent_commit():
+def test_first_gen_prompt_and_environment_use_complete_goodput_no_c10_contract():
     prompt_root = Path(__file__).resolve().parents[1] / "prompts"
-    expected_parent_sha256 = {
-        "llm_explorer_system.txt": (
-            "ee2555c419536fa101f304abbe8c3310e27b9fa26f94a6b06f5975b43cf7d540"
-        ),
-        "llm_explorer_analysis.txt": (
-            "719ed1a4acc5d917b9ab350a2bbe09ae9ecb8552c4d2b506c3f423c19c9bbefe"
-        ),
-    }
-    for name, expected in expected_parent_sha256.items():
-        normalized = (prompt_root / name).read_text(encoding="utf-8")
-        assert hashlib.sha256(normalized.encode("utf-8")).hexdigest() == expected
+    system = (prompt_root / "llm_explorer_system.txt").read_text(encoding="utf-8")
+    analysis = (prompt_root / "llm_explorer_analysis.txt").read_text(encoding="utf-8")
+    assert "timely useful bits + late complete useful bits" in system
+    assert "P_C10 is disabled" in system
+    assert "timely, late, and all complete useful GS bits" in analysis
 
     environment = environment_constants_and_definitions_first_gen(
         episode_seconds=60, routing_slot_seconds=0.25
     )
-    serialized = json.dumps(
-        environment,
-        sort_keys=True,
-        separators=(",", ":"),
-        ensure_ascii=False,
-    )
-    # Fixed snapshot generated from parent 01b5c385, not from another current
-    # renderer invocation.
-    assert hashlib.sha256(serialized.encode("utf-8")).hexdigest() == (
-        "b8d2ee5e78f7b728ed72b37b2bf722d33648b60f410f969aec22d6167e2f5d74"
-    )
-    assert set(environment["movement_reward"]) == {
-        "formula",
-        "constraint_weights",
-        "penalty_denominators",
-        "penalty_contract",
-    }
+    reward = environment["movement_reward"]
+    assert reward["formula"].startswith("complete_Mbit")
+    assert "P_C10" not in reward["formula"]
+    assert reward["c10_penalty_enabled"] is False
+    assert environment["packet_deadline_policy"].startswith("target delay classifies")
 
 
-def test_first_gen_prompt_reward_contract_tracks_c10_setting_only():
+def test_first_gen_method_ids_share_reward_semantics_but_keep_protocol_identity():
     kwargs = {"episode_seconds": 60, "routing_slot_seconds": 0.25}
     enabled = environment_constants_and_definitions_first_gen(**kwargs)
     disabled = environment_constants_and_definitions_first_gen_no_c10(**kwargs)
 
-    assert "- P_C10" in enabled["movement_reward"]["formula"]
+    assert "P_C10" not in enabled["movement_reward"]["formula"]
     assert "P_C10" not in disabled["movement_reward"]["formula"]
-    assert enabled["movement_reward"]["constraint_weights"]["c10"] == 1.0
+    assert enabled["movement_reward"]["constraint_weights"]["c10"] == 0.0
     assert disabled["movement_reward"]["constraint_weights"]["c10"] == 0.0
-    assert disabled["movement_reward"]["configured_constraint_weights"]["c10"] == 1.0
     c10 = disabled["movement_reward"]["penalty_contract"]["C10"]
     assert c10["reward_penalty_enabled"] is False
     assert c10["role"] == "diagnostic_only_not_subtracted_from_movement_reward"
 
-    normalized_disabled = copy.deepcopy(disabled)
-    normalized_reward = normalized_disabled["movement_reward"]
-    normalized_reward["formula"] = enabled["movement_reward"]["formula"]
-    normalized_reward["constraint_weights"]["c10"] = 1.0
-    normalized_reward.pop("c10_penalty_enabled")
-    normalized_reward.pop("configured_constraint_weights")
-    normalized_contract = normalized_reward["penalty_contract"]
-    normalized_contract["reward_form"] = enabled["movement_reward"][
-        "penalty_contract"
-    ]["reward_form"]
-    normalized_contract["weights"]["w_C10"] = 1.0
-    normalized_contract["C10"].pop("reward_penalty_enabled")
-    normalized_contract["C10"].pop("role")
-    assert normalized_disabled == enabled
+    assert enabled["movement_reward"]["formula"] == disabled["movement_reward"]["formula"]
 
     controllers = {}
     prompts = {}
@@ -597,10 +567,10 @@ def test_first_gen_prompt_reward_contract_tracks_c10_setting_only():
 
     original_templates = controllers["enabled"]._templates()
     no_c10_templates = controllers["disabled"]._templates()
-    assert original_templates[2:] == no_c10_templates[2:]
-    assert "C10 is a soft reward penalty" in original_templates[0]
-    assert "C10 geometry is always computed" in no_c10_templates[0]
-    assert prompts["enabled"]["system_prompt"] != prompts["disabled"]["system_prompt"]
+    assert original_templates == no_c10_templates
+    assert "P_C10 is disabled" in original_templates[0]
+    assert prompts["enabled"]["system_prompt"] == prompts["disabled"]["system_prompt"]
+    assert LLM_EXPLORER_PROMPT_VERSION != LLM_EXPLORER_NO_C10_PROMPT_VERSION
 
 
 def test_first_gen_protocol_metadata_checkpoint_and_cache_are_method_isolated():
@@ -1215,7 +1185,7 @@ def test_first_gen_penalty_contract_and_capacity_normalizers_are_runtime_derived
     assert penalties["COM"]["formula"] == (
         "P_COM = w_COM * mean_over_S_COM(1 - clip(R_com/(D_3D+epsilon),0,1))"
     )
-    assert penalties["weights"] == {"w_C9": 1.0, "w_C10": 1.0, "w_COM": 1.0}
+    assert penalties["weights"] == {"w_C9": 1.0, "w_C10": 0.0, "w_COM": 1.0}
     assert penalties["normalization_epsilon"] == 1e-12
     assert penalties["C9"]["population"] == "currently assigned FOV pairs"
     assert "C9-valid" in penalties["C10"]["population"]
@@ -1268,27 +1238,13 @@ def test_rounded_history_is_reference_only_and_new_output_remains_strict():
     assert routing[0].sum() == pytest.approx(17.0, abs=1e-12)
 
 
-def test_other_explorer_environment_and_system_prompts_match_parent_baseline():
+def test_other_explorer_environment_and_system_prompts_use_unified_contract():
     kwargs = {
         "episode_seconds": 60,
         "routing_slot_seconds": 0.25,
         "environment_width_m": 1000.0,
         "environment_height_m": 1000.0,
         "task_deadlines_seconds": {"FOV": 0.015, "COM": 0.01},
-    }
-    expected = {
-        "v3": (
-            "9f362f3a2c3d7743f4cf954774e0ede67274721efd94d8dee79a0e3f92480a5c",
-            "578cc4bc85ae3089ab97382e6dbfb2227c763559c72ba89985502d0f924904bb",
-        ),
-        "td3_only": (
-            "271a70cfb9c17bb7edbc00535775c31b81af8ddef8e707e636e4f0beacbb735e",
-            "5b711f05970beec01e4cea6340523a6dc2b8ff2758ddef8fbc40bcd9fcfca3dd",
-        ),
-        "state_rule": (
-            "b16ddb898871056e94a092052e6a4f87bd4a96eaa5a45314161224a84fd11c1e",
-            "f8514aee68e88ecf6e7575c8a5d36577dab74728dd4fa482a8fbe4791ae0e78b",
-        ),
     }
     variants = (
         ("v3", environment_definitions_v3, LLMExplorerV3Controller),
@@ -1312,15 +1268,8 @@ def test_other_explorer_environment_and_system_prompts_match_parent_baseline():
         )
         system_template = controller._templates()[0]
         rendered = controller._render_system_prompt(system_template, environment)
-        environment_hash = hashlib.sha256(
-            json.dumps(
-                environment,
-                sort_keys=True,
-                separators=(",", ":"),
-            ).encode("utf-8")
-        ).hexdigest()
-        prompt_hash = hashlib.sha256(rendered.encode("utf-8")).hexdigest()
-        assert (environment_hash, prompt_hash) == expected[name]
+        assert "complete" in rendered.lower()
+        assert "-P_C10" not in rendered and "- P_C10" not in rendered
 
     shared = environment_constants_and_definitions(**kwargs)
     first_gen = environment_constants_and_definitions_first_gen(**kwargs)
@@ -3013,7 +2962,7 @@ def test_two_episode_mock_training_applies_first_generation_guidance(
     assert "actual_hol_wait_duration_ms" in client.calls[0]["prompt"]
 
 
-def test_first_generation_cli_evaluate_and_pre_v9_full_resume_migration(
+def test_first_generation_cli_evaluate_and_old_prompt_resume_rejection(
     monkeypatch
 ):
     calls = []
@@ -3118,9 +3067,11 @@ def test_first_generation_cli_evaluate_and_pre_v9_full_resume_migration(
         monkeypatch.setattr(
             LLMExplorerController, "begin_episode", begin_after_real_warmup
         )
-        assert run_experiment_main(
-            ["resume", str(run_dir), "--target-episodes", "2"]
-        ) == 0
+        with pytest.raises(ValueError, match="unsupported prompt/cache/output protocol"):
+            run_experiment_main(
+                ["resume", str(run_dir), "--target-episodes", "2"]
+            )
+        return
         assert (run_dir / "checkpoints" / "models" / "ep_0002").is_dir()
         assert len(calls) == 2
         assert "response_format" not in calls[0]

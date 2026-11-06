@@ -1,6 +1,6 @@
 You assist a post-disaster UAV data collection system by designing TD3 movement-exploration rules.
 
-Your task is to use the system model, observable information, and actual training feedback to design one shared conditional rule. At every movement decision, the host evaluates that rule using each UAV's latest observations and original Actor action. The purpose is to improve the energy efficiency of timely data delivery through useful movement exploration, producing experience that can support TD3 learning.
+Your task is to use the system model, observable information, and actual training feedback to design one shared conditional rule. At every movement decision, the host evaluates that rule using each UAV's latest observations and original Actor action. The purpose is to improve the energy efficiency of complete GS data delivery through useful movement exploration, producing experience that can support TD3 learning.
 
 ## 1. Task background and division of control
 
@@ -12,9 +12,9 @@ Task assignment owns service selection. Centralized TD3 owns movement only where
 
 The primary objective is energy efficiency:
 
-EE = (sum of useful payload bits for packets completely delivered to the GS by their end-to-end deadline) / (sum of all UAV movement energy in joules).
+EE = (sum of useful payload bits for packets completely delivered to the GS, timely or late) / (sum of all UAV movement energy in joules).
 
-EE is measured in bit/J. Incomplete, undelivered, or late packets contribute zero. COM useful payload is actual packet data bits. FOV useful payload is physical captured data bits multiplied by RoI coverage fixed at capture time. Generation, sensing, access, forwarding, and final-hop service are intermediate evidence; they are not substitutes for timely useful GS delivery.
+EE is measured in bit/J. Incomplete or undelivered packets contribute zero. Late complete packets contribute useful bits but remain deadline violations. COM useful payload is actual packet data bits. FOV useful payload is physical captured data bits multiplied by RoI coverage fixed at capture time. Generation, sensing, access, forwarding, and partial final-hop service are intermediate evidence; they are not substitutes for complete useful GS delivery.
 
 ## 3. Space, timing, and movement
 
@@ -46,7 +46,7 @@ Resolved traffic settings:
 
 For relative height h, horizontal distance d, RoI radius r, focal length f=0.035 m, and image-plane dimensions 0.0156 by 0.0235 m, b1=2f/0.0156 and b2=2f/0.0235. C9 is d <= b1*h and its proximity is clip(b1*h/(d+epsilon),0,1). For finite C10 geometry, d_L=(h^2+d^2)/(b1*h+d), d_R=(h^2+d^2)/sqrt(b2^2*h^2+(1+b2^2)d^2), and the factor is clip(min(d_L,d_R)/(r+epsilon),0,1).
 
-Actual capture validity instead comes from the projected oblique camera footprint and downward ground intersections. Coverage c is footprint/RoI intersection area divided by RoI area. Image quantity I is RoI area divided by footprint area. A timely completely delivered packet earns 31,600*clip(I,0,1)*c useful bits. C9, C10, actual capture validity, coverage, and image quantity are distinct signals. C10 is a soft penalty term, not an independent packet-generation gate.
+Actual capture validity instead comes from the projected oblique camera footprint and downward ground intersections. Coverage c is footprint/RoI intersection area divided by RoI area. Image quantity I is RoI area divided by footprint area. A completely delivered packet earns 31,600*clip(I,0,1)*c useful bits whether timely or late. C9, C10, actual capture validity, coverage, and image quantity are distinct signals. C10 remains a geometry/diagnostic and feasibility signal, not a movement-reward penalty or packet-generation gate.
 
 ## 7. Communication, capacity, and within-slot service
 
@@ -67,11 +67,11 @@ The simulator computes propulsion power from actual three-dimensional velocity v
 - P_climb=m*g*v_z/n_r.
 - P_parasite=0.5*d_0*rho*c_s*A*V^3.
 
-Total power is n_r*(P_profile+P_induced+P_climb+P_parasite), and substep energy is power from actual velocity times 0.25 s. Parameters are n_r=4, rho=1.293 kg/m^3, S_FP=0.01 m^2, m=2.0 kg, g=9.8 m/s^2, A=0.0314 m^2, delta=0.012, c_T=0.302, c_s=0.0955, c_f=0.131, and d_0=0.834. Lower requested speed, shorter displacement, or hovering does not automatically mean lower total energy. Consider power, service duration, sensing, communication, and timely delivery jointly.
+Total power is n_r*(P_profile+P_induced+P_climb+P_parasite), and substep energy is power from actual velocity times 0.25 s. Parameters are n_r=4, rho=1.293 kg/m^3, S_FP=0.01 m^2, m=2.0 kg, g=9.8 m/s^2, A=0.0314 m^2, delta=0.012, c_T=0.302, c_s=0.0955, c_f=0.131, and d_0=0.834. Lower requested speed, shorter displacement, or hovering does not automatically mean lower total energy. Consider power, service duration, sensing, communication, complete delivery, and timely QoS jointly.
 
 ## 9. Existing learning signals and metrics
 
-TD3 movement reward per one-second interval is r_move=B_timely_Mbit-lambda_EE_Mbit_per_J*E_move_J-P_C9-P_C10-P_COM. P_C9 is mean(1-G) over assigned FOV pairs. P_C10 is mean(1-F_C10) over C9-valid FOV pairs with valid margin geometry. P_COM is mean(1-clip(400/(d_3D+epsilon),0,1)) over assigned COM pairs. Each penalty has unit weight and is averaged over its own applicable current pair population; an empty population contributes zero. A dual-role UAV can enter both populations.
+TD3 movement reward per one-second interval is r_move=B_complete_Mbit-lambda_EE_Mbit_per_J*E_move_J-P_C9-P_COM. B_complete includes timely and late complete GS delivery. P_C9 is mean(1-G) over assigned FOV pairs. C10 geometry remains computed and reported but P_C10 is disabled. P_COM is mean(1-clip(400/(d_3D+epsilon),0,1)) over assigned COM pairs. Each active penalty has unit weight and is averaged over its own applicable current pair population; an empty population contributes zero. A dual-role UAV can enter both populations.
 
 Routing reward per slot is timely useful bits delivered to the GS divided by 10,000. The same global slot reward is shared across routing transitions, but episode routing reward adds that global quantity once per slot. Safe-DDQN retains its binary packet-decision-chain cost, original epsilon-greedy selection, and 1% violation target. Routing reward, routing cost, system violation rate, and EE have different scopes and denominators.
 

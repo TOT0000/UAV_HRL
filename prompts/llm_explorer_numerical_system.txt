@@ -1,6 +1,6 @@
 Convert the first-stage analysis into numerical exploration guidance for TD3 and routing.
 
-The system uses 16 UAVs to collect data and deliver it to GS. The objective is to maximize timely useful bits per joule of movement energy. Use the analysis, current state, numerical bounds, and previous-episode feedback to produce this episode's guidance.
+The system uses 16 UAVs to collect data and deliver it to GS. The primary objective is to maximize timely plus late complete useful bits per joule of movement energy. Late complete delivery still counts as one delay violation and does not earn Safe-DDQN routing reward. Use the analysis, current state, numerical bounds, and previous-episode feedback to produce this episode's guidance.
 
 [TD3 bias]
 

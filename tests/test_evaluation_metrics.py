@@ -307,8 +307,15 @@ class EvaluationModeIntegrationTest(unittest.TestCase):
             checkpoint_dinkelbach_state = checkpoint_metadata["experiment"][
                 "dinkelbach_state"
             ]
-            self.assertNotIn(
-                "packet_deadline_policy", checkpoint_metadata["experiment"]
+            self.assertEqual(
+                checkpoint_metadata["experiment"]["packet_deadline_policy"],
+                PACKET_DEADLINE_POLICY_CONTINUE,
+            )
+            self.assertEqual(
+                checkpoint_metadata["experiment"][
+                    "primary_energy_efficiency_definition_id"
+                ],
+                COMPLETE_EE_DEFINITION,
             )
             checkpoint_constraint_state = checkpoint_metadata[
                 "routing_agent_configuration"

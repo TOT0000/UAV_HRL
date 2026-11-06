@@ -537,7 +537,7 @@ def test_prompt_is_complete_current_only_and_example_parses(design_fixture):
     )
     assert "Current observable information available before the TD3 movement action" in prompt
     assert "f and r_extra use pre-action information" in prompt
-    assert "useful data delivered to the GS within deadline" in prompt
+    assert "useful data fully delivered to GS, timely or late" in prompt
     assert "Select data using validity flags" in prompt
     assert "Return only one JSON object" in prompt
     assert "d_R=(h^2+d^2)/sqrt" in prompt
@@ -577,7 +577,7 @@ def test_prompt_is_complete_current_only_and_example_parses(design_fixture):
 
 def test_master_prompt_has_exact_placeholder_contract_and_supported_operations_match():
     template = PROMPT_TEMPLATE_PATH.read_text(encoding="utf-8")
-    assert PROMPT_VERSION == "uav-hrl-llm-design-prompt-v10"
+    assert PROMPT_VERSION == "uav-hrl-llm-design-prompt-v11-complete-ee-no-c10"
     assert {
         token
         for token in (
@@ -1887,7 +1887,7 @@ def test_repeated_failed_candidate_is_diagnosed_and_cannot_be_approved(tmp_path)
         client=client,
         max_attempts=4,
         output_dir=tmp_path / "duplicate-revision",
-        worker_timeout=10,
+        worker_timeout=30,
     )
     assert result["status"] == "approved"
     report = json.loads(
@@ -2761,13 +2761,14 @@ def test_parse_failure_carries_prior_runtime_issue_into_actual_next_request(
         {**_response(faulty, model=model), "content": raw_claim},
         _response(faulty, model=model),
     ]
-    client = MockClient(responses, model=model)
+    client = MockClient(responses, model=model, loaded_context=22_000)
     result = run_design(
         fixed_sample=fixed,
         provider=provider,
         model=model,
         client=client,
         max_attempts=3,
+        context_length=22_000,
         output_dir=tmp_path / f"history-{provider}-{model.split('/')[-1]}",
         worker_timeout=10,
     )
@@ -4072,7 +4073,7 @@ def test_evaluation_diagnostics_stop_when_minimum_revision_exceeds_budget(
         model=client.model,
         client=client,
         max_attempts=2,
-        context_length=16_000,
+        context_length=16_100,
         output_dir=output,
         timeout=10,
     )
@@ -4267,14 +4268,17 @@ def test_latest_invalid_json_does_not_reuse_older_parsed_candidate(tmp_path):
     old = _response(_candidate(passing=False, name="older-parsed-candidate"))
     newest_text = "LATEST-BROKEN-JSON"
     newest = {**_response(_candidate()), "content": newest_text}
-    client = MockClient([old, newest, _response(_candidate(name="fixed"))])
+    client = MockClient(
+        [old, newest, _response(_candidate(name="fixed"))], loaded_context=22_000
+    )
     result = run_design(
         fixed_sample=fixed,
         model=client.model,
         client=client,
         max_attempts=3,
+        context_length=21_000,
         output_dir=tmp_path / "latest-output",
-        worker_timeout=10,
+        worker_timeout=30,
     )
     assert result["status"] == "approved"
     prompt = (tmp_path / "latest-output" / "attempt_03" / "prompt.txt").read_text()

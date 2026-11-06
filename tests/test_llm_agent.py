@@ -2155,7 +2155,7 @@ def test_context_compaction_keeps_complete_candidate_and_tool_pairs(tmp_path):
         model=model.model_id,
         model_backend=model,
         max_model_calls=4,
-        context_length=20_250,
+        context_length=20_000,
         max_output_tokens=1_024,
         output_dir=tmp_path / "compaction",
     )
@@ -2239,7 +2239,7 @@ def test_pending_query_page_survives_compaction_into_actual_request(tmp_path):
         model="gpt-4o",
         model_backend=model,
         max_model_calls=3,
-        context_length=21_500,
+        context_length=21_000,
         max_output_tokens=1_024,
         output_dir=tmp_path / "pending-query-compaction",
     )
@@ -2494,7 +2494,7 @@ def test_pending_result_that_cannot_fit_stops_before_incomplete_request(tmp_path
         model=model.model_id,
         model_backend=model,
         max_model_calls=2,
-        context_length=19_500,
+        context_length=19_000,
         max_output_tokens=1_024,
         output_dir=tmp_path / "pending-does-not-fit",
     )

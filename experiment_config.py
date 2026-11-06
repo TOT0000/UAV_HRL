@@ -302,7 +302,7 @@ def validate_task_potential_weights():
     return {"C9": (1.0,), "C10": (1.0,), "COM": (1.0,)}
 
 
-def task_potential_contract_metadata(c10_penalty_enabled=True):
+def task_potential_contract_metadata(c10_penalty_enabled=False):
     """Return the shared reward/config/checkpoint auxiliary-reward contract."""
 
     validate_task_potential_weights()
@@ -362,6 +362,7 @@ _COMMON_METHOD = {
     "routing": "safe_ddqn",
     "task_observation": "full",
     "task_potential_enabled": True,
+    "c10_penalty_enabled": False,
 }
 
 _METHOD_DEFINITIONS = {
@@ -386,7 +387,7 @@ _METHOD_DEFINITIONS = {
         "agent": "td3",
         "movement": "centralized_td3",
         "reward_mode": "dinkelbach",
-        "c10_penalty_enabled": True,
+        "c10_penalty_enabled": False,
         "dinkelbach_update_interval_episodes": 200,
         "label": "TD3-Dinkelbach (200-Episode Lambda Update)",
     },
@@ -684,7 +685,7 @@ class MethodSpec:
         """Whether the computed C10 auxiliary value enters the movement reward."""
 
         definition = METHOD_REGISTRY[self.method_id]
-        return bool(definition.get("c10_penalty_enabled", True))
+        return bool(definition.get("c10_penalty_enabled", False))
 
     @property
     def dinkelbach_update_interval_episodes(self) -> int:
@@ -1284,6 +1285,14 @@ def comparison_method_configuration(method_spec: MethodSpec) -> dict:
             TIMELY_USEFUL_GOODPUT_CONTRACT_VERSION
         ),
         "timely_goodput_definition": "total timely useful bits",
+        "late_useful_goodput_definition": (
+            "total useful bits from packets completed at GS after target delay"
+        ),
+        "complete_useful_goodput_definition": (
+            "total timely useful bits plus total late complete useful bits"
+        ),
+        "movement_goodput_definition": "total complete useful bits",
+        "packet_deadline_policy": "continue_until_episode_end_v1",
         "fov_coverage_snapshot_timing": "packet generation/capture time",
         "fov_physical_packet_bits_coverage_weighted": False,
         "com_session_lifecycle_version": COM_SESSION_LIFECYCLE_VERSION,

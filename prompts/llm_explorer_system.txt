@@ -12,9 +12,9 @@ A UAV may serve both FOV and COM. Roles and service targets may change within an
 
 FOV packets originate at the sensing UAV. COM packets originate at an SR, first access its serving UAV through S2U, and then reach GS directly or through UAV relays and a final U2G hop.
 
-The primary objective is the energy efficiency of timely useful delivery:
+The primary objective is the energy efficiency of complete useful delivery:
 
-EE = timely useful bits fully delivered to GS / actual movement energy of all UAVs in J.
+EE = (timely useful bits + late complete useful bits) fully delivered to GS / actual movement energy of all UAVs in J.
 
 Energy includes all movement controllers and hovering. Examine delivered useful data, energy, and deadline violations together, and identify which terms explain an EE change. Safe-DDQN's deadline-violation learning target is 1%.
 
@@ -48,7 +48,7 @@ A routing slot lasts 250 ms, much longer than the 10/15 ms deadlines. Same-slot 
 
 The standard S2U, U2U, and U2G communication limit is a 3D distance of 400 m. Currently serviceable links dynamically share the standard total bandwidth of 10 MHz equally. Empty preselected links reserve no bandwidth.
 
-Geometry and channel conditions affect capacity. Realized transmission also depends on bandwidth sharing, queues, and remaining deadlines. A legal individual hop does not establish that an entire route can deliver on time.
+Geometry and channel conditions affect capacity. Realized transmission also depends on bandwidth sharing and queues. Remaining deadline indicates whether completion can still be timely, but crossing it does not stop or reprioritize service. A legal individual hop does not establish that an entire route can deliver on time.
 
 [FOV geometry and useful data]
 
@@ -74,7 +74,7 @@ margin_C10 = min(d_L,d_R) - r.
 
 A nonnegative margin satisfies the image-geometry scale condition.
 
-Actual sensing validity also includes positive relative altitude and valid camera-projection rays. Use the supplied capture_valid observation. C10 is a soft reward penalty rather than a packet-generation switch.
+Actual sensing validity also includes positive relative altitude and valid camera-projection rays. Use the supplied capture_valid observation. C10 remains a computed geometry/diagnostic and feasibility signal, but it is not subtracted from movement reward and is not a packet-generation switch.
 
 Let footprint denote the camera projection on the RoI plane:
 
@@ -101,9 +101,9 @@ Hovering consumes energy, and power is not simply linear in speed. The input pro
 
 The original TD3 reward is:
 
-r_move = B_timely,Mbit - lambda_EE*E_move,J - P_C9 - P_C10 - P_COM.
+r_move = B_complete,Mbit - lambda_EE*E_move,J - P_C9 - P_COM.
 
-lambda_EE uses Mbit/J. The three penalties reflect C9, C10, and COM access-distance conditions. Each is averaged over its own applicable service-pair population; an empty population contributes zero. The input supplies the actual definitions and values.
+lambda_EE uses Mbit/J. B_complete includes timely and late complete GS delivery; partial or unfinished packets contribute zero. P_C9 and P_COM retain their definitions. C10 geometry is still supplied for diagnostics but P_C10 is disabled. Each active penalty is averaged over its own applicable service-pair population; an empty population contributes zero.
 
 The Safe-DDQN reward for each routing slot is:
 
@@ -163,7 +163,7 @@ The input provides global outcomes, core summaries for all UAVs, complete action
 
 Interpret the data dictionary's distinctions between:
 - Requested bias, pre-projection Actor offset, movement-mask-qualified application, and final executed action.
-- Route preselection, actual packet use, positive transmitted bits, completed hops, and timely useful GS delivery.
+- Route preselection, actual packet use, positive transmitted bits, completed hops, timely useful GS delivery, and late complete useful GS delivery.
 - Actual time with a HOL packet under WAIT and decision-boundary observation counts.
 - Current-geometry expected capacity, realized allocated service, and the centralized routing-state normalization constants. Those constants are not current link capacities or realized service rates.
 - Measured zero, an empty queue, an unassigned target, and unknown information.

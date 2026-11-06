@@ -109,7 +109,7 @@ from llm_streaming import (
 
 
 AGENT_RUN_SCHEMA_VERSION = "uav-hrl-llm-feature-agent-run-v1"
-AGENT_PROMPT_VERSION = "uav-hrl-llm-feature-agent-prompt-v8"
+AGENT_PROMPT_VERSION = "uav-hrl-llm-feature-agent-prompt-v9-complete-ee-no-c10"
 AGENT_TOOL_CONTRACT_VERSION = "uav-hrl-llm-feature-agent-tools-v9"
 DEFAULT_MAX_MODEL_CALLS = 20
 DEFAULT_AGENT_OUTPUT_ROOT = Path("results") / "llm_agents"

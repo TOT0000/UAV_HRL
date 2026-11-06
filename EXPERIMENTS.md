@@ -340,9 +340,11 @@ counts, rather than an episode-number assumption, are authoritative.
 ## Movement constraint-reward contract
 
 Every method whose existing `task_potential_enabled` flag is true uses the
-post-action immediate reward `r_base - P_C9 - P_C10 - P_COM`. Each penalty has
-weight one, is averaged over the currently assigned pairs of its own task type,
-and is not divided by 60 or by a dynamic movement-step count. The
+post-action immediate reward `r_base - P_C9 - P_COM`. C9 and COM each retain
+weight one, are averaged over the currently assigned pairs of their own task
+type, and are not divided by 60 or by a dynamic movement-step count. C10
+geometry, observations, feasibility checks, and diagnostics remain available,
+but its movement-reward weight is zero for every comparison method. The
 `no_task_potential` methods apply none of these penalties. Dinkelbach and ratio
 methods retain their distinct base objectives.
 
@@ -464,16 +466,17 @@ quadrature and normalized by link-type physical LoS-Rician reference capacity.
 After all routing actions are chosen, only S2U/U2U/U2G links with an actual
 serviceable HOL packet share the common 10 MHz pool by equal FDMA. Empty
 preselections reserve no bandwidth. Generation, full-hop completion, queue
-emptying, and exact deadline expiry are event boundaries; after each such
+emptying, and exact deadline crossing are event boundaries; after each such
 change, bandwidth and capacity are recomputed only for future time while
 reusing the current 5 ms block's cached gains. Full-band capacity is never
 linearly scaled and no resource event draws new fading. A packet can complete
 at any positive sub-block time. Complete-packet store-and-forward immediately
 enqueues it at the receiver, whose already-held action may transmit it again in
 the same slot. FIFO, partial-hop receiver locking, Wait, hop limits, and the
-communication-energy model remain in force. An unfinished packet is removed at
-its absolute 10/15 ms deadline; a GS completion at exactly the deadline is
-processed first and is timely.
+communication-energy model remain in force. Crossing the absolute 10/15 ms
+deadline records the packet's late status without removing or reprioritizing
+it. A GS completion at exactly the deadline is processed first and is timely;
+later complete delivery remains eligible for movement goodput and EE.
 
 Within one routing slot, the allocator also reuses an already computed
 50-block capacity profile when link type, directed endpoints, exact allocated
@@ -490,7 +493,7 @@ python benchmarks/benchmark_active_link_capacity_cache.py --episode-seconds 5 --
 ```
 
 Packet deadlines are indexed by absolute deadline within each episode. Packet
-creation inserts one heap entry; delivery or drop invalidates it, and stale
+creation inserts one heap entry; delivery or terminal settlement invalidates it, and stale
 entries are removed lazily with bounded compaction. Event-time deadline checks
 use the heap minimum and run the historical UAV/SR/detached queue traversal
 only when a deadline is due or deferred queue cleanup is pending. The index is
@@ -901,15 +904,16 @@ mode, artifact schema, output path, and written episode count are recorded in
 metadata. Writer/open/serialization errors fail the evaluation, and the stream
 is closed on both successful and exceptional exits.
 
-Formal evaluation uses `packet_deadline_policy=continue_until_episode_end_v1`.
+Training and formal evaluation use
+`packet_deadline_policy=continue_until_episode_end_v1` for every method.
 The target delay still classifies a complete GS delivery as on-time or late,
 and a late delivery counts as one delay violation, but the packet keeps its
 normal FIFO position and may continue over S2U/U2U/U2G links until delivery or
 episode-end settlement. Queue capacity, hop limits, and other non-time limits
-remain active. Training and non-formal sampling retain the original
-`drop_at_target_delay_v1` policy. The primary evaluation EE and paper EE plots
-use all completely delivered useful bits (on-time plus late) divided by UAV
-movement energy. Per-episode outputs also retain
+remain active. The primary movement goodput, replay reward, Dinkelbach
+numerator, training/evaluation EE, and paper EE plots use all completely
+delivered useful bits (on-time plus late) divided by UAV movement energy.
+Safe-DDQN routing reward remains timely-only. Per-episode outputs also retain
 `timely_energy_efficiency_mbit_per_j`, `total_timely_useful_bits`,
 `total_late_useful_bits`, and `total_all_useful_bits`; fields containing
 `timely` never include late delivery. FOV useful bits in both classes use the
@@ -928,6 +932,15 @@ complete-delivery columns remain identified as deadline-drop/timely-EE data;
 compatibility backfills do not relabel them. Current paper plotting accepts only
 the v6 continued-delivery/complete-EE format. Historical v5 paper results must
 be redrawn with the corresponding legacy plotting code.
+
+First-generation LLM-Explorer training uses global, one-based episode numbers
+for its full analysis-plus-guidance schedule. After the existing warmup and
+previous-feedback checks, episodes through 500 call every episode; episodes
+501--1000 call on 501, 503, ..., 999; episodes from 1001 onward call on
+1001, 1005, ... . A schedule-skipped episode clears movement bias and routing
+weights, uses the ordinary exploration mechanisms, and still records feedback
+for the next scheduled call. Exact resume continues from the checkpointed
+global episode number; evaluation never calls the LLM.
 
 The canonical evaluation suites are `training_ee_vs_episode`,
 `uav_trajectory_snapshots`, `task_type_delay_vs_arrival_rate`,

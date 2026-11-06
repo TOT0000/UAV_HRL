@@ -613,7 +613,9 @@ class ExperimentPreflightTest(unittest.TestCase):
                 "episode_metrics": [],
             }
 
-            with mock.patch("HRL_task_aware.train", return_value=result):
+            with mock.patch("HRL_task_aware.train", return_value=result), mock.patch(
+                "evaluation_metrics.write_evaluation_outputs", return_value={}
+            ):
                 comparison_main(
                     self._evaluate_args(manifest_path, checkpoint, output)
                 )

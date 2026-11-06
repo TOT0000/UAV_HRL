@@ -30,7 +30,7 @@ SUPPORTED_OBS_INTERFACE_VERSIONS = (
     LEGACY_OBS_INTERFACE_VERSION,
     OBS_INTERFACE_VERSION,
 )
-PROMPT_VERSION = "uav-hrl-llm-design-prompt-v10"
+PROMPT_VERSION = "uav-hrl-llm-design-prompt-v11-complete-ee-no-c10"
 DESIGN_RUN_SCHEMA_VERSION = "uav-hrl-llm-design-run-v4"
 APPROVED_ARTIFACT_SCHEMA_VERSION = "uav-hrl-approved-shared-feature-design-v2"
 ROOT = Path(__file__).resolve().parent
@@ -744,9 +744,9 @@ def render_environment_interface(
                 "- C9 uses G=clip(b1*h/(d+epsilon),0,1), violation=1-G, averaged over currently assigned VS pairs. model_range_valid is d<=b1*h with valid positive geometry.",
                 "- After C9 is model-range-valid, d_L=(h^2+d^2)/(b1*h+d) and d_R=(h^2+d^2)/sqrt(b2^2*h^2+(1+b2^2)*d^2). C10 violation=1-clip(min(d_L,d_R)/(RoI_radius+epsilon),0,1), averaged only over finite C9-valid pairs.",
                 "- vs_geometry_valid, vs_c10_geometry_valid, and vs_capture_valid are distinct. The exact C9 boundary may be model-range-valid while capture-invalid because of a horizontal corner ray.",
-                "- Packet generation requires vs_capture_valid, but incomplete C10 coverage is not a separate hard gate. image_quantity is RoI area divided by the oblique camera-footprint area and its raw value may exceed 1. A valid capture creates physical_bits=packet_max_bits*clip(image_quantity,0,1). On timely GS delivery, useful VS bits equal those frozen physical bits times frozen capture coverage; useful COM bits equal timely physical bits.",
+                "- Packet generation requires vs_capture_valid, but incomplete C10 coverage is not a separate hard gate. image_quantity is RoI area divided by the oblique camera-footprint area and its raw value may exceed 1. A valid capture creates physical_bits=packet_max_bits*clip(image_quantity,0,1). On complete GS delivery, timely or late, useful VS bits equal those frozen physical bits times frozen capture coverage; useful COM bits equal complete physical bits.",
                 "- COM violation=1-clip(communication_range_m/(assigned_S2U_distance_3d+epsilon),0,1), averaged over all assigned COM pairs, including out-of-range pairs.",
-                "- The three stored baseline penalties are per-task-type means and each has weight 1; they are post-action reward components and therefore are not present in obs.",
+                "- C9 and COM are stored per-task-type mean reward penalties with weight 1. C10 is still computed as geometry and diagnostic information but has zero movement-reward weight. These post-action values are not present in obs.",
             )
         )
     if include_constants:
@@ -865,9 +865,12 @@ def packet_lifecycle_and_observation_timing() -> str:
         "all UAVs, including empty ones, preselect and hold one legal next hop. Activated "
         "COM and valid VS sources generate at fixed-rate event times; future events are "
         "unobservable. Full-packet store-and-forward S2U/U2U/U2G may multi-hop within "
-        "the slot. Only serviceable links share equal FDMA; arrival, completion, or "
-        "expiry reallocates future bandwidth without resampling current 5 ms fading. "
-        "GS arrival no later than the 10 ms COM or 15 ms VS deadline is timely. Boundary "
+        "the slot. Only serviceable links share equal FDMA; arrival or completion "
+        "reallocates future bandwidth without resampling current 5 ms fading. Passing a "
+        "deadline does not drop or reprioritize a packet: it may continue until complete "
+        "GS delivery or episode end. GS arrival no later than the 10 ms COM or 15 ms VS "
+        "deadline is timely; later complete arrival is a violation but counts toward "
+        "movement goodput and EE. Boundary "
         "snapshots contain only generated unfinished packets; HOL validity describes the "
         "FIFO head, and empty queues use false validity plus zero padding. Violations are "
         "historical outcomes."
@@ -880,7 +883,7 @@ def visual_sensing_spec(constants_metadata: dict[str, Any]) -> str:
         "C9 proximity is G=clip(b1*h/(d+epsilon),0,1); model-range validity requires "
         "finite positive geometry and d<=b1*h. C9 penalty is mean(1-G) over assigned "
         "VS pairs. For C9-valid pairs, d_L=(h^2+d^2)/(b1*h+d) and "
-        "d_R=(h^2+d^2)/sqrt(b2^2*h^2+(1+b2^2)*d^2); C10 penalty is "
+        "d_R=(h^2+d^2)/sqrt(b2^2*h^2+(1+b2^2)*d^2); the C10 diagnostic violation is "
         "mean(1-clip(min(d_L,d_R)/(RoI_radius+epsilon),0,1)) over finite eligible "
         "pairs. Capture validity is a distinct polygon/corner-ray geometry check; C10 "
         "incomplete coverage is not an additional packet-generation gate. Coverage is "
@@ -888,8 +891,9 @@ def visual_sensing_spec(constants_metadata: dict[str, Any]) -> str:
         "footprint area is the area of the same canonical oblique footprint polygon, and "
         "image_quantity=RoI area/camera footprint area; this raw ratio may exceed 1. A valid capture "
         "creates physical_bits=packet_max_bits*clip(image_quantity,0,1), including partial "
-        "coverage. Timely useful VS bits at GS equal the frozen physical bits times the "
-        "frozen capture coverage. geometry-valid, C10-valid, and capture-valid flags in "
+        "coverage. Complete useful VS bits at GS, timely or late, equal the frozen physical "
+        "bits times frozen capture coverage. C10 remains a diagnostic and feasibility "
+        "signal with zero movement-reward weight. geometry-valid, C10-valid, and capture-valid flags in "
         "obs are intentionally distinct."
     )
 

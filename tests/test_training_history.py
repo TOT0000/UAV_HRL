@@ -43,7 +43,7 @@ class TrainingHistoryPersistenceTest(unittest.TestCase):
             dinkelbach_update_status="accumulating",
             dinkelbach_block_index=1,
             dinkelbach_block_episode=episode,
-            dinkelbach_block_timely_mbits_so_far=(
+            dinkelbach_block_complete_mbits_so_far=(
                 episode * (episode + 1) / 2
             ),
             dinkelbach_block_energy_joules_so_far=episode * energy,
@@ -105,7 +105,7 @@ class TrainingHistoryPersistenceTest(unittest.TestCase):
                         "energy_efficiency_mbit_per_j",
                         "dinkelbach_lambda_used",
                         "dinkelbach_lambda_after_episode",
-                        "dinkelbach_block_timely_mbits_so_far",
+                        "dinkelbach_block_complete_mbits_so_far",
                         "dinkelbach_block_energy_joules_so_far",
                     )
                 )
@@ -156,7 +156,7 @@ class TrainingHistoryPersistenceTest(unittest.TestCase):
                     dinkelbach_update_status="accumulating",
                     dinkelbach_block_index=1,
                     dinkelbach_block_episode=1,
-                    dinkelbach_block_timely_mbits_so_far=1.0,
+                    dinkelbach_block_complete_mbits_so_far=1.0,
                     dinkelbach_block_energy_joules_so_far=1.0,
                 )
             ]
