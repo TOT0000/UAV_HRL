@@ -79,11 +79,11 @@ from llm_potential import (
 from llm_explorer import (
     LLM_EXPLORER_CASE_VERSION,
     LLM_EXPLORER_GUIDANCE_MAX_OUTPUT_TOKENS,
-    LLM_EXPLORER_NUMERICAL_OUTPUT_PROTOCOL,
     LLM_EXPLORER_SUMMARY_VERSION,
     LLM_EXPLORER_VERSION,
     first_gen_resume_protocol_upgrade,
     first_gen_cache_version,
+    first_gen_output_protocol,
     first_gen_prompt_version,
     llm_explorer_path_preflight,
 )
@@ -149,7 +149,11 @@ def _explorer_preflight_options(method):
             if method.llm_explorer_v3_enabled
             else "llm_explorer"
         ),
-        "named_routing": bool(method.llm_explorer_v3_enabled),
+        "named_routing": bool(
+            method.llm_explorer_v3_enabled
+            or method.method_id
+            == "td3_dinkelbach_llm_explorer_wo_c10_penalty"
+        ),
         "td3_only": bool(method.llm_explorer_td3_only_enabled),
     }
     if method.llm_explorer_state_rule_enabled:
@@ -1122,7 +1126,7 @@ def run(args):
                 case_selection_version=LLM_EXPLORER_CASE_VERSION,
                 cache_version=first_gen_cache_version(method.method_id),
                 numerical_output_protocol=(
-                    LLM_EXPLORER_NUMERICAL_OUTPUT_PROTOCOL
+                    first_gen_output_protocol(method.method_id)
                 ),
                 guidance_max_output_tokens=(
                     LLM_EXPLORER_GUIDANCE_MAX_OUTPUT_TOKENS
@@ -1133,7 +1137,10 @@ def run(args):
                 annealing_end_episode=None,
                 td3_guidance="episode_fixed_raw_bias_added_once",
                 routing_guidance=(
-                    "episode_fixed_16x17_raw_relative_weights_with_host_normalized_pre_mask_prior"
+                    "episode_fixed_named_nonself_plus_gs_weights_mapped_to_16x17"
+                    if method.method_id
+                    == "td3_dinkelbach_llm_explorer_wo_c10_penalty"
+                    else "episode_fixed_16x17_raw_relative_weights_with_host_normalized_pre_mask_prior"
                 ),
                 routing_intervention=(
                     "epsilon_branch_100_percent_masked_renormalized_weights; "
@@ -1489,7 +1496,7 @@ def run_resume(args):
             case_selection_version=LLM_EXPLORER_CASE_VERSION,
             cache_version=first_gen_cache_version(method.method_id),
             numerical_output_protocol=(
-                LLM_EXPLORER_NUMERICAL_OUTPUT_PROTOCOL
+                first_gen_output_protocol(method.method_id)
             ),
             guidance_max_output_tokens=(
                 LLM_EXPLORER_GUIDANCE_MAX_OUTPUT_TOKENS

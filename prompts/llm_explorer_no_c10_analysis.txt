@@ -1,0 +1,79 @@
+Combine the previous episode’s outcomes with the current initial state to identify the main factors affecting useful delivery, energy, and delay violations. Propose movement and routing exploration guidance for this episode.
+
+[Current training phase and exploration settings]
+
+{{PHASE_AND_EXPLORATION_SETTINGS}}
+
+These include the episode number, training progress, warmup status, sigma_episode_start, epsilon, and bias bounds.
+
+[Previous episode’s global outcomes]
+
+{{EPISODE_OUTCOMES}}
+
+Use EE, timely and late complete useful delivery, movement energy, FOV/COM outcomes, and delay-violation numerators and denominators to identify the main limitations.
+
+[Previous episode’s complete guidance and application outcomes]
+
+{{PREVIOUS_COMPLETE_GUIDANCE}}
+
+{{PREVIOUS_APPLICATION_STATUS}}
+
+Compare the previous guidance, its actual application, and the observed outcomes to assess which guidance should be retained or adjusted.
+
+[Currently observable initial state]
+
+{{CURRENT_OBSERVABLE_INITIAL_STATE}}
+
+This includes UAV positions, roles, movement masks, queues, known RoIs/SRs, service relationships, and legal links. Tasks and links may change within the episode.
+
+[Actual settings and data dictionary]
+
+{{RESOLVED_SETTINGS_AND_DATA_DICTIONARY}}
+
+Use these to identify timing, traffic, deadlines, communication range, camera geometry, action decoding, penalty definitions, and statistical scopes.
+
+Coordinate and direction definitions:
+- Relative position: target position minus UAV position.
+- Relative altitude h: UAV altitude minus target altitude.
+- Heading error: target bearing minus the Actor’s horizontal direction, wrapped to [-pi,pi).
+- Direction summaries include circular means, concentration, and valid sample counts.
+
+[Movement power references]
+
+{{MOVEMENT_POWER_REFERENCE_POINTS}}
+
+[Movement and service statistics for all UAVs]
+
+{{MOVEMENT_AND_SERVICE_TABLES}}
+
+Use roles, TD3 control and bias application counts, Actor/actual actions, projection rates, energy, target geometry, sensing, access, and queue data to assess the effects of movement adjustments.
+
+[Routing statistics for all sender UAVs]
+
+{{ROUTING_TABLES}}
+
+Use action frequencies, legal opportunities, actual transmission, completed hops, waiting duration, and link capacity to assess forwarding preferences. Interpret the scope of representative-link data according to the field definitions.
+
+[Representative cases]
+
+{{REPRESENTATIVE_CASES}}
+
+Use cases to explain how the main limitations arise and aggregate statistics to assess how widespread they are.
+
+[Analysis output]
+
+Return the following four concise sections:
+
+1. Priority limitations
+Choose at most two main problems. Support your assessment with numerical evidence and valid denominators, and explain their effects on complete useful delivery, energy, or delay violations.
+
+2. TD3 exploration recommendations
+Identify UAV IDs, action components, bias directions, and magnitudes, with supporting evidence. Express magnitudes as raw bias values or fractions of the current sigma bound. Consider changes in roles and target directions, and the suitability of a fixed episode-wide bias.
+
+3. Routing exploration recommendations
+Use sender UAV_i and destination UAV_j (j != i) or GS to specify relative weights for important destinations and explain the evidence. State how the remaining destination weights should be assigned. Treat waiting as an outcome of link availability, receiver locking, or queue blocking, and analyze the causes that can be improved.
+
+4. Expected effects and uncertainty
+Explain the expected effects on useful delivery, energy, and delay violations, together with hypotheses requiring subsequent validation. For all remaining entries, explicitly choose neutral guidance or evidence-supported reuse of historical guidance.
+
+Neutral guidance means zero TD3 bias and weight 1 for each sender’s other 15 UAV destinations and GS. The next stage will produce the complete numerical output from this analysis.

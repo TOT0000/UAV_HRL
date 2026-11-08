@@ -314,6 +314,7 @@ class ControlledDQNTest(unittest.TestCase):
         self.assertFalse(hasattr(agent, "cost_optimizer"))
         self.assertFalse(hasattr(agent, "eta"))
         next_state = torch.zeros((1, 42), dtype=torch.float32)
+        next_state[0, 0] = 1.0
         next_state[0, 10:13] = torch.tensor([1.0, 0.0, 1.0])
         target = agent._standard_targets(
             next_state,

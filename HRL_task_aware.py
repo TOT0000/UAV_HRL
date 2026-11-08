@@ -173,6 +173,7 @@ from llm_explorer import (
     environment_constants_and_definitions_first_gen_no_c10,
     explorer_metadata,
     first_gen_prompt_version,
+    LLM_EXPLORER_NO_C10_METHOD_ID,
     first_gen_slot_service_record,
     llm_explorer_path_preflight,
 )
@@ -997,7 +998,7 @@ def _run_routing_slot(
                 # COM/FOV task class.
                 continue
             inspection = ddqn.inspect_action_scores(
-                states[uid], effective_masks[uid]
+                states[uid], effective_masks[uid], uav_id=uid
             )
             routing_q_score_accumulator.add_decision(
                 inspection,
@@ -2639,7 +2640,10 @@ def train(
                 if method_spec.llm_explorer_v3_enabled
                 else "llm_explorer"
             ),
-            named_routing=method_spec.llm_explorer_v3_enabled,
+            named_routing=(
+                method_spec.llm_explorer_v3_enabled
+                or method_spec.method_id == LLM_EXPLORER_NO_C10_METHOD_ID
+            ),
             td3_only=method_spec.llm_explorer_td3_only_enabled,
             state_rule=method_spec.llm_explorer_state_rule_enabled,
         )

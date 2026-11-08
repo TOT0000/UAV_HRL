@@ -1,0 +1,37 @@
+Use the following information to produce complete numerical exploration guidance for this episode.
+
+[First-stage analysis]
+
+{{ANALYSIS_STAGE_OUTPUT}}
+
+[Current numerical settings and field definitions]
+
+{{CURRENT_NUMERICAL_SETTINGS_AND_DEFINITIONS}}
+
+These include sigma_episode_start, bias bounds, epsilon, and coordinate and state-field definitions and units.
+
+[Currently observable initial state]
+
+{{CURRENT_OBSERVABLE_INITIAL_STATE}}
+
+[Previous episode’s TD3 bias]
+
+{{PREVIOUS_COMPLETE_TD3_BIAS}}
+
+[Previous episode’s raw routing weights]
+
+{{PREVIOUS_COMPLETE_ROUTING_WEIGHTS}}
+
+[Previous episode’s normalized routing probabilities before legal masking]
+
+{{PREVIOUS_COMPLETE_ROUTING_PRIOR}}
+
+[Previous episode’s application outcomes]
+
+{{PREVIOUS_APPLICATION_STATUS}}
+
+[Validation feedback; empty on the first attempt]
+
+{{VALIDATION_FEEDBACK_OR_EMPTY}}
+
+Follow the first-stage analysis and current numerical bounds to return JSON containing complete td3_bias and routing_weights. For remaining entries, use the neutral values or historical guidance selected in the analysis. When validation feedback is present, apply the corrections and return the complete output.

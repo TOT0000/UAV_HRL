@@ -8,7 +8,13 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from DDQN import DDQN, QNetwork, device, routing_action_mask_from_state
+from DDQN import (
+    DDQN,
+    QNetwork,
+    device,
+    forwarding_or_forced_wait_mask,
+    routing_action_mask_from_state,
+)
 from experiment_config import ROUTING_GAMMA, ROUTING_LEARNING_RATE, ROUTING_TAU
 from rng_contract import NamedRNGStreams, build_torch_module
 
@@ -61,13 +67,16 @@ class ControlledDQN:
         logits_noise_std=0.0,
         eta=None,
     ):
-        del uav_id, visited_nodes, eta
+        del visited_nodes, eta
         state_tensor = torch.as_tensor(
             np.asarray(state).reshape(1, -1), dtype=torch.float32, device=device
         )
         with torch.no_grad():
             q_values = self.q_network(state_tensor).cpu().numpy().reshape(-1)
-        legal = np.ones(self.action_dim, dtype=bool) if mask is None else np.asarray(mask, dtype=bool)
+        effective = np.ones(self.action_dim, dtype=bool) if mask is None else np.asarray(mask, dtype=bool)
+        legal = forwarding_or_forced_wait_mask(
+            effective, uav_id, self.action_dim
+        )
         if legal.shape != (self.action_dim,):
             raise ValueError("routing mask shape does not match controlled DQN actions")
         if not legal.any():
@@ -162,8 +171,10 @@ class RandomRoutingController:
         logits_noise_std=0.0,
         eta=None,
     ):
-        del state, uav_id, visited_nodes, epsilon, logits_noise_std, eta
-        legal = np.asarray(mask, dtype=bool)
+        del state, visited_nodes, epsilon, logits_noise_std, eta
+        legal = forwarding_or_forced_wait_mask(
+            np.asarray(mask, dtype=bool), uav_id
+        )
         if legal.ndim != 1 or not legal.any():
             raise ValueError("random routing requires at least one legal action")
         return int(self.rng.choice(np.flatnonzero(legal)))

@@ -29,12 +29,36 @@ Implementation of Double DQN for gym environments with discrete action space.
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
 
+def forwarding_or_forced_wait_mask(mask, sender_id, action_dim=None):
+    """Return legal forwarding actions, or the sender WAIT action as fallback.
+
+    ``mask`` is the scheduler's authoritative effective mask.  The sender
+    column remains the internal WAIT representation, but it is selectable only
+    when no legal forwarding destination exists.
+    """
+
+    legal = np.asarray(mask, dtype=bool).copy()
+    expected = int(action_dim if action_dim is not None else legal.size)
+    sender = int(sender_id)
+    if legal.shape != (expected,):
+        raise ValueError(
+            f"routing mask shape {legal.shape} does not match ({expected},)"
+        )
+    if not 0 <= sender < expected - 1:
+        raise ValueError(f"routing sender id {sender} is outside the UAV range")
+    legal[sender] = False
+    if legal.any():
+        return legal
+    legal[sender] = True
+    return legal
+
+
 def _bellman_target(immediate_value, next_value, not_done, discount):
     return immediate_value + not_done * discount * next_value
 
 
 def routing_action_mask_from_state(next_state, action_dim):
-    """Extract the embedded effective action mask from a routing state batch."""
+    """Extract effective masks and enforce forwarding-or-forced-WAIT policy."""
 
     num_uav = int(action_dim) - 1
     state_dim = next_state.shape[1]
@@ -53,10 +77,19 @@ def routing_action_mask_from_state(next_state, action_dim):
             f"Unsupported routing state layout: state_dim={state_dim}, "
             f"action_dim={action_dim}"
         )
-    action_mask = next_state[:, mask_start : mask_start + int(action_dim)].bool()
-    if (~action_mask.any(dim=1)).any():
-        raise ValueError("routing target state has no legal action")
-    return action_mask
+    effective = next_state[:, mask_start : mask_start + int(action_dim)].bool()
+    sender_one_hot = next_state[:, :num_uav]
+    senders = sender_one_hot.argmax(dim=1)
+    if (sender_one_hot.gather(1, senders.unsqueeze(1)).squeeze(1) <= 0).any():
+        raise ValueError("routing target state does not identify its sender")
+    selection = effective.clone()
+    rows = torch.arange(selection.shape[0], device=selection.device)
+    selection[rows, senders] = False
+    has_forward = selection.any(dim=1)
+    if (~has_forward).any():
+        selection[~has_forward] = False
+        selection[rows[~has_forward], senders[~has_forward]] = True
+    return selection
 
 
 """
@@ -207,9 +240,13 @@ class DDQN:
         # ----------  mask ----------
         # 1. 先從「外部傳入的 mask」開始，如果沒有就預設全 1
         if mask is None:
-            final_mask = np.ones_like(q_values, dtype=bool)
+            effective_mask = np.ones_like(q_values, dtype=bool)
         else:
-            final_mask = np.array(mask, dtype=bool)
+            effective_mask = np.array(mask, dtype=bool)
+
+        final_mask = forwarding_or_forced_wait_mask(
+            effective_mask, uav_id, self.action_dim
+        )
 
         if final_mask.shape != q_values.shape:
             raise ValueError(
@@ -286,7 +323,7 @@ class DDQN:
             }
         return action
 
-    def inspect_action_scores(self, state, mask=None):
+    def inspect_action_scores(self, state, mask=None, uav_id=None):
         """Read raw legal Q scores without touching selection or RNG state."""
 
         prohibited = (
@@ -319,30 +356,39 @@ class DDQN:
             raise AssertionError("Q-score inspection changed network module state")
         if q_r.shape != (self.action_dim,) or q_c.shape != (self.action_dim,):
             raise ValueError("Q-score inspection network output shape is invalid")
-        legal_mask = (
+        effective_mask = (
             np.ones(self.action_dim, dtype=bool)
             if mask is None
             else np.asarray(mask, dtype=bool).copy()
         )
-        if legal_mask.shape != q_r.shape:
+        if effective_mask.shape != q_r.shape:
             raise ValueError(
-                f"routing mask shape {legal_mask.shape} does not match "
+                f"routing mask shape {effective_mask.shape} does not match "
                 f"action values {q_r.shape}"
             )
-        if not legal_mask.any():
-            raise ValueError("routing action mask has no legal action")
+        if uav_id is None:
+            # Diagnostic-only callers historically omitted the sender and used
+            # UAV 0.  Production passes it explicitly because compact test
+            # states need not contain the canonical one-hot prefix.
+            sender = 0
+        else:
+            sender = int(uav_id)
+        selection_mask = forwarding_or_forced_wait_mask(
+            effective_mask, sender, self.action_dim
+        )
         lambda_cost_used = float(self.lambda_cost)
         q_safe = q_r - lambda_cost_used * q_c
         for name, values in (("Q_r", q_r), ("Q_c", q_c), ("Q_safe", q_safe)):
-            if not np.all(np.isfinite(values[legal_mask])):
+            if not np.all(np.isfinite(values[effective_mask])):
                 raise ValueError(f"legal routing {name} values must be finite")
-        masked_q_r = np.where(legal_mask, q_r, -np.inf)
-        masked_q_safe = np.where(legal_mask, q_safe, -np.inf)
+        masked_q_r = np.where(selection_mask, q_r, -np.inf)
+        masked_q_safe = np.where(selection_mask, q_safe, -np.inf)
         return {
             "q_r": q_r.copy(),
             "q_c": q_c.copy(),
             "q_safe": q_safe.copy(),
-            "legal_mask": legal_mask,
+            "legal_mask": effective_mask,
+            "selection_mask": selection_mask,
             "lambda_cost_used": lambda_cost_used,
             "reward_argmax_action": int(np.argmax(masked_q_r)),
             "safe_argmax_action": int(np.argmax(masked_q_safe)),

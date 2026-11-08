@@ -382,11 +382,15 @@ class RoutingQScoreDiagnosticAccumulator:
         q_c_native = np.asarray(inspection["q_c"])
         q_safe_native = np.asarray(inspection["q_safe"])
         legal_mask = np.asarray(inspection["legal_mask"], dtype=bool)
+        selection_mask = np.asarray(
+            inspection.get("selection_mask", legal_mask), dtype=bool
+        )
         if q_r_native.ndim != 1 or not (
             q_r_native.shape
             == q_c_native.shape
             == q_safe_native.shape
             == legal_mask.shape
+            == selection_mask.shape
         ):
             raise ValueError("routing Q-score arrays must be aligned one-dimensional values")
         for name, values in (
@@ -398,6 +402,8 @@ class RoutingQScoreDiagnosticAccumulator:
                 raise TypeError(f"routing {name} values must have a floating dtype")
         if not legal_mask.any():
             raise ValueError("routing Q-score diagnostic has no legal action")
+        if not selection_mask.any() or np.any(selection_mask & ~legal_mask):
+            raise ValueError("routing Q-score selection mask is invalid")
         for name, values in (
             ("Q_r", q_r_native),
             ("Q_c", q_c_native),
@@ -445,10 +451,12 @@ class RoutingQScoreDiagnosticAccumulator:
         selected = int(selected_action)
         if not 0 <= sender < q_r.size or not bool(legal_mask[sender]):
             raise ValueError("routing Q-score Wait action must be legal")
-        if not 0 <= selected < q_r.size or not bool(legal_mask[selected]):
-            raise ValueError("routing Q-score selected action must be legal")
-        reward_argmax = _masked_argmax(q_r, legal_mask)
-        safe_argmax = _masked_argmax(q_safe, legal_mask)
+        if not 0 <= selected < q_r.size or not bool(selection_mask[selected]):
+            raise AssertionError(
+                "evaluation diagnostic production action is outside the selection mask"
+            )
+        reward_argmax = _masked_argmax(q_r, selection_mask)
+        safe_argmax = _masked_argmax(q_safe, selection_mask)
         if int(inspection["reward_argmax_action"]) != reward_argmax:
             raise AssertionError("diagnostic reward argmax is inconsistent")
         if int(inspection["safe_argmax_action"]) != safe_argmax:

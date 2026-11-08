@@ -32,18 +32,21 @@ LLM_EXPLORER_NO_C10_METHOD_ID = (
     "td3_dinkelbach_llm_explorer_wo_c10_penalty"
 )
 LLM_EXPLORER_NO_C10_PROMPT_VERSION = (
-    "uav-hrl-llm-explorer-prompts-v11-complete-ee-no-c10-variant-v1"
+    "uav-hrl-llm-explorer-prompts-v12-named-forwarding-weights-v1"
 )
 LLM_EXPLORER_SUMMARY_VERSION = "complete-core-feedback-v4"
 LLM_EXPLORER_CASE_VERSION = "deterministic-diverse-cases-v1"
 LLM_EXPLORER_CACHE_VERSION = "episode-fixed-dual-guidance-cache-v8-complete-ee"
 LLM_EXPLORER_NO_C10_CACHE_VERSION = (
-    "episode-fixed-dual-guidance-cache-v8-complete-ee-no-c10-variant-v1"
+    "episode-fixed-dual-guidance-cache-v9-named-forwarding-weights-v1"
 )
 LLM_EXPLORER_COMPRESSION_VERSION = LLM_EXPLORER_SUMMARY_VERSION
 LLM_EXPLORER_PRESENTATION_VERSION = "firstgen-columns-rows-3dp-ms-v2"
 LLM_EXPLORER_NUMERICAL_OUTPUT_PROTOCOL = (
     "chat-completions-strict-json-schema-routing-weights-v2"
+)
+LLM_EXPLORER_NO_C10_NUMERICAL_OUTPUT_PROTOCOL = (
+    "chat-completions-strict-json-schema-named-forwarding-weights-v3"
 )
 LLM_EXPLORER_NUMERICAL_STAGE = "numerical_routing_weights_v2"
 LLM_EXPLORER_GUIDANCE_MAX_OUTPUT_TOKENS = 8_000
@@ -111,7 +114,17 @@ def _cache_version_for_prompt(prompt_version: str) -> str:
     )
 
 
-def first_gen_numerical_response_format() -> dict[str, Any]:
+def first_gen_output_protocol(method_id: str) -> str:
+    return (
+        LLM_EXPLORER_NO_C10_NUMERICAL_OUTPUT_PROTOCOL
+        if str(method_id) == LLM_EXPLORER_NO_C10_METHOD_ID
+        else LLM_EXPLORER_NUMERICAL_OUTPUT_PROTOCOL
+    )
+
+
+def first_gen_numerical_response_format(
+    method_id: str = LLM_EXPLORER_METHOD_ID,
+) -> dict[str, Any]:
     """Return the strict Chat Completions schema for first-gen guidance."""
 
     number_row_3 = {
@@ -126,10 +139,42 @@ def first_gen_numerical_response_format() -> dict[str, Any]:
         "maxItems": 17,
         "items": {"type": "number"},
     }
+    if str(method_id) == LLM_EXPLORER_NO_C10_METHOD_ID:
+        routing_properties = {}
+        for sender in range(NUM_UAV):
+            destinations = {
+                **{
+                    f"UAV_{receiver}": {"type": "number", "minimum": 0}
+                    for receiver in range(NUM_UAV)
+                    if receiver != sender
+                },
+                "GS": {"type": "number", "minimum": 0},
+            }
+            routing_properties[f"UAV_{sender}"] = {
+                "type": "object",
+                "properties": destinations,
+                "required": list(destinations),
+                "additionalProperties": False,
+            }
+        routing_schema = {
+            "type": "object",
+            "properties": routing_properties,
+            "required": list(routing_properties),
+            "additionalProperties": False,
+        }
+        schema_name = "uav_hrl_no_c10_named_forwarding_guidance"
+    else:
+        routing_schema = {
+            "type": "array",
+            "minItems": 16,
+            "maxItems": 16,
+            "items": number_row_17,
+        }
+        schema_name = "uav_hrl_first_gen_exploration_guidance"
     return {
         "type": "json_schema",
         "json_schema": {
-            "name": "uav_hrl_first_gen_exploration_guidance",
+            "name": schema_name,
             "strict": True,
             "schema": {
                 "type": "object",
@@ -140,12 +185,7 @@ def first_gen_numerical_response_format() -> dict[str, Any]:
                         "maxItems": 16,
                         "items": number_row_3,
                     },
-                    "routing_weights": {
-                        "type": "array",
-                        "minItems": 16,
-                        "maxItems": 16,
-                        "items": number_row_17,
-                    },
+                    "routing_weights": routing_schema,
                 },
                 "required": ["td3_bias", "routing_weights"],
                 "additionalProperties": False,
@@ -174,6 +214,7 @@ def first_gen_resume_protocol_upgrade(
     guidance_budget = int(source.get("guidance_max_output_tokens", 5_000))
     target_prompt_version = first_gen_prompt_version(method_id)
     target_cache_version = first_gen_cache_version(method_id)
+    target_output_protocol = first_gen_output_protocol(method_id)
     source_git = str(source_git_sha or "")
     migration = dict(verified_protocol_migration or {})
     has_verified_original_migration = (
@@ -196,34 +237,10 @@ def first_gen_resume_protocol_upgrade(
     if (
         prompt_version == target_prompt_version
         and cache_version == target_cache_version
-        and output_protocol == LLM_EXPLORER_NUMERICAL_OUTPUT_PROTOCOL
+        and output_protocol == target_output_protocol
         and guidance_budget == LLM_EXPLORER_GUIDANCE_MAX_OUTPUT_TOKENS
     ):
         return None
-    if (
-        str(method_id) == LLM_EXPLORER_NO_C10_METHOD_ID
-        and prompt_version == LLM_EXPLORER_PROMPT_VERSION
-        and cache_version == LLM_EXPLORER_CACHE_VERSION
-        and output_protocol == LLM_EXPLORER_NUMERICAL_OUTPUT_PROTOCOL
-        and guidance_budget == LLM_EXPLORER_GUIDANCE_MAX_OUTPUT_TOKENS
-    ):
-        return {
-            "source_schema_version": source["schema_version"],
-            "target_schema_version": LLM_EXPLORER_VERSION,
-            "source_prompt_version": prompt_version,
-            "target_prompt_version": target_prompt_version,
-            "source_cache_version": cache_version,
-            "target_cache_version": target_cache_version,
-            "source_prompt_contract": (
-                "615f7bf_shared_templates_with_no_c10_environment"
-            ),
-            "target_prompt_contract": "method_aware_no_c10_v1",
-            "template_content_compatibility": (
-                "same_no_c10_text_and_environment_payload"
-            ),
-            "training_state_compatibility": "full_state_preserved_reidentified_protocol",
-            "old_numerical_cache_reuse": False,
-        }
     source_profile = (
         prompt_version,
         cache_version,
@@ -243,7 +260,7 @@ def first_gen_resume_protocol_upgrade(
             "target_cache_version": target_cache_version,
             "source_numerical_output_protocol": output_protocol,
             "target_numerical_output_protocol": (
-                LLM_EXPLORER_NUMERICAL_OUTPUT_PROTOCOL
+                target_output_protocol
             ),
             "source_guidance_max_output_tokens": guidance_budget,
             "target_guidance_max_output_tokens": (
@@ -1395,10 +1412,8 @@ def masked_routing_exploration_distribution(
 
     weights = np.asarray(prior, dtype=np.float64)
     mask = np.asarray(legal_mask, dtype=bool)
-    if weights.shape != (ROUTING_ACTION_DIM,):
-        raise ValueError(
-            f"routing prior row must have shape ({ROUTING_ACTION_DIM},)"
-        )
+    if weights.ndim != 1:
+        raise ValueError("routing prior row must be one-dimensional")
     if mask.shape != weights.shape:
         raise ValueError("routing legal mask and prior shapes differ")
     if not mask.any():
@@ -1624,6 +1639,75 @@ def validate_routing_weights(
     return weights
 
 
+def named_routing_weights_to_internal(
+    value: Any, *, detailed_errors: bool = False
+) -> np.ndarray:
+    """Validate named non-self destinations and map them to [16,17]."""
+
+    expected_senders = {f"UAV_{index}" for index in range(NUM_UAV)}
+    if not isinstance(value, Mapping):
+        raise ExplorerValidationError("routing_weights must be a named object")
+    actual_senders = set(value)
+    if actual_senders != expected_senders:
+        missing = sorted(expected_senders - actual_senders)
+        extra = sorted(actual_senders - expected_senders)
+        raise ExplorerValidationError(
+            f"routing_weights sender keys differ; missing={missing}, extra={extra}"
+        )
+    weights = np.zeros((NUM_UAV, ROUTING_ACTION_DIM), dtype=np.float64)
+    for sender in range(NUM_UAV):
+        sender_name = f"UAV_{sender}"
+        row = value[sender_name]
+        if not isinstance(row, Mapping):
+            raise ExplorerValidationError(
+                f"routing_weights.{sender_name} must be an object"
+            )
+        expected_destinations = {
+            *(f"UAV_{receiver}" for receiver in range(NUM_UAV) if receiver != sender),
+            "GS",
+        }
+        actual_destinations = set(row)
+        if actual_destinations != expected_destinations:
+            missing = sorted(expected_destinations - actual_destinations)
+            extra = sorted(actual_destinations - expected_destinations)
+            raise ExplorerValidationError(
+                f"routing_weights.{sender_name} destination keys differ; "
+                f"missing={missing}, extra={extra}"
+            )
+        for destination, raw_weight in row.items():
+            if isinstance(raw_weight, (bool, np.bool_)) or not isinstance(
+                raw_weight, (int, float, np.integer, np.floating)
+            ):
+                raise ExplorerValidationError(
+                    f"routing_weights.{sender_name}.{destination} must be a JSON number"
+                )
+            weight = float(raw_weight)
+            if not math.isfinite(weight) or weight < 0.0:
+                raise ExplorerValidationError(
+                    f"routing_weights.{sender_name}.{destination} must be finite and non-negative"
+                )
+            receiver = NUM_UAV if destination == "GS" else int(destination[4:])
+            weights[sender, receiver] = weight
+    return validate_routing_weights(weights, detailed_errors=detailed_errors)
+
+
+def routing_weights_to_named(value: Any) -> dict[str, dict[str, float]]:
+    """Present an internal/history [16,17] matrix without self WAIT entries."""
+
+    weights = validate_routing_weights(value)
+    return {
+        f"UAV_{sender}": {
+            **{
+                f"UAV_{receiver}": float(weights[sender, receiver])
+                for receiver in range(NUM_UAV)
+                if receiver != sender
+            },
+            "GS": float(weights[sender, NUM_UAV]),
+        }
+        for sender in range(NUM_UAV)
+    }
+
+
 def routing_weights_to_prior(
     value: Any,
 ) -> tuple[np.ndarray, list[int]]:
@@ -1741,6 +1825,62 @@ def parse_guidance_response(
                 value["routing_weights"], detailed_errors=True
             )
         )
+    except (ExplorerValidationError, TypeError, ValueError) as exc:
+        routing_weights = None
+        errors["routing"] = str(exc)
+    return td3_bias, routing_weights, errors
+
+
+def parse_named_guidance_response(
+    content: str, sigma_episode_start: float
+) -> tuple[np.ndarray | None, np.ndarray | None, dict[str, str]]:
+    """Parse the no-C10 named routing response into the internal matrix."""
+
+    errors: dict[str, str] = {}
+    try:
+        def reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+            result: dict[str, Any] = {}
+            for key, item in pairs:
+                if key in result:
+                    raise ExplorerValidationError(
+                        f"duplicate JSON object key {key!r}"
+                    )
+                result[key] = item
+            return result
+
+        value = json.loads(
+            _strip_complete_json_code_fence(content),
+            object_pairs_hook=reject_duplicate_keys,
+        )
+    except (TypeError, json.JSONDecodeError, ExplorerValidationError) as exc:
+        reason = f"invalid JSON: {type(exc).__name__}: {exc}"
+        return None, None, {"td3": reason, "routing": reason}
+    if not isinstance(value, dict):
+        return None, None, {
+            "td3": "response root is not an object",
+            "routing": "response root is not an object",
+        }
+    extra = sorted(set(value).difference({"td3_bias", "routing_weights"}))
+    if extra:
+        reason = f"unexpected response fields: {extra}"
+        return None, None, {"td3": reason, "routing": reason}
+    try:
+        td3_bias = validate_td3_bias(
+            value["td3_bias"], sigma_episode_start, detailed_errors=True
+        )
+    except KeyError:
+        td3_bias = None
+        errors["td3"] = "response is missing required field 'td3_bias'"
+    except (ExplorerValidationError, TypeError, ValueError) as exc:
+        td3_bias = None
+        errors["td3"] = str(exc)
+    try:
+        routing_weights = named_routing_weights_to_internal(
+            value["routing_weights"], detailed_errors=True
+        )
+    except KeyError:
+        routing_weights = None
+        errors["routing"] = "response is missing required field 'routing_weights'"
     except (ExplorerValidationError, TypeError, ValueError) as exc:
         routing_weights = None
         errors["routing"] = str(exc)
@@ -4267,7 +4407,6 @@ def llm_explorer_path_preflight(
     episode = f"episode_{max(1, int(maximum_episode)):06d}"
     first_generation_four_prompt_contract = (
         str(artifact_directory) == "llm_explorer"
-        and not named_routing
         and not td3_only
         and not state_rule
     )
@@ -4363,8 +4502,9 @@ def llm_explorer_path_preflight(
         representative_guidance_value[routing_field] = (
             {
                 f"UAV_{sender}": {
-                    ("WAIT" if action == sender else "GS" if action == NUM_UAV else f"UAV_{action}"): round(1.0 / ROUTING_ACTION_DIM, 8)
+                    ("GS" if action == NUM_UAV else f"UAV_{action}"): 1.0
                     for action in range(ROUTING_ACTION_DIM)
+                    if action != sender
                 }
                 for sender in range(NUM_UAV)
             }
@@ -4391,6 +4531,8 @@ def llm_explorer_path_preflight(
                 if state_rule
                 else "[16,3] JSON response"
                 if td3_only
+                else "[16,3] and named routing-weights JSON response"
+                if named_routing
                 else "[16,3] and [16,17] JSON response"
             )
         )
@@ -4426,7 +4568,7 @@ class DeterministicMockExplorerClient:
 
     def chat(self, *, model: str, prompt: str, system_prompt: str, **kwargs: Any) -> dict[str, Any]:
         del system_prompt
-        if "[Requested analysis]" in prompt:
+        if kwargs.get("response_format") is None:
             content = (
                 "1. Priority issues\nNo reliable issue in offline mock data.\n"
                 "2. TD3 recommendations\nUse neutral raw biases.\n"
@@ -4434,13 +4576,26 @@ class DeterministicMockExplorerClient:
                 "4. Expected effects and limitations\nNo live model inference."
             )
         else:
+            response_format = kwargs.get("response_format") or {}
+            schema_name = response_format.get("json_schema", {}).get("name")
+            named_routing = (
+                schema_name == "uav_hrl_no_c10_named_forwarding_guidance"
+            )
+            neutral_internal = np.ones(
+                (NUM_UAV, ROUTING_ACTION_DIM), dtype=np.float64
+            )
+            neutral_internal[np.arange(NUM_UAV), np.arange(NUM_UAV)] = 0.0
             content = json.dumps(
                 {
                     "td3_bias": [[0.0, 0.0, 0.0] for _ in range(NUM_UAV)],
-                    "routing_weights": [
-                        [1.0 for _ in range(ROUTING_ACTION_DIM)]
-                        for _ in range(NUM_UAV)
-                    ],
+                    "routing_weights": (
+                        routing_weights_to_named(neutral_internal)
+                        if named_routing
+                        else [
+                            [1.0 for _ in range(ROUTING_ACTION_DIM)]
+                            for _ in range(NUM_UAV)
+                        ]
+                    ),
                 },
                 separators=(",", ":"),
             )
@@ -4729,15 +4884,10 @@ class LLMExplorerController:
                 and source_budget == 5_000
                 and saved_without_prompt == current_without_prompt
             )
-            legacy_no_c10_reidentification = (
-                self.run_identity.get("method_id")
-                == LLM_EXPLORER_NO_C10_METHOD_ID
-                and source_prompt == LLM_EXPLORER_PROMPT_VERSION
-                and self.config.prompt_version
-                == LLM_EXPLORER_NO_C10_PROMPT_VERSION
-                and source_budget == LLM_EXPLORER_GUIDANCE_MAX_OUTPUT_TOKENS
-                and saved_without_prompt == current_without_prompt
-            )
+            # Named forwarding weights change the actual numerical contract;
+            # older no-C10 replay/guidance checkpoints are not exact-resume
+            # compatible and are intentionally not reidentified.
+            legacy_no_c10_reidentification = False
             if not (legacy_original_upgrade or legacy_no_c10_reidentification):
                 raise ExplorerValidationError(
                     "LLM explorer checkpoint config is incompatible"
@@ -4765,7 +4915,11 @@ class LLMExplorerController:
                     else "chat-completions-strict-json-schema-v1"
                 ),
                 "target_numerical_output_protocol": (
-                    LLM_EXPLORER_NUMERICAL_OUTPUT_PROTOCOL
+                    first_gen_output_protocol(
+                        self.run_identity.get(
+                            "method_id", LLM_EXPLORER_METHOD_ID
+                        )
+                    )
                 ),
                 "source_guidance_max_output_tokens": source_budget,
                 "target_guidance_max_output_tokens": (
@@ -4975,18 +5129,20 @@ class LLMExplorerController:
 
     def _templates(self) -> tuple[str, str, str, str]:
         prompt_root = Path(__file__).resolve().parent / "prompts"
+        prefix = (
+            "llm_explorer_no_c10"
+            if self._uses_named_routing_output()
+            else "llm_explorer"
+        )
         templates = tuple(
             (prompt_root / name).read_text(encoding="utf-8")
             for name in (
-                "llm_explorer_system.txt",
-                "llm_explorer_analysis.txt",
-                "llm_explorer_numerical_system.txt",
-                "llm_explorer_guidance.txt",
+                f"{prefix}_system.txt",
+                f"{prefix}_analysis.txt",
+                f"{prefix}_numerical_system.txt",
+                f"{prefix}_guidance.txt",
             )
         )
-        # Both first-generation method IDs now share the same complete-goodput,
-        # no-C10 reward semantics.  Their prompt/cache versions remain distinct
-        # so old and new runs can never share guidance artifacts.
         return templates
 
     def _prompt_contract_identity(self) -> dict[str, Any]:
@@ -5015,15 +5171,72 @@ class LLMExplorerController:
         )
 
     def _compact_feedback(self, previous: dict[str, Any]) -> dict[str, Any]:
-        return compact_feedback_for_llm(previous)
+        feedback = compact_feedback_for_llm(previous)
+        if self._uses_named_routing_output():
+            guidance = feedback.get("previous_complete_guidance", {})
+            weights_reference = guidance.get("routing_weights")
+            weights = (
+                weights_reference.get("value")
+                if isinstance(weights_reference, Mapping)
+                else weights_reference
+            )
+            if weights is not None:
+                named_weights = routing_weights_to_named(weights)
+                if isinstance(weights_reference, Mapping):
+                    weights_reference["value"] = named_weights
+                    weights_reference["shape"] = "16 named sender objects x 16 non-self/GS destinations"
+                    weights_reference["presentation_semantics"] = (
+                        "complete named raw relative weights; each sender omits its WAIT/self key"
+                    )
+                else:
+                    guidance["routing_weights"] = named_weights
+            prior_reference = guidance.get("routing_prior")
+            prior = (
+                prior_reference.get("value")
+                if isinstance(prior_reference, Mapping)
+                else prior_reference
+            )
+            if prior is not None:
+                nonself = validate_routing_weights(prior).copy()
+                nonself[np.arange(NUM_UAV), np.arange(NUM_UAV)] = 0.0
+                nonself_prior, _ = routing_weights_to_prior(nonself)
+                named_prior = routing_weights_to_named(nonself_prior)
+                if isinstance(prior_reference, Mapping):
+                    prior_reference["value"] = named_prior
+                    prior_reference["shape"] = "16 named sender objects x 16 non-self/GS destinations"
+                    prior_reference["presentation_semantics"] = (
+                        "named non-self/GS probabilities renormalized after omitting historical WAIT/self mass"
+                    )
+                else:
+                    guidance["routing_prior"] = named_prior
+        return feedback
+
+    def _uses_named_routing_output(self) -> bool:
+        return (
+            self.run_identity.get("method_id")
+            == LLM_EXPLORER_NO_C10_METHOD_ID
+        )
 
     def _exploration_settings(
         self, *, sigma_episode_start: float, routing_epsilon: float
     ) -> dict[str, Any]:
+        upcoming_episode = getattr(self, "_upcoming_episode", None)
+        training_horizon = getattr(
+            self, "_configured_training_horizon_episodes", None
+        )
+        progress = (
+            float(upcoming_episode) / float(training_horizon)
+            if upcoming_episode is not None
+            and training_horizon is not None
+            and int(training_horizon) > 0
+            else None
+        )
         return {
-            "upcoming_episode": getattr(self, "_upcoming_episode", None),
-            "configured_training_horizon_episodes": getattr(
-                self, "_configured_training_horizon_episodes", None
+            "upcoming_episode": upcoming_episode,
+            "configured_training_horizon_episodes": training_horizon,
+            "training_progress_fraction": progress,
+            "training_progress_status": (
+                "known" if progress is not None else "unknown"
             ),
             "total_joint_transitions": getattr(
                 self, "_total_joint_transitions", None
@@ -5147,7 +5360,12 @@ class LLMExplorerController:
     def _parse_guidance_response(
         self, content: str, sigma_episode_start: float
     ) -> tuple[np.ndarray | None, np.ndarray | None, dict[str, str]]:
-        return parse_guidance_response(content, sigma_episode_start)
+        parser = (
+            parse_named_guidance_response
+            if self._uses_named_routing_output()
+            else parse_guidance_response
+        )
+        return parser(content, sigma_episode_start)
 
     def _guidance_cache_content(
         self, td3_bias: np.ndarray, routing_weights: np.ndarray
@@ -5155,7 +5373,11 @@ class LLMExplorerController:
         return _compact_json(
             {
                 "td3_bias": td3_bias.tolist(),
-                "routing_weights": routing_weights.tolist(),
+                "routing_weights": (
+                    routing_weights_to_named(routing_weights)
+                    if self._uses_named_routing_output()
+                    else routing_weights.tolist()
+                ),
             }
         )
 
@@ -5206,7 +5428,11 @@ class LLMExplorerController:
                 ),
                 presentation_version=LLM_EXPLORER_PRESENTATION_VERSION,
                 numerical_output_protocol=(
-                    LLM_EXPLORER_NUMERICAL_OUTPUT_PROTOCOL
+                    first_gen_output_protocol(
+                        self.run_identity.get(
+                            "method_id", LLM_EXPLORER_METHOD_ID
+                        )
+                    )
                 ),
                 routing_epsilon_branch="100_percent_masked_llm_prior",
                 prompt_component_sha256=prompt_components,
@@ -5950,7 +6176,11 @@ class LLMExplorerController:
                     }
                     if self.schema_version == LLM_EXPLORER_VERSION:
                         request_arguments["response_format"] = (
-                            first_gen_numerical_response_format()
+                            first_gen_numerical_response_format(
+                                self.run_identity.get(
+                                    "method_id", LLM_EXPLORER_METHOD_ID
+                                )
+                            )
                         )
                     response = self.client.chat(
                         **request_arguments,
@@ -6239,7 +6469,7 @@ def explorer_metadata(
         "case_selection_version": LLM_EXPLORER_CASE_VERSION,
         "cache_version": _cache_version_for_prompt(config.prompt_version),
         "presentation_version": LLM_EXPLORER_PRESENTATION_VERSION,
-        "numerical_output_protocol": LLM_EXPLORER_NUMERICAL_OUTPUT_PROTOCOL,
+        "numerical_output_protocol": first_gen_output_protocol(method_id),
         "numerical_response_format": "strict_json_schema",
         "request_prompt_contract": (
             "analysis_system+analysis_user then independent_numerical_system+numerical_user"
@@ -6268,7 +6498,12 @@ def explorer_metadata(
         "context_window_tokens": config.context_window_tokens,
         "safety_margin_tokens": config.safety_margin_tokens,
         "td3_intervention": "episode_fixed_raw_bias_added_once_with_original_gaussian_before_projection",
-        "routing_intervention": "epsilon_branch_100_percent_masked_renormalized_prior; legal_uniform_only_on_zero_legal_mass",
+        "routing_intervention": "legal_forwarding_only; forced_wait_only_when_no_forward; epsilon_branch_100_percent_masked_renormalized_prior; legal_uniform_only_on_zero_legal_mass",
+        "routing_output_format": (
+            "named_other_15_uavs_plus_gs"
+            if str(method_id) == LLM_EXPLORER_NO_C10_METHOD_ID
+            else "internal_16x17_weights"
+        ),
         "guidance_weight": 1.0,
         "annealing_end_episode": None,
         "evaluation_calls_llm": False,

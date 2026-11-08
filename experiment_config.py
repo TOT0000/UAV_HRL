@@ -54,6 +54,9 @@ ROUTING_STATE_DIM = (
     + len(ROUTING_ACTION_FEATURE_GROUPS) * ROUTING_ACTION_DIM
 )
 ROUTING_STATE_SCHEMA_VERSION = "16-uav-action-wise-gs-progress-v2"
+ROUTING_ACTION_SELECTION_CONTRACT_VERSION = (
+    "effective-forwarding-only-forced-wait-v1"
+)
 ROI_COUNT_MIN = 2
 ROI_COUNT_MAX = 8
 RESERVED_SEARCH_UAV_IDS = (0, NUM_UAV - 1)
@@ -1348,6 +1351,12 @@ def comparison_method_configuration(method_spec: MethodSpec) -> dict:
         "routing_state_dim": ROUTING_STATE_DIM,
         "routing_action_dim": ROUTING_ACTION_DIM,
         "routing_action_order": "UAV_0_through_UAV_N_minus_1_then_GS",
+        "routing_action_selection_contract_version": (
+            ROUTING_ACTION_SELECTION_CONTRACT_VERSION
+        ),
+        "routing_action_selection_policy": (
+            "legal_forwarding_actions_only_when_any_exist; sender_wait_only_when_no_forwarding_action_is_legal"
+        ),
         "routing_action_feature_groups": list(ROUTING_ACTION_FEATURE_GROUPS),
         "reference_u2u_max_capacity_mbps": (
             reference_u2u_max_capacity_mbps(TOTAL_COMMUNICATION_BANDWIDTH_HZ)

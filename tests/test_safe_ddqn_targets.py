@@ -92,7 +92,7 @@ class SafeDDQNTargetTest(unittest.TestCase):
         self.assertTrue(torch.allclose(target_q, torch.tensor([29.0, 2.0])))
         self.assertTrue(torch.allclose(target_c, torch.tensor([57.0, 3.0])))
 
-    def test_wait_is_legal_and_empty_target_mask_is_rejected(self):
+    def test_wait_is_forced_when_no_forwarding_action_exists(self):
         model = DDQN.__new__(DDQN)
         model.action_dim = 3
         model.gamma = 0.9
@@ -126,8 +126,10 @@ class SafeDDQNTargetTest(unittest.TestCase):
         self.assertEqual(next_actions.item(), 1)
 
         next_state[0, 10:13] = 0.0
-        with self.assertRaisesRegex(ValueError, "no legal action"):
-            model._routing_action_mask(next_state)
+        self.assertEqual(
+            model._routing_action_mask(next_state).tolist(),
+            [[False, True, False]],
+        )
 
     def test_single_training_step_smoke(self):
         model = DDQN(state_dim=42, action_dim=3, hidden_dim=8)

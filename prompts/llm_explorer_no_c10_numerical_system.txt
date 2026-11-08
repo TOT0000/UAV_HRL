@@ -1,0 +1,55 @@
+Convert the first-stage analysis into complete TD3 bias and routing exploration weights for this episode.
+
+The objective is to improve the energy efficiency of complete useful delivery and reduce delay violations. Both timely and late but completely delivered useful bits contribute to EE. Timely delivery additionally provides Safe-DDQN routing reward.
+
+[TD3 bias]
+
+td3_bias is a 16x3 matrix:
+- Rows correspond to UAVs 0–15 in order.
+- Columns are speed, heading, and vertical, in that order.
+
+Normalized action decoding:
+v_xy = 5*(speed+1) m/s.
+theta = pi*heading rad.
+v_x = v_xy*cos(theta).
+v_y = v_xy*sin(theta).
+v_z = 2*vertical m/s.
+
+Speed and vertical lie in [-1,1]. Heading is periodic within [-1,1).
+
+Each UAV uses a bias fixed throughout the episode:
+a_cmd = Project[Actor(s) + td3_bias + original Gaussian noise].
+
+Bias is added directly in normalized action units. Each component is a finite number satisfying:
+-sigma_episode_start <= bias <= sigma_episode_start.
+
+The host applies the bias according to movement_mask at each decision. Follow the directions and magnitudes specified in the analysis, converting sigma fractions into actual bias values.
+
+[Routing exploration weights]
+
+routing_weights is a named JSON object:
+- Its outer keys are UAV_0 through UAV_15, representing the 16 senders.
+- Each UAV_i contains the names of the other 15 UAVs and GS, for a total of 16 destinations.
+- Each destination maps to one finite nonnegative number representing its relative exploration weight.
+
+Weights remain fixed throughout the episode. During epsilon exploration, the host filters the currently legal forwarding destinations, normalizes their weights, and samples a destination.
+
+For example, weights of 3, 1, and 1 for three legal destinations represent relative preferences of 3:1:1. Fill in weights for all 16 destinations per sender to accommodate link changes.
+
+When legal weights sum to zero, the host uses uniform exploration. When no forwarding action is legal, the host handles waiting.
+
+[Choosing numerical values]
+
+Use the first-stage analysis to determine each UAV’s bias and forwarding weights. For remaining entries, use the neutral or historical guidance selected in the analysis:
+- Neutral TD3 bias is [0,0,0].
+- Neutral routing guidance assigns weight 1 to every destination.
+
+Reused biases must satisfy the current sigma bounds. Weights may use integers or short decimals. Use sufficient bias precision to represent the recommended magnitude and satisfy the bounds.
+
+[Output]
+
+Return one complete JSON object containing:
+- td3_bias: the complete 16x3 numerical matrix.
+- routing_weights: the complete object for all 16 senders, each containing weights for the other 15 UAVs and GS.
+
+Verify that node names, matrix dimensions, bias bounds, and weight values satisfy these specifications. When validation feedback is provided, correct the relevant content and return the complete JSON again.

@@ -97,6 +97,26 @@ def _guidance(td3_value=0.0, routing=None):
     )
 
 
+def _named_guidance(td3_value=0.0):
+    routing = {
+        f"UAV_{sender}": {
+            **{
+                f"UAV_{receiver}": 1.0
+                for receiver in range(16)
+                if receiver != sender
+            },
+            "GS": 1.0,
+        }
+        for sender in range(16)
+    }
+    return json.dumps(
+        {
+            "td3_bias": [[td3_value, -td3_value, 0.0] for _ in range(16)],
+            "routing_weights": routing,
+        }
+    )
+
+
 class SequenceClient:
     def __init__(self, responses):
         self.responses = list(responses)
@@ -526,7 +546,14 @@ def test_first_gen_method_ids_share_reward_semantics_but_keep_protocol_identity(
             LLM_EXPLORER_NO_C10_PROMPT_VERSION,
         ),
     ):
-        client = SequenceClient(["analysis", _guidance(0.01)])
+        client = SequenceClient(
+            [
+                "analysis",
+                _named_guidance(0.01)
+                if method_id == LLM_EXPLORER_NO_C10_METHOD_ID
+                else _guidance(0.01),
+            ]
+        )
         controller = LLMExplorerController(
             run_directory=None,
             run_identity={"method_id": method_id},
@@ -567,9 +594,11 @@ def test_first_gen_method_ids_share_reward_semantics_but_keep_protocol_identity(
 
     original_templates = controllers["enabled"]._templates()
     no_c10_templates = controllers["disabled"]._templates()
-    assert original_templates == no_c10_templates
-    assert "P_C10 is disabled" in original_templates[0]
-    assert prompts["enabled"]["system_prompt"] == prompts["disabled"]["system_prompt"]
+    assert original_templates != no_c10_templates
+    assert "r_move = B_complete,Mbit - lambda_EE*E_move,J - P_C9 - P_COM" in (
+        no_c10_templates[0]
+    )
+    assert prompts["enabled"]["system_prompt"] != prompts["disabled"]["system_prompt"]
     assert LLM_EXPLORER_PROMPT_VERSION != LLM_EXPLORER_NO_C10_PROMPT_VERSION
 
 
@@ -1009,7 +1038,7 @@ def test_compact_and_full_short_training_are_algorithmically_identical(
     clients = {}
     for mode in ("compact", "full"):
         active_mode["value"] = mode
-        client = SequenceClient(["analysis final", _guidance(0.02)])
+        client = SequenceClient(["analysis final", _named_guidance(0.02)])
         clients[mode] = client
         results[mode] = train(
             TrainingConfig(
@@ -2802,25 +2831,23 @@ def test_first_gen_checkpoint_compatibility_distinguishes_615_prompt_contracts()
     legacy_no_c10 = no_c10.state_dict()
     legacy_no_c10["config"]["prompt_version"] = LLM_EXPLORER_PROMPT_VERSION
     legacy_no_c10.pop("prompt_contract")
-    no_c10.load_state_dict(legacy_no_c10)
-    migration = no_c10.state_dict()["resume_protocol_migrations"][-1]
-    assert migration["source_prompt_contract"].startswith("615f7bf")
-    assert migration["old_numerical_cache_reuse"] is False
+    with pytest.raises(
+        ValueError, match="checkpoint config is incompatible"
+    ):
+        no_c10.load_state_dict(legacy_no_c10)
 
-    upgrade = first_gen_resume_protocol_upgrade(
-        {
-            "schema_version": LLM_EXPLORER_VERSION,
-            "prompt_version": LLM_EXPLORER_PROMPT_VERSION,
-            "cache_version": LLM_EXPLORER_CACHE_VERSION,
-            "numerical_output_protocol": LLM_EXPLORER_NUMERICAL_OUTPUT_PROTOCOL,
-            "guidance_max_output_tokens": 8_000,
-        },
-        method_id=LLM_EXPLORER_NO_C10_METHOD_ID,
-        source_git_sha="615f7bf9db68",
-    )
-    assert upgrade["target_prompt_version"] == LLM_EXPLORER_NO_C10_PROMPT_VERSION
-    assert upgrade["target_cache_version"] == LLM_EXPLORER_NO_C10_CACHE_VERSION
-    assert upgrade["old_numerical_cache_reuse"] is False
+    with pytest.raises(ValueError, match="unsupported"):
+        first_gen_resume_protocol_upgrade(
+            {
+                "schema_version": LLM_EXPLORER_VERSION,
+                "prompt_version": LLM_EXPLORER_PROMPT_VERSION,
+                "cache_version": LLM_EXPLORER_CACHE_VERSION,
+                "numerical_output_protocol": LLM_EXPLORER_NUMERICAL_OUTPUT_PROTOCOL,
+                "guidance_max_output_tokens": 8_000,
+            },
+            method_id=LLM_EXPLORER_NO_C10_METHOD_ID,
+            source_git_sha="615f7bf9db68",
+        )
 
     original_identity = {
         "method_id": "td3_dinkelbach_llm_explorer",

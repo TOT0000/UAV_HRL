@@ -110,14 +110,13 @@ class RoutingQScoreDecisionTest(unittest.TestCase):
             [True, True, False],
         )
 
-        self.assertEqual(selected, 0)
-        self.assertTrue(event["reward_also_prefers_wait"])
-        self.assertFalse(event["cost_induced_forward_to_wait_flip"])
+        self.assertEqual(selected, 1)
+        self.assertIsNone(event)
         self.assertEqual(
             accumulator.summary()["groups"]["ALL"][
                 "voluntary_wait_reward_also_prefers_wait_count"
             ],
-            1,
+            0,
         )
 
     def test_negative_qc_causes_forward_to_wait_flip(self):
@@ -128,17 +127,14 @@ class RoutingQScoreDecisionTest(unittest.TestCase):
             [True, True],
         )
 
-        self.assertEqual(selected, 0)
+        self.assertEqual(selected, 1)
         self.assertEqual(inspection["reward_argmax_action"], 1)
-        self.assertEqual(inspection["safe_argmax_action"], 0)
-        self.assertAlmostEqual(event["q_safe_wait"], 0.7, places=6)
-        self.assertAlmostEqual(event["q_safe_best_safe_forward"], 0.2, places=6)
-        self.assertTrue(event["cost_induced_forward_to_wait_flip"])
-        self.assertTrue(event["q_c_wait_is_negative"])
+        self.assertEqual(inspection["safe_argmax_action"], 1)
+        self.assertIsNone(event)
         group = accumulator.summary()["groups"]["ALL"]
-        self.assertEqual(group["voluntary_wait_cost_induced_flip_count"], 1)
+        self.assertEqual(group["voluntary_wait_cost_induced_flip_count"], 0)
         self.assertEqual(
-            group["cost_induced_flip_and_qc_wait_negative_count"], 1
+            group["cost_induced_flip_and_qc_wait_negative_count"], 0
         )
 
     def test_positive_qc_can_also_cause_flip(self):
@@ -149,11 +145,10 @@ class RoutingQScoreDecisionTest(unittest.TestCase):
             [True, True],
         )
 
-        self.assertEqual(selected, 0)
-        self.assertTrue(event["cost_induced_forward_to_wait_flip"])
-        self.assertFalse(event["q_c_wait_is_negative"])
+        self.assertEqual(selected, 1)
+        self.assertIsNone(event)
         group = accumulator.summary()["groups"]["ALL"]
-        self.assertEqual(group["voluntary_wait_cost_induced_flip_count"], 1)
+        self.assertEqual(group["voluntary_wait_cost_induced_flip_count"], 0)
         self.assertEqual(
             group["cost_induced_flip_and_qc_wait_negative_count"], 0
         )
@@ -177,8 +172,7 @@ class RoutingQScoreDecisionTest(unittest.TestCase):
             10.0,
             [True, True, False],
         )
-        self.assertEqual(wait_event["best_qr_forward_action"], 1)
-        self.assertEqual(wait_event["best_safe_forward_action"], 1)
+        self.assertIsNone(wait_event)
 
     def test_only_wait_mask_is_not_a_voluntary_wait_event(self):
         selected, _, accumulator, event = inspect_and_add(
@@ -302,7 +296,7 @@ class RoutingTrainingDiagnosticTest(unittest.TestCase):
         summary = accumulator.summary()
         self.assertEqual(summary["epsilon_decision_count"], 1)
         self.assertEqual(summary["greedy_decision_count"], 0)
-        self.assertEqual(summary["reward_safe_argmax_difference_count"], 1)
+        self.assertEqual(summary["reward_safe_argmax_difference_count"], 0)
         self.assertIsNone(
             summary["greedy_selected_differs_from_reward_argmax_fraction"]
         )
@@ -367,7 +361,7 @@ class RoutingTrainingDiagnosticTest(unittest.TestCase):
             slot_index=0,
             time_seconds=0.0,
         )
-        self.assertIsNotNone(event)
+        self.assertIsNone(event)
 
         corrupted = copy.deepcopy(inspection)
         corrupted["q_safe"][0] += np.float32(1.0)
@@ -404,10 +398,10 @@ class RoutingQScoreArtifactTest(unittest.TestCase):
             ROUTING_Q_SCORE_DIAGNOSTIC_CONTRACT_VERSION,
         )
         self.assertEqual(set(diagnostics["groups"]), {"ALL", "COM", "FOV"})
-        self.assertEqual(all_group["voluntary_wait_qc_wait_negative_fraction"], 1.0)
-        self.assertAlmostEqual(all_group["q_c_wait_mean"], -0.1, places=6)
-        self.assertAlmostEqual(all_group["q_c_wait_median"], -0.1, places=6)
-        self.assertEqual(tuple(event), VOLUNTARY_WAIT_EVENT_FIELDS)
+        self.assertIsNone(all_group["voluntary_wait_qc_wait_negative_fraction"])
+        self.assertIsNone(all_group["q_c_wait_mean"])
+        self.assertIsNone(all_group["q_c_wait_median"])
+        self.assertIsNone(event)
 
         with tempfile.TemporaryDirectory() as temp_dir:
             outputs = write_routing_q_score_diagnostic_artifacts(
@@ -431,8 +425,7 @@ class RoutingQScoreArtifactTest(unittest.TestCase):
         self.assertEqual(
             [row["task_type"] for row in aggregate_rows], ["ALL", "COM", "FOV"]
         )
-        self.assertEqual(len(event_rows), 1)
-        self.assertEqual(tuple(event_rows[0]), VOLUNTARY_WAIT_EVENT_FIELDS)
+        self.assertEqual(len(event_rows), 0)
 
     def test_paper_output_hook_writes_safe_ddqn_only(self):
         _, _, accumulator, _ = inspect_and_add(
@@ -600,9 +593,8 @@ class RoutingQScoreNoBehaviorChangeTest(unittest.TestCase):
             else None,
         )
         if accumulator is not None:
-            event = accumulator.voluntary_wait_events[0]
-            if event["hol_task_type"] != "COM":
-                raise AssertionError("diagnostic did not use frozen HOL task type")
+            if accumulator.voluntary_wait_events:
+                raise AssertionError("forward-capable slot recorded voluntary WAIT")
             if accumulator.summary()["groups"]["ALL"][
                 "total_routing_q_decisions"
             ] != 1:

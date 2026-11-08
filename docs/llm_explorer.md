@@ -18,16 +18,14 @@ The method has its own registry identity, fingerprint, run directory, and
 checkpoint identity. Checkpoints from either parent method cannot be used for
 exact resume.
 
-The original method keeps its pre-ablation `prompts-v10` templates and original
-C10-enabled environment payload byte-for-byte. The no-C10 method uses the
-separate `prompts-v10-no-c10-v1` / `cache-v7-no-c10-v1` identities. Its
-observations, summaries, cases, and numerical protocol are unchanged; only the
-movement-reward formula and explicit C10 diagnostic-only status differ. A
-no-C10 checkpoint created by commit `615f7bf` is recognized as the earlier
-mislabelled form and may migrate its training state, but its old guidance cache
-is not reused under the new identity. An original-method run created by that
-commit is refused for exact resume because its `prompts-v10` metadata does not
-reliably identify the modified shared template. Existing original checkpoints
+The original method keeps its own templates and `[16,17]` numerical routing
+format. The no-C10 method uses separate prompt/cache identities and four
+method-specific templates. Its `routing_weights` output is a named object:
+each `UAV_i` supplies weights for the other 15 UAVs and `GS`; the host maps
+those names to the internal 17-action row and inserts zero at the sender/WAIT
+column. Older array-format no-C10 full checkpoints are refused for exact
+resume because the numerical guidance and cache contracts differ. Existing
+original checkpoints
 from the earlier supported prompt protocols retain their migration path.
 
 All Explorer methods accept `--llm-explorer-log-mode compact|full`. Existing
@@ -108,12 +106,10 @@ request is checked with the `o200k_base` tokenizer against the 128,000-token
 context limit, including reserved output and a safety margin. Token budgets are
 saved beside each attempt. The payload contains filtered observable state and
 never serializes a scenario manifest or undiscovered RoI and SR ground truth.
-The first-generation controller schema is `uav-hrl-llm-explorer-firstgen-v6`,
-prompt schema is v10, summary schema is `complete-core-feedback-v4`, and cache
-schema is `episode-fixed-dual-guidance-cache-v7`. The first-generation numerical
-Chat Completions request uses a strict JSON Schema for exactly one object with
-complete `[16,3]` `td3_bias` and `[16,17]` `routing_weights` matrices and reserves
-8,000 output tokens. Host validation remains authoritative: weights must be
+The first-generation numerical Chat Completions request reserves 8,000 output
+tokens and uses a strict JSON Schema. The original method returns complete
+`[16,3]` `td3_bias` and `[16,17]` routing matrices. The no-C10 method returns
+the same bias matrix and named non-self-plus-GS routing objects. Host validation remains authoritative: weights must be
 finite and nonnegative, but have no upper bound or row-sum requirement. Stable
 maximum scaling prevents overflow before normalization. The parser accepts bare JSON
 or a complete outer plain/`json` Markdown fence, but does not extract JSON from
@@ -135,7 +131,11 @@ retains its valid normalized prior and records raw weights as unavailable; the
 next generated episode uses the new protocol. Other old or unknown protocol combinations
 remain incompatible. Numerical template hashes and the output protocol are part
 of the cache identity, and the v10 numerical stage uses a versioned directory, so
-old numerical artifacts are preserved but never silently reused.
+old numerical artifacts are preserved but never silently reused. Across safe-DDQN,
+DQN, DDQN, random routing, and LLM epsilon exploration, WAIT is excluded when
+at least one effective forwarding action exists. The sender action is selected
+only as a programmatic forced WAIT when no forwarding action is effective;
+bootstrap targets use the same rule.
 
 ## PowerShell commands
 
