@@ -1245,10 +1245,28 @@ def _select_routing_actions(
             if exploration_guidance_kind == "routing_weights":
                 raw_row = np.asarray(exploration_prior, dtype=np.float64)[uid]
                 whole_zero = not bool(np.any(raw_row > 0.0))
+                effective_mask = np.asarray(routing_masks[uid], dtype=bool)
+                forwarding_mask = effective_mask.copy()
+                forwarding_mask[int(uid)] = False
+                forced_wait = not bool(forwarding_mask.any())
+                if forced_wait:
+                    if int(action) != int(uid):
+                        raise AssertionError(
+                            "forced WAIT must select the sender action"
+                        )
+                    detail["decision_branch"] = (
+                        "forced_wait_no_legal_forwarding_action"
+                    )
+                    detail["zero_legal_prior_mass_fallback"] = False
+                    detail["exploration_distribution"] = None
                 zero_legal = bool(
                     detail.get("zero_legal_prior_mass_fallback", False)
+                ) and not forced_wait
+                detail["routing_weights_applied"] = bool(
+                    not forced_wait
+                    and not zero_legal
+                    and detail.get("decision_branch") == "epsilon_exploration"
                 )
-                detail["routing_weights_applied"] = True
                 detail["routing_weight_row_all_zero"] = whole_zero
                 detail["routing_weight_row_positive"] = not whole_zero
                 detail["zero_legal_routing_weight_after_mask"] = bool(

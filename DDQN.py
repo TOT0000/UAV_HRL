@@ -247,6 +247,9 @@ class DDQN:
         final_mask = forwarding_or_forced_wait_mask(
             effective_mask, uav_id, self.action_dim
         )
+        forwarding_mask = effective_mask.copy()
+        forwarding_mask[int(uav_id)] = False
+        forced_wait = not bool(forwarding_mask.any())
 
         if final_mask.shape != q_values.shape:
             raise ValueError(
@@ -261,48 +264,57 @@ class DDQN:
         q_values_masked = q_values.copy()
         q_values_masked[~final_mask] = -np.inf
 
-        # 加上 noise（可選）
-        if logits_noise_std > 0:
-            q_values_masked = q_values_masked + self.exploration_rng.normal(
-                0, logits_noise_std, size=q_values_masked.shape
-            )
-
-        # ---------- ε-greedy ----------
-        explored = (
-            float(epsilon) > 0.0
-            and self.exploration_rng.random() < float(epsilon)
-        )
         zero_prior_mass = False
         exploration_distribution = None
-        if explored:
-            available_actions = np.where(final_mask)[0]
-            if exploration_prior is None:
-                # Preserve the original path and RNG behavior for every
-                # existing comparison method.
-                action = int(self.exploration_rng.choice(available_actions))
-            else:
-                exploration_distribution, zero_prior_mass = (
-                    masked_routing_exploration_distribution(
-                        exploration_prior,
-                        final_mask,
-                        prior_weight=exploration_prior_weight,
-                    )
-                )
-                action = int(
-                    self.exploration_rng.choice(
-                        np.arange(self.action_dim), p=exploration_distribution
-                    )
-                )
-                if zero_prior_mass and zero_prior_mass_callback is not None:
-                    zero_prior_mass_callback()
+        if forced_wait:
+            # WAIT is a scheduler-mandated action, not an epsilon-exploration
+            # outcome.  In particular, do not inspect an LLM prior whose
+            # self-weight is intentionally zero or report a false fallback.
+            action = int(uav_id)
+            explored = False
+            decision_branch = "forced_wait_no_legal_forwarding_action"
         else:
-            action = int(np.argmax(q_values_masked))
+            # 加上 noise（可選）
+            if logits_noise_std > 0:
+                q_values_masked = q_values_masked + self.exploration_rng.normal(
+                    0, logits_noise_std, size=q_values_masked.shape
+                )
+
+            # ---------- ε-greedy ----------
+            explored = (
+                float(epsilon) > 0.0
+                and self.exploration_rng.random() < float(epsilon)
+            )
+            if explored:
+                available_actions = np.where(final_mask)[0]
+                if exploration_prior is None:
+                    # Preserve the original path and RNG behavior for every
+                    # existing comparison method.
+                    action = int(self.exploration_rng.choice(available_actions))
+                else:
+                    exploration_distribution, zero_prior_mass = (
+                        masked_routing_exploration_distribution(
+                            exploration_prior,
+                            final_mask,
+                            prior_weight=exploration_prior_weight,
+                        )
+                    )
+                    action = int(
+                        self.exploration_rng.choice(
+                            np.arange(self.action_dim),
+                            p=exploration_distribution,
+                        )
+                    )
+                    if zero_prior_mass and zero_prior_mass_callback is not None:
+                        zero_prior_mass_callback()
+                decision_branch = "epsilon_exploration"
+            else:
+                action = int(np.argmax(q_values_masked))
+                decision_branch = "safe_q_greedy"
 
         if return_diagnostics:
             return action, {
-                "decision_branch": (
-                    "epsilon_exploration" if explored else "safe_q_greedy"
-                ),
+                "decision_branch": decision_branch,
                 "zero_legal_prior_mass_fallback": bool(zero_prior_mass),
                 "exploration_distribution": (
                     None

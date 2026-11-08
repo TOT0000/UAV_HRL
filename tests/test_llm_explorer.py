@@ -2386,7 +2386,7 @@ def test_first_generation_diagnostics_distinguish_whole_and_masked_zero_weights(
     states = {0: np.zeros(4), 1: np.zeros(4)}
     masks = {
         0: np.asarray([True] + [False] * 16),
-        1: np.asarray([False, True] + [False] * 15),
+        1: np.asarray([False, True, True] + [False] * 14),
     }
     _, details = _select_routing_actions(
         CaptureAgent(),
@@ -2398,7 +2398,10 @@ def test_first_generation_diagnostics_distinguish_whole_and_masked_zero_weights(
         exploration_prior_weight=1.0,
         return_diagnostics=True,
     )
-    assert details[0]["routing_weight_uniform_fallback_reason"] == "all_weights_zero"
+    assert details[0]["decision_branch"] == "forced_wait_no_legal_forwarding_action"
+    assert details[0]["routing_weights_applied"] is False
+    assert details[0]["routing_weight_uniform_fallback_reason"] is None
+    assert details[0]["routing_weight_uniform_fallback_used"] is False
     assert details[0]["routing_weight_row_all_zero"] is True
     assert details[1]["routing_weight_uniform_fallback_reason"] == "legal_weights_zero_after_mask"
     assert details[1]["zero_legal_routing_weight_after_mask"] is True

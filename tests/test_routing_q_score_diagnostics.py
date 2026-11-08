@@ -217,6 +217,32 @@ class RoutingQScoreDecisionTest(unittest.TestCase):
 
 
 class RoutingTrainingDiagnosticTest(unittest.TestCase):
+    def test_forced_wait_is_counted_as_an_explicit_decision_branch(self):
+        accumulator = RoutingTrainingEpisodeDiagnostics()
+        accumulator.add_decision(
+            {
+                "q_r": [1.0, 99.0, 99.0],
+                "q_c": [0.0, 99.0, 99.0],
+                "q_safe": [1.0, 99.0, 99.0],
+                "legal_mask": [True, False, False],
+                "lambda_cost_used": 0.0,
+                "reward_argmax_action": 0,
+                "safe_argmax_action": 0,
+                "decision_branch": "forced_wait_no_legal_forwarding_action",
+            },
+            selected_action=0,
+            sender_uav_id=0,
+            hol_task_type="COM",
+            slot_index=0,
+        )
+        summary = accumulator.summary()
+
+        self.assertEqual(summary["decision_count"], 1)
+        self.assertEqual(summary["forced_wait_decision_count"], 1)
+        self.assertEqual(summary["epsilon_decision_count"], 0)
+        self.assertEqual(summary["greedy_decision_count"], 0)
+        self.assertEqual(summary["other_decision_branch_count"], 0)
+
     def test_empty_single_action_tie_negative_qc_and_lambda_zero(self):
         accumulator = RoutingTrainingEpisodeDiagnostics()
         inspection = {
@@ -258,6 +284,8 @@ class RoutingTrainingDiagnosticTest(unittest.TestCase):
         self.assertEqual(summary["empty_hol_decision_count"], 1)
         self.assertEqual(summary["epsilon_decision_count"], 1)
         self.assertEqual(summary["greedy_decision_count"], 1)
+        self.assertEqual(summary["forced_wait_decision_count"], 0)
+        self.assertEqual(summary["other_decision_branch_count"], 0)
         self.assertEqual(summary["reward_safe_argmax_difference_fraction"], 0.0)
         self.assertGreater(summary["legal_qc_negative_fraction"], 0.0)
         self.assertGreater(summary["legal_qc_above_one_fraction"], 0.0)
@@ -296,6 +324,7 @@ class RoutingTrainingDiagnosticTest(unittest.TestCase):
         summary = accumulator.summary()
         self.assertEqual(summary["epsilon_decision_count"], 1)
         self.assertEqual(summary["greedy_decision_count"], 0)
+        self.assertEqual(summary["forced_wait_decision_count"], 0)
         self.assertEqual(summary["reward_safe_argmax_difference_count"], 0)
         self.assertIsNone(
             summary["greedy_selected_differs_from_reward_argmax_fraction"]

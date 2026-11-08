@@ -14,7 +14,7 @@ ROUTING_Q_SCORE_DIAGNOSTIC_CONTRACT_VERSION = (
     "uav-hrl-routing-q-score-diagnostics-v2"
 )
 ROUTING_TRAINING_DIAGNOSTIC_CONTRACT_VERSION = (
-    "uav-hrl-routing-training-diagnostics-v1"
+    "uav-hrl-routing-training-diagnostics-v2"
 )
 ROUTING_Q_SCORE_DIAGNOSTIC_DEFINITIONS = {
     "routing_q_r_definition": "raw reward critic output Q_r(s,a)",
@@ -180,6 +180,7 @@ class RoutingTrainingEpisodeDiagnostics:
         self.empty_hol_decision_count = 0
         self.epsilon_decision_count = 0
         self.greedy_decision_count = 0
+        self.forced_wait_decision_count = 0
         self.reward_safe_argmax_difference_count = 0
         self.greedy_selected_differs_from_reward_argmax_count = 0
         self.legal_qc_negative_count = 0
@@ -233,10 +234,12 @@ class RoutingTrainingEpisodeDiagnostics:
         branch = str(diagnostics.get("decision_branch", "unknown"))
         is_epsilon = branch == "epsilon_exploration"
         is_greedy = branch == "safe_q_greedy"
+        is_forced_wait = branch == "forced_wait_no_legal_forwarding_action"
         self.decision_count += 1
         self.empty_hol_decision_count += int(hol_task_type is None)
         self.epsilon_decision_count += int(is_epsilon)
         self.greedy_decision_count += int(is_greedy)
+        self.forced_wait_decision_count += int(is_forced_wait)
         differs = reward_argmax != safe_argmax
         self.reward_safe_argmax_difference_count += int(differs)
         self.greedy_selected_differs_from_reward_argmax_count += int(
@@ -322,10 +325,12 @@ class RoutingTrainingEpisodeDiagnostics:
             "empty_hol_decision_count": self.empty_hol_decision_count,
             "epsilon_decision_count": self.epsilon_decision_count,
             "greedy_decision_count": self.greedy_decision_count,
+            "forced_wait_decision_count": self.forced_wait_decision_count,
             "other_decision_branch_count": (
                 self.decision_count
                 - self.epsilon_decision_count
                 - self.greedy_decision_count
+                - self.forced_wait_decision_count
             ),
             "reward_safe_argmax_difference_count": (
                 self.reward_safe_argmax_difference_count

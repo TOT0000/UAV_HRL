@@ -27,10 +27,13 @@ class FixedQNetwork(nn.Module):
         return self.values.unsqueeze(0).expand(state.shape[0], -1)
 
 
-def routing_state_batch(masks):
-    """Build legacy-layout routing states with the supplied effective masks."""
+def routing_state_batch(senders, masks):
+    """Build legacy-layout states with explicit senders and effective masks."""
 
+    if len(senders) != len(masks):
+        raise ValueError("each routing state needs one sender and one mask")
     states = torch.zeros((len(masks), 30), dtype=torch.float32)
+    states[torch.arange(len(senders)), torch.tensor(senders)] = 1.0
     states[:, 9:12] = torch.tensor(masks, dtype=torch.float32)
     return states.to(device)
 
@@ -43,7 +46,12 @@ class RoutingTargetTest(unittest.TestCase):
             agent.q_network = FixedQNetwork([1.0, 10.0, 5.0]).to(device)
             agent.target_q_network = FixedQNetwork([7.0, 2.0, 3.0]).to(device)
 
-        next_state = routing_state_batch([[1, 1, 1], [1, 1, 1]])
+        # Sender 0 is WAIT, so legal forwarding actions are 1 and 2. DQN
+        # bootstraps max(target[1:])=3 while DDQN selects online argmax 1 and
+        # evaluates target[1]=2. The terminal row cuts both targets off.
+        next_state = routing_state_batch(
+            [0, 0], [[1, 1, 1], [1, 1, 1]]
+        )
         reward = torch.tensor([[1.0], [4.0]], device=device)
         not_done = torch.tensor([[1.0], [0.0]], device=device)
 
@@ -51,7 +59,7 @@ class RoutingTargetTest(unittest.TestCase):
         ddqn_target = ddqn._standard_targets(next_state, reward, not_done)
 
         self.assertTrue(
-            torch.allclose(dqn_target, torch.tensor([7.3, 4.0], device=device))
+            torch.allclose(dqn_target, torch.tensor([3.7, 4.0], device=device))
         )
         self.assertTrue(
             torch.allclose(ddqn_target, torch.tensor([2.8, 4.0], device=device))
@@ -65,7 +73,10 @@ class RoutingTargetTest(unittest.TestCase):
             agent.q_network = FixedQNetwork([1.0, 100.0, 5.0]).to(device)
             agent.target_q_network = FixedQNetwork([7.0, 200.0, 3.0]).to(device)
 
-        next_state = routing_state_batch([[1, 0, 1]])
+        # Action 1 has the largest Q values but is sender 1's WAIT, so it is
+        # excluded while forwarding actions 0 and 2 remain legal. DQN uses
+        # target max action 0; DDQN selects online action 2.
+        next_state = routing_state_batch([1], [[1, 1, 1]])
         reward = torch.tensor([[0.0]], device=device)
         not_done = torch.tensor([[1.0]], device=device)
 
@@ -76,9 +87,9 @@ class RoutingTargetTest(unittest.TestCase):
             float(ddqn._standard_targets(next_state, reward, not_done)[0]), 1.5
         )
         state = np.zeros(30, dtype=np.float32)
-        mask = np.array([True, False, True])
-        self.assertEqual(dqn.select_action(state, 0, mask=mask, epsilon=0.0), 2)
-        self.assertEqual(ddqn.select_action(state, 0, mask=mask, epsilon=0.0), 2)
+        mask = np.array([True, True, True])
+        self.assertEqual(dqn.select_action(state, 1, mask=mask, epsilon=0.0), 2)
+        self.assertEqual(ddqn.select_action(state, 1, mask=mask, epsilon=0.0), 2)
         self.assertFalse(hasattr(ddqn, "cost_network"))
         self.assertFalse(hasattr(ddqn, "lambda_cost"))
 
@@ -86,10 +97,12 @@ class RoutingTargetTest(unittest.TestCase):
         class Replay:
             def sample(self, batch_size):
                 self.batch_size = batch_size
-                state = routing_state_batch([[1, 1, 1], [1, 0, 1]])
+                state = routing_state_batch(
+                    [0, 0], [[1, 1, 1], [1, 0, 1]]
+                )
                 return (
                     state,
-                    torch.tensor([0, 2], dtype=torch.long, device=device),
+                    torch.tensor([1, 2], dtype=torch.long, device=device),
                     state.clone(),
                     torch.tensor([[1.0], [2.0]], device=device),
                     torch.zeros((2, 1), device=device),

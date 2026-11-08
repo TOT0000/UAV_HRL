@@ -5,7 +5,9 @@ import pytest
 import torch
 from torch import nn
 
+import DDQN as ddqn_module
 from DDQN import DDQN, forwarding_or_forced_wait_mask
+from HRL_task_aware import _select_routing_actions
 from llm_explorer import (
     FirstGenLLMExplorerConfig,
     LLMExplorerController,
@@ -85,6 +87,153 @@ def test_safe_ddqn_greedy_epsilon_and_llm_epsilon_never_voluntarily_wait():
             exploration_prior=[1_000.0, 0.0, 0.0],
             exploration_prior_weight=1.0,
         ) in {1, 2}
+
+
+@pytest.mark.parametrize("epsilon", [1.0, 0.0])
+def test_forced_wait_skips_epsilon_prior_sampling_and_fallback(
+    monkeypatch, epsilon
+):
+    agent = DDQN(state_dim=42, action_dim=3, hidden_dim=4, master_seed=17)
+    agent.q_network = ConstantNetwork([100.0, 5.0, 4.0])
+    agent.cost_network = ConstantNetwork([0.0, 0.0, 0.0])
+    state = _routing_state(0, [True, False, False])[0].numpy()
+    sampling_calls = []
+    callback_calls = []
+
+    def forbidden_sampling(*args, **kwargs):
+        sampling_calls.append((args, kwargs))
+        raise AssertionError("forced WAIT must not normalize or sample LLM weights")
+
+    monkeypatch.setattr(
+        ddqn_module,
+        "masked_routing_exploration_distribution",
+        forbidden_sampling,
+    )
+    action, detail = agent.select_action(
+        state,
+        0,
+        mask=[True, False, False],
+        epsilon=epsilon,
+        logits_noise_std=0.0,
+        exploration_prior=[0.0, 1.0, 1.0],
+        exploration_prior_weight=1.0,
+        zero_prior_mass_callback=lambda: callback_calls.append(True),
+        return_diagnostics=True,
+    )
+
+    assert action == 0
+    assert detail["decision_branch"] == "forced_wait_no_legal_forwarding_action"
+    assert detail["zero_legal_prior_mass_fallback"] is False
+    assert detail["exploration_distribution"] is None
+    assert detail["legal_mask"] == [True, False, False]
+    assert len(detail["q_r"]) == len(detail["q_c"]) == len(detail["q_safe"]) == 3
+    assert sampling_calls == []
+    assert callback_calls == []
+
+
+def test_zero_legal_forwarding_weight_falls_back_only_over_forwarding_actions(
+    monkeypatch,
+):
+    agent = DDQN(state_dim=42, action_dim=3, hidden_dim=4, master_seed=23)
+    agent.q_network = ConstantNetwork([100.0, 5.0, 4.0])
+    agent.cost_network = ConstantNetwork([0.0, 0.0, 0.0])
+    state = _routing_state(0, [True, True, True])[0].numpy()
+    original = ddqn_module.masked_routing_exploration_distribution
+    captured = []
+    callback_calls = []
+
+    def capture_distribution(*args, **kwargs):
+        result = original(*args, **kwargs)
+        captured.append(result)
+        return result
+
+    monkeypatch.setattr(
+        ddqn_module,
+        "masked_routing_exploration_distribution",
+        capture_distribution,
+    )
+    action, detail = agent.select_action(
+        state,
+        0,
+        mask=[True, True, True],
+        epsilon=1.0,
+        logits_noise_std=0.0,
+        exploration_prior=[1.0, 0.0, 0.0],
+        exploration_prior_weight=1.0,
+        zero_prior_mass_callback=lambda: callback_calls.append(True),
+        return_diagnostics=True,
+    )
+
+    assert action in {1, 2}
+    assert len(captured) == 1
+    np.testing.assert_allclose(captured[0][0], [0.0, 0.5, 0.5])
+    assert captured[0][1] is True
+    assert detail["zero_legal_prior_mass_fallback"] is True
+    assert callback_calls == [True]
+
+
+def test_valid_legal_forwarding_weights_preserve_weighted_sampling(monkeypatch):
+    agent = DDQN(state_dim=42, action_dim=3, hidden_dim=4, master_seed=29)
+    agent.q_network = ConstantNetwork([100.0, 5.0, 4.0])
+    agent.cost_network = ConstantNetwork([0.0, 0.0, 0.0])
+    state = _routing_state(0, [True, True, True])[0].numpy()
+    original = ddqn_module.masked_routing_exploration_distribution
+    sampling_calls = []
+
+    def capture_distribution(*args, **kwargs):
+        sampling_calls.append((args, kwargs))
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(
+        ddqn_module,
+        "masked_routing_exploration_distribution",
+        capture_distribution,
+    )
+    action, detail = agent.select_action(
+        state,
+        0,
+        mask=[True, True, True],
+        epsilon=1.0,
+        logits_noise_std=0.0,
+        exploration_prior=[0.0, 0.0, 1.0],
+        exploration_prior_weight=1.0,
+        return_diagnostics=True,
+    )
+
+    assert action == 2
+    assert len(sampling_calls) == 1
+    assert detail["decision_branch"] == "epsilon_exploration"
+    assert detail["zero_legal_prior_mass_fallback"] is False
+    np.testing.assert_allclose(detail["exploration_distribution"], [0.0, 0.0, 1.0])
+
+
+def test_outer_routing_selection_preserves_forced_wait_diagnostics():
+    agent = DDQN(state_dim=42, action_dim=3, hidden_dim=4, master_seed=31)
+    agent.q_network = ConstantNetwork([100.0, 5.0, 4.0])
+    agent.cost_network = ConstantNetwork([0.0, 0.0, 0.0])
+    callback_calls = []
+    actions, details = _select_routing_actions(
+        agent,
+        {0: _routing_state(0, [True, False, False])[0].numpy()},
+        {0: np.asarray([True, False, False])},
+        epsilon=1.0,
+        exploration_prior=np.asarray([[0.0, 1.0, 1.0]]),
+        exploration_guidance_kind="routing_weights",
+        exploration_prior_weight=1.0,
+        zero_prior_mass_callback=lambda: callback_calls.append(True),
+        return_diagnostics=True,
+    )
+
+    assert actions == {0: 0}
+    assert set(details) == {0}
+    detail = details[0]
+    assert detail["decision_branch"] == "forced_wait_no_legal_forwarding_action"
+    assert detail["zero_legal_prior_mass_fallback"] is False
+    assert detail["routing_weights_applied"] is False
+    assert detail["zero_legal_routing_weight_after_mask"] is False
+    assert detail["routing_weight_uniform_fallback_used"] is False
+    assert detail["routing_weight_uniform_fallback_reason"] is None
+    assert callback_calls == []
 
 
 def test_controlled_ddqn_random_and_bootstrap_share_forwarding_policy():
