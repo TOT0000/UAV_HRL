@@ -16,6 +16,7 @@ from centralized_movement import (
     build_joint_movement_proposals,
     executed_joint_action_from_displacement,
     gs_gateway_distance_m,
+    policy_command_replay_action,
     project_gs_gateway_position,
 )
 from evaluation_aggregation import canonical_aggregation
@@ -245,7 +246,7 @@ class PermanentGatewayProjectionTest(unittest.TestCase):
                     GS_GATEWAY_HARD_RADIUS_M + 1e-9,
                 )
 
-    def test_executed_replay_action_matches_projected_displacement_and_energy(self):
+    def test_replay_keeps_command_while_actual_diagnostic_and_energy_use_execution(self):
         env = Simulator(num_UAV=NUM_UAV)
         env.num_GT = 2
         env.reset_environment()
@@ -259,6 +260,9 @@ class PermanentGatewayProjectionTest(unittest.TestCase):
         )
         action = np.tile(np.asarray(HOVER_ACTION, dtype=np.float32), NUM_UAV)
         action[:3] = (1.0, 0.0, 0.0)
+        replay_command = policy_command_replay_action(
+            action, np.ones(NUM_UAV, dtype=bool)
+        )
         proposals = build_joint_movement_proposals(
             env, RandomMovementController(), action, step_time=1.0
         )
@@ -270,14 +274,16 @@ class PermanentGatewayProjectionTest(unittest.TestCase):
         final = np.asarray(
             [env.uav_dict[uid].get_position() for uid in range(NUM_UAV)], dtype=float
         )
-        replay_action = executed_joint_action_from_displacement(initial, final, 1.0)
+        actual_action = executed_joint_action_from_displacement(initial, final, 1.0)
         decoded = np.asarray(
             [
-                CentralizedDDPG.decode_action(replay_action[uid * 3 : (uid + 1) * 3])
+                CentralizedDDPG.decode_action(actual_action[uid * 3 : (uid + 1) * 3])
                 for uid in range(NUM_UAV)
             ]
         )
         self.assertTrue(np.allclose(decoded, final - initial, atol=1e-5))
+        self.assertFalse(np.allclose(replay_command[:3], actual_action[:3]))
+        np.testing.assert_array_equal(replay_command[:3], (1.0, 0.0, 0.0))
         expected_energy = env.energy_model.compute_mobility_energy(
             uav_idx=0,
             t=1.0,

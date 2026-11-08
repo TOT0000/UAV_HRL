@@ -51,7 +51,8 @@ LLM_EXPLORER_COMPATIBLE_RESUME_PROTOCOLS = frozenset()
 SHARED_ENVIRONMENT_DEFINITIONS_VERSION = "uav-hrl-llm-explorer-v2"
 LLM_EXPLORER_WARMUP_TRANSITIONS = 10_000
 LLM_EXPLORER_UPDATE_INTERVAL_EPISODES = 1
-LLM_EXPLORER_CALL_SCHEDULE_VERSION = "global-episode-piecewise-1-2-4-v1"
+LLM_EXPLORER_LEGACY_CALL_SCHEDULE_VERSION = "global-episode-piecewise-1-2-4-v1"
+LLM_EXPLORER_CALL_SCHEDULE_VERSION = "global-episode-every-post-warmup-v2"
 LLM_EXPLORER_MAX_ATTEMPTS = 2
 # Retained for the separately versioned annealed v3 method.
 ROUTING_PRIOR_WEIGHT = 0.8
@@ -65,7 +66,16 @@ WINDOWS_CONSERVATIVE_PATH_LIMIT = 240
 
 
 def llm_explorer_call_scheduled(global_episode_number: int) -> bool:
-    """Return whether a post-warmup first-gen episode requests fresh guidance."""
+    """Return whether an eligible first-gen episode requests fresh guidance."""
+
+    episode = int(global_episode_number)
+    if episode <= 0:
+        raise ValueError("global episode number must be positive")
+    return True
+
+
+def legacy_llm_explorer_call_scheduled(global_episode_number: int) -> bool:
+    """Retain the separately contracted 1/2/4 schedule for older variants."""
 
     episode = int(global_episode_number)
     if episode <= 0:
@@ -299,7 +309,10 @@ class LLMExplorerConfig:
             raise ValueError("LLM explorer token safety margin is too small")
         if str(self.tokenizer_encoding) != LLM_EXPLORER_ENCODING:
             raise ValueError("LLM explorer must use the o200k_base tokenizer")
-        if str(self.call_schedule_version) != LLM_EXPLORER_CALL_SCHEDULE_VERSION:
+        if str(self.call_schedule_version) not in {
+            LLM_EXPLORER_CALL_SCHEDULE_VERSION,
+            LLM_EXPLORER_LEGACY_CALL_SCHEDULE_VERSION,
+        }:
             raise ValueError("unsupported LLM explorer call schedule")
 
 
@@ -311,6 +324,10 @@ class FirstGenLLMExplorerConfig(LLMExplorerConfig):
 
     def __post_init__(self) -> None:
         super().__post_init__()
+        if self.call_schedule_version != LLM_EXPLORER_CALL_SCHEDULE_VERSION:
+            raise ValueError(
+                "first-gen LLM explorer requires per-episode post-warmup guidance"
+            )
         if int(self.guidance_max_output_tokens) != 8_000:
             raise ValueError("first-gen numerical output reserve must remain 8,000")
 
@@ -3350,7 +3367,7 @@ def build_movement_decision_record(
     interval_index: int,
     movement_mask: Any,
     action_source: str,
-    executed_action: Any,
+    policy_projected_action: Any,
     actor_action: Any = None,
     applied_bias: Any = None,
     td3_guidance_active: bool = False,
@@ -3365,7 +3382,9 @@ def build_movement_decision_record(
     }
     uavs = []
     mask = np.asarray(movement_mask, dtype=bool)
-    actions = np.asarray(executed_action, dtype=float).reshape(NUM_UAV, 3)
+    projected_actions = np.asarray(policy_projected_action, dtype=float).reshape(
+        NUM_UAV, 3
+    )
     actors = None if actor_action is None else np.asarray(actor_action, dtype=float).reshape(NUM_UAV, 3)
     biases = None if applied_bias is None else np.asarray(applied_bias, dtype=float).reshape(NUM_UAV, 3)
     pre_projection = None
@@ -3613,8 +3632,12 @@ def build_movement_decision_record(
                     if pre_projection is None
                     else pre_projection[uav_id].tolist()
                 ),
-                "policy_projected_normalized_action": actions[uav_id].tolist(),
-                "executed_normalized_action": actions[uav_id].tolist(),
+                "policy_projected_normalized_action": projected_actions[
+                    uav_id
+                ].tolist(),
+                # Replaced with the physical inverse-displacement diagnostic
+                # after the movement interval completes.
+                "executed_normalized_action": projected_actions[uav_id].tolist(),
                 "actor_normalized_action": None if actors is None else actors[uav_id].tolist(),
                 "td3_guidance_active": bool(td3_guidance_active),
                 "actor_pre_projection_llm_bias": (
@@ -4675,6 +4698,18 @@ class LLMExplorerController:
                 raise ExplorerValidationError(
                     "LLM explorer checkpoint config is incompatible"
                 )
+            if (
+                isinstance(self.config, FirstGenLLMExplorerConfig)
+                and saved_config.get("call_schedule_version")
+                == LLM_EXPLORER_LEGACY_CALL_SCHEDULE_VERSION
+                and current_config.get("call_schedule_version")
+                == LLM_EXPLORER_CALL_SCHEDULE_VERSION
+            ):
+                raise ExplorerValidationError(
+                    "first-gen LLM explorer checkpoint uses the retired 1/2/4 "
+                    "episode call schedule; exact resume under per-episode "
+                    "guidance is incompatible, so start a new training run"
+                )
             source_prompt = saved_config.get("prompt_version")
             source_budget = int(
                 saved_config.get("guidance_max_output_tokens", 5_000)
@@ -5139,6 +5174,7 @@ class LLMExplorerController:
             "complete_input_sha256": _sha256_text(system_prompt + "\n" + user_prompt),
             "model": self.config.model,
             "prompt_version": self.config.prompt_version,
+            "call_schedule_version": self.config.call_schedule_version,
             "config_sha256": _sha256_text(_canonical_json(asdict(self.config))),
         }
         if self.schema_version == LLM_EXPLORER_VERSION:
@@ -5654,7 +5690,18 @@ class LLMExplorerController:
                 reason="warmup",
             )
             return self.active_guidance
-        if not llm_explorer_call_scheduled(self._upcoming_episode):
+        if self.config.call_schedule_version == LLM_EXPLORER_CALL_SCHEDULE_VERSION:
+            call_scheduled = llm_explorer_call_scheduled(self._upcoming_episode)
+        elif (
+            self.config.call_schedule_version
+            == LLM_EXPLORER_LEGACY_CALL_SCHEDULE_VERSION
+        ):
+            call_scheduled = legacy_llm_explorer_call_scheduled(
+                self._upcoming_episode
+            )
+        else:  # guarded by config validation
+            raise ExplorerValidationError("unsupported LLM explorer call schedule")
+        if not call_scheduled:
             self.active_guidance = self._unguided("schedule_skip")
             self._event(
                 "episode_guidance_skipped",
@@ -6201,13 +6248,21 @@ def explorer_metadata(
         "warmup_joint_transitions": config.warmup_joint_transitions,
         "update_interval_episodes": config.update_interval_episodes,
         "call_schedule_version": config.call_schedule_version,
-        "call_schedule": {
-            "episodes_1_to_500": "every_episode",
-            "episodes_501_to_1000": "501_503_through_999",
-            "episodes_1001_and_later": "1001_plus_multiples_of_4",
-            "warmup_and_previous_feedback_requirements_unchanged": True,
-            "skipped_episode_reuses_guidance": False,
-        },
+        "call_schedule": (
+            {
+                "post_warmup_with_previous_feedback": "every_episode",
+                "warmup_and_previous_feedback_requirements_unchanged": True,
+                "skipped_episode_reuses_guidance": False,
+            }
+            if config.call_schedule_version == LLM_EXPLORER_CALL_SCHEDULE_VERSION
+            else {
+                "episodes_1_to_500": "every_episode",
+                "episodes_501_to_1000": "501_503_through_999",
+                "episodes_1001_and_later": "1001_plus_multiples_of_4",
+                "warmup_and_previous_feedback_requirements_unchanged": True,
+                "skipped_episode_reuses_guidance": False,
+            }
+        ),
         "max_attempts_per_stage": config.max_attempts,
         "request_timeout_seconds": config.request_timeout_seconds,
         "context_window_tokens": config.context_window_tokens,

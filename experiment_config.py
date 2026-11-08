@@ -249,8 +249,11 @@ PROPULSION_MODEL_ID = "canonical-3d-quadrotor-v1"
 MOVEMENT_ACTION_PROJECTION_CONTRACT_VERSION = (
     "fieldwise-clamp-heading-wrap-service-owned-mask-external-search-uav0-hard400-v7"
 )
-MOVEMENT_REPLAY_CONTRACT_VERSION = (
+PRE_POLICY_COMMAND_MOVEMENT_REPLAY_CONTRACT_VERSION = (
     "boundary-aligned-next-state-post-action-constraint-penalties-executed-action-hover-mask-capacity-50000-v10"
+)
+MOVEMENT_REPLAY_CONTRACT_VERSION = (
+    "boundary-aligned-next-state-post-action-constraint-penalties-final-policy-command-hover-mask-capacity-50000-v11"
 )
 MOVEMENT_WARMUP_CONTRACT_VERSION = "global-joint-transition-boundary-10000-v1"
 PROPULSION_PARAMETERS = MappingProxyType(
@@ -931,7 +934,9 @@ def movement_agent_configuration(method_spec: MethodSpec, training_config=None) 
         ),
         "heading_projection": "periodic-wrap-to-[-1,1)",
         "replay_action_semantics": (
-            "inverse-encoded-executed-net-displacement" if learned else None
+            "final-normalized-policy-command-after-exploration-bias-projection-and-mask"
+            if learned
+            else None
         ),
         "replay_contract_version": (
             MOVEMENT_REPLAY_CONTRACT_VERSION if learned else None

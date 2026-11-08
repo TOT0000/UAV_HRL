@@ -15,6 +15,7 @@ from llm_explorer import (
     ExplorerValidationError,
     LLMExplorerConfig,
     LLMExplorerController,
+    LLM_EXPLORER_LEGACY_CALL_SCHEDULE_VERSION,
     NUM_UAV,
     ROUTING_ACTION_DIM,
     ROUTING_PRIOR_WEIGHT,
@@ -45,6 +46,7 @@ LLM_EXPLORER_V3_TARGET_INPUT_TOKENS = 12_000
 @dataclass(frozen=True)
 class LLMExplorerV3Config(LLMExplorerConfig):
     prompt_version: str = LLM_EXPLORER_V3_PROMPT_VERSION
+    call_schedule_version: str = LLM_EXPLORER_LEGACY_CALL_SCHEDULE_VERSION
     input_hard_limit_tokens: int = LLM_EXPLORER_V3_MAX_INPUT_TOKENS
     annealing_end_episode: int = LLM_EXPLORER_V3_ANNEAL_END_EPISODE
     episode_joint_transitions: int = 60

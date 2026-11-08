@@ -45,6 +45,7 @@ from centralized_movement import (
     movement_mask_from_state,
     movement_constraint_penalties,
     movement_state_feature_schema,
+    policy_command_replay_action,
     project_joint_action,
 )
 from com_capacity_calibration import load_com_capacity_reference
@@ -3615,6 +3616,13 @@ def train(
             projected_action = project_joint_action(
                 raw_joint_action, movement_mask=current_movement_mask
             )
+            # Replay stores the final normalized policy command, not a value
+            # reconstructed from the physical displacement after constraints.
+            # Keep a detached copy before decoding or environment execution.
+            replay_policy_command_action = policy_command_replay_action(
+                projected_action,
+                current_movement_mask,
+            )
             movement_explorer_record = None
             if llm_explorer is not None:
                 movement_explorer_record = build_movement_decision_record(
@@ -3623,7 +3631,7 @@ def train(
                     interval_index=interval,
                     movement_mask=current_movement_mask,
                     action_source=action_source,
-                    executed_action=projected_action,
+                    policy_projected_action=replay_policy_command_action,
                     actor_action=(
                         movement_action_diagnostics["actor_action"]
                         if movement_action_diagnostics is not None
@@ -3691,7 +3699,7 @@ def train(
                             },
                         )
             velocity_commands = decode_joint_velocity_commands(
-                movement_agent, projected_action
+                movement_agent, replay_policy_command_action.copy()
             )
             search_uav_ids = set(env.search_path_manager.active_search_uavs())
             if any(bool(current_movement_mask[uav_id]) for uav_id in search_uav_ids):
@@ -3886,24 +3894,34 @@ def train(
                     footprint_transitions=fov_transitions,
                 )
 
-            executed_action = executed_joint_action_from_displacement(
-                interval_initial_positions,
-                np.asarray(
-                    [
-                        env.uav_dict[uav_id].get_position()
-                        for uav_id in range(env.num_UAV)
-                    ],
-                    dtype=np.float64,
-                ),
-                MOVEMENT_INTERVAL_SECONDS,
+            interval_final_positions = np.asarray(
+                [
+                    env.uav_dict[uav_id].get_position()
+                    for uav_id in range(env.num_UAV)
+                ],
+                dtype=np.float64,
             )
-            executed_action = env.search_path_manager.replay_action(
-                executed_action,
-                current_movement_mask,
-                HOVER_ACTION,
+            actual_displacement_m = (
+                interval_final_positions - interval_initial_positions
+            )
+            actual_all_controller_normalized_action = (
+                executed_joint_action_from_displacement(
+                    interval_initial_positions,
+                    interval_final_positions,
+                    MOVEMENT_INTERVAL_SECONDS,
+                )
+            )
+            actual_executed_normalized_action = (
+                env.search_path_manager.mask_actual_action_for_policy_diagnostics(
+                    actual_all_controller_normalized_action,
+                    current_movement_mask,
+                    HOVER_ACTION,
+                )
             )
             if movement_explorer_record is not None:
-                executed_blocks = np.asarray(executed_action, dtype=float).reshape(
+                executed_blocks = np.asarray(
+                    actual_executed_normalized_action, dtype=float
+                ).reshape(
                     NUM_UAV, 3
                 )
                 for item in movement_explorer_record["uavs"]:
@@ -4040,7 +4058,7 @@ def train(
             if not evaluation and method_spec.learns_movement:
                 joint_replay.add(
                     state,
-                    executed_action,
+                    replay_policy_command_action,
                     next_state,
                     done=done,
                     delivered_mbits=interval_delivered_mbits,
@@ -4170,8 +4188,24 @@ def train(
                 transition_observer(
                     {
                         "state": state.copy(),
-                        "projected_joint_action": projected_action.copy(),
-                        "executed_action": executed_action.copy(),
+                        # Legacy observer name retained as an alias for the final
+                        # command; new consumers should use the explicit key.
+                        "projected_joint_action": replay_policy_command_action.copy(),
+                        "replay_policy_command_action": (
+                            replay_policy_command_action.copy()
+                        ),
+                        # Legacy executed_action remains an actual-motion
+                        # diagnostic and is never written to movement replay.
+                        "executed_action": (
+                            actual_executed_normalized_action.copy()
+                        ),
+                        "actual_executed_normalized_action": (
+                            actual_executed_normalized_action.copy()
+                        ),
+                        "actual_all_controller_normalized_action": (
+                            actual_all_controller_normalized_action.copy()
+                        ),
+                        "actual_displacement_m": actual_displacement_m.copy(),
                         "current_movement_mask": current_movement_mask.copy(),
                         "next_movement_mask": next_movement_mask.copy(),
                         "next_state": next_state.copy(),

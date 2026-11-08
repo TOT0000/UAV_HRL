@@ -501,15 +501,26 @@ class SearchPathManager:
             commands[uav_id] = command
         return commands
 
-    def replay_action(self, executed_action, movement_mask, hover_action):
+    def mask_actual_action_for_policy_diagnostics(
+        self, executed_action, movement_mask, hover_action
+    ):
+        """Mask Search-controlled actual motion without treating it as policy action."""
+
         action = np.asarray(executed_action, dtype=np.float32).reshape(self.env.num_UAV, 3).copy()
         mask = np.asarray(movement_mask, dtype=bool)
         if mask.shape != (self.env.num_UAV,):
-            raise ValueError("movement replay mask has invalid shape")
+            raise ValueError("movement diagnostic mask has invalid shape")
         action[~mask] = np.asarray(hover_action, dtype=np.float32)
         if not np.isfinite(action).all():
-            raise RuntimeError("movement replay action is not finite")
+            raise RuntimeError("movement diagnostic action is not finite")
         return action.reshape(-1)
+
+    def replay_action(self, executed_action, movement_mask, hover_action):
+        """Compatibility alias for the pre-v11 diagnostic helper name."""
+
+        return self.mask_actual_action_for_policy_diagnostics(
+            executed_action, movement_mask, hover_action
+        )
 
     def record_effective_visits(self, transitions, visited_before, interval_index):
         snapshot = np.asarray(visited_before, dtype=bool)

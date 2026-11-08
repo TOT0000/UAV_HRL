@@ -147,8 +147,10 @@ class JointReplayAndLearnerTest(unittest.TestCase):
         reward_lambda_4 = replay._reward_numpy(
             np.array([0, 1]), current_lambda=4.0, gamma=0.9
         ).ravel()
-        self.assertAlmostEqual(reward_lambda_3[0], -1.9, places=5)
-        self.assertAlmostEqual(reward_lambda_3[1], -1.9, places=5)
+        # C10 remains diagnostic-only under the existing no-C10 movement
+        # reward contract; this task must not reintroduce its 0.3 penalty.
+        self.assertAlmostEqual(reward_lambda_3[0], -1.6, places=5)
+        self.assertAlmostEqual(reward_lambda_3[1], -1.6, places=5)
         np.testing.assert_allclose(reward_lambda_4, reward_lambda_3 - 2.0)
         self.assertEqual(replay.size, size_before)
         np.testing.assert_array_equal(replay.not_done[:2, 0], [1.0, 0.0])

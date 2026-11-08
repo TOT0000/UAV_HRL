@@ -935,12 +935,20 @@ be redrawn with the corresponding legacy plotting code.
 
 First-generation LLM-Explorer training uses global, one-based episode numbers
 for its full analysis-plus-guidance schedule. After the existing warmup and
-previous-feedback checks, episodes through 500 call every episode; episodes
-501--1000 call on 501, 503, ..., 999; episodes from 1001 onward call on
-1001, 1005, ... . A schedule-skipped episode clears movement bias and routing
-weights, uses the ordinary exploration mechanisms, and still records feedback
-for the next scheduled call. Exact resume continues from the checkpointed
-global episode number; evaluation never calls the LLM.
+previous-feedback checks, every training episode performs both the analysis and
+numerical-guidance requests. There is no later 1/2/4 episode thinning and no
+reuse of prior movement bias or routing weights as a substitute for a fresh
+request. The separately versioned v3, TD3-only, and state-rule Explorer methods
+retain their own existing schedule contracts. Evaluation never calls the LLM.
+
+Movement replay action v11 is the independent final normalized policy command
+after exploration noise, LLM bias, canonical projection, and movement masking,
+captured before environment execution. Search-controlled UAV blocks remain the
+neutral hover action. Actual displacement and its inverse-normalized action are
+diagnostics only; next state, reward, complete delivery, energy, and constraint
+values still come from physical execution. Full-resume checkpoints containing
+the pre-v11 inverse-displacement replay action are rejected for exact resume;
+otherwise-compatible model-only checkpoints remain usable for evaluation.
 
 The canonical evaluation suites are `training_ee_vs_episode`,
 `uav_trajectory_snapshots`, `task_type_delay_vs_arrival_rate`,

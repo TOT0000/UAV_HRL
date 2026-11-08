@@ -22,6 +22,7 @@ from llm_explorer import (
     ExplorerValidationError,
     LLMExplorerConfig,
     LLMExplorerController,
+    LLM_EXPLORER_LEGACY_CALL_SCHEDULE_VERSION,
     NUM_UAV,
     _atomic_json,
     _json_clone,
@@ -56,6 +57,7 @@ LLM_STATE_RULE_RULE_OUTPUT_TOKENS = 4096
 @dataclass(frozen=True)
 class LLMStateRuleConfig(LLMExplorerConfig):
     prompt_version: str = LLM_STATE_RULE_PROMPT_VERSION
+    call_schedule_version: str = LLM_EXPLORER_LEGACY_CALL_SCHEDULE_VERSION
     analysis_max_output_tokens: int = LLM_STATE_RULE_ANALYSIS_OUTPUT_TOKENS
     guidance_max_output_tokens: int = LLM_STATE_RULE_RULE_OUTPUT_TOKENS
     episode_joint_transitions: int = 60

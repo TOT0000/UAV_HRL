@@ -5,6 +5,8 @@ from unittest import mock
 import numpy as np
 import pytest
 
+from centralized_movement import policy_command_replay_action
+
 from HRL_task_aware import (
     TrainingConfig,
     _interval_reward,
@@ -14,6 +16,9 @@ from HRL_task_aware import (
 from experiment_config import METHOD_REGISTRY, MethodSpec, comparison_method_configuration
 from llm_explorer import (
     LLM_EXPLORER_CALL_SCHEDULE_VERSION,
+    LLM_EXPLORER_LEGACY_CALL_SCHEDULE_VERSION,
+    DeterministicMockExplorerClient,
+    ExplorerValidationError,
     FirstGenLLMExplorerConfig,
     LLMExplorerController,
     environment_constants_and_definitions_first_gen,
@@ -37,14 +42,15 @@ class _NoCallsClient:
         (1, True),
         (500, True),
         (501, True),
-        (502, False),
+        (502, True),
         (999, True),
-        (1000, False),
+        (1000, True),
         (1001, True),
-        (1004, False),
+        (1002, True),
+        (1004, True),
         (1005, True),
         (1497, True),
-        (1500, False),
+        (1500, True),
         (1501, True),
         (1505, True),
     ],
@@ -62,11 +68,14 @@ def _begin(controller, *, episode_index, transitions):
         sigma_episode_start=0.2,
         routing_epsilon=0.5,
         current_observable_initial_state={"known_rois": [], "uavs": []},
-        environment_constants={"episode_seconds": 60},
+        environment_constants=environment_constants_and_definitions_first_gen(
+            episode_seconds=60,
+            routing_slot_seconds=0.25,
+        ),
     )
 
 
-def test_warmup_and_schedule_skips_are_distinct_and_clear_guidance():
+def test_warmup_skips_without_calling_or_reusing_guidance():
     client = _NoCallsClient()
     controller = LLMExplorerController(
         run_directory=None,
@@ -76,25 +85,51 @@ def test_warmup_and_schedule_skips_are_distinct_and_clear_guidance():
     )
     controller.previous_episode_feedback = {"episode": 499}
 
-    warmup = _begin(controller, episode_index=499, transitions=9_999)
-    assert warmup["td3_reason"] == "warmup"
-
     controller.active_guidance = {
         **controller._unguided("test"),
         "enabled": True,
         "td3_bias": np.ones((16, 3), dtype=np.float32),
         "routing_weights": np.ones((16, 17), dtype=np.float64),
     }
-    skipped = _begin(controller, episode_index=501, transitions=10_000)
-    assert skipped["td3_reason"] == "schedule_skip"
-    assert skipped["routing_reason"] == "schedule_skip"
-    assert np.count_nonzero(skipped["td3_bias"]) == 0
-    assert skipped["routing_weights"] is None
-    assert skipped["routing_prior"] is None
+    warmup = _begin(controller, episode_index=499, transitions=9_999)
+    assert warmup["td3_reason"] == "warmup"
+    assert np.count_nonzero(warmup["td3_bias"]) == 0
+    assert warmup["routing_weights"] is None
     assert client.calls == 0
 
 
-def test_schedule_identity_and_exact_resume_keep_global_episode_number():
+@pytest.mark.parametrize(
+    "episode",
+    [500, 501, 502, 1000, 1001, 1002, 1497, 1500, 1701],
+)
+def test_first_gen_calls_both_stages_every_eligible_episode(episode):
+    class RecordingClient(DeterministicMockExplorerClient):
+        def __init__(self):
+            self.calls = []
+
+        def chat(self, **kwargs):
+            self.calls.append(kwargs)
+            return super().chat(**kwargs)
+
+    client = RecordingClient()
+    controller = LLMExplorerController(
+        run_directory=None,
+        run_identity={"method_id": "td3_dinkelbach_llm_explorer"},
+        config=FirstGenLLMExplorerConfig(),
+        client=client,
+    )
+    controller.complete_episode(
+        episode_index=episode - 2,
+        metrics={"episode": episode - 1, "energy_efficiency_bit_per_j": 1.0},
+    )
+    result = _begin(controller, episode_index=episode - 1, transitions=10_000)
+    assert result["enabled"] is True
+    assert result["td3_fallback"] is False
+    assert result["routing_fallback"] is False
+    assert len(client.calls) == 2
+
+
+def test_schedule_identity_and_old_first_gen_exact_resume_is_rejected():
     config = FirstGenLLMExplorerConfig()
     source = LLMExplorerController(
         run_directory=None,
@@ -102,22 +137,24 @@ def test_schedule_identity_and_exact_resume_keep_global_episode_number():
         config=config,
         client=_NoCallsClient(),
     )
-    source.previous_episode_feedback = {"episode": 501}
     state = source.state_dict()
-
-    client = _NoCallsClient()
-    restored = LLMExplorerController(
-        run_directory=None,
-        run_identity={"method_id": "td3_dinkelbach_llm_explorer"},
-        config=config,
-        client=client,
+    state["config"]["call_schedule_version"] = (
+        LLM_EXPLORER_LEGACY_CALL_SCHEDULE_VERSION
     )
-    restored.load_state_dict(state)
-    result = _begin(restored, episode_index=501, transitions=10_000)
-    assert result["td3_reason"] == "schedule_skip"
-    assert client.calls == 0
+    with pytest.raises(ExplorerValidationError, match="retired 1/2/4"):
+        source.load_state_dict(state)
     metadata = explorer_metadata(config)
     assert metadata["call_schedule_version"] == LLM_EXPLORER_CALL_SCHEDULE_VERSION
+    assert metadata["call_schedule"]["post_warmup_with_previous_feedback"] == (
+        "every_episode"
+    )
+    identity = source._cache_identity(
+        episode_index=500,
+        stage="analysis",
+        system_prompt="system",
+        user_prompt="user",
+    )
+    assert identity["call_schedule_version"] == LLM_EXPLORER_CALL_SCHEDULE_VERSION
 
 
 def test_late_complete_bits_feed_movement_but_not_routing_reward():
@@ -259,7 +296,10 @@ def test_normal_training_entry_replays_complete_goodput_and_keeps_c10_diagnostic
         ), mock.patch(
             "HRL_task_aware.movement_constraint_penalties",
             side_effect=lambda env: _diagnostic_penalties(),
-        ):
+        ), mock.patch(
+            "HRL_task_aware.policy_command_replay_action",
+            wraps=policy_command_replay_action,
+        ) as replay_command_mock:
             result = train(
                 config,
                 method_spec=MethodSpec.parse(method_id),
@@ -280,3 +320,10 @@ def test_normal_training_entry_replays_complete_goodput_and_keeps_c10_diagnostic
         ) as replay:
             assert float(replay["delivered_mbits"][0, 0]) == pytest.approx(3.0)
             assert float(replay["c10_penalty"][0, 0]) == pytest.approx(0.9)
+            np.testing.assert_array_equal(
+                replay["action"][0],
+                policy_command_replay_action(
+                    *replay_command_mock.call_args_list[0].args
+                ),
+            )
+        assert replay_command_mock.call_count == 1

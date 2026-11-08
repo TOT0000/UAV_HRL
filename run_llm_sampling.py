@@ -259,12 +259,15 @@ def collect_samples(
         "learning_updates": "disabled",
         "dinkelbach_lambda": "fixed from source checkpoint",
         "routing_cost_multiplier": "fixed from source checkpoint",
-        "action_semantics": "executed post-displacement action, matching movement replay",
+        "action_semantics": (
+            "final normalized policy command after exploration, LLM bias, "
+            "projection, and movement mask"
+        ),
         "replay_auxiliary": replay_auxiliary_metadata(),
         "joint_replay_field_order": list(collector.all_fields),
         "field_role_contract": {
             "current_snapshot": "decision-available data aligned with state",
-            "action": "executed post-displacement movement action",
+            "action": "final normalized policy command sent to the environment",
             "next_snapshot": "post-action boundary data aligned with next_state",
             "provenance": (
                 "episode/step/scenario identifiers and Dinkelbach lambda are "
@@ -282,7 +285,7 @@ def collect_samples(
             )
         collector.add(
             record["state"],
-            record["executed_action"],
+            record["replay_policy_command_action"],
             record["next_state"],
             done=record["done"],
             delivered_mbits=record["delivered_mbits"],

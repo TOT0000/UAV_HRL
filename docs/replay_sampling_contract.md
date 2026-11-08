@@ -11,6 +11,14 @@ after the four routing subslots and the next movement-boundary reassignment (if
 one occurs). Terminal `next_` snapshots describe the physical terminal boundary.
 Arrays are copied into replay storage at the same circular-buffer index.
 
+The action column is the final normalized policy control command after
+exploration noise, any LLM bias, canonical action projection, and the movement
+mask. It is copied before decoding and physical execution. Search-controlled
+UAVs therefore use the neutral hover block; their Search Path Manager movement
+is never back-filled as a policy action. Actual displacement and its
+inverse-normalized representation remain diagnostics, while next state, reward,
+delivery, energy, and constraint fields record the real executed outcome.
+
 The complete field/shape/dtype/unit/mask dictionary is emitted under
 `replay_auxiliary` in sampling `metadata.json`. Main groups are:
 

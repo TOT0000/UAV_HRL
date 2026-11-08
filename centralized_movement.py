@@ -834,7 +834,11 @@ def project_gs_gateway_position(
 def executed_joint_action_from_displacement(
     initial_positions, final_positions, interval_seconds
 ):
-    """Encode the actually executed net displacement in the replay action domain."""
+    """Encode actual net displacement for diagnostics in the policy action domain.
+
+    This is deliberately not the movement replay action: replay stores the final
+    normalized policy command that was sent to the environment.
+    """
 
     initial = np.asarray(initial_positions, dtype=np.float64)
     final = np.asarray(final_positions, dtype=np.float64)
@@ -860,8 +864,29 @@ def executed_joint_action_from_displacement(
             vertical_scalar,
         )
     if not np.isfinite(result).all():
-        raise RuntimeError("executed replay action contains NaN or Inf")
+        raise RuntimeError("executed diagnostic action contains NaN or Inf")
     return result.reshape(JOINT_ACTION_DIM)
+
+
+def policy_command_replay_action(projected_joint_action, movement_mask):
+    """Return an independent canonical copy of the command stored in replay.
+
+    The input must already include exploration noise and any LLM bias.  Applying
+    the canonical projection again makes the replay boundary explicit and keeps
+    heading wrapping and neutral Search-UAV blocks identical to actor/target
+    action projection.
+    """
+
+    command = project_joint_action(
+        projected_joint_action,
+        movement_mask=movement_mask,
+    )
+    if hasattr(command, "detach"):
+        command = command.detach().cpu().numpy()
+    result = np.asarray(command, dtype=np.float32).reshape(JOINT_ACTION_DIM).copy()
+    if not np.isfinite(result).all():
+        raise RuntimeError("movement replay policy command contains NaN or Inf")
+    return result
 
 
 def build_velocity_substep_proposals(env, velocity_commands, step_time):

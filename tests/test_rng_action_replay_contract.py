@@ -8,6 +8,7 @@ import torch
 from centralized_ddpg import CentralizedDDPG
 from centralized_movement import (
     JOINT_ACTION_DIM,
+    policy_command_replay_action,
     project_joint_action,
     project_local_action,
 )
@@ -161,6 +162,23 @@ class ProjectionSmoothingReplayTest(unittest.TestCase):
         wrapped_equivalent = CentralizedDDPG.decode_action([0.0, 2.2, 0.0])
         np.testing.assert_allclose(equivalent, wrapped_equivalent, atol=1e-6)
 
+    def test_replay_command_includes_noise_bias_projection_mask_and_is_detached(self):
+        actor = np.zeros(JOINT_ACTION_DIM, dtype=np.float32)
+        noise = np.full(JOINT_ACTION_DIM, 0.25, dtype=np.float32)
+        bias = np.zeros(JOINT_ACTION_DIM, dtype=np.float32)
+        bias[0:3] = (1.5, 2.2, -2.0)
+        mask = np.asarray([True, False] + [True] * 14, dtype=bool)
+        projected = project_joint_action(actor + noise + bias, movement_mask=mask)
+        replay_command = policy_command_replay_action(projected, mask)
+        expected = project_joint_action(actor + noise + bias, movement_mask=mask)
+        np.testing.assert_array_equal(replay_command, expected)
+        np.testing.assert_array_equal(
+            replay_command.reshape(16, 3)[1],
+            np.asarray([-1.0, 0.0, 0.0], dtype=np.float32),
+        )
+        projected[:] = -0.75
+        np.testing.assert_array_equal(replay_command, expected)
+
     def test_td3_target_noise_is_independent_clipped_and_masked(self):
         first_streams = NamedRNGStreams(44)
         second_streams = NamedRNGStreams(44)
@@ -205,6 +223,7 @@ class ProjectionSmoothingReplayTest(unittest.TestCase):
                 "newest_physical_index": 1,
                 "oldest_age": 2,
                 "newest_age": 0,
+                "llm_extra_reward_enabled": False,
             },
         )
         inactive = replay.action[: replay.size].reshape(-1, 16, 3)[:, 1]
@@ -259,7 +278,7 @@ class RegistryContractTest(unittest.TestCase):
                     self.assertEqual(resolved["warmup_joint_transitions"], 10_000)
                     self.assertEqual(
                         resolved["replay_action_semantics"],
-                        "inverse-encoded-executed-net-displacement",
+                        "final-normalized-policy-command-after-exploration-bias-projection-and-mask",
                     )
                 else:
                     self.assertIsNone(resolved["replay_capacity"])

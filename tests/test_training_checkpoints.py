@@ -21,6 +21,7 @@ from experiment_config import (
     INITIAL_COMMUNICATION_TOPOLOGY_CONTRACT_VERSION,
     MethodSpec,
     MOVEMENT_EXPLORATION_DECAY_EPISODES,
+    PRE_POLICY_COMMAND_MOVEMENT_REPLAY_CONTRACT_VERSION,
     ROUTING_EPSILON_DECAY_EPISODES,
     SR_ROUTE_LIFECYCLE_VERSION,
     TASK_POTENTIAL_CONTRACT_VERSION,
@@ -46,18 +47,23 @@ from routing_lifecycle import RoutingLearnerLifecycle
 from scenario_manifest import extend_training_manifest, generate_manifest
 from training_checkpoint import (
     CHECKPOINT_SCHEMA_VERSION,
+    FULL_CHECKPOINT_TYPE,
     FULL_RESUME_LOGGING_SCHEMA_VERSION,
     PRE_SHARED_GOODPUT_REWARD_CHECKPOINT_SCHEMA_VERSION,
     PRE_SERVICE_ONLY_CHECKPOINT_SCHEMA_VERSION,
     PRE_CONTINUOUS_GATEWAY_PROJECTION_CHECKPOINT_SCHEMA_VERSION,
     PRE_UNIFIED_400M_COMMUNICATION_CHECKPOINT_SCHEMA_VERSION,
+    MODEL_CHECKPOINT_TYPE,
     PRE_ROUTING_LIFECYCLE_CHECKPOINT_SCHEMA_VERSION,
     ROUTING_LIFECYCLE_CHECKPOINT_SCHEMA_VERSION,
     load_full_resume_checkpoint,
     load_model_checkpoint,
     inspect_full_resume_checkpoint,
     _bit_counter_tolerance,
+    _resolved_training_config_for_provenance,
     _validate_full_resume_logging_state,
+    _validate_checkpoint_schema,
+    validate_model_checkpoint_metadata,
     save_full_resume_checkpoint,
     save_model_checkpoint,
 )
@@ -670,7 +676,7 @@ class FullResumeCheckpointTest(unittest.TestCase):
             },
         )
 
-    def test_full_resume_preserves_llm_schedule_and_latest_feedback(self):
+    def test_full_resume_preserves_per_episode_llm_schedule_and_latest_feedback(self):
         run_identity = {"method_id": "td3_dinkelbach_llm_explorer"}
         explorer_config = FirstGenLLMExplorerConfig()
         source = LLMExplorerController(
@@ -749,11 +755,11 @@ class FullResumeCheckpointTest(unittest.TestCase):
                 },
                 "environment_constants": environment,
             }
-            skipped = controller.begin_episode(episode_index=501, **common)
-            self.assertEqual(skipped["td3_reason"], "schedule_skip")
-            self.assertEqual(np.count_nonzero(skipped["td3_bias"]), 0)
-            self.assertIsNone(skipped["routing_weights"])
-            self.assertEqual(client.calls, [])
+            guidance_502 = controller.begin_episode(episode_index=501, **common)
+            self.assertTrue(guidance_502["enabled"])
+            self.assertFalse(guidance_502["td3_fallback"])
+            self.assertEqual(len(client.calls), 2)
+            self.assertIn("501", client.calls[0]["prompt"])
 
             controller.complete_episode(
                 episode_index=501,
@@ -767,8 +773,82 @@ class FullResumeCheckpointTest(unittest.TestCase):
             guidance = controller.begin_episode(episode_index=502, **common)
             self.assertTrue(guidance["enabled"])
             self.assertFalse(guidance["td3_fallback"])
-            self.assertEqual(len(client.calls), 2)
-            self.assertIn("50250.5", client.calls[0]["prompt"])
+            self.assertEqual(len(client.calls), 4)
+            self.assertIn("50250.5", client.calls[2]["prompt"])
+
+    def test_legacy_replay_semantics_reject_full_resume_but_allow_model_only(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            fixture = self._preflight_checkpoint(temp_dir)
+            full_metadata = json.loads(
+                (fixture["checkpoint_dir"] / "metadata.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+        full_metadata["movement_replay_contract_version"] = (
+            PRE_POLICY_COMMAND_MOVEMENT_REPLAY_CONTRACT_VERSION
+        )
+        full_metadata["checkpoint_type"] = FULL_CHECKPOINT_TYPE
+        with self.assertRaisesRegex(RuntimeError, "inverse-encoded executed.*Exact resume"):
+            _validate_checkpoint_schema(full_metadata)
+
+        td3, ddqn, _, _ = self._components()
+        experiment = _model_provenance_fixture(1)
+        dinkelbach_state = DinkelbachBlockState.from_config(
+            experiment["formal_config"]
+        )
+        dinkelbach_state.record_episode(1.0, 2.0)
+        experiment.update(
+            dinkelbach_config_metadata(experiment["formal_config"]),
+            lambda_ee=dinkelbach_state.current_lambda,
+            dinkelbach_state=dinkelbach_state.training_state(),
+        )
+        expected_current_formal_config = copy.deepcopy(experiment["formal_config"])
+        with tempfile.TemporaryDirectory() as temp_dir:
+            model_dir = Path(temp_dir) / "model"
+            save_model_checkpoint(
+                model_dir,
+                episode=0,
+                td3=td3,
+                ddqn=ddqn,
+                movement_state_dim=MOVEMENT_STATE_DIM,
+                joint_action_dim=JOINT_ACTION_DIM,
+                routing_state_dim=ROUTING_STATE_DIM,
+                calibration={"seed": 1, "c_ref_com": 10.0},
+                experiment_metadata=experiment,
+                routing_lifecycle_state=_empty_routing_lifecycle(),
+            )
+            metadata = json.loads(
+                (model_dir / "metadata.json").read_text(encoding="utf-8")
+            )
+        metadata["movement_replay_contract_version"] = (
+            PRE_POLICY_COMMAND_MOVEMENT_REPLAY_CONTRACT_VERSION
+        )
+        self.assertEqual(_validate_checkpoint_schema(metadata), CHECKPOINT_SCHEMA_VERSION)
+        legacy_formal = metadata["experiment"]["formal_config"]
+        legacy_formal["movement_replay_contract_version"] = (
+            PRE_POLICY_COMMAND_MOVEMENT_REPLAY_CONTRACT_VERSION
+        )
+        legacy_movement = metadata["movement_agent_configuration"]
+        legacy_movement["replay_contract_version"] = (
+            PRE_POLICY_COMMAND_MOVEMENT_REPLAY_CONTRACT_VERSION
+        )
+        legacy_movement["replay_action_semantics"] = (
+            "inverse-encoded-executed-net-displacement"
+        )
+        legacy_formal_movement = legacy_formal["movement_agent_configuration"]
+        legacy_formal_movement["replay_contract_version"] = (
+            PRE_POLICY_COMMAND_MOVEMENT_REPLAY_CONTRACT_VERSION
+        )
+        legacy_formal_movement["replay_action_semantics"] = (
+            "inverse-encoded-executed-net-displacement"
+        )
+        metadata["training_provenance"]["resolved_training_config"] = (
+            _resolved_training_config_for_provenance(metadata)
+        )
+        validate_model_checkpoint_metadata(
+            metadata,
+            expected_formal_config=expected_current_formal_config,
+        )
 
     def test_large_roundoff_state_full_checkpoint_save_load_is_lossless(self):
         state = _large_roundoff_useful_goodput_training_state()

@@ -57,6 +57,7 @@ from experiment_config import (
     GS_GATEWAY_SOFT_RADIUS_OPERATIONAL,
     INITIAL_COMMUNICATION_TOPOLOGY_CONTRACT_VERSION,
     MOVEMENT_ACTION_PROJECTION_CONTRACT_VERSION,
+    PRE_POLICY_COMMAND_MOVEMENT_REPLAY_CONTRACT_VERSION,
     MOVEMENT_REPLAY_CONTRACT_VERSION,
     MOVEMENT_WARMUP_CONTRACT_VERSION,
     MAX_3D_COMMUNICATION_DISTANCE_M,
@@ -1676,10 +1677,32 @@ def _validate_checkpoint_schema(metadata):
             "routing_state_schema_version": ROUTING_STATE_SCHEMA_VERSION,
             "packet_qos_contract_version": PACKET_QOS_CONTRACT_VERSION,
         }
+        replay_contract = metadata.get("movement_replay_contract_version")
+        checkpoint_type = metadata.get("checkpoint_type")
+        if (
+            replay_contract == PRE_POLICY_COMMAND_MOVEMENT_REPLAY_CONTRACT_VERSION
+            and checkpoint_type == FULL_CHECKPOINT_TYPE
+        ):
+            raise RuntimeError(
+                "full-resume checkpoint stores movement replay actions as "
+                "inverse-encoded executed net displacement; current training "
+                "stores the final normalized policy command. Exact resume is "
+                "incompatible and no replay migration is provided; start a new "
+                "training run"
+            )
+        model_only_legacy_replay_is_safe = (
+            replay_contract == PRE_POLICY_COMMAND_MOVEMENT_REPLAY_CONTRACT_VERSION
+            and checkpoint_type == MODEL_CHECKPOINT_TYPE
+        )
         mismatches = {
             key: (metadata.get(key), value)
             for key, value in required_contracts.items()
-            if key in metadata and metadata.get(key) != value
+            if key in metadata
+            and metadata.get(key) != value
+            and not (
+                key == "movement_replay_contract_version"
+                and model_only_legacy_replay_is_safe
+            )
         }
         capabilities = metadata.get("capabilities")
         if mismatches or (
@@ -1877,6 +1900,19 @@ def validate_model_checkpoint_metadata(
             )
 
     if expected_formal_config is not None:
+        model_config_fields = FORMAL_CORE_CONFIG_FIELDS
+        if (
+            metadata.get("checkpoint_type") == MODEL_CHECKPOINT_TYPE
+            and metadata.get("movement_replay_contract_version")
+            == PRE_POLICY_COMMAND_MOVEMENT_REPLAY_CONTRACT_VERSION
+        ):
+            # Model-only evaluation never loads replay, so its historical
+            # replay-action identity is not a policy-weight incompatibility.
+            model_config_fields = tuple(
+                field
+                for field in FORMAL_CORE_CONFIG_FIELDS
+                if field != "movement_replay_contract_version"
+            )
         checkpoint_run_compatibility_from_metadata(
             metadata,
             expected_formal_config,
@@ -1885,7 +1921,7 @@ def validate_model_checkpoint_metadata(
                 if expected_completed_episodes is None
                 else int(expected_completed_episodes)
             ),
-            config_fields=FORMAL_CORE_CONFIG_FIELDS,
+            config_fields=model_config_fields,
             current_training_manifest=current_training_manifest,
         )
         if _checkpoint_uses_dinkelbach(metadata):
