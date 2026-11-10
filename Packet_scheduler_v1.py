@@ -1,5 +1,6 @@
 import heapq
 import math
+import sys
 from copy import deepcopy
 from collections import defaultdict, deque
 from dataclasses import replace
@@ -46,6 +47,7 @@ def final_hop_delivered_bits(to_target, gs_id, bits_tx_used):
 MAX_PACKET_HOPS = 20
 PACKET_EPS = 1e-9
 EVENT_TIME_EPS = 1e-12
+EVENT_SERVICE_STALL_GUARD_LIMIT = 100000
 TASK_DEADLINE_SECONDS = dict(PRODUCTION_TASK_DEADLINE_SECONDS)
 EPISODE_INJECTION_CUTOFF_SECONDS = PRODUCTION_PACKET_INJECTION_CUTOFF_SECONDS
 
@@ -2907,6 +2909,7 @@ class PacketEngine:
         routing_transition_ids_by_sender=None,
         effective_masks_by_sender=None,
         collect_first_gen_event_diagnostics=False,
+        stall_diagnostic_context=None,
     ):
         """Advance one slot by physical generation/service/deadline events.
 
@@ -2936,6 +2939,7 @@ class PacketEngine:
             int(sender): np.asarray(mask, dtype=bool)
             for sender, mask in dict(effective_masks_by_sender or {}).items()
         }
+        stall_context = dict(stall_diagnostic_context or {})
         result = self._event_result()
         if bool(collect_first_gen_event_diagnostics):
             result["first_gen_event_diagnostics"] = {
@@ -3244,7 +3248,7 @@ class PacketEngine:
 
         def append_expirations(moment):
             if self.allow_late_delivery:
-                return
+                return 0
             # Outcome rows snapshot diagnostics inside mark_packet_done().
             # Settle a current-slot S2U opportunity before that snapshot when
             # the deadline itself terminates the HOL packet.
@@ -3261,13 +3265,16 @@ class PacketEngine:
                         + event_time_tolerance_seconds(deadline_abs, moment)
                     ):
                         settle_s2u_no_service(pkt["id"])
-            for violation in self.expire_packets(moment, inclusive=True):
+            violations = self.expire_packets(moment, inclusive=True)
+            for violation in violations:
                 result["outcomes"].append(
                     self._outcome_from_violation(violation)
                 )
+            return len(violations)
 
         def materialize_due(moment):
             nonlocal event_index
+            consumed = 0
             while (
                 event_index < len(events)
                 and float(events[event_index]["time_seconds"])
@@ -3280,6 +3287,76 @@ class PacketEngine:
                 if pkt is not None:
                     result["generated_packet_ids"].append(int(pkt["id"]))
                 event_index += 1
+                consumed += 1
+            return consumed
+
+        def stall_queue_heads():
+            queue_heads = []
+            for sender, receiver in sorted(actions.items()):
+                pkt = self.get_hol_packet(sender)
+                if pkt is None:
+                    continue
+                queue_heads.append(
+                    {
+                        "link": f"UAV:{sender}->{receiver}",
+                        "packet_id": int(pkt["id"]),
+                        "remaining_bits": float(pkt.get("rem_bits", 0.0)),
+                        "hops": int(pkt.get("hops", 0)),
+                    }
+                )
+            for sr_id in sorted(self.sr_queues):
+                pkt = self.get_sr_hol_packet(sr_id)
+                if pkt is None:
+                    continue
+                receiver = pkt.get("s2u_receiver")
+                if receiver is None:
+                    receiver = assigned_com_receiver(sr_id)
+                queue_heads.append(
+                    {
+                        "link": f"SR:{sr_id}->{receiver}",
+                        "packet_id": int(pkt["id"]),
+                        "remaining_bits": float(pkt.get("rem_bits", 0.0)),
+                        "hops": int(pkt.get("hops", 0)),
+                    }
+                )
+            return queue_heads
+
+        consecutive_no_progress = 0
+        stall_guard_limit = int(
+            getattr(
+                self,
+                "_event_service_stall_guard_limit",
+                EVENT_SERVICE_STALL_GUARD_LIMIT,
+            )
+        )
+        if stall_guard_limit <= 0:
+            raise ValueError("event service stall guard limit must be positive")
+
+        def record_iteration_progress(made_progress, candidate_event_times):
+            nonlocal consecutive_no_progress
+            if made_progress:
+                consecutive_no_progress = 0
+                return
+            consecutive_no_progress += 1
+            if consecutive_no_progress < stall_guard_limit:
+                return
+            context_fields = " ".join(
+                f"{key}={value!r}" for key, value in sorted(stall_context.items())
+            )
+            diagnostic = (
+                "[PacketEngine stall] "
+                f"slot_start={slot_start!r} slot_end={slot_end!r} "
+                f"current_time={t!r} candidates={candidate_event_times!r} "
+                f"consecutive_no_progress={consecutive_no_progress} "
+                f"queue_heads={stall_queue_heads()!r}"
+            )
+            if context_fields:
+                diagnostic = f"{diagnostic} {context_fields}"
+            print(diagnostic, file=sys.stderr, flush=True)
+            raise RuntimeError(
+                "event service stalled after "
+                f"{consecutive_no_progress} consecutive iterations without progress"
+            )
 
         t = slot_start
         materialize_due(t)
@@ -3287,8 +3364,6 @@ class PacketEngine:
         iteration_count = 0
         while t < slot_end:
             iteration_count += 1
-            if iteration_count > 100000:
-                raise RuntimeError("event service exceeded the zero-time loop guard")
             env.current_time = t
             event_clock[0] = t
             uav_links, s2u_links, topology_scanned = active_links()
@@ -3360,6 +3435,7 @@ class PacketEngine:
                     packets_by_link[link] = self.get_sr_hol_packet(sr_id)
             ordered_rate_links = tuple(sorted(rates_bps, key=str))
             completion_times = {}
+            nextafter_completion_links = set()
             for link, pkt in packets_by_link.items():
                 if pkt is None:
                     continue
@@ -3374,8 +3450,16 @@ class PacketEngine:
                 # minimum hop duration.
                 if completion_time <= t:
                     completion_time = float(np.nextafter(t, float("inf")))
+                    nextafter_completion_links.add(link)
                 completion_times[link] = completion_time
             next_completion = min(completion_times.values(), default=float("inf"))
+            candidate_event_times = {
+                "slot_end": float(slot_end),
+                "block_end": float(block_end),
+                "generation": float(next_generation),
+                "deadline": float(next_deadline),
+                "completion": float(next_completion),
+            }
             next_time = min(
                 slot_end,
                 block_end,
@@ -3389,12 +3473,29 @@ class PacketEngine:
                 # a minimum event duration: a positive sub-nanosecond service
                 # interval is still real service and must drain the residual
                 # bits instead of spinning on the same completion event.
-                materialize_due(t)
-                append_expirations(t)
+                consumed_events = materialize_due(t)
+                expired_packets = append_expirations(t)
                 if block_end <= t:
                     t = min(float(np.nextafter(t, float("inf"))), slot_end)
+                record_iteration_progress(
+                    consumed_events > 0 or expired_packets > 0,
+                    candidate_event_times,
+                )
                 continue
             duration = next_time - t
+            normal_time_progress = any(
+                candidate > t and candidate == next_time
+                for candidate in (
+                    slot_end,
+                    block_end,
+                    next_generation,
+                    next_deadline,
+                )
+            ) or any(
+                completion_time == next_time
+                and link not in nextafter_completion_links
+                for link, completion_time in completion_times.items()
+            )
             if bool(collect_first_gen_event_diagnostics):
                 # Events at t have already been materialized/expired.  The
                 # HOL observed here therefore exists throughout [t,next_time)
@@ -3423,6 +3524,7 @@ class PacketEngine:
                 }
             )
             completed = []
+            service_progress = False
             if not self._event_service_cache_enabled:
                 self._event_service_counters[
                     "resource_bandwidth_serializations"
@@ -3495,6 +3597,11 @@ class PacketEngine:
                     self.s2u_backlog_bits[int(sr_id)] = max(
                         previous_s2u_backlog - bits, 0.0
                     )
+                    service_progress = service_progress or (
+                        float(pkt.get("rem_bits", 0.0)) < remaining_before
+                        or self.s2u_backlog_bits[int(sr_id)]
+                        < previous_s2u_backlog
+                    )
                     if (
                         previous_s2u_backlog > PACKET_EPS
                         and self.s2u_backlog_bits[int(sr_id)] <= PACKET_EPS
@@ -3513,6 +3620,9 @@ class PacketEngine:
                         )
                     self.record_hop_transmission(
                         pkt, sender, receiver, bits
+                    )
+                    service_progress = service_progress or (
+                        float(pkt.get("rem_bits", 0.0)) < remaining_before
                     )
                     pkt["current_hop_actual_tx_seconds"] = float(
                         pkt.get("current_hop_actual_tx_seconds", 0.0)
@@ -3563,8 +3673,16 @@ class PacketEngine:
                     self._event_complete_uav_hop(
                         env, pkt, sender, receiver, t, result
                     )
-            materialize_due(t)
-            append_expirations(t)
+            consumed_events = materialize_due(t)
+            expired_packets = append_expirations(t)
+            record_iteration_progress(
+                normal_time_progress
+                or service_progress
+                or bool(completed)
+                or consumed_events > 0
+                or expired_packets > 0,
+                candidate_event_times,
+            )
 
         env.current_time = slot_end
         if bool(collect_first_gen_event_diagnostics):

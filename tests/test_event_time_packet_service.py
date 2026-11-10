@@ -99,6 +99,143 @@ def _actions(*values):
     return {sender: int(receiver) for sender, receiver in enumerate(values)}
 
 
+def test_more_than_100000_progressing_events_complete_the_slot(monkeypatch):
+    env = EventCapacityEnvironment(1)
+    engine = PacketEngine(1)
+    event_count = 100_005
+    event_times = np.linspace(
+        0.0,
+        engine.step_time,
+        event_count + 2,
+        dtype=float,
+    )[1:-1]
+    events = [{"time_seconds": float(value)} for value in event_times]
+    consumed = []
+
+    def consume_event(_env, event):
+        consumed.append(event["time_seconds"])
+        return None
+
+    monkeypatch.setattr(engine, "materialize_generation_event", consume_event)
+
+    result = engine.serve_event_driven_slot(
+        env,
+        _actions(0),
+        0.0,
+        generation_events=events,
+    )
+
+    assert len(consumed) == event_count
+    assert len(result["resource_segments"]) > 100_000
+    assert env.current_time == pytest.approx(engine.step_time)
+
+
+def test_repeated_no_progress_aborts_with_compact_context_and_hol(capsys, monkeypatch):
+    env = EventCapacityEnvironment(1)
+    engine = PacketEngine(
+        1,
+        task_deadlines_seconds={"FOV": 1.0, "COM": 1.0},
+    )
+    packet = engine.create_packet(0, "COM", 10.0, generation_time=0.0)
+    engine._event_service_stall_guard_limit = 3
+    monkeypatch.setattr(engine, "next_packet_deadline", lambda moment: float(moment))
+
+    with pytest.raises(RuntimeError, match="3 consecutive iterations without progress"):
+        engine.serve_event_driven_slot(
+            env,
+            _actions(0),
+            0.0,
+            stall_diagnostic_context={"episode": 312, "slot_index": 236},
+        )
+
+    diagnostic = capsys.readouterr().err
+    assert diagnostic.count("[PacketEngine stall]") == 1
+    for expected in (
+        "slot_start=0.0",
+        "slot_end=0.25",
+        "current_time=0.0",
+        "'deadline': 0.0",
+        "consecutive_no_progress=3",
+        "episode=312",
+        "slot_index=236",
+        "'packet_id': 0",
+        "'remaining_bits': 10.0",
+        "'hops': 0",
+    ):
+        assert expected in diagnostic
+    assert packet["done"] is False
+
+
+def test_nextafter_only_motion_without_service_state_change_is_stalled(
+    capsys, monkeypatch
+):
+    env = EventCapacityEnvironment(1)
+    engine = PacketEngine(
+        1,
+        task_deadlines_seconds={"FOV": 1.0, "COM": 1.0},
+    )
+    packet = engine.create_packet(
+        0,
+        "COM",
+        PACKET_EPS / 10.0,
+        generation_time=59.0,
+    )
+    engine._event_service_stall_guard_limit = 3
+    monkeypatch.setattr(
+        engine,
+        "record_hop_transmission",
+        lambda _packet, _sender, _receiver, _bits: False,
+    )
+
+    with pytest.raises(RuntimeError, match="3 consecutive iterations without progress"):
+        engine.serve_event_driven_slot(
+            env,
+            _actions(env.GS_ID),
+            59.0,
+        )
+
+    diagnostic = capsys.readouterr().err
+    assert "current_time=59.00000000000002" in diagnostic
+    assert "'completion': 59.00000000000002" in diagnostic
+    assert packet["rem_bits"] == pytest.approx(PACKET_EPS / 10.0)
+    assert packet["hops"] == 0
+
+
+def test_nextafter_sized_service_and_same_time_events_are_real_progress(monkeypatch):
+    env = EventCapacityEnvironment(1)
+    engine = PacketEngine(
+        1,
+        task_deadlines_seconds={"FOV": 1.0, "COM": 1.0},
+    )
+    packet = engine.create_packet(
+        0,
+        "COM",
+        np.nextafter(0.0, float("inf")),
+        generation_time=0.0,
+    )
+    consumed = []
+    monkeypatch.setattr(
+        engine,
+        "materialize_generation_event",
+        lambda _env, event: consumed.append(event["sequence"]) or None,
+    )
+
+    result = engine.serve_event_driven_slot(
+        env,
+        _actions(env.GS_ID),
+        0.0,
+        generation_events=[
+            {"time_seconds": 0.0, "sequence": 1},
+            {"time_seconds": 0.0, "sequence": 2},
+        ],
+    )
+
+    assert consumed == [1, 2]
+    assert packet["terminal_outcome"] == "on_time_delivered"
+    assert packet["hops"] == 1
+    assert result["outcomes"][0]["packet_id"] == packet["id"]
+
+
 def test_authoritative_millisecond_deadlines_reach_every_registered_method():
     assert PRODUCTION_TASK_DEADLINE_SECONDS == {"FOV": 0.015, "COM": 0.010}
     assert TASK_DEADLINE_SECONDS == PRODUCTION_TASK_DEADLINE_SECONDS

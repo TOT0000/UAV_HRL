@@ -834,6 +834,7 @@ def _run_routing_slot(
     routing_slot_observer=None,
     first_gen_slot_service_observer=False,
     record_current_expected_capacities=False,
+    stall_diagnostic_context=None,
 ):
     del routing_masks
     packet_cost_attribution = (
@@ -1055,6 +1056,7 @@ def _run_routing_slot(
         collect_first_gen_event_diagnostics=(
             first_gen_slot_service_observer
         ),
+        stall_diagnostic_context=stall_diagnostic_context,
     )
     if routing_slot_observer is not None:
         routing_slot_observer(
@@ -3895,6 +3897,10 @@ def train(
                         method_spec.llm_explorer_state_rule_enabled
                         or method_spec.llm_explorer_first_gen_enabled
                     ),
+                    stall_diagnostic_context={
+                        "episode": episode + 1,
+                        "slot_index": absolute_slot,
+                    },
                 )
                 ddqn_action_selections += action_selections
                 interval_delivered_bits += delivered_bits
