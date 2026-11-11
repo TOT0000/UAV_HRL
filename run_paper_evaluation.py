@@ -14,7 +14,18 @@ from experiment_config import (
     METHOD_REGISTRY,
     MethodSpec,
 )
-from paper_evaluation import PAPER_EVALUATION_SUITES, run_paper_evaluation
+from paper_evaluation import (
+    PAPER_EVALUATION_SUITES,
+    evaluation_sweep_points,
+    run_paper_evaluation,
+)
+
+
+COMMUNICATION_RESOURCE_SUITES = {
+    "bandwidth_sweep",
+    "sr_transmit_power_sweep",
+    "uav_transmit_power_sweep",
+}
 
 
 def build_parser():
@@ -43,6 +54,24 @@ def build_parser():
         type=float,
         nargs="+",
         help="custom thresholds for the target-delay deadline suite only",
+    )
+    parser.add_argument(
+        "--bandwidth-mhz",
+        type=float,
+        nargs="+",
+        help="bandwidth sweep values, or one fixed value for a power sweep",
+    )
+    parser.add_argument(
+        "--sr-tx-power-dbm",
+        type=float,
+        nargs="+",
+        help="SR power sweep values, or one fixed value for another resource sweep",
+    )
+    parser.add_argument(
+        "--uav-tx-power-dbm",
+        type=float,
+        nargs="+",
+        help="UAV power sweep values, or one fixed value for another resource sweep",
     )
     checkpoint = parser.add_mutually_exclusive_group()
     checkpoint.add_argument("--checkpoint-episode", type=int)
@@ -87,19 +116,50 @@ def main(argv=None):
         or args.checkpoint_episodes is not None
     )
     explicit_roi = args.roi_count is not None or args.roi_counts is not None
-    if explicit_roi and args.suite not in {"fixed_roi", "environment_size"}:
+    if explicit_roi and args.suite not in {
+        "fixed_roi",
+        "environment_size",
+        *COMMUNICATION_RESOURCE_SUITES,
+    }:
         raise ValueError(
-            "RoI selectors are available only for fixed_roi or environment_size"
+            "RoI selectors require fixed_roi, environment_size, or a "
+            "communication-resource suite"
         )
-    if args.suite == "environment_size" and args.roi_counts is not None:
-        raise ValueError("environment_size accepts --roi-count, not --roi-counts")
+    if (
+        args.suite == "environment_size"
+        or args.suite in COMMUNICATION_RESOURCE_SUITES
+    ) and args.roi_counts is not None:
+        raise ValueError(f"{args.suite} accepts --roi-count, not --roi-counts")
     roi_counts = None
     if args.suite == "fixed_roi":
         roi_counts = resolve_roi_counts(args.roi_count, args.roi_counts)
-    elif args.suite == "environment_size":
+    elif (
+        args.suite == "environment_size"
+        or args.suite in COMMUNICATION_RESOURCE_SUITES
+    ):
         roi_counts = resolve_roi_counts(
             args.roi_count if args.roi_count is not None else 8,
             None,
+        )
+    resource_values_present = any(
+        value is not None
+        for value in (
+            args.bandwidth_mhz,
+            args.sr_tx_power_dbm,
+            args.uav_tx_power_dbm,
+        )
+    )
+    if resource_values_present and args.suite not in COMMUNICATION_RESOURCE_SUITES:
+        raise ValueError(
+            "communication-resource arguments require a communication-resource suite"
+        )
+    if args.suite in COMMUNICATION_RESOURCE_SUITES:
+        evaluation_sweep_points(
+            args.suite,
+            roi_counts=roi_counts,
+            bandwidth_mhz=args.bandwidth_mhz,
+            sr_tx_power_dbm=args.sr_tx_power_dbm,
+            uav_tx_power_dbm=args.uav_tx_power_dbm,
         )
     explicit_environment_size = (
         args.environment_size_m is not None
@@ -209,6 +269,9 @@ def main(argv=None):
         episode_horizons_s=episode_horizons_s,
         collect_search_diagnostics=args.collect_search_diagnostics,
         deadline_seconds=args.deadline_seconds,
+        bandwidth_mhz=args.bandwidth_mhz,
+        sr_tx_power_dbm=args.sr_tx_power_dbm,
+        uav_tx_power_dbm=args.uav_tx_power_dbm,
         allow_registered_fixed_roi_method=bool(
             args.suite == "fixed_roi" and (explicit_checkpoint or explicit_roi)
         ),

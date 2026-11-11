@@ -14,6 +14,13 @@ import numpy as np
 import pandas as pd
 import torch
 
+from Channel_model import (
+    S2U_TX_POWER_DBM,
+    U2U_U2G_TX_POWER_DBM,
+    validate_bandwidth_hz,
+    validate_transmit_power_dbm,
+)
+
 from visual_sensing import VISUAL_SENSING_CONTRACT_VERSION, visual_sensing_metadata, vs_geometry
 from dinkelbach_blocks import (
     DINKELBACH_DENOMINATOR_UNIT,
@@ -83,6 +90,7 @@ from experiment_config import (
     TASK_POTENTIAL_BETA_COM,
     TASK_POTENTIAL_BETA_SEARCH,
     TASK_POTENTIAL_BETA_VS,
+    TOTAL_COMMUNICATION_BANDWIDTH_HZ,
     effective_training_config,
     exploration_schedule_configuration,
     movement_agent_configuration,
@@ -557,6 +565,9 @@ def _normalize_evaluation_overrides(overrides):
         "packet_injection_cutoff_seconds",
         "environment_width_m",
         "environment_height_m",
+        "total_communication_bandwidth_hz",
+        "s2u_tx_power_dbm",
+        "uav_tx_power_dbm",
     }
     unknown = set(values).difference(allowed)
     if unknown:
@@ -615,6 +626,18 @@ def _normalize_evaluation_overrides(overrides):
             "evaluation environment size must be one of "
             f"{list(ENVIRONMENT_SIZE_EVALUATION_VALUES_M)} metres"
         )
+    total_bandwidth_hz = validate_bandwidth_hz(
+        values.get(
+            "total_communication_bandwidth_hz",
+            TOTAL_COMMUNICATION_BANDWIDTH_HZ,
+        )
+    )
+    s2u_tx_power_dbm = validate_transmit_power_dbm(
+        values.get("s2u_tx_power_dbm", S2U_TX_POWER_DBM)
+    )
+    uav_tx_power_dbm = validate_transmit_power_dbm(
+        values.get("uav_tx_power_dbm", U2U_U2G_TX_POWER_DBM)
+    )
     return {
         "traffic_rates_packets_per_second": rates,
         "task_deadlines_seconds": deadlines,
@@ -622,11 +645,16 @@ def _normalize_evaluation_overrides(overrides):
         "environment_width_m": environment_width,
         "environment_height_m": environment_height,
         "environment_size_evaluation": environment_size_evaluation,
+        "total_communication_bandwidth_hz": total_bandwidth_hz,
+        "s2u_tx_power_dbm": s2u_tx_power_dbm,
+        "uav_tx_power_dbm": uav_tx_power_dbm,
         "units": {
             "traffic_rate": "packets/s",
             "deadline": "seconds",
             "packet_injection_cutoff": "seconds",
             "environment_dimensions": "metres",
+            "total_communication_bandwidth": "Hz",
+            "transmit_power": "dBm",
         },
     }
 
@@ -2487,6 +2515,11 @@ def train(
         evaluation=evaluation,
         environment_width_m=resolved_evaluation["environment_width_m"],
         environment_height_m=resolved_evaluation["environment_height_m"],
+        total_communication_bandwidth_hz=resolved_evaluation[
+            "total_communication_bandwidth_hz"
+        ],
+        s2u_tx_power_dbm=resolved_evaluation["s2u_tx_power_dbm"],
+        uav_tx_power_dbm=resolved_evaluation["uav_tx_power_dbm"],
     )
     env.configure_method(method_spec)
     # Formal execution initializes interval zero only after the canonical
@@ -4966,6 +4999,19 @@ def train(
                 "packet_injection_cutoff_seconds": float(
                     resolved_evaluation["packet_injection_cutoff_seconds"]
                 ),
+                "total_communication_bandwidth_hz": float(
+                    resolved_evaluation["total_communication_bandwidth_hz"]
+                ),
+                "total_communication_bandwidth_mhz": float(
+                    resolved_evaluation["total_communication_bandwidth_hz"]
+                )
+                / 1e6,
+                "sr_tx_power_dbm": float(
+                    resolved_evaluation["s2u_tx_power_dbm"]
+                ),
+                "uav_tx_power_dbm": float(
+                    resolved_evaluation["uav_tx_power_dbm"]
+                ),
                 "episode_horizon_seconds": float(config.episode_seconds),
                 "movement_transition_count": int(config.episode_seconds),
                 "routing_slot_count": int(
@@ -5948,7 +5994,15 @@ def train(
                     is not None
                     else COM_OFFERED_RATE_BPS
                 ),
-                "communication_bandwidth_pool_hz": 10e6,
+                "communication_bandwidth_pool_hz": float(
+                    resolved_evaluation["total_communication_bandwidth_hz"]
+                ),
+                "sr_tx_power_dbm": float(
+                    resolved_evaluation["s2u_tx_power_dbm"]
+                ),
+                "uav_tx_power_dbm": float(
+                    resolved_evaluation["uav_tx_power_dbm"]
+                ),
                 "fdma_policy": "equal-across-active-S2U-U2U-U2G",
             },
             "evaluation": bool(evaluation),

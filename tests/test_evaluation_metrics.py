@@ -341,9 +341,45 @@ class EvaluationModeIntegrationTest(unittest.TestCase):
                 evaluation=True,
                 formal_evaluation=True,
                 checkpoint_dir=checkpoint_dir,
+                evaluation_overrides={
+                    "total_communication_bandwidth_hz": 5.5e6,
+                    "s2u_tx_power_dbm": -2.5,
+                    "uav_tx_power_dbm": 18.25,
+                },
+            )
+            implicit_default_result = train(
+                evaluation_config,
+                scenario_manifest=evaluation_manifest,
+                method_spec=method,
+                evaluation=True,
+                formal_evaluation=True,
+                checkpoint_dir=checkpoint_dir,
+            )
+            explicit_default_result = train(
+                evaluation_config,
+                scenario_manifest=evaluation_manifest,
+                method_spec=method,
+                evaluation=True,
+                formal_evaluation=True,
+                checkpoint_dir=checkpoint_dir,
+                evaluation_overrides={
+                    "total_communication_bandwidth_hz": 10e6,
+                    "s2u_tx_power_dbm": 23.0,
+                    "uav_tx_power_dbm": 30.0,
+                },
             )
 
         self.assertTrue(all(result["evaluation_invariants"].values()))
+        self.assertTrue(
+            all(implicit_default_result["evaluation_invariants"].values())
+        )
+        self.assertTrue(
+            all(explicit_default_result["evaluation_invariants"].values())
+        )
+        self.assertEqual(
+            implicit_default_result["episode_metrics"],
+            explicit_default_result["episode_metrics"],
+        )
         self.assertEqual(result["td3_noise_log"], [])
         self.assertEqual(result["routing_epsilon_log"], [0.0] * 4)
         self.assertEqual(result["joint_replay_size"], 0)
@@ -368,6 +404,16 @@ class EvaluationModeIntegrationTest(unittest.TestCase):
             evaluation_manifest.episodes[0]["scenario_id"],
         )
         metadata = result["run_metadata"]
+        self.assertEqual(
+            metadata["evaluation_overrides"]["total_communication_bandwidth_hz"],
+            5.5e6,
+        )
+        self.assertEqual(
+            metadata["evaluation_overrides"]["s2u_tx_power_dbm"], -2.5
+        )
+        self.assertEqual(
+            metadata["evaluation_overrides"]["uav_tx_power_dbm"], 18.25
+        )
         self.assertTrue(metadata["formal_evaluation"])
         self.assertEqual(
             metadata["packet_deadline_policy"], PACKET_DEADLINE_POLICY_CONTINUE

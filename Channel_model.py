@@ -95,13 +95,53 @@ def noise_power_dbm(bandwidth_hz):
     return NOISE_PSD_DBM_PER_HZ + 10.0 * np.log10(bandwidth)
 
 
+def validate_bandwidth_hz(bandwidth_hz):
+    """Return a scalar finite positive bandwidth in Hz."""
+
+    try:
+        bandwidth = float(bandwidth_hz)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("bandwidth must be positive and finite") from exc
+    if not np.isfinite(bandwidth) or bandwidth <= 0.0:
+        raise ValueError("bandwidth must be positive and finite")
+    return bandwidth
+
+
+def transmit_power_mw(transmit_power_dbm):
+    """Convert scalar dBm to a finite positive linear power in mW."""
+
+    try:
+        power_dbm = float(transmit_power_dbm)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("transmit power dBm must be finite") from exc
+    if not np.isfinite(power_dbm):
+        raise ValueError("transmit power dBm must be finite")
+    with np.errstate(over="ignore", under="ignore", invalid="ignore"):
+        power_mw = float(np.power(10.0, power_dbm / 10.0))
+    if not np.isfinite(power_mw) or power_mw <= 0.0:
+        raise ValueError(
+            "transmit power must convert to finite positive linear power"
+        )
+    return power_mw
+
+
+def validate_transmit_power_dbm(transmit_power_dbm):
+    try:
+        power_dbm = float(transmit_power_dbm)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("transmit power dBm must be finite") from exc
+    transmit_power_mw(power_dbm)
+    return power_dbm
+
+
 def average_snr_linear(path_loss_db, bandwidth_hz, transmit_power_dbm):
     bandwidth = np.asarray(bandwidth_hz, dtype=np.float64)
     path_loss = np.asarray(path_loss_db, dtype=np.float64)
     if np.any(bandwidth <= 0.0) or not np.all(np.isfinite(bandwidth)):
         raise ValueError("bandwidth must be positive and finite")
+    power_dbm = validate_transmit_power_dbm(transmit_power_dbm)
     snr = 10.0 ** (
-        (float(transmit_power_dbm) - path_loss - noise_power_dbm(bandwidth)) / 10.0
+        (power_dbm - path_loss - noise_power_dbm(bandwidth)) / 10.0
     )
     return np.where(np.isfinite(snr), np.maximum(snr, 0.0), 0.0)
 
@@ -333,45 +373,57 @@ def a2g_capacity_mbps(
     )
 
 
-def u2u_capacity_mbps(sender_position, receiver_position, bandwidth_hz):
+def u2u_capacity_mbps(
+    sender_position,
+    receiver_position,
+    bandwidth_hz,
+    transmit_power_dbm=U2U_U2G_TX_POWER_DBM,
+):
     return expected_fading_capacity_mbps(
         u2u_path_loss_db(sender_position, receiver_position),
         bandwidth_hz,
-        U2U_U2G_TX_POWER_DBM,
+        transmit_power_dbm,
         fading="rician",
     )
 
 
-def reference_s2u_max_capacity_mbps(bandwidth_hz):
+def reference_s2u_max_capacity_mbps(
+    bandwidth_hz, transmit_power_dbm=S2U_TX_POWER_DBM
+):
     return float(
         a2g_expected_capacity_mbps(
             (0.0, 0.0, REFERENCE_UAV_MIN_AGL_M),
             (0.0, 0.0, 0.0),
             bandwidth_hz,
-            S2U_TX_POWER_DBM,
+            transmit_power_dbm,
             True,
         )
     )
 
 
-def reference_u2g_max_capacity_mbps(system_bandwidth_hz):
+def reference_u2g_max_capacity_mbps(
+    system_bandwidth_hz, transmit_power_dbm=U2U_U2G_TX_POWER_DBM
+):
     return float(
         a2g_expected_capacity_mbps(
             (0.0, 0.0, REFERENCE_UAV_MIN_AGL_M),
             (0.0, 0.0, 0.0),
             system_bandwidth_hz,
-            U2U_U2G_TX_POWER_DBM,
+            transmit_power_dbm,
             True,
         )
     )
 
 
-def reference_u2u_max_capacity_mbps(system_bandwidth_hz):
+def reference_u2u_max_capacity_mbps(
+    system_bandwidth_hz, transmit_power_dbm=U2U_U2G_TX_POWER_DBM
+):
     return float(
         u2u_capacity_mbps(
             (0.0, 0.0, REFERENCE_UAV_MIN_AGL_M),
             (MINIMUM_A2A_DISTANCE_M, 0.0, REFERENCE_UAV_MIN_AGL_M),
             system_bandwidth_hz,
+            transmit_power_dbm,
         )
     )
 
@@ -382,17 +434,20 @@ def normalized_s2u_capacity_utility(
     bandwidth_hz,
     *,
     los_state=True,
+    transmit_power_dbm=S2U_TX_POWER_DBM,
 ):
     capacity = float(
         a2g_expected_capacity_mbps(
             aerial_position,
             ground_position,
             bandwidth_hz,
-            S2U_TX_POWER_DBM,
+            transmit_power_dbm,
             bool(los_state),
         )
     )
-    maximum = reference_s2u_max_capacity_mbps(bandwidth_hz)
+    maximum = reference_s2u_max_capacity_mbps(
+        bandwidth_hz, transmit_power_dbm
+    )
     if not np.isfinite(capacity) or maximum <= 0.0 or not np.isfinite(maximum):
         raise RuntimeError("canonical S2U reference capacity is invalid")
     return float(np.clip(capacity / maximum, 0.0, 1.0))

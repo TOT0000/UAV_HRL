@@ -27,6 +27,8 @@ from Channel_model import (
     u2u_path_loss_db,
     normalized_s2u_capacity_utility,
     reference_s2u_max_capacity_mbps,
+    validate_bandwidth_hz,
+    validate_transmit_power_dbm,
 )
 from visual_sensing import (
     SEARCH_DETECTION_OVERLAP_THRESHOLD,
@@ -105,6 +107,9 @@ class Simulator:
         evaluation=False,
         environment_width_m=ENVIRONMENT_WIDTH_M,
         environment_height_m=ENVIRONMENT_HEIGHT_M,
+        total_communication_bandwidth_hz=TOTAL_COMMUNICATION_BANDWIDTH_HZ,
+        s2u_tx_power_dbm=S2U_TX_POWER_DBM,
+        uav_tx_power_dbm=U2U_U2G_TX_POWER_DBM,
     ): #初始化
         self.dt = ROUTING_SLOT_SECONDS
         self.rng_streams = rng_streams
@@ -151,7 +156,18 @@ class Simulator:
             raise ValueError(
                 f"canonical Simulator requires exactly {NUM_UAV} UAVs, got {num_UAV}"
             )
-        self.B_tot = TOTAL_COMMUNICATION_BANDWIDTH_HZ
+        self.B_tot = validate_bandwidth_hz(total_communication_bandwidth_hz)
+        self.s2u_tx_power_dbm = validate_transmit_power_dbm(
+            s2u_tx_power_dbm
+        )
+        self.uav_tx_power_dbm = validate_transmit_power_dbm(
+            uav_tx_power_dbm
+        )
+        self.reference_com_bandwidth_hz = (
+            float(REFERENCE_COM_BANDWIDTH_HZ)
+            * self.B_tot
+            / float(TOTAL_COMMUNICATION_BANDWIDTH_HZ)
+        )
         self.E_max = 10000
         self.num_UAV = num_UAV
         self.p_u = np.full(num_UAV, p_u)
@@ -869,7 +885,9 @@ class Simulator:
         """Return conditional mean SNR and deterministic expected S2U capacity."""
 
         bandwidth_hz = float(
-            REFERENCE_COM_BANDWIDTH_HZ if bandwidth_hz is None else bandwidth_hz
+            self.reference_com_bandwidth_hz
+            if bandwidth_hz is None
+            else bandwidth_hz
         )
         uav_position = self.uav_dict[int(uav_id)].get_position()
         sr_position = self.SR_teams[int(sr_id)].get_position()
@@ -884,11 +902,15 @@ class Simulator:
                 uav_position,
                 sr_position,
                 bandwidth_hz,
-                S2U_TX_POWER_DBM,
+                self.s2u_tx_power_dbm,
                 los_state,
             )
         )
-        snr = float(average_snr_linear(path_loss, bandwidth_hz, S2U_TX_POWER_DBM))
+        snr = float(
+            average_snr_linear(
+                path_loss, bandwidth_hz, self.s2u_tx_power_dbm
+            )
+        )
         return float(snr), capacity_mbps
 
     def get_snr(self, uav_id, sr_id):
@@ -911,13 +933,16 @@ class Simulator:
         return normalized_s2u_capacity_utility(
             self.uav_dict[int(uav_id)].get_position(),
             self.SR_teams[int(sr_id)].get_position(),
-            REFERENCE_COM_BANDWIDTH_HZ,
+            self.reference_com_bandwidth_hz,
             los_state=self.channel.a2g_state("S2U", int(sr_id), int(uav_id)),
+            transmit_power_dbm=self.s2u_tx_power_dbm,
         )
 
     @property
     def reference_s2u_max_capacity_mbps(self):
-        return reference_s2u_max_capacity_mbps(REFERENCE_COM_BANDWIDTH_HZ)
+        return reference_s2u_max_capacity_mbps(
+            self.reference_com_bandwidth_hz, self.s2u_tx_power_dbm
+        )
 
     # =====================U2U channel model================================
     def update_u2u_channels(self):
@@ -938,7 +963,7 @@ class Simulator:
                     expected_fading_capacity_mbps(
                         path_loss[sender, receiver],
                         self.B_tot,
-                        U2U_U2G_TX_POWER_DBM,
+                        self.uav_tx_power_dbm,
                         fading="rician",
                     )
                 )
@@ -980,7 +1005,7 @@ class Simulator:
                     positions[index],
                     gs_position,
                     self.B_tot,
-                    U2U_U2G_TX_POWER_DBM,
+                    self.uav_tx_power_dbm,
                     bool(los_state[index]),
                 )
                 for index in range(len(positions))
@@ -1301,7 +1326,7 @@ class Simulator:
                 receiver,
                 path_loss,
                 shared_bandwidth,
-                U2U_U2G_TX_POWER_DBM,
+                self.uav_tx_power_dbm,
                 gains,
             )
             capacity_profiles[(sender, receiver)] = profile
@@ -1359,7 +1384,7 @@ class Simulator:
                 uav_id,
                 path_loss,
                 shared_bandwidth,
-                S2U_TX_POWER_DBM,
+                self.s2u_tx_power_dbm,
                 gains,
             )
             key = ("S2U", sr_id, uav_id)
@@ -1386,7 +1411,7 @@ class Simulator:
             )
 
         if sum(bandwidths.values()) > self.B_tot + 1e-6:
-            raise AssertionError("active link bandwidth exceeds the shared 10 MHz pool")
+            raise AssertionError("active link bandwidth exceeds the shared pool")
 
         self.active_link_capacities = capacities
         self.active_link_capacity_profiles_mbps = capacity_profiles
@@ -1397,10 +1422,18 @@ class Simulator:
         return capacities, bandwidths
 
     def routing_capacity_reference_mbps(self, sender_id, receiver_id):
+        """Return the training-time observation normalization reference."""
+
         del sender_id
         if int(receiver_id) == self.GS_ID:
-            return reference_u2g_max_capacity_mbps(self.B_tot)
-        return reference_u2u_max_capacity_mbps(self.B_tot)
+            return reference_u2g_max_capacity_mbps(
+                TOTAL_COMMUNICATION_BANDWIDTH_HZ,
+                U2U_U2G_TX_POWER_DBM,
+            )
+        return reference_u2u_max_capacity_mbps(
+            TOTAL_COMMUNICATION_BANDWIDTH_HZ,
+            U2U_U2G_TX_POWER_DBM,
+        )
 
     #===========回傳不可選擇的節點======================== 
     def get_routing_action_mask(self, from_uav_id):

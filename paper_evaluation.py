@@ -11,6 +11,12 @@ import math
 from pathlib import Path
 import subprocess
 
+from Channel_model import (
+    S2U_TX_POWER_DBM,
+    U2U_U2G_TX_POWER_DBM,
+    validate_bandwidth_hz,
+    validate_transmit_power_dbm,
+)
 from evaluation_metrics import write_evaluation_outputs
 from evaluation_selection import (
     DEFAULT_ENVIRONMENT_SIZES_M,
@@ -33,6 +39,7 @@ from experiment_config import (
     MethodSpec,
     NUM_UAV,
     ROI_COUNT_MAX,
+    TOTAL_COMMUNICATION_BANDWIDTH_HZ,
     PRODUCTION_PACKET_INJECTION_CUTOFF_SECONDS,
     PRODUCTION_EPISODE_HORIZON_SECONDS,
     PRODUCTION_TASK_DEADLINE_SECONDS,
@@ -112,6 +119,16 @@ _FIXED_ROI_METHODS = tuple(
     )
 )
 
+_RESOURCE_SWEEP_METHODS = tuple(
+    method_id
+    for method_id in METHOD_REGISTRY
+    if method_id not in {
+        "td3_dinkelbach_llm",
+        "td3_dinkelbach_llm_search",
+        "td3_dinkelbach_llm_train_search",
+    }
+)
+
 PAPER_EVALUATION_SUITES = {
     "training_ee_vs_episode": {
         "methods": tuple(FIGURE_REGISTRY["training_ee_vs_episode"]["methods"]),
@@ -140,16 +157,23 @@ PAPER_EVALUATION_SUITES = {
     },
     "fixed_roi": {"methods": _FIXED_ROI_METHODS, "kind": "fixed_roi"},
     "environment_size": {
-        "methods": tuple(
-            method_id
-            for method_id in METHOD_REGISTRY
-            if method_id not in {
-                "td3_dinkelbach_llm",
-                "td3_dinkelbach_llm_search",
-                "td3_dinkelbach_llm_train_search",
-            }
-        ),
+        "methods": _RESOURCE_SWEEP_METHODS,
         "kind": "environment_size",
+    },
+    "bandwidth_sweep": {
+        "methods": _RESOURCE_SWEEP_METHODS,
+        "kind": "communication_resource",
+        "scan_axis": "bandwidth_mhz",
+    },
+    "sr_transmit_power_sweep": {
+        "methods": _RESOURCE_SWEEP_METHODS,
+        "kind": "communication_resource",
+        "scan_axis": "sr_tx_power_dbm",
+    },
+    "uav_transmit_power_sweep": {
+        "methods": _RESOURCE_SWEEP_METHODS,
+        "kind": "communication_resource",
+        "scan_axis": "uav_tx_power_dbm",
     },
 }
 
@@ -244,6 +268,134 @@ def _validate_deadline_seconds(deadline_seconds):
     return values
 
 
+def _validate_resource_values(values, *, parameter, bandwidth=False):
+    if values is None:
+        return None
+    try:
+        raw_values = tuple(values)
+    except TypeError as exc:
+        raise ValueError(f"{parameter} must contain at least one value") from exc
+    if not raw_values:
+        raise ValueError(f"{parameter} must contain at least one value")
+    resolved = []
+    for raw_value in raw_values:
+        if isinstance(raw_value, bool):
+            raise ValueError(f"{parameter} values must be finite numbers")
+        try:
+            value = float(raw_value)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError(f"{parameter} values must be finite numbers") from exc
+        if not math.isfinite(value):
+            raise ValueError(f"{parameter} values must be finite numbers")
+        if bandwidth:
+            validate_bandwidth_hz(value * 1e6)
+        else:
+            validate_transmit_power_dbm(value)
+        resolved.append(value)
+    if len(set(resolved)) != len(resolved):
+        raise ValueError(f"{parameter} values must not contain duplicates")
+    return tuple(resolved)
+
+
+def _resource_point_id(axis, value):
+    canonical = float(value).hex()
+    digest = hashlib.sha256(canonical.encode("ascii")).hexdigest()[:10]
+    readable = format(float(value), ".12g").replace("-", "neg").replace(".", "p")
+    return f"{axis}_{readable}_{digest}"
+
+
+def _communication_resource_points(
+    suite,
+    roi_counts,
+    bandwidth_mhz,
+    sr_tx_power_dbm,
+    uav_tx_power_dbm,
+):
+    axis = PAPER_EVALUATION_SUITES[suite]["scan_axis"]
+    bandwidth_values = _validate_resource_values(
+        bandwidth_mhz,
+        parameter="bandwidth_mhz",
+        bandwidth=True,
+    )
+    sr_power_values = _validate_resource_values(
+        sr_tx_power_dbm,
+        parameter="sr_tx_power_dbm",
+    )
+    uav_power_values = _validate_resource_values(
+        uav_tx_power_dbm,
+        parameter="uav_tx_power_dbm",
+    )
+    values_by_axis = {
+        "bandwidth_mhz": bandwidth_values,
+        "sr_tx_power_dbm": sr_power_values,
+        "uav_tx_power_dbm": uav_power_values,
+    }
+    if values_by_axis[axis] is None:
+        raise ValueError(f"{suite} requires at least one {axis} value")
+    defaults = {
+        "bandwidth_mhz": float(TOTAL_COMMUNICATION_BANDWIDTH_HZ) / 1e6,
+        "sr_tx_power_dbm": float(S2U_TX_POWER_DBM),
+        "uav_tx_power_dbm": float(U2U_U2G_TX_POWER_DBM),
+    }
+    for parameter, values in tuple(values_by_axis.items()):
+        if parameter == axis:
+            continue
+        if values is not None and len(values) != 1:
+            raise ValueError(
+                f"non-scan parameter {parameter} requires exactly one fixed value"
+            )
+        values_by_axis[parameter] = (
+            (defaults[parameter],) if values is None else values
+        )
+    selected_roi_counts = (
+        (ROI_COUNT_MAX,)
+        if roi_counts is None
+        else resolve_roi_counts(roi_counts=roi_counts)
+    )
+    if len(selected_roi_counts) != 1:
+        raise ValueError("communication-resource sweeps require one fixed RoI count")
+    fixed_num_gt = int(selected_roi_counts[0])
+    axis_metadata = {
+        "bandwidth_mhz": ("total_communication_bandwidth", "MHz"),
+        "sr_tx_power_dbm": ("sr_transmit_power", "dBm"),
+        "uav_tx_power_dbm": ("uav_transmit_power", "dBm"),
+    }
+    parameter_name, unit = axis_metadata[axis]
+    points = []
+    for scanned_value in values_by_axis[axis]:
+        actual = {
+            parameter: (
+                float(scanned_value)
+                if parameter == axis
+                else float(values[0])
+            )
+            for parameter, values in values_by_axis.items()
+        }
+        bandwidth_hz = validate_bandwidth_hz(actual["bandwidth_mhz"] * 1e6)
+        point_id = _resource_point_id(axis, scanned_value)
+        points.append(
+            {
+                "point_id": point_id,
+                "overrides": {
+                    "total_communication_bandwidth_hz": bandwidth_hz,
+                    "s2u_tx_power_dbm": actual["sr_tx_power_dbm"],
+                    "uav_tx_power_dbm": actual["uav_tx_power_dbm"],
+                },
+                "fixed_num_gt": fixed_num_gt,
+                "swept_parameter": parameter_name,
+                "swept_parameter_value": float(scanned_value),
+                "swept_parameter_unit": unit,
+                "x_value": float(scanned_value),
+                "x_unit": unit,
+                "total_communication_bandwidth_hz": bandwidth_hz,
+                "total_communication_bandwidth_mhz": actual["bandwidth_mhz"],
+                "sr_tx_power_dbm": actual["sr_tx_power_dbm"],
+                "uav_tx_power_dbm": actual["uav_tx_power_dbm"],
+            }
+        )
+    return tuple(points)
+
+
 def evaluation_sweep_points(
     suite,
     roi_counts=None,
@@ -251,12 +403,26 @@ def evaluation_sweep_points(
     episode_seconds=None,
     environment_sizes_m=None,
     episode_horizons_s=None,
+    bandwidth_mhz=None,
+    sr_tx_power_dbm=None,
+    uav_tx_power_dbm=None,
 ):
     suite = resolve_evaluation_suite(suite)
     kind = PAPER_EVALUATION_SUITES[suite]["kind"]
-    if roi_counts is not None and kind not in {"fixed_roi", "environment_size"}:
+    if roi_counts is not None and kind not in {
+        "fixed_roi",
+        "environment_size",
+        "communication_resource",
+    }:
         raise ValueError(
-            "RoI selectors are available only for fixed_roi or environment_size"
+            "RoI selectors are unavailable for this suite"
+        )
+    resource_inputs = (bandwidth_mhz, sr_tx_power_dbm, uav_tx_power_dbm)
+    if kind != "communication_resource" and any(
+        value is not None for value in resource_inputs
+    ):
+        raise ValueError(
+            "communication-resource selectors are available only for resource sweeps"
         )
     if environment_sizes_m is not None and kind != "environment_size":
         raise ValueError(
@@ -300,6 +466,14 @@ def evaluation_sweep_points(
                     }
                 )
         return tuple(points)
+    if kind == "communication_resource":
+        return _communication_resource_points(
+            suite,
+            roi_counts,
+            bandwidth_mhz,
+            sr_tx_power_dbm,
+            uav_tx_power_dbm,
+        )
     if kind == "deadline":
         defaults = validate_production_deadlines()
         sweep_seconds = (
@@ -552,6 +726,12 @@ def _manifest_for_point(point, *, base_manifest, manifest_seed, episodes):
             environment_size_m=int(point["environment_width_m"]),
         )
     if "fixed_num_gt" in point:
+        if base_manifest is not None:
+            if base_manifest.episode_count != int(episodes):
+                raise ValueError(
+                    "paper evaluation manifest episode_count must equal requested episodes"
+                )
+            return base_manifest
         return generate_manifest(
             "test", int(manifest_seed), int(episodes), num_gt=int(point["fixed_num_gt"])
         )
@@ -660,6 +840,9 @@ def run_paper_evaluation(
     roi_counts=None,
     environment_sizes_m=None,
     episode_horizons_s=None,
+    bandwidth_mhz=None,
+    sr_tx_power_dbm=None,
+    uav_tx_power_dbm=None,
     deadline_seconds=None,
     output_directory=None,
     fixed_roi_manifests=None,
@@ -670,6 +853,7 @@ def run_paper_evaluation(
     validate_production_deadlines()
     suite = resolve_evaluation_suite(suite)
     definition = PAPER_EVALUATION_SUITES[suite]
+    resource_suite = definition["kind"] == "communication_resource"
     collect_search_diagnostics = bool(collect_search_diagnostics)
     if collect_search_diagnostics and suite != "environment_size":
         raise ValueError(
@@ -706,19 +890,28 @@ def run_paper_evaluation(
     )[0]
     if suite == "fixed_roi":
         selected_roi_counts = resolve_roi_counts(roi_counts=roi_counts)
-    elif suite == "environment_size":
+    elif suite == "environment_size" or resource_suite:
         selected_roi_counts = (
             (ROI_COUNT_MAX,)
             if roi_counts is None
             else resolve_roi_counts(roi_counts=roi_counts)
         )
         if len(selected_roi_counts) != 1:
-            raise ValueError("environment_size requires exactly one fixed RoI count")
+            raise ValueError(f"{suite} requires exactly one fixed RoI count")
     else:
         selected_roi_counts = None
-    if suite not in {"fixed_roi", "environment_size"} and roi_counts is not None:
+    if (
+        suite not in {"fixed_roi", "environment_size"}
+        and not resource_suite
+        and roi_counts is not None
+    ):
         raise ValueError(
-            "RoI selectors are available only for fixed_roi or environment_size"
+            "RoI selectors are unavailable for this suite"
+        )
+    resource_inputs = (bandwidth_mhz, sr_tx_power_dbm, uav_tx_power_dbm)
+    if not resource_suite and any(value is not None for value in resource_inputs):
+        raise ValueError(
+            "communication-resource selectors are available only for resource sweeps"
         )
     if fixed_roi_manifests is not None and suite != "fixed_roi":
         raise ValueError("fixed_roi_manifests is available only for fixed_roi")
@@ -742,12 +935,13 @@ def run_paper_evaluation(
 
     base_manifest = (
         ScenarioManifest.load(manifest_path)
-        if suite == "fixed_roi" and manifest_path is not None
+        if (suite == "fixed_roi" or resource_suite) and manifest_path is not None
         else None
     )
     explicit_fixed_roi_manifest = bool(suite == "fixed_roi" and base_manifest is not None)
+    explicit_resource_manifest = bool(resource_suite and base_manifest is not None)
     if (
-        explicit_fixed_roi_manifest
+        (explicit_fixed_roi_manifest or explicit_resource_manifest)
         and manifest_seed is not None
         and int(manifest_seed) != int(base_manifest.manifest_seed)
     ):
@@ -757,7 +951,8 @@ def run_paper_evaluation(
         )
     requested_manifest_seed = int(
         base_manifest.manifest_seed
-        if explicit_fixed_roi_manifest and manifest_seed is None
+        if (explicit_fixed_roi_manifest or explicit_resource_manifest)
+        and manifest_seed is None
         else DEFAULT_TRAINING_SEED if manifest_seed is None else manifest_seed
     )
     checkpoint_required = bool(method.learns_movement or method.learns_routing)
@@ -781,6 +976,8 @@ def run_paper_evaluation(
     evaluation_purpose = (
         "environment_size_sweep_evaluation"
         if suite == "environment_size"
+        else "communication_resource_sweep_evaluation"
+        if resource_suite
         else
         "formal_checkpoint_evaluation"
         if is_formal_checkpoint
@@ -874,6 +1071,9 @@ def run_paper_evaluation(
         episode_seconds=resolved_seconds,
         environment_sizes_m=selected_environment_sizes,
         episode_horizons_s=selected_episode_horizons,
+        bandwidth_mhz=bandwidth_mhz,
+        sr_tx_power_dbm=sr_tx_power_dbm,
+        uav_tx_power_dbm=uav_tx_power_dbm,
     )
     if flatten_single_point and len(points) != 1:
         raise ValueError("flatten_single_point requires exactly one evaluation point")
@@ -924,8 +1124,9 @@ def run_paper_evaluation(
     for point in points:
         fixed_num_gt = point.get("fixed_num_gt")
         manifest_cache_key = (
-            int(point["environment_width_m"]), int(fixed_num_gt)
-        ) if "environment_width_m" in point else None
+            int(point.get("environment_width_m", ENVIRONMENT_WIDTH_M)),
+            int(fixed_num_gt),
+        ) if fixed_num_gt is not None else None
         if fixed_num_gt is not None and shared_manifests:
             manifest = shared_manifests[int(fixed_num_gt)]
         elif manifest_cache_key in generated_manifest_cache:
@@ -1106,6 +1307,20 @@ def run_paper_evaluation(
             },
             "semantic_suite": suite,
             "paper_sweep_point": point,
+            "evaluation_communication_resources": (
+                {
+                    "total_communication_bandwidth_hz": point[
+                        "total_communication_bandwidth_hz"
+                    ],
+                    "total_communication_bandwidth_mhz": point[
+                        "total_communication_bandwidth_mhz"
+                    ],
+                    "sr_tx_power_dbm": point["sr_tx_power_dbm"],
+                    "uav_tx_power_dbm": point["uav_tx_power_dbm"],
+                }
+                if resource_suite
+                else None
+            ),
             "git_sha": git_sha,
             "training_run_id": context["training_run_id"],
             "training_run_directory": (
@@ -1177,6 +1392,14 @@ def run_paper_evaluation(
                     "terminal_coverage_ratio",
                 )
                 if suite == "environment_size"
+                else (
+                    "episode_horizon_seconds",
+                    "total_communication_bandwidth_hz",
+                    "total_communication_bandwidth_mhz",
+                    "sr_tx_power_dbm",
+                    "uav_tx_power_dbm",
+                )
+                if resource_suite
                 else ()
             ),
         )
@@ -1203,6 +1426,17 @@ def run_paper_evaluation(
             {
                 **point,
                 "evaluation_config_fingerprint": evaluation_config_fingerprint,
+                "checkpoint_episode": context["checkpoint_episode"],
+                "checkpoint_path": (
+                    str(context["checkpoint"]) if checkpoint_required else None
+                ),
+                "training_run_directory": (
+                    str(context["run_dir"]) if context["run_dir"] else None
+                ),
+                "manifest_seed": int(manifest.manifest_seed),
+                "manifest_hash": manifest.content_hash,
+                "episode_seconds": point_seconds,
+                "git_sha": git_sha,
             },
             result["episode_metrics"],
         )
@@ -1444,6 +1678,22 @@ def run_paper_evaluation(
         "evaluation_seed": context["training_seed"],
         "manifest_seed": requested_manifest_seed,
         "evaluation_episodes_per_point": resolved_episodes,
+        "communication_resource_sweep": (
+            {
+                "swept_parameter": points[0]["swept_parameter"],
+                "swept_parameter_unit": points[0]["swept_parameter_unit"],
+                "values": [
+                    point["swept_parameter_value"] for point in points
+                ],
+                "fixed_roi_count": int(points[0]["fixed_num_gt"]),
+                "same_manifest_across_points": len(
+                    {result["manifest_hash"] for result in point_results}
+                )
+                == 1,
+            }
+            if resource_suite
+            else None
+        ),
         **(
             {
                 "deadline_sweep": {
