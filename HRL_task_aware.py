@@ -4,6 +4,7 @@ import copy
 from dataclasses import dataclass
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import random
@@ -150,6 +151,7 @@ from training_history import (
     TRAINING_HISTORY_JSONL,
     build_training_history_row,
     prepare_training_history,
+    routing_reward_sum_consistency_tolerance,
     training_history_identity,
     write_training_history,
 )
@@ -2293,6 +2295,64 @@ def _evaluate_llm_observation(runtime, obs, config, episode, step, phase, *, sta
         ) from exc
 
 
+def _assert_episode_routing_reward_consistency(
+    *,
+    episode,
+    episode_routing_reward,
+    delivery_reward,
+    progress_reward,
+    positive_progress_reward,
+    negative_progress_reward,
+    completed_uav_hop_count,
+    routing_slot_count,
+):
+    """Validate the two independent episode reward accumulation paths."""
+
+    episode_routing_reward = float(episode_routing_reward)
+    delivery_reward = float(delivery_reward)
+    progress_reward = float(progress_reward)
+    positive_progress_reward = float(positive_progress_reward)
+    negative_progress_reward = float(negative_progress_reward)
+    completed_uav_hop_count = int(completed_uav_hop_count)
+    routing_slot_count = int(routing_slot_count)
+    expected = delivery_reward + progress_reward
+    gross_term_sum = (
+        abs(delivery_reward)
+        + abs(positive_progress_reward)
+        + abs(negative_progress_reward)
+    )
+    event_term_count = max(completed_uav_hop_count, 1)
+    slot_term_count = max(routing_slot_count, 1)
+    tolerance = routing_reward_sum_consistency_tolerance(
+        absolute_term_sum=gross_term_sum,
+        accumulation_term_counts=(
+            event_term_count + slot_term_count,
+            event_term_count + 1,
+        ),
+    )
+    difference = abs(episode_routing_reward - expected)
+    if not math.isclose(
+        episode_routing_reward,
+        expected,
+        rel_tol=0.0,
+        abs_tol=tolerance,
+    ):
+        raise AssertionError(
+            "episode routing reward diverged from delivery plus progress: "
+            f"episode={int(episode)}, "
+            f"episode_routing_reward={episode_routing_reward!r}, "
+            f"delivery_plus_progress={expected!r}, "
+            f"delivery_reward={delivery_reward!r}, "
+            f"progress_reward={progress_reward!r}, "
+            f"positive_progress_reward={positive_progress_reward!r}, "
+            f"negative_progress_reward={negative_progress_reward!r}, "
+            f"difference={difference!r}, tolerance={tolerance!r}, "
+            f"completed_uav_hop_count={completed_uav_hop_count}, "
+            f"routing_slot_count={routing_slot_count}"
+        )
+    return tolerance
+
+
 def train(
     config=None,
     *,
@@ -3464,6 +3524,7 @@ def train(
         )
         episode_warmup_random_action_intervals = 0
         episode_behavior_noise_values = []
+        episode_routing_slots_executed_before = int(routing_slots_executed)
         episode_routing_reward = 0.0
         episode_c9_penalty_sum = 0.0
         episode_c9_penalty_samples = 0
@@ -4593,22 +4654,24 @@ def train(
         episode_routing_progress_reward = float(
             packet_engine.routing_progress_reward_total
         )
-        expected_episode_routing_reward = (
-            episode_routing_delivery_reward + episode_routing_progress_reward
+        episode_routing_slot_count = (
+            int(routing_slots_executed)
+            - episode_routing_slots_executed_before
         )
-        if not np.isclose(
-            episode_routing_reward,
-            expected_episode_routing_reward,
-            rtol=1e-12,
-            atol=max(
-                1e-9,
-                32.0
-                * np.spacing(max(abs(expected_episode_routing_reward), 1.0)),
+        _assert_episode_routing_reward_consistency(
+            episode=episode + 1,
+            episode_routing_reward=episode_routing_reward,
+            delivery_reward=episode_routing_delivery_reward,
+            progress_reward=episode_routing_progress_reward,
+            positive_progress_reward=(
+                packet_engine.routing_positive_progress_reward_total
             ),
-        ):
-            raise AssertionError(
-                "episode routing reward diverged from delivery plus progress"
-            )
+            negative_progress_reward=(
+                packet_engine.routing_negative_progress_reward_total
+            ),
+            completed_uav_hop_count=packet_engine.completed_uav_hop_count,
+            routing_slot_count=episode_routing_slot_count,
+        )
         routing_training_diagnostic_summary = None
         if episode_routing_training_diagnostics is not None:
             routing_replay_transitions_added = int(

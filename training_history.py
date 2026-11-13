@@ -112,6 +112,9 @@ BOOLEAN_COLUMNS = ("dinkelbach_lambda_updated",)
 STRING_COLUMNS = ("dinkelbach_update_status",)
 
 TRAINING_HISTORY_SCHEMA_VERSION = 9
+FLOAT64_UNIT_ROUNDOFF = 2.0**-53
+ROUTING_REWARD_CONSISTENCY_BASE_RELATIVE_TOLERANCE = 1e-12
+ROUTING_REWARD_CONSISTENCY_MIN_ULPS = 64.0
 TRAINING_HISTORY_CSV = "training_history.csv"
 TRAINING_HISTORY_JSONL = "training_history.jsonl"
 TRAINING_HISTORY_COMMIT = "training_history_commit.json"
@@ -127,6 +130,37 @@ class TrainingHistoryIdentityError(TrainingHistoryError):
 
 class TrainingHistoryConsistencyError(TrainingHistoryError):
     pass
+
+
+def routing_reward_sum_consistency_tolerance(
+    *, absolute_term_sum, accumulation_term_counts
+):
+    """Bound binary64 differences between independent serial sum paths.
+
+    Each count describes one summation path being compared.  The standard
+    gamma_n forward-error bound is applied to the gross absolute term sum;
+    the relative-scale and ULP floors cover short sums and persisted data for
+    which the exact operation count is not represented in the history schema.
+    """
+
+    absolute_term_sum = float(absolute_term_sum)
+    if not math.isfinite(absolute_term_sum) or absolute_term_sum < 0.0:
+        raise ValueError("reward absolute term sum must be finite and non-negative")
+    counts = tuple(int(count) for count in accumulation_term_counts)
+    if not counts or any(count < 0 for count in counts):
+        raise ValueError("reward accumulation term counts must be non-negative")
+    gammas = []
+    for count in counts:
+        product = count * FLOAT64_UNIT_ROUNDOFF
+        if product >= 1.0:
+            raise ValueError("reward accumulation count exceeds binary64 error model")
+        gammas.append(product / (1.0 - product))
+    scale = max(1.0, absolute_term_sum)
+    return max(
+        ROUTING_REWARD_CONSISTENCY_BASE_RELATIVE_TOLERANCE * scale,
+        sum(gammas) * scale,
+        ROUTING_REWARD_CONSISTENCY_MIN_ULPS * math.ulp(scale),
+    )
 
 
 def training_history_identity(method_id, training_seed, training_manifest_hash):
@@ -454,22 +488,55 @@ def validate_training_history(rows, identity):
                 raise ValueError(
                     "training history routing cross-slot fraction is inconsistent"
                 )
+            progress_total = row["routing_progress_reward_total"]
+            positive_progress = row[
+                "routing_positive_progress_reward_total"
+            ]
+            negative_progress = row[
+                "routing_negative_progress_reward_total"
+            ]
+            progress_scale = max(
+                abs(progress_total),
+                abs(positive_progress) + abs(negative_progress),
+            )
+            progress_term_count = max(int(completed), 1)
+            progress_tolerance = routing_reward_sum_consistency_tolerance(
+                absolute_term_sum=progress_scale,
+                accumulation_term_counts=(
+                    progress_term_count,
+                    progress_term_count,
+                ),
+            )
             if not math.isclose(
-                row["routing_progress_reward_total"],
-                row["routing_positive_progress_reward_total"]
-                + row["routing_negative_progress_reward_total"],
-                rel_tol=1e-12,
-                abs_tol=1e-12,
+                progress_total,
+                positive_progress + negative_progress,
+                rel_tol=0.0,
+                abs_tol=progress_tolerance,
             ):
                 raise ValueError(
                     "training history routing progress reward is inconsistent"
                 )
+            routing_total = row["routing_reward_total"]
+            delivery_total = row["routing_delivery_reward_total"]
+            total_scale = max(
+                abs(routing_total),
+                abs(delivery_total)
+                + abs(positive_progress)
+                + abs(negative_progress),
+            )
+            total_term_count = progress_term_count + 1
+            total_tolerance = routing_reward_sum_consistency_tolerance(
+                absolute_term_sum=total_scale,
+                accumulation_term_counts=(
+                    total_term_count,
+                    total_term_count,
+                ),
+            )
             if not math.isclose(
-                row["routing_reward_total"],
-                row["routing_delivery_reward_total"]
-                + row["routing_progress_reward_total"],
-                rel_tol=1e-12,
-                abs_tol=1e-12,
+                routing_total,
+                delivery_total + progress_total,
+                rel_tol=0.0,
+                abs_tol=total_tolerance,
             ):
                 raise ValueError(
                     "training history routing total reward is inconsistent"
