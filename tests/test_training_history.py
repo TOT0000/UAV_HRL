@@ -6,12 +6,15 @@ import shutil
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
+import numpy as np
 import torch
 
 from experiment_config import MethodSpec
 from HRL_task_aware import TrainingConfig, train
+from Packet_scheduler_v1 import PacketEngine
 from scenario_manifest import generate_manifest
 from training_history import (
     TRAINING_HISTORY_COMMIT,
@@ -108,6 +111,234 @@ class TrainingHistoryPersistenceTest(unittest.TestCase):
             json_row["routing_cross_slot_completed_uav_hop_fraction"], 0.25
         )
         self.assertEqual(float(csv_row["routing_reward_total"]), 3.0)
+
+    def test_packet_engine_cancellation_round_trips_without_rewriting_values(self):
+        env = SimpleNamespace(
+            num_UAV=2,
+            GS_ID=2,
+            GS_pos=(0.0, 0.0, 0.0),
+            uav_dict={
+                0: SimpleNamespace(
+                    get_position=lambda: (math.sqrt(80_000.0), 0.0, 100.0)
+                ),
+                1: SimpleNamespace(
+                    get_position=lambda: (0.0, 0.0, 100.0)
+                ),
+            },
+        )
+        engine = PacketEngine(2)
+        rng = np.random.default_rng(0)
+        coverages = rng.random(500)
+        packets = [
+            engine.create_packet(
+                0,
+                "FOV",
+                31_600.0,
+                0.0,
+                capture_coverage_ratio=float(coverage),
+            )
+            for coverage in coverages
+        ]
+        packets.extend(
+            engine.create_packet(0, "COM", 256.0, 0.0)
+            for _index in range(4_500)
+        )
+        for packet in packets:
+            packet["hop_service_start_time"] = 0.0
+        result = engine._event_result()
+        for packet in packets:
+            engine._record_completed_uav_hop_reward(
+                env,
+                packet,
+                0,
+                1,
+                0.0,
+                result,
+                slot_start=0.0,
+            )
+        for packet_index in rng.permutation(5_000):
+            engine._record_completed_uav_hop_reward(
+                env,
+                packets[int(packet_index)],
+                1,
+                0,
+                0.0,
+                result,
+                slot_start=0.0,
+            )
+
+        authoritative = {
+            "routing_reward_total": engine.routing_progress_reward_total,
+            "routing_delivery_reward_total": 0.0,
+            "routing_progress_reward_total": (
+                engine.routing_progress_reward_total
+            ),
+            "routing_positive_progress_reward_total": (
+                engine.routing_positive_progress_reward_total
+            ),
+            "routing_negative_progress_reward_total": (
+                engine.routing_negative_progress_reward_total
+            ),
+            "routing_completed_uav_hop_count": (
+                engine.completed_uav_hop_count
+            ),
+            "routing_cross_slot_completed_uav_hop_count": 0,
+            "routing_cross_slot_completed_uav_hop_fraction": 0.0,
+        }
+        component_sum = (
+            authoritative["routing_positive_progress_reward_total"]
+            + authoritative["routing_negative_progress_reward_total"]
+        )
+        self.assertEqual(engine.completed_uav_hop_count, 10_000)
+        self.assertAlmostEqual(
+            authoritative["routing_positive_progress_reward_total"],
+            476.9003806143868,
+            places=10,
+        )
+        self.assertAlmostEqual(
+            authoritative["routing_negative_progress_reward_total"],
+            -476.90038061431693,
+            places=10,
+        )
+        self.assertAlmostEqual(
+            authoritative["routing_progress_reward_total"],
+            6.712478316239778e-11,
+            delta=1e-18,
+        )
+        self.assertAlmostEqual(
+            component_sum,
+            6.986056177993305e-11,
+            delta=1e-18,
+        )
+        self.assertGreater(
+            abs(authoritative["routing_progress_reward_total"] - component_sum),
+            1e-12,
+        )
+
+        row = self._row(1)
+        row.update(authoritative)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            write_training_history(temp_dir, [row], self.identity)
+            saved_json = json.loads(
+                (Path(temp_dir) / "training_history.jsonl").read_text(
+                    encoding="utf-8"
+                )
+            )
+            read_back = read_committed_training_history(
+                temp_dir, self.identity
+            )[0]
+
+        for field, value in authoritative.items():
+            self.assertEqual(saved_json[field], value)
+            self.assertEqual(read_back[field], value)
+
+    def test_total_reward_cancellation_uses_gross_progress_scale(self):
+        delivery = 476.9003806143868
+        progress = -476.90038061431693
+        authoritative_total = 6.712478316239778e-11
+        row = self._row(1)
+        row.update(
+            routing_reward_total=authoritative_total,
+            routing_delivery_reward_total=delivery,
+            routing_progress_reward_total=progress,
+            routing_positive_progress_reward_total=0.0,
+            routing_negative_progress_reward_total=progress,
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            written = write_training_history(
+                temp_dir, [row], self.identity
+            )[0]
+
+        self.assertEqual(written["routing_reward_total"], authoritative_total)
+        self.assertEqual(written["routing_progress_reward_total"], progress)
+        self.assertGreater(
+            abs(authoritative_total - (delivery + progress)), 1e-12
+        )
+
+    def test_routing_reward_consistency_accepts_normal_values_at_multiple_scales(self):
+        cases = (
+            (0.0, 0.0, 0.0, 0.0),
+            (0.5, 0.75, -0.25, 0.5),
+            (2e-9, 3e-9, -1e-9, 2e-9),
+            (2e6 + 1e-7, 3e6, -1e6, 2e6 + 1e-7),
+        )
+        for progress, positive, negative, total in cases:
+            with self.subTest(progress=progress, total=total):
+                row = self._row(1)
+                row.update(
+                    routing_reward_total=total,
+                    routing_delivery_reward_total=0.0,
+                    routing_progress_reward_total=progress,
+                    routing_positive_progress_reward_total=positive,
+                    routing_negative_progress_reward_total=negative,
+                )
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    written = write_training_history(
+                        temp_dir, [row], self.identity
+                    )[0]
+                self.assertEqual(written["routing_progress_reward_total"], progress)
+                self.assertEqual(written["routing_reward_total"], total)
+
+    def test_routing_reward_consistency_still_rejects_material_errors(self):
+        bad_progress = self._row(1)
+        bad_progress.update(
+            routing_reward_total=1.01,
+            routing_delivery_reward_total=0.0,
+            routing_progress_reward_total=1.01,
+            routing_positive_progress_reward_total=1.0,
+            routing_negative_progress_reward_total=0.0,
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with self.assertRaisesRegex(
+                ValueError, "routing progress reward is inconsistent"
+            ):
+                write_training_history(
+                    temp_dir, [bad_progress], self.identity
+                )
+
+        bad_total = self._row(1)
+        bad_total.update(
+            routing_reward_total=1.01,
+            routing_delivery_reward_total=0.5,
+            routing_progress_reward_total=0.5,
+            routing_positive_progress_reward_total=0.5,
+            routing_negative_progress_reward_total=0.0,
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with self.assertRaisesRegex(
+                ValueError, "routing total reward is inconsistent"
+            ):
+                write_training_history(temp_dir, [bad_total], self.identity)
+
+    def test_routing_reward_validation_keeps_nonfinite_and_count_guards(self):
+        for value in (math.nan, math.inf, -math.inf):
+            with self.subTest(nonfinite=value):
+                nonfinite = self._row(1)
+                nonfinite["routing_progress_reward_total"] = value
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    with self.assertRaisesRegex(ValueError, "must be finite"):
+                        write_training_history(
+                            temp_dir, [nonfinite], self.identity
+                        )
+
+        incomplete = self._row(1)
+        incomplete["routing_positive_progress_reward_total"] = None
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with self.assertRaisesRegex(
+                ValueError, "routing reward diagnostics are incomplete"
+            ):
+                write_training_history(temp_dir, [incomplete], self.identity)
+
+        illegal_count = self._row(1)
+        illegal_count["routing_cross_slot_completed_uav_hop_count"] = 1
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with self.assertRaisesRegex(
+                ValueError, "completed-hop counts are inconsistent"
+            ):
+                write_training_history(
+                    temp_dir, [illegal_count], self.identity
+                )
 
     def test_legacy_rows_preserve_unknown_routing_diagnostics(self):
         legacy = self._row(1)

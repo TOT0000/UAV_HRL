@@ -112,6 +112,7 @@ BOOLEAN_COLUMNS = ("dinkelbach_lambda_updated",)
 STRING_COLUMNS = ("dinkelbach_update_status",)
 
 TRAINING_HISTORY_SCHEMA_VERSION = 9
+ROUTING_REWARD_CONSISTENCY_SCALE_TOLERANCE = 1e-12
 TRAINING_HISTORY_CSV = "training_history.csv"
 TRAINING_HISTORY_JSONL = "training_history.jsonl"
 TRAINING_HISTORY_COMMIT = "training_history_commit.json"
@@ -454,22 +455,48 @@ def validate_training_history(rows, identity):
                 raise ValueError(
                     "training history routing cross-slot fraction is inconsistent"
                 )
+            progress_total = row["routing_progress_reward_total"]
+            positive_progress = row[
+                "routing_positive_progress_reward_total"
+            ]
+            negative_progress = row[
+                "routing_negative_progress_reward_total"
+            ]
+            progress_scale = max(
+                1.0,
+                abs(progress_total),
+                abs(positive_progress) + abs(negative_progress),
+            )
+            progress_tolerance = (
+                ROUTING_REWARD_CONSISTENCY_SCALE_TOLERANCE
+                * progress_scale
+            )
             if not math.isclose(
-                row["routing_progress_reward_total"],
-                row["routing_positive_progress_reward_total"]
-                + row["routing_negative_progress_reward_total"],
-                rel_tol=1e-12,
-                abs_tol=1e-12,
+                progress_total,
+                positive_progress + negative_progress,
+                rel_tol=0.0,
+                abs_tol=progress_tolerance,
             ):
                 raise ValueError(
                     "training history routing progress reward is inconsistent"
                 )
+            routing_total = row["routing_reward_total"]
+            delivery_total = row["routing_delivery_reward_total"]
+            total_scale = max(
+                1.0,
+                abs(routing_total),
+                abs(delivery_total)
+                + abs(positive_progress)
+                + abs(negative_progress),
+            )
+            total_tolerance = (
+                ROUTING_REWARD_CONSISTENCY_SCALE_TOLERANCE * total_scale
+            )
             if not math.isclose(
-                row["routing_reward_total"],
-                row["routing_delivery_reward_total"]
-                + row["routing_progress_reward_total"],
-                rel_tol=1e-12,
-                abs_tol=1e-12,
+                routing_total,
+                delivery_total + progress_total,
+                rel_tol=0.0,
+                abs_tol=total_tolerance,
             ):
                 raise ValueError(
                     "training history routing total reward is inconsistent"
