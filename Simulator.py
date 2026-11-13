@@ -275,8 +275,9 @@ class Simulator:
         self.uav_paths = {}  
 
         # ===== Path-loss diagnostics cache =====
-        # Refreshed with channel geometry. Canonical routing reward consumes
-        # allocated capacities; the legacy per-hop reward entry point fails fast.
+        # Refreshed with channel geometry. Canonical routing progress uses
+        # actual endpoint positions at hop completion; the legacy per-hop
+        # reward entry point still fails fast.
         self.PL_uu_cache = np.zeros((self.num_UAV, self.num_UAV), dtype=float)
         self.PL_ug_cache = np.zeros(self.num_UAV, dtype=float)
         self.mobility_params = dict(self.energy_model.mobility_params)

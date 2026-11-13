@@ -1,10 +1,14 @@
 import unittest
 
 import numpy as np
+import pytest
 
 from HRL_task_aware import _run_routing_slot
-from Packet_scheduler_v1 import PacketEngine
+from Packet_scheduler_v1 import PacketEngine, completed_hop_gs_progress
 from Simulator import Simulator
+from experiment_config import MethodSpec, ROUTING_ACTION_DIM, ROUTING_STATE_DIM
+from rng_contract import NamedRNGStreams
+from routing_agents import create_routing_agent
 from utils_update_v2 import ReplayBufferDiscrete
 
 
@@ -95,6 +99,23 @@ class RoutingTransitionTerminalTest(unittest.TestCase):
         self.assertTrue(np.all(replay.not_done[: replay.size, 0] == 1.0))
         self.assertEqual(self.stats["COM"]["timely_delivered_packets"], 1)
         self.assertEqual(self.stats["COM"]["deadline_violated_packets"], 0)
+        delivery_reward = 100.0 / 10_000.0
+        progress_reward = (
+            100.0
+            * completed_hop_gs_progress(self.env, 0, self.env.GS_ID)
+            / 10_000.0
+        )
+        sender_index = replay.latest_index_by_agent[0]
+        self.assertAlmostEqual(
+            float(replay.reward[sender_index, 0]),
+            delivery_reward + progress_reward,
+            places=7,
+        )
+        for uid in range(1, self.env.num_UAV):
+            index = replay.latest_index_by_agent[uid]
+            self.assertAlmostEqual(
+                float(replay.reward[index, 0]), delivery_reward, places=7
+            )
 
     def test_deadline_outcome_only_increments_violation_stat(self):
         packet = self.engine.create_packet(0, "COM", 100.0, 0.0)
@@ -148,6 +169,7 @@ class RoutingTransitionTerminalTest(unittest.TestCase):
         self.assertEqual(replay.size, self.env.num_UAV)
         self.assertTrue(np.all(replay.not_done[: replay.size, 0] == 0.0))
 
+
     def test_empty_senders_preselect_and_create_neutral_reward_transitions(self):
         replay = self.run_slot({}, {})
 
@@ -180,6 +202,96 @@ class RoutingTransitionTerminalTest(unittest.TestCase):
         self.assertEqual(packet["last_routing_sender"], receiver)
         self.assertAlmostEqual(packet["routing_eligible_time"], 0.1)
         self.assertTrue(packet["done"])
+
+
+@pytest.mark.parametrize(
+    ("method_id", "routing_kind"),
+    [
+        ("td3_dinkelbach_dqn", "dqn"),
+        ("td3_dinkelbach_ddqn", "ddqn"),
+        ("td3_dinkelbach", "safe_ddqn"),
+    ],
+)
+def test_all_learning_routing_agents_store_sender_local_progress(
+    method_id, routing_kind
+):
+    env = Simulator(num_UAV=16)
+    env.num_GT = 2
+    env.reset_environment()
+    env.source_uavs = set()
+    env.current_time = 0.0
+    engine = PacketEngine(
+        num_uav=16,
+        step_time=0.25,
+        task_deadlines_seconds={"FOV": 1.0, "COM": 1.0},
+    )
+    packet = engine.create_packet(0, "COM", 100.0, 0.0)
+    actions = {uid: uid for uid in range(16)}
+    actions[0] = env.GS_ID
+
+    def allocate(proposed, s2u_links=None):
+        del s2u_links
+        active = {
+            (int(sender), int(receiver)): (
+                0.001 if int(sender) == 0 else 0.0
+            )
+            for sender, receiver in proposed.items()
+        }
+        env.active_link_capacity_profiles_mbps = {
+            link: np.full(50, value, dtype=float)
+            for link, value in active.items()
+        }
+        env.active_s2u_capacity_profiles_mbps = {}
+        env.active_s2u_capacities = {}
+        return active, {}
+
+    env.allocate_active_link_capacities = allocate
+    agent = create_routing_agent(
+        MethodSpec.parse(method_id),
+        ROUTING_STATE_DIM,
+        ROUTING_ACTION_DIM,
+        rng_streams=NamedRNGStreams(123),
+    )
+    assert agent.routing_agent_kind == routing_kind
+    agent.select_action = lambda state, uav_id, **kwargs: actions[int(uav_id)]
+    replay = ReplayBufferDiscrete(
+        ROUTING_STATE_DIM, ROUTING_ACTION_DIM, max_size=64, n_step=1
+    )
+    stats = {
+        task: {
+            "timely_delivered_packets": 0,
+            "deadline_violated_packets": 0,
+        }
+        for task in ("FOV", "COM")
+    }
+    _, total_reward, _, _ = _run_routing_slot(
+        env,
+        engine,
+        agent,
+        replay,
+        {uid: np.ones(ROUTING_ACTION_DIM, dtype=bool) for uid in range(16)},
+        current_time=0.0,
+        done=False,
+        delay_bound_steps=20,
+        violation_stats=stats,
+        epsilon=0.0,
+        traffic_rate_overrides={"FOV": 0.0, "COM": 0.0},
+    )
+
+    delivery = 100.0 / 10_000.0
+    progress = (
+        100.0 * completed_hop_gs_progress(env, 0, env.GS_ID) / 10_000.0
+    )
+    assert packet["terminal_outcome"] == "on_time_delivered"
+    assert total_reward == pytest.approx(delivery + progress)
+    sender_index = replay.latest_index_by_agent[0]
+    assert replay.reward[sender_index, 0] == pytest.approx(
+        delivery + progress, abs=1e-7
+    )
+    for uid in range(1, 16):
+        assert replay.reward[replay.latest_index_by_agent[uid], 0] == pytest.approx(
+            delivery, abs=1e-7
+        )
 
 
 if __name__ == "__main__":

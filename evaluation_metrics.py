@@ -88,6 +88,14 @@ METRIC_COLUMNS = (
     "coverage",
     "found_GT_ratio",
     "routing_wait_count",
+    "routing_reward_total",
+    "routing_delivery_reward_total",
+    "routing_progress_reward_total",
+    "routing_positive_progress_reward_total",
+    "routing_negative_progress_reward_total",
+    "routing_completed_uav_hop_count",
+    "routing_cross_slot_completed_uav_hop_count",
+    "routing_cross_slot_completed_uav_hop_fraction",
     "partial_transmission_count",
     "slot_budget_violation_count",
     "system_qos_violation_count",
@@ -132,10 +140,18 @@ OPTIONAL_METRIC_COLUMNS = {
     "system_qos_violation_probability",
     "system_violation_probability",
     "routing_stage_violation_probability",
+    "routing_reward_total",
+    "routing_delivery_reward_total",
+    "routing_progress_reward_total",
+    "routing_positive_progress_reward_total",
+    "routing_negative_progress_reward_total",
+    "routing_completed_uav_hop_count",
+    "routing_cross_slot_completed_uav_hop_count",
+    "routing_cross_slot_completed_uav_hop_fraction",
 }
 
 GENERIC_CROSS_SEED_ARTIFACT_SCHEMA_VERSION = (
-    "uav-hrl-generic-cross-seed-aggregate-v4"
+    "uav-hrl-generic-cross-seed-aggregate-v5"
 )
 
 # Every per-episode metric must opt in to exactly one generic aggregation path.
@@ -172,6 +188,14 @@ DESCRIPTIVE_EPISODE_METRIC_COLUMNS = (
     "coverage",
     "found_GT_ratio",
     "routing_wait_count",
+    "routing_reward_total",
+    "routing_delivery_reward_total",
+    "routing_progress_reward_total",
+    "routing_positive_progress_reward_total",
+    "routing_negative_progress_reward_total",
+    "routing_completed_uav_hop_count",
+    "routing_cross_slot_completed_uav_hop_count",
+    "routing_cross_slot_completed_uav_hop_fraction",
     "partial_transmission_count",
     "slot_budget_violation_count",
     "system_qos_violation_count",

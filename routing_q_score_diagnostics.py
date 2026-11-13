@@ -14,7 +14,7 @@ ROUTING_Q_SCORE_DIAGNOSTIC_CONTRACT_VERSION = (
     "uav-hrl-routing-q-score-diagnostics-v2"
 )
 ROUTING_TRAINING_DIAGNOSTIC_CONTRACT_VERSION = (
-    "uav-hrl-routing-training-diagnostics-v2"
+    "uav-hrl-routing-training-diagnostics-v3"
 )
 ROUTING_Q_SCORE_DIAGNOSTIC_DEFINITIONS = {
     "routing_q_r_definition": "raw reward critic output Q_r(s,a)",
@@ -175,7 +175,9 @@ class RoutingTrainingEpisodeDiagnostics:
     def __init__(self):
         self._samples = {name: [] for name in self._SAMPLE_FIELDS}
         self.slot_timely_useful_bits = []
-        self.slot_rewards = []
+        self.slot_delivery_rewards = []
+        self.slot_progress_rewards = []
+        self.slot_total_rewards = []
         self.decision_count = 0
         self.empty_hol_decision_count = 0
         self.epsilon_decision_count = 0
@@ -189,13 +191,43 @@ class RoutingTrainingEpisodeDiagnostics:
         self.representative_cases = []
         self.optimizer_event_count = 0
 
-    def add_slot(self, timely_useful_bits, reward):
+    def add_slot(
+        self,
+        timely_useful_bits,
+        delivery_reward,
+        progress_reward=0.0,
+        total_reward=None,
+    ):
         bits = float(timely_useful_bits)
-        reward = float(reward)
-        if not math.isfinite(bits) or bits < 0.0 or not math.isfinite(reward):
-            raise ValueError("routing slot diagnostics require finite non-negative data")
+        delivery_reward = float(delivery_reward)
+        progress_reward = float(progress_reward)
+        total_reward = (
+            delivery_reward + progress_reward
+            if total_reward is None
+            else float(total_reward)
+        )
+        if (
+            not math.isfinite(bits)
+            or bits < 0.0
+            or not all(
+                math.isfinite(value)
+                for value in (delivery_reward, progress_reward, total_reward)
+            )
+        ):
+            raise ValueError("routing slot diagnostics require finite data")
+        if delivery_reward < 0.0:
+            raise ValueError("routing delivery reward must be non-negative")
+        if not math.isclose(
+            total_reward,
+            delivery_reward + progress_reward,
+            rel_tol=1e-12,
+            abs_tol=1e-12,
+        ):
+            raise ValueError("routing total reward must equal delivery plus progress")
         self.slot_timely_useful_bits.append(bits)
-        self.slot_rewards.append(reward)
+        self.slot_delivery_rewards.append(delivery_reward)
+        self.slot_progress_rewards.append(progress_reward)
+        self.slot_total_rewards.append(total_reward)
 
     def add_decision(
         self,
@@ -307,18 +339,23 @@ class RoutingTrainingEpisodeDiagnostics:
         slot_kbits = _distribution(
             [value / 1000.0 for value in self.slot_timely_useful_bits]
         )
-        slot_reward = _distribution(self.slot_rewards)
-        slot_count = len(self.slot_rewards)
+        slot_delivery_reward = _distribution(self.slot_delivery_rewards)
+        slot_progress_reward = _distribution(self.slot_progress_rewards)
+        slot_total_reward = _distribution(self.slot_total_rewards)
+        slot_count = len(self.slot_total_rewards)
         return {
             "schema_version": ROUTING_TRAINING_DIAGNOSTIC_CONTRACT_VERSION,
             "slot_timely_useful_bits": slot_bits,
             "slot_timely_useful_kbits": slot_kbits,
-            "slot_global_reward": slot_reward,
+            "slot_global_reward": slot_delivery_reward,
+            "slot_delivery_reward": slot_delivery_reward,
+            "slot_progress_reward": slot_progress_reward,
+            "slot_total_reward": slot_total_reward,
             "slot_zero_reward_count": int(
-                np.count_nonzero(np.asarray(self.slot_rewards) == 0.0)
+                np.count_nonzero(np.asarray(self.slot_total_rewards) == 0.0)
             ),
             "slot_zero_reward_fraction": _ratio(
-                int(np.count_nonzero(np.asarray(self.slot_rewards) == 0.0)),
+                int(np.count_nonzero(np.asarray(self.slot_total_rewards) == 0.0)),
                 slot_count,
             ),
             "decision_count": self.decision_count,

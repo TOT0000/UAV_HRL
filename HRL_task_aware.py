@@ -1121,7 +1121,9 @@ def _run_routing_slot(
     if routing_training_diagnostics is not None:
         routing_training_diagnostics.add_slot(
             slot_result["total_timely_useful_bits"],
-            slot_result["global_routing_reward"],
+            slot_result["delivery_routing_reward"],
+            slot_result["progress_routing_reward"],
+            slot_result["total_routing_reward"],
         )
     for outcome in slot_result["outcomes"]:
         task_type = outcome["task_type"]
@@ -1203,10 +1205,10 @@ def _run_routing_slot(
                 )
     selected_links = list(slot_result.get("active_links", []))
     return (
-        # Movement learning uses every complete GS delivery.  The routing
-        # reward beside it intentionally remains timely-only.
+        # Movement learning uses every complete GS delivery. Routing uses the
+        # shared timely-delivery term plus sender-local completed-hop progress.
         _movement_complete_useful_bits(slot_result),
-        float(slot_result["global_routing_reward"]),
+        float(slot_result["total_routing_reward"]),
         len(next_hops),
         selected_links,
     )
@@ -4587,7 +4589,13 @@ def train(
             atol=1e-9,
         ):
             raise AssertionError("timely-goodput alias diverged from useful bits")
-        expected_episode_routing_reward = total_timely_useful_bits / 10_000.0
+        episode_routing_delivery_reward = total_timely_useful_bits / 10_000.0
+        episode_routing_progress_reward = float(
+            packet_engine.routing_progress_reward_total
+        )
+        expected_episode_routing_reward = (
+            episode_routing_delivery_reward + episode_routing_progress_reward
+        )
         if not np.isclose(
             episode_routing_reward,
             expected_episode_routing_reward,
@@ -4599,7 +4607,7 @@ def train(
             ),
         ):
             raise AssertionError(
-                "episode global routing reward diverged from timely useful bits"
+                "episode routing reward diverged from delivery plus progress"
             )
         routing_training_diagnostic_summary = None
         if episode_routing_training_diagnostics is not None:
@@ -4684,11 +4692,17 @@ def train(
                     lambda_cost_used=float(episode_lambda_cost),
                     lambda_cost_after_episode=float(lambda_cost_after_episode),
                     episode_global_routing_reward=float(
+                        episode_routing_delivery_reward
+                    ),
+                    episode_progress_routing_reward=float(
+                        episode_routing_progress_reward
+                    ),
+                    episode_total_routing_reward=float(
                         episode_routing_reward
                     ),
                     episode_timely_useful_bits=total_timely_useful_bits,
                     reward_bits_conservation_error=float(
-                        episode_routing_reward * 10_000.0
+                        episode_routing_delivery_reward * 10_000.0
                         - total_timely_useful_bits
                     ),
                 )
@@ -4770,6 +4784,30 @@ def train(
                 "sr_movement_diagnostics": sr_episode_summary,
                 "dual_task_service_diagnostics": dual_episode_rows,
                 "routing_reward_total": float(episode_routing_reward),
+                "routing_delivery_reward_total": float(
+                    episode_routing_delivery_reward
+                ),
+                "routing_progress_reward_total": float(
+                    episode_routing_progress_reward
+                ),
+                "routing_positive_progress_reward_total": float(
+                    packet_engine.routing_positive_progress_reward_total
+                ),
+                "routing_negative_progress_reward_total": float(
+                    packet_engine.routing_negative_progress_reward_total
+                ),
+                "routing_completed_uav_hop_count": int(
+                    packet_engine.completed_uav_hop_count
+                ),
+                "routing_cross_slot_completed_uav_hop_count": int(
+                    packet_engine.cross_slot_completed_uav_hop_count
+                ),
+                "routing_cross_slot_completed_uav_hop_fraction": (
+                    float(packet_engine.cross_slot_completed_uav_hop_count)
+                    / float(packet_engine.completed_uav_hop_count)
+                    if packet_engine.completed_uav_hop_count
+                    else None
+                ),
                 "routing_training_diagnostics": (
                     routing_training_diagnostic_summary
                 ),

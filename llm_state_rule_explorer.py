@@ -821,6 +821,39 @@ def state_rule_slot_service_record(
         "com_timely_delivered_bits": float(
             slot_result.get("com_timely_delivered_bits", 0.0)
         ),
+        "routing_delivery_reward": float(
+            slot_result.get(
+                "delivery_routing_reward",
+                slot_result.get("global_routing_reward", 0.0),
+            )
+        ),
+        "routing_progress_reward": float(
+            slot_result.get("progress_routing_reward", 0.0)
+        ),
+        "routing_positive_progress_reward": float(
+            slot_result.get("positive_progress_routing_reward", 0.0)
+        ),
+        "routing_negative_progress_reward": float(
+            slot_result.get("negative_progress_routing_reward", 0.0)
+        ),
+        "routing_total_reward": float(
+            slot_result.get(
+                "total_routing_reward",
+                slot_result.get("global_routing_reward", 0.0),
+            )
+        ),
+        "routing_progress_reward_by_sender": {
+            str(int(sender)): float(value)
+            for sender, value in dict(
+                slot_result.get("progress_reward_by_sender", {})
+            ).items()
+        },
+        "completed_uav_hop_count": int(
+            slot_result.get("completed_uav_hop_count", 0)
+        ),
+        "cross_slot_completed_uav_hop_count": int(
+            slot_result.get("cross_slot_completed_uav_hop_count", 0)
+        ),
         "same_slot_multi_hop_packets": sum(
             count >= 2 for count in packet_use_counts.values()
         ),

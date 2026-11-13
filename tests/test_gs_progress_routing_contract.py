@@ -8,6 +8,8 @@ from Packet_scheduler_v1 import (
     PacketEngine,
     action_wise_gs_progress,
     canonical_routing_gs_progress,
+    completed_hop_gs_progress,
+    packet_useful_bits_for_routing_progress,
     timely_useful_bits_routing_reward,
 )
 from communication_contract import normalized_gs_progress
@@ -87,12 +89,43 @@ class GroundStationProgressHelperTest(unittest.TestCase):
 
 
 class RoutingRewardAndStateContractTest(unittest.TestCase):
-    def test_reward_uses_only_timely_useful_gs_bits_with_fixed_scale(self):
+    def test_delivery_reward_uses_timely_useful_gs_bits_with_fixed_scale(self):
         self.assertEqual(ROUTING_REWARD_BITS_PER_UNIT, 10_000.0)
         self.assertEqual(timely_useful_bits_routing_reward(0.0), 0.0)
         self.assertEqual(timely_useful_bits_routing_reward(50_000.0), 5.0)
         self.assertEqual(timely_useful_bits_routing_reward(150_000.0), 15.0)
-        self.assertTrue(ROUTING_REWARD_CONTRACT_VERSION.endswith("v9"))
+        self.assertTrue(ROUTING_REWARD_CONTRACT_VERSION.endswith("v10"))
+
+    def test_completed_hop_progress_is_signed_unclipped_3d_and_uses_frozen_payload(self):
+        env = SimpleNamespace(
+            GS_ID=3,
+            GS_pos=(0.0, 0.0, 0.0),
+            uav_dict={
+                0: _point((0.0, 0.0, 300.0)),
+                1: _point((0.0, 0.0, 100.0)),
+                2: _point((0.0, 0.0, 500.0)),
+            },
+        )
+        self.assertAlmostEqual(completed_hop_gs_progress(env, 0, 1), 0.5)
+        self.assertEqual(completed_hop_gs_progress(env, 0, 0), 0.0)
+        self.assertAlmostEqual(completed_hop_gs_progress(env, 0, 2), -0.5)
+        self.assertAlmostEqual(completed_hop_gs_progress(env, 2, env.GS_ID), 1.25)
+        self.assertEqual(
+            packet_useful_bits_for_routing_progress(
+                {"task_type": "COM", "size_bits": 120.0}
+            ),
+            120.0,
+        )
+        self.assertEqual(
+            packet_useful_bits_for_routing_progress(
+                {
+                    "task_type": "FOV",
+                    "size_bits": 120.0,
+                    "capture_coverage_ratio": 0.25,
+                }
+            ),
+            30.0,
+        )
 
     def test_state_is_143d_and_progress_block_survives_task_masking(self):
         env = Simulator(num_UAV=NUM_UAV)
@@ -181,7 +214,9 @@ class QosAndCheckpointContractTest(unittest.TestCase):
         self.assertEqual(DEADLINE_SWEEP_INJECTION_CUTOFF_SECONDS, 59.97)
 
     def test_schema_21_and_90d_current_schema_are_rejected(self):
-        self.assertEqual(CHECKPOINT_SCHEMA_VERSION, 36)
+        self.assertEqual(CHECKPOINT_SCHEMA_VERSION, 37)
+        with self.assertRaisesRegex(RuntimeError, "timely-only routing reward replay"):
+            _validate_checkpoint_schema({"checkpoint_schema_version": 36})
         with self.assertRaisesRegex(RuntimeError, "must be retrained"):
             _validate_checkpoint_schema({"checkpoint_schema_version": 21})
         with self.assertRaisesRegex(RuntimeError, "GS-progress"):

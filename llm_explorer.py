@@ -2737,7 +2737,43 @@ def first_gen_slot_service_record(
             and item.get("sender_uav_id") is not None
         ],
         global_routing_reward=float(slot_result.get("global_routing_reward", 0.0)),
+        delivery_routing_reward=float(
+            slot_result.get(
+                "delivery_routing_reward",
+                slot_result.get("global_routing_reward", 0.0),
+            )
+        ),
+        progress_routing_reward=float(
+            slot_result.get("progress_routing_reward", 0.0)
+        ),
+        positive_progress_routing_reward=float(
+            slot_result.get("positive_progress_routing_reward", 0.0)
+        ),
+        negative_progress_routing_reward=float(
+            slot_result.get("negative_progress_routing_reward", 0.0)
+        ),
+        total_routing_reward=float(
+            slot_result.get(
+                "total_routing_reward",
+                slot_result.get("global_routing_reward", 0.0),
+            )
+        ),
+        progress_reward_by_sender={
+            str(int(sender)): float(value)
+            for sender, value in dict(
+                slot_result.get("progress_reward_by_sender", {})
+            ).items()
+        },
+        completed_uav_hop_count=int(
+            slot_result.get("completed_uav_hop_count", 0)
+        ),
+        cross_slot_completed_uav_hop_count=int(
+            slot_result.get("cross_slot_completed_uav_hop_count", 0)
+        ),
         shared_reward_row_sum=float(slot_result.get("shared_reward_row_sum", 0.0)),
+        routing_reward_row_sum=float(
+            slot_result.get("routing_reward_row_sum", 0.0)
+        ),
     )
     return _json_clone(record)
 
@@ -3178,7 +3214,53 @@ def first_gen_routing_summary(
                     for slot in slot_records
                 )
             ),
-            "aggregation_rule": "the episode learning-signal total uses the global slot reward once, not the per-UAV row sum",
+            "aggregation_rule": (
+                "the episode delivery component uses the global slot reward "
+                "once, not the per-UAV duplicated row sum"
+            ),
+        },
+        "routing_reward": {
+            "delivery_reward_episode_sum_counting_each_slot_once": float(
+                math.fsum(
+                    float(
+                        slot.get(
+                            "delivery_routing_reward",
+                            slot.get("global_routing_reward", 0.0),
+                        )
+                    )
+                    for slot in slot_records
+                )
+            ),
+            "progress_reward_episode_sum": float(
+                math.fsum(
+                    float(slot.get("progress_routing_reward", 0.0))
+                    for slot in slot_records
+                )
+            ),
+            "total_reward_episode_sum": float(
+                math.fsum(
+                    float(
+                        slot.get(
+                            "total_routing_reward",
+                            slot.get("global_routing_reward", 0.0),
+                        )
+                    )
+                    for slot in slot_records
+                )
+            ),
+            "completed_uav_hop_count": int(
+                sum(int(slot.get("completed_uav_hop_count", 0)) for slot in slot_records)
+            ),
+            "cross_slot_completed_uav_hop_count": int(
+                sum(
+                    int(slot.get("cross_slot_completed_uav_hop_count", 0))
+                    for slot in slot_records
+                )
+            ),
+            "aggregation_rule": (
+                "delivery is counted once per slot; sender-local progress is "
+                "summed once per completed U2U/U2G hop"
+            ),
         },
         "service_semantics": {
             "preselection": "selected action at slot start",
@@ -3887,10 +3969,22 @@ def environment_constants_and_definitions(
             "queue priority until complete GS delivery, a non-time drop, or episode end"
         ),
         "routing_reward": {
-            "formula": "slot timely useful bits delivered to GS / 10000",
+            "formula": (
+                "per sender: slot timely useful bits delivered to GS / 10000 + "
+                "sum of completed U2U/U2G hop useful_bits * "
+                "(sender_distance_to_GS - receiver_distance_to_GS) / 400 / 10000"
+            ),
             "unit": "1 reward per decimal 10 kbit",
-            "sharing": "the same global slot reward is stored in every UAV routing transition; episode routing reward sums each slot once",
-            "zero_and_bounds": "zero when no timely useful GS delivery; no clipping or dynamic normalization",
+            "sharing": (
+                "timely delivery is shared by every UAV transition; completed-hop "
+                "progress is stored only for the actual sender; episode total counts "
+                "delivery once per slot plus every sender-local progress event"
+            ),
+            "completion_semantics": (
+                "U2U and U2G only, using actual 3-D endpoint positions when the full "
+                "hop completes; late packets retain progress; S2U and partial hops earn none"
+            ),
+            "zero_and_bounds": "signed progress is retained without clipping or dynamic normalization",
         },
         "safe_ddqn": {
             "score": "Q_reward - lambda_cost * Q_cost",
@@ -4098,7 +4192,10 @@ def environment_constants_and_definitions_first_gen(
                 "PacketEngine terminal-outcome definitions"
             ),
             "movement_energy_j": "all UAVs and all movement controllers, including hover",
-            "routing_reward_episode_sum": "global shared reward counted once per slot",
+            "routing_reward_episode_sum": (
+                "global timely-delivery reward counted once per slot plus all "
+                "sender-local completed-hop progress rewards"
+            ),
             "branch_action_counts": "17-entry arrays in action-index order; sender index is WAIT",
             "legal_action_opportunities": "decision-time effective-mask counts, not service counts",
             "slot_start_hol": (

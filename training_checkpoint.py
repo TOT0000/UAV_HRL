@@ -116,7 +116,8 @@ from dinkelbach_blocks import (
     dinkelbach_config_metadata,
 )
 
-CHECKPOINT_SCHEMA_VERSION = 36
+CHECKPOINT_SCHEMA_VERSION = 37
+PRE_COMPLETED_HOP_PROGRESS_REWARD_CHECKPOINT_SCHEMA_VERSION = 36
 PRE_UNIFIED_COMPLETE_GOODPUT_CHECKPOINT_SCHEMA_VERSION = 35
 PRE_SHARED_GOODPUT_REWARD_CHECKPOINT_SCHEMA_VERSION = 34
 PRE_EVENT_TIME_SERVICE_CHECKPOINT_SCHEMA_VERSION = 33
@@ -1549,6 +1550,12 @@ def _checkpoint_uses_dinkelbach(metadata):
 def _validate_checkpoint_schema(metadata):
     schema = metadata.get("checkpoint_schema_version")
     if schema != CHECKPOINT_SCHEMA_VERSION:
+        if schema == PRE_COMPLETED_HOP_PROGRESS_REWARD_CHECKPOINT_SCHEMA_VERSION:
+            raise RuntimeError(
+                "checkpoint schema v36 contains shared timely-only routing "
+                "reward replay. The delivery-plus-sender-completed-hop-progress "
+                "reward contract is incompatible; retraining is required"
+            )
         if schema == PRE_UNIFIED_COMPLETE_GOODPUT_CHECKPOINT_SCHEMA_VERSION:
             raise RuntimeError(
                 "checkpoint schema v35 used deadline-drop/timely-goodput movement "
@@ -1613,7 +1620,8 @@ def _validate_checkpoint_schema(metadata):
             "permanent GS gateway, capture-weighted timely useful goodput, "
             "continuous hard-only 400 m UAV 0 gateway projection, "
             "unified inclusive 400 m S2U/U2G/U2U communication range, "
-            "143-D action-wise GS-progress routing state and v7 routing reward, "
+            "143-D action-wise GS-progress routing state and completed-hop "
+            "progress routing reward, "
             "15 ms FOV / 10 ms COM QoS deadlines and event-time service, "
             "531-D Search/FOV/COM movement state, named-RNG, projected-action "
             "and service-only replay contract, and must be retrained: "

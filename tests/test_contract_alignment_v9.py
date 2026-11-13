@@ -49,7 +49,7 @@ class FormalContractTest(unittest.TestCase):
         self.assertEqual(FORMAL_CHECKPOINT_EPISODE, 1500)
         self.assertEqual(FORMAL_EXPERIMENT_DEFAULTS["training_episodes_per_seed"], 1500)
         self.assertEqual(checkpoint_episode_schedule(1500, 50), list(range(50, 1501, 50)))
-        self.assertEqual(CHECKPOINT_SCHEMA_VERSION, 36)
+        self.assertEqual(CHECKPOINT_SCHEMA_VERSION, 37)
 
     def test_all_methods_publish_the_same_physical_contracts(self):
         shared_fields = (
@@ -62,7 +62,11 @@ class FormalContractTest(unittest.TestCase):
             "routing_reward_contract_version",
             "routing_reward_formula",
             "routing_reward_bits_per_unit",
+            "routing_reward_progress_beta",
+            "routing_reward_progress_distance_normalization_m",
             "routing_reward_assignment",
+            "routing_reward_position_timing",
+            "routing_reward_cross_slot_timing",
             "routing_episode_reward_aggregation",
             "routing_state_gs_progress_formula",
             "reference_u2u_max_capacity_mbps",

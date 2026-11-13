@@ -18,7 +18,10 @@ from Channel_model import (
     u2u_path_loss_db,
 )
 from centralized_movement import fov_task_geometry, fov_task_metrics
-from communication_contract import normalized_gs_progress
+from communication_contract import (
+    MAX_3D_COMMUNICATION_DISTANCE_M,
+    normalized_gs_progress,
+)
 from experiment_config import (
     COM_SESSION_LIFECYCLE_VERSION,
     COM_PACKET_RATE_PER_SECOND,
@@ -27,6 +30,7 @@ from experiment_config import (
     PRODUCTION_PACKET_INJECTION_CUTOFF_SECONDS,
     PRODUCTION_TASK_DEADLINE_SECONDS,
     ROUTING_ACTION_FEATURE_GROUPS,
+    ROUTING_PROGRESS_REWARD_BETA,
     ROUTING_REWARD_BITS_PER_UNIT,
 )
 from fov_ema_lifecycle import validate_fov_ema_state
@@ -34,7 +38,7 @@ import numpy as np
 
 
 PACKET_ENGINE_CHECKPOINT_SCHEMA_VERSION = (
-    "event-time-shared-goodput-reward-and-tolerant-deadline-v7"
+    "event-time-delivery-plus-completed-hop-progress-reward-v8"
 )
 
 
@@ -66,6 +70,47 @@ def timely_useful_bits_routing_reward(timely_useful_bits):
     if not math.isfinite(bits) or bits < 0.0:
         raise ValueError("timely useful bits must be finite and non-negative")
     return bits / ROUTING_REWARD_BITS_PER_UNIT
+
+
+def packet_useful_bits_for_routing_progress(pkt):
+    """Return the immutable useful payload credited for each completed hop."""
+
+    physical_bits = float(pkt["size_bits"])
+    if not math.isfinite(physical_bits) or physical_bits < 0.0:
+        raise ValueError("packet size_bits must be finite and non-negative")
+    if "FOV" in str(pkt.get("task_type", "COM")).upper():
+        return physical_bits * sanitize_capture_coverage_ratio(
+            pkt.get("capture_coverage_ratio", 0.0)
+        )
+    return physical_bits
+
+
+def completed_hop_gs_progress(env, sender, receiver):
+    """Compute unclipped 3-D GS progress at the hop-completion instant."""
+
+    sender = int(sender)
+    receiver = int(receiver)
+    gs_id = int(env.GS_ID)
+    gs_position = tuple(float(value) for value in _routing_ground_station_position(env))
+    sender_position = tuple(
+        float(value) for value in env.uav_dict[sender].get_position()
+    )
+    receiver_position = (
+        gs_position
+        if receiver == gs_id
+        else tuple(float(value) for value in env.uav_dict[receiver].get_position())
+    )
+    for name, position in (
+        ("ground station", gs_position),
+        ("sender", sender_position),
+        ("receiver", receiver_position),
+    ):
+        if len(position) != 3 or not all(math.isfinite(value) for value in position):
+            raise ValueError(f"{name} position must be finite and three-dimensional")
+    return (
+        math.dist(sender_position, gs_position)
+        - math.dist(receiver_position, gs_position)
+    ) / float(MAX_3D_COMMUNICATION_DISTANCE_M)
 
 
 def _routing_ground_station_position(env):
@@ -371,6 +416,11 @@ class PacketEngine:
         self.com_late_delivered_bits = 0.0
         self.total_late_useful_bits = 0.0
         self.total_all_useful_bits = 0.0
+        self.routing_progress_reward_total = 0.0
+        self.routing_positive_progress_reward_total = 0.0
+        self.routing_negative_progress_reward_total = 0.0
+        self.completed_uav_hop_count = 0
+        self.cross_slot_completed_uav_hop_count = 0
         self.wait_actions = 0
         self.deadline_drops = 0
         self.link_slot_budget_violations = 0
@@ -2080,6 +2130,9 @@ class PacketEngine:
             }
         result = {
             "reward_by_sender": defaultdict(float),
+            "progress_reward_by_sender": defaultdict(float),
+            "positive_progress_reward_by_sender": defaultdict(float),
+            "negative_progress_reward_by_sender": defaultdict(float),
             "cost_by_sender": defaultdict(float),
             "timely_goodput_bits": 0.0,
             "total_timely_useful_bits": 0.0,
@@ -2097,7 +2150,16 @@ class PacketEngine:
             "outcomes": [],
             "start_of_slot_routing_sender_ids": tuple(sorted(frozen_hol)),
             "global_routing_reward": 0.0,
+            "delivery_routing_reward": 0.0,
+            "progress_routing_reward": 0.0,
+            "positive_progress_routing_reward": 0.0,
+            "negative_progress_routing_reward": 0.0,
+            "total_routing_reward": 0.0,
             "shared_reward_row_sum": 0.0,
+            "routing_reward_row_sum": 0.0,
+            "completed_uav_hops": [],
+            "completed_uav_hop_count": 0,
+            "cross_slot_completed_uav_hop_count": 0,
             "active_links": [],
         }
         pending_relay_arrivals = []
@@ -2236,6 +2298,15 @@ class PacketEngine:
                     delay_accum["sum_tx"] += tx_elapsed_s
                     delay_accum["sum_total"] += total_hop_s
                     delay_accum["count"] += 1
+                    self._record_completed_uav_hop_reward(
+                        env,
+                        pkt,
+                        sender,
+                        receiver,
+                        completion_time,
+                        result,
+                        slot_start=current_time,
+                    )
                     arrival = self.detach_completed_hop(
                         pkt, sender, receiver, completion_time
                     )
@@ -2383,10 +2454,20 @@ class PacketEngine:
         global_reward = timely_useful_bits_routing_reward(
             result["total_timely_useful_bits"]
         )
+        result["delivery_routing_reward"] = global_reward
         result["global_routing_reward"] = global_reward
         for sender in actions:
-            result["reward_by_sender"][int(sender)] = global_reward
+            sender = int(sender)
+            result["reward_by_sender"][sender] = (
+                global_reward + result["progress_reward_by_sender"][sender]
+            )
+        result["total_routing_reward"] = (
+            global_reward + result["progress_routing_reward"]
+        )
         result["shared_reward_row_sum"] = global_reward * len(actions)
+        result["routing_reward_row_sum"] = math.fsum(
+            result["reward_by_sender"].values()
+        )
         result["charged_snapshot_packet_ids"] = ()
         return result
 
@@ -2656,6 +2737,9 @@ class PacketEngine:
     def _event_result():
         return {
             "reward_by_sender": defaultdict(float),
+            "progress_reward_by_sender": defaultdict(float),
+            "positive_progress_reward_by_sender": defaultdict(float),
+            "negative_progress_reward_by_sender": defaultdict(float),
             "cost_by_sender": defaultdict(float),
             "timely_goodput_bits": 0.0,
             "total_timely_useful_bits": 0.0,
@@ -2677,7 +2761,16 @@ class PacketEngine:
             "active_links": [],
             "generated_packet_ids": [],
             "global_routing_reward": 0.0,
+            "delivery_routing_reward": 0.0,
+            "progress_routing_reward": 0.0,
+            "positive_progress_routing_reward": 0.0,
+            "negative_progress_routing_reward": 0.0,
+            "total_routing_reward": 0.0,
             "shared_reward_row_sum": 0.0,
+            "routing_reward_row_sum": 0.0,
+            "completed_uav_hops": [],
+            "completed_uav_hop_count": 0,
+            "cross_slot_completed_uav_hop_count": 0,
         }
 
     @staticmethod
@@ -2796,8 +2889,82 @@ class PacketEngine:
         self.s2u_completed_packets += 1
         result["s2u_arrivals"].append(pkt)
 
+    def _record_completed_uav_hop_reward(
+        self,
+        env,
+        pkt,
+        sender,
+        receiver,
+        completion_time,
+        result,
+        *,
+        slot_start,
+    ):
+        """Credit one physical U2U/U2G completion to its actual sender."""
+
+        sender = int(sender)
+        receiver = int(receiver)
+        completion_time = float(completion_time)
+        service_start = float(
+            pkt.get("hop_service_start_time", completion_time)
+        )
+        useful_bits = packet_useful_bits_for_routing_progress(pkt)
+        gs_progress = completed_hop_gs_progress(env, sender, receiver)
+        progress_reward = (
+            ROUTING_PROGRESS_REWARD_BETA
+            * useful_bits
+            * gs_progress
+            / ROUTING_REWARD_BITS_PER_UNIT
+        )
+        if not math.isfinite(progress_reward):
+            raise ValueError("completed-hop routing progress reward is non-finite")
+        tolerance = event_time_tolerance_seconds(
+            service_start, slot_start, completion_time
+        )
+        cross_slot = service_start < float(slot_start) - tolerance
+        event = {
+            "packet_id": int(pkt["id"]),
+            "task_type": self._task_norm(pkt.get("task_type", "COM")),
+            "sender_uav_id": sender,
+            "receiver_id": receiver,
+            "link_type": (
+                "U2G" if receiver == int(env.GS_ID) else "U2U"
+            ),
+            "service_start_time_seconds": service_start,
+            "completion_time_seconds": completion_time,
+            "cross_slot_transmission": bool(cross_slot),
+            "useful_bits": float(useful_bits),
+            "gs_progress": float(gs_progress),
+            "progress_reward": float(progress_reward),
+        }
+        result["completed_uav_hops"].append(event)
+        result["completed_uav_hop_count"] += 1
+        result["cross_slot_completed_uav_hop_count"] += int(cross_slot)
+        result["progress_reward_by_sender"][sender] += progress_reward
+        result["progress_routing_reward"] += progress_reward
+        if progress_reward >= 0.0:
+            result["positive_progress_reward_by_sender"][sender] += progress_reward
+            result["positive_progress_routing_reward"] += progress_reward
+            self.routing_positive_progress_reward_total += progress_reward
+        else:
+            result["negative_progress_reward_by_sender"][sender] += progress_reward
+            result["negative_progress_routing_reward"] += progress_reward
+            self.routing_negative_progress_reward_total += progress_reward
+        self.routing_progress_reward_total += progress_reward
+        self.completed_uav_hop_count += 1
+        self.cross_slot_completed_uav_hop_count += int(cross_slot)
+        return event
+
     def _event_complete_uav_hop(
-        self, env, pkt, sender, receiver, completion_time, result
+        self,
+        env,
+        pkt,
+        sender,
+        receiver,
+        completion_time,
+        result,
+        *,
+        slot_start,
     ):
         queue_delay = float(pkt.get("hop_queue_delay_s", 0.0))
         service_start = float(pkt.get("hop_service_start_time", completion_time))
@@ -2830,6 +2997,15 @@ class PacketEngine:
             float(completion_time) - service_start, 0.0
         )
         delay_accum["count"] += 1
+        self._record_completed_uav_hop_reward(
+            env,
+            pkt,
+            sender,
+            receiver,
+            completion_time,
+            result,
+            slot_start=slot_start,
+        )
         arrival = self.detach_completed_hop(
             pkt, sender, receiver, completion_time
         )
@@ -3187,7 +3363,7 @@ class PacketEngine:
         # The slot-start allocation seeds the event cache.  Frozen HOL and
         # backlog snapshots remain available for cost attribution and
         # diagnostics, but routing reward is computed only from authoritative
-        # timely useful GS delivery after the complete slot has executed.
+        # complete-hop events and timely GS delivery during slot execution.
         def prepare_allocation_view(capacities, bandwidths):
             self._event_service_counters["allocation_rebuilds"] += 1
             if not self._event_service_cache_enabled:
@@ -3671,7 +3847,13 @@ class PacketEngine:
                 else:
                     sender, receiver = link
                     self._event_complete_uav_hop(
-                        env, pkt, sender, receiver, t, result
+                        env,
+                        pkt,
+                        sender,
+                        receiver,
+                        t,
+                        result,
+                        slot_start=slot_start,
                     )
             consumed_events = materialize_due(t)
             expired_packets = append_expirations(t)
@@ -3727,10 +3909,19 @@ class PacketEngine:
         global_reward = timely_useful_bits_routing_reward(
             result["total_timely_useful_bits"]
         )
+        result["delivery_routing_reward"] = global_reward
         result["global_routing_reward"] = global_reward
         for sender in actions:
-            result["reward_by_sender"][sender] = global_reward
+            result["reward_by_sender"][sender] = (
+                global_reward + result["progress_reward_by_sender"][sender]
+            )
+        result["total_routing_reward"] = (
+            global_reward + result["progress_routing_reward"]
+        )
         result["shared_reward_row_sum"] = global_reward * len(actions)
+        result["routing_reward_row_sum"] = math.fsum(
+            result["reward_by_sender"].values()
+        )
         result["start_of_slot_routing_sender_ids"] = tuple(
             sorted(sender for sender, pkt in observed_hol.items() if pkt is not None)
         )
@@ -4606,6 +4797,11 @@ class PacketEngine:
         self.com_late_delivered_bits = 0.0
         self.total_late_useful_bits = 0.0
         self.total_all_useful_bits = 0.0
+        self.routing_progress_reward_total = 0.0
+        self.routing_positive_progress_reward_total = 0.0
+        self.routing_negative_progress_reward_total = 0.0
+        self.completed_uav_hop_count = 0
+        self.cross_slot_completed_uav_hop_count = 0
         self.wait_actions = 0
         self.deadline_drops = 0
         self.link_slot_budget_violations = 0

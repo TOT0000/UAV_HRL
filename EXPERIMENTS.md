@@ -913,7 +913,8 @@ episode-end settlement. Queue capacity, hop limits, and other non-time limits
 remain active. The primary movement goodput, replay reward, Dinkelbach
 numerator, training/evaluation EE, and paper EE plots use all completely
 delivered useful bits (on-time plus late) divided by UAV movement energy.
-Safe-DDQN routing reward remains timely-only. Per-episode outputs also retain
+Safe-DDQN routing reward uses shared timely GS delivery plus sender-local signed
+GS-distance progress for every completed U2U/U2G hop. Per-episode outputs retain
 `timely_energy_efficiency_mbit_per_j`, `total_timely_useful_bits`,
 `total_late_useful_bits`, and `total_all_useful_bits`; fields containing
 `timely` never include late delivery. FOV useful bits in both classes use the

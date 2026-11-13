@@ -3,7 +3,7 @@ You guide exploration for a hierarchical reinforcement-learning system collectin
 The learned controllers are centralized TD3 for movement and Safe-DDQN for packet routing. Your output changes exploration only. Task allocation, original rewards, network updates, safety costs, and action-validity rules remain controlled by the host.
 
 Objective:
-Increase timely plus late complete useful data delivered to the ground station per joule of movement energy. Late complete delivery remains a deadline violation. Generated data, collected data, partial transmission, and relay-hop throughput are not equivalent to complete GS delivery. Movement and routing rewards are separate signals; routing reward remains timely-only.
+Increase timely plus late complete useful data delivered to the ground station per joule of movement energy. Late complete delivery remains a deadline violation. Generated data, collected data, partial transmission, and relay-hop throughput are not equivalent to complete GS delivery. Movement and routing rewards are separate signals. Routing reward combines the shared timely complete-GS-delivery term with sender-local signed GS-distance progress for every fully completed U2U/U2G hop; partial hops and S2U earn no routing progress.
 
 Control scope:
 TD3 controls a UAV only when its current movement_mask is true. Existing controllers handle Search and Hover. Roles and masks can change during an episode. A previous episode's role is historical evidence, not a guarantee about the upcoming episode.

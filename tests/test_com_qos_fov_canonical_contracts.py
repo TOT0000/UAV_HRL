@@ -366,7 +366,7 @@ class CanonicalArtifactSourceContractTest(unittest.TestCase):
         self.assertEqual(len(csv_rows), expected_rows)
         self.assertEqual(
             aggregation_metadata["generic_cross_seed_artifact_schema_version"],
-            "uav-hrl-generic-cross-seed-aggregate-v4",
+            "uav-hrl-generic-cross-seed-aggregate-v5",
         )
         kind_counts = {
             kind: sum(row["aggregation_kind"] == kind for row in generic_rows)

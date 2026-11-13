@@ -8,7 +8,7 @@ import numpy as np
 
 
 ROUTING_TRANSITION_LEDGER_SCHEMA_VERSION = (
-    "all-uav-reward-multi-packet-path-cost-v4"
+    "delivery-plus-sender-hop-progress-multi-packet-path-cost-v5"
 )
 
 

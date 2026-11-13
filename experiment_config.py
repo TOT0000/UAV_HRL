@@ -238,9 +238,10 @@ CHECKPOINT_EVALUATION_AGGREGATION_SCHEMA_VERSION = (
     "canonical-useful-goodput-service-only-v4"
 )
 ROUTING_REWARD_CONTRACT_VERSION = (
-    "shared-slot-timely-useful-gs-bits-per-10000-v9"
+    "shared-delivery-plus-sender-completed-hop-gs-progress-v10"
 )
 ROUTING_REWARD_BITS_PER_UNIT = 10_000.0
+ROUTING_PROGRESS_REWARD_BETA = 1.0
 ROUTING_GS_PROGRESS_FORMULA = (
     "clip((d_3d(sender,GS)-d_3d(receiver,GS))/"
     "maximum_3d_communication_distance_m,-1,1)"
@@ -1338,11 +1339,30 @@ def comparison_method_configuration(method_spec: MethodSpec) -> dict:
         ),
         "routing_reward_contract_version": ROUTING_REWARD_CONTRACT_VERSION,
         "routing_reward_formula": (
-            "slot_total_timely_useful_bits_delivered_to_gs / 10000"
+            "per_sender_slot_reward = slot_total_timely_useful_bits_"
+            "delivered_to_gs / 10000 + beta * sum_over_completed_"
+            "u2u_or_u2g_hops(packet_useful_bits * (sender_completion_"
+            "distance_to_gs - receiver_completion_distance_to_gs) / 400) "
+            "/ 10000"
         ),
         "routing_reward_bits_per_unit": ROUTING_REWARD_BITS_PER_UNIT,
-        "routing_reward_assignment": "same_global_slot_reward_to_every_uav_transition",
-        "routing_episode_reward_aggregation": "sum_global_slot_reward_once_per_slot",
+        "routing_reward_progress_beta": ROUTING_PROGRESS_REWARD_BETA,
+        "routing_reward_progress_distance_normalization_m": (
+            MAX_3D_COMMUNICATION_DISTANCE_M
+        ),
+        "routing_reward_assignment": (
+            "shared_timely_delivery_reward_plus_sender_local_completed_hop_"
+            "progress; S2U excluded; late completed hops included"
+        ),
+        "routing_reward_position_timing": (
+            "sender_and_receiver_actual_3d_positions_at_hop_completion"
+        ),
+        "routing_reward_cross_slot_timing": (
+            "credit_once_to_sender_transition_in_completion_slot"
+        ),
+        "routing_episode_reward_aggregation": (
+            "sum_shared_delivery_once_per_slot_plus_all_sender_progress"
+        ),
         "routing_state_gs_progress_formula": ROUTING_GS_PROGRESS_FORMULA,
         "routing_gs_progress_normalization_reference_m": (
             MAX_3D_COMMUNICATION_DISTANCE_M

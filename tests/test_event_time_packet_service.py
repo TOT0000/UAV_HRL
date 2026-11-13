@@ -11,6 +11,7 @@ from Packet_scheduler_v1 import (
     PACKET_EPS,
     PacketEngine,
     TASK_DEADLINE_SECONDS,
+    completed_hop_gs_progress,
 )
 from experiment_config import (
     METHOD_REGISTRY,
@@ -280,7 +281,17 @@ def test_sr_uav_uav_gs_completes_three_real_hops_in_one_slot():
     assert [row["sender_uav_id"] for row in result["packet_decision_uses"]] == [0, 1]
     assert result["timely_goodput_bits"] == pytest.approx(100.0)
     assert result["global_routing_reward"] == pytest.approx(0.01)
-    assert result["reward_by_sender"] == pytest.approx({0: 0.01, 1: 0.01})
+    progress_0 = 100.0 * completed_hop_gs_progress(env, 0, 1) / 10_000.0
+    progress_1 = 100.0 * completed_hop_gs_progress(env, 1, env.GS_ID) / 10_000.0
+    assert result["progress_reward_by_sender"] == pytest.approx(
+        {0: progress_0, 1: progress_1}
+    )
+    assert result["reward_by_sender"] == pytest.approx(
+        {0: 0.01 + progress_0, 1: 0.01 + progress_1}
+    )
+    assert result["total_routing_reward"] == pytest.approx(
+        0.01 + progress_0 + progress_1
+    )
 
 
 def test_dynamic_fdma_reallocates_only_future_time_and_is_order_independent():
@@ -596,6 +607,149 @@ def test_formal_policy_late_fov_keeps_capture_coverage_weight():
     assert result["fov_late_delivered_raw_bits"] == pytest.approx(100.0)
     assert result["fov_late_useful_bits"] == pytest.approx(25.0)
     assert result["total_all_useful_bits"] == pytest.approx(25.0)
+    assert result["global_routing_reward"] == 0.0
+    assert result["progress_routing_reward"] == pytest.approx(
+        25.0 * completed_hop_gs_progress(env, 0, env.GS_ID) / 10_000.0
+    )
+
+
+def test_completed_hop_progress_uses_completion_positions(monkeypatch):
+    env = EventCapacityEnvironment(2)
+    positions = {
+        0: [300.0, 0.0, 0.0],
+        1: [200.0, 0.0, 0.0],
+    }
+    env.GS_pos = (0.0, 0.0, 0.0)
+    env.uav_dict = {
+        uid: SimpleNamespace(
+            get_position=lambda uid=uid: tuple(positions[uid])
+        )
+        for uid in positions
+    }
+    engine = PacketEngine(2)
+    packet = engine.create_packet(0, "COM", 100.0, 0.0)
+    original = engine.record_hop_transmission
+
+    def move_before_completion(pkt, sender, receiver, bits):
+        completed = original(pkt, sender, receiver, bits)
+        if completed:
+            positions[0][:] = [100.0, 0.0, 0.0]
+            positions[1][:] = [300.0, 0.0, 0.0]
+        return completed
+
+    monkeypatch.setattr(engine, "record_hop_transmission", move_before_completion)
+    result = engine.serve_event_driven_slot(
+        env,
+        _actions(1, 1),
+        0.0,
+        observed_hol_by_sender={0: packet, 1: None},
+        observed_backlog_bits_by_sender={0: 100.0, 1: 0.0},
+    )
+
+    # Start positions would give +0.25. Completion positions give -0.5.
+    assert result["progress_routing_reward"] == pytest.approx(-0.005)
+    assert result["negative_progress_routing_reward"] == pytest.approx(-0.005)
+    assert result["positive_progress_routing_reward"] == 0.0
+    assert result["completed_uav_hops"][0]["sender_uav_id"] == 0
+    assert result["completed_uav_hops"][0]["gs_progress"] == pytest.approx(-0.5)
+
+
+def test_twentieth_completed_hop_keeps_progress_before_terminal_handling():
+    env = EventCapacityEnvironment(2)
+    engine = PacketEngine(2)
+    packet = engine.create_packet(0, "COM", 100.0, 0.0)
+    packet["hops"] = 19
+    result = engine.serve_event_driven_slot(
+        env,
+        _actions(1, 1),
+        0.0,
+        observed_hol_by_sender={0: packet, 1: None},
+        observed_backlog_bits_by_sender={0: 100.0, 1: 0.0},
+    )
+
+    expected = 100.0 * completed_hop_gs_progress(env, 0, 1) / 10_000.0
+    assert packet["terminal_outcome"] == "expired_dropped"
+    assert packet["hops"] == 20
+    assert result["progress_routing_reward"] == pytest.approx(expected)
+    assert result["completed_uav_hop_count"] == 1
+    assert len(result["outcomes"]) == 1
+
+
+def test_reward_and_cost_do_not_depend_on_optional_packet_diagnostics():
+    snapshots = []
+    for diagnostics_enabled in (False, True):
+        env = EventCapacityEnvironment(1)
+        engine = PacketEngine(
+            1, enable_packet_diagnostic_artifacts=diagnostics_enabled
+        )
+        packet = engine.create_packet(0, "FOV", 100.0, 0.0)
+        packet["capture_coverage_ratio"] = 0.4
+        result = engine.serve_event_driven_slot(
+            env,
+            _actions(env.GS_ID),
+            0.0,
+            observed_hol_by_sender={0: packet},
+            observed_backlog_bits_by_sender={0: 100.0},
+        )
+        snapshots.append(
+            {
+                "timely": result["total_timely_useful_bits"],
+                "transmitted": dict(result["transmitted_bits_by_link"]),
+                "delivery_reward": result["delivery_routing_reward"],
+                "progress_reward": result["progress_routing_reward"],
+                "reward_by_sender": dict(result["reward_by_sender"]),
+                "cost_by_sender": dict(result["cost_by_sender"]),
+                "terminal_outcome": packet["terminal_outcome"],
+            }
+        )
+
+    assert snapshots[0] == snapshots[1]
+
+
+def test_fixed_actions_change_only_reward_and_reward_diagnostics(monkeypatch):
+    def run(*, disable_progress):
+        env = EventCapacityEnvironment(2)
+        engine = PacketEngine(2)
+        packet = engine.create_packet(0, "COM", 100.0, 0.0)
+        if disable_progress:
+            monkeypatch.setattr(
+                engine,
+                "_record_completed_uav_hop_reward",
+                lambda *args, **kwargs: None,
+            )
+        result = engine.serve_event_driven_slot(
+            env,
+            _actions(1, env.GS_ID),
+            0.0,
+            observed_hol_by_sender={0: packet, 1: None},
+            observed_backlog_bits_by_sender={0: 100.0, 1: 0.0},
+        )
+        physical = {
+            "terminal_outcome": packet["terminal_outcome"],
+            "finish_time": packet["finish_time"],
+            "path": tuple(packet["path"]),
+            "per_hop": tuple(
+                (row["from"], row["to"], row["link_type"], row["delay_ms"])
+                for row in packet["per_hop"]
+            ),
+            "transmitted_bits_by_link": dict(result["transmitted_bits_by_link"]),
+            "timely_useful_bits": result["total_timely_useful_bits"],
+            "late_useful_bits": result["total_late_useful_bits"],
+            "all_useful_bits": result["total_all_useful_bits"],
+            "cost_by_sender": dict(result["cost_by_sender"]),
+            "total_violated": engine.total_violated,
+            "raw_final_hop_bits": engine.raw_final_hop_bits,
+        }
+        return physical, result
+
+    old_physical, old_reward = run(disable_progress=True)
+    new_physical, new_reward = run(disable_progress=False)
+
+    assert new_physical == old_physical
+    assert old_reward["global_routing_reward"] == new_reward["global_routing_reward"]
+    assert old_reward["progress_routing_reward"] == 0.0
+    assert new_reward["progress_routing_reward"] != 0.0
+    assert old_reward["reward_by_sender"] != new_reward["reward_by_sender"]
 
 
 def test_formal_policy_keeps_fifo_order_after_head_packet_becomes_late():
@@ -716,7 +870,9 @@ def test_empty_uav_action_serves_mid_slot_arrival_and_multiple_packets(
     # though the UAV was EMPTY at action selection. Cost still needs real use.
     assert result["total_timely_useful_bits"] == pytest.approx(75.0)
     assert result["global_routing_reward"] == pytest.approx(0.0075)
-    assert result["reward_by_sender"][0] == pytest.approx(0.0075)
+    progress = 75.0 * completed_hop_gs_progress(env, 0, env.GS_ID) / 10_000.0
+    assert result["reward_by_sender"][0] == pytest.approx(0.0075 + progress)
+    assert result["completed_uav_hop_count"] == 2
 
 
 def test_shared_global_reward_is_unclipped_and_not_multiplied_by_uav_count():
@@ -736,11 +892,19 @@ def test_shared_global_reward_is_unclipped_and_not_multiplied_by_uav_count():
     assert result["total_timely_useful_bits"] == pytest.approx(50_000.0)
     assert result["global_routing_reward"] == pytest.approx(5.0)
     assert set(result["reward_by_sender"]) == set(range(16))
+    progress = (
+        50_000.0
+        * completed_hop_gs_progress(env, 3, env.GS_ID)
+        / 10_000.0
+    )
+    assert result["reward_by_sender"][3] == pytest.approx(5.0 + progress)
     assert all(
         value == pytest.approx(5.0)
-        for value in result["reward_by_sender"].values()
+        for sender, value in result["reward_by_sender"].items()
+        if sender != 3
     )
     assert result["shared_reward_row_sum"] == pytest.approx(80.0)
+    assert result["total_routing_reward"] == pytest.approx(5.0 + progress)
     assert len(result["active_links"]) == 1
     active = result["active_links"][0]
     assert (active["sender_id"], active["receiver_id"], active["link_type"]) == (
@@ -795,6 +959,18 @@ def test_reward_is_zero_until_cross_slot_packet_reaches_gs_then_counted_once():
     assert first["global_routing_reward"] == 0.0
     assert second["global_routing_reward"] == pytest.approx(5.0)
     assert third["global_routing_reward"] == 0.0
+    assert first["progress_routing_reward"] == 0.0
+    expected_progress = (
+        50_000.0
+        * completed_hop_gs_progress(env, 0, env.GS_ID)
+        / 10_000.0
+    )
+    assert second["progress_routing_reward"] == pytest.approx(expected_progress)
+    assert second["reward_by_sender"][0] == pytest.approx(
+        5.0 + expected_progress
+    )
+    assert second["cross_slot_completed_uav_hop_count"] == 1
+    assert third["progress_routing_reward"] == 0.0
     assert engine.total_timely_useful_bits == pytest.approx(50_000.0)
 
 
