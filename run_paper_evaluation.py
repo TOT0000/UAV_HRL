@@ -26,6 +26,7 @@ COMMUNICATION_RESOURCE_SUITES = {
     "sr_transmit_power_sweep",
     "uav_transmit_power_sweep",
 }
+SR_SPEED_SUITE = "sr_speed_sweep"
 
 
 def build_parser():
@@ -72,6 +73,12 @@ def build_parser():
         type=float,
         nargs="+",
         help="UAV power sweep values, or one fixed value for another resource sweep",
+    )
+    parser.add_argument(
+        "--sr-speeds-mps",
+        type=float,
+        nargs="+",
+        help="one or more arbitrary finite positive SR speeds for sr_speed_sweep",
     )
     checkpoint = parser.add_mutually_exclusive_group()
     checkpoint.add_argument("--checkpoint-episode", type=int)
@@ -120,6 +127,7 @@ def main(argv=None):
         "fixed_roi",
         "environment_size",
         *COMMUNICATION_RESOURCE_SUITES,
+        SR_SPEED_SUITE,
     }:
         raise ValueError(
             "RoI selectors require fixed_roi, environment_size, or a "
@@ -132,6 +140,8 @@ def main(argv=None):
         raise ValueError(f"{args.suite} accepts --roi-count, not --roi-counts")
     roi_counts = None
     if args.suite == "fixed_roi":
+        roi_counts = resolve_roi_counts(args.roi_count, args.roi_counts)
+    elif args.suite == SR_SPEED_SUITE:
         roi_counts = resolve_roi_counts(args.roi_count, args.roi_counts)
     elif (
         args.suite == "environment_size"
@@ -161,6 +171,14 @@ def main(argv=None):
             sr_tx_power_dbm=args.sr_tx_power_dbm,
             uav_tx_power_dbm=args.uav_tx_power_dbm,
         )
+    if args.suite == SR_SPEED_SUITE:
+        evaluation_sweep_points(
+            args.suite,
+            roi_counts=roi_counts,
+            sr_speeds_mps=args.sr_speeds_mps,
+        )
+    elif args.sr_speeds_mps is not None:
+        raise ValueError("--sr-speeds-mps is available only for sr_speed_sweep")
     explicit_environment_size = (
         args.environment_size_m is not None
         or args.environment_sizes_m is not None
@@ -272,6 +290,7 @@ def main(argv=None):
         bandwidth_mhz=args.bandwidth_mhz,
         sr_tx_power_dbm=args.sr_tx_power_dbm,
         uav_tx_power_dbm=args.uav_tx_power_dbm,
+        sr_speeds_mps=args.sr_speeds_mps,
         allow_registered_fixed_roi_method=bool(
             args.suite == "fixed_roi" and (explicit_checkpoint or explicit_roi)
         ),

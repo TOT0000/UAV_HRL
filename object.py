@@ -4,12 +4,30 @@ from Fov_model_phase import FovModel
 from Energy_model import EnergyConsumptionModel
 
 
-def straight_line_route(start, goal, speed=1.0):
+def validate_sr_speed_mps(speed):
+    """Return a finite positive SR speed without restricting legal values."""
+
+    if isinstance(speed, (bool, np.bool_)):
+        raise ValueError("SR speed must be a finite positive number")
+    try:
+        speed = float(speed)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("SR speed must be a finite positive number") from exc
+    if not np.isfinite(speed) or speed <= 0.0:
+        raise ValueError("SR speed must be a finite positive number")
+    return speed
+
+
+def straight_line_route(start, goal, speed=1.0, update_seconds=1.0):
     """Return movement points after start, ending exactly at the target."""
 
-    speed = float(speed)
-    if not np.isfinite(speed) or speed <= 0.0:
-        raise ValueError("SR route speed must be finite and positive")
+    speed = validate_sr_speed_mps(speed)
+    update_seconds = float(update_seconds)
+    if not np.isfinite(update_seconds) or update_seconds <= 0.0:
+        raise ValueError("SR route update duration must be finite and positive")
+    step_distance = speed * update_seconds
+    if not np.isfinite(step_distance) or step_distance <= 0.0:
+        raise ValueError("SR route step distance must be finite and positive")
     start_xy = np.asarray(start[:2], dtype=float)
     goal_xy = np.asarray(goal[:2], dtype=float)
     if not np.isfinite(start_xy).all() or not np.isfinite(goal_xy).all():
@@ -19,9 +37,9 @@ def straight_line_route(start, goal, speed=1.0):
     if distance <= 1e-12:
         return []
     direction = delta / distance
-    step_count = int(np.ceil(distance / speed))
+    step_count = int(np.ceil(distance / step_distance))
     route = [
-        tuple(start_xy + direction * min(step * speed, distance))
+        tuple(start_xy + direction * min(step * step_distance, distance))
         for step in range(1, step_count + 1)
     ]
     route[-1] = tuple(goal_xy)
@@ -316,7 +334,7 @@ class SRTeam:
         self.current_step = 0
     def get_position(self):
         return self.x, self.y, self.z
-    def assign_mission(self, gt_id, gt_pos, speed=1.0):
+    def assign_mission(self, gt_id, gt_pos, speed=1.0, update_seconds=1.0):
         """
         ✅ 由環境分派 GT 任務並啟動移動
         """
@@ -326,7 +344,9 @@ class SRTeam:
                 f"{self.assigned_gt_id} for this episode"
             )
         self.assigned_gt_id = int(gt_id)
-        self.path = straight_line_route(self.get_position(), gt_pos, speed)
+        self.path = straight_line_route(
+            self.get_position(), gt_pos, speed, update_seconds=update_seconds
+        )
         self.arrived = not self.path
         self.current_step = 0
     def step_forward(self):

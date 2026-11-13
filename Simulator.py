@@ -38,7 +38,7 @@ from visual_sensing import (
 from collections import defaultdict
 from Energy_model import EnergyConsumptionModel
 from Task_assignment import UAVAssigner, Task
-from object import UAV, SRTeam, GroundTarget
+from object import UAV, SRTeam, GroundTarget, validate_sr_speed_mps
 from search_path_manager import SearchPathManager
 from experiment_config import (
     ASSIGNMENT_CONTRACT_VERSION,
@@ -110,6 +110,7 @@ class Simulator:
         total_communication_bandwidth_hz=TOTAL_COMMUNICATION_BANDWIDTH_HZ,
         s2u_tx_power_dbm=S2U_TX_POWER_DBM,
         uav_tx_power_dbm=U2U_U2G_TX_POWER_DBM,
+        sr_speed_mps_override=None,
     ): #初始化
         self.dt = ROUTING_SLOT_SECONDS
         self.rng_streams = rng_streams
@@ -151,6 +152,12 @@ class Simulator:
         )
         self.channel_namespace = "evaluation" if evaluation else "training"
         self.sr_update_interval = int(1.0 / self.dt)
+        self.sr_update_seconds = float(self.sr_update_interval * self.dt)
+        self.sr_speed_mps_override = (
+            None
+            if sr_speed_mps_override is None
+            else validate_sr_speed_mps(sr_speed_mps_override)
+        )
         self.sim_step_count = 0
         if int(num_UAV) != NUM_UAV:
             raise ValueError(
@@ -358,7 +365,14 @@ class Simulator:
         )
         self.last_assignment_metadata = self.assignment_metadata()
 
-    def update_visited_grid(self, uav_id, *, footprint=None, coverage_contributor=True):
+    def update_visited_grid(
+        self,
+        uav_id,
+        *,
+        footprint=None,
+        coverage_contributor=True,
+        observation_time_seconds=None,
+    ):
         """
         根據 UAV 的 FOV 更新 visited_grid，並判斷是否有 Ground Target 被發現。
         """
@@ -372,7 +386,9 @@ class Simulator:
 
             if (not gt.is_found) and self.is_visible(uav_id, gt, footprint=footprint, coverage_contributor=coverage_contributor):
                 # print(f"[觸發] UAV {uav_id}  發現 GT {gt.id}，觸發 FOV + COM")
-                sr = self.SR_team_gogo(gt)
+                sr = self.SR_team_gogo(
+                    gt, assignment_time_seconds=observation_time_seconds
+                )
                 gt.mark_found(uav_id)
                  #  直接給 bonus reward
                 if  not gt.rewarded:
@@ -692,7 +708,7 @@ class Simulator:
             defer_assignment=defer_assignment
         )
     # =============搜救隊出發===============================
-    def SR_team_gogo(self, gt):
+    def SR_team_gogo(self, gt, assignment_time_seconds=None):
         """
         找出距離目標最近的 SR team，並更新其移動目標
         """
@@ -719,7 +735,29 @@ class Simulator:
                 gt.id,
                 (gt.x, gt.y),
                 speed=float(getattr(self, "sr_speed_mps", 1.0)),
+                update_seconds=float(self.sr_update_seconds),
             )
+            assignment_time = float(
+                getattr(self, "current_time", 0.0)
+                if assignment_time_seconds is None
+                else assignment_time_seconds
+            )
+            initial_distance = float(
+                np.linalg.norm(np.asarray(sr.get_position()[:2]) - gt_pos)
+            )
+            target_radius = float(getattr(gt, "radius", 80.0))
+            self.sr_movement_events[int(sr.id)] = {
+                "assigned_roi_id": int(gt.id),
+                "assignment_time_seconds": assignment_time,
+                "assignment_position_m": [float(sr.x), float(sr.y), float(sr.z)],
+                "assignment_distance_to_roi_center_m": initial_distance,
+                "entered_roi_time_seconds": (
+                    assignment_time if initial_distance <= target_radius else None
+                ),
+                "arrived_center_time_seconds": (
+                    assignment_time if bool(sr.arrived) else None
+                ),
+            }
             self.SR_paths = list(sr.path)
             gt.assigned = True
             # print(f"[SR Team] 指派 SR {sr.id} 前往 GT {gt.id}")
@@ -728,6 +766,23 @@ class Simulator:
     def advance_sr_teams(self):
         for sr in self.SR_teams:
             sr.step_forward()
+            event = self.sr_movement_events.get(int(sr.id))
+            if event is not None:
+                gt = self.gts[int(event["assigned_roi_id"])]
+                distance = float(
+                    np.linalg.norm(
+                        np.asarray(sr.get_position()[:2])
+                        - np.asarray(gt.get_position()[:2])
+                    )
+                )
+                event_time = float(getattr(self, "current_time", 0.0))
+                if (
+                    event["entered_roi_time_seconds"] is None
+                    and distance <= float(gt.radius)
+                ):
+                    event["entered_roi_time_seconds"] = event_time
+                if event["arrived_center_time_seconds"] is None and bool(sr.arrived):
+                    event["arrived_center_time_seconds"] = event_time
             point = [sr.x, sr.y, sr.z]
             if not self.sr_trajectory[sr.id] or self.sr_trajectory[sr.id][-1] != point:
                 self.sr_trajectory[sr.id].append(point)
@@ -1739,8 +1794,17 @@ class Simulator:
                 scenario_entry["sr_teams"],
                 key=lambda item: int(item["sr_id"]),
             )
+        base_speeds = tuple(
+            validate_sr_speed_mps(item["movement_primitive"]["speed_mps"])
+            for item in sr_initial_data
+        )
+        if len(set(base_speeds)) != 1:
+            raise ValueError("all SR teams in one scenario must share one base speed")
+        self.sr_base_speed_mps = float(base_speeds[0])
         self.sr_speed_mps = float(
-            sr_initial_data[0]["movement_primitive"]["speed_mps"]
+            self.sr_base_speed_mps
+            if self.sr_speed_mps_override is None
+            else self.sr_speed_mps_override
         )
         for initial in sr_initial_data:
             i = int(initial["sr_id"])
@@ -1750,6 +1814,7 @@ class Simulator:
             sr.reset_lifecycle()
             self.SR_teams.append(sr)
         self.sr_trajectory = {i: [] for i in range(self.num_SR_team)}
+        self.sr_movement_events = {}
         for sr in self.SR_teams:
             self.sr_trajectory[sr.id].append([sr.x, sr.y, sr.z])  # 初始位置
         for uav in self.UAVs:

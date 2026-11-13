@@ -47,6 +47,7 @@ from experiment_config import (
 )
 from visual_sensing import VISUAL_SENSING_CONTRACT_VERSION, visual_sensing_metadata
 from HRL_task_aware import TrainingConfig, train
+from object import validate_sr_speed_mps
 from Packet_scheduler_v1 import (
     PACKET_DEADLINE_POLICY_CONTINUE,
     TASK_DEADLINE_SECONDS,
@@ -82,6 +83,11 @@ from search_diagnostics import (
     SEARCH_DIAGNOSTICS_INDEXING,
     SEARCH_DIAGNOSTICS_SCHEMA_VERSION,
     SearchDiagnosticsJsonlWriter,
+)
+from sr_speed_diagnostics import (
+    DUAL_TASK_SAMPLING,
+    SR_SPEED_DIAGNOSTIC_SCHEMA_VERSION,
+    write_sr_speed_diagnostic_artifacts,
 )
 from training_checkpoint import (
     CHECKPOINT_HORIZON_COMPATIBILITY_FIELDS,
@@ -174,6 +180,11 @@ PAPER_EVALUATION_SUITES = {
         "methods": _RESOURCE_SWEEP_METHODS,
         "kind": "communication_resource",
         "scan_axis": "uav_tx_power_dbm",
+    },
+    "sr_speed_sweep": {
+        "methods": _RESOURCE_SWEEP_METHODS,
+        "kind": "sr_speed",
+        "scan_axis": "sr_speed_mps",
     },
 }
 
@@ -304,6 +315,42 @@ def _resource_point_id(axis, value):
     return f"{axis}_{readable}_{digest}"
 
 
+def _sr_speed_points(roi_counts, sr_speeds_mps):
+    if sr_speeds_mps is None:
+        raise ValueError("sr_speed_sweep requires --sr-speeds-mps with at least one value")
+    try:
+        speeds = tuple(validate_sr_speed_mps(value) for value in sr_speeds_mps)
+    except TypeError as exc:
+        raise ValueError("sr_speeds_mps must contain at least one value") from exc
+    if not speeds:
+        raise ValueError("sr_speed_sweep requires at least one SR speed")
+    if len(set(speeds)) != len(speeds):
+        raise ValueError("sr_speeds_mps values must not contain duplicates")
+    selected_roi_counts = (
+        FIXED_ROI_VALUES
+        if roi_counts is None
+        else resolve_roi_counts(roi_counts=roi_counts)
+    )
+    return tuple(
+        {
+            "point_id": (
+                f"roi_{int(num_gt)}_"
+                f"{_resource_point_id('sr_speed_mps', speed)}"
+            ),
+            "overrides": {"sr_speed_mps": float(speed)},
+            "fixed_num_gt": int(num_gt),
+            "swept_parameter": "sr_speed",
+            "swept_parameter_value": float(speed),
+            "swept_parameter_unit": "m/s",
+            "sr_speed_mps": float(speed),
+            "x_value": float(speed),
+            "x_unit": "m/s",
+        }
+        for num_gt in selected_roi_counts
+        for speed in speeds
+    )
+
+
 def _communication_resource_points(
     suite,
     roi_counts,
@@ -406,6 +453,7 @@ def evaluation_sweep_points(
     bandwidth_mhz=None,
     sr_tx_power_dbm=None,
     uav_tx_power_dbm=None,
+    sr_speeds_mps=None,
 ):
     suite = resolve_evaluation_suite(suite)
     kind = PAPER_EVALUATION_SUITES[suite]["kind"]
@@ -413,6 +461,7 @@ def evaluation_sweep_points(
         "fixed_roi",
         "environment_size",
         "communication_resource",
+        "sr_speed",
     }:
         raise ValueError(
             "RoI selectors are unavailable for this suite"
@@ -424,6 +473,8 @@ def evaluation_sweep_points(
         raise ValueError(
             "communication-resource selectors are available only for resource sweeps"
         )
+    if kind != "sr_speed" and sr_speeds_mps is not None:
+        raise ValueError("sr_speeds_mps is available only for sr_speed_sweep")
     if environment_sizes_m is not None and kind != "environment_size":
         raise ValueError(
             "environment-size selectors are available only for the environment_size suite"
@@ -474,6 +525,8 @@ def evaluation_sweep_points(
             sr_tx_power_dbm,
             uav_tx_power_dbm,
         )
+    if kind == "sr_speed":
+        return _sr_speed_points(roi_counts, sr_speeds_mps)
     if kind == "deadline":
         defaults = validate_production_deadlines()
         sweep_seconds = (
@@ -843,6 +896,7 @@ def run_paper_evaluation(
     bandwidth_mhz=None,
     sr_tx_power_dbm=None,
     uav_tx_power_dbm=None,
+    sr_speeds_mps=None,
     deadline_seconds=None,
     output_directory=None,
     fixed_roi_manifests=None,
@@ -854,6 +908,7 @@ def run_paper_evaluation(
     suite = resolve_evaluation_suite(suite)
     definition = PAPER_EVALUATION_SUITES[suite]
     resource_suite = definition["kind"] == "communication_resource"
+    sr_speed_suite = definition["kind"] == "sr_speed"
     collect_search_diagnostics = bool(collect_search_diagnostics)
     if collect_search_diagnostics and suite != "environment_size":
         raise ValueError(
@@ -898,11 +953,18 @@ def run_paper_evaluation(
         )
         if len(selected_roi_counts) != 1:
             raise ValueError(f"{suite} requires exactly one fixed RoI count")
+    elif sr_speed_suite:
+        selected_roi_counts = (
+            FIXED_ROI_VALUES
+            if roi_counts is None
+            else resolve_roi_counts(roi_counts=roi_counts)
+        )
     else:
         selected_roi_counts = None
     if (
         suite not in {"fixed_roi", "environment_size"}
         and not resource_suite
+        and not sr_speed_suite
         and roi_counts is not None
     ):
         raise ValueError(
@@ -913,6 +975,8 @@ def run_paper_evaluation(
         raise ValueError(
             "communication-resource selectors are available only for resource sweeps"
         )
+    if not sr_speed_suite and sr_speeds_mps is not None:
+        raise ValueError("sr_speeds_mps is available only for sr_speed_sweep")
     if fixed_roi_manifests is not None and suite != "fixed_roi":
         raise ValueError("fixed_roi_manifests is available only for fixed_roi")
     if environment_sizes_m is not None and suite != "environment_size":
@@ -935,13 +999,15 @@ def run_paper_evaluation(
 
     base_manifest = (
         ScenarioManifest.load(manifest_path)
-        if (suite == "fixed_roi" or resource_suite) and manifest_path is not None
+        if (suite == "fixed_roi" or resource_suite or sr_speed_suite)
+        and manifest_path is not None
         else None
     )
     explicit_fixed_roi_manifest = bool(suite == "fixed_roi" and base_manifest is not None)
     explicit_resource_manifest = bool(resource_suite and base_manifest is not None)
+    explicit_sr_speed_manifest = bool(sr_speed_suite and base_manifest is not None)
     if (
-        (explicit_fixed_roi_manifest or explicit_resource_manifest)
+        (explicit_fixed_roi_manifest or explicit_resource_manifest or explicit_sr_speed_manifest)
         and manifest_seed is not None
         and int(manifest_seed) != int(base_manifest.manifest_seed)
     ):
@@ -951,7 +1017,7 @@ def run_paper_evaluation(
         )
     requested_manifest_seed = int(
         base_manifest.manifest_seed
-        if (explicit_fixed_roi_manifest or explicit_resource_manifest)
+        if (explicit_fixed_roi_manifest or explicit_resource_manifest or explicit_sr_speed_manifest)
         and manifest_seed is None
         else DEFAULT_TRAINING_SEED if manifest_seed is None else manifest_seed
     )
@@ -978,6 +1044,8 @@ def run_paper_evaluation(
         if suite == "environment_size"
         else "communication_resource_sweep_evaluation"
         if resource_suite
+        else "sr_speed_sweep_evaluation"
+        if sr_speed_suite
         else
         "formal_checkpoint_evaluation"
         if is_formal_checkpoint
@@ -1074,6 +1142,7 @@ def run_paper_evaluation(
         bandwidth_mhz=bandwidth_mhz,
         sr_tx_power_dbm=sr_tx_power_dbm,
         uav_tx_power_dbm=uav_tx_power_dbm,
+        sr_speeds_mps=sr_speeds_mps,
     )
     if flatten_single_point and len(points) != 1:
         raise ValueError("flatten_single_point requires exactly one evaluation point")
@@ -1101,6 +1170,13 @@ def run_paper_evaluation(
         shared_manifests = {
             int(points[0]["fixed_num_gt"]): base_manifest,
         }
+    if explicit_sr_speed_manifest:
+        selected_manifest_rois = {int(point["fixed_num_gt"]) for point in points}
+        if len(selected_manifest_rois) != 1:
+            raise ValueError(
+                "an explicit manifest can be used with only one RoI count in sr_speed_sweep"
+            )
+        shared_manifests = {next(iter(selected_manifest_rois)): base_manifest}
     if shared_manifests:
         expected_keys = {int(point["fixed_num_gt"]) for point in points}
         actual_keys = {int(key) for key in shared_manifests}
@@ -1235,6 +1311,7 @@ def run_paper_evaluation(
                 search_diagnostics_sink=(
                     search_writer.write if search_writer is not None else None
                 ),
+                collect_sr_speed_diagnostics=sr_speed_suite,
                 llm_artifact_dir=(
                     context["run_dir"] / "llm_artifact"
                     if method.llm_enabled
@@ -1271,6 +1348,15 @@ def run_paper_evaluation(
         routing_q_score_outputs = _write_routing_q_score_outputs(
             point_dir, method, result
         )
+        sr_speed_summary = None
+        sr_speed_outputs = {}
+        if sr_speed_suite:
+            sr_speed_summary, sr_speed_outputs = write_sr_speed_diagnostic_artifacts(
+                point_dir,
+                result["sr_movement_diagnostics"],
+                result["sr_movement_episode_summaries"],
+                result["dual_task_service_diagnostics"],
+            )
         if fixed_num_gt is not None and any(
             int(row["num_GT"]) != int(fixed_num_gt)
             for row in result["episode_metrics"]
@@ -1319,6 +1405,20 @@ def run_paper_evaluation(
                     "uav_tx_power_dbm": point["uav_tx_power_dbm"],
                 }
                 if resource_suite
+                else None
+            ),
+            "evaluation_sr_speed": (
+                {
+                    "scenario_manifest_base_speed_mps": result["run_metadata"][
+                        "scenario_sr_base_speed_mps"
+                    ],
+                    "effective_speed_mps": point["sr_speed_mps"],
+                    "source_manifest_hash": manifest.content_hash,
+                    "source_manifest_unchanged": True,
+                    "diagnostic_schema_version": SR_SPEED_DIAGNOSTIC_SCHEMA_VERSION,
+                    "dual_task_sampling": DUAL_TASK_SAMPLING,
+                }
+                if sr_speed_suite
                 else None
             ),
             "git_sha": git_sha,
@@ -1400,6 +1500,13 @@ def run_paper_evaluation(
                     "uav_tx_power_dbm",
                 )
                 if resource_suite
+                else (
+                    "episode_horizon_seconds",
+                    "sr_speed_mps",
+                    "sr_movement_diagnostics",
+                    "dual_task_service_diagnostics",
+                )
+                if sr_speed_suite
                 else ()
             ),
         )
@@ -1408,6 +1515,7 @@ def run_paper_evaluation(
             outputs["search_diagnostics_jsonl"] = search_diagnostics_path.resolve()
         outputs.update(diagnostic_outputs)
         outputs.update(routing_q_score_outputs)
+        outputs.update(sr_speed_outputs)
         trajectories = [
             {
                 **artifact,
@@ -1425,6 +1533,16 @@ def run_paper_evaluation(
             suite,
             {
                 **point,
+                **(
+                    {
+                        "sr_movement_summary": sr_speed_summary["sr_movement"],
+                        "dual_task_service_summary": sr_speed_summary[
+                            "dual_task_service"
+                        ],
+                    }
+                    if sr_speed_summary is not None
+                    else {}
+                ),
                 "evaluation_config_fingerprint": evaluation_config_fingerprint,
                 "checkpoint_episode": context["checkpoint_episode"],
                 "checkpoint_path": (
@@ -1548,6 +1666,7 @@ def run_paper_evaluation(
                 "checkpoint_path": (
                     str(context["checkpoint"]) if checkpoint_required else None
                 ),
+                "sr_speed_diagnostic_summary": sr_speed_summary,
                 "evaluation_invariants": result["evaluation_invariants"],
                 "evaluation_state_fingerprints": result[
                     "evaluation_state_fingerprints"
@@ -1692,6 +1811,37 @@ def run_paper_evaluation(
                 == 1,
             }
             if resource_suite
+            else None
+        ),
+        "sr_speed_sweep": (
+            {
+                "speed_unit": "m/s",
+                "speeds_mps": list(
+                    dict.fromkeys(float(point["sr_speed_mps"]) for point in points)
+                ),
+                "roi_counts": list(
+                    dict.fromkeys(int(point["fixed_num_gt"]) for point in points)
+                ),
+                "cartesian_point_count": len(points),
+                "same_manifest_within_each_roi": all(
+                    len(
+                        {
+                            result["manifest_hash"]
+                            for result in point_results
+                            if int(result["fixed_num_gt"]) == int(roi_count)
+                        }
+                    )
+                    == 1
+                    for roi_count in {
+                        int(point["fixed_num_gt"]) for point in points
+                    }
+                ),
+                "source_manifests_modified": False,
+                "diagnostic_schema_version": SR_SPEED_DIAGNOSTIC_SCHEMA_VERSION,
+                "dual_task_time_unit": "UAV-seconds",
+                "dual_task_sampling": DUAL_TASK_SAMPLING,
+            }
+            if sr_speed_suite
             else None
         ),
         **(

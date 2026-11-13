@@ -40,6 +40,13 @@ from Packet_scheduler_v1 import (
     TASK_DEADLINE_SECONDS,
 )
 from Simulator import Simulator
+from object import validate_sr_speed_mps
+from sr_speed_diagnostics import (
+    build_sr_episode_diagnostics,
+    empty_dual_task_accumulator,
+    observe_dual_task_service,
+    summarize_dual_task_accumulator,
+)
 from centralized_movement import (
     HOVER_ACTION,
     JOINT_ACTION_DIM,
@@ -568,6 +575,7 @@ def _normalize_evaluation_overrides(overrides):
         "total_communication_bandwidth_hz",
         "s2u_tx_power_dbm",
         "uav_tx_power_dbm",
+        "sr_speed_mps",
     }
     unknown = set(values).difference(allowed)
     if unknown:
@@ -638,6 +646,11 @@ def _normalize_evaluation_overrides(overrides):
     uav_tx_power_dbm = validate_transmit_power_dbm(
         values.get("uav_tx_power_dbm", U2U_U2G_TX_POWER_DBM)
     )
+    sr_speed_mps = (
+        None
+        if values.get("sr_speed_mps") is None
+        else validate_sr_speed_mps(values["sr_speed_mps"])
+    )
     return {
         "traffic_rates_packets_per_second": rates,
         "task_deadlines_seconds": deadlines,
@@ -648,6 +661,7 @@ def _normalize_evaluation_overrides(overrides):
         "total_communication_bandwidth_hz": total_bandwidth_hz,
         "s2u_tx_power_dbm": s2u_tx_power_dbm,
         "uav_tx_power_dbm": uav_tx_power_dbm,
+        "sr_speed_mps": sr_speed_mps,
         "units": {
             "traffic_rate": "packets/s",
             "deadline": "seconds",
@@ -655,6 +669,7 @@ def _normalize_evaluation_overrides(overrides):
             "environment_dimensions": "metres",
             "total_communication_bandwidth": "Hz",
             "transmit_power": "dBm",
+            "sr_speed": "m/s",
         },
     }
 
@@ -1323,6 +1338,7 @@ def _mark_search_observations(
     diagnostics_visited_before=None,
     effective_visit_interval_index=None,
     transition_visited_snapshot=None,
+    observation_time_seconds=None,
 ):
     diagnostics_enabled = search_diagnostics_sink is not None
     if diagnostics_enabled and not isinstance(search_diagnostics_context, dict):
@@ -1376,7 +1392,11 @@ def _mark_search_observations(
     footprints = {uid: env.search_footprint(uid) for uid in search_uav_ids}
     # One frozen continuous footprint drives discovery and bitmap sampling.
     for uav_id in search_uav_ids:
-        env.update_visited_grid(uav_id, footprint=footprints[uav_id])
+        env.update_visited_grid(
+            uav_id,
+            footprint=footprints[uav_id],
+            observation_time_seconds=observation_time_seconds,
+        )
     search_uav_ids = frozenset(search_uav_ids)
     # Non-contributors (FOV and FOV+COM) carry an empty Search footprint sample.
     transitions = tuple(
@@ -2292,6 +2312,7 @@ def train(
     packet_outcome_sink=None,
     collect_routing_q_score_diagnostics=False,
     search_diagnostics_sink=None,
+    collect_sr_speed_diagnostics=False,
     sampling_mode=False,
     sampling_noise_std=None,
     sampling_seed=None,
@@ -2421,6 +2442,9 @@ def train(
         raise ValueError(
             "Search diagnostics require an evaluation-only callable sink"
         )
+    collect_sr_speed_diagnostics = bool(collect_sr_speed_diagnostics)
+    if collect_sr_speed_diagnostics and not evaluation:
+        raise ValueError("SR-speed diagnostics are available only during evaluation")
     collect_routing_q_score_diagnostics = bool(
         collect_routing_q_score_diagnostics
     )
@@ -2520,6 +2544,7 @@ def train(
         ],
         s2u_tx_power_dbm=resolved_evaluation["s2u_tx_power_dbm"],
         uav_tx_power_dbm=resolved_evaluation["uav_tx_power_dbm"],
+        sr_speed_mps_override=resolved_evaluation["sr_speed_mps"],
     )
     env.configure_method(method_spec)
     # Formal execution initializes interval zero only after the canonical
@@ -3005,6 +3030,9 @@ def train(
     lambda_cost_used_log = []
     lambda_cost_after_episode_log = []
     episode_metrics = []
+    sr_movement_diagnostics = []
+    sr_movement_episode_summaries = []
+    dual_task_service_diagnostics = []
     trajectory_artifacts = []
     packet_outcome_artifacts = (
         [] if packet_outcome_mode == PACKET_OUTCOME_MODE_BOUNDED else None
@@ -3273,6 +3301,9 @@ def train(
             scenario_id = str(scenario_entry["scenario_id"])
         executed_scenario_ids.append(scenario_id)
         env.prepare_initial_movement_interval()
+        episode_dual_task_accumulator = (
+            empty_dual_task_accumulator() if collect_sr_speed_diagnostics else None
+        )
         packet_engine.reset_packet_state()
         if routing_transition_ledger is not None:
             routing_transition_ledger.begin_episode()
@@ -3838,7 +3869,21 @@ def train(
                         if routing_slot == MOVEMENT_CONTROL_INTERVAL - 1
                         else None
                     ),
+                    observation_time_seconds=(
+                        float(
+                            interval * MOVEMENT_CONTROL_INTERVAL
+                            + routing_slot
+                            + 1
+                        )
+                        * config.routing_slot_seconds
+                    ),
                 )
+                if episode_dual_task_accumulator is not None:
+                    observe_dual_task_service(
+                        env,
+                        episode_dual_task_accumulator,
+                        config.routing_slot_seconds,
+                    )
                 if fov_transitions:
                     interval_transition_batches.append(fov_transitions)
                 slot_epsilon = (
@@ -4701,9 +4746,29 @@ def train(
             if all_rois_discovered and first_discovery_time_by_roi_s
             else None
         )
+        sr_episode_summary = None
+        dual_episode_rows = None
+        if collect_sr_speed_diagnostics:
+            sr_rows, sr_episode_summary = build_sr_episode_diagnostics(
+                env,
+                episode_index=episode,
+                scenario_id=scenario_id,
+                episode_end_s=float(config.episode_seconds),
+            )
+            dual_episode_rows = summarize_dual_task_accumulator(
+                episode_dual_task_accumulator,
+                episode_index=episode,
+                scenario_id=scenario_id,
+            )
+            sr_movement_diagnostics.extend(sr_rows)
+            sr_movement_episode_summaries.append(sr_episode_summary)
+            dual_task_service_diagnostics.extend(dual_episode_rows)
         episode_metrics.append(
             {
                 "method_id": method_spec.method_id,
+                "sr_speed_mps": float(env.sr_speed_mps),
+                "sr_movement_diagnostics": sr_episode_summary,
+                "dual_task_service_diagnostics": dual_episode_rows,
                 "routing_reward_total": float(episode_routing_reward),
                 "routing_training_diagnostics": (
                     routing_training_diagnostic_summary
@@ -5822,6 +5887,9 @@ def train(
         "evaluation_state_fingerprints": evaluation_state_fingerprints,
         "scenario_ids": executed_scenario_ids,
         "episode_metrics": episode_metrics,
+        "sr_movement_diagnostics": sr_movement_diagnostics,
+        "sr_movement_episode_summaries": sr_movement_episode_summaries,
+        "dual_task_service_diagnostics": dual_task_service_diagnostics,
         "packet_outcome_artifacts": packet_outcome_artifacts,
         "packet_outcome_streamed_episode_count": (
             packet_outcome_streamed_episode_count
@@ -5882,6 +5950,10 @@ def train(
             "training_environment_height_m": int(ENVIRONMENT_HEIGHT_M),
             "evaluation_environment_width_m": int(env.env_width),
             "evaluation_environment_height_m": int(env.env_height),
+            "scenario_sr_base_speed_mps": float(env.sr_base_speed_mps),
+            "effective_sr_speed_mps": float(env.sr_speed_mps),
+            "sr_speed_override_mps": resolved_evaluation["sr_speed_mps"],
+            "sr_update_seconds": float(env.sr_update_seconds),
             "training_episode_horizon_s": int(
                 FORMAL_EXPERIMENT_DEFAULTS["episode_seconds"]
             ),
