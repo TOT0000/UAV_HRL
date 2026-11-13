@@ -746,16 +746,39 @@ class Simulator:
                 np.linalg.norm(np.asarray(sr.get_position()[:2]) - gt_pos)
             )
             target_radius = float(getattr(gt, "radius", 80.0))
+            assigned_inside_roi = initial_distance <= target_radius
+            assigned_at_center = bool(sr.arrived)
             self.sr_movement_events[int(sr.id)] = {
                 "assigned_roi_id": int(gt.id),
                 "assignment_time_seconds": assignment_time,
+                "assignment_movement_update_index": int(
+                    self.sr_movement_update_index
+                ),
                 "assignment_position_m": [float(sr.x), float(sr.y), float(sr.z)],
                 "assignment_distance_to_roi_center_m": initial_distance,
+                "assigned_inside_roi": bool(assigned_inside_roi),
+                "assigned_at_center": bool(assigned_at_center),
                 "entered_roi_time_seconds": (
-                    assignment_time if initial_distance <= target_radius else None
+                    assignment_time if assigned_inside_roi else None
+                ),
+                "entered_roi_event_source": (
+                    "assignment_state" if assigned_inside_roi else None
+                ),
+                "entered_roi_movement_update_index": (
+                    int(self.sr_movement_update_index)
+                    if assigned_inside_roi
+                    else None
                 ),
                 "arrived_center_time_seconds": (
-                    assignment_time if bool(sr.arrived) else None
+                    assignment_time if assigned_at_center else None
+                ),
+                "arrived_center_event_source": (
+                    "assignment_state" if assigned_at_center else None
+                ),
+                "arrived_center_movement_update_index": (
+                    int(self.sr_movement_update_index)
+                    if assigned_at_center
+                    else None
                 ),
             }
             self.SR_paths = list(sr.path)
@@ -763,7 +786,13 @@ class Simulator:
             # print(f"[SR Team] 指派 SR {sr.id} 前往 GT {gt.id}")
             # print(self.SR_paths)
             return sr
-    def advance_sr_teams(self):
+    def advance_sr_teams(self, observation_time_seconds=None):
+        self.sr_movement_update_index += 1
+        event_time = float(
+            getattr(self, "current_time", 0.0)
+            if observation_time_seconds is None
+            else observation_time_seconds
+        )
         for sr in self.SR_teams:
             sr.step_forward()
             event = self.sr_movement_events.get(int(sr.id))
@@ -775,14 +804,23 @@ class Simulator:
                         - np.asarray(gt.get_position()[:2])
                     )
                 )
-                event_time = float(getattr(self, "current_time", 0.0))
                 if (
                     event["entered_roi_time_seconds"] is None
                     and distance <= float(gt.radius)
                 ):
                     event["entered_roi_time_seconds"] = event_time
+                    event["entered_roi_event_source"] = "discrete_movement_update"
+                    event["entered_roi_movement_update_index"] = int(
+                        self.sr_movement_update_index
+                    )
                 if event["arrived_center_time_seconds"] is None and bool(sr.arrived):
                     event["arrived_center_time_seconds"] = event_time
+                    event["arrived_center_event_source"] = (
+                        "discrete_movement_update"
+                    )
+                    event["arrived_center_movement_update_index"] = int(
+                        self.sr_movement_update_index
+                    )
             point = [sr.x, sr.y, sr.z]
             if not self.sr_trajectory[sr.id] or self.sr_trajectory[sr.id][-1] != point:
                 self.sr_trajectory[sr.id].append(point)
@@ -885,7 +923,7 @@ class Simulator:
 
         if self.channel.movement_interval_index is not None:
             raise RuntimeError("initial movement interval is already prepared")
-        self.advance_sr_teams()
+        self.advance_sr_teams(observation_time_seconds=0.0)
         self.initialize_channel_episode_boundary()
 
     def advance_channel_boundary(self, next_interval_index):
@@ -907,7 +945,11 @@ class Simulator:
     def prepare_next_movement_interval(self, next_interval_index):
         """Authoritative non-terminal one-second geometry/channel boundary."""
 
-        self.advance_sr_teams()
+        self.advance_sr_teams(
+            observation_time_seconds=(
+                float(next_interval_index) * float(self.sr_update_seconds)
+            )
+        )
         self.advance_channel_boundary(next_interval_index)
         assignment_performed = False
         if self.need_reassign:
@@ -1815,6 +1857,7 @@ class Simulator:
             self.SR_teams.append(sr)
         self.sr_trajectory = {i: [] for i in range(self.num_SR_team)}
         self.sr_movement_events = {}
+        self.sr_movement_update_index = 0
         for sr in self.SR_teams:
             self.sr_trajectory[sr.id].append([sr.x, sr.y, sr.z])  # 初始位置
         for uav in self.UAVs:

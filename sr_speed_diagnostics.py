@@ -7,7 +7,7 @@ from pathlib import Path
 from visual_sensing import vs_geometry
 
 
-SR_SPEED_DIAGNOSTIC_SCHEMA_VERSION = "sr-speed-evaluation-diagnostics-v1"
+SR_SPEED_DIAGNOSTIC_SCHEMA_VERSION = "sr-speed-evaluation-diagnostics-v2"
 DUAL_TASK_SAMPLING = "routing-slot state, integrated at 0.25-second resolution"
 
 
@@ -17,6 +17,49 @@ def _ratio(numerator, denominator):
 
 def _mean(total, count):
     return float(total) / float(count) if count else None
+
+
+def _event_elapsed(event, event_name):
+    """Resolve elapsed time only when the discrete observation order supports it."""
+
+    event_time = event.get(f"{event_name}_time_seconds")
+    if event_time is None:
+        return {
+            "elapsed_seconds": None,
+            "valid": False,
+            "reason": "event_not_observed",
+            "basis": None,
+        }
+    assignment_time = float(event["assignment_time_seconds"])
+    event_time = float(event_time)
+    source = event.get(f"{event_name}_event_source")
+    if source == "assignment_state":
+        return {
+            "elapsed_seconds": 0.0,
+            "valid": True,
+            "reason": "already_satisfied_at_assignment",
+            "basis": "assignment_state_observation",
+        }
+    if event_time < assignment_time:
+        return {
+            "elapsed_seconds": None,
+            "valid": False,
+            "reason": "event_observation_precedes_assignment",
+            "basis": "discrete_state_observation",
+        }
+    if event_time == assignment_time:
+        return {
+            "elapsed_seconds": None,
+            "valid": False,
+            "reason": "same_timestamp_discrete_movement_after_assignment",
+            "basis": "discrete_state_observation",
+        }
+    return {
+        "elapsed_seconds": event_time - assignment_time,
+        "valid": True,
+        "reason": "observed_at_later_discrete_movement_update",
+        "basis": "discrete_state_observation",
+    }
 
 
 def build_sr_episode_diagnostics(env, *, episode_index, scenario_id, episode_end_s):
@@ -37,6 +80,26 @@ def build_sr_episode_diagnostics(env, *, episode_index, scenario_id, episode_end
         assignment_time = event["assignment_time_seconds"] if assigned else None
         entered_time = event["entered_roi_time_seconds"] if assigned else None
         arrived_time = event["arrived_center_time_seconds"] if assigned else None
+        entered_elapsed = (
+            _event_elapsed(event, "entered_roi")
+            if assigned
+            else {
+                "elapsed_seconds": None,
+                "valid": False,
+                "reason": "sr_not_assigned",
+                "basis": None,
+            }
+        )
+        arrived_elapsed = (
+            _event_elapsed(event, "arrived_center")
+            if assigned
+            else {
+                "elapsed_seconds": None,
+                "valid": False,
+                "reason": "sr_not_assigned",
+                "basis": None,
+            }
+        )
         rows.append(
             {
                 "schema_version": SR_SPEED_DIAGNOSTIC_SCHEMA_VERSION,
@@ -48,6 +111,9 @@ def build_sr_episode_diagnostics(env, *, episode_index, scenario_id, episode_end
                 "sr_speed_mps": float(env.sr_speed_mps),
                 "received_rescue_mission": bool(assigned),
                 "mission_assignment_time_seconds": assignment_time,
+                "mission_assignment_movement_update_index": (
+                    event.get("assignment_movement_update_index") if assigned else None
+                ),
                 "mission_assignment_position_m": (
                     event["assignment_position_m"] if assigned else None
                 ),
@@ -56,17 +122,35 @@ def build_sr_episode_diagnostics(env, *, episode_index, scenario_id, episode_end
                 ),
                 "entered_roi": entered_time is not None,
                 "first_entered_roi_time_seconds": entered_time,
+                "first_entered_roi_observation_time_seconds": entered_time,
+                "entered_roi_event_source": (
+                    event.get("entered_roi_event_source") if assigned else None
+                ),
+                "entered_roi_movement_update_index": (
+                    event.get("entered_roi_movement_update_index") if assigned else None
+                ),
                 "arrived_center": arrived_time is not None,
                 "first_arrived_center_time_seconds": arrived_time,
-                "assignment_to_roi_entry_seconds": (
-                    float(entered_time) - float(assignment_time)
-                    if entered_time is not None
-                    else None
+                "first_arrived_center_observation_time_seconds": arrived_time,
+                "arrived_center_event_source": (
+                    event.get("arrived_center_event_source") if assigned else None
                 ),
-                "assignment_to_center_arrival_seconds": (
-                    float(arrived_time) - float(assignment_time)
-                    if arrived_time is not None
-                    else None
+                "arrived_center_movement_update_index": (
+                    event.get("arrived_center_movement_update_index") if assigned else None
+                ),
+                "assignment_to_roi_entry_seconds": entered_elapsed["elapsed_seconds"],
+                "assignment_to_roi_entry_time_valid": entered_elapsed["valid"],
+                "assignment_to_roi_entry_time_reason": entered_elapsed["reason"],
+                "assignment_to_roi_entry_time_basis": entered_elapsed["basis"],
+                "assignment_to_center_arrival_seconds": arrived_elapsed[
+                    "elapsed_seconds"
+                ],
+                "assignment_to_center_arrival_time_valid": arrived_elapsed["valid"],
+                "assignment_to_center_arrival_time_reason": arrived_elapsed["reason"],
+                "assignment_to_center_arrival_time_basis": arrived_elapsed["basis"],
+                "assignment_observation_resolution_seconds": float(env.dt),
+                "movement_state_update_resolution_seconds": float(
+                    env.sr_update_seconds
                 ),
                 "episode_end_time_seconds": float(episode_end_s),
                 "episode_end_position_m": [float(sr.x), float(sr.y), float(sr.z)],
@@ -80,9 +164,19 @@ def summarize_sr_rows(rows, *, episode_index=None, scenario_id=None):
     assigned = [row for row in rows if row["received_rescue_mission"]]
     entered = [row for row in assigned if row["entered_roi"]]
     arrived = [row for row in assigned if row["arrived_center"]]
-    entry_sum = sum(float(row["assignment_to_roi_entry_seconds"]) for row in entered)
+    valid_entry_times = [
+        row for row in entered if row["assignment_to_roi_entry_time_valid"]
+    ]
+    valid_arrival_times = [
+        row for row in arrived if row["assignment_to_center_arrival_time_valid"]
+    ]
+    entry_sum = sum(
+        float(row["assignment_to_roi_entry_seconds"])
+        for row in valid_entry_times
+    )
     arrival_sum = sum(
-        float(row["assignment_to_center_arrival_seconds"]) for row in arrived
+        float(row["assignment_to_center_arrival_seconds"])
+        for row in valid_arrival_times
     )
     return {
         "schema_version": SR_SPEED_DIAGNOSTIC_SCHEMA_VERSION,
@@ -98,11 +192,27 @@ def summarize_sr_rows(rows, *, episode_index=None, scenario_id=None):
         "entered_roi_ratio": _ratio(len(entered), len(assigned)),
         "arrived_center_ratio": _ratio(len(arrived), len(assigned)),
         "roi_entry_elapsed_seconds_sum": entry_sum,
-        "roi_entry_elapsed_seconds_sample_count": len(entered),
-        "mean_assignment_to_roi_entry_seconds": _mean(entry_sum, len(entered)),
+        "roi_entry_elapsed_seconds_sample_count": len(valid_entry_times),
+        "roi_entry_elapsed_seconds_unresolved_event_count": (
+            len(entered) - len(valid_entry_times)
+        ),
+        "mean_assignment_to_roi_entry_seconds": _mean(
+            entry_sum, len(valid_entry_times)
+        ),
+        "mean_assignment_to_roi_entry_sample_scope": (
+            "entered events with valid observed discrete-state elapsed time"
+        ),
         "center_arrival_elapsed_seconds_sum": arrival_sum,
-        "center_arrival_elapsed_seconds_sample_count": len(arrived),
-        "mean_assignment_to_center_arrival_seconds": _mean(arrival_sum, len(arrived)),
+        "center_arrival_elapsed_seconds_sample_count": len(valid_arrival_times),
+        "center_arrival_elapsed_seconds_unresolved_event_count": (
+            len(arrived) - len(valid_arrival_times)
+        ),
+        "mean_assignment_to_center_arrival_seconds": _mean(
+            arrival_sum, len(valid_arrival_times)
+        ),
+        "mean_assignment_to_center_arrival_sample_scope": (
+            "arrival events with valid observed discrete-state elapsed time"
+        ),
         "zero_assigned_denominator": len(assigned) == 0,
     }
 
@@ -199,7 +309,17 @@ def aggregate_diagnostics(sr_rows, dual_rows):
         "dual_task_service": summarize_dual_task_accumulator(pooled_dual),
         "definitions": {
             "sr_event_denominator": "SR teams assigned a rescue mission",
-            "mean_event_times": "pooled elapsed-time sum / actually observed event count",
+            "absolute_event_times": (
+                "simulation timestamps at assignment-state or discrete movement-state observation"
+            ),
+            "elapsed_time_validity": (
+                "elapsed time is null when an outside-at-assignment SR first satisfies "
+                "an event after a movement update sharing the assignment timestamp"
+            ),
+            "mean_event_times": (
+                "pooled valid observed elapsed-time sum / valid elapsed-time sample count; "
+                "observed events with unresolved elapsed time are excluded and counted separately"
+            ),
             "dual_task_time_unit": "UAV-seconds",
             "dual_task_sampling": DUAL_TASK_SAMPLING,
             "com_serviceable": "assigned COM SR is within the existing 400 m S2U range; queue occupancy is ignored",
