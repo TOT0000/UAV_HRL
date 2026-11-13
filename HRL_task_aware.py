@@ -5373,6 +5373,31 @@ def train(
                     ),
                     lambda_cost_used=episode_lambda_cost,
                     lambda_cost_after_episode=lambda_cost_after_episode,
+                    routing_reward_total=episode_routing_reward,
+                    routing_delivery_reward_total=(
+                        episode_routing_delivery_reward
+                    ),
+                    routing_progress_reward_total=(
+                        episode_routing_progress_reward
+                    ),
+                    routing_positive_progress_reward_total=(
+                        packet_engine.routing_positive_progress_reward_total
+                    ),
+                    routing_negative_progress_reward_total=(
+                        packet_engine.routing_negative_progress_reward_total
+                    ),
+                    routing_completed_uav_hop_count=(
+                        packet_engine.completed_uav_hop_count
+                    ),
+                    routing_cross_slot_completed_uav_hop_count=(
+                        packet_engine.cross_slot_completed_uav_hop_count
+                    ),
+                    routing_cross_slot_completed_uav_hop_fraction=(
+                        float(packet_engine.cross_slot_completed_uav_hop_count)
+                        / float(packet_engine.completed_uav_hop_count)
+                        if packet_engine.completed_uav_hop_count
+                        else None
+                    ),
                     **dinkelbach_event,
                 )
             )

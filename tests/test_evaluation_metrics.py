@@ -8,6 +8,7 @@ from pathlib import Path
 from evaluation_metrics import (
     METRIC_COLUMNS,
     _read_episode_csvs,
+    aggregate_descriptive_seed_metrics,
     canonical_cross_seed_artifact_rows,
     safe_energy_efficiency,
     summarize_training_seeds,
@@ -269,6 +270,114 @@ class EvaluationMetricTest(unittest.TestCase):
         self.assertIsNone(summaries[0]["training_manifest_hash"])
         self.assertIsNone(summaries[0]["checkpoint_completed_episodes"])
         self.assertIsNone(summaries[0]["checkpoint_metadata_fingerprint"])
+
+    def test_routing_cross_slot_fraction_uses_matching_count_sums(self):
+        first = self._row(11, "a", 1.0)
+        second = self._row(11, "b", 1.0)
+        first.update(
+            {
+                "routing_completed_uav_hop_count": 1,
+                "routing_cross_slot_completed_uav_hop_count": 1,
+                "routing_cross_slot_completed_uav_hop_fraction": 1.0,
+            }
+        )
+        second.update(
+            {
+                "routing_completed_uav_hop_count": 99,
+                "routing_cross_slot_completed_uav_hop_count": 0,
+                "routing_cross_slot_completed_uav_hop_fraction": 0.0,
+            }
+        )
+
+        summary = summarize_training_seeds([first, second])[0]
+
+        self.assertEqual(
+            summary["routing_cross_slot_completed_uav_hop_fraction"], 0.01
+        )
+        self.assertEqual(
+            summary["routing_cross_slot_completed_uav_hop_numerator_sum"], 1
+        )
+        self.assertEqual(
+            summary["routing_cross_slot_completed_uav_hop_denominator_sum"],
+            100,
+        )
+        self.assertEqual(
+            summary[
+                "routing_cross_slot_completed_uav_hop_valid_episode_count"
+            ],
+            2,
+        )
+        self.assertEqual(
+            summary[
+                "routing_cross_slot_completed_uav_hop_missing_episode_count"
+            ],
+            0,
+        )
+
+    def test_routing_cross_slot_fraction_preserves_missing_and_zero_denominator(self):
+        missing = self._row(11, "missing", 1.0)
+        zero = self._row(11, "zero", 1.0)
+        missing["routing_completed_uav_hop_count"] = None
+        missing["routing_cross_slot_completed_uav_hop_count"] = None
+        missing["routing_cross_slot_completed_uav_hop_fraction"] = None
+        zero["routing_completed_uav_hop_count"] = 0
+        zero["routing_cross_slot_completed_uav_hop_count"] = 0
+        zero["routing_cross_slot_completed_uav_hop_fraction"] = None
+
+        summary = summarize_training_seeds([missing, zero])[0]
+
+        self.assertIsNone(
+            summary["routing_cross_slot_completed_uav_hop_fraction"]
+        )
+        self.assertEqual(
+            summary["routing_cross_slot_completed_uav_hop_numerator_sum"], 0
+        )
+        self.assertEqual(
+            summary["routing_cross_slot_completed_uav_hop_denominator_sum"], 0
+        )
+        self.assertEqual(
+            summary[
+                "routing_cross_slot_completed_uav_hop_valid_episode_count"
+            ],
+            1,
+        )
+        self.assertEqual(
+            summary[
+                "routing_cross_slot_completed_uav_hop_missing_episode_count"
+            ],
+            1,
+        )
+
+    def test_routing_cross_slot_cross_seed_inference_equal_weights_seed_ratios(self):
+        rows = []
+        for seed, counts in (
+            (11, ((1, 1), (0, 99))),
+            (12, ((1, 2),)),
+        ):
+            for index, (cross_slot, completed) in enumerate(counts):
+                row = self._row(seed, f"{seed}-{index}", 1.0)
+                row["routing_completed_uav_hop_count"] = completed
+                row["routing_cross_slot_completed_uav_hop_count"] = cross_slot
+                row["routing_cross_slot_completed_uav_hop_fraction"] = (
+                    cross_slot / completed if completed else None
+                )
+                rows.append(row)
+
+        summaries = summarize_training_seeds(rows)
+        aggregates = aggregate_descriptive_seed_metrics(summaries)
+        ratio = next(
+            row
+            for row in aggregates
+            if row["metric"]
+            == "routing_cross_slot_completed_uav_hop_fraction"
+        )
+
+        self.assertEqual(ratio["per_seed_values"], [0.01, 0.5])
+        self.assertEqual(ratio["per_seed_numerators"], [1, 1])
+        self.assertEqual(ratio["per_seed_denominators"], [100, 2])
+        self.assertEqual(ratio["per_seed_valid_episode_counts"], [2, 1])
+        self.assertEqual(ratio["mean"], 0.255)
+        self.assertNotEqual(ratio["mean"], 2 / 102)
 
 
 class EvaluationModeIntegrationTest(unittest.TestCase):

@@ -47,6 +47,25 @@ TRAINING_HISTORY_COLUMNS = (
     "routing_immediate_cost_sum",
     "lambda_cost_used",
     "lambda_cost_after_episode",
+    "routing_reward_total",
+    "routing_delivery_reward_total",
+    "routing_progress_reward_total",
+    "routing_positive_progress_reward_total",
+    "routing_negative_progress_reward_total",
+    "routing_completed_uav_hop_count",
+    "routing_cross_slot_completed_uav_hop_count",
+    "routing_cross_slot_completed_uav_hop_fraction",
+)
+
+ROUTING_REWARD_HISTORY_COLUMNS = (
+    "routing_reward_total",
+    "routing_delivery_reward_total",
+    "routing_progress_reward_total",
+    "routing_positive_progress_reward_total",
+    "routing_negative_progress_reward_total",
+    "routing_completed_uav_hop_count",
+    "routing_cross_slot_completed_uav_hop_count",
+    "routing_cross_slot_completed_uav_hop_fraction",
 )
 
 FLOAT_COLUMNS = (
@@ -67,6 +86,12 @@ FLOAT_COLUMNS = (
     "routing_immediate_cost_sum",
     "lambda_cost_used",
     "lambda_cost_after_episode",
+    "routing_reward_total",
+    "routing_delivery_reward_total",
+    "routing_progress_reward_total",
+    "routing_positive_progress_reward_total",
+    "routing_negative_progress_reward_total",
+    "routing_cross_slot_completed_uav_hop_fraction",
 )
 
 INTEGER_COLUMNS = (
@@ -78,13 +103,15 @@ INTEGER_COLUMNS = (
     "system_violated_packets",
     "routing_stage_eligible_packets",
     "routing_stage_violated_packets",
+    "routing_completed_uav_hop_count",
+    "routing_cross_slot_completed_uav_hop_count",
 )
 
 BOOLEAN_COLUMNS = ("dinkelbach_lambda_updated",)
 
 STRING_COLUMNS = ("dinkelbach_update_status",)
 
-TRAINING_HISTORY_SCHEMA_VERSION = 8
+TRAINING_HISTORY_SCHEMA_VERSION = 9
 TRAINING_HISTORY_CSV = "training_history.csv"
 TRAINING_HISTORY_JSONL = "training_history.jsonl"
 TRAINING_HISTORY_COMMIT = "training_history_commit.json"
@@ -141,6 +168,14 @@ def build_training_history_row(
     routing_immediate_cost_sum=0.0,
     lambda_cost_used=None,
     lambda_cost_after_episode=None,
+    routing_reward_total=0.0,
+    routing_delivery_reward_total=0.0,
+    routing_progress_reward_total=0.0,
+    routing_positive_progress_reward_total=0.0,
+    routing_negative_progress_reward_total=0.0,
+    routing_completed_uav_hop_count=0,
+    routing_cross_slot_completed_uav_hop_count=0,
+    routing_cross_slot_completed_uav_hop_fraction=None,
 ):
     timely_goodput_mbits = float(timely_goodput_mbits)
     total_timely_useful_mbits = (
@@ -211,11 +246,32 @@ def build_training_history_row(
         "routing_immediate_cost_sum": float(routing_immediate_cost_sum),
         "lambda_cost_used": lambda_cost_used,
         "lambda_cost_after_episode": lambda_cost_after_episode,
+        "routing_reward_total": routing_reward_total,
+        "routing_delivery_reward_total": routing_delivery_reward_total,
+        "routing_progress_reward_total": routing_progress_reward_total,
+        "routing_positive_progress_reward_total": (
+            routing_positive_progress_reward_total
+        ),
+        "routing_negative_progress_reward_total": (
+            routing_negative_progress_reward_total
+        ),
+        "routing_completed_uav_hop_count": routing_completed_uav_hop_count,
+        "routing_cross_slot_completed_uav_hop_count": (
+            routing_cross_slot_completed_uav_hop_count
+        ),
+        "routing_cross_slot_completed_uav_hop_fraction": (
+            routing_cross_slot_completed_uav_hop_fraction
+        ),
     }
     return normalize_training_history_row(row)
 
 
 def normalize_training_history_row(row):
+    row = dict(row)
+    # Schema v8 and earlier do not have routing-reward diagnostics.  Missing
+    # legacy observations remain unknown; only newly built rows receive zeros.
+    for column in ROUTING_REWARD_HISTORY_COLUMNS:
+        row.setdefault(column, None)
     missing = set(TRAINING_HISTORY_COLUMNS).difference(row)
     if missing:
         raise ValueError(f"training history row is missing: {sorted(missing)}")
@@ -237,6 +293,7 @@ def normalize_training_history_row(row):
         "routing_stage_violation_probability",
         "lambda_cost_used",
         "lambda_cost_after_episode",
+        *ROUTING_REWARD_HISTORY_COLUMNS,
     }
     normalized.update(
         {
@@ -358,6 +415,65 @@ def validate_training_history(rows, identity):
             raise ValueError(
                 "training history routing-stage probability is inconsistent"
             )
+        routing_values = [row[column] for column in ROUTING_REWARD_HISTORY_COLUMNS]
+        if any(value is not None for value in routing_values):
+            if any(
+                row[column] is None
+                for column in ROUTING_REWARD_HISTORY_COLUMNS[:-1]
+            ):
+                raise ValueError(
+                    "training history routing reward diagnostics are incomplete"
+                )
+            completed = row["routing_completed_uav_hop_count"]
+            cross_slot = row["routing_cross_slot_completed_uav_hop_count"]
+            if completed < 0 or cross_slot < 0 or cross_slot > completed:
+                raise ValueError(
+                    "training history routing completed-hop counts are inconsistent"
+                )
+            expected_fraction = (
+                cross_slot / float(completed) if completed else None
+            )
+            actual_fraction = row[
+                "routing_cross_slot_completed_uav_hop_fraction"
+            ]
+            if (
+                expected_fraction is None
+                and actual_fraction is not None
+            ) or (
+                expected_fraction is not None
+                and (
+                    actual_fraction is None
+                    or not math.isclose(
+                        actual_fraction,
+                        expected_fraction,
+                        rel_tol=0.0,
+                        abs_tol=1e-12,
+                    )
+                )
+            ):
+                raise ValueError(
+                    "training history routing cross-slot fraction is inconsistent"
+                )
+            if not math.isclose(
+                row["routing_progress_reward_total"],
+                row["routing_positive_progress_reward_total"]
+                + row["routing_negative_progress_reward_total"],
+                rel_tol=1e-12,
+                abs_tol=1e-12,
+            ):
+                raise ValueError(
+                    "training history routing progress reward is inconsistent"
+                )
+            if not math.isclose(
+                row["routing_reward_total"],
+                row["routing_delivery_reward_total"]
+                + row["routing_progress_reward_total"],
+                rel_tol=1e-12,
+                abs_tol=1e-12,
+            ):
+                raise ValueError(
+                    "training history routing total reward is inconsistent"
+                )
     return normalized
 
 
@@ -482,7 +598,11 @@ def _history_paths(run_directory):
 
 
 def _validate_commit_identity(commit, identity):
-    if commit.get("schema_version") not in {2, TRAINING_HISTORY_SCHEMA_VERSION}:
+    if commit.get("schema_version") not in {
+        2,
+        8,
+        TRAINING_HISTORY_SCHEMA_VERSION,
+    }:
         raise TrainingHistoryConsistencyError(
             "training history commit schema is incompatible"
         )

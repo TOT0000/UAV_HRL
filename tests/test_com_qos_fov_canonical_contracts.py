@@ -361,12 +361,12 @@ class CanonicalArtifactSourceContractTest(unittest.TestCase):
             )
 
         self.assertEqual(len(canonical_rows), 6)
-        expected_rows = 7 + len(DESCRIPTIVE_EPISODE_METRIC_COLUMNS)
+        expected_rows = 8 + len(DESCRIPTIVE_EPISODE_METRIC_COLUMNS)
         self.assertEqual(len(generic_rows), expected_rows)
         self.assertEqual(len(csv_rows), expected_rows)
         self.assertEqual(
             aggregation_metadata["generic_cross_seed_artifact_schema_version"],
-            "uav-hrl-generic-cross-seed-aggregate-v5",
+            "uav-hrl-generic-cross-seed-aggregate-v6",
         )
         kind_counts = {
             kind: sum(row["aggregation_kind"] == kind for row in generic_rows)
@@ -374,6 +374,7 @@ class CanonicalArtifactSourceContractTest(unittest.TestCase):
                 "canonical_ratio",
                 "canonical_alias",
                 "descriptive_seed_mean",
+                "within_seed_ratio_of_sums_then_equal_seed_mean",
             )
         }
         self.assertEqual(
@@ -384,8 +385,19 @@ class CanonicalArtifactSourceContractTest(unittest.TestCase):
                 "descriptive_seed_mean": len(
                     DESCRIPTIVE_EPISODE_METRIC_COLUMNS
                 ),
+                "within_seed_ratio_of_sums_then_equal_seed_mean": 1,
             },
         )
+        routing_ratio = next(
+            row
+            for row in generic_rows
+            if row["metric"]
+            == "routing_cross_slot_completed_uav_hop_fraction"
+        )
+        self.assertEqual(routing_ratio["per_seed_values"], [1.0, 1.0])
+        self.assertEqual(routing_ratio["per_seed_numerators"], [3, 7])
+        self.assertEqual(routing_ratio["per_seed_denominators"], [3, 7])
+        self.assertEqual(routing_ratio["per_seed_valid_episode_counts"], [2, 2])
         identities = {
             (row["metric"], row.get("task_type")) for row in generic_rows
         }

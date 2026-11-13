@@ -151,7 +151,21 @@ OPTIONAL_METRIC_COLUMNS = {
 }
 
 GENERIC_CROSS_SEED_ARTIFACT_SCHEMA_VERSION = (
-    "uav-hrl-generic-cross-seed-aggregate-v5"
+    "uav-hrl-generic-cross-seed-aggregate-v6"
+)
+
+ROUTING_CROSS_SLOT_FRACTION = (
+    "routing_cross_slot_completed_uav_hop_fraction"
+)
+ROUTING_CROSS_SLOT_NUMERATOR = (
+    "routing_cross_slot_completed_uav_hop_count"
+)
+ROUTING_CROSS_SLOT_DENOMINATOR = "routing_completed_uav_hop_count"
+ROUTING_CROSS_SLOT_SEED_AUDIT_COLUMNS = (
+    "routing_cross_slot_completed_uav_hop_numerator_sum",
+    "routing_cross_slot_completed_uav_hop_denominator_sum",
+    "routing_cross_slot_completed_uav_hop_valid_episode_count",
+    "routing_cross_slot_completed_uav_hop_missing_episode_count",
 )
 
 # Every per-episode metric must opt in to exactly one generic aggregation path.
@@ -195,7 +209,6 @@ DESCRIPTIVE_EPISODE_METRIC_COLUMNS = (
     "routing_negative_progress_reward_total",
     "routing_completed_uav_hop_count",
     "routing_cross_slot_completed_uav_hop_count",
-    "routing_cross_slot_completed_uav_hop_fraction",
     "partial_transmission_count",
     "slot_budget_violation_count",
     "system_qos_violation_count",
@@ -249,6 +262,11 @@ METRIC_AGGREGATION_REGISTRY = {
         "alias_of_metric": "violation_probability",
         "alias_of_task_type": "ALL",
     },
+    ROUTING_CROSS_SLOT_FRACTION: {
+        "aggregation_kind": "within_seed_ratio_of_sums_then_equal_seed_mean",
+        "numerator_metric": ROUTING_CROSS_SLOT_NUMERATOR,
+        "denominator_metric": ROUTING_CROSS_SLOT_DENOMINATOR,
+    },
 }
 
 if set(METRIC_AGGREGATION_REGISTRY) != set(METRIC_COLUMNS):
@@ -263,7 +281,11 @@ SEED_CANONICAL_METRIC_COLUMNS = (
     "com_violation_probability",
     "all_violation_probability",
 )
-SEED_SUMMARY_METRIC_COLUMNS = (*METRIC_COLUMNS, *SEED_CANONICAL_METRIC_COLUMNS)
+SEED_SUMMARY_METRIC_COLUMNS = (
+    *METRIC_COLUMNS,
+    *ROUTING_CROSS_SLOT_SEED_AUDIT_COLUMNS,
+    *SEED_CANONICAL_METRIC_COLUMNS,
+)
 
 PACKET_METRIC_COLUMNS = tuple(
     f"{task}_{field}"
@@ -334,6 +356,23 @@ def aggregation_metadata(seed_count):
             "ratio of episode numerator sums / denominator sums"
         ),
         "descriptive_within_seed_rule": "episode arithmetic mean",
+        "routing_cross_slot_fraction_within_seed_rule": (
+            "sum routing_cross_slot_completed_uav_hop_count over episodes "
+            "with both counts present / sum routing_completed_uav_hop_count "
+            "over those same episodes"
+        ),
+        "routing_hop_count_seed_summary_semantics": {
+            "routing_completed_uav_hop_count": "per-episode arithmetic mean",
+            "routing_cross_slot_completed_uav_hop_count": (
+                "per-episode arithmetic mean"
+            ),
+            "routing_cross_slot_completed_uav_hop_numerator_sum": (
+                "cross-slot completed-hop count sum over paired valid episodes"
+            ),
+            "routing_cross_slot_completed_uav_hop_denominator_sum": (
+                "all completed-hop count sum over paired valid episodes"
+            ),
+        },
         "cross_seed_rule": "equal weight across valid trained-policy seed values",
         "zero_denominator": "missing",
         "aggregation_kinds": {
@@ -343,6 +382,11 @@ def aggregation_metadata(seed_count):
             ),
             "descriptive_seed_mean": (
                 "episode mean within seed, then equal-weight seed inference"
+            ),
+            "within_seed_ratio_of_sums_then_equal_seed_mean": (
+                "sum valid episode cross-slot hop counts / sum matching "
+                "completed-hop counts within seed, then equal-weight valid "
+                "seed inference"
             ),
         },
         "metric_aggregation_registry": METRIC_AGGREGATION_REGISTRY,
@@ -377,6 +421,48 @@ def _optional_int(value):
 
 def _optional_text(value):
     return None if value is None or value == "" else str(value)
+
+
+def _routing_cross_slot_seed_ratio(rows):
+    numerator_sum = 0
+    denominator_sum = 0
+    valid_episode_count = 0
+    missing_episode_count = 0
+    for row in rows:
+        raw_numerator = row.get(ROUTING_CROSS_SLOT_NUMERATOR)
+        raw_denominator = row.get(ROUTING_CROSS_SLOT_DENOMINATOR)
+        if raw_numerator in (None, "") or raw_denominator in (None, ""):
+            missing_episode_count += 1
+            continue
+        numerator = float(raw_numerator)
+        denominator = float(raw_denominator)
+        if (
+            not math.isfinite(numerator)
+            or not math.isfinite(denominator)
+            or numerator < 0.0
+            or denominator < 0.0
+            or not numerator.is_integer()
+            or not denominator.is_integer()
+            or numerator > denominator
+        ):
+            raise ValueError(
+                "routing cross-slot aggregation requires finite non-negative "
+                "integer counts with numerator <= denominator"
+            )
+        numerator_sum += int(numerator)
+        denominator_sum += int(denominator)
+        valid_episode_count += 1
+    return {
+        "value": (
+            numerator_sum / float(denominator_sum)
+            if denominator_sum
+            else None
+        ),
+        "numerator_sum": numerator_sum,
+        "denominator_sum": denominator_sum,
+        "valid_episode_count": valid_episode_count,
+        "missing_episode_count": missing_episode_count,
+    }
 
 
 def summarize_training_seeds(episode_rows):
@@ -431,6 +517,20 @@ def summarize_training_seeds(episode_rows):
                 if row[metric] is not None and row[metric] != ""
             ]
             summary[metric] = fmean(values) if values else None
+        routing_cross_slot = _routing_cross_slot_seed_ratio(rows)
+        summary[ROUTING_CROSS_SLOT_FRACTION] = routing_cross_slot["value"]
+        summary[
+            "routing_cross_slot_completed_uav_hop_numerator_sum"
+        ] = routing_cross_slot["numerator_sum"]
+        summary[
+            "routing_cross_slot_completed_uav_hop_denominator_sum"
+        ] = routing_cross_slot["denominator_sum"]
+        summary[
+            "routing_cross_slot_completed_uav_hop_valid_episode_count"
+        ] = routing_cross_slot["valid_episode_count"]
+        summary[
+            "routing_cross_slot_completed_uav_hop_missing_episode_count"
+        ] = routing_cross_slot["missing_episode_count"]
         canonical_rows, _canonical_cross_seed_rows = canonical_aggregation(
             rows
         )
@@ -549,7 +649,7 @@ def canonical_cross_seed_artifact_rows(canonical_rows, episode_rows):
 
 
 def aggregate_descriptive_seed_metrics(seed_summaries):
-    """Aggregate only descriptive metrics from episode means within each seed."""
+    """Aggregate descriptive means and the declared per-seed routing ratio."""
 
     grouped = {}
     for row in seed_summaries:
@@ -639,6 +739,100 @@ def aggregate_descriptive_seed_metrics(seed_summaries):
                     "missing": count == 0,
                 }
             )
+        ratio_values = [row.get(ROUTING_CROSS_SLOT_FRACTION) for row in rows]
+        valid_ratio_pairs = [
+            (seed, float(value))
+            for seed, value in zip(seeds, ratio_values)
+            if value is not None and value != ""
+        ]
+        values = [value for _seed, value in valid_ratio_pairs]
+        count = len(values)
+        mean = fmean(values) if values else None
+        sample_sd = stdev(values) if count > 1 else (0.0 if count else None)
+        degrees_of_freedom = max(count - 1, 0)
+        critical = (
+            float(student_t.ppf(0.975, df=degrees_of_freedom))
+            if degrees_of_freedom
+            else 0.0
+        )
+        half_width = critical * sample_sd / math.sqrt(count) if count else None
+        per_seed_numerators = [
+            int(
+                row[
+                    "routing_cross_slot_completed_uav_hop_numerator_sum"
+                ]
+            )
+            for row in rows
+        ]
+        per_seed_denominators = [
+            int(
+                row[
+                    "routing_cross_slot_completed_uav_hop_denominator_sum"
+                ]
+            )
+            for row in rows
+        ]
+        aggregates.append(
+            {
+                **identity,
+                "aggregation_kind": (
+                    "within_seed_ratio_of_sums_then_equal_seed_mean"
+                ),
+                "aggregation_level": "cross_seed",
+                "aggregation_rule": (
+                    "equal_weight_valid_seed_ratios_of_matching_episode_count_sums"
+                ),
+                "metric": ROUTING_CROSS_SLOT_FRACTION,
+                "task_type": None,
+                "numerator_metric": ROUTING_CROSS_SLOT_NUMERATOR,
+                "denominator_metric": ROUTING_CROSS_SLOT_DENOMINATOR,
+                "valid_training_seed_count": count,
+                "missing_training_seed_count": len(rows) - count,
+                "training_seed_count": len(rows),
+                "valid_training_seeds": [
+                    seed for seed, _value in valid_ratio_pairs
+                ],
+                "missing_training_seeds": [
+                    seed
+                    for seed, value in zip(seeds, ratio_values)
+                    if value is None or value == ""
+                ],
+                "per_seed_values": ratio_values,
+                "per_seed_numerators": per_seed_numerators,
+                "per_seed_denominators": per_seed_denominators,
+                "per_seed_valid_episode_counts": [
+                    int(
+                        row[
+                            "routing_cross_slot_completed_uav_hop_valid_episode_count"
+                        ]
+                    )
+                    for row in rows
+                ],
+                "per_seed_missing_episode_counts": [
+                    int(
+                        row[
+                            "routing_cross_slot_completed_uav_hop_missing_episode_count"
+                        ]
+                    )
+                    for row in rows
+                ],
+                "per_seed_episode_counts": [
+                    int(row["evaluation_episode_count"]) for row in rows
+                ],
+                "pooled_numerator": sum(per_seed_numerators),
+                "pooled_denominator": sum(per_seed_denominators),
+                "mean": mean,
+                "sample_stddev": sample_sd,
+                "degrees_of_freedom": degrees_of_freedom,
+                "confidence_interval_method": "Student-t",
+                "confidence_level": 0.95,
+                "t_critical_975": critical,
+                "ci95_half_width": half_width,
+                "ci95_lower": mean - half_width if count else None,
+                "ci95_upper": mean + half_width if count else None,
+                "missing": count == 0,
+            }
+        )
     return aggregates
 
 
@@ -668,16 +862,22 @@ def build_generic_cross_seed_artifact(
     }
     descriptive_rows = [dict(row) for row in descriptive_cross_seed_rows]
     if (
-        len(descriptive_rows) != len(DESCRIPTIVE_EPISODE_METRIC_COLUMNS)
+        len(descriptive_rows) != len(DESCRIPTIVE_EPISODE_METRIC_COLUMNS) + 1
         or {row.get("metric") for row in descriptive_rows}
-        != set(DESCRIPTIVE_EPISODE_METRIC_COLUMNS)
+        != {
+            *DESCRIPTIVE_EPISODE_METRIC_COLUMNS,
+            ROUTING_CROSS_SLOT_FRACTION,
+        }
         or any(
-            row.get("aggregation_kind") != "descriptive_seed_mean"
+            row.get("aggregation_kind")
+            != METRIC_AGGREGATION_REGISTRY[row.get("metric")][
+                "aggregation_kind"
+            ]
             for row in descriptive_rows
         )
     ):
         raise ValueError(
-            "generic artifact requires exactly one row for every descriptive metric"
+            "generic artifact requires exactly one row for every noncanonical metric"
         )
     identity_fields = (
         "generic_cross_seed_artifact_schema_version",

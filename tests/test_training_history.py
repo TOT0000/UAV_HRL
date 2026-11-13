@@ -30,7 +30,19 @@ class TrainingHistoryPersistenceTest(unittest.TestCase):
     def setUp(self):
         self.identity = training_history_identity("method", 7, "manifest")
 
-    def _row(self, episode, reward=None, energy=2.0):
+    def _row(
+        self,
+        episode,
+        reward=None,
+        energy=2.0,
+        *,
+        routing_delivery=0.0,
+        routing_positive_progress=0.0,
+        routing_negative_progress=0.0,
+        completed_hops=0,
+        cross_slot_hops=0,
+    ):
+        routing_progress = routing_positive_progress + routing_negative_progress
         return build_training_history_row(
             self.identity,
             episode=episode,
@@ -47,6 +59,130 @@ class TrainingHistoryPersistenceTest(unittest.TestCase):
                 episode * (episode + 1) / 2
             ),
             dinkelbach_block_energy_joules_so_far=episode * energy,
+            routing_reward_total=routing_delivery + routing_progress,
+            routing_delivery_reward_total=routing_delivery,
+            routing_progress_reward_total=routing_progress,
+            routing_positive_progress_reward_total=routing_positive_progress,
+            routing_negative_progress_reward_total=routing_negative_progress,
+            routing_completed_uav_hop_count=completed_hops,
+            routing_cross_slot_completed_uav_hop_count=cross_slot_hops,
+            routing_cross_slot_completed_uav_hop_fraction=(
+                cross_slot_hops / float(completed_hops)
+                if completed_hops
+                else None
+            ),
+        )
+
+    def test_nonzero_routing_reward_components_are_persisted_authoritatively(self):
+        row = self._row(
+            1,
+            routing_delivery=2.5,
+            routing_positive_progress=0.75,
+            routing_negative_progress=-0.25,
+            completed_hops=4,
+            cross_slot_hops=1,
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            write_training_history(temp_dir, [row], self.identity)
+            json_row = json.loads(
+                (Path(temp_dir) / "training_history.jsonl").read_text(
+                    encoding="utf-8"
+                )
+            )
+            with (Path(temp_dir) / "training_history.csv").open(
+                "r", encoding="utf-8", newline=""
+            ) as handle:
+                csv_row = next(csv.DictReader(handle))
+
+        self.assertEqual(json_row["reward"], 1.0)
+        self.assertEqual(json_row["routing_delivery_reward_total"], 2.5)
+        self.assertEqual(json_row["routing_positive_progress_reward_total"], 0.75)
+        self.assertEqual(json_row["routing_negative_progress_reward_total"], -0.25)
+        self.assertEqual(json_row["routing_progress_reward_total"], 0.5)
+        self.assertEqual(json_row["routing_reward_total"], 3.0)
+        self.assertEqual(json_row["routing_completed_uav_hop_count"], 4)
+        self.assertEqual(
+            json_row["routing_cross_slot_completed_uav_hop_count"], 1
+        )
+        self.assertEqual(
+            json_row["routing_cross_slot_completed_uav_hop_fraction"], 0.25
+        )
+        self.assertEqual(float(csv_row["routing_reward_total"]), 3.0)
+
+    def test_legacy_rows_preserve_unknown_routing_diagnostics(self):
+        legacy = self._row(1)
+        for column in (
+            "routing_reward_total",
+            "routing_delivery_reward_total",
+            "routing_progress_reward_total",
+            "routing_positive_progress_reward_total",
+            "routing_negative_progress_reward_total",
+            "routing_completed_uav_hop_count",
+            "routing_cross_slot_completed_uav_hop_count",
+            "routing_cross_slot_completed_uav_hop_fraction",
+        ):
+            legacy.pop(column)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            normalized = prepare_training_history(
+                temp_dir, self.identity, checkpoint_rows=[legacy]
+            )
+
+        self.assertTrue(
+            all(
+                normalized[0][column] is None
+                for column in (
+                    "routing_reward_total",
+                    "routing_delivery_reward_total",
+                    "routing_progress_reward_total",
+                    "routing_positive_progress_reward_total",
+                    "routing_negative_progress_reward_total",
+                    "routing_completed_uav_hop_count",
+                    "routing_cross_slot_completed_uav_hop_count",
+                    "routing_cross_slot_completed_uav_hop_fraction",
+                )
+            )
+        )
+
+    def test_resume_keeps_legacy_unknown_row_and_appends_new_routing_values(self):
+        legacy = self._row(1)
+        for column in (
+            "routing_reward_total",
+            "routing_delivery_reward_total",
+            "routing_progress_reward_total",
+            "routing_positive_progress_reward_total",
+            "routing_negative_progress_reward_total",
+            "routing_completed_uav_hop_count",
+            "routing_cross_slot_completed_uav_hop_count",
+            "routing_cross_slot_completed_uav_hop_fraction",
+        ):
+            legacy.pop(column)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            resumed = prepare_training_history(
+                temp_dir, self.identity, checkpoint_rows=[legacy]
+            )
+            resumed.append(
+                self._row(
+                    2,
+                    routing_delivery=1.0,
+                    routing_positive_progress=0.5,
+                    completed_hops=2,
+                    cross_slot_hops=1,
+                )
+            )
+            persisted = write_training_history(
+                temp_dir, resumed, self.identity
+            )
+
+        self.assertEqual([row["episode"] for row in persisted], [1, 2])
+        self.assertIsNone(persisted[0]["routing_reward_total"])
+        self.assertIsNone(
+            persisted[0]["routing_completed_uav_hop_count"]
+        )
+        self.assertEqual(persisted[1]["routing_reward_total"], 1.5)
+        self.assertEqual(
+            persisted[1]["routing_cross_slot_completed_uav_hop_fraction"],
+            0.5,
         )
 
     def test_csv_and_jsonl_contain_the_same_finite_episode_rows(self):
@@ -299,6 +435,64 @@ class TrainingHistoryPersistenceTest(unittest.TestCase):
 
 
 class TrainingHistoryResumeIntegrationTest(unittest.TestCase):
+    def test_shared_training_entry_persists_routing_fields_for_all_routing_modes(self):
+        routing_fields = (
+            "routing_reward_total",
+            "routing_delivery_reward_total",
+            "routing_progress_reward_total",
+            "routing_positive_progress_reward_total",
+            "routing_negative_progress_reward_total",
+            "routing_completed_uav_hop_count",
+            "routing_cross_slot_completed_uav_hop_count",
+            "routing_cross_slot_completed_uav_hop_fraction",
+        )
+        manifest = generate_manifest("train", 7711, 1)
+        methods = (
+            "td3_dinkelbach",
+            "td3_dinkelbach_dqn",
+            "td3_dinkelbach_ddqn",
+            "td3_dinkelbach_random_routing",
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            for method_id in methods:
+                with self.subTest(method_id=method_id):
+                    run_dir = root / method_id
+                    result = train(
+                        TrainingConfig(
+                            total_episodes=1,
+                            mode="custom",
+                            episode_seconds=1,
+                            routing_slot_seconds=0.25,
+                            warmup_joint_transitions=0,
+                            routing_warmup_transitions=1,
+                            batch_size=1,
+                            enable_model_checkpoints=False,
+                            enable_full_resume=False,
+                            enable_plots=False,
+                            enable_csv=False,
+                            random_seed=7711,
+                            run_directory=str(run_dir),
+                        ),
+                        scenario_manifest=manifest,
+                        method_spec=MethodSpec.parse(method_id),
+                    )
+                    json_row = json.loads(
+                        (run_dir / "training_history.jsonl").read_text(
+                            encoding="utf-8"
+                        )
+                    )
+                    with (run_dir / "training_history.csv").open(
+                        "r", encoding="utf-8", newline=""
+                    ) as handle:
+                        csv_row = next(csv.DictReader(handle))
+                    for field in routing_fields:
+                        self.assertIn(field, json_row)
+                        self.assertIn(field, csv_row)
+                        self.assertEqual(
+                            json_row[field], result["episode_metrics"][0][field]
+                        )
+
     def test_short_exact_resume_reconciles_history_without_duplicate_rows(self):
         method = MethodSpec()
         manifest = generate_manifest("train", 6601, 2)
@@ -415,6 +609,22 @@ class TrainingHistoryResumeIntegrationTest(unittest.TestCase):
         self.assertEqual(resumed["training_history_rows"], expected_history)
         self.assertEqual(persisted, expected_history)
         self.assertEqual([row["episode"] for row in persisted], [1, 2])
+        routing_fields = (
+            "routing_reward_total",
+            "routing_delivery_reward_total",
+            "routing_progress_reward_total",
+            "routing_positive_progress_reward_total",
+            "routing_negative_progress_reward_total",
+            "routing_completed_uav_hop_count",
+            "routing_cross_slot_completed_uav_hop_count",
+            "routing_cross_slot_completed_uav_hop_fraction",
+        )
+        for persisted_row, metric_row in zip(
+            persisted, first["episode_metrics"]
+        ):
+            for field in routing_fields:
+                self.assertIn(field, persisted_row)
+                self.assertEqual(persisted_row[field], metric_row[field])
         self.assertEqual(resumed["dinkelbach_update_count"], 0)
         self.assertEqual(resumed["dinkelbach_state"], first["dinkelbach_state"])
         self.assertEqual(resumed["lambda_used_log"], first["lambda_used_log"])
