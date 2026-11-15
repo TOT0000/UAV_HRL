@@ -904,7 +904,18 @@ def run_paper_evaluation(
     flatten_single_point=False,
     collect_search_diagnostics=False,
     routing_loop_diagnostics=None,
+    mutual_next_hop_guard=False,
 ):
+    from mutual_next_hop_guard import (
+        MUTUAL_NEXT_HOP_GUARD_FINGERPRINT,
+        MUTUAL_NEXT_HOP_GUARD_SPEC,
+        MUTUAL_NEXT_HOP_GUARD_VERSION,
+        normalize_mutual_next_hop_guard,
+    )
+
+    mutual_next_hop_guard = normalize_mutual_next_hop_guard(
+        mutual_next_hop_guard
+    )
     validate_production_deadlines()
     suite = resolve_evaluation_suite(suite)
     definition = PAPER_EVALUATION_SUITES[suite]
@@ -1342,6 +1353,7 @@ def run_paper_evaluation(
                 # live/mock client configuration.
                 llm_explorer_mock=False,
                 routing_loop_diagnostics=routing_loop_diagnostics,
+                mutual_next_hop_guard=mutual_next_hop_guard,
             )
         diagnostic_outputs = write_packet_routing_diagnostic_artifacts(
             point_dir,
@@ -1765,6 +1777,19 @@ def run_paper_evaluation(
         ),
         "method_id": method.method_id,
         "method_spec": method.to_dict(),
+        "mutual_next_hop_guard": {
+            "enabled": bool(mutual_next_hop_guard),
+            "scope": "evaluation_only",
+            "strategy_version": (
+                MUTUAL_NEXT_HOP_GUARD_VERSION if mutual_next_hop_guard else None
+            ),
+            "strategy_fingerprint": (
+                MUTUAL_NEXT_HOP_GUARD_FINGERPRINT
+                if mutual_next_hop_guard
+                else None
+            ),
+            "strategy": MUTUAL_NEXT_HOP_GUARD_SPEC if mutual_next_hop_guard else None,
+        },
         "training_run": str(context["run_dir"]) if context["run_dir"] else None,
         "training_run_id": context["training_run_id"],
         "training_run_directory": (

@@ -17,7 +17,7 @@ from pathlib import Path
 import numpy as np
 
 
-ROUTING_LOOP_DIAGNOSTIC_SCHEMA_VERSION = "routing-loop-diagnostics-v2"
+ROUTING_LOOP_DIAGNOSTIC_SCHEMA_VERSION = "routing-loop-diagnostics-v3"
 ROUTING_LOOP_EVENT_DEFINITION = (
     "A completed U2U hop A->B immediately followed for the same packet by a "
     "completed U2U hop B->A; overlapping events are counted (A->B->A->B is two)."
@@ -37,6 +37,20 @@ ROUTING_LOOP_EVENT_FIELD_SEMANTICS = {
     ),
     "reused_preselected_action": (
         "this departure did not receive a packet-specific new policy decision"
+    ),
+}
+ROUTING_LOOP_SLOT_FIELD_SEMANTICS = {
+    "effective_masks": "packet-engine masks after physical and receiver-lock constraints",
+    "applied_effective_masks": (
+        "copied effective masks after same-slot mutual-next-hop exclusions; these masks "
+        "are supplied to policy legality checks and packet service"
+    ),
+    "selection_masks": (
+        "actual forwarding-only or forced-WAIT masks used for action selection"
+    ),
+    "selection_strategy.per_uav": (
+        "decision-time candidate counts, exclusions, forced-WAIT cause, order, and "
+        "partial-hop receiver lock; values are captured when that UAV is selected"
     ),
 }
 
@@ -103,6 +117,9 @@ def _new_stats():
         "twenty_hop_all_completed_in_one_slot": 0,
         "twenty_hop_delivered_to_gs": 0,
         "twenty_hop_hop_limit_not_delivered": 0,
+        "packet_hol_decision_count": 0,
+        "forced_wait_no_forwarding_candidate_count": 0,
+        "guard_induced_forced_wait_count": 0,
     }
 
 
@@ -127,6 +144,12 @@ class RoutingLoopDiagnosticsCollector:
         self._decision_departures = defaultdict(set)
         self._finalized = False
         self._initialized_pair_groups = set()
+        self._selection_decision_totals = {
+            "all_uav_decision_count": 0,
+            "forced_wait_no_forwarding_candidate_count": 0,
+            "guard_induced_forced_wait_count": 0,
+            "originally_no_forwarding_candidate_count": 0,
+        }
 
     @staticmethod
     def _packet_key(roi_count, scenario_id, packet_id):
@@ -190,15 +213,24 @@ class RoutingLoopDiagnosticsCollector:
         slot_index,
         physical_masks,
         effective_masks,
+        applied_effective_masks=None,
         selection_masks,
         selected_actions,
         start_of_slot_hol_by_sender,
+        selection_context=None,
     ):
         del packet_engine
         if self._episode is None:
             raise RuntimeError("routing-loop diagnostic episode is not active")
         num_uav = int(env.num_UAV)
         gs_id = int(env.GS_ID)
+        applied_effective_masks = (
+            effective_masks
+            if applied_effective_masks is None
+            else applied_effective_masks
+        )
+        selection_context = dict(selection_context or {})
+        per_uav_selection = selection_context.get("per_uav") or {}
         adjacency, edges, reachable = self._physical_graph(env)
         groups = set(self._group_keys(self._episode["roi_count"], "FOV"))
         groups.update(self._group_keys(self._episode["roi_count"], "COM"))
@@ -224,6 +256,26 @@ class RoutingLoopDiagnosticsCollector:
                 ),
             }
             selection = np.asarray(selection_masks[sender], dtype=bool)
+            selection_detail = dict(per_uav_selection.get(sender) or {})
+            filtered_count = selection_detail.get(
+                "filtered_non_wait_candidate_count"
+            )
+            if filtered_count is None:
+                filtered_count = int(
+                    np.count_nonzero(selection) - int(bool(selection[sender]))
+                )
+            self._selection_decision_totals["all_uav_decision_count"] += 1
+            self._selection_decision_totals[
+                "forced_wait_no_forwarding_candidate_count"
+            ] += int(int(filtered_count) == 0)
+            self._selection_decision_totals[
+                "guard_induced_forced_wait_count"
+            ] += int(bool(selection_detail.get("guard_induced_forced_wait", False)))
+            self._selection_decision_totals[
+                "originally_no_forwarding_candidate_count"
+            ] += int(
+                bool(selection_detail.get("originally_no_forwarding_candidate", False))
+            )
             physical_neighbors = sorted(
                 int(value) for value in adjacency[sender] if int(value) != sender
             )
@@ -244,7 +296,22 @@ class RoutingLoopDiagnosticsCollector:
                 "selection_legal_actions": np.flatnonzero(selection).astype(int).tolist(),
                 "physical_neighbors": physical_neighbors,
                 "physical_gs_reachable": bool(sender in reachable),
+                "guard_induced_forced_wait": bool(
+                    selection_detail.get("guard_induced_forced_wait", False)
+                ),
             }
+            if hol is not None:
+                for group in self._group_keys(
+                    self._episode["roi_count"], str(hol.get("task_type"))
+                ):
+                    stats = self._stats[group]
+                    stats["packet_hol_decision_count"] += 1
+                    stats["forced_wait_no_forwarding_candidate_count"] += int(
+                        int(filtered_count) == 0
+                    )
+                    stats["guard_induced_forced_wait_count"] += int(
+                        bool(selection_detail.get("guard_induced_forced_wait", False))
+                    )
         record = {
             "schema_version": ROUTING_LOOP_DIAGNOSTIC_SCHEMA_VERSION,
             "record_type": "routing_slot_snapshot",
@@ -272,11 +339,39 @@ class RoutingLoopDiagnosticsCollector:
             "effective_masks": {
                 str(uid): self._mask_values(effective_masks[uid]) for uid in range(num_uav)
             },
+            "applied_effective_masks": {
+                str(uid): self._mask_values(applied_effective_masks[uid])
+                for uid in range(num_uav)
+            },
             "selection_masks": {
                 str(uid): self._mask_values(selection_masks[uid]) for uid in range(num_uav)
             },
             "selected_next_hops": {
                 str(uid): int(selected_actions[uid]) for uid in range(num_uav)
+            },
+            "selection_strategy": {
+                "mutual_next_hop_guard": bool(
+                    selection_context.get("mutual_next_hop_guard", False)
+                ),
+                "strategy_version": selection_context.get("strategy_version"),
+                "strategy_fingerprint": selection_context.get(
+                    "strategy_fingerprint"
+                ),
+                "rotation_start_uav_id": selection_context.get(
+                    "rotation_start_uav_id"
+                ),
+                "selection_order": selection_context.get(
+                    "selection_order", list(range(num_uav))
+                ),
+                "per_uav": {
+                    str(uid): {
+                        **dict(per_uav_selection.get(uid) or {}),
+                        "partial_hop_receiver_lock": hol_rows[str(uid)][
+                            "hop_receiver_lock"
+                        ],
+                    }
+                    for uid in range(num_uav)
+                },
             },
             "slot_start_hol": hol_rows,
             "physical_topology": {
@@ -748,6 +843,7 @@ class RoutingLoopDiagnosticsCollector:
             "schema_version": ROUTING_LOOP_DIAGNOSTIC_SCHEMA_VERSION,
             "event_definition": ROUTING_LOOP_EVENT_DEFINITION,
             "event_field_semantics": ROUTING_LOOP_EVENT_FIELD_SEMANTICS,
+            "slot_field_semantics": ROUTING_LOOP_SLOT_FIELD_SEMANTICS,
             "denominator_notes": {
                 "event_ratios": "completed immediate-foldback events",
                 "distinct_packet_count": "scenario-qualified packets with at least one event",
@@ -761,6 +857,10 @@ class RoutingLoopDiagnosticsCollector:
                     "first departure of the slot-start HOL, same packet returned and reused, "
                     "other packet reused, empty-queue action reused, or unknown; event denominator"
                 ),
+                "grouped_forced_wait_counts": (
+                    "slot-start HOL decisions classified by that packet task; empty-queue "
+                    "preselections remain visible in selection_decisions and snapshots"
+                ),
                 "pair_twenty_hop": (
                     "distinct 20-completed-hop packets with at least one immediate foldback "
                     "for that pair; a packet may count once for each involved pair"
@@ -768,6 +868,7 @@ class RoutingLoopDiagnosticsCollector:
                 "overlap": "packet classifications are not mutually exclusive event categories",
             },
             "groups": summary_rows,
+            "selection_decisions": dict(self._selection_decision_totals),
             "uav_11_15": [
                 self._public_stats(group, stats)
                 for (group, pair), stats in sorted(
@@ -785,6 +886,7 @@ class RoutingLoopDiagnosticsCollector:
             "read_only_observer": True,
             "event_definition": ROUTING_LOOP_EVENT_DEFINITION,
             "event_field_semantics": ROUTING_LOOP_EVENT_FIELD_SEMANTICS,
+            "slot_field_semantics": ROUTING_LOOP_SLOT_FIELD_SEMANTICS,
             "slot_snapshot_count": self.snapshot_writer.row_count,
             "foldback_event_count": self.event_writer.row_count,
             "files": {

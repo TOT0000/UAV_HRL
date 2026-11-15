@@ -881,6 +881,7 @@ def _run_routing_slot(
     record_current_expected_capacities=False,
     stall_diagnostic_context=None,
     routing_loop_diagnostics=None,
+    mutual_next_hop_guard=False,
 ):
     del routing_masks
     packet_cost_attribution = (
@@ -969,7 +970,7 @@ def _run_routing_slot(
                 start_of_slot_hol_by_sender,
             )
 
-    next_hops, selection_diagnostics = _select_routing_actions(
+    next_hops, selection_diagnostics, selection_context = _select_routing_actions(
         ddqn,
         states,
         effective_masks,
@@ -979,23 +980,17 @@ def _run_routing_slot(
         exploration_prior_weight=exploration_prior_weight,
         zero_prior_mass_callback=zero_prior_mass_callback,
         return_diagnostics=True,
+        return_selection_context=True,
         capture_diagnostics=(
             routing_decision_observer is not None
             or routing_training_diagnostics is not None
         ),
+        mutual_next_hop_guard=mutual_next_hop_guard,
+        slot_index=absolute_slot,
     )
+    applied_effective_masks = selection_context["applied_effective_masks"]
+    selection_masks = selection_context["selection_masks"]
     if routing_loop_diagnostics is not None:
-        # Import and derive this only for the opt-in observer.  The helper is
-        # the policy's authoritative pure mask transformation; it copies its
-        # input and consumes no model inference or RNG.
-        from DDQN import forwarding_or_forced_wait_mask
-
-        selection_masks = {
-            uid: forwarding_or_forced_wait_mask(
-                effective_masks[uid], uid, len(effective_masks[uid])
-            )
-            for uid in routing_decision_uav_ids
-        }
         routing_loop_diagnostics.observe_slot(
             env=env,
             packet_engine=packet_engine,
@@ -1003,9 +998,11 @@ def _run_routing_slot(
             slot_index=int(absolute_slot),
             physical_masks=physical_masks,
             effective_masks=effective_masks,
+            applied_effective_masks=applied_effective_masks,
             selection_masks=selection_masks,
             selected_actions=next_hops,
             start_of_slot_hol_by_sender=start_of_slot_hol_by_sender,
+            selection_context=selection_context,
         )
     if routing_decision_observer is not None:
         for uid in routing_decision_uav_ids:
@@ -1016,7 +1013,7 @@ def _run_routing_slot(
                 if deadline_abs is None
                 else max(float(deadline_abs) - float(current_time), 0.0)
             )
-            legal_actions = np.flatnonzero(effective_masks[uid])
+            legal_actions = np.flatnonzero(selection_masks[uid])
             if record_current_expected_capacities:
                 capacity_observation = routing_expected_capacity_observation(
                     env, uid, legal_actions
@@ -1041,7 +1038,9 @@ def _run_routing_slot(
                     "sender_uav_id": int(uid),
                     "selected_action": int(next_hops[uid]),
                     "compact_routing_state": states[uid].astype(float).tolist(),
-                    "legal_action_mask": effective_masks[uid].astype(int).tolist(),
+                    "legal_action_mask": selection_masks[uid].astype(int).tolist(),
+                    "original_effective_action_mask": effective_masks[uid].astype(int).tolist(),
+                    "applied_effective_action_mask": applied_effective_masks[uid].astype(int).tolist(),
                     **capacity_observation,
                     "sender_total_backlog_bits": float(backlog_before.get(uid, 0.0)),
                     "hol_packet_id": None if hol is None else int(hol["id"]),
@@ -1068,7 +1067,7 @@ def _run_routing_slot(
                 # COM/FOV task class.
                 continue
             inspection = ddqn.inspect_action_scores(
-                states[uid], effective_masks[uid], uav_id=uid
+                states[uid], applied_effective_masks[uid], uav_id=uid
             )
             routing_q_score_accumulator.add_decision(
                 inspection,
@@ -1121,7 +1120,7 @@ def _run_routing_slot(
             for uid in routing_decision_uav_ids
         },
         routing_transition_ids_by_sender=routing_transition_ids,
-        effective_masks_by_sender=effective_masks,
+        effective_masks_by_sender=applied_effective_masks,
         collect_first_gen_event_diagnostics=(
             first_gen_slot_service_observer
         ),
@@ -1272,18 +1271,49 @@ def _select_routing_actions(
     exploration_prior_weight=0.8,
     zero_prior_mass_callback=None,
     return_diagnostics=False,
+    return_selection_context=False,
     capture_diagnostics=False,
+    mutual_next_hop_guard=False,
+    slot_index=None,
 ):
-    """Select all routing actions with one shared slot-level epsilon."""
+    """Select one action per UAV, optionally with the evaluation-only guard."""
 
+    from mutual_next_hop_guard import (
+        MUTUAL_NEXT_HOP_GUARD_FINGERPRINT,
+        MUTUAL_NEXT_HOP_GUARD_VERSION,
+        actual_selection_mask,
+        assert_no_mutual_next_hops,
+        forwarding_candidate_count,
+        guarded_effective_mask,
+        normalize_mutual_next_hop_guard,
+        rotating_priority,
+    )
+
+    guard_enabled = normalize_mutual_next_hop_guard(mutual_next_hop_guard)
+    uav_ids = tuple(sorted(int(uid) for uid in states))
+    if not uav_ids:
+        raise ValueError("routing action selection requires at least one UAV")
+    if guard_enabled and uav_ids != tuple(range(len(uav_ids))):
+        raise ValueError("routing UAV ids must be contiguous from zero")
+    if guard_enabled and slot_index is None:
+        raise ValueError("mutual next-hop guard requires the simulation slot index")
+
+    original_masks = {
+        uid: np.asarray(routing_masks[uid], dtype=bool).copy() for uid in uav_ids
+    }
     actions = {}
     diagnostics = {}
-    for uid in sorted(states):
+    applied_masks = {}
+    selection_masks = {}
+    per_uav_context = {}
+    selection_order = []
+
+    def select_one(uid, mask):
         if exploration_prior is None:
             selection_kwargs = dict(
                 state=states[uid],
                 uav_id=uid,
-                mask=routing_masks[uid],
+                mask=mask,
                 visited_nodes=None,
                 epsilon=epsilon,
                 logits_noise_std=0.0,
@@ -1295,72 +1325,152 @@ def _select_routing_actions(
             )
             if capture_diagnostics:
                 action, detail = selected
-                actions[uid] = int(action)
-                diagnostics[uid] = detail
+                return int(action), detail
             else:
-                actions[uid] = int(selected)
-                diagnostics[uid] = {
+                return int(selected), {
                     "decision_branch": "unknown_legacy_selection",
                     "zero_legal_prior_mass_fallback": False,
                     "exploration_distribution": None,
                 }
+        prior_kwargs = dict(
+            visited_nodes=None,
+            epsilon=epsilon,
+            logits_noise_std=0.0,
+            exploration_prior=np.asarray(exploration_prior)[uid],
+            zero_prior_mass_callback=zero_prior_mass_callback,
+            return_diagnostics=True,
+        )
+        if not np.isclose(float(exploration_prior_weight), 0.8):
+            prior_kwargs["exploration_prior_weight"] = float(
+                exploration_prior_weight
+            )
+        action, detail = ddqn.select_action(states[uid], uid, mask, **prior_kwargs)
+        if exploration_guidance_kind == "routing_weights":
+            raw_row = np.asarray(exploration_prior, dtype=np.float64)[uid]
+            whole_zero = not bool(np.any(raw_row > 0.0))
+            forwarding_mask = np.asarray(mask, dtype=bool).copy()
+            forwarding_mask[int(uid)] = False
+            forced_wait = not bool(forwarding_mask.any())
+            if forced_wait:
+                if int(action) != int(uid):
+                    raise AssertionError("forced WAIT must select the sender action")
+                detail["decision_branch"] = "forced_wait_no_legal_forwarding_action"
+                detail["zero_legal_prior_mass_fallback"] = False
+                detail["exploration_distribution"] = None
+            zero_legal = bool(
+                detail.get("zero_legal_prior_mass_fallback", False)
+            ) and not forced_wait
+            detail["routing_weights_applied"] = bool(
+                not forced_wait
+                and not zero_legal
+                and detail.get("decision_branch") == "epsilon_exploration"
+            )
+            detail["routing_weight_row_all_zero"] = whole_zero
+            detail["routing_weight_row_positive"] = not whole_zero
+            detail["zero_legal_routing_weight_after_mask"] = bool(
+                zero_legal and not whole_zero
+            )
+            detail["routing_weight_uniform_fallback_used"] = zero_legal
+            detail["routing_weight_uniform_fallback_reason"] = (
+                "all_weights_zero"
+                if zero_legal and whole_zero
+                else "legal_weights_zero_after_mask"
+                if zero_legal
+                else None
+            )
+        return int(action), detail
+
+    remaining = set(uav_ids)
+    while remaining:
+        candidates = {}
+        for uid in remaining:
+            if guard_enabled:
+                working_mask, excluded = guarded_effective_mask(
+                    original_masks[uid], uid, actions
+                )
+            else:
+                working_mask = original_masks[uid].copy()
+                excluded = ()
+            candidates[uid] = (
+                forwarding_candidate_count(working_mask, uid),
+                working_mask,
+                excluded,
+            )
+
+        if guard_enabled:
+            uid = min(
+                remaining,
+                key=lambda value: (
+                    candidates[value][0],
+                    rotating_priority(value, slot_index, len(uav_ids)),
+                ),
+            )
         else:
-            prior_kwargs = dict(
-                visited_nodes=None,
-                epsilon=epsilon,
-                logits_noise_std=0.0,
-                exploration_prior=np.asarray(exploration_prior)[uid],
-                zero_prior_mass_callback=zero_prior_mass_callback,
-                return_diagnostics=True,
+            uid = min(remaining)
+        filtered_count, working_mask, excluded = candidates[uid]
+        original_count = forwarding_candidate_count(original_masks[uid], uid)
+        formal_mask = (
+            actual_selection_mask(working_mask, uid)
+            if 0 <= int(uid) < len(working_mask) - 1
+            else working_mask.copy()
+        )
+        guard_forced_wait = bool(
+            guard_enabled and original_count > 0 and filtered_count == 0
+        )
+        if guard_enabled and filtered_count == 0:
+            action = int(uid)
+            detail = {
+                "decision_branch": "guard_induced_forced_wait"
+                if guard_forced_wait
+                else "forced_wait_no_legal_forwarding_action",
+                "zero_legal_prior_mass_fallback": False,
+                "exploration_distribution": None,
+            }
+        else:
+            action, detail = select_one(uid, working_mask)
+        if not bool(formal_mask[int(action)]):
+            raise AssertionError(
+                f"routing policy selected illegal action {action} for UAV {uid}"
             )
-            if not np.isclose(float(exploration_prior_weight), 0.8):
-                prior_kwargs["exploration_prior_weight"] = float(
-                    exploration_prior_weight
-                )
-            action, detail = ddqn.select_action(
-                states[uid], uid, routing_masks[uid], **prior_kwargs
-            )
-            if exploration_guidance_kind == "routing_weights":
-                raw_row = np.asarray(exploration_prior, dtype=np.float64)[uid]
-                whole_zero = not bool(np.any(raw_row > 0.0))
-                effective_mask = np.asarray(routing_masks[uid], dtype=bool)
-                forwarding_mask = effective_mask.copy()
-                forwarding_mask[int(uid)] = False
-                forced_wait = not bool(forwarding_mask.any())
-                if forced_wait:
-                    if int(action) != int(uid):
-                        raise AssertionError(
-                            "forced WAIT must select the sender action"
-                        )
-                    detail["decision_branch"] = (
-                        "forced_wait_no_legal_forwarding_action"
-                    )
-                    detail["zero_legal_prior_mass_fallback"] = False
-                    detail["exploration_distribution"] = None
-                zero_legal = bool(
-                    detail.get("zero_legal_prior_mass_fallback", False)
-                ) and not forced_wait
-                detail["routing_weights_applied"] = bool(
-                    not forced_wait
-                    and not zero_legal
-                    and detail.get("decision_branch") == "epsilon_exploration"
-                )
-                detail["routing_weight_row_all_zero"] = whole_zero
-                detail["routing_weight_row_positive"] = not whole_zero
-                detail["zero_legal_routing_weight_after_mask"] = bool(
-                    zero_legal and not whole_zero
-                )
-                detail["routing_weight_uniform_fallback_used"] = zero_legal
-                detail["routing_weight_uniform_fallback_reason"] = (
-                    "all_weights_zero"
-                    if zero_legal and whole_zero
-                    else "legal_weights_zero_after_mask"
-                    if zero_legal
-                    else None
-                )
-            actions[uid] = int(action)
-            diagnostics[uid] = detail
-    return (actions, diagnostics) if return_diagnostics else actions
+
+        actions[uid] = int(action)
+        diagnostics[uid] = detail
+        applied_masks[uid] = working_mask.copy()
+        selection_masks[uid] = formal_mask.copy()
+        selection_order.append(uid)
+        per_uav_context[uid] = {
+            "selection_order_index": len(selection_order) - 1,
+            "original_non_wait_candidate_count": int(original_count),
+            "filtered_non_wait_candidate_count": int(filtered_count),
+            "excluded_candidates_by_selected_uav": [int(value) for value in excluded],
+            "guard_induced_forced_wait": guard_forced_wait,
+            "originally_no_forwarding_candidate": bool(original_count == 0),
+        }
+        remaining.remove(uid)
+
+    if guard_enabled:
+        assert_no_mutual_next_hops(actions, len(uav_ids))
+    context = {
+        "mutual_next_hop_guard": bool(guard_enabled),
+        "strategy_version": MUTUAL_NEXT_HOP_GUARD_VERSION if guard_enabled else None,
+        "strategy_fingerprint": (
+            MUTUAL_NEXT_HOP_GUARD_FINGERPRINT if guard_enabled else None
+        ),
+        "rotation_start_uav_id": (
+            int(slot_index) % len(uav_ids) if guard_enabled else None
+        ),
+        "selection_order": [int(uid) for uid in selection_order],
+        "per_uav": per_uav_context,
+        "applied_effective_masks": applied_masks,
+        "selection_masks": selection_masks,
+    }
+    if return_diagnostics and return_selection_context:
+        return actions, diagnostics, context
+    if return_diagnostics:
+        return actions, diagnostics
+    if return_selection_context:
+        return actions, context
+    return actions
 
 
 def _mark_search_observations(
@@ -2418,6 +2528,7 @@ def train(
     llm_explorer_client=None,
     llm_explorer_log_mode=None,
     routing_loop_diagnostics=None,
+    mutual_next_hop_guard=False,
 ):
     if config is None:
         raise ValueError(
@@ -2426,6 +2537,16 @@ def train(
         )
     method_spec = method_spec or MethodSpec()
     formal_evaluation = bool(formal_evaluation)
+    from mutual_next_hop_guard import normalize_mutual_next_hop_guard
+
+    mutual_next_hop_guard = normalize_mutual_next_hop_guard(
+        mutual_next_hop_guard
+    )
+    if mutual_next_hop_guard and not evaluation:
+        raise ValueError(
+            "mutual-next-hop guard is evaluation-only and cannot be enabled "
+            "during training"
+        )
     if formal_evaluation and not evaluation:
         raise ValueError("formal_evaluation requires evaluation=True")
     # Reconstructing validates even subclasses or deserialized specifications.
@@ -4098,6 +4219,7 @@ def train(
                         "slot_index": absolute_slot,
                     },
                     routing_loop_diagnostics=routing_loop_diagnostics,
+                    mutual_next_hop_guard=mutual_next_hop_guard,
                 )
                 ddqn_action_selections += action_selections
                 interval_delivered_bits += delivered_bits
