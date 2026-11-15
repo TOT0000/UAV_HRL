@@ -17,11 +17,28 @@ from pathlib import Path
 import numpy as np
 
 
-ROUTING_LOOP_DIAGNOSTIC_SCHEMA_VERSION = "routing-loop-diagnostics-v1"
+ROUTING_LOOP_DIAGNOSTIC_SCHEMA_VERSION = "routing-loop-diagnostics-v2"
 ROUTING_LOOP_EVENT_DEFINITION = (
     "A completed U2U hop A->B immediately followed for the same packet by a "
     "completed U2U hop B->A; overlapping events are counted (A->B->A->B is two)."
 )
+ROUTING_LOOP_EVENT_FIELD_SEMANTICS = {
+    "was_original_decision_slot_start_hol": (
+        "packet identity matched the HOL captured in the referenced decision snapshot"
+    ),
+    "packet_decision_relation": (
+        "how this departure used the referenced decision: first HOL departure, "
+        "same-packet return reuse, other-packet reuse, empty-queue reuse, or unknown"
+    ),
+    "reused_same_packet_preselected_action": (
+        "the same packet had already completed a departure from this sender using "
+        "the referenced decision, including a prior-slot partial hop completed in "
+        "that decision slot"
+    ),
+    "reused_preselected_action": (
+        "this departure did not receive a packet-specific new policy decision"
+    ),
+}
 
 
 def _json_default(value):
@@ -73,6 +90,8 @@ def _new_stats():
         "gs_unreachable_with_alternative": 0,
         "gs_unreachable_without_alternative": 0,
         "slot_start_hol": 0,
+        "first_departure_slot_start_hol": 0,
+        "reused_same_packet_action": 0,
         "reused_other_packet_action": 0,
         "reused_empty_queue_action": 0,
         "decision_relation_unknown": 0,
@@ -105,6 +124,7 @@ class RoutingLoopDiagnosticsCollector:
         self._current_decisions = {}
         self._hop_origins = {}
         self._hop_slot_state = {}
+        self._decision_departures = defaultdict(set)
         self._finalized = False
         self._initialized_pair_groups = set()
 
@@ -125,6 +145,7 @@ class RoutingLoopDiagnosticsCollector:
         self._current_decisions = {}
         self._hop_origins = {}
         self._hop_slot_state = {}
+        self._decision_departures = defaultdict(set)
         for group in self._group_keys(int(roi_count), "FOV") + self._group_keys(
             int(roi_count), "COM"
         ):
@@ -281,13 +302,31 @@ class RoutingLoopDiagnosticsCollector:
         if decision is None:
             return None
         packet_id = int(event["packet_id"])
-        if decision["hol_packet_id"] == packet_id:
-            relation = "slot_start_hol"
-        elif decision["hol_packet_id"] is None:
-            relation = "reused_empty_queue_preselected_action"
-        else:
-            relation = "reused_other_packet_preselected_action"
-        return {**decision, "packet_decision_relation": relation}
+        return {
+            **decision,
+            "was_original_decision_slot_start_hol": (
+                decision["hol_packet_id"] == packet_id
+            ),
+        }
+
+    @staticmethod
+    def _decision_relation(origin, reused_same_packet):
+        """Separate decision-time HOL identity from reuse after a return.
+
+        Completed-departure uses are keyed by decision snapshot.  In
+        particular this identifies a repeat departure when the first hop began
+        in an earlier slot and completed under the current slot's held action.
+        """
+
+        if origin is None:
+            return "unknown"
+        if reused_same_packet:
+            return "reused_same_packet_preselected_action"
+        if origin["was_original_decision_slot_start_hol"]:
+            return "first_departure_slot_start_hol"
+        if origin["hol_packet_id"] is None:
+            return "reused_empty_queue_preselected_action"
+        return "reused_other_packet_preselected_action"
 
     def observe_hop_event(self, event):
         if self._episode is None:
@@ -321,6 +360,31 @@ class RoutingLoopDiagnosticsCollector:
 
         origin = self._hop_origins.pop(hop_key, None)
         completed_hops = list(event.get("completed_hops") or ())
+        sender = int(event["sender_uav_id"])
+        origin_departure_key = (
+            None
+            if origin is None
+            else (packet_key, sender, origin["decision_key"])
+        )
+        completion_departure_key = (
+            None
+            if slot_decision is None
+            else (packet_key, sender, slot_decision["decision_key"])
+        )
+        reused_for_origin = bool(
+            origin_departure_key is not None
+            and self._decision_departures[origin_departure_key]
+        )
+        reused_for_completion_slot = bool(
+            completion_departure_key is not None
+            and self._decision_departures[completion_departure_key]
+        )
+        # A completion is a use of both its traced start decision and the
+        # current slot's held action.  Recording the latter is what makes a
+        # prior-slot partial completion count before a same-slot return.
+        for departure_key in {origin_departure_key, completion_departure_key}:
+            if departure_key is not None:
+                self._decision_departures[departure_key].add(hop_number)
         if str(event.get("link_type")) != "U2U" or len(completed_hops) < 2:
             return
         previous = completed_hops[-2]
@@ -337,7 +401,6 @@ class RoutingLoopDiagnosticsCollector:
         if not is_foldback:
             return
 
-        sender = int(event["sender_uav_id"])
         receiver = int(event["receiver_id"])
         if origin is None:
             actual_alternatives = None
@@ -358,7 +421,7 @@ class RoutingLoopDiagnosticsCollector:
                 for action in origin["physical_neighbors"]
                 if action not in {sender, receiver}
             )
-            relation = origin["packet_decision_relation"]
+            relation = self._decision_relation(origin, reused_for_origin)
             decision_snapshot_id = origin["snapshot_id"]
             decision_key = origin["decision_key"]
             gs_reachable = bool(origin["physical_gs_reachable"])
@@ -378,12 +441,15 @@ class RoutingLoopDiagnosticsCollector:
                 for action in slot_decision["physical_neighbors"]
                 if action not in {sender, receiver}
             )
-            if slot_decision["hol_packet_id"] == int(event["packet_id"]):
-                completion_slot_relation = "slot_start_hol"
-            elif slot_decision["hol_packet_id"] is None:
-                completion_slot_relation = "reused_empty_queue_preselected_action"
-            else:
-                completion_slot_relation = "reused_other_packet_preselected_action"
+            completion_slot_relation = self._decision_relation(
+                {
+                    **slot_decision,
+                    "was_original_decision_slot_start_hol": (
+                        slot_decision["hol_packet_id"] == int(event["packet_id"])
+                    ),
+                },
+                reused_for_completion_slot,
+            )
         event_id = (
             f"{packet_key[0]}|{packet_key[1]}|packet={packet_key[2]}|hop={hop_number}"
         )
@@ -409,18 +475,29 @@ class RoutingLoopDiagnosticsCollector:
             ),
             "decision_trace_status": "known" if origin is not None else "unknown",
             "packet_decision_relation": relation,
-            "was_slot_start_hol": relation == "slot_start_hol" if origin else None,
+            "was_slot_start_hol": (
+                origin["was_original_decision_slot_start_hol"]
+                if origin
+                else None
+            ),
             "was_original_decision_slot_start_hol": (
-                relation == "slot_start_hol" if origin else None
+                origin["was_original_decision_slot_start_hol"]
+                if origin
+                else None
             ),
             "completion_slot_packet_decision_relation": completion_slot_relation,
             "was_completion_slot_start_hol": (
                 None
                 if slot_decision is None
-                else completion_slot_relation == "slot_start_hol"
+                else slot_decision["hol_packet_id"] == int(event["packet_id"])
             ),
             "reused_preselected_action": (
                 relation.startswith("reused_") if origin else None
+            ),
+            "reused_same_packet_preselected_action": (
+                relation == "reused_same_packet_preselected_action"
+                if origin
+                else None
             ),
             "cross_slot_transmission": bool(event["cross_slot_transmission"]),
             "existing_receiver_lock_traced_to_prior_decision": bool(
@@ -478,7 +555,20 @@ class RoutingLoopDiagnosticsCollector:
 
     @staticmethod
     def _group_keys(roi_count, task_type):
-        return ("ALL", f"ROI_{int(roi_count)}", "VS" if task_type == "FOV" else "COM")
+        task = "VS" if task_type == "FOV" else "COM"
+        roi = int(roi_count)
+        return ((None, "ALL"), (None, task), (roi, "ALL"), (roi, task))
+
+    @staticmethod
+    def _group_label(group):
+        roi_count, task = group
+        return task if roi_count is None else f"ROI_{roi_count}_{task}"
+
+    @staticmethod
+    def _group_sort_key(group):
+        roi_count, task = group
+        task_order = {"ALL": 0, "VS": 1, "COM": 2}
+        return (-1 if roi_count is None else int(roi_count), task_order[task])
 
     def _add_event(self, record, packet_key, decision_key):
         pair = tuple(sorted((int(record["sender_uav_id"]), int(record["receiver_uav_id"]))))
@@ -515,11 +605,15 @@ class RoutingLoopDiagnosticsCollector:
                 prefix = "gs_reachable" if reachable else "gs_unreachable"
                 stats[f"{prefix}_{suffix}"] += 1
         relation_key = {
-            "slot_start_hol": "slot_start_hol",
+            "first_departure_slot_start_hol": "first_departure_slot_start_hol",
+            "reused_same_packet_preselected_action": "reused_same_packet_action",
             "reused_other_packet_preselected_action": "reused_other_packet_action",
             "reused_empty_queue_preselected_action": "reused_empty_queue_action",
         }.get(record["packet_decision_relation"], "decision_relation_unknown")
         stats[relation_key] += 1
+        stats["slot_start_hol"] += int(
+            bool(record.get("was_original_decision_slot_start_hol"))
+        )
         stats["cross_slot_transmission"] += int(record["cross_slot_transmission"])
 
     def end_episode(self, packet_outcomes):
@@ -552,21 +646,30 @@ class RoutingLoopDiagnosticsCollector:
             completed = int(outcome.get("completed_uav_hop_count", 0))
             if completed == 20:
                 hop_state = self._hop_slot_state.get(packet_key)
-                for group in groups:
-                    stats = self._stats[group]
+                delivered = bool(outcome.get("delivered_to_gs", False))
+
+                def update_twenty_hop(stats):
                     stats["twenty_hop_terminal_packet_count"] += 1
                     stats["twenty_hop_all_completed_in_one_slot"] += int(
                         hop_state is not None
                         and hop_state["count"] == 20
                         and hop_state["all_same_slot"]
                     )
-                    delivered = bool(outcome.get("delivered_to_gs", False))
                     stats["twenty_hop_delivered_to_gs"] += int(delivered)
-                    stats["twenty_hop_hop_limit_not_delivered"] += int(not delivered)
+                    stats["twenty_hop_hop_limit_not_delivered"] += int(
+                        not delivered
+                    )
+
+                for group in groups:
+                    update_twenty_hop(self._stats[group])
+                for (group, _pair), stats in self._pair_stats.items():
+                    if group in groups and packet_key in stats["packet_keys"]:
+                        update_twenty_hop(stats)
         self._episode = None
         self._current_decisions = {}
         self._hop_origins = {}
         self._hop_slot_state = {}
+        self._decision_departures = defaultdict(set)
 
     @staticmethod
     def _ratio(numerator, denominator):
@@ -576,7 +679,9 @@ class RoutingLoopDiagnosticsCollector:
         event_count = int(stats["event_count"])
         twenty_count = int(stats["twenty_hop_terminal_packet_count"])
         row = {
-            "group": group,
+            "group": self._group_label(group),
+            "roi_count": group[0],
+            "task": group[1],
             "event_count": event_count,
             "distinct_packet_count": len(stats["packet_keys"]),
             "distinct_decision_count": len(stats["decision_keys"]),
@@ -591,6 +696,12 @@ class RoutingLoopDiagnosticsCollector:
                 ),
                 "gs_reachable_ratio": self._ratio(stats["gs_reachable"], event_count),
                 "slot_start_hol_ratio": self._ratio(stats["slot_start_hol"], event_count),
+                "reused_preselected_action_ratio": self._ratio(
+                    stats["reused_same_packet_action"]
+                    + stats["reused_other_packet_action"]
+                    + stats["reused_empty_queue_action"],
+                    event_count,
+                ),
                 "twenty_hop_all_completed_in_one_slot_ratio": self._ratio(
                     stats["twenty_hop_all_completed_in_one_slot"], twenty_count
                 ),
@@ -618,10 +729,13 @@ class RoutingLoopDiagnosticsCollector:
         self.event_writer.close()
         summary_rows = [
             self._public_stats(group, self._stats[group])
-            for group in sorted(self._stats, key=lambda value: (value != "ALL", value))
+            for group in sorted(self._stats, key=self._group_sort_key)
         ]
         pair_rows = []
-        for (group, pair), stats in sorted(self._pair_stats.items()):
+        for (group, pair), stats in sorted(
+            self._pair_stats.items(),
+            key=lambda item: (self._group_sort_key(item[0][0]), item[0][1]),
+        ):
             pair_rows.append(
                 {
                     **self._public_stats(group, stats),
@@ -633,17 +747,35 @@ class RoutingLoopDiagnosticsCollector:
         summary = {
             "schema_version": ROUTING_LOOP_DIAGNOSTIC_SCHEMA_VERSION,
             "event_definition": ROUTING_LOOP_EVENT_DEFINITION,
+            "event_field_semantics": ROUTING_LOOP_EVENT_FIELD_SEMANTICS,
             "denominator_notes": {
                 "event_ratios": "completed immediate-foldback events",
                 "distinct_packet_count": "scenario-qualified packets with at least one event",
                 "distinct_decision_count": "sender decisions referenced by at least one event",
                 "twenty_hop_ratio": "terminal packets with exactly 20 completed UAV hops",
+                "slot_start_hol_ratio": (
+                    "events whose packet was the original decision's slot-start HOL; "
+                    "this identity is independent of whether the departure reused the decision"
+                ),
+                "decision_use_categories": (
+                    "first departure of the slot-start HOL, same packet returned and reused, "
+                    "other packet reused, empty-queue action reused, or unknown; event denominator"
+                ),
+                "pair_twenty_hop": (
+                    "distinct 20-completed-hop packets with at least one immediate foldback "
+                    "for that pair; a packet may count once for each involved pair"
+                ),
                 "overlap": "packet classifications are not mutually exclusive event categories",
             },
             "groups": summary_rows,
             "uav_11_15": [
                 self._public_stats(group, stats)
-                for (group, pair), stats in sorted(self._pair_stats.items())
+                for (group, pair), stats in sorted(
+                    self._pair_stats.items(),
+                    key=lambda item: (
+                        self._group_sort_key(item[0][0]), item[0][1]
+                    ),
+                )
                 if pair == (11, 15)
             ],
         }
@@ -652,6 +784,7 @@ class RoutingLoopDiagnosticsCollector:
             "collector_enabled": True,
             "read_only_observer": True,
             "event_definition": ROUTING_LOOP_EVENT_DEFINITION,
+            "event_field_semantics": ROUTING_LOOP_EVENT_FIELD_SEMANTICS,
             "slot_snapshot_count": self.snapshot_writer.row_count,
             "foldback_event_count": self.event_writer.row_count,
             "files": {

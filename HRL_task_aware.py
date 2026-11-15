@@ -985,6 +985,17 @@ def _run_routing_slot(
         ),
     )
     if routing_loop_diagnostics is not None:
+        # Import and derive this only for the opt-in observer.  The helper is
+        # the policy's authoritative pure mask transformation; it copies its
+        # input and consumes no model inference or RNG.
+        from DDQN import forwarding_or_forced_wait_mask
+
+        selection_masks = {
+            uid: forwarding_or_forced_wait_mask(
+                effective_masks[uid], uid, len(effective_masks[uid])
+            )
+            for uid in routing_decision_uav_ids
+        }
         routing_loop_diagnostics.observe_slot(
             env=env,
             packet_engine=packet_engine,
@@ -992,7 +1003,7 @@ def _run_routing_slot(
             slot_index=int(absolute_slot),
             physical_masks=physical_masks,
             effective_masks=effective_masks,
-            selection_masks=effective_masks,
+            selection_masks=selection_masks,
             selected_actions=next_hops,
             start_of_slot_hol_by_sender=start_of_slot_hol_by_sender,
         )
