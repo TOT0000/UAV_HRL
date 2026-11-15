@@ -1397,6 +1397,7 @@ def _evaluation_preflight(args):
         movement_state_dim += int(llm_identity["feature_count"])
     inspect_model_checkpoint(
         args.checkpoint,
+        allow_safe_constraint_config_mismatch=True,
         movement_state_dim=movement_state_dim,
         joint_action_dim=JOINT_ACTION_DIM,
         routing_state_dim=ROUTING_STATE_DIM,

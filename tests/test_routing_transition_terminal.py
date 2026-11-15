@@ -17,7 +17,17 @@ class FixedRoutingPolicy:
         self.actions = actions
 
     def select_action(self, state, uav_id, mask=None, **kwargs):
-        return self.actions.get(int(uav_id), int(uav_id))
+        del state, kwargs
+        sender = int(uav_id)
+        legal = np.asarray(mask, dtype=bool).copy()
+        forwarding = legal.copy()
+        forwarding[sender] = False
+        if forwarding.any():
+            preferred = int(self.actions.get(sender, sender))
+            if preferred != sender and forwarding[preferred]:
+                return preferred
+            return int(np.flatnonzero(forwarding)[0])
+        return sender
 
 
 class RoutingTransitionTerminalTest(unittest.TestCase):
@@ -253,7 +263,7 @@ def test_all_learning_routing_agents_store_sender_local_progress(
         rng_streams=NamedRNGStreams(123),
     )
     assert agent.routing_agent_kind == routing_kind
-    agent.select_action = lambda state, uav_id, **kwargs: actions[int(uav_id)]
+    agent.select_action = FixedRoutingPolicy(actions).select_action
     replay = ReplayBufferDiscrete(
         ROUTING_STATE_DIM, ROUTING_ACTION_DIM, max_size=64, n_step=1
     )

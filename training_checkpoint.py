@@ -932,15 +932,13 @@ def _routing_agent_configuration(agent, resolved_configuration=None):
     return common
 
 
-def _validate_safe_ddqn_constraint_metadata(metadata):
+def _validate_safe_ddqn_constraint_metadata(
+    metadata, *, allow_historical_hyperparameters=False
+):
     if metadata.get("routing_agent_kind", "safe_ddqn") != "safe_ddqn":
         return
     routing = metadata.get("routing_agent_configuration") or {}
-    expected = {
-        "initial_lambda_cost": SAFE_DDQN_INITIAL_LAMBDA_COST,
-        "normalized_eta_c": SAFE_DDQN_ETA_C,
-        "qos_target_probability": SAFE_DDQN_QOS_TARGET_PROBABILITY,
-        "system_dvp_target": SAFE_DDQN_QOS_TARGET_PROBABILITY,
+    structural_expected = {
         "lambda_update_scope": "episode_end",
         "lambda_update_mode": "direct_episode_system_dvp",
         "cost_denominator": "episode_system_eligible_packets",
@@ -949,9 +947,46 @@ def _validate_safe_ddqn_constraint_metadata(metadata):
     }
     mismatches = {
         field: (routing.get(field), value)
-        for field, value in expected.items()
+        for field, value in structural_expected.items()
         if not _metadata_value_matches(routing.get(field), value)
     }
+    hyperparameters = {
+        "initial_lambda_cost": SAFE_DDQN_INITIAL_LAMBDA_COST,
+        "normalized_eta_c": SAFE_DDQN_ETA_C,
+        "qos_target_probability": SAFE_DDQN_QOS_TARGET_PROBABILITY,
+        "system_dvp_target": SAFE_DDQN_QOS_TARGET_PROBABILITY,
+    }
+    if allow_historical_hyperparameters:
+        try:
+            initial_lambda = float(routing["initial_lambda_cost"])
+            eta_c = float(routing["normalized_eta_c"])
+            target = float(routing["qos_target_probability"])
+            system_target = float(routing["system_dvp_target"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise RuntimeError(
+                "checkpoint safe-DDQN constraint metadata is incomplete or "
+                "invalid for model evaluation"
+            ) from exc
+        if (
+            not np.isfinite(initial_lambda)
+            or not np.isclose(initial_lambda, SAFE_DDQN_INITIAL_LAMBDA_COST)
+            or not np.isfinite(eta_c)
+            or eta_c <= 0.0
+            or not np.isfinite(target)
+            or not 0.0 <= target <= 1.0
+            or not np.isfinite(system_target)
+            or not np.isclose(target, system_target)
+        ):
+            mismatches["historical_constraint_hyperparameters"] = (
+                dict(hyperparameters),
+                "initial lambda 0, eta > 0, and matching targets in [0,1]",
+            )
+    else:
+        mismatches.update({
+            field: (routing.get(field), value)
+            for field, value in hyperparameters.items()
+            if not _metadata_value_matches(routing.get(field), value)
+        })
     if mismatches or "lambda_cost" not in routing:
         raise RuntimeError(
             "checkpoint safe-DDQN constraint metadata is incomplete or "
@@ -1854,6 +1889,7 @@ def validate_model_checkpoint_metadata(
     current_training_manifest=None,
     movement_agent_kind=None,
     allow_incomplete_provenance=False,
+    allow_safe_constraint_config_mismatch=False,
 ):
     """Validate evaluation provenance before any model payload is loaded."""
 
@@ -1957,7 +1993,10 @@ def validate_model_checkpoint_metadata(
         _validate_effective_formal_movement_config(
             experiment["formal_config"], metadata.get("movement_agent_kind", "td3"), metadata
         )
-    _validate_safe_ddqn_constraint_metadata(metadata)
+    _validate_safe_ddqn_constraint_metadata(
+        metadata,
+        allow_historical_hyperparameters=allow_safe_constraint_config_mismatch,
+    )
     checkpoint_training_provenance(
         metadata, allow_incomplete=allow_incomplete_provenance
     )
@@ -1982,6 +2021,7 @@ def inspect_model_checkpoint(
     require_episode_directory=False,
     movement_agent_kind=None,
     allow_incomplete_provenance=False,
+    allow_safe_constraint_config_mismatch=False,
 ):
     """Validate model metadata and required files without loading weights."""
 
@@ -2005,6 +2045,9 @@ def inspect_model_checkpoint(
         current_training_manifest=current_training_manifest,
         movement_agent_kind=movement_agent_kind,
         allow_incomplete_provenance=allow_incomplete_provenance,
+        allow_safe_constraint_config_mismatch=(
+            allow_safe_constraint_config_mismatch
+        ),
     )
     if not models_path.is_file():
         raise RuntimeError(f"checkpoint model payload is missing: {models_path}")
@@ -2077,6 +2120,9 @@ def load_model_checkpoint(
         training_run_directory=training_run_directory,
         movement_agent_kind=_agent_kind(td3),
         allow_incomplete_provenance=allow_incomplete_provenance,
+        allow_safe_constraint_config_mismatch=(
+            allow_safe_constraint_config_mismatch
+        ),
     )
     metadata = inspected["metadata"]
     payload = torch.load(

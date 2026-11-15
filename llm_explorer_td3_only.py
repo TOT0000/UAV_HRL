@@ -49,7 +49,7 @@ from llm_explorer_v3 import (
 LLM_EXPLORER_TD3_ONLY_METHOD_ID = "td3_dinkelbach_llm_explorer_td3_only"
 LLM_EXPLORER_TD3_ONLY_VERSION = "uav-hrl-llm-explorer-td3-only-v1"
 LLM_EXPLORER_TD3_ONLY_PROMPT_VERSION = (
-    "uav-hrl-llm-explorer-td3-only-prompts-v4-complete-ee-no-c10"
+    "uav-hrl-llm-explorer-td3-only-prompts-v5-runtime-routing-policy"
 )
 LLM_EXPLORER_TD3_ONLY_SUMMARY_VERSION = (
     "shared-goodput-movement-communication-summary-v3"

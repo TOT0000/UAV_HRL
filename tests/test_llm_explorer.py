@@ -515,6 +515,36 @@ def test_first_gen_prompt_and_environment_use_complete_goodput_no_c10_contract()
     assert environment["packet_deadline_policy"].startswith("target delay classifies")
 
 
+def test_rendered_llm_runtime_policy_matches_effective_speed_guard_and_safe_qos():
+    environment = environment_constants_and_definitions_first_gen(
+        episode_seconds=60,
+        routing_slot_seconds=0.25,
+        sr_speed_mps=7.5,
+        mutual_next_hop_guard=False,
+    )
+    assert environment["source_responder_effective_speed_mps"] == 7.5
+    strategy = environment["routing_selection_strategy"]
+    assert strategy["enabled"] is False
+    assert strategy["strategy"]["ordering"] == "fixed_uav_id_order"
+    safe_ddqn = environment["safe_ddqn"]
+    assert safe_ddqn["score"] == "Q_reward - lambda_cost * Q_cost"
+    assert safe_ddqn["qos_target_probability"] == 0.05
+    assert safe_ddqn["lambda_cost_step_size"] == 0.05
+    prompt_root = Path(__file__).resolve().parents[1] / "prompts"
+    template = (prompt_root / "llm_explorer_system.txt").read_text(
+        encoding="utf-8"
+    )
+    rendered = template + render_prompt(
+        "\n{{SETTINGS_AND_DATA_DEFINITIONS}}",
+        {"SETTINGS_AND_DATA_DEFINITIONS": environment},
+    )
+    assert "target is 5%" in rendered
+    assert "update coefficient is 0.05" in rendered
+    assert '"source_responder_effective_speed_mps":7.5' in rendered
+    assert '"mutual_next_hop_guard_enabled":false' in rendered
+    assert "target is 1%" not in rendered
+
+
 def test_first_gen_method_ids_share_reward_semantics_but_keep_protocol_identity():
     kwargs = {"episode_seconds": 60, "routing_slot_seconds": 0.25}
     enabled = environment_constants_and_definitions_first_gen(**kwargs)

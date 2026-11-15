@@ -115,9 +115,14 @@ class CheckpointEvaluationProvenanceTest(unittest.TestCase):
         for method_id in METHOD_REGISTRY:
             with self.subTest(method=method_id):
                 metadata = self._metadata(method_id)
-                validate_model_checkpoint_metadata(metadata)
-                provenance = checkpoint_training_provenance(metadata)
                 method = MethodSpec.parse(method_id)
+                validate_model_checkpoint_metadata(
+                    metadata,
+                    allow_safe_constraint_config_mismatch=(
+                        method.routing == "safe_ddqn"
+                    ),
+                )
+                provenance = checkpoint_training_provenance(metadata)
                 counts[method.routing] += 1
                 self.assertEqual(
                     provenance["resolved_training_config"]["method_id"],

@@ -17,6 +17,7 @@ from experiment_config import (
 
 import hashlib
 import json
+from pathlib import Path
 
 EVALUATION_ROUTING_STRATEGY_SCHEMA_VERSION = "evaluation-routing-strategy-v1"
 LEGACY_EVALUATION_ROUTING_STRATEGY_VERSION = "evaluation-fixed-order-independent-v1"
@@ -62,6 +63,69 @@ def evaluation_routing_strategy_info(enabled):
             else dict(LEGACY_EVALUATION_ROUTING_STRATEGY_SPEC)
         ),
     }
+
+
+def checkpoint_training_routing_strategy(checkpoint_dir):
+    """Read and validate the actual routing strategy of a full checkpoint."""
+
+    metadata_path = Path(checkpoint_dir) / "metadata.json"
+    if not metadata_path.is_file():
+        raise RuntimeError(
+            "full-resume checkpoint lacks routing strategy metadata: "
+            f"{metadata_path}"
+        )
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    experiment = metadata.get("experiment") or {}
+    saved = experiment.get("evaluation_routing_strategy")
+    if not isinstance(saved, dict):
+        raise RuntimeError(
+            "full-resume checkpoint lacks the actual mutual-next-hop guard "
+            "training contract; start a new run instead of assuming the new default"
+        )
+    try:
+        enabled = saved["mutual_next_hop_guard_enabled"]
+    except KeyError as exc:
+        raise RuntimeError(
+            "full-resume checkpoint routing strategy has no actual enabled state"
+        ) from exc
+    if not isinstance(enabled, bool):
+        raise RuntimeError(
+            "full-resume checkpoint routing strategy enabled state is invalid"
+        )
+    expected = evaluation_routing_strategy_info(enabled)
+    required = (
+        "schema_version",
+        "scope",
+        "enabled",
+        "mutual_next_hop_guard_enabled",
+        "strategy_version",
+        "strategy_fingerprint",
+        "strategy",
+    )
+    mismatches = {
+        key: (saved.get(key), expected[key])
+        for key in required
+        if saved.get(key) != expected[key]
+    }
+    aliases = {
+        "mutual_next_hop_guard_enabled": enabled,
+        "evaluation_routing_strategy_version": expected["strategy_version"],
+        "evaluation_routing_strategy_fingerprint": expected[
+            "strategy_fingerprint"
+        ],
+        "evaluation_routing_strategy_scope": expected["scope"],
+    }
+    mismatches.update({
+        key: (experiment.get(key), value)
+        for key, value in aliases.items()
+        if experiment.get(key) != value
+    })
+    if mismatches:
+        raise RuntimeError(
+            "full-resume checkpoint routing strategy contract is incompatible: "
+            f"{mismatches}"
+        )
+    return expected
 
 
 def normalize_mutual_next_hop_guard(value):

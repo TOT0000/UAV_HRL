@@ -2542,7 +2542,7 @@ def train(
     llm_explorer_client=None,
     llm_explorer_log_mode=None,
     routing_loop_diagnostics=None,
-    mutual_next_hop_guard=True,
+    mutual_next_hop_guard=None,
 ):
     if config is None:
         raise ValueError(
@@ -2552,13 +2552,35 @@ def train(
     method_spec = method_spec or MethodSpec()
     formal_evaluation = bool(formal_evaluation)
     from mutual_next_hop_guard import (
+        checkpoint_training_routing_strategy,
         evaluation_routing_strategy_info,
         normalize_mutual_next_hop_guard,
     )
 
-    mutual_next_hop_guard = normalize_mutual_next_hop_guard(
-        mutual_next_hop_guard
-    )
+    requested_guard = mutual_next_hop_guard
+    if config.resume_dir is not None:
+        saved_routing_strategy = checkpoint_training_routing_strategy(
+            config.resume_dir
+        )
+        saved_guard = bool(saved_routing_strategy["enabled"])
+        if requested_guard is None:
+            mutual_next_hop_guard = saved_guard
+        else:
+            mutual_next_hop_guard = normalize_mutual_next_hop_guard(
+                requested_guard
+            )
+            if mutual_next_hop_guard != saved_guard:
+                raise RuntimeError(
+                    "resume mutual-next-hop guard conflicts with checkpoint: "
+                    f"checkpoint={'on' if saved_guard else 'off'}, "
+                    f"requested={'on' if mutual_next_hop_guard else 'off'}"
+                )
+    else:
+        mutual_next_hop_guard = (
+            True
+            if requested_guard is None
+            else normalize_mutual_next_hop_guard(requested_guard)
+        )
     evaluation_routing_strategy = evaluation_routing_strategy_info(
         mutual_next_hop_guard
     )
@@ -3230,6 +3252,15 @@ def train(
             "checkpoint_method_spec_fingerprint": checkpoint_experiment.get(
                 "method_spec_fingerprint"
             ),
+            "checkpoint_safe_ddqn_training_constraint_configuration": (
+                copy.deepcopy(
+                    loaded_checkpoint_metadata.get(
+                        "routing_agent_configuration"
+                    )
+                )
+                if method_spec.routing == "safe_ddqn"
+                else None
+            ),
             "checkpoint_metadata_path": os.path.abspath(
                 os.path.join(checkpoint_dir, "metadata.json")
             ),
@@ -3337,6 +3368,19 @@ def train(
                     {"potential_artifact_identity": potential_identity}
                     if potential_identity is not None
                     else {}
+                ),
+                "evaluation_routing_strategy": evaluation_routing_strategy,
+                "mutual_next_hop_guard_enabled": bool(
+                    mutual_next_hop_guard
+                ),
+                "evaluation_routing_strategy_version": (
+                    evaluation_routing_strategy["strategy_version"]
+                ),
+                "evaluation_routing_strategy_fingerprint": (
+                    evaluation_routing_strategy["strategy_fingerprint"]
+                ),
+                "evaluation_routing_strategy_scope": (
+                    evaluation_routing_strategy["scope"]
                 ),
             },
             expected_formal_config=formal_config,
@@ -3638,6 +3682,8 @@ def train(
                 task_deadlines_seconds=resolved_evaluation[
                     "task_deadlines_seconds"
                 ],
+                sr_speed_mps=env.sr_speed_mps,
+                mutual_next_hop_guard=mutual_next_hop_guard,
             )
             if method_spec.llm_explorer_first_gen_enabled:
                 llm_environment_constants[

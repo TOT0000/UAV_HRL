@@ -95,10 +95,13 @@ class RoutingTargetTest(unittest.TestCase):
 
     def test_ddqn_can_complete_a_replay_and_target_update(self):
         class Replay:
-            def sample(self, batch_size):
+            def sample_with_masks(self, batch_size):
                 self.batch_size = batch_size
                 state = routing_state_batch(
                     [0, 0], [[1, 1, 1], [1, 0, 1]]
+                )
+                action_mask = torch.tensor(
+                    [[0, 1, 1], [1, 0, 1]], dtype=torch.bool, device=device
                 )
                 return (
                     state,
@@ -107,6 +110,8 @@ class RoutingTargetTest(unittest.TestCase):
                     torch.tensor([[1.0], [2.0]], device=device),
                     torch.zeros((2, 1), device=device),
                     torch.tensor([[1.0], [0.0]], device=device),
+                    action_mask,
+                    action_mask.clone(),
                 )
 
         replay = Replay()

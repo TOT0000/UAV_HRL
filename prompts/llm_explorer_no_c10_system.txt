@@ -16,7 +16,7 @@ The primary objective is:
 
 EE = useful bits completely delivered to GS / actual movement energy of all UAVs (bit/J).
 
-Useful bits include both timely and late but completely delivered data. Late delivery still counts as a delay violation. Examine useful delivery, energy, and delay violations together to identify the causes of EE changes. Safe-DDQN’s delay-violation learning target is 1%.
+Useful bits include both timely and late but completely delivered data. Late delivery still counts as a delay violation. Examine useful delivery, energy, and delay violations together to identify the causes of EE changes. Safe-DDQN's system delay-violation target is 5% and its lambda_cost update coefficient is 0.05. The injected runtime definitions are authoritative for the effective SR speed and routing-guard mode.
 
 TD3 controls a UAV when movement_mask=true. Search/Hover controllers handle its other movement. All UAVs may participate in routing.
 

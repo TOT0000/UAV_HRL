@@ -5,11 +5,20 @@ from types import SimpleNamespace
 
 import numpy as np
 import pytest
+import torch
 
 from DDQN import forwarding_or_forced_wait_mask
-from HRL_task_aware import _select_routing_actions, smoke_training_config, train
+from HRL_task_aware import (
+    TrainingConfig,
+    _select_routing_actions,
+    smoke_training_config,
+    train,
+)
 from Packet_scheduler_v1 import PacketEngine
-from mutual_next_hop_guard import evaluation_routing_strategy_info
+from mutual_next_hop_guard import (
+    checkpoint_training_routing_strategy,
+    evaluation_routing_strategy_info,
+)
 from paper_evaluation import _evaluation_config_fingerprint
 from routing_guard_comparison import build_routing_guard_comparison
 from routing_loop_diagnostics import RoutingLoopDiagnosticsCollector
@@ -346,12 +355,155 @@ def test_training_uses_shared_guard_strategy():
         == "training_and_evaluation"
     )
     assert result["run_metadata"]["effective_sr_speed_mps"] == 5.0
-    routing_config = result["run_metadata"]["formal_config"][
+    formal_config = result["run_metadata"]["formal_config"]
+    routing_config = formal_config[
         "routing_agent_configuration"
     ]
     assert routing_config["mutual_next_hop_guard_default_enabled"] is True
-    assert routing_config["safe_ddqn_qos_target_probability"] == 0.05
-    assert routing_config["safe_ddqn_eta_c"] == 0.05
+    assert formal_config["safe_ddqn_qos_target_probability"] == 0.05
+    assert formal_config["safe_ddqn_eta_c"] == 0.05
+
+
+@pytest.mark.parametrize("saved_enabled", (False, True))
+def test_train_resume_rejects_explicit_cross_guard_override(
+    tmp_path, saved_enabled
+):
+    checkpoint = tmp_path / ("on" if saved_enabled else "off")
+    checkpoint.mkdir()
+    strategy = evaluation_routing_strategy_info(saved_enabled)
+    (checkpoint / "metadata.json").write_text(json.dumps({
+        "experiment": {
+            "evaluation_routing_strategy": strategy,
+            "mutual_next_hop_guard_enabled": saved_enabled,
+            "evaluation_routing_strategy_version": strategy["strategy_version"],
+            "evaluation_routing_strategy_fingerprint": strategy[
+                "strategy_fingerprint"
+            ],
+            "evaluation_routing_strategy_scope": strategy["scope"],
+        }
+    }), encoding="utf-8")
+    assert checkpoint_training_routing_strategy(checkpoint) == strategy
+    config = smoke_training_config()
+    config.resume_dir = str(checkpoint)
+    with pytest.raises(RuntimeError, match="guard conflicts with checkpoint"):
+        train(
+            config=config,
+            mutual_next_hop_guard=not saved_enabled,
+        )
+
+
+def test_resume_checkpoint_without_actual_guard_contract_is_not_assumed_on(
+    tmp_path,
+):
+    checkpoint = tmp_path / "legacy-full"
+    checkpoint.mkdir()
+    (checkpoint / "metadata.json").write_text(
+        json.dumps({"experiment": {}}), encoding="utf-8"
+    )
+    with pytest.raises(RuntimeError, match="lacks the actual.*guard"):
+        checkpoint_training_routing_strategy(checkpoint)
+
+
+def test_full_resume_without_override_restores_saved_guard_off(tmp_path):
+    checkpoint_root = tmp_path / "source"
+    base = dict(
+        total_episodes=2,
+        mode="custom",
+        episode_seconds=1,
+        warmup_joint_transitions=10_000,
+        batch_size=1,
+        model_checkpoint_every=1,
+        full_resume_every=1,
+        full_resume_keep_last=2,
+        enable_model_checkpoints=False,
+        enable_full_resume=True,
+        enable_plots=False,
+        enable_csv=False,
+        random_seed=1403,
+    )
+    train(
+        TrainingConfig(**base, checkpoint_root=str(checkpoint_root)),
+        mutual_next_hop_guard=False,
+    )
+    checkpoint = checkpoint_root / "full" / "ep_0001"
+    resumed = train(
+        TrainingConfig(
+            **base,
+            checkpoint_root=str(tmp_path / "resumed"),
+            resume_dir=str(checkpoint),
+        ),
+    )
+    assert resumed["episodes_run"] == 1
+    assert resumed["run_metadata"]["mutual_next_hop_guard_enabled"] is False
+
+
+def test_normal_evaluation_entry_loads_historical_safe_constraint_frozen(
+    tmp_path,
+):
+    checkpoint_root = tmp_path / "checkpoint"
+    training_config = TrainingConfig(
+        total_episodes=1,
+        mode="custom",
+        episode_seconds=1,
+        warmup_joint_transitions=10_000,
+        batch_size=1,
+        model_checkpoint_every=1,
+        enable_model_checkpoints=True,
+        enable_full_resume=False,
+        enable_plots=False,
+        enable_csv=False,
+        checkpoint_root=str(checkpoint_root),
+        random_seed=1404,
+    )
+    train(training_config)
+    checkpoint = checkpoint_root / "models" / "ep_0001"
+    metadata_path = checkpoint / "metadata.json"
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    for field in (
+        "normalized_eta_c",
+        "qos_target_probability",
+        "system_dvp_target",
+    ):
+        metadata["routing_agent_configuration"][field] = 0.01
+    metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+    models_path = checkpoint / "models.pt"
+    payload = torch.load(models_path, weights_only=False)
+    historical = payload["ddqn"]["constraint_state"]
+    historical["normalized_eta_c"] = 0.01
+    historical["qos_target_probability"] = 0.01
+    historical["system_dvp_target"] = 0.01
+    historical["lambda_cost"] = 0.321
+    torch.save(payload, models_path)
+
+    evaluation = train(
+        TrainingConfig(
+            total_episodes=1,
+            mode="custom",
+            episode_seconds=1,
+            warmup_joint_transitions=10_000,
+            batch_size=1,
+            enable_model_checkpoints=False,
+            enable_full_resume=False,
+            enable_plots=False,
+            enable_csv=False,
+            random_seed=1404,
+        ),
+        evaluation=True,
+        checkpoint_dir=str(checkpoint),
+        expected_checkpoint_episodes=1,
+    )
+    assert evaluation["safe_ddqn_constraint_state"]["lambda_cost"] == pytest.approx(
+        0.321
+    )
+    assert evaluation["safe_ddqn_constraint_state"][
+        "cost_multiplier_update_count"
+    ] == historical["cost_multiplier_update_count"]
+    checkpoint_constraint = evaluation["run_metadata"][
+        "checkpoint_safe_ddqn_training_constraint_configuration"
+    ]
+    assert checkpoint_constraint["qos_target_probability"] == 0.01
+    assert checkpoint_constraint["normalized_eta_c"] == 0.01
+    assert all(evaluation["evaluation_invariants"].values())
 
 
 def test_off_on_comparison_accepts_changed_results_and_uses_ratio_of_sums(tmp_path):

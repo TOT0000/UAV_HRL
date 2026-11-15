@@ -16,7 +16,7 @@ The primary objective is the energy efficiency of complete useful delivery:
 
 EE = (timely useful bits + late complete useful bits) fully delivered to GS / actual movement energy of all UAVs in J.
 
-Energy includes all movement controllers and hovering. Examine delivered useful data, energy, and deadline violations together, and identify which terms explain an EE change. Safe-DDQN's deadline-violation learning target is 1%.
+Energy includes all movement controllers and hovering. Examine delivered useful data, energy, and deadline violations together, and identify which terms explain an EE change. Safe-DDQN's system deadline-violation target is 5% and its lambda_cost update coefficient is 0.05. The injected runtime definitions are authoritative for the effective SR speed and routing-guard mode.
 
 TD3 controls a UAV only when its current movement_mask is true. Other movement follows the existing Search/Hover controllers. All UAVs may participate in routing.
 

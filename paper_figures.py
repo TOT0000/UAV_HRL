@@ -126,6 +126,7 @@ def _inspect_checkpoint(method_id, checkpoint_dir, training_seed, formal_config)
     try:
         inspected = inspect_model_checkpoint(
             checkpoint_dir,
+            allow_safe_constraint_config_mismatch=True,
             expected_experiment_metadata=_checkpoint_identity(method, training_seed),
             expected_completed_episodes=FORMAL_CHECKPOINT_EPISODE,
             expected_formal_config=formal_config,

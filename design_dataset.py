@@ -656,6 +656,7 @@ def design_dataset_preflight(args):
     _, calibration = load_com_capacity_reference()
     checkpoint = inspect_model_checkpoint(
         args.checkpoint,
+        allow_safe_constraint_config_mismatch=True,
         movement_state_dim=MOVEMENT_STATE_DIM,
         joint_action_dim=JOINT_ACTION_DIM,
         routing_state_dim=ROUTING_STATE_DIM,

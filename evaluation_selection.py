@@ -342,6 +342,7 @@ def resolve_training_run_checkpoint(
         potential_identity = potential_artifact_identity(design)
     inspected = inspect_model_checkpoint(
         checkpoint,
+        allow_safe_constraint_config_mismatch=True,
         movement_state_dim=movement_state_dim,
         joint_action_dim=JOINT_ACTION_DIM,
         routing_state_dim=ROUTING_STATE_DIM,

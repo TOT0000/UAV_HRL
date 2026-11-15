@@ -496,7 +496,9 @@ def test_contaminated_routing_prior_is_never_forwarded_to_safe_ddqn():
 
         def select_action(self, **kwargs):
             self.calls.append(kwargs)
-            action = int(kwargs["uav_id"])
+            legal = np.asarray(kwargs["mask"], dtype=bool).copy()
+            legal[int(kwargs["uav_id"])] = False
+            action = int(np.flatnonzero(legal)[0])
             if kwargs.get("return_diagnostics"):
                 return action, {
                     "decision_branch": "epsilon_exploration",
@@ -520,7 +522,7 @@ def test_contaminated_routing_prior_is_never_forwarded_to_safe_ddqn():
         return_diagnostics=True,
         capture_diagnostics=True,
     )
-    assert actions == {0: 0}
+    assert actions == {0: 1}
     assert diagnostics[0]["exploration_distribution"] is None
     assert "exploration_prior" not in agent.calls[0]
     assert "exploration_prior_weight" not in agent.calls[0]

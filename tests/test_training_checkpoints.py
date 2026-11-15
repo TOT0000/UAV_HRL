@@ -1332,6 +1332,69 @@ class FullResumeCheckpointTest(unittest.TestCase):
                     calibration=calibration,
                 )
 
+    def test_historical_safe_ddqn_constraint_loads_for_model_evaluation_only(self):
+        td3, ddqn, _joint, _routing = self._components()
+        calibration = {"fixture": "historical-safe-ddqn"}
+        with tempfile.TemporaryDirectory() as temp_dir:
+            checkpoint_dir = Path(temp_dir) / "model"
+            save_model_checkpoint(
+                checkpoint_dir,
+                episode=0,
+                td3=td3,
+                ddqn=ddqn,
+                movement_state_dim=MOVEMENT_STATE_DIM,
+                joint_action_dim=JOINT_ACTION_DIM,
+                routing_state_dim=ROUTING_STATE_DIM,
+                calibration=calibration,
+                experiment_metadata=_model_provenance_fixture(1),
+                routing_lifecycle_state=_empty_routing_lifecycle(),
+            )
+            metadata_path = checkpoint_dir / "metadata.json"
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            for field in (
+                "normalized_eta_c",
+                "qos_target_probability",
+                "system_dvp_target",
+            ):
+                metadata["routing_agent_configuration"][field] = 0.01
+            metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+
+            models_path = checkpoint_dir / "models.pt"
+            payload = torch.load(models_path, weights_only=False)
+            historical = payload["ddqn"]["constraint_state"]
+            historical["normalized_eta_c"] = 0.01
+            historical["qos_target_probability"] = 0.01
+            historical["system_dvp_target"] = 0.01
+            historical["lambda_cost"] = 0.123
+            torch.save(payload, models_path)
+
+            with self.assertRaisesRegex(RuntimeError, "constraint metadata"):
+                load_model_checkpoint(checkpoint_dir, td3, ddqn)
+            metadata["routing_agent_configuration"][
+                "lambda_update_mode"
+            ] = "incompatible-update-contract"
+            metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+            with self.assertRaisesRegex(RuntimeError, "constraint metadata"):
+                load_model_checkpoint(
+                    checkpoint_dir,
+                    td3,
+                    ddqn,
+                    allow_safe_constraint_config_mismatch=True,
+                )
+            metadata["routing_agent_configuration"][
+                "lambda_update_mode"
+            ] = "direct_episode_system_dvp"
+            metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+            load_model_checkpoint(
+                checkpoint_dir,
+                td3,
+                ddqn,
+                allow_safe_constraint_config_mismatch=True,
+            )
+            self.assertAlmostEqual(ddqn.lambda_cost, 0.123)
+            self.assertEqual(ddqn.eta_c, 0.05)
+            self.assertEqual(ddqn.qos_target_probability, 0.05)
+
     def test_split_range_schema_18_checkpoint_is_rejected_before_network_restore(self):
         td3, ddqn, _joint, _routing = self._components()
         with tempfile.TemporaryDirectory() as temp_dir:

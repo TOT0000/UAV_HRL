@@ -636,6 +636,15 @@ def build_parser():
         type=int,
         help="explicitly extend the planned training horizon before exact resume",
     )
+    resume.add_argument(
+        "--mutual-next-hop-guard",
+        choices=("on", "off"),
+        default=None,
+        help=(
+            "optional exact-resume assertion; omission restores the run's "
+            "recorded guard setting"
+        ),
+    )
     resume.set_defaults(method=None)
 
     evaluate = commands.add_parser(
@@ -1215,6 +1224,25 @@ def _episode_directories(root):
 
 def run_resume(args):
     run_dir, resolved, method, manifest = _load_run_context(args.run_directory)
+    saved_guard = resolved.get("mutual_next_hop_guard")
+    if isinstance(saved_guard, bool):
+        saved_guard_enabled = saved_guard
+    elif saved_guard in ("on", "off"):
+        saved_guard_enabled = saved_guard == "on"
+    else:
+        raise RuntimeError(
+            "run metadata lacks the actual mutual-next-hop guard training "
+            "setting required for exact resume"
+        )
+    requested_guard = getattr(args, "mutual_next_hop_guard", None)
+    if requested_guard is not None:
+        requested_guard_enabled = requested_guard == "on"
+        if requested_guard_enabled != saved_guard_enabled:
+            raise RuntimeError(
+                "resume mutual-next-hop guard conflicts with the saved run: "
+                f"saved={'on' if saved_guard_enabled else 'off'}, "
+                f"requested={requested_guard}"
+            )
     explorer_protocol_upgrade = None
     if method.llm_explorer_enabled:
         if method.llm_explorer_first_gen_enabled:
@@ -1607,9 +1635,7 @@ def run_resume(args):
             llm_explorer_log_mode=(resolved.get("llm_explorer") or {}).get(
                 "log_mode", method.default_llm_explorer_log_mode
             ),
-            mutual_next_hop_guard=resolved.get(
-                "mutual_next_hop_guard", "on"
-            ),
+            mutual_next_hop_guard=saved_guard_enabled,
         )
         resolved.update(
             status="COMPLETED",
@@ -1730,6 +1756,7 @@ def run_evaluate(args):
         _, calibration = load_com_capacity_reference()
         inspected = inspect_model_checkpoint(
             checkpoint,
+            allow_safe_constraint_config_mismatch=True,
             movement_state_dim=movement_state_dim,
             joint_action_dim=JOINT_ACTION_DIM,
             routing_state_dim=ROUTING_STATE_DIM,
