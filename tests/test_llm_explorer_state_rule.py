@@ -527,7 +527,7 @@ def test_two_stage_prompt_is_self_contained_cache_isolated_and_resume_restores_r
         restored.load_state_dict(wrong)
 
 
-def test_v3_cache_identity_and_v2_checkpoint_feedback_migrates_from_raw(tmp_path):
+def test_current_cache_identity_isolates_v2_and_migrates_raw_feedback(tmp_path):
     identity = {"method_id": "td3_dinkelbach_llm_explorer_state_rule"}
     controller = LLMStateRuleController(
         run_directory=tmp_path,
@@ -541,7 +541,6 @@ def test_v3_cache_identity_and_v2_checkpoint_feedback_migrates_from_raw(tmp_path
         user_prompt="prompt",
     )
     assert cache_identity["cache_version"] == LLM_STATE_RULE_CACHE_VERSION
-    assert cache_identity["cache_version"].endswith("v3")
     old_cache_identity = dict(cache_identity)
     old_cache_identity["cache_version"] = "state-rule-complete-input-cache-v2"
     old_cache_path = controller._episode_result_path(1)

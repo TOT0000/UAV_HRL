@@ -14,7 +14,13 @@ from HRL_task_aware import formal_training_config
 from centralized_movement import JOINT_ACTION_DIM, MOVEMENT_STATE_DIM
 from com_capacity_calibration import load_com_capacity_reference
 from comparison_experiment import main as comparison_main
-from experiment_config import MethodSpec, effective_training_config
+from experiment_config import (
+    SAFE_DDQN_ETA_C,
+    SAFE_DDQN_INITIAL_LAMBDA_COST,
+    SAFE_DDQN_QOS_TARGET_PROBABILITY,
+    MethodSpec,
+    effective_training_config,
+)
 from routing_lifecycle import RoutingLearnerLifecycle
 from scenario_manifest import extend_training_manifest, generate_manifest
 from td3 import TD3
@@ -63,11 +69,13 @@ class FormalCheckpointMetadataTest(unittest.TestCase):
             "routing_ddqn_gamma": 0.99,
             "routing_agent_kind": "safe_ddqn",
             "routing_agent_configuration": {
-                "lambda_cost": 0.0,
-                "initial_lambda_cost": 0.0,
-                "normalized_eta_c": 0.01,
-                "qos_target_probability": 0.01,
-                "system_dvp_target": 0.01,
+                "lambda_cost": SAFE_DDQN_INITIAL_LAMBDA_COST,
+                "initial_lambda_cost": SAFE_DDQN_INITIAL_LAMBDA_COST,
+                "normalized_eta_c": SAFE_DDQN_ETA_C,
+                "qos_target_probability": (
+                    SAFE_DDQN_QOS_TARGET_PROBABILITY
+                ),
+                "system_dvp_target": SAFE_DDQN_QOS_TARGET_PROBABILITY,
                 "lambda_update_scope": "episode_end",
                 "lambda_update_mode": "direct_episode_system_dvp",
                 "cost_denominator": "episode_system_eligible_packets",
@@ -165,6 +173,23 @@ class FormalCheckpointMetadataTest(unittest.TestCase):
 
         self.assertIs(validated, self.metadata)
         self.assertEqual(validated["episode"] + 1, 1500)
+        routing = validated["routing_agent_configuration"]
+        self.assertEqual(
+            routing["initial_lambda_cost"],
+            self.formal_config["safe_ddqn_initial_lambda_cost"],
+        )
+        self.assertEqual(
+            routing["normalized_eta_c"],
+            self.formal_config["safe_ddqn_eta_c"],
+        )
+        self.assertEqual(
+            routing["qos_target_probability"],
+            self.formal_config["safe_ddqn_qos_target_probability"],
+        )
+        self.assertEqual(
+            routing["system_dvp_target"],
+            self.formal_config["safe_ddqn_system_dvp_target"],
+        )
 
     def test_1500_checkpoint_metadata_accepts_only_monotonic_3000_horizon(self):
         previous_manifest = generate_manifest("train", self.training_seed, 1500)
