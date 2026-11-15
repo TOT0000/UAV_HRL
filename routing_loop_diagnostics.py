@@ -17,7 +17,7 @@ from pathlib import Path
 import numpy as np
 
 
-ROUTING_LOOP_DIAGNOSTIC_SCHEMA_VERSION = "routing-loop-diagnostics-v3"
+ROUTING_LOOP_DIAGNOSTIC_SCHEMA_VERSION = "routing-loop-diagnostics-v4"
 ROUTING_LOOP_EVENT_DEFINITION = (
     "A completed U2U hop A->B immediately followed for the same packet by a "
     "completed U2U hop B->A; overlapping events are counted (A->B->A->B is two)."
@@ -51,6 +51,25 @@ ROUTING_LOOP_SLOT_FIELD_SEMANTICS = {
     "selection_strategy.per_uav": (
         "decision-time candidate counts, exclusions, forced-WAIT cause, order, and "
         "partial-hop receiver lock; values are captured when that UAV is selected"
+    ),
+}
+ROUTING_LOOP_WAIT_FIELD_SEMANTICS = {
+    "uav_preselection_*": (
+        "one slot-boundary preselection per scenario/slot/sender, including empty queues; "
+        "these counts have no VS/COM task attribution"
+    ),
+    "slot_start_hol_*": (
+        "slot-boundary decisions whose sender had a HOL packet, attributed to that HOL task"
+    ),
+    "held_action_packet_*": (
+        "actual packet HOL uses of the sender's already-selected action, deduplicated by "
+        "(RoI, scenario_id, slot_index, sender_uav_id, packet_id); a guard-induced WAIT "
+        "means the held sender action was forced to WAIT because guard filtering removed "
+        "all original forwarding candidates, not that the policy was rerun for that packet"
+    ),
+    "packet_hol_decision_count / forced_wait_no_forwarding_candidate_count / "
+    "guard_induced_forced_wait_count": (
+        "deprecated v3 aliases for the slot_start_hol_* fields; retained with unchanged scope"
     ),
 }
 
@@ -120,6 +139,12 @@ def _new_stats():
         "packet_hol_decision_count": 0,
         "forced_wait_no_forwarding_candidate_count": 0,
         "guard_induced_forced_wait_count": 0,
+        "slot_start_hol_decision_count": 0,
+        "slot_start_hol_forced_wait_decision_count": 0,
+        "slot_start_hol_guard_induced_forced_wait_decision_count": 0,
+        "held_action_packet_use_count": 0,
+        "held_action_packet_forced_wait_count": 0,
+        "held_action_packet_guard_induced_forced_wait_count": 0,
     }
 
 
@@ -142,6 +167,7 @@ class RoutingLoopDiagnosticsCollector:
         self._hop_origins = {}
         self._hop_slot_state = {}
         self._decision_departures = defaultdict(set)
+        self._held_action_packet_keys = set()
         self._finalized = False
         self._initialized_pair_groups = set()
         self._selection_decision_totals = {
@@ -150,6 +176,14 @@ class RoutingLoopDiagnosticsCollector:
             "guard_induced_forced_wait_count": 0,
             "originally_no_forwarding_candidate_count": 0,
         }
+        self._uav_preselection_stats = defaultdict(
+            lambda: {
+                "uav_preselection_decision_count": 0,
+                "uav_preselection_forced_wait_decision_count": 0,
+                "uav_preselection_guard_induced_forced_wait_decision_count": 0,
+                "uav_preselection_originally_no_candidate_decision_count": 0,
+            }
+        )
 
     @staticmethod
     def _packet_key(roi_count, scenario_id, packet_id):
@@ -169,6 +203,7 @@ class RoutingLoopDiagnosticsCollector:
         self._hop_origins = {}
         self._hop_slot_state = {}
         self._decision_departures = defaultdict(set)
+        self._held_action_packet_keys = set()
         for group in self._group_keys(int(roi_count), "FOV") + self._group_keys(
             int(roi_count), "COM"
         ):
@@ -276,6 +311,26 @@ class RoutingLoopDiagnosticsCollector:
             ] += int(
                 bool(selection_detail.get("originally_no_forwarding_candidate", False))
             )
+            for roi_key in (None, int(self._episode["roi_count"])):
+                preselection = self._uav_preselection_stats[roi_key]
+                preselection["uav_preselection_decision_count"] += 1
+                preselection["uav_preselection_forced_wait_decision_count"] += int(
+                    int(filtered_count) == 0
+                )
+                preselection[
+                    "uav_preselection_guard_induced_forced_wait_decision_count"
+                ] += int(
+                    bool(selection_detail.get("guard_induced_forced_wait", False))
+                )
+                preselection[
+                    "uav_preselection_originally_no_candidate_decision_count"
+                ] += int(
+                    bool(
+                        selection_detail.get(
+                            "originally_no_forwarding_candidate", False
+                        )
+                    )
+                )
             physical_neighbors = sorted(
                 int(value) for value in adjacency[sender] if int(value) != sender
             )
@@ -306,10 +361,19 @@ class RoutingLoopDiagnosticsCollector:
                 ):
                     stats = self._stats[group]
                     stats["packet_hol_decision_count"] += 1
+                    stats["slot_start_hol_decision_count"] += 1
                     stats["forced_wait_no_forwarding_candidate_count"] += int(
                         int(filtered_count) == 0
                     )
+                    stats["slot_start_hol_forced_wait_decision_count"] += int(
+                        int(filtered_count) == 0
+                    )
                     stats["guard_induced_forced_wait_count"] += int(
+                        bool(selection_detail.get("guard_induced_forced_wait", False))
+                    )
+                    stats[
+                        "slot_start_hol_guard_induced_forced_wait_decision_count"
+                    ] += int(
                         bool(selection_detail.get("guard_induced_forced_wait", False))
                     )
         record = {
@@ -390,6 +454,46 @@ class RoutingLoopDiagnosticsCollector:
             ],
         }
         self.snapshot_writer.write(record)
+
+    def observe_held_action_packet(self, event):
+        """Observe a real PacketEngine HOL use of the slot's held action."""
+
+        if self._episode is None:
+            raise RuntimeError("routing-loop diagnostic episode is not active")
+        sender = int(event["sender_uav_id"])
+        decision = self._current_decisions.get(sender)
+        if decision is None:
+            raise RuntimeError("held-action observation lacks its slot decision")
+        if int(event["selected_action"]) != int(decision["selected_action"]):
+            raise AssertionError("held-action observation disagrees with slot action")
+        packet_id = int(event["packet_id"])
+        dedup_key = (
+            int(self._episode["roi_count"]),
+            str(self._episode["scenario_id"]),
+            int(decision["slot_index"]),
+            sender,
+            packet_id,
+        )
+        if dedup_key in self._held_action_packet_keys:
+            return
+        self._held_action_packet_keys.add(dedup_key)
+        legal = tuple(int(value) for value in decision["selection_legal_actions"])
+        forced_wait = (
+            int(decision["selected_action"]) == sender
+            and not any(value != sender for value in legal)
+        )
+        guard_wait = bool(
+            forced_wait and decision.get("guard_induced_forced_wait", False)
+        )
+        for group in self._group_keys(
+            self._episode["roi_count"], str(event.get("task_type", "COM"))
+        ):
+            stats = self._stats[group]
+            stats["held_action_packet_use_count"] += 1
+            stats["held_action_packet_forced_wait_count"] += int(forced_wait)
+            stats[
+                "held_action_packet_guard_induced_forced_wait_count"
+            ] += int(guard_wait)
 
     def _origin_from_current_decision(self, event):
         sender = int(event["sender_uav_id"])
@@ -765,6 +869,7 @@ class RoutingLoopDiagnosticsCollector:
         self._hop_origins = {}
         self._hop_slot_state = {}
         self._decision_departures = defaultdict(set)
+        self._held_action_packet_keys = set()
 
     @staticmethod
     def _ratio(numerator, denominator):
@@ -802,6 +907,13 @@ class RoutingLoopDiagnosticsCollector:
                 ),
             }
         )
+        if (
+            row["held_action_packet_guard_induced_forced_wait_count"]
+            > row["held_action_packet_forced_wait_count"]
+        ):
+            raise AssertionError(
+                "guard-induced held-action WAIT count exceeds all forced WAITs"
+            )
         return row
 
     @staticmethod
@@ -826,6 +938,16 @@ class RoutingLoopDiagnosticsCollector:
             self._public_stats(group, self._stats[group])
             for group in sorted(self._stats, key=self._group_sort_key)
         ]
+        preselection_rows = [
+            {
+                "roi_count": roi_count,
+                **dict(self._uav_preselection_stats[roi_count]),
+            }
+            for roi_count in sorted(
+                self._uav_preselection_stats,
+                key=lambda value: -1 if value is None else int(value),
+            )
+        ]
         pair_rows = []
         for (group, pair), stats in sorted(
             self._pair_stats.items(),
@@ -844,6 +966,7 @@ class RoutingLoopDiagnosticsCollector:
             "event_definition": ROUTING_LOOP_EVENT_DEFINITION,
             "event_field_semantics": ROUTING_LOOP_EVENT_FIELD_SEMANTICS,
             "slot_field_semantics": ROUTING_LOOP_SLOT_FIELD_SEMANTICS,
+            "wait_field_semantics": ROUTING_LOOP_WAIT_FIELD_SEMANTICS,
             "denominator_notes": {
                 "event_ratios": "completed immediate-foldback events",
                 "distinct_packet_count": "scenario-qualified packets with at least one event",
@@ -858,8 +981,8 @@ class RoutingLoopDiagnosticsCollector:
                     "other packet reused, empty-queue action reused, or unknown; event denominator"
                 ),
                 "grouped_forced_wait_counts": (
-                    "slot-start HOL decisions classified by that packet task; empty-queue "
-                    "preselections remain visible in selection_decisions and snapshots"
+                    "slot_start_hol_* uses slot-start HOL task; held_action_packet_* uses the "
+                    "actual packet HOL that consumed the held action, including mid-slot arrivals"
                 ),
                 "pair_twenty_hop": (
                     "distinct 20-completed-hop packets with at least one immediate foldback "
@@ -868,6 +991,7 @@ class RoutingLoopDiagnosticsCollector:
                 "overlap": "packet classifications are not mutually exclusive event categories",
             },
             "groups": summary_rows,
+            "uav_preselection_decisions": preselection_rows,
             "selection_decisions": dict(self._selection_decision_totals),
             "uav_11_15": [
                 self._public_stats(group, stats)
@@ -887,6 +1011,7 @@ class RoutingLoopDiagnosticsCollector:
             "event_definition": ROUTING_LOOP_EVENT_DEFINITION,
             "event_field_semantics": ROUTING_LOOP_EVENT_FIELD_SEMANTICS,
             "slot_field_semantics": ROUTING_LOOP_SLOT_FIELD_SEMANTICS,
+            "wait_field_semantics": ROUTING_LOOP_WAIT_FIELD_SEMANTICS,
             "slot_snapshot_count": self.snapshot_writer.row_count,
             "foldback_event_count": self.event_writer.row_count,
             "files": {
@@ -895,6 +1020,7 @@ class RoutingLoopDiagnosticsCollector:
                 "summary_json": "routing_loop_summary.json",
                 "summary_csv": "routing_loop_summary.csv",
                 "pairs_csv": "routing_loop_pairs.csv",
+                "uav_preselection_csv": "routing_loop_uav_preselection.csv",
             },
             **self.metadata,
             **dict(extra_metadata or {}),
@@ -908,6 +1034,10 @@ class RoutingLoopDiagnosticsCollector:
         )
         self._write_csv(self.output_directory / "routing_loop_summary.csv", summary_rows)
         self._write_csv(self.output_directory / "routing_loop_pairs.csv", pair_rows)
+        self._write_csv(
+            self.output_directory / "routing_loop_uav_preselection.csv",
+            preselection_rows,
+        )
         self._finalized = True
         return metadata
 
@@ -952,7 +1082,13 @@ def compare_json_values(actual, expected, *, path="$", float_rtol=1e-12, float_a
         )
 
 
-def verify_episode_jsonl_prefix(actual_path, source_path, expected_scenario_ids):
+def verify_episode_jsonl_prefix(
+    actual_path,
+    source_path,
+    expected_scenario_ids,
+    *,
+    legacy_off_strategy_compatibility=False,
+):
     """Stream-compare exactly the selected source episodes in manifest order."""
 
     expected_ids = list(expected_scenario_ids)
@@ -974,6 +1110,27 @@ def verify_episode_jsonl_prefix(actual_path, source_path, expected_scenario_ids)
             # simulation result field remains part of this strict comparison.
             actual.pop("evaluation_manifest_hash", None)
             expected.pop("evaluation_manifest_hash", None)
+            if legacy_off_strategy_compatibility:
+                from mutual_next_hop_guard import evaluation_routing_strategy_info
+
+                strategy = evaluation_routing_strategy_info(False)
+                compatibility = {
+                    "mutual_next_hop_guard_enabled": False,
+                    "evaluation_routing_strategy_version": strategy[
+                        "strategy_version"
+                    ],
+                    "evaluation_routing_strategy_fingerprint": strategy[
+                        "strategy_fingerprint"
+                    ],
+                    "evaluation_routing_strategy_scope": strategy["scope"],
+                }
+                for key, value in compatibility.items():
+                    if key not in expected:
+                        if actual.get(key) != value:
+                            raise AssertionError(
+                                f"$.{key}: invalid legacy-OFF compatibility value"
+                            )
+                        actual.pop(key)
             compare_json_values(actual, expected)
             compared += 1
         if actual_handle.readline().strip():

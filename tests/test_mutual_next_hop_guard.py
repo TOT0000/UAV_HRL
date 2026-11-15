@@ -1,4 +1,5 @@
 import copy
+import hashlib
 import json
 from types import SimpleNamespace
 
@@ -8,6 +9,8 @@ import pytest
 from DDQN import forwarding_or_forced_wait_mask
 from HRL_task_aware import _select_routing_actions, smoke_training_config, train
 from Packet_scheduler_v1 import PacketEngine
+from mutual_next_hop_guard import evaluation_routing_strategy_info
+from paper_evaluation import _evaluation_config_fingerprint
 from routing_guard_comparison import build_routing_guard_comparison
 from routing_loop_diagnostics import RoutingLoopDiagnosticsCollector
 
@@ -279,6 +282,11 @@ def _guarded_packet_run(output, diagnostics_enabled):
             uav_hop_observer=(
                 collector.observe_hop_event if collector is not None else None
             ),
+            held_action_packet_observer=(
+                collector.observe_held_action_packet
+                if collector is not None
+                else None
+            ),
         )
         actions_seen.append(actions)
         rewards.append(float(result["total_routing_reward"]))
@@ -360,14 +368,29 @@ def test_off_on_comparison_accepts_changed_results_and_uses_ratio_of_sums(tmp_pa
         (point / "packet_outcomes.jsonl").write_text(
             json.dumps({"scenario_id": "s", "packet_outcomes": [packet]}) + "\n"
         )
-    (guarded / "routing_loop_summary.json").write_text(json.dumps({"groups": [
-        {"roi_count": None, "task": "ALL", "guard_induced_forced_wait_count": 1},
-        {"roi_count": None, "task": "VS", "guard_induced_forced_wait_count": 1},
-        {"roi_count": None, "task": "COM", "guard_induced_forced_wait_count": 0},
-        {"roi_count": 2, "task": "ALL", "guard_induced_forced_wait_count": 1},
-        {"roi_count": 2, "task": "VS", "guard_induced_forced_wait_count": 1},
-        {"roi_count": 2, "task": "COM", "guard_induced_forced_wait_count": 0},
-    ]}))
+    (guarded / "routing_loop_summary.json").write_text(json.dumps({
+        "schema_version": "routing-loop-diagnostics-v4",
+        "groups": [
+            {
+                "roi_count": roi, "task": task,
+                "held_action_packet_guard_induced_forced_wait_count": (
+                    1 if task in {"ALL", "VS"} else 0
+                ),
+                "slot_start_hol_guard_induced_forced_wait_decision_count": 0,
+            }
+            for roi in (None, 2) for task in ("ALL", "VS", "COM")
+        ],
+        "uav_preselection_decisions": [
+            {
+                "roi_count": roi,
+                "uav_preselection_guard_induced_forced_wait_decision_count": 1,
+            }
+            for roi in (None, 2)
+        ],
+    }))
+    (guarded / "paper_evaluation_metadata.json").write_text(json.dumps({
+        "evaluation_routing_strategy": evaluation_routing_strategy_info(True)
+    }))
     outputs = build_routing_guard_comparison(
         source_evaluation_dir=source, guarded_evaluation_dir=guarded,
         roi_counts=(2,), selected_scenario_ids_by_roi={"2": ["s"]},
@@ -378,3 +401,209 @@ def test_off_on_comparison_accepts_changed_results_and_uses_ratio_of_sums(tmp_pa
     assert row["on_energy_efficiency_mbit_per_j"] == 4.0
     assert row["delta_violation_packet_count"] == 1
     assert row["on_guard_induced_forced_wait_count"] == 1
+    assert row[
+        "on_slot_start_hol_guard_induced_forced_wait_decision_count"
+    ] == 0
+    assert row[
+        "on_uav_preselection_guard_induced_forced_wait_decision_count"
+    ] == 1
+    assert row["on_guard_induced_forced_wait_count"] <= row[
+        "on_forced_wait_no_forwarding_candidate_count"
+    ]
+
+
+def test_packet_engine_counts_mid_slot_packet_using_guard_held_wait(tmp_path):
+    env = PartialEnv()
+    env.bits_per_second_per_hz = 0.01
+    engine = PacketEngine(
+        2,
+        task_deadlines_seconds={"FOV": 2.0, "COM": 2.0},
+        enable_packet_diagnostic_artifacts=True,
+    )
+    packet = engine.create_packet(0, "COM", 100.0, 0.0)
+    masks = {0: _mask(3, 0, 1), 1: _mask(3, 0, 1)}
+    policy = PreferredLegalPolicy({0: (1,), 1: (0,)})
+    actions, context = _select_routing_actions(
+        policy,
+        {0: np.zeros(143), 1: np.zeros(143)},
+        masks,
+        epsilon=0.0,
+        mutual_next_hop_guard=True,
+        slot_index=0,
+        return_selection_context=True,
+    )
+    assert actions == {0: 1, 1: 1}
+    assert context["per_uav"][1]["guard_induced_forced_wait"] is True
+    collector = RoutingLoopDiagnosticsCollector(tmp_path)
+    collector.begin_episode(roi_count=2, scenario_id="mid-slot", episode_index=0)
+    collector.observe_slot(
+        env=env,
+        packet_engine=engine,
+        current_time=0.0,
+        slot_index=0,
+        physical_masks=masks,
+        effective_masks=masks,
+        applied_effective_masks=context["applied_effective_masks"],
+        selection_masks=context["selection_masks"],
+        selected_actions=actions,
+        start_of_slot_hol_by_sender={0: packet, 1: None},
+        selection_context=context,
+    )
+    engine.serve_event_driven_slot(
+        env,
+        actions,
+        0.0,
+        observed_hol_by_sender={0: packet, 1: None},
+        observed_backlog_bits_by_sender={0: 100.0, 1: 0.0},
+        effective_masks_by_sender=context["applied_effective_masks"],
+        held_action_packet_observer=collector.observe_held_action_packet,
+    )
+    # Repeated observation of the same packet/sender/slot is idempotent.
+    collector.observe_held_action_packet(
+        {
+            "packet_id": packet["id"],
+            "task_type": "COM",
+            "sender_uav_id": 1,
+            "selected_action": 1,
+        }
+    )
+    collector.end_episode([])
+    collector.finalize()
+    summary = json.loads((tmp_path / "routing_loop_summary.json").read_text())
+    com = next(
+        row for row in summary["groups"]
+        if row["roi_count"] is None and row["task"] == "COM"
+    )
+    all_preselection = next(
+        row for row in summary["uav_preselection_decisions"]
+        if row["roi_count"] is None
+    )
+    assert all_preselection[
+        "uav_preselection_guard_induced_forced_wait_decision_count"
+    ] == 1
+    assert com["slot_start_hol_guard_induced_forced_wait_decision_count"] == 0
+    assert com["held_action_packet_forced_wait_count"] == 1
+    assert com["held_action_packet_guard_induced_forced_wait_count"] == 1
+    assert packet["routing_only_wait_no_available_link_slot_count"] == 1
+
+
+def test_evaluation_config_fingerprint_distinguishes_guard_and_preserves_off():
+    point = {
+        "point_id": "roi_2",
+        "environment_width_m": None,
+        "environment_height_m": None,
+        "evaluation_episode_horizon_s": 60,
+        "overrides": {},
+    }
+    legacy_payload = {
+        "method_id": "ours",
+        "point_id": "roi_2",
+        "episodes": 10,
+        "evaluation_seed": 7,
+        "environment_width_m": None,
+        "environment_height_m": None,
+        "evaluation_episode_horizon_s": 60,
+        "overrides": {},
+    }
+    legacy = hashlib.sha256(
+        json.dumps(
+            legacy_payload, sort_keys=True, separators=(",", ":"), allow_nan=False
+        ).encode()
+    ).hexdigest()
+    manifest = SimpleNamespace(environment_size_m=None)
+    off = _evaluation_config_fingerprint(
+        "ours", point, 10, 7, manifest,
+        evaluation_routing_strategy=evaluation_routing_strategy_info(False),
+    )
+    on_a = _evaluation_config_fingerprint(
+        "ours", point, 10, 7, manifest,
+        evaluation_routing_strategy=evaluation_routing_strategy_info(True),
+    )
+    on_b = _evaluation_config_fingerprint(
+        "ours", point, 10, 7, manifest,
+        evaluation_routing_strategy=evaluation_routing_strategy_info(True),
+    )
+    assert off == legacy
+    assert on_a == on_b
+    assert on_a != off
+
+
+def test_guarded_comparison_rejects_missing_v4_packet_wait_diagnostics(tmp_path):
+    source = tmp_path / "off"
+    guarded = tmp_path / "on"
+    for root in (source, guarded):
+        point = root / "roi_2"
+        point.mkdir(parents=True)
+        (point / "per_episode.jsonl").write_text(json.dumps({
+            "scenario_id": "s", "total_mobility_energy_j": 1.0,
+            "total_all_useful_mbits": 0.0, "fov_timely_useful_bits": 0.0,
+            "fov_late_useful_bits": 0.0, "com_timely_delivered_bits": 0.0,
+            "com_late_delivered_bits": 0.0,
+        }) + "\n")
+        (point / "packet_outcomes.jsonl").write_text(
+            json.dumps({"scenario_id": "s", "packet_outcomes": []}) + "\n"
+        )
+    (guarded / "routing_loop_summary.json").write_text(json.dumps({
+        "schema_version": "routing-loop-diagnostics-v3", "groups": []
+    }))
+    (guarded / "paper_evaluation_metadata.json").write_text(json.dumps({
+        "evaluation_routing_strategy": evaluation_routing_strategy_info(True)
+    }))
+    with pytest.raises(ValueError, match="diagnostics v4"):
+        build_routing_guard_comparison(
+            source_evaluation_dir=source,
+            guarded_evaluation_dir=guarded,
+            roi_counts=(2,),
+            selected_scenario_ids_by_roi={"2": ["s"]},
+        )
+
+
+def test_held_wait_dedup_separates_sender_slot_and_original_no_candidate(tmp_path):
+    env = PartialEnv()
+    collector = RoutingLoopDiagnosticsCollector(tmp_path)
+    collector.begin_episode(roi_count=3, scenario_id="partial-vs", episode_index=0)
+    packet = {"id": 9, "task_type": "FOV", "hop_receiver": 1}
+    masks = {0: _mask(3, 0), 1: _mask(3, 1)}
+    for slot in (0, 1):
+        actions, context = _select_routing_actions(
+            PreferredLegalPolicy({}),
+            {0: np.zeros(143), 1: np.zeros(143)},
+            masks,
+            epsilon=0.0,
+            mutual_next_hop_guard=True,
+            slot_index=slot,
+            return_selection_context=True,
+        )
+        collector.observe_slot(
+            env=env,
+            packet_engine=None,
+            current_time=slot * 0.25,
+            slot_index=slot,
+            physical_masks=masks,
+            effective_masks=masks,
+            applied_effective_masks=context["applied_effective_masks"],
+            selection_masks=context["selection_masks"],
+            selected_actions=actions,
+            start_of_slot_hol_by_sender={0: packet, 1: None},
+            selection_context=context,
+        )
+        event = {
+            "packet_id": 9, "task_type": "FOV", "sender_uav_id": 0,
+            "selected_action": 0, "hop_receiver_lock": 1,
+        }
+        collector.observe_held_action_packet(event)
+        collector.observe_held_action_packet(event)
+        if slot == 1:
+            collector.observe_held_action_packet({
+                **event, "sender_uav_id": 1, "selected_action": 1,
+            })
+    collector.end_episode([])
+    collector.finalize()
+    summary = json.loads((tmp_path / "routing_loop_summary.json").read_text())
+    vs = next(
+        row for row in summary["groups"]
+        if row["roi_count"] is None and row["task"] == "VS"
+    )
+    assert vs["held_action_packet_use_count"] == 3
+    assert vs["held_action_packet_forced_wait_count"] == 3
+    assert vs["held_action_packet_guard_induced_forced_wait_count"] == 0

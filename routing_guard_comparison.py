@@ -9,7 +9,7 @@ from collections import defaultdict
 from pathlib import Path
 
 
-COMPARISON_SCHEMA_VERSION = "routing-guard-off-on-comparison-v1"
+COMPARISON_SCHEMA_VERSION = "routing-guard-off-on-comparison-v2"
 
 
 def _new_totals():
@@ -27,6 +27,8 @@ def _new_totals():
         "distinct_foldback_packet_count": 0,
         "forced_wait_no_forwarding_candidate_count": 0,
         "guard_induced_forced_wait_count": 0,
+        "slot_start_hol_guard_induced_forced_wait_decision_count": 0,
+        "uav_preselection_guard_induced_forced_wait_decision_count": None,
     }
 
 
@@ -158,11 +160,56 @@ def _accumulate_evaluation(
 
 def _inject_guard_wait_counts(totals, routing_summary_path):
     summary = json.loads(Path(routing_summary_path).read_text(encoding="utf-8"))
-    for row in summary.get("groups", ()):
+    if summary.get("schema_version") != "routing-loop-diagnostics-v4":
+        raise ValueError(
+            "guarded ON evaluation requires routing-loop diagnostics v4 "
+            "with held-action packet WAIT counts"
+        )
+    rows = list(summary.get("groups", ()))
+    if not rows:
+        raise ValueError("guarded ON evaluation routing summary has no groups")
+    seen = set()
+    for row in rows:
         key = (row.get("roi_count"), str(row["task"]))
         if key in totals:
+            required = (
+                "held_action_packet_guard_induced_forced_wait_count",
+                "slot_start_hol_guard_induced_forced_wait_decision_count",
+            )
+            missing = [field for field in required if field not in row]
+            if missing:
+                raise ValueError(
+                    "guarded ON routing summary lacks required WAIT diagnostics: "
+                    + ", ".join(missing)
+                )
             totals[key]["guard_induced_forced_wait_count"] = int(
-                row.get("guard_induced_forced_wait_count", 0)
+                row["held_action_packet_guard_induced_forced_wait_count"]
+            )
+            totals[key][
+                "slot_start_hol_guard_induced_forced_wait_decision_count"
+            ] = int(
+                row["slot_start_hol_guard_induced_forced_wait_decision_count"]
+            )
+            seen.add(key)
+    if seen != set(totals):
+        raise ValueError("guarded ON routing summary does not contain every comparison group")
+    preselection = {
+        row.get("roi_count"): row
+        for row in summary.get("uav_preselection_decisions", ())
+    }
+    expected_rois = {key[0] for key in totals}
+    if set(preselection) != expected_rois:
+        raise ValueError(
+            "guarded ON routing summary lacks per-RoI UAV preselection diagnostics"
+        )
+    for (roi_count, task), stats in totals.items():
+        if task == "ALL":
+            stats[
+                "uav_preselection_guard_induced_forced_wait_decision_count"
+            ] = int(
+                preselection[roi_count][
+                    "uav_preselection_guard_induced_forced_wait_decision_count"
+                ]
             )
 
 
@@ -196,6 +243,14 @@ def _public(group, stats):
         "guard_induced_forced_wait_count": int(
             stats["guard_induced_forced_wait_count"]
         ),
+        "slot_start_hol_guard_induced_forced_wait_decision_count": int(
+            stats["slot_start_hol_guard_induced_forced_wait_decision_count"]
+        ),
+        "uav_preselection_guard_induced_forced_wait_decision_count": (
+            None
+            if stats["uav_preselection_guard_induced_forced_wait_decision_count"] is None
+            else int(stats["uav_preselection_guard_induced_forced_wait_decision_count"])
+        ),
     }
 
 
@@ -204,10 +259,51 @@ def _sort_key(group):
     return (-1 if group[0] is None else int(group[0]), task_order[group[1]])
 
 
+def _verified_strategy(root, *, enabled):
+    from mutual_next_hop_guard import evaluation_routing_strategy_info
+
+    expected = evaluation_routing_strategy_info(enabled)
+    metadata_path = Path(root) / "paper_evaluation_metadata.json"
+    if not metadata_path.is_file():
+        if enabled:
+            raise ValueError(
+                "guarded ON evaluation lacks paper evaluation strategy metadata"
+            )
+        return expected, "legacy_off_missing_strategy_metadata"
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    actual = metadata.get("evaluation_routing_strategy")
+    if actual is None:
+        actual = metadata.get("mutual_next_hop_guard")
+    if actual is None:
+        if enabled:
+            raise ValueError("guarded ON evaluation lacks routing strategy identity")
+        return expected, "legacy_off_missing_strategy_fields"
+    actual_enabled = bool(
+        actual.get(
+            "mutual_next_hop_guard_enabled", actual.get("enabled", False)
+        )
+    )
+    if actual_enabled != bool(enabled):
+        raise ValueError("evaluation routing strategy guard mode is inconsistent")
+    if enabled:
+        for field in ("strategy_version", "strategy_fingerprint"):
+            if actual.get(field) != expected[field]:
+                raise ValueError(
+                    f"guarded ON evaluation routing strategy {field} is inconsistent"
+                )
+    return expected, "explicit_strategy_metadata"
+
+
 def build_routing_guard_comparison(
     *, source_evaluation_dir, guarded_evaluation_dir, roi_counts,
     selected_scenario_ids_by_roi,
 ):
+    off_strategy, off_strategy_compatibility = _verified_strategy(
+        source_evaluation_dir, enabled=False
+    )
+    on_strategy, on_strategy_compatibility = _verified_strategy(
+        guarded_evaluation_dir, enabled=True
+    )
     off = _accumulate_evaluation(
         source_evaluation_dir, roi_counts, selected_scenario_ids_by_roi
     )
@@ -217,11 +313,37 @@ def build_routing_guard_comparison(
     _inject_guard_wait_counts(
         on, Path(guarded_evaluation_dir) / "routing_loop_summary.json"
     )
+    for stats in off.values():
+        # A confirmed legacy source has no guard, so guard-caused counts are
+        # logically zero even though it predates the diagnostic fields.
+        stats["guard_induced_forced_wait_count"] = 0
+        stats["slot_start_hol_guard_induced_forced_wait_decision_count"] = 0
+    for (roi_count, task), stats in off.items():
+        if task == "ALL":
+            stats["uav_preselection_guard_induced_forced_wait_decision_count"] = 0
     rows = []
     for group in sorted(off, key=_sort_key):
         off_row = _public(group, off[group])
         on_row = _public(group, on[group])
+        if (
+            on_row["guard_induced_forced_wait_count"]
+            > on_row["forced_wait_no_forwarding_candidate_count"]
+        ):
+            raise AssertionError(
+                f"{on_row['group']}: guard-induced packet WAIT exceeds all forced WAIT"
+            )
         row = {key: off_row[key] for key in ("group", "roi_count", "task")}
+        row.update(
+            {
+                "off_strategy_version": off_strategy["strategy_version"],
+                "off_strategy_fingerprint": off_strategy["strategy_fingerprint"],
+                "off_mutual_next_hop_guard_enabled": False,
+                "on_strategy_version": on_strategy["strategy_version"],
+                "on_strategy_fingerprint": on_strategy["strategy_fingerprint"],
+                "on_mutual_next_hop_guard_enabled": True,
+                "evaluation_strategy_scope": "evaluation_only",
+            }
+        )
         for key in off_row.keys() - {"group", "roi_count", "task"}:
             before, after = off_row[key], on_row[key]
             row[f"off_{key}"] = before
@@ -241,6 +363,12 @@ def build_routing_guard_comparison(
         "schema_version": COMPARISON_SCHEMA_VERSION,
         "off_source_evaluation_directory": str(Path(source_evaluation_dir).resolve()),
         "on_guarded_evaluation_directory": str(output.resolve()),
+        "off_evaluation_routing_strategy": off_strategy,
+        "on_evaluation_routing_strategy": on_strategy,
+        "strategy_metadata_compatibility": {
+            "off": off_strategy_compatibility,
+            "on": on_strategy_compatibility,
+        },
         "aggregation": {
             "energy_efficiency": "sum complete useful Mbit / sum mobility energy J",
             "violation_rate": "sum violations / sum eligible packets",
@@ -251,6 +379,10 @@ def build_routing_guard_comparison(
                 "not delivered, terminal node SR/UAV, and finish time equals the 60 s horizon"
             ),
             "relative_change": "(ON - OFF) / OFF; null when OFF is zero or missing",
+            "forced_wait_counts": (
+                "all and guard-induced counts both use actual packet HOL uses of held "
+                "actions, deduplicated by RoI/scenario/slot/sender/packet"
+            ),
         },
         "groups": rows,
     }

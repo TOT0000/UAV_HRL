@@ -3098,6 +3098,7 @@ class PacketEngine:
         collect_first_gen_event_diagnostics=False,
         stall_diagnostic_context=None,
         uav_hop_observer=None,
+        held_action_packet_observer=None,
     ):
         """Advance one slot by physical generation/service/deadline events.
 
@@ -3109,6 +3110,10 @@ class PacketEngine:
 
         if uav_hop_observer is not None and not callable(uav_hop_observer):
             raise TypeError("uav_hop_observer must be callable")
+        if held_action_packet_observer is not None and not callable(
+            held_action_packet_observer
+        ):
+            raise TypeError("held_action_packet_observer must be callable")
 
         slot_start = float(current_time)
         slot_end = slot_start + float(self.step_time)
@@ -3149,6 +3154,7 @@ class PacketEngine:
         event_index = 0
         decision_use_keys = set()
         decision_diagnostic_keys = set()
+        held_action_observation_keys = set()
         active_link_totals = {}
         wait_senders = tuple(
             sender
@@ -3214,6 +3220,28 @@ class PacketEngine:
                 return
             packet_id = int(pkt["id"])
             diagnostic_key = (packet_id, sender)
+            if (
+                held_action_packet_observer is not None
+                and diagnostic_key not in held_action_observation_keys
+            ):
+                held_action_observation_keys.add(diagnostic_key)
+                held_action_packet_observer(
+                    {
+                        "packet_id": packet_id,
+                        "task_type": self._task_norm(
+                            pkt.get("task_type", "COM")
+                        ),
+                        "sender_uav_id": sender,
+                        "selected_action": int(actions[sender]),
+                        "slot_start_time_seconds": float(slot_start),
+                        "observation_time_seconds": float(event_clock[0]),
+                        "hop_receiver_lock": (
+                            None
+                            if pkt.get("hop_receiver") is None
+                            else int(pkt["hop_receiver"])
+                        ),
+                    }
+                )
             if (
                 self.enable_packet_diagnostic_artifacts
                 and diagnostic_key not in decision_diagnostic_keys

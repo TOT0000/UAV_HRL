@@ -32,6 +32,49 @@ MUTUAL_NEXT_HOP_GUARD_FINGERPRINT = hashlib.sha256(
     ).encode("utf-8")
 ).hexdigest()
 
+EVALUATION_ROUTING_STRATEGY_SCHEMA_VERSION = "evaluation-routing-strategy-v1"
+LEGACY_EVALUATION_ROUTING_STRATEGY_VERSION = "evaluation-fixed-order-independent-v1"
+LEGACY_EVALUATION_ROUTING_STRATEGY_SPEC = {
+    "scope": "evaluation_only",
+    "ordering": "fixed_uav_id_order",
+    "constraint": "independent_action_selection",
+    "forced_wait": "self_only_when_no_forwarding_candidate",
+}
+LEGACY_EVALUATION_ROUTING_STRATEGY_FINGERPRINT = hashlib.sha256(
+    json.dumps(
+        LEGACY_EVALUATION_ROUTING_STRATEGY_SPEC,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+).hexdigest()
+
+
+def evaluation_routing_strategy_info(enabled):
+    """Return stable evaluation-policy provenance for both guard modes."""
+
+    enabled = normalize_mutual_next_hop_guard(enabled)
+    return {
+        "schema_version": EVALUATION_ROUTING_STRATEGY_SCHEMA_VERSION,
+        "scope": "evaluation_only",
+        "enabled": bool(enabled),
+        "mutual_next_hop_guard_enabled": bool(enabled),
+        "strategy_version": (
+            MUTUAL_NEXT_HOP_GUARD_VERSION
+            if enabled
+            else LEGACY_EVALUATION_ROUTING_STRATEGY_VERSION
+        ),
+        "strategy_fingerprint": (
+            MUTUAL_NEXT_HOP_GUARD_FINGERPRINT
+            if enabled
+            else LEGACY_EVALUATION_ROUTING_STRATEGY_FINGERPRINT
+        ),
+        "strategy": (
+            dict(MUTUAL_NEXT_HOP_GUARD_SPEC)
+            if enabled
+            else dict(LEGACY_EVALUATION_ROUTING_STRATEGY_SPEC)
+        ),
+    }
+
 
 def normalize_mutual_next_hop_guard(value):
     if isinstance(value, bool):

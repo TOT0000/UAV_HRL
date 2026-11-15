@@ -1130,6 +1130,11 @@ def _run_routing_slot(
             if routing_loop_diagnostics is not None
             else None
         ),
+        held_action_packet_observer=(
+            routing_loop_diagnostics.observe_held_action_packet
+            if routing_loop_diagnostics is not None
+            else None
+        ),
     )
     if routing_slot_observer is not None:
         routing_slot_observer(
@@ -2537,9 +2542,15 @@ def train(
         )
     method_spec = method_spec or MethodSpec()
     formal_evaluation = bool(formal_evaluation)
-    from mutual_next_hop_guard import normalize_mutual_next_hop_guard
+    from mutual_next_hop_guard import (
+        evaluation_routing_strategy_info,
+        normalize_mutual_next_hop_guard,
+    )
 
     mutual_next_hop_guard = normalize_mutual_next_hop_guard(
+        mutual_next_hop_guard
+    )
+    evaluation_routing_strategy = evaluation_routing_strategy_info(
         mutual_next_hop_guard
     )
     if mutual_next_hop_guard and not evaluation:
@@ -2661,6 +2672,7 @@ def train(
         required_methods = (
             "begin_episode",
             "observe_slot",
+            "observe_held_action_packet",
             "observe_hop_event",
             "end_episode",
         )
@@ -2904,6 +2916,22 @@ def train(
         formal_evaluation=formal_evaluation,
         rng_contract_metadata=rng_streams.metadata(),
     )
+    if evaluation:
+        experiment_identity["evaluation_routing_strategy"] = copy.deepcopy(
+            evaluation_routing_strategy
+        )
+        experiment_identity["mutual_next_hop_guard_enabled"] = bool(
+            mutual_next_hop_guard
+        )
+        experiment_identity["evaluation_routing_strategy_version"] = (
+            evaluation_routing_strategy["strategy_version"]
+        )
+        experiment_identity["evaluation_routing_strategy_fingerprint"] = (
+            evaluation_routing_strategy["strategy_fingerprint"]
+        )
+        experiment_identity["evaluation_routing_strategy_scope"] = (
+            evaluation_routing_strategy["scope"]
+        )
     llm_explorer_config = (
         (
             LLMStateRuleConfig(
@@ -5023,6 +5051,24 @@ def train(
         episode_metrics.append(
             {
                 "method_id": method_spec.method_id,
+                **(
+                    {
+                        "mutual_next_hop_guard_enabled": bool(
+                            mutual_next_hop_guard
+                        ),
+                        "evaluation_routing_strategy_version": (
+                            evaluation_routing_strategy["strategy_version"]
+                        ),
+                        "evaluation_routing_strategy_fingerprint": (
+                            evaluation_routing_strategy["strategy_fingerprint"]
+                        ),
+                        "evaluation_routing_strategy_scope": (
+                            evaluation_routing_strategy["scope"]
+                        ),
+                    }
+                    if evaluation
+                    else {}
+                ),
                 "sr_speed_mps": float(env.sr_speed_mps),
                 "sr_movement_diagnostics": sr_episode_summary,
                 "dual_task_service_diagnostics": dual_episode_rows,

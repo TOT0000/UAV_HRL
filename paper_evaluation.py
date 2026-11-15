@@ -838,7 +838,9 @@ def _manifest_deployment_provenance(manifest):
     }
 
 
-def _evaluation_config_fingerprint(method_id, point, episodes, seed, manifest):
+def _evaluation_config_fingerprint(
+    method_id, point, episodes, seed, manifest, *, evaluation_routing_strategy=None
+):
     deployment = _manifest_deployment_provenance(manifest)
     payload = {
         "method_id": str(method_id),
@@ -859,6 +861,17 @@ def _evaluation_config_fingerprint(method_id, point, episodes, seed, manifest):
                 "scenario_manifest_hash": manifest.content_hash,
                 **deployment,
             }
+        )
+    if (
+        evaluation_routing_strategy is not None
+        and bool(
+            evaluation_routing_strategy.get("mutual_next_hop_guard_enabled")
+        )
+    ):
+        # Deliberately absent for OFF so all legacy OFF fingerprints remain
+        # byte-for-byte identical to their historical calculation.
+        payload["evaluation_routing_strategy"] = dict(
+            evaluation_routing_strategy
         )
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=False)
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
@@ -907,13 +920,14 @@ def run_paper_evaluation(
     mutual_next_hop_guard=False,
 ):
     from mutual_next_hop_guard import (
-        MUTUAL_NEXT_HOP_GUARD_FINGERPRINT,
-        MUTUAL_NEXT_HOP_GUARD_SPEC,
-        MUTUAL_NEXT_HOP_GUARD_VERSION,
+        evaluation_routing_strategy_info,
         normalize_mutual_next_hop_guard,
     )
 
     mutual_next_hop_guard = normalize_mutual_next_hop_guard(
+        mutual_next_hop_guard
+    )
+    evaluation_routing_strategy = evaluation_routing_strategy_info(
         mutual_next_hop_guard
     )
     validate_production_deadlines()
@@ -1113,6 +1127,18 @@ def run_paper_evaluation(
             "collect_packet_outcomes": False,
             "packet_outcome_artifact_mode": PACKET_OUTCOME_MODE_DISABLED,
             "packet_outcome_artifact_schema_version": None,
+            "evaluation_routing_strategy": evaluation_routing_strategy,
+            "mutual_next_hop_guard": evaluation_routing_strategy,
+            "mutual_next_hop_guard_enabled": bool(mutual_next_hop_guard),
+            "evaluation_routing_strategy_version": evaluation_routing_strategy[
+                "strategy_version"
+            ],
+            "evaluation_routing_strategy_fingerprint": evaluation_routing_strategy[
+                "strategy_fingerprint"
+            ],
+            "evaluation_routing_strategy_scope": evaluation_routing_strategy[
+                "scope"
+            ],
         }
         _write_json(output_dir / "paper_evaluation_metadata.json", metadata)
         return {"output_directory": str(output_dir), **metadata}
@@ -1265,6 +1291,7 @@ def run_paper_evaluation(
             resolved_episodes,
             context["training_seed"],
             manifest,
+            evaluation_routing_strategy=evaluation_routing_strategy,
         )
         deployment_provenance = _manifest_deployment_provenance(manifest)
         fixed_num_gt = point.get("fixed_num_gt")
@@ -1355,6 +1382,26 @@ def run_paper_evaluation(
                 routing_loop_diagnostics=routing_loop_diagnostics,
                 mutual_next_hop_guard=mutual_next_hop_guard,
             )
+        episode_strategy_fields = {
+            "mutual_next_hop_guard_enabled": bool(mutual_next_hop_guard),
+            "evaluation_routing_strategy_version": evaluation_routing_strategy[
+                "strategy_version"
+            ],
+            "evaluation_routing_strategy_fingerprint": evaluation_routing_strategy[
+                "strategy_fingerprint"
+            ],
+            "evaluation_routing_strategy_scope": evaluation_routing_strategy[
+                "scope"
+            ],
+        }
+        for episode_row in result["episode_metrics"]:
+            for field, expected in episode_strategy_fields.items():
+                actual = episode_row.get(field, expected)
+                if actual != expected:
+                    raise AssertionError(
+                        f"episode evaluation strategy field disagrees: {field}"
+                    )
+                episode_row[field] = expected
         diagnostic_outputs = write_packet_routing_diagnostic_artifacts(
             point_dir,
             outcome_writer.routing_diagnostics(),
@@ -1458,6 +1505,17 @@ def run_paper_evaluation(
             "training_episode_horizon_s": int(PRODUCTION_EPISODE_HORIZON_SECONDS),
             "evaluation_episode_horizon_s": point_seconds,
             "evaluation_config_fingerprint": evaluation_config_fingerprint,
+            "evaluation_routing_strategy": evaluation_routing_strategy,
+            "mutual_next_hop_guard_enabled": bool(mutual_next_hop_guard),
+            "evaluation_routing_strategy_version": evaluation_routing_strategy[
+                "strategy_version"
+            ],
+            "evaluation_routing_strategy_fingerprint": evaluation_routing_strategy[
+                "strategy_fingerprint"
+            ],
+            "evaluation_routing_strategy_scope": evaluation_routing_strategy[
+                "scope"
+            ],
             **deployment_provenance,
             **(
                 {
@@ -1493,6 +1551,11 @@ def run_paper_evaluation(
             result["episode_metrics"],
             run_metadata,
             episode_context_columns=(
+                "mutual_next_hop_guard_enabled",
+                "evaluation_routing_strategy_version",
+                "evaluation_routing_strategy_fingerprint",
+                "evaluation_routing_strategy_scope",
+            ) + (
                 (
                     "episode_horizon_seconds",
                     "movement_transition_count",
@@ -1558,6 +1621,16 @@ def run_paper_evaluation(
                     else {}
                 ),
                 "evaluation_config_fingerprint": evaluation_config_fingerprint,
+                "mutual_next_hop_guard_enabled": bool(mutual_next_hop_guard),
+                "evaluation_routing_strategy_version": evaluation_routing_strategy[
+                    "strategy_version"
+                ],
+                "evaluation_routing_strategy_fingerprint": evaluation_routing_strategy[
+                    "strategy_fingerprint"
+                ],
+                "evaluation_routing_strategy_scope": evaluation_routing_strategy[
+                    "scope"
+                ],
                 "checkpoint_episode": context["checkpoint_episode"],
                 "checkpoint_path": (
                     str(context["checkpoint"]) if checkpoint_required else None
@@ -1616,6 +1689,17 @@ def run_paper_evaluation(
                 "evaluation_episode_horizon_s": point_seconds,
                 "training_episode_horizon_s": int(PRODUCTION_EPISODE_HORIZON_SECONDS),
                 "evaluation_config_fingerprint": evaluation_config_fingerprint,
+                "evaluation_routing_strategy": evaluation_routing_strategy,
+                "mutual_next_hop_guard_enabled": bool(mutual_next_hop_guard),
+                "evaluation_routing_strategy_version": evaluation_routing_strategy[
+                    "strategy_version"
+                ],
+                "evaluation_routing_strategy_fingerprint": evaluation_routing_strategy[
+                    "strategy_fingerprint"
+                ],
+                "evaluation_routing_strategy_scope": evaluation_routing_strategy[
+                    "scope"
+                ],
                 **(
                     {"llm_artifact_id": llm_artifact_id}
                     if llm_artifact_id is not None
@@ -1777,19 +1861,18 @@ def run_paper_evaluation(
         ),
         "method_id": method.method_id,
         "method_spec": method.to_dict(),
-        "mutual_next_hop_guard": {
-            "enabled": bool(mutual_next_hop_guard),
-            "scope": "evaluation_only",
-            "strategy_version": (
-                MUTUAL_NEXT_HOP_GUARD_VERSION if mutual_next_hop_guard else None
-            ),
-            "strategy_fingerprint": (
-                MUTUAL_NEXT_HOP_GUARD_FINGERPRINT
-                if mutual_next_hop_guard
-                else None
-            ),
-            "strategy": MUTUAL_NEXT_HOP_GUARD_SPEC if mutual_next_hop_guard else None,
-        },
+        "evaluation_routing_strategy": evaluation_routing_strategy,
+        "mutual_next_hop_guard": evaluation_routing_strategy,
+        "mutual_next_hop_guard_enabled": bool(mutual_next_hop_guard),
+        "evaluation_routing_strategy_version": evaluation_routing_strategy[
+            "strategy_version"
+        ],
+        "evaluation_routing_strategy_fingerprint": evaluation_routing_strategy[
+            "strategy_fingerprint"
+        ],
+        "evaluation_routing_strategy_scope": evaluation_routing_strategy[
+            "scope"
+        ],
         "training_run": str(context["run_dir"]) if context["run_dir"] else None,
         "training_run_id": context["training_run_id"],
         "training_run_directory": (

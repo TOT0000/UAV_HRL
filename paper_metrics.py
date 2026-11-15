@@ -453,6 +453,18 @@ def aggregate_paper_point_metrics(
         "manifest_hash": point.get("manifest_hash"),
         "episode_seconds": point.get("episode_seconds"),
         "git_sha": point.get("git_sha"),
+        "mutual_next_hop_guard_enabled": point.get(
+            "mutual_next_hop_guard_enabled"
+        ),
+        "evaluation_routing_strategy_version": point.get(
+            "evaluation_routing_strategy_version"
+        ),
+        "evaluation_routing_strategy_fingerprint": point.get(
+            "evaluation_routing_strategy_fingerprint"
+        ),
+        "evaluation_routing_strategy_scope": point.get(
+            "evaluation_routing_strategy_scope"
+        ),
         "evaluation_episode_count": len(rows),
         "ee_numerator_definition": (
             "total complete useful Mbit (timely plus late delivery)"

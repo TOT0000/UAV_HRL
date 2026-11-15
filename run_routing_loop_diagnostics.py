@@ -15,9 +15,7 @@ from routing_loop_diagnostics import (
     verify_episode_jsonl_prefix,
 )
 from mutual_next_hop_guard import (
-    MUTUAL_NEXT_HOP_GUARD_FINGERPRINT,
-    MUTUAL_NEXT_HOP_GUARD_SPEC,
-    MUTUAL_NEXT_HOP_GUARD_VERSION,
+    evaluation_routing_strategy_info,
     normalize_mutual_next_hop_guard,
 )
 from routing_guard_comparison import build_routing_guard_comparison
@@ -82,6 +80,19 @@ def _load_source(source_dir, roi_counts, episodes_per_roi):
         raise ValueError("source evaluation must identify checkpoint episode 1400")
     if int(metadata.get("training_total_episodes", -1)) != 1400:
         raise ValueError("source evaluation training run is not the 1400-episode run")
+    source_strategy = metadata.get("evaluation_routing_strategy")
+    legacy_off_strategy = source_strategy is None
+    if source_strategy is None:
+        source_strategy = metadata.get("mutual_next_hop_guard")
+    if source_strategy is not None:
+        source_enabled = bool(
+            source_strategy.get(
+                "mutual_next_hop_guard_enabled",
+                source_strategy.get("enabled", False),
+            )
+        )
+        if source_enabled:
+            raise ValueError("source evaluation must be an unguarded OFF result")
     training_run = Path(
         metadata.get("training_run_directory") or metadata.get("training_run") or ""
     ).resolve()
@@ -137,7 +148,15 @@ def _load_source(source_dir, roi_counts, episodes_per_roi):
             "source_packet_outcomes_jsonl": str(packet_outcomes_path.resolve()),
             "selected_entries_exact_source_prefix": True,
         }
-    return source_dir, metadata, training_run, checkpoint_path, manifests, provenance
+    return (
+        source_dir,
+        metadata,
+        training_run,
+        checkpoint_path,
+        manifests,
+        provenance,
+        legacy_off_strategy,
+    )
 
 
 def run_diagnostics(
@@ -154,6 +173,7 @@ def run_diagnostics(
         checkpoint_path,
         manifests,
         manifest_provenance,
+        legacy_off_strategy,
     ) = _load_source(source_evaluation_dir, roi_counts, episodes_per_roi)
     git_sha = _git_sha()
     output_dir = _unique_output_directory(output_root, git_sha)
@@ -175,15 +195,12 @@ def run_diagnostics(
             "manifest_provenance": manifest_provenance,
             "selected_scenario_count": len(roi_counts) * episodes_per_roi,
             "git_sha": git_sha,
-            "mutual_next_hop_guard": {
-                "enabled": guard_enabled,
-                "strategy_version": (
-                    MUTUAL_NEXT_HOP_GUARD_VERSION if guard_enabled else None
-                ),
-                "strategy_fingerprint": (
-                    MUTUAL_NEXT_HOP_GUARD_FINGERPRINT if guard_enabled else None
-                ),
-                "strategy": MUTUAL_NEXT_HOP_GUARD_SPEC if guard_enabled else None,
+            "evaluation_routing_strategy": evaluation_routing_strategy_info(
+                guard_enabled
+            ),
+            "source_evaluation_strategy_compatibility": {
+                "confirmed_guard_off": True,
+                "legacy_missing_strategy_fields": bool(legacy_off_strategy),
             },
         },
     )
@@ -218,6 +235,7 @@ def run_diagnostics(
                     point_dir / "per_episode.jsonl",
                     source_dir / f"roi_{roi_count}" / "per_episode.jsonl",
                     selected_ids,
+                    legacy_off_strategy_compatibility=legacy_off_strategy,
                 )
             actual_manifest_hashes[str(roi_count)] = actual_manifest.content_hash
         diagnostic_metadata = collector.finalize(
