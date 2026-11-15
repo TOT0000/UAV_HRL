@@ -230,9 +230,9 @@ class QoSAndRoutingRewardContractTest(unittest.TestCase):
         initial = agent.lambda_cost
         self.assertEqual(agent.qos_target_probability, SAFE_DDQN_QOS_TARGET_PROBABILITY)
         first = agent.update_cost_multiplier(1, 20)
-        self.assertAlmostEqual(first, initial + 0.01 * (0.05 - 0.01))
+        self.assertAlmostEqual(first, initial)
         increased = agent.update_cost_multiplier(2, 20)
-        self.assertAlmostEqual(increased, first + 0.01 * (0.10 - 0.01))
+        self.assertAlmostEqual(increased, first + 0.05 * (0.10 - 0.05))
         agent.lambda_cost = 0.0
         self.assertEqual(agent.update_cost_multiplier(0, 20), 0.0)
         self.assertEqual(agent.update_cost_multiplier(0, 0), 0.0)

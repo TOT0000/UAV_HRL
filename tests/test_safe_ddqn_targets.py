@@ -92,6 +92,44 @@ class SafeDDQNTargetTest(unittest.TestCase):
         self.assertTrue(torch.allclose(target_q, torch.tensor([29.0, 2.0])))
         self.assertTrue(torch.allclose(target_c, torch.tensor([57.0, 3.0])))
 
+    def test_replayed_guard_mask_overrides_state_encoded_mask(self):
+        model = DDQN.__new__(DDQN)
+        model.action_dim = 3
+        model.gamma = 1.0
+        model.lambda_cost = 0.0
+        model.q_network = FixedNetwork([[1.0, 100.0, 8.0]])
+        model.cost_network = FixedNetwork([[0.0, 0.0, 0.0]])
+        model.target_q_network = FixedNetwork([[10.0, 20.0, 30.0]])
+        model.target_cost_network = FixedNetwork([[0.0, 0.0, 0.0]])
+        next_state = torch.zeros((1, 42), dtype=torch.float32)
+        next_state[0, 0] = 1.0
+        next_state[0, 10:13] = torch.tensor([0.0, 1.0, 1.0])
+
+        target_q, _, next_actions = model._safe_targets(
+            next_state,
+            torch.zeros((1, 1)),
+            torch.zeros((1, 1)),
+            torch.ones((1, 1)),
+            next_action_mask=torch.tensor([[False, False, True]]),
+        )
+
+        self.assertEqual(next_actions.item(), 2)
+        self.assertEqual(target_q.item(), 30.0)
+
+        replay = ReplayBufferDiscrete(42, 3, max_size=2, n_step=1)
+        replay.add(
+            next_state[0].numpy(),
+            2,
+            next_state[0].numpy(),
+            reward=0.0,
+            cost=0.0,
+            done=False,
+            action_mask=np.array([False, False, True]),
+            next_action_mask=np.array([False, False, True]),
+        )
+        self.assertTrue(replay.action_mask[0, 2])
+        self.assertFalse(replay.action_mask[0, 1])
+
     def test_wait_is_forced_when_no_forwarding_action_exists(self):
         model = DDQN.__new__(DDQN)
         model.action_dim = 3
@@ -150,42 +188,42 @@ class SafeDDQNTargetTest(unittest.TestCase):
 
     def test_constraint_defaults_and_episode_end_update_formula(self):
         model = DDQN(state_dim=42, action_dim=3, hidden_dim=8)
-        self.assertEqual(model.qos_target_probability, 0.01)
+        self.assertEqual(model.qos_target_probability, 0.05)
         self.assertEqual(model.lambda_cost, 0.0)
-        self.assertEqual(model.eta_c, 0.01)
+        self.assertEqual(model.eta_c, 0.05)
 
         unchanged = model.update_cost_multiplier(
-            episode_violation_count=1,
+            episode_violation_count=5,
             episode_eligible_packet_count=100,
         )
         self.assertAlmostEqual(unchanged, 0.0)
         self.assertEqual(model.cost_multiplier_update_count, 1)
         increased = model.update_cost_multiplier(
-            episode_violation_count=2,
+            episode_violation_count=20,
             episode_eligible_packet_count=100,
         )
-        self.assertAlmostEqual(increased, 0.0001)
+        self.assertAlmostEqual(increased, 0.0075)
         self.assertEqual(model.cost_multiplier_update_count, 2)
         decreased = model.update_cost_multiplier(
             episode_violation_count=0,
             episode_eligible_packet_count=100,
         )
-        self.assertAlmostEqual(decreased, 0.0)
+        self.assertAlmostEqual(decreased, 0.005)
         self.assertEqual(model.cost_multiplier_update_count, 3)
         zero_eligible = model.update_cost_multiplier(
             episode_violation_count=0,
             episode_eligible_packet_count=0,
         )
-        self.assertAlmostEqual(zero_eligible, 0.0)
+        self.assertAlmostEqual(zero_eligible, 0.005)
         self.assertEqual(model.cost_multiplier_update_count, 3)
         self.assertEqual(model.cost_multiplier_skipped_episode_count, 1)
         state = model.constraint_state()
         self.assertEqual(state["lambda_update_scope"], "episode_end")
         self.assertEqual(state["cost_denominator"], "episode_system_eligible_packets")
         self.assertEqual(state["lambda_update_mode"], "direct_episode_system_dvp")
-        self.assertEqual(state["system_dvp_target"], 0.01)
+        self.assertEqual(state["system_dvp_target"], 0.05)
         self.assertIsNone(state["reference_packet_count"])
-        self.assertEqual(state["normalized_eta_c"], 0.01)
+        self.assertEqual(state["normalized_eta_c"], 0.05)
         self.assertEqual(state["last_episode_eligible_packet_count"], 0)
         self.assertIsNone(state["last_episode_violation_probability"])
         self.assertFalse(state["mid_episode_checkpoint_supported"])

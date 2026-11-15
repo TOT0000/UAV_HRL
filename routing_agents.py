@@ -96,8 +96,14 @@ class ControlledDQN:
         return routing_action_mask_from_state(next_state, self.action_dim)
 
     @torch.no_grad()
-    def _standard_targets(self, next_state, reward, not_done):
-        legal = self._routing_action_mask(next_state)
+    def _standard_targets(
+        self, next_state, reward, not_done, next_action_mask=None
+    ):
+        legal = (
+            self._routing_action_mask(next_state)
+            if next_action_mask is None
+            else next_action_mask.to(next_state.device).bool()
+        )
         target_values = self.target_q_network(next_state)
         if getattr(self, "double_dqn", False):
             online_values = self.q_network(next_state).masked_fill(
@@ -112,11 +118,14 @@ class ControlledDQN:
         return reward.squeeze(1) + not_done.squeeze(1) * self.gamma * next_values
 
     def train(self, replay_buffer, batch_size=64):
-        state, action, next_state, reward, _cost, not_done = replay_buffer.sample(
-            batch_size
-        )
+        (
+            state, action, next_state, reward, _cost, not_done,
+            _action_mask, next_action_mask,
+        ) = replay_buffer.sample_with_masks(batch_size)
         values = self.q_network(state).gather(1, action.unsqueeze(1)).squeeze(1)
-        targets = self._standard_targets(next_state, reward, not_done)
+        targets = self._standard_targets(
+            next_state, reward, not_done, next_action_mask
+        )
         loss = F.mse_loss(values, targets)
         self.optimizer.zero_grad()
         loss.backward()

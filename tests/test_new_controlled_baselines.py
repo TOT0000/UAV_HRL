@@ -322,6 +322,13 @@ class ControlledDQNTest(unittest.TestCase):
             not_done=torch.tensor([[1.0]]),
         )
         self.assertAlmostEqual(target.item(), 2.0 + 0.9 * 8.0, places=6)
+        guarded_target = agent._standard_targets(
+            next_state,
+            reward=torch.tensor([[2.0]]),
+            not_done=torch.tensor([[1.0]]),
+            next_action_mask=torch.tensor([[True, False, False]]),
+        )
+        self.assertAlmostEqual(guarded_target.item(), 2.0 + 0.9, places=6)
 
     def test_epsilon_and_greedy_actions_respect_current_mask(self):
         agent = ControlledDQN(state_dim=42, action_dim=3, hidden_dim=8)

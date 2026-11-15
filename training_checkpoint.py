@@ -180,7 +180,9 @@ def _joint_replay_fields(replay):
 ROUTING_REPLAY_FIELDS = (
     "state",
     "action",
+    "action_mask",
     "next_state",
+    "next_action_mask",
     "reward",
     "cost",
     "not_done",
@@ -191,7 +193,9 @@ ROUTING_REPLAY_FIELDS = (
     "cost_ready",
     "path_cost_state",
     "path_cost_action",
+    "path_cost_action_mask",
     "path_cost_next_state",
+    "path_cost_next_action_mask",
     "path_cost_value",
     "path_cost_not_done",
     "path_cost_tag_gt",
@@ -1066,7 +1070,9 @@ def _network_states(td3, ddqn):
     return states
 
 
-def _load_network_states(payload, td3, ddqn):
+def _load_network_states(
+    payload, td3, ddqn, *, allow_safe_constraint_config_mismatch=False
+):
     kind = _agent_kind(td3)
     if kind == "td3":
         td3_state = payload["td3"]
@@ -1102,7 +1108,10 @@ def _load_network_states(payload, td3, ddqn):
             raise RuntimeError(
                 "legacy safe-DDQN checkpoint lacks adaptive constraint state"
             )
-        ddqn.load_constraint_state(ddqn_state["constraint_state"])
+        ddqn.load_constraint_state(
+            ddqn_state["constraint_state"],
+            allow_hyperparameter_mismatch=allow_safe_constraint_config_mismatch,
+        )
     elif routing_kind in {"dqn", "ddqn"}:
         state = payload.get("routing_agent") or {}
         if state.get("kind") != routing_kind or "cost_network" in state:
@@ -2049,6 +2058,7 @@ def load_model_checkpoint(
     training_run_directory=None,
     allow_incomplete_provenance=False,
     rnd_explorer=None,
+    allow_safe_constraint_config_mismatch=False,
 ):
     checkpoint_dir = Path(checkpoint_dir).resolve()
     inspected = inspect_model_checkpoint(
@@ -2072,7 +2082,12 @@ def load_model_checkpoint(
     payload = torch.load(
         checkpoint_dir / "models.pt", map_location="cpu", weights_only=False
     )
-    _load_network_states(payload, td3, ddqn)
+    _load_network_states(
+        payload, td3, ddqn,
+        allow_safe_constraint_config_mismatch=(
+            allow_safe_constraint_config_mismatch
+        ),
+    )
     if rnd_explorer is not None:
         if "rnd" not in payload or "rnd" not in metadata:
             raise RuntimeError("RND model checkpoint is incomplete")

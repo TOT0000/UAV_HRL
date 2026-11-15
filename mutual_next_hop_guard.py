@@ -1,4 +1,4 @@
-"""Evaluation-only sequential routing mask guard.
+"""Sequential routing mask guard shared by training and evaluation.
 
 The guard changes only the external action mask supplied to an existing routing
 policy.  It is deterministic, consumes no random numbers, and never mutates the
@@ -7,30 +7,16 @@ effective masks produced by the packet engine.
 
 from __future__ import annotations
 
-import hashlib
-import json
-
 import numpy as np
 
-from DDQN import forwarding_or_forced_wait_mask
+from experiment_config import (
+    MUTUAL_NEXT_HOP_GUARD_FINGERPRINT,
+    MUTUAL_NEXT_HOP_GUARD_SPEC,
+    MUTUAL_NEXT_HOP_GUARD_VERSION,
+)
 
-
-MUTUAL_NEXT_HOP_GUARD_VERSION = "evaluation-mrv-no-mutual-v1"
-MUTUAL_NEXT_HOP_GUARD_SPEC = {
-    "scope": "evaluation_only",
-    "ordering": "minimum_remaining_forwarding_candidates",
-    "tie_break": "rotating_uav_order_from_slot_index",
-    "constraint": "exclude_i_to_j_when_selected_action_j_equals_i",
-    "forced_wait": "self_only_when_no_forwarding_candidate",
-    "cycle_scope": "two_node_only",
-}
-MUTUAL_NEXT_HOP_GUARD_FINGERPRINT = hashlib.sha256(
-    json.dumps(
-        MUTUAL_NEXT_HOP_GUARD_SPEC,
-        sort_keys=True,
-        separators=(",", ":"),
-    ).encode("utf-8")
-).hexdigest()
+import hashlib
+import json
 
 EVALUATION_ROUTING_STRATEGY_SCHEMA_VERSION = "evaluation-routing-strategy-v1"
 LEGACY_EVALUATION_ROUTING_STRATEGY_VERSION = "evaluation-fixed-order-independent-v1"
@@ -55,7 +41,9 @@ def evaluation_routing_strategy_info(enabled):
     enabled = normalize_mutual_next_hop_guard(enabled)
     return {
         "schema_version": EVALUATION_ROUTING_STRATEGY_SCHEMA_VERSION,
-        "scope": "evaluation_only",
+        "scope": (
+            "training_and_evaluation" if enabled else "explicit_legacy_control"
+        ),
         "enabled": bool(enabled),
         "mutual_next_hop_guard_enabled": bool(enabled),
         "strategy_version": (
@@ -117,6 +105,8 @@ def guarded_effective_mask(
 
 
 def actual_selection_mask(effective_mask, sender_uav_id):
+    from DDQN import forwarding_or_forced_wait_mask
+
     values = np.asarray(effective_mask, dtype=bool)
     return forwarding_or_forced_wait_mask(values, sender_uav_id, len(values))
 

@@ -502,7 +502,9 @@ class ReplayBufferDiscrete:
 
         self.state      = np.zeros((self.max_size, state_dim), dtype=np.float32)
         self.action     = np.zeros((self.max_size,), dtype=np.int64)
+        self.action_mask = np.ones((self.max_size, action_dim), dtype=bool)
         self.next_state = np.zeros((self.max_size, state_dim), dtype=np.float32)
+        self.next_action_mask = np.ones((self.max_size, action_dim), dtype=bool)
         self.reward     = np.zeros((self.max_size, 1), dtype=np.float32)
         self.cost       = np.zeros((self.max_size, 1), dtype=np.float32)
         self.not_done   = np.zeros((self.max_size, 1), dtype=np.float32)
@@ -518,8 +520,14 @@ class ReplayBufferDiscrete:
             (self.max_size, state_dim), dtype=np.float32
         )
         self.path_cost_action = np.zeros((self.max_size,), dtype=np.int64)
+        self.path_cost_action_mask = np.ones(
+            (self.max_size, action_dim), dtype=bool
+        )
         self.path_cost_next_state = np.zeros(
             (self.max_size, state_dim), dtype=np.float32
+        )
+        self.path_cost_next_action_mask = np.ones(
+            (self.max_size, action_dim), dtype=bool
         )
         self.path_cost_value = np.zeros((self.max_size, 1), dtype=np.float32)
         self.path_cost_not_done = np.zeros(
@@ -549,7 +557,8 @@ class ReplayBufferDiscrete:
     @torch.no_grad()
     def add(
         self, state, action, next_state, reward, cost, done, tag_gt=None,
-        agent_id=None, transition_id=None,
+        agent_id=None, transition_id=None, action_mask=None,
+        next_action_mask=None,
     ):
         s  = _to_np_float32(state)
         a  = _to_np_float32(action)
@@ -559,13 +568,18 @@ class ReplayBufferDiscrete:
         c  = float(cost)
         tg = int(tag_gt) if tag_gt is not None else -1
         tid = int(transition_id) if transition_id is not None else -1
+        am = self._validated_action_mask(action_mask)
+        nam = self._validated_action_mask(next_action_mask)
+        action_index = int(a)
+        if action_index < 0 or action_index >= am.size or not bool(am[action_index]):
+            raise ValueError("routing replay action is illegal under its decision mask")
 
-        self.n_step_buffer.append((s, a, ns, r, c, d, tg, tid))
+        self.n_step_buffer.append((s, a, ns, r, c, d, tg, tid, am, nam))
         if len(self.n_step_buffer) < self.n_step:
             return
 
         R, C, next_s, done_flag = 0.0, 0.0, None, False
-        for idx, (_, _, ns_i, r_i, c_i, d_i, _, _) in enumerate(self.n_step_buffer):
+        for idx, (_, _, ns_i, r_i, c_i, d_i, _, _, _, _) in enumerate(self.n_step_buffer):
             g = self.gamma ** idx
             R += g * float(r_i)
             C += g * float(c_i)
@@ -576,7 +590,8 @@ class ReplayBufferDiscrete:
         if not done_flag:
             next_s = self.n_step_buffer[-1][2]
 
-        s0, a0, _, _, _, _, tg0, tid0 = self.n_step_buffer[0]
+        s0, a0, _, _, _, _, tg0, tid0, am0, _ = self.n_step_buffer[0]
+        next_am = self.n_step_buffer[idx][9]
 
         i = self.ptr
         previous_transition_id = int(self.transition_id[i])
@@ -584,7 +599,9 @@ class ReplayBufferDiscrete:
             self.index_by_transition_id.pop(previous_transition_id, None)
         self.state[i]       = s0
         self.action[i]      = a0
+        self.action_mask[i] = am0
         self.next_state[i]  = next_s
+        self.next_action_mask[i] = next_am
         self.reward[i, 0]   = R
         self.cost[i, 0]     = C
         self.not_done[i, 0] = 1.0 - float(done_flag)
@@ -627,6 +644,8 @@ class ReplayBufferDiscrete:
         tag_gt=None,
         transition_id=None,
         packet_id=None,
+        action_mask=None,
+        next_action_mask=None,
     ):
         """Append one packet-use cost transition without duplicating reward."""
 
@@ -644,7 +663,18 @@ class ReplayBufferDiscrete:
         index = self.path_cost_ptr
         self.path_cost_state[index] = state_array
         self.path_cost_action[index] = int(action)
+        stored_action_mask = self._validated_action_mask(
+            action_mask
+        )
+        if not bool(stored_action_mask[int(action)]):
+            raise ValueError(
+                "packet-path action is illegal under its decision mask"
+            )
+        self.path_cost_action_mask[index] = stored_action_mask
         self.path_cost_next_state[index] = next_state_array
+        self.path_cost_next_action_mask[index] = self._validated_action_mask(
+            next_action_mask
+        )
         self.path_cost_value[index, 0] = value
         self.path_cost_not_done[index, 0] = 1.0 - float(bool(done))
         self.path_cost_tag_gt[index, 0] = (
@@ -695,6 +725,12 @@ class ReplayBufferDiscrete:
         ind = self.rng.integers(0, self.size, size=batch_size)
         return self._gather(ind, include_cost=include_cost)
 
+    def sample_with_masks(self, batch_size):
+        ind = self.rng.integers(0, self.size, size=batch_size)
+        return (*self._gather(ind),
+                torch.from_numpy(self.action_mask[ind]).to(self.device),
+                torch.from_numpy(self.next_action_mask[ind]).to(self.device))
+
     def sample_cost(self, batch_size):
         if self.path_cost_size > 0:
             indices = self.rng.integers(
@@ -718,6 +754,44 @@ class ReplayBufferDiscrete:
             torch.from_numpy(self.cost[indices]).to(self.device),
             torch.from_numpy(self.cost_not_done[indices]).to(self.device),
         )
+
+    def sample_cost_with_masks(self, batch_size):
+        if self.path_cost_size > 0:
+            indices = self.rng.integers(
+                0, self.path_cost_size, size=int(batch_size)
+            )
+            return (
+                torch.from_numpy(self.path_cost_state[indices]).to(self.device),
+                torch.from_numpy(self.path_cost_action[indices]).to(self.device),
+                torch.from_numpy(self.path_cost_next_state[indices]).to(self.device),
+                torch.from_numpy(self.path_cost_value[indices]).to(self.device),
+                torch.from_numpy(self.path_cost_not_done[indices]).to(self.device),
+                torch.from_numpy(self.path_cost_action_mask[indices]).to(self.device),
+                torch.from_numpy(self.path_cost_next_action_mask[indices]).to(self.device),
+            )
+        ready = np.flatnonzero(self.cost_ready[: self.size, 0])
+        if ready.size == 0:
+            raise ValueError("routing replay has no packet-chain cost transitions")
+        indices = self.rng.choice(ready, size=int(batch_size), replace=True)
+        return (
+            torch.from_numpy(self.state[indices]).to(self.device),
+            torch.from_numpy(self.action[indices]).to(self.device),
+            torch.from_numpy(self.cost_next_state[indices]).to(self.device),
+            torch.from_numpy(self.cost[indices]).to(self.device),
+            torch.from_numpy(self.cost_not_done[indices]).to(self.device),
+            torch.from_numpy(self.action_mask[indices]).to(self.device),
+            torch.from_numpy(self.next_action_mask[indices]).to(self.device),
+        )
+
+    def _validated_action_mask(self, value):
+        if value is None:
+            return np.ones(self.action_mask.shape[1], dtype=bool)
+        result = np.asarray(value, dtype=bool).copy()
+        if result.shape != (self.action_mask.shape[1],):
+            raise ValueError("routing replay action mask has incompatible shape")
+        if not result.any():
+            raise ValueError("routing replay action mask must allow one action")
+        return result
 
     def sample_by_tag(self, batch_size, curr_tag, neighbor_step=2,
                       p_same=0.6, p_neighbor=0.2, include_cost=False):

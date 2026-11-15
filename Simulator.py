@@ -38,7 +38,13 @@ from visual_sensing import (
 from collections import defaultdict
 from Energy_model import EnergyConsumptionModel
 from Task_assignment import UAVAssigner, Task
-from object import UAV, SRTeam, GroundTarget, validate_sr_speed_mps
+from object import (
+    DEFAULT_SR_SPEED_MPS,
+    UAV,
+    SRTeam,
+    GroundTarget,
+    validate_sr_speed_mps,
+)
 from search_path_manager import SearchPathManager
 from experiment_config import (
     ASSIGNMENT_CONTRACT_VERSION,
@@ -157,6 +163,12 @@ class Simulator:
             None
             if sr_speed_mps_override is None
             else validate_sr_speed_mps(sr_speed_mps_override)
+        )
+        self.sr_base_speed_mps = float(DEFAULT_SR_SPEED_MPS)
+        self.sr_speed_mps = float(
+            self.sr_base_speed_mps
+            if self.sr_speed_mps_override is None
+            else self.sr_speed_mps_override
         )
         self.sim_step_count = 0
         if int(num_UAV) != NUM_UAV:
@@ -1828,7 +1840,9 @@ class Simulator:
                 {
                     "sr_id": index,
                     "position": [*start_points[index % 4], 0.0],
-                    "movement_primitive": {"speed_mps": 1.0},
+                    "movement_primitive": {
+                        "speed_mps": DEFAULT_SR_SPEED_MPS
+                    },
                 }
                 for index in range(self.num_GT)
             ]

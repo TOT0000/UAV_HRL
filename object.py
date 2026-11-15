@@ -1,5 +1,7 @@
 from collections import deque
 import numpy as np
+
+from experiment_defaults import DEFAULT_SR_SPEED_MPS
 from Fov_model_phase import FovModel
 from Energy_model import EnergyConsumptionModel
 
@@ -18,7 +20,9 @@ def validate_sr_speed_mps(speed):
     return speed
 
 
-def straight_line_route(start, goal, speed=1.0, update_seconds=1.0):
+def straight_line_route(
+    start, goal, speed=DEFAULT_SR_SPEED_MPS, update_seconds=1.0
+):
     """Return movement points after start, ending exactly at the target."""
 
     speed = validate_sr_speed_mps(speed)
@@ -334,7 +338,9 @@ class SRTeam:
         self.current_step = 0
     def get_position(self):
         return self.x, self.y, self.z
-    def assign_mission(self, gt_id, gt_pos, speed=1.0, update_seconds=1.0):
+    def assign_mission(
+        self, gt_id, gt_pos, speed=DEFAULT_SR_SPEED_MPS, update_seconds=1.0
+    ):
         """
         ✅ 由環境分派 GT 任務並啟動移動
         """

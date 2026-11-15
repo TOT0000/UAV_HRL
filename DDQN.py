@@ -410,12 +410,18 @@ class DDQN:
         return routing_action_mask_from_state(next_state, self.action_dim)
 
     @torch.no_grad()
-    def _safe_targets(self, next_state, reward, cost, not_done):
+    def _safe_targets(
+        self, next_state, reward, cost, not_done, next_action_mask=None
+    ):
         next_q_online = self.q_network(next_state)
         next_c_online = self.cost_network(next_state)
         safe_scores = next_q_online - self.lambda_cost * next_c_online
 
-        action_mask = self._routing_action_mask(next_state)
+        action_mask = (
+            self._routing_action_mask(next_state)
+            if next_action_mask is None
+            else next_action_mask.to(next_state.device).bool()
+        )
         safe_scores = safe_scores.masked_fill(~action_mask, float("-inf"))
         next_actions = safe_scores.argmax(dim=1, keepdim=True)
 
@@ -504,7 +510,7 @@ class DDQN:
             ),
         }
 
-    def load_constraint_state(self, state):
+    def load_constraint_state(self, state, *, allow_hyperparameter_mismatch=False):
         required = {
             "lambda_cost",
             "initial_lambda_cost",
@@ -525,14 +531,17 @@ class DDQN:
             raise RuntimeError(
                 f"safe-DDQN checkpoint constraint state is incomplete: {missing}"
             )
-        if (
+        hyperparameters_match = (
             float(state["initial_lambda_cost"])
-            != SAFE_DDQN_INITIAL_LAMBDA_COST
-            or float(state["normalized_eta_c"]) != SAFE_DDQN_ETA_C
-            or float(state["qos_target_probability"])
-            != SAFE_DDQN_QOS_TARGET_PROBABILITY
-            or float(state["system_dvp_target"])
-            != SAFE_DDQN_QOS_TARGET_PROBABILITY
+            == SAFE_DDQN_INITIAL_LAMBDA_COST
+            and float(state["normalized_eta_c"]) == SAFE_DDQN_ETA_C
+            and float(state["qos_target_probability"])
+            == SAFE_DDQN_QOS_TARGET_PROBABILITY
+            and float(state["system_dvp_target"])
+            == SAFE_DDQN_QOS_TARGET_PROBABILITY
+        )
+        if (
+            (not hyperparameters_match and not allow_hyperparameter_mismatch)
             or state["lambda_update_scope"] != "episode_end"
             or state["lambda_update_mode"] != "direct_episode_system_dvp"
             or state["cost_denominator"] != "episode_system_eligible_packets"
@@ -568,16 +577,23 @@ class DDQN:
 
     def train(self, replay_buffer, batch_size=64):
 
-        state, action, next_state, reward, _unused_cost, not_done = replay_buffer.sample(batch_size)
-        cost_state, cost_action, cost_next_state, cost, cost_not_done = (
-            replay_buffer.sample_cost(batch_size)
+        (
+            state, action, next_state, reward, _unused_cost, not_done,
+            _action_mask, next_action_mask,
+        ) = replay_buffer.sample_with_masks(batch_size)
+        (
+            cost_state, cost_action, cost_next_state, cost, cost_not_done,
+            _cost_action_mask, cost_next_action_mask,
+        ) = (
+            replay_buffer.sample_cost_with_masks(batch_size)
         )
 
         q_values = self.q_network(state)
         q_values = q_values.gather(1, action.unsqueeze(1)).squeeze(1)
 
         target_q, _, _ = self._safe_targets(
-            next_state, reward, torch.zeros_like(reward), not_done
+            next_state, reward, torch.zeros_like(reward), not_done,
+            next_action_mask,
         )
         reward_td_error = target_q - q_values
         
@@ -597,6 +613,7 @@ class DDQN:
             torch.zeros_like(cost),
             cost,
             cost_not_done,
+            cost_next_action_mask,
         )
         cost_td_error = target_c - c_values
 

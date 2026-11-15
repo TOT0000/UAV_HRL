@@ -338,9 +338,20 @@ def test_off_path_preserves_fixed_order_and_masks():
     assert all(np.array_equal(context["applied_effective_masks"][uid], masks[uid]) for uid in masks)
 
 
-def test_training_rejects_evaluation_only_guard():
-    with pytest.raises(ValueError, match="evaluation-only"):
-        train(config=smoke_training_config(), mutual_next_hop_guard=True)
+def test_training_uses_shared_guard_strategy():
+    result = train(config=smoke_training_config(), mutual_next_hop_guard=True)
+    assert result["run_metadata"]["mutual_next_hop_guard_enabled"] is True
+    assert (
+        result["run_metadata"]["evaluation_routing_strategy_scope"]
+        == "training_and_evaluation"
+    )
+    assert result["run_metadata"]["effective_sr_speed_mps"] == 5.0
+    routing_config = result["run_metadata"]["formal_config"][
+        "routing_agent_configuration"
+    ]
+    assert routing_config["mutual_next_hop_guard_default_enabled"] is True
+    assert routing_config["safe_ddqn_qos_target_probability"] == 0.05
+    assert routing_config["safe_ddqn_eta_c"] == 0.05
 
 
 def test_off_on_comparison_accepts_changed_results_and_uses_ratio_of_sums(tmp_path):

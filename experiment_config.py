@@ -9,6 +9,7 @@ import math
 from types import MappingProxyType
 
 from movement_feature_schema import LOCAL_MOVEMENT_DIM
+from experiment_defaults import DEFAULT_SR_SPEED_MPS
 
 from visual_sensing import (
     SEARCH_DETECTION_OVERLAP_THRESHOLD,
@@ -55,7 +56,26 @@ ROUTING_STATE_DIM = (
 )
 ROUTING_STATE_SCHEMA_VERSION = "16-uav-action-wise-gs-progress-v2"
 ROUTING_ACTION_SELECTION_CONTRACT_VERSION = (
-    "effective-forwarding-only-forced-wait-v1"
+    "sequential-mrv-no-mutual-final-mask-replay-v2"
+)
+MUTUAL_NEXT_HOP_GUARD_VERSION = "routing-mrv-no-mutual-v2"
+MUTUAL_NEXT_HOP_GUARD_SPEC = {
+    "scope": "training_and_evaluation",
+    "ordering": "minimum_remaining_forwarding_candidates",
+    "tie_break": "rotating_uav_order_from_slot_index",
+    "constraint": "exclude_i_to_j_when_selected_action_j_equals_i",
+    "forced_wait": "self_only_when_no_forwarding_candidate",
+    "cycle_scope": "two_node_only",
+}
+MUTUAL_NEXT_HOP_GUARD_FINGERPRINT = hashlib.sha256(
+    json.dumps(
+        MUTUAL_NEXT_HOP_GUARD_SPEC,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+).hexdigest()
+ROUTING_REPLAY_MASK_CONTRACT_VERSION = (
+    "actual-selection-and-next-actual-selection-mask-v1"
 )
 ROI_COUNT_MIN = 2
 ROI_COUNT_MAX = 8
@@ -183,9 +203,9 @@ FOV_COVERAGE_SOURCE = (
     "visual_sensing.vs_geometry circle-ROI/oblique-polygon "
     "intersection ratio [0,1]"
 )
-SAFE_DDQN_QOS_TARGET_PROBABILITY = 0.01
+SAFE_DDQN_QOS_TARGET_PROBABILITY = 0.05
 SAFE_DDQN_INITIAL_LAMBDA_COST = 0.0
-SAFE_DDQN_ETA_C = 0.01
+SAFE_DDQN_ETA_C = 0.05
 SAFE_DDQN_LAMBDA_UPDATE_SCOPE = "episode_end"
 SAFE_DDQN_LAMBDA_UPDATE_MODE = "direct_episode_system_dvp"
 SAFE_DDQN_EVALUATION_LAMBDA_MODE = "checkpoint_frozen"
@@ -1093,6 +1113,15 @@ def routing_agent_configuration(method_spec: MethodSpec, training_config=None) -
         "tau": ROUTING_TAU if learned else None,
         "target_update_scope": "after_each_optimizer_event" if learned else None,
         "routing_mask_scope": ROUTING_MASK_SCOPE,
+        "mutual_next_hop_guard_default_enabled": True,
+        "mutual_next_hop_guard_version": MUTUAL_NEXT_HOP_GUARD_VERSION,
+        "mutual_next_hop_guard_fingerprint": (
+            MUTUAL_NEXT_HOP_GUARD_FINGERPRINT
+        ),
+        "routing_replay_mask_contract_version": (
+            ROUTING_REPLAY_MASK_CONTRACT_VERSION
+        ),
+        "default_sr_speed_mps": DEFAULT_SR_SPEED_MPS,
     }
 
 
@@ -1284,6 +1313,15 @@ def comparison_method_configuration(method_spec: MethodSpec) -> dict:
             else None
         ),
         "routing_mask_scope": ROUTING_MASK_SCOPE,
+        "mutual_next_hop_guard_default_enabled": True,
+        "mutual_next_hop_guard_version": MUTUAL_NEXT_HOP_GUARD_VERSION,
+        "mutual_next_hop_guard_fingerprint": (
+            MUTUAL_NEXT_HOP_GUARD_FINGERPRINT
+        ),
+        "routing_replay_mask_contract_version": (
+            ROUTING_REPLAY_MASK_CONTRACT_VERSION
+        ),
+        "default_sr_speed_mps": DEFAULT_SR_SPEED_MPS,
         "fov_ema_lifecycle_version": FOV_EMA_LIFECYCLE_VERSION,
         "sr_route_lifecycle_version": SR_ROUTE_LIFECYCLE_VERSION,
         "packet_qos_contract_version": PACKET_QOS_CONTRACT_VERSION,

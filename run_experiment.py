@@ -531,6 +531,10 @@ def _add_training_options(parser):
     parser.add_argument("--output-root")
     parser.add_argument("--checkpoint-interval", type=int)
     parser.add_argument(
+        "--mutual-next-hop-guard", choices=("on", "off"), default="on",
+        help="shared sequential two-node mutual-next-hop guard (default: on)",
+    )
+    parser.add_argument(
         "--routing-training-diagnostics",
         action="store_true",
         help=(
@@ -650,6 +654,9 @@ def build_parser():
     evaluate.add_argument("--episode-seconds", type=int)
     evaluate.add_argument("--manifest-seed", type=int)
     evaluate.add_argument("--split", choices=("validation", "test"), default="test")
+    evaluate.add_argument(
+        "--mutual-next-hop-guard", choices=("on", "off"), default="on"
+    )
     evaluate.add_argument(
         "--smoke",
         action="store_true",
@@ -882,6 +889,7 @@ def _base_resolved(run_dir, method, manifest, config, values, args, git_sha):
         "num_uav": FORMAL_EXPERIMENT_DEFAULTS["num_uav"],
         "roi_count": args.roi_count if args.roi_count is not None else [ROI_COUNT_MIN, ROI_COUNT_MAX],
         "checkpoint_interval": values["checkpoint_interval"],
+        "mutual_next_hop_guard": args.mutual_next_hop_guard,
         "formal_checkpoint_episode": FORMAL_CHECKPOINT_EPISODE,
         "movement_hyperparameters": FORMAL_EXPERIMENT_DEFAULTS["movement_hyperparameters"],
         "effective_movement_agent_configuration": movement_agent_configuration(
@@ -1173,6 +1181,7 @@ def run(args):
             llm_explorer_log_mode=(
                 resolved.get("llm_explorer") or {}
             ).get("log_mode", method.default_llm_explorer_log_mode),
+            mutual_next_hop_guard=args.mutual_next_hop_guard,
         )
         resolved.update(
             status="COMPLETED",
@@ -1598,6 +1607,9 @@ def run_resume(args):
             llm_explorer_log_mode=(resolved.get("llm_explorer") or {}).get(
                 "log_mode", method.default_llm_explorer_log_mode
             ),
+            mutual_next_hop_guard=resolved.get(
+                "mutual_next_hop_guard", "on"
+            ),
         )
         resolved.update(
             status="COMPLETED",
@@ -1806,6 +1818,7 @@ def run_evaluate(args):
         llm_explorer_log_mode=(resolved.get("llm_explorer") or {}).get(
             "log_mode", method.default_llm_explorer_log_mode
         ),
+        mutual_next_hop_guard=args.mutual_next_hop_guard,
     )
     formal_evaluation = bool(
         not args.smoke

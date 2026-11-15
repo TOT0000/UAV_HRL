@@ -645,7 +645,7 @@ def _sr_initial_data(
             "position": [*boundary_points[sr_id % 4], 0.0],
             "movement_primitive": {
                 "model": "policy-triggered-straight-line-v1",
-                "speed_mps": 1.0,
+                "speed_mps": 5.0,
             },
         }
         for sr_id in range(int(num_gt))

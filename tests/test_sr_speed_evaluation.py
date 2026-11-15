@@ -1,3 +1,4 @@
+import copy
 from types import SimpleNamespace
 
 import numpy as np
@@ -247,7 +248,7 @@ def test_runtime_speed_override_does_not_mutate_manifest_or_other_simulator():
     fast.apply_scenario_entry(manifest.episodes[0])
     default.apply_scenario_entry(manifest.episodes[0])
     assert fast.sr_speed_mps == 2.75
-    assert default.sr_speed_mps == original_speed == 1.0
+    assert default.sr_speed_mps == original_speed == 5.0
     assert [sr.get_position() for sr in fast.SR_teams] == [
         sr.get_position() for sr in default.SR_teams
     ]
@@ -255,6 +256,26 @@ def test_runtime_speed_override_does_not_mutate_manifest_or_other_simulator():
     assert manifest.episodes[0]["sr_teams"][0]["movement_primitive"][
         "speed_mps"
     ] == original_speed
+
+
+def test_legacy_one_mps_manifest_records_base_override_and_effective_speed():
+    manifest = generate_manifest(
+        split="test", manifest_seed=1357, episode_count=1, num_gt=2
+    )
+    entry = copy.deepcopy(manifest.episodes[0])
+    for team in entry["sr_teams"]:
+        team["movement_primitive"]["speed_mps"] = 1.0
+    env = Simulator(
+        num_UAV=NUM_UAV, evaluation=True, sr_speed_mps_override=5.0
+    )
+    env.apply_scenario_entry(entry)
+    assert env.sr_base_speed_mps == 1.0
+    assert env.sr_speed_mps_override == 5.0
+    assert env.sr_speed_mps == 5.0
+    assert all(
+        team["movement_primitive"]["speed_mps"] == 1.0
+        for team in entry["sr_teams"]
+    )
 
 
 def test_assignment_inside_roi_records_entry_at_assignment_time():

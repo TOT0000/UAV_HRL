@@ -8,7 +8,7 @@ import numpy as np
 
 
 ROUTING_TRANSITION_LEDGER_SCHEMA_VERSION = (
-    "delivery-plus-sender-hop-progress-multi-packet-path-cost-v5"
+    "guarded-decision-mask-and-packet-path-cost-v6"
 )
 
 
@@ -37,7 +37,9 @@ class RoutingTransitionLedger:
         self.episode_terminal_cost_sum = 0.0
         self.episode_terminal_without_decision_count = 0
 
-    def create(self, *, agent_id, state, action, tag_gt, packet_id=None):
+    def create(
+        self, *, agent_id, state, action, action_mask=None, tag_gt, packet_id=None
+    ):
         transition_id = self.next_transition_id
         self.next_transition_id += 1
         state_array = np.asarray(state, dtype=np.float32).copy()
@@ -46,6 +48,7 @@ class RoutingTransitionLedger:
             "agent_id": int(agent_id),
             "state": state_array,
             "action": int(action),
+            "action_mask": self._copy_mask(action_mask),
             "tag_gt": int(tag_gt),
             "reward": None,
             "next_state": None,
@@ -55,6 +58,7 @@ class RoutingTransitionLedger:
         self.decision_snapshots[transition_id] = {
             "state": state_array.copy(),
             "action": int(action),
+            "action_mask": self._copy_mask(action_mask),
             "agent_id": int(agent_id),
             "tag_gt": int(tag_gt),
         }
@@ -78,6 +82,7 @@ class RoutingTransitionLedger:
             self._close_cost_transition(
                 previous["transition_id"],
                 snapshot["state"],
+                snapshot["action_mask"],
                 cost=0.0,
                 done=False,
                 packet_id=packet_id,
@@ -85,6 +90,7 @@ class RoutingTransitionLedger:
         self.packet_pending[packet_id] = {
             "transition_id": transition_id,
             "state": np.asarray(snapshot["state"], dtype=np.float32).copy(),
+            "action_mask": self._copy_mask(snapshot["action_mask"]),
         }
         self.episode_decision_count += 1
         return True
@@ -113,6 +119,7 @@ class RoutingTransitionLedger:
         self._close_cost_transition(
             pending["transition_id"],
             pending["state"],
+            pending["action_mask"],
             cost=cost,
             done=True,
             packet_id=packet_id,
@@ -121,7 +128,7 @@ class RoutingTransitionLedger:
         return True
 
     def _close_cost_transition(
-        self, transition_id, next_state, *, cost, done, packet_id
+        self, transition_id, next_state, next_action_mask, *, cost, done, packet_id
     ):
         transition_id = int(transition_id)
         snapshot = self.decision_snapshots.get(transition_id)
@@ -132,17 +139,25 @@ class RoutingTransitionLedger:
             "packet_id": int(packet_id),
             "state": np.asarray(snapshot["state"], dtype=np.float32).copy(),
             "action": int(snapshot["action"]),
+            "action_mask": self._copy_mask(snapshot["action_mask"]),
             "tag_gt": int(snapshot["tag_gt"]),
             "next_state": np.asarray(next_state, dtype=np.float32).copy(),
+            "next_action_mask": self._copy_mask(next_action_mask),
             "cost": float(cost),
             "done": bool(done),
         })
         self.episode_cost_transition_count += 1
 
-    def finalize_causality(self, states, start_of_slot_hol_by_sender, *, terminal=False):
+    def finalize_causality(
+        self, states, start_of_slot_hol_by_sender, *, action_masks=None,
+        terminal=False
+    ):
         """Resolve reward transitions from the next real sender snapshot."""
 
         states = {int(key): value for key, value in dict(states).items()}
+        action_masks = {
+            int(key): value for key, value in dict(action_masks or {}).items()
+        }
         del start_of_slot_hol_by_sender
         finalized = 0
         for transition_id in sorted(self.entries):
@@ -153,6 +168,9 @@ class RoutingTransitionLedger:
             entry["next_state"] = np.asarray(
                 states.get(agent_id, entry["state"]), dtype=np.float32
             ).copy()
+            entry["next_action_mask"] = self._copy_mask(
+                action_masks.get(agent_id, entry["action_mask"])
+            )
             entry["done"] = bool(terminal)
             entry["causality_pending"] = False
             finalized += 1
@@ -171,6 +189,8 @@ class RoutingTransitionLedger:
                 entry["reward"], 0.0, entry["done"],
                 tag_gt=entry["tag_gt"], agent_id=entry["agent_id"],
                 transition_id=transition_id,
+                action_mask=entry["action_mask"],
+                next_action_mask=entry["next_action_mask"],
             )
             committed.append(transition_id)
             del self.entries[transition_id]
@@ -185,10 +205,16 @@ class RoutingTransitionLedger:
                 tag_gt=closure["tag_gt"],
                 transition_id=closure["transition_id"],
                 packet_id=closure["packet_id"],
+                action_mask=closure["action_mask"],
+                next_action_mask=closure["next_action_mask"],
             ):
                 remaining.append(closure)
         self.cost_closures = remaining
         return committed
+
+    @staticmethod
+    def _copy_mask(value):
+        return None if value is None else np.asarray(value, dtype=bool).copy()
 
     def episode_diagnostics(self):
         return {

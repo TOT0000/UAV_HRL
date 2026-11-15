@@ -917,7 +917,7 @@ def run_paper_evaluation(
     flatten_single_point=False,
     collect_search_diagnostics=False,
     routing_loop_diagnostics=None,
-    mutual_next_hop_guard=False,
+    mutual_next_hop_guard=True,
 ):
     from mutual_next_hop_guard import (
         evaluation_routing_strategy_info,

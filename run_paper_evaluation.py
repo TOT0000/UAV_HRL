@@ -47,6 +47,9 @@ def build_parser():
     parser.add_argument("--episodes", type=int)
     parser.add_argument("--episode-seconds", type=int)
     parser.add_argument("--collect-search-diagnostics", action="store_true")
+    parser.add_argument(
+        "--mutual-next-hop-guard", choices=("on", "off"), default="on"
+    )
     episode_horizon = parser.add_mutually_exclusive_group()
     episode_horizon.add_argument("--episode-horizon-s", type=int)
     episode_horizon.add_argument("--episode-horizons-s", type=int, nargs="+")
@@ -294,6 +297,7 @@ def main(argv=None):
         allow_registered_fixed_roi_method=bool(
             args.suite == "fixed_roi" and (explicit_checkpoint or explicit_roi)
         ),
+        mutual_next_hop_guard=args.mutual_next_hop_guard,
     )
     print(json.dumps(result, ensure_ascii=False))
     return 0

@@ -216,22 +216,28 @@ class DQN(nn.Module):
           state, action, next_state, reward, cost, dones
         where each is a torch.Tensor on CPU (we'll move to device).
         """
-        state, action, next_state, reward, cost, dones = replay_buffer.sample(batch_size)
+        (
+            state, action, next_state, reward, cost, not_done,
+            _action_mask, next_action_mask,
+        ) = replay_buffer.sample_with_masks(batch_size)
 
         state = state.to(self.device)
         next_state = next_state.to(self.device)
         action = action.to(self.device).long().view(-1)            # (B,)
         reward = reward.to(self.device).view(-1)                   # (B,)
         cost = cost.to(self.device).view(-1)                       # (B,)
-        dones = dones.to(self.device).view(-1).float()             # (B,)
+        not_done = not_done.to(self.device).view(-1).float()       # (B,)
+        next_action_mask = next_action_mask.to(self.device).bool()
 
         # -------- reward Q update --------
         q_eval_all = self.eval_net(state)                          # (B, A)
         q_eval = q_eval_all.gather(1, action.unsqueeze(1)).squeeze(1)
 
         with torch.no_grad():
-            q_next = self.target_net(next_state).max(1)[0]         # (B,)
-            q_target = reward + self.gamma * q_next * (1.0 - dones)
+            q_next = self.target_net(next_state).masked_fill(
+                ~next_action_mask, float("-inf")
+            ).max(1)[0]
+            q_target = reward + self.gamma * q_next * not_done
 
         loss_r = self.loss_fn(q_eval, q_target)
         self.optimizer.zero_grad()
@@ -244,8 +250,10 @@ class DQN(nn.Module):
         c_eval = c_eval_all.gather(1, action.unsqueeze(1)).squeeze(1)
 
         with torch.no_grad():
-            c_next = self.target_cost_net(next_state).max(1)[0]    # (B,)
-            c_target = cost + self.gamma * c_next * (1.0 - dones)
+            c_next = self.target_cost_net(next_state).masked_fill(
+                ~next_action_mask, float("-inf")
+            ).max(1)[0]
+            c_target = cost + self.gamma * c_next * not_done
 
         loss_c = self.cost_loss_fn(c_eval, c_target)
         self.cost_optimizer.zero_grad()

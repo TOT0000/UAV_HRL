@@ -41,7 +41,7 @@ from Packet_scheduler_v1 import (
     TASK_DEADLINE_SECONDS,
 )
 from Simulator import Simulator
-from object import validate_sr_speed_mps
+from object import DEFAULT_SR_SPEED_MPS, validate_sr_speed_mps
 from sr_speed_diagnostics import (
     build_sr_episode_diagnostics,
     empty_dual_task_accumulator,
@@ -648,10 +648,9 @@ def _normalize_evaluation_overrides(overrides):
     uav_tx_power_dbm = validate_transmit_power_dbm(
         values.get("uav_tx_power_dbm", U2U_U2G_TX_POWER_DBM)
     )
-    sr_speed_mps = (
-        None
-        if values.get("sr_speed_mps") is None
-        else validate_sr_speed_mps(values["sr_speed_mps"])
+    sr_speed_value = values.get("sr_speed_mps")
+    sr_speed_mps = validate_sr_speed_mps(
+        DEFAULT_SR_SPEED_MPS if sr_speed_value is None else sr_speed_value
     )
     return {
         "traffic_rates_packets_per_second": rates,
@@ -821,6 +820,7 @@ def _finalize_pending_routing_transitions(
     routing_buffer,
     pending_transitions,
     states,
+    selection_masks,
     start_of_slot_hol_by_sender,
 ):
     """Finalize prior-slot transitions at the next real decision snapshot.
@@ -847,6 +847,8 @@ def _finalize_pending_routing_transitions(
             transition_done,
             tag_gt=transition["tag_gt"],
             agent_id=uid,
+            action_mask=transition.get("action_mask"),
+            next_action_mask=selection_masks.get(uid),
         )
         finalized += 1
     return finalized
@@ -956,20 +958,6 @@ def _run_routing_slot(
                 f"expected ({ROUTING_STATE_DIM},)"
             )
 
-    if write_replay:
-        if routing_transition_ledger is not None:
-            routing_transition_ledger.finalize_causality(
-                states, start_of_slot_hol_by_sender
-            )
-            routing_transition_ledger.commit_ready(routing_buffer)
-        else:
-            _finalize_pending_routing_transitions(
-                routing_buffer,
-                pending_routing_transitions,
-                states,
-                start_of_slot_hol_by_sender,
-            )
-
     next_hops, selection_diagnostics, selection_context = _select_routing_actions(
         ddqn,
         states,
@@ -990,6 +978,21 @@ def _run_routing_slot(
     )
     applied_effective_masks = selection_context["applied_effective_masks"]
     selection_masks = selection_context["selection_masks"]
+    if write_replay:
+        if routing_transition_ledger is not None:
+            routing_transition_ledger.finalize_causality(
+                states, start_of_slot_hol_by_sender,
+                action_masks=selection_masks,
+            )
+            routing_transition_ledger.commit_ready(routing_buffer)
+        else:
+            _finalize_pending_routing_transitions(
+                routing_buffer,
+                pending_routing_transitions,
+                states,
+                selection_masks,
+                start_of_slot_hol_by_sender,
+            )
     if routing_loop_diagnostics is not None:
         routing_loop_diagnostics.observe_slot(
             env=env,
@@ -1106,6 +1109,7 @@ def _run_routing_slot(
                 agent_id=uid,
                 state=states[uid],
                 action=int(next_hops.get(uid, uid)),
+                action_mask=selection_masks[uid],
                 tag_gt=int(env.num_GT),
                 packet_id=None,
             )
@@ -1188,7 +1192,7 @@ def _run_routing_slot(
                 )
             if done:
                 routing_transition_ledger.finalize_causality(
-                    {}, {}, terminal=True
+                    {}, {}, action_masks={}, terminal=True
                 )
             routing_transition_ledger.commit_ready(routing_buffer)
             immediate_next_states = None
@@ -1222,6 +1226,7 @@ def _run_routing_slot(
                 "reward": float(slot_result["reward_by_sender"][uid]),
                 "cost": float(slot_result["cost_by_sender"][uid]),
                 "tag_gt": int(env.num_GT),
+                "action_mask": selection_masks[uid].copy(),
             }
             if pending_routing_transitions is not None and not transition_done:
                 if uid in pending_routing_transitions:
@@ -1237,6 +1242,8 @@ def _run_routing_slot(
                     transition_done,
                     tag_gt=transition["tag_gt"],
                     agent_id=uid,
+                    action_mask=transition["action_mask"],
+                    next_action_mask=transition["action_mask"],
                 )
     selected_links = list(slot_result.get("active_links", []))
     return (
@@ -2273,10 +2280,12 @@ def _evaluation_state_snapshot(
             "routing": replay_snapshot(
                 routing_replay,
                 (
-                    "state", "action", "next_state", "reward", "cost",
+                    "state", "action", "action_mask", "next_state",
+                    "next_action_mask", "reward", "cost",
                     "not_done", "cost_next_state", "cost_not_done",
                     "cost_ready", "tag_gt", "path_cost_state",
-                    "path_cost_action", "path_cost_next_state",
+                    "path_cost_action", "path_cost_action_mask",
+                    "path_cost_next_state", "path_cost_next_action_mask",
                     "path_cost_value", "path_cost_not_done",
                     "path_cost_tag_gt", "path_cost_transition_id",
                     "path_cost_packet_id",
@@ -2533,7 +2542,7 @@ def train(
     llm_explorer_client=None,
     llm_explorer_log_mode=None,
     routing_loop_diagnostics=None,
-    mutual_next_hop_guard=False,
+    mutual_next_hop_guard=True,
 ):
     if config is None:
         raise ValueError(
@@ -2553,11 +2562,6 @@ def train(
     evaluation_routing_strategy = evaluation_routing_strategy_info(
         mutual_next_hop_guard
     )
-    if mutual_next_hop_guard and not evaluation:
-        raise ValueError(
-            "mutual-next-hop guard is evaluation-only and cannot be enabled "
-            "during training"
-        )
     if formal_evaluation and not evaluation:
         raise ValueError("formal_evaluation requires evaluation=True")
     # Reconstructing validates even subclasses or deserialized specifications.
@@ -2916,22 +2920,21 @@ def train(
         formal_evaluation=formal_evaluation,
         rng_contract_metadata=rng_streams.metadata(),
     )
-    if evaluation:
-        experiment_identity["evaluation_routing_strategy"] = copy.deepcopy(
-            evaluation_routing_strategy
-        )
-        experiment_identity["mutual_next_hop_guard_enabled"] = bool(
-            mutual_next_hop_guard
-        )
-        experiment_identity["evaluation_routing_strategy_version"] = (
-            evaluation_routing_strategy["strategy_version"]
-        )
-        experiment_identity["evaluation_routing_strategy_fingerprint"] = (
-            evaluation_routing_strategy["strategy_fingerprint"]
-        )
-        experiment_identity["evaluation_routing_strategy_scope"] = (
-            evaluation_routing_strategy["scope"]
-        )
+    experiment_identity["evaluation_routing_strategy"] = copy.deepcopy(
+        evaluation_routing_strategy
+    )
+    experiment_identity["mutual_next_hop_guard_enabled"] = bool(
+        mutual_next_hop_guard
+    )
+    experiment_identity["evaluation_routing_strategy_version"] = (
+        evaluation_routing_strategy["strategy_version"]
+    )
+    experiment_identity["evaluation_routing_strategy_fingerprint"] = (
+        evaluation_routing_strategy["strategy_fingerprint"]
+    )
+    experiment_identity["evaluation_routing_strategy_scope"] = (
+        evaluation_routing_strategy["scope"]
+    )
     llm_explorer_config = (
         (
             LLMStateRuleConfig(
@@ -3149,6 +3152,7 @@ def train(
             joint_action_dim=JOINT_ACTION_DIM,
             routing_state_dim=ROUTING_STATE_DIM,
             calibration=calibration,
+            allow_safe_constraint_config_mismatch=True,
             expected_experiment_metadata={
                 "method_spec_fingerprint": method_spec.compatible_fingerprints,
                 "training_seed": int(config.random_seed),
