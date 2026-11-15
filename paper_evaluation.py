@@ -903,6 +903,7 @@ def run_paper_evaluation(
     allow_registered_fixed_roi_method=False,
     flatten_single_point=False,
     collect_search_diagnostics=False,
+    routing_loop_diagnostics=None,
 ):
     validate_production_deadlines()
     suite = resolve_evaluation_suite(suite)
@@ -1340,6 +1341,7 @@ def run_paper_evaluation(
                 # guidance; this flag must never mirror a training run's
                 # live/mock client configuration.
                 llm_explorer_mock=False,
+                routing_loop_diagnostics=routing_loop_diagnostics,
             )
         diagnostic_outputs = write_packet_routing_diagnostic_artifacts(
             point_dir,

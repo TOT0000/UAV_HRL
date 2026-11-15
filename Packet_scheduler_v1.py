@@ -2965,6 +2965,7 @@ class PacketEngine:
         result,
         *,
         slot_start,
+        uav_hop_observer=None,
     ):
         queue_delay = float(pkt.get("hop_queue_delay_s", 0.0))
         service_start = float(pkt.get("hop_service_start_time", completion_time))
@@ -2997,7 +2998,7 @@ class PacketEngine:
             float(completion_time) - service_start, 0.0
         )
         delay_accum["count"] += 1
-        self._record_completed_uav_hop_reward(
+        completed_hop_event = self._record_completed_uav_hop_reward(
             env,
             pkt,
             sender,
@@ -3006,6 +3007,16 @@ class PacketEngine:
             result,
             slot_start=slot_start,
         )
+        if uav_hop_observer is not None:
+            uav_hop_observer(
+                {
+                    "phase": "completed",
+                    **completed_hop_event,
+                    "hop_sequence_number": int(pkt.get("hops", 0)) + 1,
+                    "packet_path_before_completion": list(pkt.get("path", ())),
+                    "completed_hops": tuple(pkt.get("per_hop", ())),
+                }
+            )
         arrival = self.detach_completed_hop(
             pkt, sender, receiver, completion_time
         )
@@ -3086,6 +3097,7 @@ class PacketEngine:
         effective_masks_by_sender=None,
         collect_first_gen_event_diagnostics=False,
         stall_diagnostic_context=None,
+        uav_hop_observer=None,
     ):
         """Advance one slot by physical generation/service/deadline events.
 
@@ -3094,6 +3106,9 @@ class PacketEngine:
         bandwidth change recomputes capacity from the already sampled fading
         gain for the current 5 ms block; it never samples the channel again.
         """
+
+        if uav_hop_observer is not None and not callable(uav_hop_observer):
+            raise TypeError("uav_hop_observer must be callable")
 
         slot_start = float(current_time)
         slot_end = slot_start + float(self.step_time)
@@ -3789,6 +3804,7 @@ class PacketEngine:
                     active_key = (int(sr_id), int(receiver), "S2U")
                 else:
                     sender, receiver = link
+                    hop_started = pkt.get("hop_receiver") is None
                     if float(pkt.get("hop_bits_sent", 0.0)) <= PACKET_EPS:
                         pkt["hop_service_start_time"] = t
                         pkt["hop_queue_delay_s"] = max(
@@ -3797,6 +3813,31 @@ class PacketEngine:
                     self.record_hop_transmission(
                         pkt, sender, receiver, bits
                     )
+                    if hop_started and uav_hop_observer is not None:
+                        uav_hop_observer(
+                            {
+                                "phase": "started",
+                                "packet_id": int(pkt["id"]),
+                                "task_type": self._task_norm(
+                                    pkt.get("task_type", "COM")
+                                ),
+                                "sender_uav_id": int(sender),
+                                "receiver_id": int(receiver),
+                                "link_type": (
+                                    "U2G"
+                                    if int(receiver) == int(env.GS_ID)
+                                    else "U2U"
+                                ),
+                                "service_start_time_seconds": float(
+                                    pkt.get("hop_service_start_time", t)
+                                ),
+                                "slot_start_time_seconds": float(slot_start),
+                                "hop_sequence_number": int(pkt.get("hops", 0)) + 1,
+                                "packet_path_before_completion": list(
+                                    pkt.get("path", ())
+                                ),
+                            }
+                        )
                     service_progress = service_progress or (
                         float(pkt.get("rem_bits", 0.0)) < remaining_before
                     )
@@ -3854,6 +3895,7 @@ class PacketEngine:
                         t,
                         result,
                         slot_start=slot_start,
+                        uav_hop_observer=uav_hop_observer,
                     )
             consumed_events = materialize_due(t)
             expired_packets = append_expirations(t)

@@ -880,6 +880,7 @@ def _run_routing_slot(
     first_gen_slot_service_observer=False,
     record_current_expected_capacities=False,
     stall_diagnostic_context=None,
+    routing_loop_diagnostics=None,
 ):
     del routing_masks
     packet_cost_attribution = (
@@ -983,6 +984,18 @@ def _run_routing_slot(
             or routing_training_diagnostics is not None
         ),
     )
+    if routing_loop_diagnostics is not None:
+        routing_loop_diagnostics.observe_slot(
+            env=env,
+            packet_engine=packet_engine,
+            current_time=float(current_time),
+            slot_index=int(absolute_slot),
+            physical_masks=physical_masks,
+            effective_masks=effective_masks,
+            selection_masks=effective_masks,
+            selected_actions=next_hops,
+            start_of_slot_hol_by_sender=start_of_slot_hol_by_sender,
+        )
     if routing_decision_observer is not None:
         for uid in routing_decision_uav_ids:
             hol = start_of_slot_hol_by_sender[uid]
@@ -1102,6 +1115,11 @@ def _run_routing_slot(
             first_gen_slot_service_observer
         ),
         stall_diagnostic_context=stall_diagnostic_context,
+        uav_hop_observer=(
+            routing_loop_diagnostics.observe_hop_event
+            if routing_loop_diagnostics is not None
+            else None
+        ),
     )
     if routing_slot_observer is not None:
         routing_slot_observer(
@@ -2388,6 +2406,7 @@ def train(
     llm_explorer_mock=False,
     llm_explorer_client=None,
     llm_explorer_log_mode=None,
+    routing_loop_diagnostics=None,
 ):
     if config is None:
         raise ValueError(
@@ -2504,6 +2523,25 @@ def train(
         raise ValueError(
             "Search diagnostics require an evaluation-only callable sink"
         )
+    if routing_loop_diagnostics is not None:
+        if not evaluation:
+            raise ValueError("routing-loop diagnostics are evaluation-only")
+        required_methods = (
+            "begin_episode",
+            "observe_slot",
+            "observe_hop_event",
+            "end_episode",
+        )
+        missing = [
+            name
+            for name in required_methods
+            if not callable(getattr(routing_loop_diagnostics, name, None))
+        ]
+        if missing:
+            raise TypeError(
+                "routing-loop diagnostics collector is missing methods: "
+                + ", ".join(missing)
+            )
     collect_sr_speed_diagnostics = bool(collect_sr_speed_diagnostics)
     if collect_sr_speed_diagnostics and not evaluation:
         raise ValueError("SR-speed diagnostics are available only during evaluation")
@@ -3367,6 +3405,12 @@ def train(
             empty_dual_task_accumulator() if collect_sr_speed_diagnostics else None
         )
         packet_engine.reset_packet_state()
+        if routing_loop_diagnostics is not None:
+            routing_loop_diagnostics.begin_episode(
+                roi_count=int(env.num_GT),
+                scenario_id=scenario_id,
+                episode_index=int(episode),
+            )
         if routing_transition_ledger is not None:
             routing_transition_ledger.begin_episode()
         packet_engine.update_fov_ema(
@@ -4042,6 +4086,7 @@ def train(
                         "episode": episode + 1,
                         "slot_index": absolute_slot,
                     },
+                    routing_loop_diagnostics=routing_loop_diagnostics,
                 )
                 ddqn_action_selections += action_selections
                 interval_delivered_bits += delivered_bits
@@ -4490,6 +4535,8 @@ def train(
         packet_metrics = packet_engine.finalize_episode(
             float(config.episode_seconds)
         )
+        if routing_loop_diagnostics is not None:
+            routing_loop_diagnostics.end_episode(packet_engine.packet_outcomes)
         if not evaluation and method_spec.learns_routing:
             if method_spec.routing == "safe_ddqn":
                 for outcome in packet_engine.packet_outcomes[terminal_outcome_start:]:
