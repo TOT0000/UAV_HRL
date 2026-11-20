@@ -1525,8 +1525,19 @@ def generate_manifest(
                 MAX_3D_COMMUNICATION_DISTANCE_M
             ),
             "s2u_communication_range_m": COMMUNICATION_RANGE_M,
+            "s2g_communication_range_m": S2G_COMMUNICATION_RANGE_M,
+            "s2g_communication_range_boundary_rule": (
+                S2G_COMMUNICATION_RANGE_BOUNDARY_RULE
+            ),
             "u2g_communication_range_m": COMMUNICATION_RANGE_M,
             "u2u_communication_range_m": COMMUNICATION_RANGE_M,
+            "sr_initial_radius_m": SR_INITIAL_RADIUS_M,
+            "sr_initial_layout": "gs-centered-80m-quarter-arc-equiangular-v2",
+            "sr_direct_state_change_reassigns_tasks": False,
+            "s2g_channel_model": "ground-pathloss-rayleigh-5ms-23dBm",
+            "s2g_reference_loss_db_at_1m": 38.46,
+            "s2g_path_loss_exponent": 4.0,
+            "s2g_fading_power_gain": "exponential-mean-1",
             "num_uav": NUM_UAV,
             "reserved_search_uav_ids": list(RESERVED_SEARCH_UAV_IDS),
             **(

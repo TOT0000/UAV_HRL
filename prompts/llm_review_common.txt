@@ -44,7 +44,7 @@ Packet deadlines are measured from generation until GS delivery:
 - VS: 0.015 s (15 ms).
 - COM: 0.010 s (10 ms).
 
-All UAVs preselect one physically legal next hop per 0.25 s routing slot and hold it for that slot. COM starts at SR mission assignment independently of connectivity. Event-time, full-packet store-and-forward permits S2G or multiple S2U/U2U/U2G hops within a slot. Equal FDMA is recomputed over currently serviceable links only; empty preselection consumes no bandwidth. S2G is deterministic without fading; other fading gains update every 5 ms, not as a minimum hop duration.
+All UAVs preselect one physically legal next hop per 0.25 s routing slot and hold it for that slot. COM starts at SR mission assignment independently of connectivity. Event-time, full-packet store-and-forward permits S2G or multiple S2U/U2U/U2G hops within a slot. Equal FDMA is recomputed over currently serviceable links only; empty preselection consumes no bandwidth. S2G uses a 100 m inclusive range, ground path loss, and 5 ms mean-one Rayleigh power-gain blocks; S2U/U2U/U2G retain their 400 m inclusive range. A fading block is not a minimum hop duration.
 
 The deadline continues across queue changes and relay hops.
 

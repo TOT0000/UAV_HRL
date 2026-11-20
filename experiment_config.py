@@ -8,7 +8,7 @@ import json
 import math
 from types import MappingProxyType
 
-from movement_feature_schema import LOCAL_MOVEMENT_DIM
+from movement_feature_schema import movement_state_dimension
 from experiment_defaults import DEFAULT_SR_SPEED_MPS
 
 from visual_sensing import (
@@ -881,7 +881,7 @@ FORMAL_EXPERIMENT_DEFAULTS = {
     "movement_hyperparameters": {
         # Derived from the authoritative feature/action schemas.  These values
         # are asserted against centralized_movement at experiment preflight.
-        "state_dim": NUM_UAV * LOCAL_MOVEMENT_DIM + 16 * 16 + 3,
+        "state_dim": movement_state_dimension(NUM_UAV),
         "joint_action_dim": NUM_UAV * 3,
         "max_action": 1.0,
         "hidden_layers": [256, 256, 256, 256],

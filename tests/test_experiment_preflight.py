@@ -13,7 +13,13 @@ from HRL_task_aware import formal_training_config
 from com_capacity_calibration import load_com_capacity_reference
 from comparison_experiment import main as comparison_main
 from dinkelbach_blocks import DinkelbachBlockState, dinkelbach_config_metadata
-from experiment_config import MethodSpec, effective_training_config
+from experiment_config import (
+    SAFE_DDQN_ETA_C,
+    SAFE_DDQN_INITIAL_LAMBDA_COST,
+    SAFE_DDQN_QOS_TARGET_PROBABILITY,
+    MethodSpec,
+    effective_training_config,
+)
 from routing_lifecycle import RoutingLearnerLifecycle
 from experiment_paths import (
     evaluation_run_directory,
@@ -429,11 +435,13 @@ class ExperimentPreflightTest(unittest.TestCase):
                 "routing_ddqn_gamma": 0.99,
                 "routing_agent_kind": "safe_ddqn",
                 "routing_agent_configuration": {
-                    "lambda_cost": 0.0,
-                    "initial_lambda_cost": 0.0,
-                    "normalized_eta_c": 0.01,
-                    "qos_target_probability": 0.01,
-                    "system_dvp_target": 0.01,
+                    "lambda_cost": SAFE_DDQN_INITIAL_LAMBDA_COST,
+                    "initial_lambda_cost": SAFE_DDQN_INITIAL_LAMBDA_COST,
+                    "normalized_eta_c": SAFE_DDQN_ETA_C,
+                    "qos_target_probability": (
+                        SAFE_DDQN_QOS_TARGET_PROBABILITY
+                    ),
+                    "system_dvp_target": SAFE_DDQN_QOS_TARGET_PROBABILITY,
                     "lambda_update_scope": "episode_end",
                     "lambda_update_mode": "direct_episode_system_dvp",
                     "cost_denominator": "episode_system_eligible_packets",

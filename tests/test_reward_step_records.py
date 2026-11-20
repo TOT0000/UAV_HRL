@@ -1,8 +1,14 @@
 import json
+from types import SimpleNamespace
 
 import pytest
 
-from HRL_task_aware import TrainingConfig, train
+from HRL_task_aware import (
+    REWARD_STEP_RECORD_SCHEMA_VERSION,
+    TrainingConfig,
+    _llm_reward_contribution,
+    train,
+)
 from experiment_config import MethodSpec
 from run_experiment import _reward_step_jsonl_sink, build_parser
 from scenario_manifest import generate_manifest
@@ -24,7 +30,7 @@ def _config(seed):
 
 
 def _assert_reconstructable(row):
-    assert row["schema_version"] == "uav-hrl-movement-reward-step-v1"
+    assert row["schema_version"] == REWARD_STEP_RECORD_SCHEMA_VERSION
     assert row["episode"] == row["episode_index"]
     assert row["movement_step"] == row["movement_interval_index"]
     assert row["lambda_EE"] == row["dinkelbach_lambda_used"]
@@ -40,10 +46,16 @@ def _assert_reconstructable(row):
         - row["applied_constraint_penalty"]
     )
     extra = (
-        row["llm_extra_reward"]
+        row["llm_extra_reward_weighted"]
         + row["potential_shaping"]
         + row["rnd_weighted_bonus"]
     )
+    assert row["llm_extra_reward_weighted"] == pytest.approx(
+        row["llm_reward_beta"] * row["llm_extra_reward"]
+    )
+    if not row["llm_reward_enabled"]:
+        assert row["llm_reward_beta"] == 0.0
+        assert row["llm_extra_reward_weighted"] == 0.0
     assert row["final_training_reward"] == pytest.approx(
         row["movement_reward_after_constraints"] + extra
     )
@@ -56,9 +68,15 @@ def _assert_reconstructable(row):
 def test_train_and_evaluation_reward_step_recording_is_non_intervening():
     method = MethodSpec.parse("kkm_random_action_random_routing")
     training_rows = []
+    training_manifest = generate_manifest("train", 901, 1, num_gt=2)
+    training_baseline = train(
+        _config(901),
+        scenario_manifest=training_manifest,
+        method_spec=method,
+    )
     training = train(
         _config(901),
-        scenario_manifest=generate_manifest("train", 901, 1, num_gt=2),
+        scenario_manifest=training_manifest,
         method_spec=method,
         reward_step_record_sink=training_rows.append,
     )
@@ -66,6 +84,14 @@ def test_train_and_evaluation_reward_step_recording_is_non_intervening():
     assert not training_rows[0]["evaluation"]
     _assert_reconstructable(training_rows[0])
     assert training["run_metadata"]["reward_step_records_enabled"]
+    assert training_baseline["episode_metrics"] == training["episode_metrics"]
+    for key in (
+        "joint_replay_size",
+        "critic_updates",
+        "actor_updates",
+        "routing_replay_size",
+    ):
+        assert training_baseline[key] == training[key]
 
     manifest = generate_manifest("test", 902, 1, num_gt=2)
     transitions_without = []
@@ -107,8 +133,21 @@ def test_reward_step_cli_flag_and_streaming_jsonl_sink(tmp_path):
     assert args.record_reward_steps
     path = tmp_path / "reward_step_records.jsonl"
     sink = _reward_step_jsonl_sink(path)
-    sink({"schema_version": "uav-hrl-movement-reward-step-v1", "value": 1})
+    sink({"schema_version": REWARD_STEP_RECORD_SCHEMA_VERSION, "value": 1})
     assert json.loads(path.read_text(encoding="utf-8")) == {
-        "schema_version": "uav-hrl-movement-reward-step-v1",
+        "schema_version": REWARD_STEP_RECORD_SCHEMA_VERSION,
         "value": 1,
     }
+
+
+@pytest.mark.parametrize("beta", (0.0, 0.5, 1.0, 2.0))
+def test_llm_reward_contribution_uses_runtime_beta(beta):
+    resolved_beta, weighted = _llm_reward_contribution(
+        1.25, SimpleNamespace(beta=beta)
+    )
+    assert resolved_beta == beta
+    assert weighted == pytest.approx(beta * 1.25)
+
+
+def test_disabled_llm_reward_contribution_is_zero():
+    assert _llm_reward_contribution(7.0, None) == (0.0, 0.0)

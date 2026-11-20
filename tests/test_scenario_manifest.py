@@ -181,8 +181,25 @@ class ScenarioManifestTest(unittest.TestCase):
         )
         self.assertEqual(
             random_manifest.content_hash,
-            "18cd3f04e2cc15ada632bbede5fa9cece087ea95c7f2c53a8a5e2fdcce090891",
+            "156d4dc1837fdc7f00a0f70c34cbfdd2c8606f855230ec1f5a3df34f7ab095d5",
         )
+        generator = random_manifest.generator_config
+        self.assertEqual(generator["sr_initial_radius_m"], 80.0)
+        self.assertEqual(generator["s2g_communication_range_m"], 100.0)
+        self.assertEqual(generator["s2u_communication_range_m"], 400.0)
+        self.assertEqual(
+            generator["s2g_channel_model"],
+            "ground-pathloss-rayleigh-5ms-23dBm",
+        )
+        self.assertEqual(generator["s2g_fading_power_gain"], "exponential-mean-1")
+        self.assertFalse(generator["sr_direct_state_change_reassigns_tasks"])
+        for entry in random_manifest.episodes:
+            for sr in entry["sr_teams"]:
+                self.assertAlmostEqual(
+                    float(np.linalg.norm(np.asarray(sr["position"], dtype=float))),
+                    80.0,
+                    places=10,
+                )
         self.assertEqual(balanced.to_dict(), repeated.to_dict())
         self.assertEqual(
             [entry["scenario_seed"] for entry in balanced.episodes],

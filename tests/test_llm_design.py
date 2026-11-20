@@ -16,6 +16,7 @@ import llm_streaming
 import run_llm_design
 
 from centralized_movement import JOINT_ACTION_DIM, MOVEMENT_STATE_DIM, movement_state_feature_schema
+from Channel_model import channel_configuration_metadata
 from llm_baseline import run_baseline
 from llm_candidate import (
     CandidateError,
@@ -60,6 +61,7 @@ from llm_design_contract import (
     build_constants,
     build_obs_arrays,
     derive_named_state_fields,
+    named_state_scalar_index,
     candidate_schema,
     format_schema_and_example,
     load_design_inputs,
@@ -68,6 +70,7 @@ from llm_design_contract import (
     render_prompt,
     runtime_diagnostic_contract,
 )
+from movement_feature_schema import movement_state_layout
 from replay_auxiliary import SNAPSHOT_FIELD_SPECS, empty_snapshot, replay_auxiliary_metadata
 from scenario_manifest import generate_manifest
 from utils_update_v2 import ReplayBufferJoint
@@ -105,7 +108,7 @@ def test_named_state_fields_follow_authoritative_layout_and_online_values(design
     fixed["state"] = state
     before = state.copy()
     obs = build_obs_arrays(fixed)
-    assert OBS_INTERFACE_VERSION.endswith("v2")
+    assert OBS_INTERFACE_VERSION.endswith("v3")
     assert set(NAMED_STATE_FIELD_SPECS).issubset(obs)
     assert obs["uav_task_vs"][0, 3]
     assert obs["uav_task_com"][0, 3]
@@ -143,6 +146,52 @@ def test_named_state_fields_follow_authoritative_layout_and_online_values(design
     assert np.array_equal(state, before)
     for name in SNAPSHOT_FIELD_SPECS:
         assert np.array_equal(snapshot[name], snapshot_before[name])
+
+
+def test_named_state_coverage_and_globals_skip_sr_block_for_single_and_batch():
+    layout = movement_state_layout(16)
+    assert layout.coverage_start == 360
+    assert layout.global_start == 616
+    assert layout.global_stop == MOVEMENT_STATE_DIM == 619
+
+    base = np.zeros(MOVEMENT_STATE_DIM, dtype=np.float32)
+    base[layout.coverage_start + 2 * 16 + 7] = 0.25
+    base[layout.global_start:layout.global_stop] = (0.4, 0.5, 0.6)
+    expected = derive_named_state_fields(base)
+    assert expected["coverage_macro_fraction"][2, 7] == pytest.approx(0.25)
+    assert expected["global_coverage_fraction"] == pytest.approx(0.4)
+    assert expected["discovered_roi_fraction"] == pytest.approx(0.5)
+    assert expected["remaining_episode_fraction"] == pytest.approx(0.6)
+
+    sr_only = base.copy()
+    sr_only[layout.sr_start:layout.sr_stop] = np.linspace(
+        0.0, 1.0, layout.sr_stop - layout.sr_start, dtype=np.float32
+    )
+    after_sr_change = derive_named_state_fields(sr_only)
+    for field in (
+        "coverage_macro_fraction",
+        "global_coverage_fraction",
+        "discovered_roi_fraction",
+        "remaining_episode_fraction",
+    ):
+        assert np.array_equal(after_sr_change[field], expected[field])
+
+    changed = base.copy()
+    changed[layout.coverage_start + 2 * 16 + 7] = 0.75
+    changed[layout.global_start + 2] = 0.2
+    batch = derive_named_state_fields(np.stack((base, changed)))
+    assert batch["coverage_macro_fraction"][:, 2, 7].tolist() == pytest.approx(
+        [0.25, 0.75]
+    )
+    assert batch["remaining_episode_fraction"].tolist() == pytest.approx(
+        [0.6, 0.2]
+    )
+    assert named_state_scalar_index("coverage_macro_fraction", (2, 7)) == (
+        layout.coverage_start + 2 * 16 + 7
+    )
+    assert named_state_scalar_index("global_coverage_fraction", ()) == 616
+    assert named_state_scalar_index("discovered_roi_fraction", ()) == 617
+    assert named_state_scalar_index("remaining_episode_fraction", ()) == 618
 
 
 def test_named_state_direct_copy_is_rejected_but_aggregation_is_allowed(design_fixture):
@@ -251,9 +300,11 @@ def _fixed_artifact(tmp_path, *, duplicate_first_state=False):
             "num_uav": 16,
             "movement_state_feature_schema": movement_state_feature_schema(),
             "visual_sensing_configuration": visual,
-            "channel_configuration": {"routing_slot_seconds": 0.25},
+            "channel_configuration": channel_configuration_metadata(),
             "production_task_deadline_seconds": {"FOV": 0.015, "COM": 0.010},
             "maximum_3d_communication_distance_m": 400.0,
+            "s2u_communication_range_m": 400.0,
+            "s2g_communication_range_m": 100.0,
             "ground_station_position_m": [0.0, 0.0, 0.0],
             "task_potential_configuration": {
                 "constraint_penalty_weights": {"c9": 1.0, "c10": 1.0, "com_range": 2.0}
@@ -546,6 +597,11 @@ def test_prompt_is_complete_current_only_and_example_parses(design_fixture):
     assert "all UAVs, including empty ones, preselect" in prompt
     assert "10 ms COM or 15 ms VS deadline" in prompt
     assert "never use an object ID as a compact row" in prompt
+    assert "S2G uses inclusive finite 3-D distance <= 100 m" in prompt
+    assert "S2U, U2U, and U2G use inclusive finite 3-D distance <= 400 m" in prompt
+    assert "Rayleigh power gain updated every 0.005 s" in prompt
+    assert "does not rerun task assignment" in prompt
+    assert "free-space-only" not in prompt
     for name in OBS_KEYS:
         assert name in prompt
     block = format_schema_and_example(model_candidate_schema())
@@ -577,7 +633,7 @@ def test_prompt_is_complete_current_only_and_example_parses(design_fixture):
 
 def test_master_prompt_has_exact_placeholder_contract_and_supported_operations_match():
     template = PROMPT_TEMPLATE_PATH.read_text(encoding="utf-8")
-    assert PROMPT_VERSION == "uav-hrl-llm-design-prompt-v12-mission-s2g"
+    assert PROMPT_VERSION == "uav-hrl-llm-design-prompt-v13-ground-s2g-rayleigh"
     assert {
         token
         for token in (
@@ -2102,6 +2158,7 @@ def test_over_budget_validation_feedback_is_summarized_before_next_request(
             ),
         ],
         model=model,
+        loaded_context=22_000,
     )
     result = run_design(
         fixed_sample=fixed,
@@ -2130,7 +2187,7 @@ def test_over_budget_validation_feedback_is_summarized_before_next_request(
     assert '"candidate_name": "many-independent-errors"' in prompt
     assert all(code in prompt for code in ("STATIC_FIELD", "STATIC_CALL", "SCHEMA_RANGE"))
     assert "omitted_error_count" in prompt
-    assert result["metadata"]["context"]["effective_budget"] == 20_000
+    assert result["metadata"]["context"]["effective_budget"] == 22_000
     assert result["metadata"]["generation"]["max_output_tokens"] == 4096
 
 
@@ -2433,7 +2490,10 @@ def test_runtime_feedback_includes_source_shapes_and_authoritative_uav_layout(
     assert issue["candidate_line"] == 7
     assert diagnostic["local_array_summaries"]["uav_energy"] == {
         "type": "ndarray",
-        "shape": [31],
+        # The deliberately unsafe unbounded stride now crosses the complete
+        # 619-D state, including SR/coverage/global blocks.  The diagnostic's
+        # authoritative UAV slice below remains [0:272).
+        "shape": [36],
         "dtype": "float32",
     }
     assert diagnostic["local_array_summaries"]["movement_mask"]["shape"] == [16]
@@ -2640,7 +2700,8 @@ def test_two_runtime_locations_survive_json_failure_prompt_and_duplicate_check(
             _response(candidate),
             {**_response(candidate), "content": raw_claim},
             _response(candidate),
-        ]
+        ],
+        loaded_context=22_000,
     )
     result = run_design(
         fixed_sample=fixed,
@@ -4073,7 +4134,10 @@ def test_evaluation_diagnostics_stop_when_minimum_revision_exceeds_budget(
         model=client.model,
         client=client,
         max_attempts=2,
-        context_length=16_250,
+        # The current prompt includes the split ranges and ground-Rayleigh
+        # contract.  Keep request one inside the fixture budget while the
+        # minimum diagnostic revision still exceeds it.
+        context_length=16_500,
         output_dir=output,
         timeout=10,
     )

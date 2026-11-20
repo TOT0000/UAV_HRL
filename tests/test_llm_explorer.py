@@ -530,6 +530,18 @@ def test_rendered_llm_runtime_policy_matches_effective_speed_guard_and_safe_qos(
     assert safe_ddqn["score"] == "Q_reward - lambda_cost * Q_cost"
     assert safe_ddqn["qos_target_probability"] == 0.05
     assert safe_ddqn["lambda_cost_step_size"] == 0.05
+    assert environment["communication_ranges_3d_m_inclusive"] == {
+        "S2G": 100.0,
+        "S2U": 400.0,
+        "U2U": 400.0,
+        "U2G": 400.0,
+    }
+    s2g = environment["s2g_ground_channel"]
+    assert s2g["reference_loss_db_at_1m"] == pytest.approx(38.46)
+    assert s2g["path_loss_exponent"] == pytest.approx(4.0)
+    assert s2g["fading_block_seconds"] == pytest.approx(0.005)
+    assert "Rayleigh" in s2g["small_scale_fading"]
+    assert "does not trigger task reassignment" in environment["sr_first_hop_policy"]
     prompt_root = Path(__file__).resolve().parents[1] / "prompts"
     template = (prompt_root / "llm_explorer_system.txt").read_text(
         encoding="utf-8"
@@ -542,7 +554,29 @@ def test_rendered_llm_runtime_policy_matches_effective_speed_guard_and_safe_qos(
     assert "update coefficient is 0.05" in rendered
     assert '"source_responder_effective_speed_mps":7.5' in rendered
     assert '"mutual_next_hop_guard_enabled":false' in rendered
+    assert '"communication_ranges_3d_m_inclusive":{"S2G":100.0' in rendered
+    assert '"s2g_ground_channel":' in rendered
+    assert '"fading_block_seconds":0.005' in rendered
+    assert '"communication_range_3d_m_inclusive":400.0' not in rendered
     assert "target is 1%" not in rendered
+    assert "inclusive 3D limit of 100 m" in rendered
+    assert "S2U, U2U, and U2G use an inclusive 400 m limit" in rendered
+    assert "Rayleigh power gain updated every 5 ms" in rendered
+    assert "deterministic free-space-only" not in rendered
+
+    for name in (
+        "llm_explorer_system.txt",
+        "llm_explorer_no_c10_system.txt",
+        "llm_state_rule_system.txt",
+        "llm_episode_search_common.txt",
+        "llm_potential_search_common.txt",
+        "llm_review_common.txt",
+        "llm_training_search_common.txt",
+    ):
+        contents = (prompt_root / name).read_text(encoding="utf-8")
+        assert "S2G has no fading" not in contents
+        assert "S2G is deterministic without fading" not in contents
+        assert "free-space-only" not in contents
 
 
 def test_first_gen_method_ids_share_reward_semantics_but_keep_protocol_identity():

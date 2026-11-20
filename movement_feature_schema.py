@@ -1,4 +1,6 @@
-"""Authoritative local feature ordering for centralized UAV movement."""
+"""Authoritative feature ordering for centralized UAV movement."""
+
+from dataclasses import dataclass
 
 
 MOVEMENT_FEATURE_SCHEMA_VERSION = 8
@@ -68,3 +70,57 @@ SR_MOVEMENT_FEATURES = (
     ("fifo_backlog", "continuous", 0.0, 1.0, "log1p(SR FIFO bits) / log1p(5e7)"),
 )
 SR_MOVEMENT_DIM = len(SR_MOVEMENT_FEATURES)
+
+
+# These fixed extents are part of the movement observation contract.  Keep the
+# block layout here so configuration metadata, the TD3 encoder, and LLM named
+# projections cannot independently drift when a block is added.
+MAX_SR_SLOTS = 8
+COVERAGE_GRID_SIZE = 16
+GLOBAL_MOVEMENT_DIM = 3
+
+
+@dataclass(frozen=True)
+class MovementStateLayout:
+    uav_start: int
+    uav_stop: int
+    sr_start: int
+    sr_stop: int
+    coverage_start: int
+    coverage_stop: int
+    global_start: int
+    global_stop: int
+
+    @property
+    def dimension(self) -> int:
+        return self.global_stop
+
+
+def movement_state_layout(num_uav: int) -> MovementStateLayout:
+    """Return authoritative contiguous block boundaries for one state vector."""
+
+    resolved_num_uav = int(num_uav)
+    if resolved_num_uav <= 0:
+        raise ValueError("num_uav must be positive")
+    uav_start = 0
+    uav_stop = resolved_num_uav * LOCAL_MOVEMENT_DIM
+    sr_start = uav_stop
+    sr_stop = sr_start + MAX_SR_SLOTS * SR_MOVEMENT_DIM
+    coverage_start = sr_stop
+    coverage_stop = coverage_start + COVERAGE_GRID_SIZE**2
+    global_start = coverage_stop
+    global_stop = global_start + GLOBAL_MOVEMENT_DIM
+    return MovementStateLayout(
+        uav_start=uav_start,
+        uav_stop=uav_stop,
+        sr_start=sr_start,
+        sr_stop=sr_stop,
+        coverage_start=coverage_start,
+        coverage_stop=coverage_stop,
+        global_start=global_start,
+        global_stop=global_stop,
+    )
+
+
+def movement_state_dimension(num_uav: int) -> int:
+    return movement_state_layout(num_uav).dimension

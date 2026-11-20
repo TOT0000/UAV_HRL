@@ -14,23 +14,32 @@ from experiment_config import (
     GROUND_STATION_POSITION_M,
     NUM_UAV,
     ROI_COUNT_MAX,
+    S2G_COMMUNICATION_RANGE_M,
     S2U_COMMUNICATION_RANGE_M,
     TASK_POTENTIAL_NORMALIZATION_EPSILON,
 )
-from centralized_movement import COVERAGE_GRID_SIZE, MOVEMENT_STATE_DIM
+from centralized_movement import MOVEMENT_STATE_DIM
 from llm_baseline import load_fixed_samples
-from movement_feature_schema import LOCAL_MOVEMENT_DIM, LOCAL_MOVEMENT_FEATURES
+from movement_feature_schema import (
+    COVERAGE_GRID_SIZE,
+    LOCAL_MOVEMENT_DIM,
+    LOCAL_MOVEMENT_FEATURES,
+    movement_state_layout,
+)
 from replay_auxiliary import SNAPSHOT_FIELD_SPECS
 
 
 CANDIDATE_SCHEMA_VERSION = "uav-hrl-llm-shared-feature-candidate-v2"
 LEGACY_OBS_INTERFACE_VERSION = "uav-hrl-llm-current-observation-v1"
-OBS_INTERFACE_VERSION = "uav-hrl-llm-current-observation-v2"
+INCOMPATIBLE_SR_OFFSET_OBS_INTERFACE_VERSION = (
+    "uav-hrl-llm-current-observation-v2"
+)
+OBS_INTERFACE_VERSION = "uav-hrl-llm-current-observation-v3"
 SUPPORTED_OBS_INTERFACE_VERSIONS = (
     LEGACY_OBS_INTERFACE_VERSION,
     OBS_INTERFACE_VERSION,
 )
-PROMPT_VERSION = "uav-hrl-llm-design-prompt-v12-mission-s2g"
+PROMPT_VERSION = "uav-hrl-llm-design-prompt-v13-ground-s2g-rayleigh"
 DESIGN_RUN_SCHEMA_VERSION = "uav-hrl-llm-design-run-v4"
 APPROVED_ARTIFACT_SCHEMA_VERSION = "uav-hrl-approved-shared-feature-design-v2"
 ROOT = Path(__file__).resolve().parent
@@ -42,6 +51,9 @@ LEGACY_OBS_KEYS = ("state", "movement_mask") + tuple(SNAPSHOT_FIELD_SPECS)
 _LOCAL_MOVEMENT_OFFSETS = {
     item[0]: index for index, item in enumerate(LOCAL_MOVEMENT_FEATURES)
 }
+_MOVEMENT_STATE_LAYOUT = movement_state_layout(NUM_UAV)
+if _MOVEMENT_STATE_LAYOUT.dimension != MOVEMENT_STATE_DIM:
+    raise RuntimeError("LLM named state layout disagrees with movement schema")
 if len(_LOCAL_MOVEMENT_OFFSETS) != len(LOCAL_MOVEMENT_FEATURES):
     raise RuntimeError("movement feature schema contains duplicate field names")
 
@@ -193,11 +205,11 @@ def derive_named_state_fields(state: np.ndarray) -> dict[str, np.ndarray]:
         raise ValueError(
             f"movement state must end in {MOVEMENT_STATE_DIM} values, got {values.shape}"
         )
-    uav = values[..., : NUM_UAV * LOCAL_MOVEMENT_DIM].reshape(
+    uav = values[..., _MOVEMENT_STATE_LAYOUT.uav_start:_MOVEMENT_STATE_LAYOUT.uav_stop].reshape(
         values.shape[:-1] + (NUM_UAV, LOCAL_MOVEMENT_DIM)
     )
-    coverage_start = NUM_UAV * LOCAL_MOVEMENT_DIM
-    coverage_stop = coverage_start + COVERAGE_GRID_SIZE**2
+    coverage_start = _MOVEMENT_STATE_LAYOUT.coverage_start
+    coverage_stop = _MOVEMENT_STATE_LAYOUT.coverage_stop
     result: dict[str, np.ndarray] = {}
     for name, spec in NAMED_STATE_FIELD_SPECS.items():
         if "columns" in spec:
@@ -215,7 +227,7 @@ def derive_named_state_fields(state: np.ndarray) -> dict[str, np.ndarray]:
                 ), dtype=spec["dtype"]
             ).copy()
         else:
-            index = coverage_stop + int(spec["global_offset"])
+            index = _MOVEMENT_STATE_LAYOUT.global_start + int(spec["global_offset"])
             result[name] = np.asarray(values[..., index], dtype=spec["dtype"]).copy()
     return result
 
@@ -239,14 +251,14 @@ def named_state_scalar_index(field: str, indices: tuple[int, ...]) -> int | None
         if not 0 <= uav_id < NUM_UAV:
             return None
         return uav_id * LOCAL_MOVEMENT_DIM + _local_offset(column)
-    coverage_start = NUM_UAV * LOCAL_MOVEMENT_DIM
+    coverage_start = _MOVEMENT_STATE_LAYOUT.coverage_start
     if spec.get("coverage") and len(indices) == 2:
         row, column = indices
         if 0 <= row < COVERAGE_GRID_SIZE and 0 <= column < COVERAGE_GRID_SIZE:
             return coverage_start + row * COVERAGE_GRID_SIZE + column
         return None
     if "global_offset" in spec and not indices:
-        return coverage_start + COVERAGE_GRID_SIZE**2 + int(spec["global_offset"])
+        return _MOVEMENT_STATE_LAYOUT.global_start + int(spec["global_offset"])
     return None
 
 
@@ -324,6 +336,19 @@ def build_constants(fixed_metadata: dict[str, Any]) -> dict[str, Any]:
     deadlines = checkpoint.get("production_task_deadline_seconds") or {}
     camera = visual.get("vs_camera") or visual.get("camera") or {}
     task_config = checkpoint.get("task_potential_configuration") or {}
+    range_cutoff = channel.get("communication_range_cutoff") or {}
+    s2g_range_m = float(
+        checkpoint.get(
+            "s2g_communication_range_m",
+            range_cutoff.get("S2G_m", S2G_COMMUNICATION_RANGE_M),
+        )
+    )
+    forwarding_range_m = float(
+        checkpoint.get(
+            "s2u_communication_range_m",
+            range_cutoff.get("S2U_m", S2U_COMMUNICATION_RANGE_M),
+        )
+    )
     constants = {
         "num_uav": {
             "value": int(_require(checkpoint, "num_uav", "checkpoint contract")),
@@ -410,13 +435,47 @@ def build_constants(fixed_metadata: dict[str, Any]) -> dict[str, Any]:
             "source": "fixed sample production_task_deadline_seconds.COM",
         },
         "communication_range_m": {
-            "value": float(
-                checkpoint.get("maximum_3d_communication_distance_m", S2U_COMMUNICATION_RANGE_M)
-            ),
+            "value": forwarding_range_m,
             "dtype": "float",
             "unit": "m",
-            "meaning": "inclusive S2G/S2U/U2U/U2G 3-D range",
-            "source": "fixed sample checkpoint communication contract",
+            "meaning": "legacy alias for the inclusive S2U/U2U/U2G 3-D range",
+            "source": "fixed sample checkpoint/channel communication contract",
+        },
+        "communication_ranges_3d_m_inclusive": {
+            "value": {
+                "S2G": s2g_range_m,
+                "S2U": forwarding_range_m,
+                "U2U": float(range_cutoff.get("U2U_m", forwarding_range_m)),
+                "U2G": float(range_cutoff.get("U2G_m", forwarding_range_m)),
+            },
+            "dtype": "mapping[str,float]",
+            "unit": "m",
+            "meaning": "inclusive finite 3-D service range by link type",
+            "source": "fixed sample checkpoint/channel communication contract",
+        },
+        "s2g_ground_channel": {
+            "value": {
+                "reference_loss_db_at_1m": float(
+                    _require(
+                        channel,
+                        "s2g_reference_loss_db_at_1m",
+                        "channel contract",
+                    )
+                ),
+                "path_loss_exponent": float(
+                    _require(channel, "s2g_path_loss_exponent", "channel contract")
+                ),
+                "fading_block_seconds": float(
+                    _require(channel, "fading_block_seconds", "channel contract")
+                ),
+                "small_scale_fading": str(
+                    _require(channel, "s2g_small_scale_fading", "channel contract")
+                ),
+            },
+            "dtype": "mapping[str,float|string]",
+            "unit": None,
+            "meaning": "actual ground S2G path-loss and Rayleigh service model",
+            "source": "fixed sample channel_configuration",
         },
         "ground_station_position_m": {
             "value": [float(value) for value in checkpoint.get(
@@ -901,11 +960,22 @@ def visual_sensing_spec(constants_metadata: dict[str, Any]) -> str:
 
 
 def communication_spec(constants_metadata: dict[str, Any]) -> str:
-    distance = constants_metadata["communication_range_m"]["value"]
+    ranges = constants_metadata["communication_ranges_3d_m_inclusive"]["value"]
+    s2g_distance = ranges["S2G"]
+    forwarding_distance = ranges["S2U"]
+    s2g_channel = constants_metadata["s2g_ground_channel"]["value"]
+    reference_loss = s2g_channel["reference_loss_db_at_1m"]
+    exponent = s2g_channel["path_loss_exponent"]
+    fading_seconds = s2g_channel["fading_block_seconds"]
     return (
-        f"S2G, S2U, U2U, and U2G links use inclusive finite 3-D distance <= {distance:g} m. "
-        "An SR in range of the GS uses S2G with 2 GHz free-space-only loss, 23 dBm, "
-        "and no fading; otherwise it uses its assigned COM UAV over S2U. An incomplete "
+        f"S2G uses inclusive finite 3-D distance <= {s2g_distance:g} m; S2U, U2U, "
+        f"and U2G use inclusive finite 3-D distance <= {forwarding_distance:g} m. "
+        f"In range, S2G uses PL_dB={reference_loss:g}+10*{exponent:g}*"
+        "log10(max(d,1 m)/1 m), 23 dBm, and independent mean-one exponential "
+        f"Rayleigh power gain updated every {fading_seconds:g} s. Outside S2G range, "
+        "the existing assigned COM UAV is retained and S2U is attempted only when its "
+        f"3-D distance is <= {forwarding_distance:g} m; crossing the S2G boundary does "
+        "not rerun task assignment. An incomplete "
         "SR first hop restarts from the full packet if its endpoint changes. A2G "
         "(S2U/U2G) path loss is free-space loss plus the currently sampled LoS or "
         "NLoS excess loss; U2U uses the directed altitude-dependent A2A loss. Expected "

@@ -49,11 +49,11 @@ from llm_explorer_state_rule import (
 LLM_STATE_RULE_METHOD_ID = "td3_dinkelbach_llm_explorer_state_rule"
 LLM_STATE_RULE_VERSION = "uav-hrl-llm-state-rule-explorer-v2"
 LLM_STATE_RULE_PROMPT_VERSION = (
-    "uav-hrl-llm-state-rule-prompts-v6-mission-s2g-runtime-policy"
+    "uav-hrl-llm-state-rule-prompts-v7-ground-s2g-rayleigh-runtime-policy"
 )
 LLM_STATE_RULE_SUMMARY_VERSION = "state-rule-observed-service-summary-v3"
 LLM_STATE_RULE_CACHE_VERSION = (
-    "state-rule-complete-input-cache-v5-mission-s2g-runtime-policy"
+    "state-rule-complete-input-cache-v6-ground-s2g-rayleigh-runtime-policy"
 )
 LLM_STATE_RULE_ANALYSIS_OUTPUT_TOKENS = 4096
 LLM_STATE_RULE_RULE_OUTPUT_TOKENS = 4096

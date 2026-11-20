@@ -28,21 +28,21 @@ LLM_EXPLORER_METHOD_ID = "td3_dinkelbach_llm_explorer"
 LLM_EXPLORER_MODEL = "gpt-4o-mini"
 LLM_EXPLORER_VERSION = "uav-hrl-llm-explorer-firstgen-v7"
 LLM_EXPLORER_PROMPT_VERSION = (
-    "uav-hrl-llm-explorer-prompts-v14-mission-s2g-runtime-policy"
+    "uav-hrl-llm-explorer-prompts-v16-ground-s2g-rayleigh-runtime-policy"
 )
 LLM_EXPLORER_NO_C10_METHOD_ID = (
     "td3_dinkelbach_llm_explorer_wo_c10_penalty"
 )
 LLM_EXPLORER_NO_C10_PROMPT_VERSION = (
-    "uav-hrl-llm-explorer-prompts-v15-mission-s2g-runtime-policy"
+    "uav-hrl-llm-explorer-prompts-v17-ground-s2g-rayleigh-runtime-policy"
 )
 LLM_EXPLORER_SUMMARY_VERSION = "complete-core-feedback-v4"
 LLM_EXPLORER_CASE_VERSION = "deterministic-diverse-cases-v1"
 LLM_EXPLORER_CACHE_VERSION = (
-    "episode-fixed-dual-guidance-cache-v11-mission-s2g-runtime-policy"
+    "episode-fixed-dual-guidance-cache-v13-ground-s2g-rayleigh-runtime-policy"
 )
 LLM_EXPLORER_NO_C10_CACHE_VERSION = (
-    "episode-fixed-dual-guidance-cache-v12-mission-s2g-runtime-policy"
+    "episode-fixed-dual-guidance-cache-v14-ground-s2g-rayleigh-runtime-policy"
 )
 LLM_EXPLORER_COMPRESSION_VERSION = LLM_EXPLORER_SUMMARY_VERSION
 LLM_EXPLORER_PRESENTATION_VERSION = "firstgen-columns-rows-3dp-ms-v2"
@@ -56,7 +56,7 @@ LLM_EXPLORER_NUMERICAL_STAGE = "numerical_routing_weights_v2"
 LLM_EXPLORER_GUIDANCE_MAX_OUTPUT_TOKENS = 8_000
 LLM_EXPLORER_COMPATIBLE_RESUME_PROTOCOLS = frozenset()
 SHARED_ENVIRONMENT_DEFINITIONS_VERSION = (
-    "uav-hrl-llm-explorer-v4-mission-s2g-runtime-policy"
+    "uav-hrl-llm-explorer-v5-ground-s2g-rayleigh-runtime-policy"
 )
 LLM_EXPLORER_WARMUP_TRANSITIONS = 10_000
 LLM_EXPLORER_UPDATE_INTERVAL_EPISODES = 1
@@ -3918,13 +3918,24 @@ def environment_constants_and_definitions(
         MOVEMENT_CONSTRAINT_WEIGHT_COM,
         SAFE_DDQN_ETA_C,
         SAFE_DDQN_QOS_TARGET_PROBABILITY,
+        S2G_COMMUNICATION_RANGE_M,
+        S2U_COMMUNICATION_RANGE_M,
     )
+    from Channel_model import channel_configuration_metadata
     from visual_sensing import visual_sensing_metadata
     from mutual_next_hop_guard import evaluation_routing_strategy_info
 
     visual = visual_sensing_metadata()
     routing_strategy = evaluation_routing_strategy_info(
         mutual_next_hop_guard
+    )
+    channel = channel_configuration_metadata()
+    s2g_reference_loss_db = float(channel["s2g_reference_loss_db_at_1m"])
+    s2g_path_loss_exponent = float(channel["s2g_path_loss_exponent"])
+    s2g_fading_block_seconds = float(channel["fading_block_seconds"])
+    s2g_path_loss_formula = (
+        f"{s2g_reference_loss_db:g} + {10.0 * s2g_path_loss_exponent:g}*"
+        "log10(max(d_m,1)/1)"
     )
     return {
         # This shared definition is part of the pre-first-generation-update
@@ -3945,7 +3956,23 @@ def environment_constants_and_definitions(
         "movement_interval_seconds": 1.0,
         "routing_slot_seconds": float(routing_slot_seconds),
         "routing_slots_per_movement_interval": int(round(1.0 / routing_slot_seconds)),
-        "communication_range_3d_m_inclusive": float(COMMUNICATION_RANGE_M),
+        "forwarding_communication_range_3d_m_inclusive": float(
+            COMMUNICATION_RANGE_M
+        ),
+        "communication_ranges_3d_m_inclusive": {
+            "S2G": float(S2G_COMMUNICATION_RANGE_M),
+            "S2U": float(S2U_COMMUNICATION_RANGE_M),
+            "U2U": float(COMMUNICATION_RANGE_M),
+            "U2G": float(COMMUNICATION_RANGE_M),
+        },
+        "s2g_ground_channel": {
+            "path_loss_formula_db": s2g_path_loss_formula,
+            "reference_loss_db_at_1m": s2g_reference_loss_db,
+            "path_loss_exponent": s2g_path_loss_exponent,
+            "small_scale_fading": channel["s2g_small_scale_fading"],
+            "fading_block_seconds": s2g_fading_block_seconds,
+            "transmit_power_dbm": float(channel["s2g_transmit_power_dbm"]),
+        },
         "task_deadlines_seconds": {
             str(key): float(value)
             for key, value in (task_deadlines_seconds or {"FOV": 0.015, "COM": 0.010}).items()
@@ -3965,11 +3992,19 @@ def environment_constants_and_definitions(
             "preselection reserves no bandwidth"
         ),
         "sr_first_hop_policy": (
-            "inclusive 3-D SR-GS distance <=400 m selects deterministic "
-            "free-space-only 2 GHz S2G; otherwise the assigned COM UAV uses "
-            "S2U. An incomplete first hop restarts in full if its endpoint changes"
+            f"inclusive 3-D SR-GS distance <= {S2G_COMMUNICATION_RANGE_M:g} m "
+            f"selects S2G with PL_dB={s2g_path_loss_formula} and mean-one "
+            f"Rayleigh power gain updated every {1000.0 * s2g_fading_block_seconds:g} "
+            "ms; outside that "
+            "range the existing COM binding is retained and S2U is attempted "
+            f"only within {S2U_COMMUNICATION_RANGE_M:g} m. Boundary crossing "
+            "does not trigger task reassignment. An incomplete first hop "
+            "restarts in full if its endpoint changes"
         ),
-        "fading_model": "5 ms gain blocks; service completion and next-hop start may be finer than 5 ms",
+        "fading_model": (
+            "S2G Rayleigh and other configured small-scale gains use 5 ms "
+            "blocks; service completion and next-hop start may be finer than 5 ms"
+        ),
         "com_packet_bits": float(COM_PACKET_SIZE_BITS),
         "action_decode": {
             "horizontal_speed_mps": "5 * (speed_scalar + 1)",
@@ -4338,9 +4373,10 @@ def first_gen_resolved_settings_and_dictionary(
                 ),
                 "routing_slot_s": environment.get("routing_slot_seconds"),
                 "fading_block_s": 0.005,
-                "communication_range_3d_m_inclusive": environment.get(
-                    "communication_range_3d_m_inclusive"
+                "communication_ranges_3d_m_inclusive": environment.get(
+                    "communication_ranges_3d_m_inclusive"
                 ),
+                "s2g_ground_channel": environment.get("s2g_ground_channel"),
                 "total_dynamic_fdma_bandwidth_hz": environment.get(
                     "total_dynamic_fdma_bandwidth_hz"
                 ),

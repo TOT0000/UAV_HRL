@@ -36,7 +36,7 @@ from llm_explorer import (
 LLM_EXPLORER_V3_METHOD_ID = "td3_dinkelbach_llm_explorer_v3"
 LLM_EXPLORER_V3_VERSION = "uav-hrl-llm-explorer-v3"
 LLM_EXPLORER_V3_PROMPT_VERSION = (
-    "uav-hrl-llm-explorer-prompts-v8-mission-s2g-runtime-policy"
+    "uav-hrl-llm-explorer-prompts-v9-ground-s2g-rayleigh-runtime-policy"
 )
 LLM_EXPLORER_V3_SUMMARY_VERSION = "shared-goodput-event-time-episode-summary-v4"
 LLM_EXPLORER_V3_CASE_VERSION = "deterministic-diverse-cases-v2"
@@ -995,6 +995,8 @@ def build_observable_initial_state_v3(env: Any, packet_engine: Any) -> dict[str,
 
 def environment_definitions_v3(**kwargs: Any) -> dict[str, Any]:
     base = environment_constants_and_definitions(**kwargs)
+    ranges = base["communication_ranges_3d_m_inclusive"]
+    s2g = base["s2g_ground_channel"]
     return {
         "schema_version": LLM_EXPLORER_V3_VERSION,
         "num_uav": NUM_UAV,
@@ -1003,15 +1005,21 @@ def environment_definitions_v3(**kwargs: Any) -> dict[str, Any]:
         "routing_slot_seconds": base["routing_slot_seconds"],
         "operating_area_m": base["operating_area_m"],
         "uav_altitude_bounds_m": base["uav_altitude_bounds_m"],
-        "communication_range_3d_m_inclusive": base[
-            "communication_range_3d_m_inclusive"
-        ],
+        "communication_ranges_3d_m_inclusive": {
+            "S2G": ranges["S2G"],
+            "S2U_U2U_U2G": ranges["S2U"],
+        },
+        "s2g_ground_channel": {
+            "PL_dB": s2g["path_loss_formula_db"],
+            "Rayleigh_power_gain": (
+                f"Exp(mean=1), block_s={s2g['fading_block_seconds']:g}"
+            ),
+        },
         "task_deadlines_seconds": base["task_deadlines_seconds"],
         "packet_generation_model": base["packet_generation_model"],
         "routing_decision_model": base["routing_decision_model"],
         "packet_service_model": base["packet_service_model"],
         "bandwidth_model": base["bandwidth_model"],
-        "fading_model": base["fading_model"],
         "action_decode": base["action_decode"],
         "routing_actions": {
             "GS": 16,

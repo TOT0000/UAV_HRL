@@ -26,22 +26,21 @@ from visual_sensing import (
 )
 from movement_feature_schema import (
     ACTIVE_MOVEMENT_TASK_TYPES,
+    COVERAGE_GRID_SIZE,
+    GLOBAL_MOVEMENT_DIM,
     LOCAL_MOVEMENT_DIM,
     LOCAL_MOVEMENT_FEATURES,
+    MAX_SR_SLOTS,
     MOVEMENT_FEATURE_SCHEMA_VERSION,
     SR_MOVEMENT_DIM,
     SR_MOVEMENT_FEATURES,
     TASK_TYPES,
+    movement_state_layout,
 )
-COVERAGE_GRID_SIZE = 16
-GLOBAL_MOVEMENT_DIM = 3
-MAX_SR_SLOTS = ROI_COUNT_MAX
-MOVEMENT_STATE_DIM = (
-    NUM_UAV * LOCAL_MOVEMENT_DIM
-    + MAX_SR_SLOTS * SR_MOVEMENT_DIM
-    + COVERAGE_GRID_SIZE**2
-    + GLOBAL_MOVEMENT_DIM
-)
+_MOVEMENT_STATE_LAYOUT = movement_state_layout(NUM_UAV)
+if MAX_SR_SLOTS != ROI_COUNT_MAX:
+    raise RuntimeError("movement SR slots must match the supported RoI maximum")
+MOVEMENT_STATE_DIM = _MOVEMENT_STATE_LAYOUT.dimension
 JOINT_ACTION_DIM = NUM_UAV * 3
 BACKLOG_NORM_REF_BITS = 5e7
 GT_COUNT_MAX = ROI_COUNT_MAX
@@ -67,7 +66,7 @@ def movement_state_feature_schema():
                     "normalization": normalization,
                 }
             )
-    sr_base = NUM_UAV * LOCAL_MOVEMENT_DIM
+    sr_base = _MOVEMENT_STATE_LAYOUT.sr_start
     for sr_id in range(MAX_SR_SLOTS):
         base = sr_base + sr_id * SR_MOVEMENT_DIM
         for offset, (name, kind, minimum, maximum, normalization) in enumerate(
@@ -83,7 +82,7 @@ def movement_state_feature_schema():
                     "normalization": normalization,
                 }
             )
-    coverage_base = sr_base + MAX_SR_SLOTS * SR_MOVEMENT_DIM
+    coverage_base = _MOVEMENT_STATE_LAYOUT.coverage_start
     for row in range(COVERAGE_GRID_SIZE):
         for column in range(COVERAGE_GRID_SIZE):
             features.append(

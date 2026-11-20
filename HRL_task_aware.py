@@ -222,7 +222,7 @@ from llm_state_rule_explorer import (
 )
 
 
-REWARD_STEP_RECORD_SCHEMA_VERSION = "uav-hrl-movement-reward-step-v1"
+REWARD_STEP_RECORD_SCHEMA_VERSION = "uav-hrl-movement-reward-step-v2"
 MOVEMENT_CONTROL_INTERVAL = int(round(MOVEMENT_INTERVAL_SECONDS / ROUTING_SLOT_SECONDS))
 if not np.isclose(
     MOVEMENT_CONTROL_INTERVAL * ROUTING_SLOT_SECONDS,
@@ -1678,6 +1678,19 @@ def _movement_constraint_penalty_total(
             constraint_penalties["c10_penalty_mean"]
         )
     return float(total)
+
+
+def _llm_reward_contribution(llm_extra_reward, llm_runtime):
+    """Return the actual beta and weighted LLM reward added to movement reward."""
+
+    if llm_runtime is None:
+        return 0.0, 0.0
+    beta = float(llm_runtime.beta)
+    raw = float(llm_extra_reward)
+    weighted = beta * raw
+    if not np.isfinite(beta) or not np.isfinite(raw) or not np.isfinite(weighted):
+        raise ValueError("LLM reward beta, raw reward, and contribution must be finite")
+    return beta, float(weighted)
 
 
 def _is_checkpoint_episode(completed_episode, total_episodes, every):
@@ -4567,10 +4580,11 @@ def train(
                 episode_rnd_weighted_bonuses.append(
                     rnd_record["weighted_bonus"]
                 )
+            llm_reward_beta, llm_extra_reward_weighted = (
+                _llm_reward_contribution(llm_extra_reward, llm_runtime)
+            )
             combined_movement_reward = interval_reward + (
-                llm_runtime.beta * llm_extra_reward
-                if llm_runtime is not None
-                else 0.0
+                llm_extra_reward_weighted
             ) + (
                 potential_shaping if potential_runtime is not None else 0.0
             ) + (
@@ -4685,6 +4699,14 @@ def train(
                             interval_reward
                         ),
                         "llm_extra_reward": float(llm_extra_reward),
+                        "llm_extra_reward_semantics": (
+                            "raw_unweighted_approved_llm_reward"
+                        ),
+                        "llm_reward_enabled": bool(llm_runtime is not None),
+                        "llm_reward_beta": float(llm_reward_beta),
+                        "llm_extra_reward_weighted": float(
+                            llm_extra_reward_weighted
+                        ),
                         "potential_shaping": float(potential_shaping),
                         "rnd_weighted_bonus": float(
                             0.0

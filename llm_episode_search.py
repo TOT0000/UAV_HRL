@@ -77,7 +77,7 @@ from training_history import read_committed_training_history, training_history_i
 
 
 SEARCH_RUN_SCHEMA_VERSION = "uav-hrl-llm-episode-search-run-v1"
-SEARCH_PROMPT_VERSION = "uav-hrl-llm-episode-search-prompt-v4-mission-s2g"
+SEARCH_PROMPT_VERSION = "uav-hrl-llm-episode-search-prompt-v5-ground-s2g-rayleigh"
 SEARCH_METHOD_ID = "td3_dinkelbach_llm_search"
 DEFAULT_OUTPUT_ROOT = Path("results") / "llm_episode_searches"
 DEFAULT_MAX_SEARCH_ROUNDS = 5

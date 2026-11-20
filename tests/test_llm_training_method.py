@@ -9,7 +9,10 @@ from types import SimpleNamespace
 from experiment_config import MethodSpec, effective_training_config
 from HRL_task_aware import TrainingConfig, _evaluate_llm_observation, train
 from llm_candidate import CandidateError, load_approved_design, save_approved_artifact
-from llm_design_contract import LEGACY_OBS_INTERFACE_VERSION
+from llm_design_contract import (
+    INCOMPATIBLE_SR_OFFSET_OBS_INTERFACE_VERSION,
+    LEGACY_OBS_INTERFACE_VERSION,
+)
 from llm_runtime import (
     ApprovedDesignRuntime,
     artifact_identity,
@@ -31,6 +34,7 @@ def _approved_fixture(
     *,
     name="integration-fixture-only",
     observation_interface_version=None,
+    beta=1.0,
 ):
     constants = {
         name: {
@@ -95,7 +99,7 @@ def _approved_fixture(
         validation_report={"status": "passed", "fixture": True},
         evaluation_report={"status": "passed", "passed": True, "fixture": True},
         provenance={
-            "beta": 1.0,
+            "beta": float(beta),
             "model_requested": "fixture/model",
             "model_actual": "fixture/model",
             "fixture_only": True,
@@ -169,6 +173,18 @@ def test_old_llm_artifact_contract_is_rejected_with_retraining_message(tmp_path)
         load_approved_design(approved)
 
 
+def test_v2_named_observation_artifact_is_not_silently_reused(tmp_path):
+    approved = _approved_fixture(tmp_path)
+    artifact_path = approved / "artifact.json"
+    artifact = json.loads(artifact_path.read_text(encoding="utf-8"))
+    artifact["observation_interface_version"] = (
+        INCOMPATIBLE_SR_OFFSET_OBS_INTERFACE_VERSION
+    )
+    artifact_path.write_text(json.dumps(artifact), encoding="utf-8")
+    with pytest.raises(CandidateError, match="observation interface"):
+        load_approved_design(approved)
+
+
 def test_llm_replay_reward_is_separate_and_added_once():
     replay = ReplayBufferJoint(2, 48, max_size=2, record_llm_reward=True)
     replay.add(
@@ -183,8 +199,11 @@ def test_llm_replay_reward_is_separate_and_added_once():
     combined = replay._reward_numpy(
         [0], current_lambda=0.5, gamma=1.0, llm_reward_beta=1.0
     )
-    assert base[0, 0] == pytest.approx(2.4)
-    assert combined[0, 0] == pytest.approx(2.65)
+    # Dinkelbach objective 4 - 0.5*2, less C9=0.1 and the authoritative
+    # 2*COM=0.6.  C10 remains disabled by this method-level default.
+    expected_base = 4.0 - 0.5 * 2.0 - 0.1 - 2.0 * 0.3
+    assert base[0, 0] == pytest.approx(expected_base)
+    assert combined[0, 0] == pytest.approx(expected_base + 0.25)
     assert replay.delivered_mbits[0, 0] == pytest.approx(4.0)
     assert replay.total_mobility_energy[0, 0] == pytest.approx(2.0)
 
@@ -228,7 +247,7 @@ def test_persistent_runtime_matches_offline_adapter_and_dynamic_constants(tmp_pa
 def test_llm_training_smoke_performs_td3_update_and_embeds_artifact(
     tmp_path, method_id
 ):
-    source = _approved_fixture(tmp_path)
+    source = _approved_fixture(tmp_path, beta=0.5)
     run_dir = tmp_path / "training-run"
     run_dir.mkdir()
     design = copy_approved_artifact(source, run_dir)
@@ -255,12 +274,27 @@ def test_llm_training_smoke_performs_td3_update_and_embeds_artifact(
         enable_csv=False,
         random_seed=20260927,
     )
+    training_reward_rows = []
     result = train(
         config,
         scenario_manifest=manifest,
         method_spec=MethodSpec.parse(method_id),
         llm_artifact_dir=design.directory,
+        reward_step_record_sink=training_reward_rows.append,
     )
+    assert training_reward_rows
+    for row in training_reward_rows:
+        assert row["llm_reward_enabled"] is True
+        assert row["llm_reward_beta"] == pytest.approx(0.5)
+        assert row["llm_extra_reward_weighted"] == pytest.approx(
+            0.5 * row["llm_extra_reward"]
+        )
+        assert row["final_training_reward"] == pytest.approx(
+            row["movement_reward_after_constraints"]
+            + row["llm_extra_reward_weighted"]
+            + row["potential_shaping"]
+            + row["rnd_weighted_bonus"]
+        )
     assert result["movement_state_dim"] == result["original_movement_state_dim"] + 1
     assert result["critic_updates"] >= 1
     assert result["joint_replay_diagnostics"]["llm_extra_reward_enabled"] is True
@@ -292,6 +326,7 @@ def test_llm_training_smoke_performs_td3_update_and_embeds_artifact(
     evaluation_manifest = generate_manifest(
         "test", 20260928, 1, num_gt=3, environment_size_m=1500
     )
+    evaluation_reward_rows = []
     evaluation = train(
         TrainingConfig(
             total_episodes=1,
@@ -320,6 +355,16 @@ def test_llm_training_smoke_performs_td3_update_and_embeds_artifact(
             "environment_height_m": 1500,
         },
         llm_artifact_dir=design.directory,
+        reward_step_record_sink=evaluation_reward_rows.append,
+    )
+    assert len(evaluation_reward_rows) == 1
+    assert evaluation_reward_rows[0]["evaluation"] is True
+    assert evaluation_reward_rows[0]["llm_reward_beta"] == pytest.approx(0.5)
+    assert evaluation_reward_rows[0]["final_training_reward"] == pytest.approx(
+        evaluation_reward_rows[0]["movement_reward_after_constraints"]
+        + evaluation_reward_rows[0]["llm_extra_reward_weighted"]
+        + evaluation_reward_rows[0]["potential_shaping"]
+        + evaluation_reward_rows[0]["rnd_weighted_bonus"]
     )
     assert evaluation["movement_state_dim"] == result["movement_state_dim"]
     assert evaluation["episode_metrics"][0]["num_GT"] == 3

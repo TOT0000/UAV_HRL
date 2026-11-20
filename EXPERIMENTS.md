@@ -427,7 +427,11 @@ The applied episode penalty is the sum of the weighted per-step means; the
 separate pooled-pair diagnostic is not multiplied by the step count. The
 optional `--record-reward-steps` JSONL stream exposes the same
 raw-versus-applied distinction during either training or evaluation without
-changing simulation RNG or learning.
+changing simulation RNG or learning. Reward-step schema v2 keeps
+`llm_extra_reward` as the raw approved-design value and records both the
+runtime `llm_reward_beta` and `llm_extra_reward_weighted`; therefore
+`final_training_reward` is exactly reconstructable as movement reward after
+constraints plus weighted LLM reward, potential shaping and weighted RND bonus.
 
 The movement auxiliary-reward contract is
 `post-action-vs-com-mean-constraint-penalties-v16-com380-weight2`. TD3 and DDPG
@@ -454,22 +458,26 @@ after a state has been sampled. This is a one-second large-scale block-state
 Monte Carlo approximation, not a claim that buildings physically change every
 second.
 
-S2G is selected when SR-to-GS 3-D distance is at most 400 m. It uses 2 GHz
-free-space loss, the SR's 23 dBm transmit power, and no LoS/NLoS excess loss or
-small-scale fading. Outside that boundary the SR uses S2U to its assigned COM
-UAV. An incomplete first hop restarts from the full packet if its link type or
-receiver changes, while retaining packet identity, deadline, FIFO order, and
-already-counted violation status.
+S2G is selected when SR-to-GS 3-D distance is at most 100 m. It uses the ground
+path-loss contract `38.46 + 40 log10(max(d, 1 m) / 1 m)` dB, the SR's 23 dBm
+transmit power, and an independent mean-one exponential Rayleigh power gain
+that is held for each 5 ms fading block. Outside that boundary the SR retains
+its assigned COM UAV and attempts S2U only within the 400 m S2U range; crossing
+the S2G boundary does not trigger task reassignment. An incomplete first hop
+restarts from the full packet if its link type or receiver changes, while
+retaining packet identity, deadline, FIFO order, and already-counted violation
+status.
 
 U2U links retain the directed sender-absolute-AGL, 3-D-distance, 2.4 GHz paper
 path-loss model and are always LoS. U2U and sampled A2G LoS links use normalized
 Rician fading with linear `K=10` (`10 dB`); sampled A2G NLoS links use normalized
-Rayleigh fading. S2G, S2U, U2G, and U2U all use the same hard, inclusive, Euclidean
-3-D slot-start range of 400 m. Out-of-range links have zero observable and service
-capacity, are absent from the physical mask, and consume no FDMA bandwidth.
-The full potential-link fading profile is still generated before the range
-mask, preserving policy-independent RNG draw counts. No `C_min`, outage/PER,
-HARQ, shadowing, or retransmission model is added.
+Rayleigh fading. S2G uses its independent hard, inclusive 100 m Euclidean 3-D
+range; S2U, U2G, and U2U retain the hard, inclusive 400 m range. Out-of-range
+links have zero observable and service capacity, are absent from the physical
+mask, and consume no FDMA bandwidth. Potential-link fading profiles are drawn
+from their named streams before service filtering, preserving
+policy-independent RNG draw counts. No `C_min`, outage/PER, HARQ, shadowing, or
+retransmission model is added.
 
 The range decision is frozen at the start of each 0.25 s routing slot and is
 shared by all fifty 5 ms service blocks in that slot. Every registered method

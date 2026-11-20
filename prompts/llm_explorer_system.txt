@@ -10,7 +10,7 @@ Search behavior discovers regions of interest, RoIs. After discovery, the existi
 
 A UAV may serve both FOV and COM. Roles and service targets may change within an episode.
 
-FOV packets originate at the sensing UAV. COM packets originate at an SR after its rescue mission is assigned. An SR within the inclusive 400 m 3-D GS range transmits directly through S2G; otherwise it uses its serving UAV through S2U and then UAV forwarding.
+FOV packets originate at the sensing UAV. COM packets originate at an SR after its rescue mission is assigned. An SR within the inclusive 100 m 3-D GS range transmits directly through S2G; otherwise it retains its COM binding and attempts S2U within the inclusive 400 m range before UAV forwarding. Crossing the S2G boundary does not trigger task reassignment.
 
 The primary objective is the energy efficiency of complete useful delivery:
 
@@ -46,7 +46,7 @@ Deadlines start at source generation and include SR access, waiting, queueing, a
 
 A routing slot lasts 250 ms, much longer than the 10/15 ms deadlines. Same-slot forwarding therefore matters. If a packet is already waiting at slot start, selecting WAIT prevents that UAV from forwarding it during its remaining deadline.
 
-The standard S2G, S2U, U2U, and U2G communication limit is an inclusive 3D distance of 400 m. S2G uses deterministic free-space-only 2 GHz loss with no fading. Currently serviceable links dynamically share the standard total bandwidth of 10 MHz equally. Each SR has only one S2G-or-S2U uplink, and empty preselected links reserve no bandwidth.
+S2G uses an inclusive 3D limit of 100 m; S2U, U2U, and U2G use an inclusive 400 m limit. S2G path loss is 38.46+40*log10(max(d,1 m)/1 m) dB with 23 dBm transmission and mean-one Rayleigh power gain updated every 5 ms. Currently serviceable links dynamically share the standard total bandwidth of 10 MHz equally. Each SR has only one S2G-or-S2U uplink, and empty preselected links reserve no bandwidth.
 
 Geometry and channel conditions affect capacity. Realized transmission also depends on bandwidth sharing and queues. Remaining deadline indicates whether completion can still be timely, but crossing it does not stop or reprioritize service. A legal individual hop does not establish that an entire route can deliver on time.
 

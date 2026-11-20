@@ -37,6 +37,12 @@ class SimpleRunnerLifecycleIntegrationTest(unittest.TestCase):
             run_dir = next(
                 (output / "kkm_random_action_random_routing").iterdir()
             )
+            resolved = json.loads(
+                (run_dir / "resolved_config.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(
+                resolved["movement_hyperparameters"]["state_dim"], 619
+            )
             self.assertFalse((run_dir / "checkpoints" / "models").exists())
 
             with mock.patch(

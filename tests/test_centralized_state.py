@@ -10,9 +10,19 @@ from centralized_movement import (
     calculate_movement_potentials,
     get_global_movement_state,
 )
+from experiment_config import FORMAL_EXPERIMENT_DEFAULTS
+from movement_feature_schema import movement_state_dimension
 
 
 class CoverageAggregationTest(unittest.TestCase):
+    def test_formal_state_dimension_uses_authoritative_layout(self):
+        self.assertEqual(MOVEMENT_STATE_DIM, 619)
+        self.assertEqual(movement_state_dimension(16), MOVEMENT_STATE_DIM)
+        self.assertEqual(
+            FORMAL_EXPERIMENT_DEFAULTS["movement_hyperparameters"]["state_dim"],
+            MOVEMENT_STATE_DIM,
+        )
+
     def test_false_true_and_shape(self):
         false_map = np.zeros((500, 500), dtype=bool)
         true_map = np.ones((500, 500), dtype=bool)

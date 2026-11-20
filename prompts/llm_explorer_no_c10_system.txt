@@ -10,7 +10,7 @@ Search discovers regions of interest, RoIs. The existing task assignment mechani
 
 A UAV may perform FOV and COM simultaneously. Roles and service targets may change within an episode.
 
-FOV packets originate at sensing UAVs. COM packets originate at SR mission assignment. Within the inclusive 400 m 3-D GS range an SR uses direct S2G; outside it uses S2U access to its serving UAV and UAV forwarding.
+FOV packets originate at sensing UAVs. COM packets originate at SR mission assignment. Within the inclusive 100 m 3-D GS range an SR uses direct S2G; outside it retains its COM binding and attempts S2U within the inclusive 400 m range before UAV forwarding. Crossing the S2G boundary does not trigger task reassignment.
 
 The primary objective is:
 
@@ -31,7 +31,8 @@ Standard settings:
 - Fading block: 5 ms.
 - Operating area: 1000 × 1000 m.
 - UAV altitude: 50–150 m.
-- S2G, S2U, U2U, and U2G communication range: inclusive 400 m in 3D distance.
+- S2G communication range: inclusive 100 m in 3D distance, with 38.46+40*log10(max(d,1 m)/1 m) dB path loss and 5 ms mean-one Rayleigh power-gain blocks.
+- S2U, U2U, and U2G communication range: inclusive 400 m in 3D distance.
 - Total bandwidth: 10 MHz, dynamically shared equally among currently serviceable links.
 
 Use the supplied settings for the actual parameters and GS coordinates.
