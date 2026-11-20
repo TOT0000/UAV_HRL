@@ -27,6 +27,8 @@ from Channel_model import (
     u2u_path_loss_db,
     normalized_s2u_capacity_utility,
     reference_s2u_max_capacity_mbps,
+    s2g_free_space_path_loss_db,
+    shannon_capacity_mbps,
     validate_bandwidth_hz,
     validate_transmit_power_dbm,
 )
@@ -74,6 +76,7 @@ from experiment_config import (
     TOTAL_COMMUNICATION_BANDWIDTH_HZ,
     TASK_COMPATIBILITY_POLICY,
 )
+from communication_contract import is_within_communication_range
 
 
 @dataclass(frozen=True)
@@ -206,8 +209,10 @@ class Simulator:
         self.active_link_capacities = {}
         self.active_link_bandwidths = {}
         self.active_s2u_capacities = {}
+        self.active_s2g_capacities = {}
         self.active_link_capacity_profiles_mbps = {}
         self.active_s2u_capacity_profiles_mbps = {}
+        self.active_s2g_capacity_profiles_mbps = {}
         self.active_link_diagnostics = []
         self._active_link_capacity_cache_enabled = bool(
             self._ACTIVE_LINK_CAPACITY_CACHE_ENABLED
@@ -306,6 +311,9 @@ class Simulator:
         self.assignment_invocations = 0
         self.search_to_hover_conversions = 0
         self.assignment_history = []
+        self.pending_assignment_events = []
+        self.sr_direct_to_gs = {}
+        self.sr_direct_state_history = []
 
     def configure_method(self, method_spec):
         """Install comparison strategies before any episode reset."""
@@ -374,8 +382,10 @@ class Simulator:
                     if (current := sorted(task["task_type"] for task in self.multi_tasks[uid]))
                     != previous_roles[uid]
                 ],
+                "triggers": copy.deepcopy(self.pending_assignment_events),
             }
         )
+        self.pending_assignment_events = []
         self.last_assignment_metadata = self.assignment_metadata()
 
     def update_visited_grid(
@@ -415,12 +425,13 @@ class Simulator:
                                     target_obj = gt,
                                     target_obj_id = gt.id)
                                     )
-                self.task_list.append(Task(
-                                    task_id= len(self.task_list), 
-                                    task_type="COM", 
-                                    target_obj=sr,
-                                    target_obj_id = sr.id)
-                                    )
+                if not self.is_s2g_in_range(sr.id):
+                    self.task_list.append(Task(
+                                        task_id= len(self.task_list),
+                                        task_type="COM",
+                                        target_obj=sr,
+                                        target_obj_id = sr.id)
+                                        )
                 self.need_reassign = True
 
     def fov_footprint_indices(self, uav_id, *, footprint=None):
@@ -689,6 +700,16 @@ class Simulator:
             "fov_assignment_utility_version": FOV_ASSIGNMENT_UTILITY_VERSION,
             "fov_quality_transform": FOV_QUALITY_TRANSFORM,
             "discovered_roi_count": int(self.count_found_targets()),
+            "sr_uplink_selection": (
+                "s2g_if_inclusive_3d_distance_le_400m_else_s2u"
+            ),
+            "sr_direct_to_gs": {
+                str(sr_id): bool(value)
+                for sr_id, value in sorted(self.sr_direct_to_gs.items())
+            },
+            "sr_direct_state_history": copy.deepcopy(
+                self.sr_direct_state_history
+            ),
             "assignment_history": copy.deepcopy(self.assignment_history),
             "service_reassignment_pending": bool(self.need_reassign),
             "search_release_reassignment_pending": bool(
@@ -747,7 +768,9 @@ class Simulator:
             sr.assign_mission(
                 gt.id,
                 (gt.x, gt.y),
-                speed=float(getattr(self, "sr_speed_mps", 1.0)),
+                speed=float(
+                    getattr(self, "sr_speed_mps", DEFAULT_SR_SPEED_MPS)
+                ),
                 update_seconds=float(self.sr_update_seconds),
             )
             assignment_time = float(
@@ -837,6 +860,83 @@ class Simulator:
             point = [sr.x, sr.y, sr.z]
             if not self.sr_trajectory[sr.id] or self.sr_trajectory[sr.id][-1] != point:
                 self.sr_trajectory[sr.id].append(point)
+
+    def _has_com_support_task(self, sr_id):
+        return any(
+            task.task_type == "COM" and int(task.target_obj_id) == int(sr_id)
+            for task in self.task_list
+        )
+
+    def _set_com_support_task(self, sr_id, required):
+        """Synchronize only UAV support demand; the SR mission is untouched."""
+
+        sr_id = int(sr_id)
+        present = self._has_com_support_task(sr_id)
+        if bool(required) == present:
+            return False
+        if required:
+            self.task_list.append(
+                Task(
+                    task_id=len(self.task_list),
+                    task_type="COM",
+                    target_obj=self.SR_teams[sr_id],
+                    target_obj_id=sr_id,
+                )
+            )
+        else:
+            self.task_list = [
+                task
+                for task in self.task_list
+                if not (
+                    task.task_type == "COM"
+                    and int(task.target_obj_id) == sr_id
+                )
+            ]
+        for index, task in enumerate(self.task_list):
+            task.task_id = int(index)
+        return True
+
+    def update_sr_direct_states(self, observation_time_seconds=None):
+        """Commit S2G state changes and coalesce them into one reassignment."""
+
+        event_time = float(
+            self.current_time
+            if observation_time_seconds is None
+            else observation_time_seconds
+        )
+        changes = []
+        for sr in sorted(self.SR_teams, key=lambda item: item.id):
+            sr_id = int(sr.id)
+            direct = bool(self.is_s2g_in_range(sr_id))
+            previous = self.sr_direct_to_gs.get(sr_id)
+            self.sr_direct_to_gs[sr_id] = direct
+            if previous is None or previous == direct:
+                continue
+            support_changed = False
+            if sr.assigned_gt_id is not None:
+                support_changed = self._set_com_support_task(sr_id, not direct)
+            changes.append(
+                {
+                    "time_seconds": event_time,
+                    "sr_id": sr_id,
+                    "direct_to_gs_before": bool(previous),
+                    "direct_to_gs_after": direct,
+                    "uav_support_task_changed": bool(support_changed),
+                    "assigned_roi_id": sr.assigned_gt_id,
+                }
+            )
+        if changes:
+            self.pending_assignment_events.append(
+                {
+                    "reason": "sr_direct_state_change",
+                    "time_seconds": event_time,
+                    "changes": copy.deepcopy(changes),
+                }
+            )
+            self.sr_direct_state_history.extend(changes)
+            if any(row["uav_support_task_changed"] for row in changes):
+                self.need_reassign = True
+        return tuple(changes)
 
     def sr_route_state(self):
         return {
@@ -937,6 +1037,7 @@ class Simulator:
         if self.channel.movement_interval_index is not None:
             raise RuntimeError("initial movement interval is already prepared")
         self.advance_sr_teams(observation_time_seconds=0.0)
+        self.update_sr_direct_states(observation_time_seconds=0.0)
         self.initialize_channel_episode_boundary()
 
     def advance_channel_boundary(self, next_interval_index):
@@ -959,6 +1060,11 @@ class Simulator:
         """Authoritative non-terminal one-second geometry/channel boundary."""
 
         self.advance_sr_teams(
+            observation_time_seconds=(
+                float(next_interval_index) * float(self.sr_update_seconds)
+            )
+        )
+        self.update_sr_direct_states(
             observation_time_seconds=(
                 float(next_interval_index) * float(self.sr_update_seconds)
             )
@@ -1304,6 +1410,13 @@ class Simulator:
             self.uav_dict[int(uav_id)].get_position(),
         ) <= COMMUNICATION_RANGE_M
 
+    def is_s2g_in_range(self, sr_id):
+        if not self.SR_teams:
+            return False
+        return is_within_communication_range(
+            self.SR_teams[int(sr_id)].get_position(), self.GS_pos
+        )
+
     def is_routing_link_in_range(self, sender_id, receiver_id):
         receiver_id = int(receiver_id)
         if receiver_id == self.GS_ID:
@@ -1389,7 +1502,9 @@ class Simulator:
             "entries": len(self._active_link_capacity_cache),
         }
 
-    def allocate_active_link_capacities(self, proposed_links, s2u_links=None):
+    def allocate_active_link_capacities(
+        self, proposed_links, s2u_links=None, s2g_links=None
+    ):
         """Equal-FDMA using slot-local profiles for exact repeated inputs."""
 
         if self.channel._gain_matrix is None:
@@ -1411,10 +1526,20 @@ class Simulator:
             for sr_id, uav_id in dict(s2u_links or {}).items()
             if self.is_s2u_in_range(sr_id, uav_id)
         }
+        s2g_links = {
+            int(sr_id): int(self.GS_ID)
+            for sr_id in dict(s2g_links or {})
+            if self.is_s2g_in_range(sr_id)
+        }
+        overlap = set(s2u_links).intersection(s2g_links)
+        if overlap:
+            raise AssertionError(
+                f"one SR cannot use S2G and S2U simultaneously: {sorted(overlap)}"
+            )
         # Range predicates above validate every endpoint that can enter this
         # allocation, including direct position mutations used by tests/tools.
         geometry = self._physical_routing_geometry()
-        total_links = len(active_links) + len(s2u_links)
+        total_links = len(active_links) + len(s2u_links) + len(s2g_links)
         shared_bandwidth = self.B_tot / total_links if total_links else 0.0
 
         capacities = {}
@@ -1520,6 +1645,46 @@ class Simulator:
                 }
             )
 
+        s2g_capacities = {}
+        s2g_capacity_profiles = {}
+        for sr_id in sorted(s2g_links):
+            sr_position = self.SR_teams[int(sr_id)].get_position()
+            path_loss = float(
+                s2g_free_space_path_loss_db(sr_position, self.GS_pos)
+            )
+            capacity = float(
+                shannon_capacity_mbps(
+                    path_loss,
+                    shared_bandwidth,
+                    self.s2u_tx_power_dbm,
+                )
+            )
+            profile = np.full(
+                FADING_BLOCKS_PER_ROUTING_SLOT,
+                capacity,
+                dtype=np.float64,
+            )
+            key = ("S2G", int(sr_id), int(self.GS_ID))
+            bandwidths[key] = float(shared_bandwidth)
+            s2g_capacities[(int(sr_id), int(self.GS_ID))] = capacity
+            s2g_capacity_profiles[(int(sr_id), int(self.GS_ID))] = profile
+            diagnostics.append(
+                {
+                    "link_type": "S2G",
+                    "sender_id": int(sr_id),
+                    "receiver_id": int(self.GS_ID),
+                    "bandwidth_hz": float(shared_bandwidth),
+                    "capacity_mbps": capacity,
+                    "fading_blocks": FADING_BLOCKS_PER_ROUTING_SLOT,
+                    "slot_service_bits": float(slot_service_bits(profile)),
+                    "gain_profile_reused": False,
+                    "fading": "none",
+                    "range_eligible": True,
+                    "distance_3d_m": self.distance_3d(
+                        sr_position, self.GS_pos
+                    ),
+                }
+            )
         if sum(bandwidths.values()) > self.B_tot + 1e-6:
             raise AssertionError("active link bandwidth exceeds the shared pool")
 
@@ -1528,6 +1693,8 @@ class Simulator:
         self.active_link_bandwidths = bandwidths
         self.active_s2u_capacities = s2u_capacities
         self.active_s2u_capacity_profiles_mbps = s2u_capacity_profiles
+        self.active_s2g_capacities = s2g_capacities
+        self.active_s2g_capacity_profiles_mbps = s2g_capacity_profiles
         self.active_link_diagnostics = diagnostics
         return capacities, bandwidths
 
@@ -1662,7 +1829,7 @@ class Simulator:
                 "load_factor": 1.0,
                 "base_fov_packets_per_second": 5.0,
                 "base_com_packets_per_second": 50.0,
-                "generation_model": "assigned-fixed-interval-event-time-v3",
+                "generation_model": "mission-assigned-fixed-interval-s2g-event-time-v4",
             }
         if not ROI_COUNT_MIN <= int(self.num_GT) <= ROI_COUNT_MAX:
             raise ValueError(
@@ -1673,6 +1840,7 @@ class Simulator:
         self.assignment_invocations = 0
         self.search_to_hover_conversions = 0
         self.assignment_history = []
+        self.pending_assignment_events = []
         self.last_assignment = None
         self.search_release_time = None
         self.search_release_coverage = None
@@ -1702,8 +1870,10 @@ class Simulator:
         self.active_link_capacities = {}
         self.active_link_bandwidths = {}
         self.active_s2u_capacities = {}
+        self.active_s2g_capacities = {}
         self.active_link_capacity_profiles_mbps = {}
         self.active_s2u_capacity_profiles_mbps = {}
+        self.active_s2g_capacity_profiles_mbps = {}
         self.active_link_diagnostics = []
         self.num_SR_team=self.num_GT
         # ==================初始化無人機位置=============================
@@ -1833,13 +2003,18 @@ class Simulator:
         # =============== SR team 初始位置 =====================
         self.SR_teams = []
         if scenario_entry is None:
-            start_points = self.fixed_boundary_points(
-                self.env_width, self.env_height
-            )
             sr_initial_data = [
                 {
                     "sr_id": index,
-                    "position": [*start_points[index % 4], 0.0],
+                    "position": [
+                        350.0 * math.cos(
+                            (index + 1) * math.pi / (2.0 * (self.num_GT + 1))
+                        ),
+                        350.0 * math.sin(
+                            (index + 1) * math.pi / (2.0 * (self.num_GT + 1))
+                        ),
+                        0.0,
+                    ],
                     "movement_primitive": {
                         "speed_mps": DEFAULT_SR_SPEED_MPS
                     },
@@ -1872,6 +2047,11 @@ class Simulator:
             self.SR_teams.append(sr)
         self.sr_trajectory = {i: [] for i in range(self.num_SR_team)}
         self.sr_movement_events = {}
+        self.sr_direct_state_history = []
+        self.sr_direct_to_gs = {
+            int(sr.id): bool(self.is_s2g_in_range(sr.id))
+            for sr in self.SR_teams
+        }
         self.sr_movement_update_index = 0
         for sr in self.SR_teams:
             self.sr_trajectory[sr.id].append([sr.x, sr.y, sr.z])  # 初始位置

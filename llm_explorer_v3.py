@@ -11,6 +11,7 @@ from typing import Any
 
 import numpy as np
 
+from experiment_config import PRODUCTION_EPISODE_HORIZON_SECONDS
 from llm_explorer import (
     ExplorerValidationError,
     LLMExplorerConfig,
@@ -34,7 +35,9 @@ from llm_explorer import (
 
 LLM_EXPLORER_V3_METHOD_ID = "td3_dinkelbach_llm_explorer_v3"
 LLM_EXPLORER_V3_VERSION = "uav-hrl-llm-explorer-v3"
-LLM_EXPLORER_V3_PROMPT_VERSION = "uav-hrl-llm-explorer-prompts-v7-runtime-routing-policy"
+LLM_EXPLORER_V3_PROMPT_VERSION = (
+    "uav-hrl-llm-explorer-prompts-v8-mission-s2g-runtime-policy"
+)
 LLM_EXPLORER_V3_SUMMARY_VERSION = "shared-goodput-event-time-episode-summary-v4"
 LLM_EXPLORER_V3_CASE_VERSION = "deterministic-diverse-cases-v2"
 LLM_EXPLORER_V3_GUIDANCE_CONTEXT_VERSION = "self-contained-raw-td3-v1"
@@ -49,7 +52,7 @@ class LLMExplorerV3Config(LLMExplorerConfig):
     call_schedule_version: str = LLM_EXPLORER_LEGACY_CALL_SCHEDULE_VERSION
     input_hard_limit_tokens: int = LLM_EXPLORER_V3_MAX_INPUT_TOKENS
     annealing_end_episode: int = LLM_EXPLORER_V3_ANNEAL_END_EPISODE
-    episode_joint_transitions: int = 60
+    episode_joint_transitions: int = PRODUCTION_EPISODE_HORIZON_SECONDS
 
     def __post_init__(self) -> None:
         super().__post_init__()

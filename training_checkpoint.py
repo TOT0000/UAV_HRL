@@ -116,7 +116,8 @@ from dinkelbach_blocks import (
     dinkelbach_config_metadata,
 )
 
-CHECKPOINT_SCHEMA_VERSION = 37
+CHECKPOINT_SCHEMA_VERSION = 38
+PRE_S2G_MISSION_TRAFFIC_CHECKPOINT_SCHEMA_VERSION = 37
 PRE_COMPLETED_HOP_PROGRESS_REWARD_CHECKPOINT_SCHEMA_VERSION = 36
 PRE_UNIFIED_COMPLETE_GOODPUT_CHECKPOINT_SCHEMA_VERSION = 35
 PRE_SHARED_GOODPUT_REWARD_CHECKPOINT_SCHEMA_VERSION = 34
@@ -1194,7 +1195,9 @@ def _base_metadata(
         "movement_feature_schema_version": MOVEMENT_FEATURE_SCHEMA_VERSION,
         "movement_state_feature_schema": movement_state_feature_schema(),
         "state_contract": "16-uav-search-fov-com-task-aware-v5",
-        "packet_lifecycle_contract": "event-time-s2u-u2u-u2g-multihop-v2",
+        "packet_lifecycle_contract": (
+            "mission-clock-event-time-s2g-s2u-u2u-u2g-multihop-v3"
+        ),
         "channel_contract": CHANNEL_ENVIRONMENT_CONTRACT_VERSION,
         "channel_model_version": CHANNEL_MODEL_VERSION,
         "channel_configuration": deepcopy(
@@ -1594,6 +1597,13 @@ def _checkpoint_uses_dinkelbach(metadata):
 def _validate_checkpoint_schema(metadata):
     schema = metadata.get("checkpoint_schema_version")
     if schema != CHECKPOINT_SCHEMA_VERSION:
+        if schema == PRE_S2G_MISSION_TRAFFIC_CHECKPOINT_SCHEMA_VERSION:
+            raise RuntimeError(
+                "checkpoint schema v37 was trained with boundary-midpoint "
+                "5 m/s SRs, a 60-second horizon, connectivity-gated COM "
+                "generation, no S2G uplink, and the previous COM penalty. "
+                "The mission-clock S2G environment requires retraining"
+            )
         if schema == PRE_COMPLETED_HOP_PROGRESS_REWARD_CHECKPOINT_SCHEMA_VERSION:
             raise RuntimeError(
                 "checkpoint schema v36 contains shared timely-only routing "

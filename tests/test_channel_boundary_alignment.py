@@ -42,10 +42,16 @@ class RecordingRoutingPolicy:
         self.observations = []
 
     def select_action(self, state, uav_id, mask=None, **kwargs):
+        legal_mask = np.asarray(mask, dtype=bool)
         self.observations.append(
-            (int(uav_id), np.asarray(state).copy(), np.asarray(mask).copy())
+            (int(uav_id), np.asarray(state).copy(), legal_mask.copy())
         )
-        return self.receiver
+        if legal_mask[self.receiver]:
+            return self.receiver
+        forwarding = np.flatnonzero(legal_mask).tolist()
+        if int(uav_id) in forwarding and len(forwarding) > 1:
+            forwarding.remove(int(uav_id))
+        return int(forwarding[0])
 
 
 def violation_stats():
@@ -183,6 +189,13 @@ class MovementBoundaryReplayTest(unittest.TestCase):
             simulator.channel.s2u_los_state[:] = True
             simulator.update_u2g_channels()
             sr = simulator.SR_teams[0]
+            # Keep the assigned pair inside the service boundary, but far
+            # enough that the authoritative LoS/NLoS block state remains
+            # visible in the normalized COM-capacity feature under the new
+            # quarter-arc SR deployment.
+            simulator.uav_dict[1].x_u = float(sr.x + 300.0)
+            simulator.uav_dict[1].y_u = float(sr.y)
+            simulator.uav_dict[1].z_u = 100.0
             simulator.multi_tasks[1] = [
                 {
                     "task_type": "COM",
@@ -250,7 +263,7 @@ class MovementBoundaryReplayTest(unittest.TestCase):
         self.assertTrue(
             all(np.isfinite(row["com_range_penalty"]) for row in records)
         )
-        com_feature = LOCAL_MOVEMENT_DIM + 17
+        com_feature = LOCAL_MOVEMENT_DIM + (LOCAL_MOVEMENT_DIM - 1)
         self.assertNotEqual(
             float(records[0]["state"][com_feature]),
             float(records[0]["next_state"][com_feature]),
@@ -572,7 +585,7 @@ class CompatibilityAndRegistryTest(unittest.TestCase):
         )
 
     def test_old_boundary_checkpoint_is_rejected_before_restore(self):
-        self.assertEqual(CHECKPOINT_SCHEMA_VERSION, 37)
+        self.assertEqual(CHECKPOINT_SCHEMA_VERSION, 38)
         with self.assertRaisesRegex(RuntimeError, "must be retrained"):
             _validate_checkpoint_schema({"checkpoint_schema_version": 12})
 

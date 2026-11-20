@@ -22,6 +22,7 @@ from centralized_movement import (
     movement_constraint_penalties,
 )
 from com_capacity_calibration import calibrate_com_capacity
+from experiment_config import COM_UTILITY_CONTRACT_VERSION
 
 
 class VisualSensingPacketGenerationTest(unittest.TestCase):
@@ -147,9 +148,7 @@ class ComStateCalibrationAndDeliveryTest(unittest.TestCase):
         first = calibrate_com_capacity(self.env, seed=1234, sample_count=1000)
         second = calibrate_com_capacity(self.env, seed=1234, sample_count=1000)
         self.assertEqual(first, second)
-        self.assertEqual(
-            first["schema"], "fading-aware-raw-capacity-maximum-v3"
-        )
+        self.assertEqual(first["schema"], COM_UTILITY_CONTRACT_VERSION)
         self.assertEqual(first["reference_bandwidth_denominator"], 24)
         self.assertAlmostEqual(first["reference_bandwidth_hz"], 10e6 / 24)
         self.assertEqual(first["offered_rate_bps"], 50 * 256)

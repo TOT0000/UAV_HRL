@@ -10,7 +10,7 @@ Search discovers regions of interest, RoIs. The existing task assignment mechani
 
 A UAV may perform FOV and COM simultaneously. Roles and service targets may change within an episode.
 
-FOV packets originate at sensing UAVs. COM packets originate at SRs and first reach their serving UAVs through S2U access. Both packet types may reach GS directly or through other UAVs as relays.
+FOV packets originate at sensing UAVs. COM packets originate at SR mission assignment. Within the inclusive 400 m 3-D GS range an SR uses direct S2G; outside it uses S2U access to its serving UAV and UAV forwarding.
 
 The primary objective is:
 
@@ -25,13 +25,13 @@ UAV 0 serves as the GS gateway. Its movement follows the Search/Hover controller
 [Timing, traffic, and transmission]
 
 Standard settings:
-- Episode duration: 60 s.
+- Episode duration: 500 s.
 - Movement decision interval: 1 s.
 - Routing slot: 0.25 s.
 - Fading block: 5 ms.
 - Operating area: 1000 × 1000 m.
 - UAV altitude: 50–150 m.
-- S2U, U2U, and U2G communication range: 400 m in 3D distance.
+- S2G, S2U, U2U, and U2G communication range: inclusive 400 m in 3D distance.
 - Total bandwidth: 10 MHz, dynamically shared equally among currently serviceable links.
 
 Use the supplied settings for the actual parameters and GS coordinates.
@@ -41,7 +41,7 @@ At the beginning of each routing slot, every UAV selects a next hop and retains 
 Transmission uses complete-packet store-and-forward. After completing one hop, a packet may continue within the same slot along the receiving UAV’s preselected, serviceable link. Each link may serve multiple packets sequentially. A preselected link with an empty queue uses bandwidth when packets become available for service.
 
 Standard traffic:
-- COM: 50 packets/s, 256 bits per packet, with a 10 ms end-to-end deadline. Sessions become active according to task assignment and initial access conditions.
+- COM: 50 packets/s, 256 bits per packet, with a 10 ms end-to-end deadline. Sessions activate at immutable SR mission-assignment time, independent of UAV assignment or connectivity; the first packet is generated 0.02 s later.
 - FOV: 5 packets/s, with a 15 ms end-to-end deadline. Packet generation depends on sensing validity.
 
 End-to-end delay starts at source packet generation and includes SR access, waiting, queueing, and all transmission hops. Overdue packets continue to receive service in the existing queue order and contribute to EE upon complete delivery.
@@ -90,7 +90,7 @@ E_move = sum P(v_actual)*delta_t.
 Use the supplied hovering, horizontal movement, and vertical movement reference points to interpret the relationship between velocity and power.
 
 The current TD3 reward is:
-r_move = B_complete,Mbit - lambda_EE*E_move,J - P_C9 - P_COM.
+r_move = B_complete,Mbit - lambda_EE*E_move,J - P_C9 - P_COM, where P_COM is twice mean(max(0,1-380/(d_3D+epsilon))) over assigned COM UAV-SR pairs.
 
 B_complete includes both timely and late but completely delivered useful data and is credited upon complete delivery. lambda_EE has units of Mbit/J. Each penalty follows the supplied definition and is averaged over its applicable service pairs.
 

@@ -69,13 +69,17 @@ from llm_potential import (
     validate_potential_candidate,
 )
 from llm_numeric_operations import NUMERIC_OPERATION_RULES_VERSION
-from experiment_config import DEFAULT_TRAINING_SEED, FORMAL_EXPERIMENT_DEFAULTS
+from experiment_config import (
+    DEFAULT_TRAINING_SEED,
+    FORMAL_EXPERIMENT_DEFAULTS,
+    PRODUCTION_EPISODE_HORIZON_SECONDS,
+)
 from llm_episode_training import WINDOWS_PORTABLE_PATH_LIMIT
 from scenario_manifest import ScenarioManifest
 
 
 SEARCH_RUN_SCHEMA_VERSION = "uav-hrl-llm-potential-search-run-v1"
-SEARCH_PROMPT_VERSION = "uav-hrl-llm-potential-search-prompt-v5-complete-ee-no-c10"
+SEARCH_PROMPT_VERSION = "uav-hrl-llm-potential-search-prompt-v6-mission-s2g"
 LEGACY_PROMPT_VERSION = "uav-hrl-llm-potential-search-prompt-v1"
 SUPPORTED_LEGACY_PROMPT_VERSIONS = {
     "uav-hrl-llm-potential-search-prompt-v0",
@@ -94,7 +98,7 @@ DEFAULT_REPAIRS_PER_CANDIDATE = 5
 DEFAULT_TRAIN_EPISODES = 400
 DEFAULT_EVALUATION_EPISODES = 100
 DEFAULT_EVALUATION_ROI_COUNT = 8
-DEFAULT_EPISODE_SECONDS = 60
+DEFAULT_EPISODE_SECONDS = PRODUCTION_EPISODE_HORIZON_SECONDS
 DEFAULT_VALIDATION_EPISODES = 4
 ROUND_DIRECTIONS = ("add", "remove", "reweight", "redesign")
 
@@ -544,7 +548,7 @@ def render_common_prompt(
                 ".17g",
             ),
             "TERMINATION_AND_BOOTSTRAP_SPEC": (
-                "The current implementation treats the 60-second horizon as a true "
+                f"The current implementation treats the {DEFAULT_EPISODE_SECONDS}-second horizon as a true "
                 "terminal transition: TD3 stores not_done=0 and the host uses zero "
                 "effective next potential. A future bootstrap-preserving truncation "
                 "must retain not_done=1 and use its actual pre-reset next observation."

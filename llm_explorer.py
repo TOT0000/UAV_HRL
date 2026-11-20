@@ -27,18 +27,22 @@ import numpy as np
 LLM_EXPLORER_METHOD_ID = "td3_dinkelbach_llm_explorer"
 LLM_EXPLORER_MODEL = "gpt-4o-mini"
 LLM_EXPLORER_VERSION = "uav-hrl-llm-explorer-firstgen-v7"
-LLM_EXPLORER_PROMPT_VERSION = "uav-hrl-llm-explorer-prompts-v12-runtime-routing-policy"
+LLM_EXPLORER_PROMPT_VERSION = (
+    "uav-hrl-llm-explorer-prompts-v14-mission-s2g-runtime-policy"
+)
 LLM_EXPLORER_NO_C10_METHOD_ID = (
     "td3_dinkelbach_llm_explorer_wo_c10_penalty"
 )
 LLM_EXPLORER_NO_C10_PROMPT_VERSION = (
-    "uav-hrl-llm-explorer-prompts-v13-runtime-routing-policy"
+    "uav-hrl-llm-explorer-prompts-v15-mission-s2g-runtime-policy"
 )
 LLM_EXPLORER_SUMMARY_VERSION = "complete-core-feedback-v4"
 LLM_EXPLORER_CASE_VERSION = "deterministic-diverse-cases-v1"
-LLM_EXPLORER_CACHE_VERSION = "episode-fixed-dual-guidance-cache-v9-runtime-policy"
+LLM_EXPLORER_CACHE_VERSION = (
+    "episode-fixed-dual-guidance-cache-v11-mission-s2g-runtime-policy"
+)
 LLM_EXPLORER_NO_C10_CACHE_VERSION = (
-    "episode-fixed-dual-guidance-cache-v10-runtime-policy"
+    "episode-fixed-dual-guidance-cache-v12-mission-s2g-runtime-policy"
 )
 LLM_EXPLORER_COMPRESSION_VERSION = LLM_EXPLORER_SUMMARY_VERSION
 LLM_EXPLORER_PRESENTATION_VERSION = "firstgen-columns-rows-3dp-ms-v2"
@@ -51,7 +55,9 @@ LLM_EXPLORER_NO_C10_NUMERICAL_OUTPUT_PROTOCOL = (
 LLM_EXPLORER_NUMERICAL_STAGE = "numerical_routing_weights_v2"
 LLM_EXPLORER_GUIDANCE_MAX_OUTPUT_TOKENS = 8_000
 LLM_EXPLORER_COMPATIBLE_RESUME_PROTOCOLS = frozenset()
-SHARED_ENVIRONMENT_DEFINITIONS_VERSION = "uav-hrl-llm-explorer-v3-runtime-policy"
+SHARED_ENVIRONMENT_DEFINITIONS_VERSION = (
+    "uav-hrl-llm-explorer-v4-mission-s2g-runtime-policy"
+)
 LLM_EXPLORER_WARMUP_TRANSITIONS = 10_000
 LLM_EXPLORER_UPDATE_INTERVAL_EPISODES = 1
 LLM_EXPLORER_LEGACY_CALL_SCHEDULE_VERSION = "global-episode-piecewise-1-2-4-v1"
@@ -3901,7 +3907,7 @@ def environment_constants_and_definitions(
     environment_width_m: float = 1000.0,
     environment_height_m: float = 1000.0,
     task_deadlines_seconds: dict[str, float] | None = None,
-    sr_speed_mps: float = 5.0,
+    sr_speed_mps: float = 1.5,
     mutual_next_hop_guard: bool = True,
 ) -> dict[str, Any]:
     from experiment_config import (
@@ -3944,12 +3950,25 @@ def environment_constants_and_definitions(
             str(key): float(value)
             for key, value in (task_deadlines_seconds or {"FOV": 0.015, "COM": 0.010}).items()
         },
-        "packet_generation_model": "fixed intervals from effective configured rates; events are invisible before generation",
+        "packet_generation_model": (
+            "COM begins one full period after immutable SR mission assignment; "
+            "generation is independent of UAV assignment/connectivity and events "
+            "are invisible before generation"
+        ),
         "routing_decision_model": "all UAVs preselect one physically legal next hop at each 0.25 s slot start and hold it for the slot",
         "source_responder_effective_speed_mps": float(sr_speed_mps),
         "routing_selection_strategy": routing_strategy,
         "packet_service_model": "event-time full-packet store-and-forward; completed packets may traverse multiple hops in one slot",
-        "bandwidth_model": "dynamic equal-FDMA over currently serviceable S2U/U2U/U2G links; empty preselection reserves no bandwidth",
+        "bandwidth_model": (
+            "dynamic equal-FDMA over currently serviceable S2G/S2U/U2U/U2G "
+            "links; each SR uses exactly one S2G-or-S2U uplink and empty "
+            "preselection reserves no bandwidth"
+        ),
+        "sr_first_hop_policy": (
+            "inclusive 3-D SR-GS distance <=400 m selects deterministic "
+            "free-space-only 2 GHz S2G; otherwise the assigned COM UAV uses "
+            "S2U. An incomplete first hop restarts in full if its endpoint changes"
+        ),
         "fading_model": "5 ms gain blocks; service completion and next-hop start may be finer than 5 ms",
         "com_packet_bits": float(COM_PACKET_SIZE_BITS),
         "action_decode": {
@@ -3990,7 +4009,9 @@ def environment_constants_and_definitions(
             ),
             "completion_semantics": (
                 "U2U and U2G only, using actual 3-D endpoint positions when the full "
-                "hop completes; late packets retain progress; S2U and partial hops earn none"
+                "hop completes; late packets retain progress; S2G, S2U, and "
+                "partial hops earn none. Timely S2G delivery still enters the "
+                "shared delivery term"
             ),
             "zero_and_bounds": "signed progress is retained without clipping or dynamic normalization",
         },
@@ -4048,8 +4069,11 @@ def _first_gen_movement_penalty_contract() -> dict[str, Any]:
             "d": "UAV-to-assigned-RoI horizontal distance, m",
             "r": "assigned RoI radius, m",
             "D_3D": "UAV-to-assigned-SR three-dimensional distance, m",
-            "R_com": "actual COM S2U communication range limit, m",
-            "R_com_value_m": contract["com_range"]["s2u_range_m"],
+            "R_com": "COM distance-penalty reference, m",
+            "R_com_value_m": contract["com_range"][
+                "penalty_reference_distance_m"
+            ],
+            "S2U_range_m": contract["com_range"]["s2u_range_m"],
             "b1": "verified VS-camera constant in camera_geometry_constants",
             "b2": "verified VS-camera constant in camera_geometry_constants",
             "d_L": edge_distances["d_left"],

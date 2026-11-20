@@ -14,6 +14,7 @@ import uuid
 import numpy as np
 
 from evaluation_selection import resolve_training_run_checkpoint
+from experiment_config import PRODUCTION_EPISODE_HORIZON_SECONDS
 from experiment_paths import read_run_status
 from llm_candidate import load_approved_design
 from llm_runtime import artifact_identity, load_run_artifact
@@ -1226,7 +1227,7 @@ def validate_baseline_preflight(
     episodes: int = 100,
     roi_count: int = 8,
     environment_size_m: tuple[float, float] = (1000.0, 1000.0),
-    episode_seconds: int = 60,
+    episode_seconds: int = PRODUCTION_EPISODE_HORIZON_SECONDS,
 ) -> dict[str, Any]:
     """Bind the explicit baseline run, checkpoint, manifest, rows, and metrics."""
 

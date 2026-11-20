@@ -14,6 +14,8 @@ import uuid
 
 import numpy as np
 
+from experiment_defaults import DEFAULT_SR_SPEED_MPS
+
 from experiment_config import (
     A2A_COMMUNICATION_RANGE_M,
     A2G_COMMUNICATION_RANGE_M,
@@ -48,8 +50,8 @@ from experiment_config import (
 )
 
 
-SCENARIO_SCHEMA_VERSION = "uav-hrl-scenario-v8"
-ENVIRONMENT_SIZE_SCENARIO_SCHEMA_VERSION = "uav-hrl-scenario-v10"
+SCENARIO_SCHEMA_VERSION = "uav-hrl-scenario-v11"
+ENVIRONMENT_SIZE_SCENARIO_SCHEMA_VERSION = "uav-hrl-scenario-v12"
 OBSOLETE_SCHEMA_VERSIONS = frozenset(
     {
         "uav-hrl-scenario-v1",
@@ -59,7 +61,9 @@ OBSOLETE_SCHEMA_VERSIONS = frozenset(
         "uav-hrl-scenario-v5",
         "uav-hrl-scenario-v6",
         "uav-hrl-scenario-v7",
+        "uav-hrl-scenario-v8",
         "uav-hrl-scenario-v9",
+        "uav-hrl-scenario-v10",
     }
 )
 # Singular compatibility name used by callers that construct an obsolete
@@ -430,6 +434,7 @@ def current_environment_config(
             MAX_3D_COMMUNICATION_DISTANCE_M
         ),
         "s2u_communication_range_m": COMMUNICATION_RANGE_M,
+        "s2g_communication_range_m": COMMUNICATION_RANGE_M,
         "u2g_communication_range_m": COMMUNICATION_RANGE_M,
         "u2u_communication_range_m": COMMUNICATION_RANGE_M,
         "communication_range_contract_version": (
@@ -455,8 +460,13 @@ def current_environment_config(
         "com_deadline_seconds": PRODUCTION_TASK_DEADLINE_SECONDS["COM"],
         "fov_deadline_seconds": PRODUCTION_TASK_DEADLINE_SECONDS["FOV"],
         "injection_cutoff_seconds": PRODUCTION_PACKET_INJECTION_CUTOFF_SECONDS,
-        "sr_initial_layout": "four-boundary-midpoints-cyclic",
+        "sr_initial_layout": "gs-centered-350m-quarter-arc-equiangular-v1",
         "sr_motion_model": "policy-triggered-straight-line-v1",
+        "sr_base_speed_mps": DEFAULT_SR_SPEED_MPS,
+        "sr_com_generation_trigger": "immutable_mission_assignment_time",
+        "sr_uplink_selection": "s2g_if_inclusive_3d_distance_le_400m_else_s2u",
+        "s2g_channel_model": "free-space-only-2GHz-23dBm-no-fading",
+        "shared_fdma_link_types": ["S2G", "S2U", "U2U", "U2G"],
     }
     if environment_size_m is not None:
         scale = environment_size_uav_xy_scale(environment_size_m)
@@ -633,22 +643,26 @@ def _sr_initial_data(
 ) -> list[dict[str, Any]]:
     width = float(environment_width_m)
     height = float(environment_height_m)
-    boundary_points = (
-        (0.0, height / 2.0),
-        (width, height / 2.0),
-        (width / 2.0, 0.0),
-        (width / 2.0, height),
-    )
+    count = int(num_gt)
+    positions = [
+        (
+            350.0 * math.cos((index + 1) * math.pi / (2.0 * (count + 1))),
+            350.0 * math.sin((index + 1) * math.pi / (2.0 * (count + 1))),
+        )
+        for index in range(count)
+    ]
+    if any(not (0.0 <= x <= width and 0.0 <= y <= height) for x, y in positions):
+        raise ValueError("350 m SR quarter-arc layout is outside the map")
     return [
         {
             "sr_id": sr_id,
-            "position": [*boundary_points[sr_id % 4], 0.0],
+            "position": [*positions[sr_id], 0.0],
             "movement_primitive": {
                 "model": "policy-triggered-straight-line-v1",
-                "speed_mps": 5.0,
+                "speed_mps": DEFAULT_SR_SPEED_MPS,
             },
         }
-        for sr_id in range(int(num_gt))
+        for sr_id in range(count)
     ]
 
 
@@ -795,7 +809,7 @@ def generate_scenario_entry(
             "load_factor": 1.0,
             "base_fov_packets_per_second": 5.0,
             "base_com_packets_per_second": 50.0,
-            "generation_model": "assigned-fixed-interval-event-time-v3",
+            "generation_model": "mission-assigned-fixed-interval-s2g-event-time-v4",
         },
         "exogenous_primitives": {
             "channel_randomness": "none",
@@ -1004,7 +1018,7 @@ def validate_scenario_entry(entry: dict[str, Any]) -> dict[str, Any]:
                 "environment-size scenario identity disagrees with deployment"
             )
     if entry["traffic_primitives"].get("generation_model") != (
-        "assigned-fixed-interval-event-time-v3"
+        "mission-assigned-fixed-interval-s2g-event-time-v4"
     ):
         raise ValueError("scenario packet generation model is incompatible")
     uav_ids = [int(item["uav_id"]) for item in entry["uavs"]]
@@ -1050,19 +1064,35 @@ def validate_scenario_entry(entry: dict[str, Any]) -> dict[str, Any]:
                 "scenario RoI is outside radius-safe map bounds: "
                 f"scenario_id={entry['scenario_id']}; gt_id={item.get('gt_id')}"
             )
-    boundary_points = (
-        (0.0, height / 2.0),
-        (width, height / 2.0),
-        (width / 2.0, 0.0),
-        (width / 2.0, height),
-    )
+    sr_count = int(entry["num_GT"])
     for item in entry["sr_teams"]:
         sr_id = int(item["sr_id"])
         x, y, z = map(float, item["position"])
-        if (x, y) != boundary_points[sr_id % 4] or z != 0.0:
+        theta = (sr_id + 1) * math.pi / (2.0 * (sr_count + 1))
+        expected = (350.0 * math.cos(theta), 350.0 * math.sin(theta))
+        speed = float(item["movement_primitive"]["speed_mps"])
+        if (
+            not math.isclose(x, expected[0], rel_tol=0.0, abs_tol=1e-9)
+            or not math.isclose(y, expected[1], rel_tol=0.0, abs_tol=1e-9)
+            or z != 0.0
+        ):
             raise ValueError(
-                "scenario SR initial position disagrees with map boundary midpoint: "
+                "scenario SR initial position disagrees with the 350 m quarter arc: "
                 f"scenario_id={entry['scenario_id']}; sr_id={sr_id}"
+            )
+        if not math.isclose(
+            math.dist((x, y, z), tuple(GROUND_STATION_POSITION_M)),
+            350.0,
+            rel_tol=0.0,
+            abs_tol=1e-9,
+        ):
+            raise ValueError("scenario SR initial GS distance must equal 350 m")
+        if not math.isclose(
+            speed, DEFAULT_SR_SPEED_MPS, rel_tol=0.0, abs_tol=0.0
+        ):
+            raise ValueError(
+                "scenario SR speed is incompatible with the current 1.5 m/s contract; "
+                "regenerate the manifest"
             )
     return topology
 
@@ -1193,6 +1223,15 @@ class ScenarioManifest:
             raise ValueError(
                 "legacy environment-size fixed-coordinate deployment is incompatible; "
                 "regenerate the manifest with the scaled canonical v10 generator"
+            )
+        if data.get("schema_version") in {
+            "uav-hrl-scenario-v8",
+            "uav-hrl-scenario-v10",
+        }:
+            raise ValueError(
+                "legacy midpoint/5 m/s mission traffic scenario is incompatible "
+                "with the 350 m quarter-arc, 1.5 m/s, mission-clock S2G "
+                "contract; regenerate the manifest with the current generator"
             )
         schema_version = data.get("schema_version")
         if schema_version not in {

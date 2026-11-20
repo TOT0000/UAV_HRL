@@ -189,6 +189,34 @@ def a2g_free_space_path_loss_db(aerial_position, ground_position):
     )
 
 
+def s2g_free_space_path_loss_db(sr_position, ground_station_position):
+    """Free-space-only S2G loss at 2 GHz with the canonical distance floor."""
+
+    source = np.asarray(sr_position, dtype=np.float64)
+    station = np.asarray(ground_station_position, dtype=np.float64)
+    distance = np.maximum(np.linalg.norm(source - station, axis=-1), 1e-3)
+    return (
+        32.44
+        + 20.0 * np.log10(distance)
+        + 20.0 * np.log10(A2G_CARRIER_GHZ)
+    )
+
+
+def s2g_capacity_mbps(
+    sr_position,
+    ground_station_position,
+    bandwidth_hz,
+    transmit_power_dbm=S2U_TX_POWER_DBM,
+):
+    """Deterministic S2G Shannon capacity without excess loss or fading."""
+
+    return shannon_capacity_mbps(
+        s2g_free_space_path_loss_db(sr_position, ground_station_position),
+        bandwidth_hz,
+        transmit_power_dbm,
+    )
+
+
 def a2g_conditional_path_loss_db(aerial_position, ground_position, los_state):
     """Conditional A2G path loss after the one-second state has been sampled."""
 
@@ -478,6 +506,8 @@ def channel_configuration_metadata():
             "bootstrap next_state finalized at the next start-of-slot decision observation"
         ),
         "a2g_path_loss_mode": "conditional-after-sampled-state",
+        "s2g_path_loss_mode": "free-space-only-2GHz-no-fading",
+        "s2g_transmit_power_dbm": S2U_TX_POWER_DBM,
         "fading_block_seconds": FADING_BLOCK_SECONDS,
         "routing_slot_seconds": ROUTING_SLOT_SECONDS,
         "fading_blocks_per_routing_slot": FADING_BLOCKS_PER_ROUTING_SLOT,
@@ -494,6 +524,7 @@ def channel_configuration_metadata():
         "communication_range_cutoff": {
             "maximum_3d_distance_m": MAX_3D_COMMUNICATION_DISTANCE_M,
             "S2U_m": MAX_3D_COMMUNICATION_DISTANCE_M,
+            "S2G_m": MAX_3D_COMMUNICATION_DISTANCE_M,
             "U2G_m": MAX_3D_COMMUNICATION_DISTANCE_M,
             "U2U_m": MAX_3D_COMMUNICATION_DISTANCE_M,
             "A2G_m": MAX_3D_COMMUNICATION_DISTANCE_M,

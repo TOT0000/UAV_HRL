@@ -14,7 +14,10 @@ from typing import Any, Mapping
 
 import numpy as np
 
-from experiment_config import COMMUNICATION_RANGE_M
+from experiment_config import (
+    COMMUNICATION_RANGE_M,
+    PRODUCTION_EPISODE_HORIZON_SECONDS,
+)
 from llm_explorer import ExplorerValidationError, NUM_UAV, _json_clone
 from replay_auxiliary import TASK_TYPE_ENCODING
 
@@ -433,7 +436,7 @@ def build_runtime_feature_rows(
     movement_mask: Any,
     actor_action: Any,
     *,
-    episode_seconds: float = 60.0,
+    episode_seconds: float = PRODUCTION_EPISODE_HORIZON_SECONDS,
 ) -> list[dict[str, Any]]:
     """Build read-only decision-aligned rule inputs from an existing snapshot."""
 

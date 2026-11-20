@@ -4,12 +4,14 @@ import numpy as np
 import torch
 
 from experiment_config import (
+    COM_PENALTY_REFERENCE_DISTANCE_M,
     COM_CAPACITY_POTENTIAL_WEIGHT,
     COM_DISTANCE_POTENTIAL_WEIGHT,
     GROUND_STATION_POSITION_M,
     GROUND_ALTITUDE_M,
     GS_GATEWAY_HARD_RADIUS_M,
     GS_GATEWAY_PROJECTION_MODE,
+    MOVEMENT_CONSTRAINT_WEIGHT_COM,
     NUM_UAV,
     PERMANENT_GS_GATEWAY_UAV_ID,
     ROI_COUNT_MAX,
@@ -663,15 +665,15 @@ def movement_constraint_penalties(env):
             distance = float(np.linalg.norm(uav_position - sr_position))
             if not math.isfinite(distance):
                 raise ValueError("assigned COM pair has non-finite 3-D distance")
-            range_factor = float(
-                np.clip(
-                    S2U_COMMUNICATION_RANGE_M
-                    / (distance + TASK_POTENTIAL_NORMALIZATION_EPSILON),
+            raw_penalty = float(
+                max(
                     0.0,
-                    1.0,
+                    1.0
+                    - COM_PENALTY_REFERENCE_DISTANCE_M
+                    / (distance + TASK_POTENTIAL_NORMALIZATION_EPSILON),
                 )
             )
-            com_values.append(1.0 - range_factor)
+            com_values.append(min(raw_penalty, 1.0))
             if distance <= S2U_COMMUNICATION_RANGE_M + 1e-9:
                 com_in_range += 1
             else:
@@ -694,6 +696,11 @@ def movement_constraint_penalties(env):
         "c10_sample_count": c10_count,
         "com_range_penalty_sum": com_sum,
         "com_range_penalty_mean": com_mean,
+        "com_range_weighted_penalty": (
+            MOVEMENT_CONSTRAINT_WEIGHT_COM * com_mean
+        ),
+        "com_range_penalty_weight": MOVEMENT_CONSTRAINT_WEIGHT_COM,
+        "com_penalty_reference_distance_m": COM_PENALTY_REFERENCE_DISTANCE_M,
         "com_range_sample_count": com_count,
         "c9_satisfied_pair_count": c9_satisfied,
         "c9_violated_pair_count": c9_violated,

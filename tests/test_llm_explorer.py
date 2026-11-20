@@ -1242,9 +1242,9 @@ def test_first_gen_penalty_contract_and_capacity_normalizers_are_runtime_derived
         "P_C10 = w_C10 * mean_over_S_C10(1 - clip(min(d_L,d_R)/(r+epsilon),0,1))"
     )
     assert penalties["COM"]["formula"] == (
-        "P_COM = w_COM * mean_over_S_COM(1 - clip(R_com/(D_3D+epsilon),0,1))"
+        "P_COM = w_COM * mean_over_S_COM(max(0,1-380/(D_3D+epsilon)))"
     )
-    assert penalties["weights"] == {"w_C9": 1.0, "w_C10": 0.0, "w_COM": 1.0}
+    assert penalties["weights"] == {"w_C9": 1.0, "w_C10": 0.0, "w_COM": 2.0}
     assert penalties["normalization_epsilon"] == 1e-12
     assert penalties["C9"]["population"] == "currently assigned FOV pairs"
     assert "C9-valid" in penalties["C10"]["population"]
@@ -2402,6 +2402,11 @@ def test_first_generation_diagnostics_distinguish_whole_and_masked_zero_weights(
         def select_action(self, *args, **kwargs):
             row = np.asarray(kwargs["exploration_prior"], dtype=float)
             legal = np.asarray(args[2], dtype=bool)
+            sender = int(args[1])
+            forwarding = legal.copy()
+            forwarding[sender] = False
+            if forwarding.any():
+                legal = forwarding
             zero = not np.any(row[legal] > 0.0)
             return int(np.flatnonzero(legal)[0]), {
                 "decision_branch": "epsilon_exploration",

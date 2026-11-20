@@ -256,7 +256,7 @@ def _fixed_artifact(tmp_path, *, duplicate_first_state=False):
             "maximum_3d_communication_distance_m": 400.0,
             "ground_station_position_m": [0.0, 0.0, 0.0],
             "task_potential_configuration": {
-                "constraint_penalty_weights": {"c9": 1.0, "c10": 1.0, "com_range": 1.0}
+                "constraint_penalty_weights": {"c9": 1.0, "c10": 1.0, "com_range": 2.0}
             },
         },
         "source_training_environment_contract": {
@@ -541,7 +541,7 @@ def test_prompt_is_complete_current_only_and_example_parses(design_fixture):
     assert "Select data using validity flags" in prompt
     assert "Return only one JSON object" in prompt
     assert "d_R=(h^2+d^2)/sqrt" in prompt
-    assert "Full-packet store-and-forward S2U/U2U/U2G" in prompt
+    assert "Full-packet store-and-forward S2G/S2U/U2U/U2G" in prompt
     assert "Activated COM and valid VS sources generate" in prompt
     assert "all UAVs, including empty ones, preselect" in prompt
     assert "10 ms COM or 15 ms VS deadline" in prompt
@@ -577,7 +577,7 @@ def test_prompt_is_complete_current_only_and_example_parses(design_fixture):
 
 def test_master_prompt_has_exact_placeholder_contract_and_supported_operations_match():
     template = PROMPT_TEMPLATE_PATH.read_text(encoding="utf-8")
-    assert PROMPT_VERSION == "uav-hrl-llm-design-prompt-v11-complete-ee-no-c10"
+    assert PROMPT_VERSION == "uav-hrl-llm-design-prompt-v12-mission-s2g"
     assert {
         token
         for token in (
@@ -4073,7 +4073,7 @@ def test_evaluation_diagnostics_stop_when_minimum_revision_exceeds_budget(
         model=client.model,
         client=client,
         max_attempts=2,
-        context_length=16_100,
+        context_length=16_250,
         output_dir=output,
         timeout=10,
     )

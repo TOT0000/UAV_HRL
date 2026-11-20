@@ -83,9 +83,13 @@ from experiment_config import (
     FORMAL_EXPERIMENT_DEFAULTS,
     MOVEMENT_EXPLORATION_DECAY_EPISODES,
     MOVEMENT_INTERVAL_SECONDS,
+    MOVEMENT_CONSTRAINT_WEIGHT_C9,
+    MOVEMENT_CONSTRAINT_WEIGHT_C10,
+    MOVEMENT_CONSTRAINT_WEIGHT_COM,
     MOVEMENT_REPLAY_CAPACITY,
     MethodSpec,
     NUM_UAV,
+    PRODUCTION_EPISODE_HORIZON_SECONDS,
     ROI_COUNT_MAX,
     ROI_COUNT_MIN,
     ROUTING_EPSILON_DECAY_EPISODES,
@@ -340,7 +344,7 @@ def _create_active_replay_buffers(
 class TrainingConfig:
     total_episodes: int
     mode: str = "train"
-    episode_seconds: int = 60
+    episode_seconds: int = int(PRODUCTION_EPISODE_HORIZON_SECONDS)
     routing_slot_seconds: float = ROUTING_SLOT_SECONDS
     warmup_joint_transitions: int = PRODUCTION_WARMUP_TRANSITIONS
     batch_size: int = PRODUCTION_BATCH_SIZE
@@ -506,7 +510,7 @@ def smoke_training_config():
     return TrainingConfig(
         total_episodes=1,
         mode="smoke",
-        episode_seconds=60,
+        episode_seconds=int(PRODUCTION_EPISODE_HORIZON_SECONDS),
         routing_slot_seconds=ROUTING_SLOT_SECONDS,
         warmup_joint_transitions=0,
         routing_warmup_transitions=1,
@@ -1662,10 +1666,17 @@ def _movement_constraint_penalty_total(
 ):
     if not task_potential_enabled:
         return 0.0
-    names = ["c9_penalty_mean", "com_range_penalty_mean"]
+    total = (
+        MOVEMENT_CONSTRAINT_WEIGHT_C9
+        * float(constraint_penalties["c9_penalty_mean"])
+        + MOVEMENT_CONSTRAINT_WEIGHT_COM
+        * float(constraint_penalties["com_range_penalty_mean"])
+    )
     if c10_penalty_enabled:
-        names.insert(1, "c10_penalty_mean")
-    return float(sum(float(constraint_penalties[name]) for name in names))
+        total += MOVEMENT_CONSTRAINT_WEIGHT_C10 * float(
+            constraint_penalties["c10_penalty_mean"]
+        )
+    return float(total)
 
 
 def _is_checkpoint_episode(completed_episode, total_episodes, every):
@@ -3792,6 +3803,11 @@ def train(
         episode_c10_violated_pairs = 0
         episode_com_in_range_pairs = 0
         episode_com_out_of_range_pairs = 0
+        episode_c9_step_mean_sum = 0.0
+        episode_c10_step_mean_sum = 0.0
+        episode_com_step_raw_mean_sum = 0.0
+        episode_com_step_weighted_penalty_sum = 0.0
+        episode_applied_constraint_penalty_sum = 0.0
         episode_base_movement_reward = 0.0
         episode_final_movement_reward = 0.0
         episode_lambda_cost = (
@@ -4609,6 +4625,19 @@ def train(
             episode_com_out_of_range_pairs += constraint_penalties[
                 "com_out_of_range_pair_count"
             ]
+            episode_c9_step_mean_sum += float(
+                constraint_penalties["c9_penalty_mean"]
+            )
+            episode_c10_step_mean_sum += float(
+                constraint_penalties["c10_penalty_mean"]
+            )
+            episode_com_step_raw_mean_sum += float(
+                constraint_penalties["com_range_penalty_mean"]
+            )
+            episode_com_step_weighted_penalty_sum += float(
+                constraint_penalties["com_range_weighted_penalty"]
+            )
+            episode_applied_constraint_penalty_sum += float(applied_penalty)
             if transition_observer is not None:
                 transition_observer(
                     {
@@ -4637,7 +4666,30 @@ def train(
                         "done": done,
                         "not_done": 1.0 - float(done),
                         "delivered_mbits": interval_delivered_mbits,
+                        "B_Mbit": interval_delivered_mbits,
                         "total_mobility_energy_j": interval_energy,
+                        "energy_J": interval_energy,
+                        "lambda_EE": float(episode_lambda),
+                        "lambda_EE_times_energy": float(
+                            episode_lambda * interval_energy
+                        ),
+                        "ee_objective_before_constraints": float(
+                            base_movement_reward
+                        ),
+                        "c9_raw_mean": float(
+                            constraint_penalties["c9_penalty_mean"]
+                        ),
+                        "c10_raw_mean": float(
+                            constraint_penalties["c10_penalty_mean"]
+                        ),
+                        "com_raw_mean": float(
+                            constraint_penalties["com_range_penalty_mean"]
+                        ),
+                        "com_weighted_penalty": float(
+                            constraint_penalties[
+                                "com_range_weighted_penalty"
+                            ]
+                        ),
                         "ratio_objective_reward": ratio_objective_reward,
                         **constraint_penalties,
                         "base_movement_reward": base_movement_reward,
@@ -5081,15 +5133,14 @@ def train(
             if all_rois_discovered and first_discovery_time_by_roi_s
             else None
         )
-        sr_episode_summary = None
+        sr_rows, sr_episode_summary = build_sr_episode_diagnostics(
+            env,
+            episode_index=episode,
+            scenario_id=scenario_id,
+            episode_end_s=float(config.episode_seconds),
+        )
         dual_episode_rows = None
         if collect_sr_speed_diagnostics:
-            sr_rows, sr_episode_summary = build_sr_episode_diagnostics(
-                env,
-                episode_index=episode,
-                scenario_id=scenario_id,
-                episode_end_s=float(config.episode_seconds),
-            )
             dual_episode_rows = summarize_dual_task_accumulator(
                 episode_dual_task_accumulator,
                 episode_index=episode,
@@ -5121,6 +5172,14 @@ def train(
                 ),
                 "sr_speed_mps": float(env.sr_speed_mps),
                 "sr_movement_diagnostics": sr_episode_summary,
+                "sr_movement_events": copy.deepcopy(env.sr_movement_events),
+                "sr_direct_state_history": copy.deepcopy(
+                    env.sr_direct_state_history
+                ),
+                "sr_direct_to_gs_terminal": {
+                    str(sr_id): bool(direct)
+                    for sr_id, direct in sorted(env.sr_direct_to_gs.items())
+                },
                 "dual_task_service_diagnostics": dual_episode_rows,
                 "routing_reward_total": float(episode_routing_reward),
                 "routing_delivery_reward_total": float(
@@ -5405,6 +5464,24 @@ def train(
                 ),
                 "total_late_useful_bits": total_late_useful_bits,
                 "total_all_useful_bits": total_all_useful_bits,
+                "delivery_path_packet_counts": dict(
+                    packet_engine.delivery_path_packet_counts
+                ),
+                "delivery_path_useful_bits": dict(
+                    packet_engine.delivery_path_useful_bits
+                ),
+                "s2g_completed_packets": int(
+                    packet_engine.s2g_completed_packets
+                ),
+                "s2u_completed_packets": int(
+                    packet_engine.s2u_completed_packets
+                ),
+                "sr_first_hop_switch_count": int(
+                    packet_engine.sr_first_hop_switch_count
+                ),
+                "sr_first_hop_retransmitted_bits": float(
+                    packet_engine.sr_first_hop_retransmitted_bits
+                ),
                 "raw_final_hop_mbits": raw_final_hop_mbits,
                 "total_mobility_energy_j": float(episode_energy),
                 "energy_efficiency_mbit_per_j": safe_energy_efficiency(
@@ -5517,6 +5594,58 @@ def train(
                 ),
                 "movement_final_reward_sum": float(
                     episode_final_movement_reward
+                ),
+                "movement_reward_decomposition": {
+                    "B_Mbit": float(episode_delivered_mbits),
+                    "energy_J": float(episode_energy),
+                    "lambda_EE": float(episode_lambda),
+                    "lambda_EE_times_energy": float(
+                        episode_lambda * episode_energy
+                    ),
+                    "ee_objective_before_constraints": float(
+                        episode_base_movement_reward
+                    ),
+                    "c9_step_raw_mean_sum": float(
+                        episode_c9_step_mean_sum
+                    ),
+                    "c10_step_raw_mean_sum": float(
+                        episode_c10_step_mean_sum
+                    ),
+                    "com_step_raw_mean_sum": float(
+                        episode_com_step_raw_mean_sum
+                    ),
+                    "com_step_weighted_penalty_sum": float(
+                        episode_com_step_weighted_penalty_sum
+                    ),
+                    "actual_applied_constraint_penalty_sum": float(
+                        episode_applied_constraint_penalty_sum
+                    ),
+                    "final_movement_reward_sum": float(
+                        episode_final_movement_reward
+                    ),
+                    "c9_pair_sample_count": int(
+                        episode_c9_penalty_samples
+                    ),
+                    "c10_pair_sample_count": int(
+                        episode_c10_penalty_samples
+                    ),
+                    "com_pair_sample_count": int(
+                        episode_com_range_penalty_samples
+                    ),
+                    "com_out_of_range_pair_observations": int(
+                        episode_com_out_of_range_pairs
+                    ),
+                },
+                "c9_step_raw_mean_sum": float(episode_c9_step_mean_sum),
+                "c10_step_raw_mean_sum": float(episode_c10_step_mean_sum),
+                "com_step_raw_mean_sum": float(
+                    episode_com_step_raw_mean_sum
+                ),
+                "com_step_weighted_penalty_sum": float(
+                    episode_com_step_weighted_penalty_sum
+                ),
+                "actual_applied_constraint_penalty_sum": float(
+                    episode_applied_constraint_penalty_sum
                 ),
                 "c9_penalty_sum": float(episode_c9_penalty_sum),
                 "c9_penalty_mean": (
@@ -6477,7 +6606,7 @@ def train(
                 "uav_tx_power_dbm": float(
                     resolved_evaluation["uav_tx_power_dbm"]
                 ),
-                "fdma_policy": "equal-across-active-S2U-U2U-U2G",
+                "fdma_policy": "equal-across-active-S2G-S2U-U2U-U2G",
             },
             "evaluation": bool(evaluation),
             "checkpoint_required": checkpoint_required,

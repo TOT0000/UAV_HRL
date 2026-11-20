@@ -8,9 +8,9 @@ import math
 from pathlib import Path
 
 
-PACKET_OUTCOME_ARTIFACT_SCHEMA_VERSION = "uav-hrl-packet-outcomes-jsonl-v7"
+PACKET_OUTCOME_ARTIFACT_SCHEMA_VERSION = "uav-hrl-packet-outcomes-jsonl-v8-s2g"
 PACKET_ROUTING_DIAGNOSTIC_CONTRACT_VERSION = (
-    "uav-hrl-packet-routing-diagnostics-v6"
+    "uav-hrl-packet-routing-diagnostics-v7-s2g"
 )
 PACKET_ROUTING_DIAGNOSTIC_DEFINITIONS = {
     "routing_wait_definition": (
@@ -83,10 +83,18 @@ PACKET_ROUTING_DIAGNOSTIC_DEFINITIONS = {
         "per_hop.actual_tx_s is actual airtime"
     ),
     "s2u_delay_definition": (
-        "for COM, S2U queue delay ends at first actual S2U service or terminal "
+        "legacy-named first-hop fields cover the selected S2G or S2U uplink: "
+        "for COM, queue delay ends at first actual first-hop service or terminal "
         "finish_time if service never starts, and S2U tx delay is actual "
         "positive-capacity block airtime including incomplete S2U service; both "
         "fields are null for FOV"
+    ),
+    "sr_first_hop_definition": (
+        "S2G is selected at inclusive SR-GS 3-D distance <=400 m and otherwise "
+        "S2U uses the assigned COM UAV. S2G and S2U completion flags/times are "
+        "separate; delivery_path is S2G, S2U_UAV, or UAV. Endpoint changes "
+        "restart incomplete SR service from the full packet and retain identity, "
+        "deadline, FIFO order, and already-counted violation state"
     ),
     "loop_hop_statistic_definition": (
         "mean_hops_loop_packets and mean_hops_non_loop_packets use completed "
@@ -119,7 +127,13 @@ PACKET_OUTCOME_REQUIRED_FIELDS = frozenset(
         "deadline_seconds",
         "e2e_delay_seconds",
         "s2u_completed",
+        "s2g_completed",
+        "sr_first_hop_link_type",
+        "sr_first_hop_switch_count",
+        "sr_first_hop_retransmitted_bits",
+        "delivery_path",
         "s2u_completion_time_seconds",
+        "s2g_completion_time_seconds",
         "routing_eligible_time_seconds",
         "terminal_node_type",
         "terminal_node_id",
@@ -207,10 +221,14 @@ def validate_packet_outcome(row):
             raise ValueError("SR packet source fields are inconsistent")
         if type(row["s2u_completed"]) is not bool:
             raise ValueError("SR packet s2u_completed must be boolean")
+        if type(row["s2g_completed"]) is not bool:
+            raise ValueError("SR packet s2g_completed must be boolean")
         if row["s2u_queue_delay_seconds"] is None:
             raise ValueError("SR packet S2U queue delay must be numeric")
         if row["s2u_tx_delay_seconds"] is None:
             raise ValueError("SR packet S2U transmission delay must be numeric")
+        if row["sr_first_hop_link_type"] not in {None, "S2G", "S2U"}:
+            raise ValueError("SR packet first-hop link type is invalid")
     else:
         if row["source_sr_id"] is not None or not isinstance(
             row["source_uav_id"], int
@@ -218,8 +236,14 @@ def validate_packet_outcome(row):
             raise ValueError("UAV packet source fields are inconsistent")
         if row["s2u_completed"] is not None:
             raise ValueError("UAV packet s2u_completed must be null")
+        if row["s2g_completed"] is not None:
+            raise ValueError("UAV packet s2g_completed must be null")
         if row["s2u_completion_time_seconds"] is not None:
             raise ValueError("UAV packet S2U completion time must be null")
+        if row["s2g_completion_time_seconds"] is not None:
+            raise ValueError("UAV packet S2G completion time must be null")
+        if row["sr_first_hop_link_type"] is not None:
+            raise ValueError("UAV packet first-hop link type must be null")
         if row["s2u_queue_delay_seconds"] is not None:
             raise ValueError("UAV packet S2U queue delay must be null")
         if row["s2u_tx_delay_seconds"] is not None:
@@ -232,6 +256,29 @@ def validate_packet_outcome(row):
         row["s2u_completion_time_seconds"] is not None
     ):
         raise ValueError("incomplete S2U packet has a completion time")
+    if row["s2g_completed"] is True and row["s2g_completion_time_seconds"] is None:
+        raise ValueError("completed S2G packet lacks completion time")
+    if row["s2g_completed"] is False and row["s2g_completion_time_seconds"] is not None:
+        raise ValueError("incomplete S2G packet has a completion time")
+    if row["s2u_completed"] is True and row["s2g_completed"] is True:
+        raise ValueError("one packet cannot complete both S2U and S2G")
+    if (
+        isinstance(row["sr_first_hop_switch_count"], bool)
+        or not isinstance(row["sr_first_hop_switch_count"], int)
+        or row["sr_first_hop_switch_count"] < 0
+    ):
+        raise ValueError("sr_first_hop_switch_count must be a non-negative integer")
+    _validate_nonnegative_number(row, "sr_first_hop_retransmitted_bits")
+    delivery_path = row["delivery_path"]
+    if delivery_path not in {None, "S2G", "S2U_UAV", "UAV"}:
+        raise ValueError("packet outcome delivery_path is invalid")
+    delivered = row["outcome"] in {"on_time_delivered", "late_delivered"}
+    if delivered and delivery_path is None:
+        raise ValueError("delivered packet outcome lacks delivery_path")
+    if delivery_path == "S2G" and row["s2g_completed"] is not True:
+        raise ValueError("S2G delivery path requires completed S2G service")
+    if delivery_path == "S2U_UAV" and row["s2u_completed"] is not True:
+        raise ValueError("S2U_UAV delivery path requires completed S2U service")
     if row["terminal_node_type"] not in {"SR", "UAV", "GS"}:
         raise ValueError("packet outcome terminal_node_type is invalid")
     if row["terminal_node_type"] == "UAV":
@@ -288,7 +335,7 @@ def validate_packet_outcome(row):
                 "per_hop entry lacks required fields: "
                 + ", ".join(sorted(missing_hop_fields))
             )
-        if hop["link_type"] not in {"S2U", "U2U", "U2G"}:
+        if hop["link_type"] not in {"S2G", "S2U", "U2U", "U2G"}:
             raise ValueError("per_hop link_type is invalid")
         _validate_nonnegative_number(hop, "queue_s")
         _validate_nonnegative_number(hop, "tx_s")
@@ -364,6 +411,7 @@ def validate_packet_outcome(row):
     for field in (
         "e2e_delay_seconds",
         "s2u_completion_time_seconds",
+        "s2g_completion_time_seconds",
         "routing_eligible_time_seconds",
         "s2u_queue_delay_seconds",
         "s2u_tx_delay_seconds",

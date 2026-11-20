@@ -19,7 +19,11 @@ from llm_explorer import (
     llm_explorer_path_preflight,
     prompt_token_budget,
 )
-from llm_explorer_v3 import LLMExplorerV3Controller
+from llm_explorer_v3 import (
+    LLMExplorerV3Controller,
+    first_eligible_episode,
+    llm_guidance_weight,
+)
 from llm_explorer_td3_only import (
     LLM_EXPLORER_TD3_ONLY_VERSION,
     LLMExplorerTD3OnlyController,
@@ -296,9 +300,18 @@ def test_two_calls_accept_td3_only_scale_w_once_and_cache_replays(tmp_path):
     assert not result["routing_fallback"]
     assert result["routing_reason"] == "routing_guidance_disabled"
     assert controller.statistics["routing_fallback_episodes_total"] == 0
-    assert result["annealing_weight"] == pytest.approx(0.5)
+    expected_weight = llm_guidance_weight(
+        384,
+        start_episode=first_eligible_episode(
+            controller.config.warmup_joint_transitions,
+            controller.config.episode_joint_transitions,
+        ),
+    )
+    assert result["annealing_weight"] == pytest.approx(expected_weight)
     np.testing.assert_allclose(result["td3_bias_raw"], _raw_matrix())
-    np.testing.assert_allclose(result["td3_bias_effective"], 0.5 * _raw_matrix())
+    np.testing.assert_allclose(
+        result["td3_bias_effective"], expected_weight * _raw_matrix()
+    )
     assert all("{{" not in call["prompt"] for call in client.calls)
     assert all("{{" not in call["system_prompt"] for call in client.calls)
     completed = json.loads(
@@ -335,7 +348,9 @@ def test_two_calls_accept_td3_only_scale_w_once_and_cache_replays(tmp_path):
     restored = _begin(replay)
     assert restored["reused"] and replay_client.calls == []
     assert restored["routing_prior"] is None
-    np.testing.assert_allclose(restored["td3_bias_effective"], 0.5 * _raw_matrix())
+    np.testing.assert_allclose(
+        restored["td3_bias_effective"], expected_weight * _raw_matrix()
+    )
 
 
 def test_previous_raw_bias_is_complete_and_unknown_is_not_zero(tmp_path):

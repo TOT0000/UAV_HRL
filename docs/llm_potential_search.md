@@ -21,7 +21,7 @@ movement hyperparameters in `experiment_config.py`; TD3 uses
 The environment builds the current observation before movement and the next
 observation after movement, sensing, service, delivery, energy, and penalty
 updates. Potential shaping uses these two snapshots before any reset. The current
-60-second horizon is represented as `done=True` on the final movement transition,
+500-second horizon is represented as `done=True` on the final movement transition,
 so its replay bootstrap mask is zero and the host substitutes a zero effective
 next potential. The current environment does not expose a separate time-limit
 `truncated` transition. The potential helper nevertheless requires a real next

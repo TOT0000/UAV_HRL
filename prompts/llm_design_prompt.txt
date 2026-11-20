@@ -22,7 +22,7 @@ Control responsibilities:
 - Routing: selects packet next hops.
 - Search and Hover: handled by existing controllers.
 
-Each episode lasts 60 s. TD3 acts every 1 s, with four 0.25 s communication slots per interval.
+Each production episode lasts 500 s. TD3 acts every 1 s, with four 0.25 s communication slots per interval.
 
 Execution sequence:
 current observations and task assignments

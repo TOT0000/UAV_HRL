@@ -199,7 +199,7 @@ class QosAndCheckpointContractTest(unittest.TestCase):
     def test_production_deadlines_and_derived_cutoff_preserve_full_window(self):
         self.assertEqual(validate_production_deadlines(), {"FOV": 0.015, "COM": 0.010})
         self.assertEqual(PRODUCTION_TASK_DEADLINE_SECONDS, {"FOV": 0.015, "COM": 0.010})
-        self.assertEqual(PRODUCTION_PACKET_INJECTION_CUTOFF_SECONDS, 59.985)
+        self.assertEqual(PRODUCTION_PACKET_INJECTION_CUTOFF_SECONDS, 499.985)
         self.assertTrue(
             math.isclose(
                 PRODUCTION_PACKET_INJECTION_CUTOFF_SECONDS
@@ -211,10 +211,12 @@ class QosAndCheckpointContractTest(unittest.TestCase):
             DEADLINE_SWEEP_SECONDS,
             (0.005, 0.010, 0.015, 0.020, 0.025, 0.030),
         )
-        self.assertEqual(DEADLINE_SWEEP_INJECTION_CUTOFF_SECONDS, 59.97)
+        self.assertEqual(DEADLINE_SWEEP_INJECTION_CUTOFF_SECONDS, 499.97)
 
     def test_schema_21_and_90d_current_schema_are_rejected(self):
-        self.assertEqual(CHECKPOINT_SCHEMA_VERSION, 37)
+        self.assertEqual(CHECKPOINT_SCHEMA_VERSION, 38)
+        with self.assertRaisesRegex(RuntimeError, "mission-clock S2G"):
+            _validate_checkpoint_schema({"checkpoint_schema_version": 37})
         with self.assertRaisesRegex(RuntimeError, "timely-only routing reward replay"):
             _validate_checkpoint_schema({"checkpoint_schema_version": 36})
         with self.assertRaisesRegex(RuntimeError, "must be retrained"):

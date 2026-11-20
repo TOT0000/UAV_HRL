@@ -237,7 +237,7 @@ class ControlledMethodRegistryTest(unittest.TestCase):
                     self.assertFalse(metadata["c10_penalty_enabled"])
                     self.assertEqual(
                         metadata["effective_movement_constraint_penalty_weights"],
-                        {"c9": 1.0, "c10": 0.0, "com_range": 1.0},
+                        {"c9": 1.0, "c10": 0.0, "com_range": 2.0},
                     )
                     self.assertEqual(
                         result["dinkelbach_state"][
@@ -316,7 +316,7 @@ class ControlledRewardTest(unittest.TestCase):
             4.0, 2.0, 0.25, self.penalties,
             reward_mode="dinkelbach", task_potential_enabled=False,
         )
-        self.assertAlmostEqual(shaped - unshaped, -0.9)
+        self.assertAlmostEqual(shaped - unshaped, -1.0)
         self.assertAlmostEqual(unshaped, 3.5)
 
     def test_ratio_reward_is_safe_and_does_not_use_lambda(self):

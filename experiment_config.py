@@ -124,14 +124,15 @@ GROUND_ALTITUDE_M = 0.0
 UAV_MAX_ALTITUDE_M = 150.0
 TASK_POTENTIAL_NORMALIZATION_EPSILON = 1e-12
 TASK_POTENTIAL_CONTRACT_VERSION = (
-    "post-action-vs-com-mean-constraint-penalties-v15"
+    "post-action-vs-com-mean-constraint-penalties-v16-com380-weight2"
 )
 TASK_POTENTIAL_BETA_SEARCH = 0.0
 TASK_POTENTIAL_BETA_VS = 1.0
-TASK_POTENTIAL_BETA_COM = 1.0
+TASK_POTENTIAL_BETA_COM = 2.0
 MOVEMENT_CONSTRAINT_WEIGHT_C9 = 1.0
 MOVEMENT_CONSTRAINT_WEIGHT_C10 = 1.0
-MOVEMENT_CONSTRAINT_WEIGHT_COM = 1.0
+MOVEMENT_CONSTRAINT_WEIGHT_COM = 2.0
+COM_PENALTY_REFERENCE_DISTANCE_M = 380.0
 SEARCH_CONTROLLER = "deterministic_region_frontier_manager"
 SEARCH_CONTROLLER_CONTRACT_VERSION = "region-frontier-hybrid-search-v1"
 SEARCH_TARGET_ALTITUDE_M = 120.0
@@ -179,10 +180,10 @@ S2U_COMMUNICATION_RANGE_M = COMMUNICATION_RANGE_M
 U2G_COMMUNICATION_RANGE_M = COMMUNICATION_RANGE_M
 U2U_COMMUNICATION_RANGE_M = COMMUNICATION_RANGE_M
 COMMUNICATION_RANGE_CONTRACT_VERSION = (
-    "slot-start-3d-inclusive-s2u-u2g-u2u-400m-v2"
+    "slot-start-3d-inclusive-s2g-s2u-u2g-u2u-400m-v3"
 )
 COM_SESSION_LIFECYCLE_VERSION = (
-    "400m-activated-fixed-interval-event-generation-persistent-v4"
+    "mission-activated-fixed-interval-event-generation-persistent-v5"
 )
 validate_communication_range_aliases(
     A2G_COMMUNICATION_RANGE_M,
@@ -193,7 +194,9 @@ validate_communication_range_aliases(
 )
 ASSIGNMENT_DUMMY_UTILITY = -1e-9
 UTILITY_NORMALIZATION_MODE = "task-type-feasible-maximum-v4"
-COM_UTILITY_CONTRACT_VERSION = "fading-aware-raw-capacity-maximum-v3"
+COM_UTILITY_CONTRACT_VERSION = (
+    "fading-aware-service-capacity-hard400-truncation-maximum-v4"
+)
 TASK_COMPATIBILITY_POLICY = "fov_com_type_only_no_distance_limit"
 FOV_ASSIGNMENT_UTILITY_VERSION = "oblique-quality-proximity-v3"
 FOV_QUALITY_TRANSFORM = (
@@ -247,7 +250,7 @@ ROUTING_COST_ATTRIBUTION_CONTRACT_VERSION = (
     "multi-packet-per-decision-path-terminal-outcome-v5"
 )
 PACKET_SERVICE_CONTRACT_VERSION = (
-    "event-time-store-forward-dynamic-fdma-fixed-fading-v4"
+    "event-time-s2g-store-forward-dynamic-fdma-fixed-fading-v5"
 )
 QOS_AGGREGATE_CONTRACT_VERSION = (
     "canonical-single-result-seed-ratio-of-sums-student-t-v3"
@@ -277,7 +280,7 @@ PRE_POLICY_COMMAND_MOVEMENT_REPLAY_CONTRACT_VERSION = (
     "boundary-aligned-next-state-post-action-constraint-penalties-executed-action-hover-mask-capacity-50000-v10"
 )
 MOVEMENT_REPLAY_CONTRACT_VERSION = (
-    "boundary-aligned-next-state-post-action-constraint-penalties-final-policy-command-hover-mask-capacity-50000-v11"
+    "boundary-aligned-next-state-post-action-weighted-constraint-penalties-final-policy-command-hover-mask-capacity-50000-v12"
 )
 MOVEMENT_WARMUP_CONTRACT_VERSION = "global-joint-transition-boundary-10000-v1"
 PROPULSION_PARAMETERS = MappingProxyType(
@@ -295,7 +298,7 @@ PROPULSION_PARAMETERS = MappingProxyType(
         "d_0": 0.834,
     }
 )
-PRODUCTION_EPISODE_HORIZON_SECONDS = 60.0
+PRODUCTION_EPISODE_HORIZON_SECONDS = 500.0
 PRODUCTION_TASK_DEADLINE_SECONDS = {"FOV": 0.015, "COM": 0.010}
 PRODUCTION_PACKET_INJECTION_CUTOFF_SECONDS = (
     PRODUCTION_EPISODE_HORIZON_SECONDS
@@ -316,17 +319,23 @@ CURRENT_METHOD_ID = "td3_dinkelbach"
 def validate_task_potential_weights():
     """Fail fast unless the authoritative immediate-penalty weights are valid."""
 
-    penalty_weights = (
-        MOVEMENT_CONSTRAINT_WEIGHT_C9,
-        MOVEMENT_CONSTRAINT_WEIGHT_C10,
-        MOVEMENT_CONSTRAINT_WEIGHT_COM,
-    )
-    if not all(
-        math.isfinite(float(weight)) and float(weight) == 1.0
-        for weight in penalty_weights
-    ):
-        raise ValueError("movement constraint penalty weights must all equal one")
-    return {"C9": (1.0,), "C10": (1.0,), "COM": (1.0,)}
+    expected = {
+        "C9": (MOVEMENT_CONSTRAINT_WEIGHT_C9, 1.0),
+        "C10": (MOVEMENT_CONSTRAINT_WEIGHT_C10, 1.0),
+        "COM": (MOVEMENT_CONSTRAINT_WEIGHT_COM, 2.0),
+    }
+    invalid = {
+        name: (actual, required)
+        for name, (actual, required) in expected.items()
+        if not math.isfinite(float(actual))
+        or not math.isclose(float(actual), required, rel_tol=0.0, abs_tol=0.0)
+    }
+    if invalid:
+        raise ValueError(
+            "movement constraint penalty weights are incompatible: "
+            f"{invalid}"
+        )
+    return {name: (float(actual),) for name, (actual, _required) in expected.items()}
 
 
 def task_potential_contract_metadata(c10_penalty_enabled=False):
@@ -342,9 +351,9 @@ def task_potential_contract_metadata(c10_penalty_enabled=False):
             "com_range": MOVEMENT_CONSTRAINT_WEIGHT_COM,
         },
         "reward_form": (
-            "base_reward - P_C9 - P_C10 - P_COM"
+            "base_reward - P_C9 - P_C10 - 2*raw_P_COM"
             if c10_penalty_enabled
-            else "base_reward - P_C9 - P_COM"
+            else "base_reward - P_C9 - 2*raw_P_COM"
         ),
         "aggregation": "mean over currently assigned pairs of each task type",
         "normalization_by_episode_steps": False,
@@ -368,10 +377,12 @@ def task_potential_contract_metadata(c10_penalty_enabled=False):
             "soft_constraint": True,
         },
         "com_range": {
-            "definition": "mean(1 - clip(R_com/(distance_3d+epsilon),0,1))",
+            "definition": "mean(max(0,1-380/(distance_3d+epsilon)))",
             "population": "all currently assigned COM UAV-SR pairs",
             "distance_dimensionality": "three_dimensional_3d",
             "s2u_range_m": S2U_COMMUNICATION_RANGE_M,
+            "penalty_reference_distance_m": COM_PENALTY_REFERENCE_DISTANCE_M,
+            "weight": MOVEMENT_CONSTRAINT_WEIGHT_COM,
             "normalization_epsilon": TASK_POTENTIAL_NORMALIZATION_EPSILON,
         },
         "evaluation_uses_training_path": True,
@@ -1351,6 +1362,7 @@ def comparison_method_configuration(method_spec: MethodSpec) -> dict:
             MAX_3D_COMMUNICATION_DISTANCE_M
         ),
         "s2u_communication_range_m": S2U_COMMUNICATION_RANGE_M,
+        "s2g_communication_range_m": S2U_COMMUNICATION_RANGE_M,
         "u2g_communication_range_m": U2G_COMMUNICATION_RANGE_M,
         "u2u_communication_range_m": U2U_COMMUNICATION_RANGE_M,
         "a2g_communication_range_m": A2G_COMMUNICATION_RANGE_M,
@@ -1362,7 +1374,13 @@ def comparison_method_configuration(method_spec: MethodSpec) -> dict:
             ROUTING_COST_ATTRIBUTION_CONTRACT_VERSION
         ),
         "packet_service_contract_version": PACKET_SERVICE_CONTRACT_VERSION,
-        "packet_generation_model": "fixed_interval_event_time",
+        "packet_generation_model": (
+            "mission_assignment_fixed_interval_event_time"
+        ),
+        "sr_uplink_selection": (
+            "s2g_if_inclusive_3d_distance_le_400m_else_s2u"
+        ),
+        "s2g_channel_model": "free-space-only-2GHz-23dBm-no-fading",
         "routing_decision_scope": "all_uavs_once_per_250ms_slot",
         "routing_action_hold": "fixed_for_entire_slot",
         "packet_forwarding_model": "full_packet_store_and_forward_same_slot_multihop",

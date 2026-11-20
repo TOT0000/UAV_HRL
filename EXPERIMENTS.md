@@ -41,7 +41,11 @@ threshold and Hovering plus GS gateway after release. UAV 15 keeps the ordinary
 reserved-Search lifecycle and may enter service matching at a subsequent new-RoI boundary after release. FOV raw utility
 and COM raw capacity are each divided by the maximum feasible candidate of
 their own task type in that matching call. Masked, dummy, completed, inactive,
-and infeasible pairs do not enter either maximum. COM uses canonical S2U capacity at the candidate's actual 3-D geometry,
+and infeasible pairs do not enter either maximum. COM assignment uses the
+canonical S2U reference capacity at the candidate's actual 3-D geometry when
+the 3-D UAV-SR distance is at most 400 m and zero otherwise. The zero-capacity
+out-of-range pair remains feasible and can be selected if no better real pair
+exists. The capacity is
 computed with `10 MHz / 24` from the sampled one-second A2G LoS/NLoS state and
 the corresponding deterministic Rician/Rayleigh expected capacity. The fixed
 reference remains available to non-assignment observation/channel paths but is
@@ -211,16 +215,16 @@ Relay diagnostics artifact.
 
 - 1,500 training episodes for the centrally configured seed `20260817`
 - inclusive RoI count range 2 through 8
-- 60 seconds per episode
+- 500 seconds per episode
 - one projected movement command held across four synchronous 0.25-second
   movement/channel/routing substeps per one-second movement interval; each
   routing slot contains exactly fifty 5 ms fading blocks
 - physical and effective routing masks recomputed in every routing slot for
   safe-DDQN, controlled DQN, controlled DDQN, and random routing
-- safe-DDQN system-DVP target probability `0.01`, initial `lambda_cost=0`, and
-  `eta_c=0.01`; every episode uses one frozen multiplier for both executed and
+- safe-DDQN system-DVP target probability `0.05`, initial `lambda_cost=0`, and
+  `eta_c=0.05`; every episode uses one frozen multiplier for both executed and
   target actions, then updates it once with
-  `max(0, lambda_cost + eta_c * (system_violations / system_eligible_packets - 0.01))`.
+  `max(0, lambda_cost + eta_c * (system_violations / system_eligible_packets - 0.05))`.
   Both counts are unique packet counts and include pre-routing and routing-stage
   outcomes. If the system denominator is zero, the update is skipped and
   diagnosed. A pre-routing failure with no routing decision creates no cost
@@ -241,7 +245,7 @@ Relay diagnostics artifact.
   the episode-level multiplier update are unchanged
 - production FOV/COM deadlines `0.015 s`/`0.010 s`; completion at the exact deadline
   is timely
-- production packet injection cutoff `59.985 s`, derived as the 60-second horizon
+- production packet injection cutoff `499.985 s`, derived as the 500-second horizon
   minus the maximum production deadline
 - every assigned FOV source has a deterministic fixed-interval generation clock
   only while canonical `fov_task_geometry` reports `sensing_valid_now=True`.
@@ -268,15 +272,16 @@ Relay diagnostics artifact.
   bitmap fallback is permitted. Routing state
   getters are pure reads. Full checkpoints persist EMA values, initialization,
   previous footprints, footprint/EMA markers, and EMA update count.
-  SR routes omit the duplicated start point, include the exact target, and mark
+  SRs start 350 m from GS on a reproducible equiangular quarter arc and use a
+  default speed of 1.5 m/s. SR routes omit the duplicated start point, include
+  the exact target, and mark
   arrival on the update that consumes the final waypoint. The only mutable SR
-  lifecycle fields are `assigned_gt_id` and `arrived`. A COM session produces
-  no packets until its assigned UAV first enters the inclusive 400 m S2U
-  range; activation is permanent for the episode and packet generation then
-  continues at fixed 20 ms intervals (50 packets/s) even while the UAV is out
-  of range. The first packet is one full effective-rate interval after
-  activation; load factors and rate overrides change the interval without
-  catch-up credit. Each activated
+  lifecycle fields are `assigned_gt_id` and `arrived`. A COM session activates
+  at the immutable SR mission-assignment time, without requiring a COM UAV or
+  connectivity. Packet generation continues at fixed 20 ms intervals
+  (50 packets/s); the first packet is one full effective-rate interval after
+  assignment. Load factors and rate overrides change the interval without
+  catch-up credit. Each generated
   COM packet is immediately `qos_eligible=True` at SR generation, while
   `routing_eligible=False` until S2U completes. S2U completion changes only
   routing eligibility and never increments the QoS denominator again. SR
@@ -340,8 +345,8 @@ counts, rather than an episode-number assumption, are authoritative.
 ## Movement constraint-reward contract
 
 Every method whose existing `task_potential_enabled` flag is true uses the
-post-action immediate reward `r_base - P_C9 - P_COM`. C9 and COM each retain
-weight one, are averaged over the currently assigned pairs of their own task
+post-action immediate reward `r_base - P_C9 - 2*raw_P_COM`. C9 has weight one;
+the COM penalty has weight two. Both are averaged over the currently assigned pairs of their own task
 type, and are not divided by 60 or by a dynamic movement-step count. C10
 geometry, observations, feasibility checks, and diagnostics remain available,
 but its movement-reward weight is zero for every comparison method. The
@@ -398,27 +403,43 @@ deferred credit. Each packet freezes `size_bits = 31600 * min(I,1)`,
 `capture_coverage_ratio`, `capture_image_quantity`, `capture_roi_id` and
 `capture_task_id`. Valid geometry must yield positive finite physical bits;
 inconsistent geometry raises an error before credit or counters change. Timely
-useful VS bits are physical bits times frozen coverage. COM is unchanged;
-the VS QoS denominator now includes only captures generated during valid sensing.
+useful VS bits are physical bits times frozen coverage. COM generation starts
+from the immutable SR mission-assignment time at 50 packets/s, whether or not a
+COM UAV or usable first hop exists; the VS QoS denominator includes only
+captures generated during valid sensing.
 
 Enriched movement replay fields and the checkpoint-driven, no-training sampling
 mode are specified in `docs/replay_sampling_contract.md`. They are auxiliary
 data only and do not change movement observations, actions, rewards, batches, or
 formal evaluation exploration.
 
-For every assigned COM UAV-SR pair, including sessions not yet activated, the
-range penalty is `1-clip(R_S2U/(d_3D+epsilon),0,1)` with the shared inclusive
-`R_S2U = 400 m`. It is averaged across assigned COM pairs. No duplicate C8
+For every assigned COM UAV-SR pair, the raw range penalty is
+`max(0,1-380/(d_3D+epsilon))`; its mean is multiplied exactly once by two in
+online and replay reward. The physical S2U range remains the separate inclusive
+400 m boundary. Direct-S2G SRs have no UAV COM task and therefore do not enter
+this population. No duplicate C8
 penalty is applied to routing links already governed by their action masks.
 
+Each episode publishes `movement_reward_decomposition` with the delivered
+Mbit, movement energy, Dinkelbach energy term, base objective, raw and applied
+C9/C10/COM terms, final reward, COM pair samples, and out-of-range COM samples.
+The applied episode penalty is the sum of the weighted per-step means; the
+separate pooled-pair diagnostic is not multiplied by the step count. The
+existing transition observer remains the opt-in step-level record and exposes
+the same raw-versus-applied distinction.
+
 The movement auxiliary-reward contract is
-`post-action-vs-com-mean-constraint-penalties-v15`. TD3 and DDPG
+`post-action-vs-com-mean-constraint-penalties-v16-com380-weight2`. TD3 and DDPG
 consume the same constraint definitions, random-movement methods publish the
 same environment/reward contract, and `*_no_task_potential` methods set all
-C9/C10/COM penalty weights to zero. Existing observations already contain UAV and task
-positions plus COM capacity. Movement state and joint action dimensions remain
-531 and 48; routing state is 143-D after adding the 17 action-wise GS-progress
-features in UAV-0-through-UAV-15-then-GS order.
+C9/C10/COM penalty weights to zero. Existing observations already contain UAV
+and assigned-task positions plus COM capacity. SR FIFO service is an environment
+process: a direct S2G SR needs no UAV action, while an out-of-range SR waiting
+for support is represented by its assigned COM task before its FIFO reaches a
+UAV. The movement state therefore needs no new model input and the movement
+state and joint action dimensions remain 531 and 48; routing state is 143-D
+after adding the 17 action-wise GS-progress features in
+UAV-0-through-UAV-15-then-GS order.
 
 ## Stochastic channel contract
 
@@ -433,10 +454,17 @@ after a state has been sampled. This is a one-second large-scale block-state
 Monte Carlo approximation, not a claim that buildings physically change every
 second.
 
+S2G is selected when SR-to-GS 3-D distance is at most 400 m. It uses 2 GHz
+free-space loss, the SR's 23 dBm transmit power, and no LoS/NLoS excess loss or
+small-scale fading. Outside that boundary the SR uses S2U to its assigned COM
+UAV. An incomplete first hop restarts from the full packet if its link type or
+receiver changes, while retaining packet identity, deadline, FIFO order, and
+already-counted violation status.
+
 U2U links retain the directed sender-absolute-AGL, 3-D-distance, 2.4 GHz paper
 path-loss model and are always LoS. U2U and sampled A2G LoS links use normalized
 Rician fading with linear `K=10` (`10 dB`); sampled A2G NLoS links use normalized
-Rayleigh fading. S2U, U2G, and U2U all use the same hard, inclusive, Euclidean
+Rayleigh fading. S2G, S2U, U2G, and U2U all use the same hard, inclusive, Euclidean
 3-D slot-start range of 400 m. Out-of-range links have zero observable and service
 capacity, are absent from the physical mask, and consume no FDMA bandwidth.
 The full potential-link fading profile is still generated before the range
@@ -463,7 +491,9 @@ samples: their CSI is the deterministic distributional expectation
 `B E_G[log2(1 + mean_snr*G)]`, evaluated with cached order-64 Gauss-Laguerre
 quadrature and normalized by link-type physical LoS-Rician reference capacity.
 
-After all routing actions are chosen, only S2U/U2U/U2G links with an actual
+S2G draws no random channel values and therefore does not alter those streams.
+
+After all routing actions are chosen, only S2G/S2U/U2U/U2G links with an actual
 serviceable HOL packet share the common 10 MHz pool by equal FDMA. Empty
 preselections reserve no bandwidth. Generation, full-hop completion, queue
 emptying, and exact deadline crossing are event boundaries; after each such
@@ -613,9 +643,11 @@ The randomness audit separates:
   assignment, actions, coverage, discovery, FOV validity, sources, packets,
   routing decisions, and delivered bits.
 
-Traffic packet creation remains gated by the policy-dependent task assignment.
-An assigned FOV source additionally requires canonical sensing validity; the manifest stores
-only the underlying demand primitive and no policy-dependent coverage snapshot.
+FOV packet creation remains gated by policy-dependent UAV task assignment and
+canonical sensing validity. COM packet creation is instead gated only by the
+persistent SR mission assignment and continues through direct/support changes.
+The manifest stores only the underlying demand primitive and no policy-dependent
+coverage snapshot.
 
 ## Commands
 
@@ -628,7 +660,7 @@ python -X utf8 comparison_experiment.py generate-manifest --split test --manifes
 python -X utf8 comparison_experiment.py generate-manifest --split test --manifest-seed 303 --episodes 100 --num-gt 4 --manifest runs/comparison/manifests/test-num-gt-4.json
 ```
 
-Run the 60-second manifest smoke:
+Run the production-horizon (500-second) manifest smoke:
 
 ```powershell
 python -X utf8 comparison_experiment.py smoke --training-seed 1 --output-dir runs/comparison/smoke
@@ -908,7 +940,7 @@ Training and formal evaluation use
 `packet_deadline_policy=continue_until_episode_end_v1` for every method.
 The target delay still classifies a complete GS delivery as on-time or late,
 and a late delivery counts as one delay violation, but the packet keeps its
-normal FIFO position and may continue over S2U/U2U/U2G links until delivery or
+  normal FIFO position and may continue over S2G/S2U/U2U/U2G links until delivery or
 episode-end settlement. Queue capacity, hop limits, and other non-time limits
 remain active. The primary movement goodput, replay reward, Dinkelbach
 numerator, training/evaluation EE, and paper EE plots use all completely
@@ -1164,9 +1196,9 @@ Each sweep point writes per-episode data plus `aggregated_plot_data.csv/json`.
 Its metadata also persists the actual manifest path and canonical hash,
 scenario IDs, evaluation count/horizon/seed, 16-UAV count, and fully resolved
 traffic-rate/deadline/cutoff overrides. The deadline-violation (Fig. 6) sweep
-uses a scoped `57.0 s` packet-injection cutoff so its maximum `3.0 s` deadline
-can resolve within the 60-second horizon; other training and evaluation suites
-retain the production `59.985 s` cutoff, while environment-size points use
+uses a scoped `497.0 s` packet-injection cutoff so its maximum `3.0 s` deadline
+can resolve within the 500-second horizon; other training and evaluation suites
+retain the production `499.985 s` cutoff, while environment-size points use
 their selected horizon minus the maximum 15 ms deadline.
 Within each training seed, delay is total delivered E2E delay divided by total
 delivered packet count. FOV and COM violation rows remain diagnostics. The

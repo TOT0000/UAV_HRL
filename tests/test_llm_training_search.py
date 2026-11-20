@@ -389,7 +389,7 @@ def test_resume_source_compatibility_uses_excerpt_content_not_git_revision(tmp_p
         "evaluation_episodes": 100,
         "evaluation_roi_count": 8,
         "evaluation_area_m": [1000.0, 1000.0],
-        "episode_seconds": 60,
+        "episode_seconds": search.DEFAULT_EPISODE_SECONDS,
         "candidate_count_per_round": 4,
         "candidate_generation_calls_per_request": 1,
     }

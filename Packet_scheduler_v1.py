@@ -38,7 +38,7 @@ import numpy as np
 
 
 PACKET_ENGINE_CHECKPOINT_SCHEMA_VERSION = (
-    "event-time-delivery-plus-completed-hop-progress-reward-v8"
+    "event-time-s2g-delivery-plus-completed-hop-progress-reward-v9"
 )
 
 
@@ -369,6 +369,9 @@ class PacketEngine:
         self.s2u_backlog_bits = defaultdict(float)
         self.s2u_partial_transmissions = 0
         self.s2u_completed_packets = 0
+        self.s2g_completed_packets = 0
+        self.sr_first_hop_switch_count = 0
+        self.sr_first_hop_retransmitted_bits = 0.0
 
         # === Dual-Queue backlog tracking (no weights) ===
         # backlog_bits_by_task[node_id][task] stores SUM of remaining bits at that node for that task.
@@ -416,6 +419,8 @@ class PacketEngine:
         self.com_late_delivered_bits = 0.0
         self.total_late_useful_bits = 0.0
         self.total_all_useful_bits = 0.0
+        self.delivery_path_packet_counts = defaultdict(int)
+        self.delivery_path_useful_bits = defaultdict(float)
         self.routing_progress_reward_total = 0.0
         self.routing_positive_progress_reward_total = 0.0
         self.routing_negative_progress_reward_total = 0.0
@@ -1100,6 +1105,10 @@ class PacketEngine:
             "s2u_receiver": None,
             "s2u_bits_sent": 0.0,
             "_s2u_service_terms": [],
+            "sr_first_hop_link_type": None,
+            "sr_first_hop_receiver": None,
+            "sr_first_hop_switch_count": 0,
+            "sr_first_hop_retransmitted_bits": 0.0,
             "routing_eligible_time": None,
             # Diagnostic only; Safe-DDQN cost never follows this field into
             # future slots or packet locations.
@@ -1223,16 +1232,95 @@ class PacketEngine:
             raise AssertionError(f"SR {sr_id} is assigned to multiple COM UAVs")
         return matches[0] if matches else None
 
+    def desired_sr_first_hop(self, env, sr_id):
+        """Return the environment-selected mutually exclusive SR uplink."""
+
+        sr_id = int(sr_id)
+        if bool(getattr(env, "is_s2g_in_range", lambda _sr_id: False)(sr_id)):
+            return "S2G", int(env.GS_ID)
+        receiver = self.assigned_com_uav(env, sr_id)
+        return ("S2U", int(receiver)) if receiver is not None else (None, None)
+
+    def synchronize_sr_first_hop(self, env, sr_id, pkt):
+        """Reset incomplete first-hop progress when its endpoint changes."""
+
+        if pkt is None:
+            return self.desired_sr_first_hop(env, sr_id)
+        desired_type, desired_receiver = self.desired_sr_first_hop(env, sr_id)
+        previous_type = pkt.get("sr_first_hop_link_type")
+        previous_receiver = pkt.get("sr_first_hop_receiver")
+        # Older/low-level S2U service callers established the legacy receiver
+        # lock before the explicit first-hop provenance fields existed.  A
+        # partially served packet still has an authoritative endpoint and
+        # must restart if the current environment selects another receiver.
+        if previous_type is None and previous_receiver is None:
+            legacy_receiver = pkt.get("s2u_receiver")
+            if (
+                legacy_receiver is not None
+                and float(pkt.get("s2u_bits_sent", 0.0)) > PACKET_EPS
+            ):
+                previous_type = "S2U"
+                previous_receiver = int(legacy_receiver)
+        if previous_type is None and previous_receiver is None:
+            pkt["sr_first_hop_link_type"] = desired_type
+            pkt["sr_first_hop_receiver"] = desired_receiver
+            pkt["s2u_receiver"] = (
+                desired_receiver if desired_type == "S2U" else None
+            )
+            return desired_type, desired_receiver
+        if (previous_type, previous_receiver) == (
+            desired_type,
+            desired_receiver,
+        ):
+            return desired_type, desired_receiver
+
+        self.sr_first_hop_switch_count += 1
+        pkt["sr_first_hop_switch_count"] = int(
+            pkt.get("sr_first_hop_switch_count", 0)
+        ) + 1
+        transmitted = max(float(pkt.get("s2u_bits_sent", 0.0)), 0.0)
+        if transmitted > PACKET_EPS:
+            self.sr_first_hop_retransmitted_bits += transmitted
+            pkt["sr_first_hop_retransmitted_bits"] = float(
+                pkt.get("sr_first_hop_retransmitted_bits", 0.0)
+            ) + transmitted
+            self.s2u_backlog_bits[int(sr_id)] += transmitted
+        pkt["rem_bits"] = float(pkt["size_bits"])
+        pkt["s2u_bits_sent"] = 0.0
+        pkt["_s2u_service_terms"] = []
+        pkt["s2u_service_start_time"] = None
+        pkt["s2u_queue_delay_s"] = 0.0
+        pkt["sr_first_hop_link_type"] = desired_type
+        pkt["sr_first_hop_receiver"] = desired_receiver
+        pkt["s2u_receiver"] = (
+            desired_receiver if desired_type == "S2U" else None
+        )
+        self._mark_queue_topology_changed(sr_id=sr_id)
+        return desired_type, desired_receiver
+
     def active_s2u_links(self, env):
         links = {}
         for sr_id in sorted(self.sr_queues):
             hol = self.get_sr_hol_packet(sr_id)
             if hol is None or self.s2u_backlog_bits[sr_id] <= PACKET_EPS:
                 continue
-            receiver = hol.get("s2u_receiver")
-            if receiver is None:
-                receiver = self.assigned_com_uav(env, sr_id)
-            if receiver is not None:
+            link_type, receiver = self.synchronize_sr_first_hop(
+                env, sr_id, hol
+            )
+            if link_type == "S2U" and receiver is not None:
+                links[int(sr_id)] = int(receiver)
+        return links
+
+    def active_s2g_links(self, env):
+        links = {}
+        for sr_id in sorted(self.sr_queues):
+            hol = self.get_sr_hol_packet(sr_id)
+            if hol is None or self.s2u_backlog_bits[sr_id] <= PACKET_EPS:
+                continue
+            link_type, receiver = self.synchronize_sr_first_hop(
+                env, sr_id, hol
+            )
+            if link_type == "S2G":
                 links[int(sr_id)] = int(receiver)
         return links
 
@@ -1304,10 +1392,15 @@ class PacketEngine:
                 "routing-stage eligible packets lack a unique active/terminal class"
             )
         if not self.get_active_packets():
-            if system_eligible != routing_eligible + self.pre_routing_violation_count:
+            pre_routing_terminal = sum(
+                bool(row.get("qos_eligible", False))
+                and not bool(row.get("routing_eligible", False))
+                for row in self.packet_outcomes
+            )
+            if system_eligible != routing_eligible + pre_routing_terminal:
                 raise AssertionError(
                     "terminal system population is not routing entrants plus "
-                    "pre-routing outcomes"
+                    "pre-routing terminal outcomes"
                 )
             if self.routing_immediate_cost_sum > routing_violations:
                 raise AssertionError(
@@ -2160,6 +2253,8 @@ class PacketEngine:
             "completed_uav_hops": [],
             "completed_uav_hop_count": 0,
             "cross_slot_completed_uav_hop_count": 0,
+            "delivery_path_packet_counts": defaultdict(int),
+            "delivery_path_useful_bits": defaultdict(float),
             "active_links": [],
         }
         pending_relay_arrivals = []
@@ -2587,8 +2682,8 @@ class PacketEngine:
                 next_time += interval
             clock["next_time_seconds"] = next_time
 
-        # COM activation is persistent, but generation starts one full interval
-        # after the actual activation boundary.  No fractional credit is kept.
+        # COM generation starts from the immutable SR mission-assignment time,
+        # independent of UAV assignment or first-hop connectivity.
         available_com_keys = {
             f"SR_{int(sr.id)}_COM"
             for sr in getattr(env, "SR_teams", ())
@@ -2609,14 +2704,15 @@ class PacketEngine:
                 sr_id,
                 {"session_active": False, "activation_time_seconds": None},
             )
-            assigned_uav = self.assigned_com_uav(env, sr_id)
-            if (
-                not session["session_active"]
-                and assigned_uav is not None
-                and env.is_s2u_in_range(sr_id, assigned_uav)
-            ):
+            if not session["session_active"]:
+                movement_event = getattr(env, "sr_movement_events", {}).get(
+                    sr_id, {}
+                )
+                assignment_time = movement_event.get(
+                    "assignment_time_seconds", slot_start
+                )
                 session["session_active"] = True
-                session["activation_time_seconds"] = slot_start
+                session["activation_time_seconds"] = float(assignment_time)
             key = f"SR_{sr_id}_COM"
             if not session["session_active"] or rates["COM"] <= 0.0:
                 # A paused/unavailable source earns no interval credit.  The
@@ -2627,16 +2723,25 @@ class PacketEngine:
             rate = rates["COM"]
             interval = 1.0 / rate
             clock = self.generation_clocks.get(key)
-            if clock is None or not np.isclose(
+            rate_changed = clock is not None and not np.isclose(
                 float(clock.get("rate_packets_per_second", -1.0)),
                 rate,
                 rtol=0.0,
                 atol=1e-12,
-            ):
+            )
+            if clock is None or rate_changed:
                 clock = {
                     "kind": "COM",
                     "rate_packets_per_second": rate,
-                    "next_time_seconds": slot_start + interval,
+                    "next_time_seconds": (
+                        slot_start + interval
+                        if rate_changed
+                        else max(
+                            float(session["activation_time_seconds"])
+                            + interval,
+                            slot_start + interval,
+                        )
+                    ),
                 }
                 self.generation_clocks[key] = clock
             next_time = float(clock["next_time_seconds"])
@@ -2771,6 +2876,8 @@ class PacketEngine:
             "completed_uav_hops": [],
             "completed_uav_hop_count": 0,
             "cross_slot_completed_uav_hop_count": 0,
+            "delivery_path_packet_counts": defaultdict(int),
+            "delivery_path_useful_bits": defaultdict(float),
         }
 
     @staticmethod
@@ -2810,6 +2917,20 @@ class PacketEngine:
         pkt["delivered_useful_bits"] = useful_bits
         self.total_all_useful_bits += useful_bits
         result["total_all_useful_bits"] += useful_bits
+        hop_types = {
+            str(hop.get("link_type")) for hop in pkt.get("per_hop", ())
+        }
+        if "S2G" in hop_types:
+            delivery_path = "S2G"
+        elif str(pkt.get("source_kind")) == "SR":
+            delivery_path = "S2U_UAV"
+        else:
+            delivery_path = "UAV"
+        pkt["delivery_path"] = delivery_path
+        self.delivery_path_packet_counts[delivery_path] += 1
+        self.delivery_path_useful_bits[delivery_path] += useful_bits
+        result["delivery_path_packet_counts"][delivery_path] += 1
+        result["delivery_path_useful_bits"][delivery_path] += useful_bits
 
         if timely:
             pkt["timely_goodput_counted"] = True
@@ -2881,6 +3002,8 @@ class PacketEngine:
         pkt["path"].append(int(receiver))
         pkt["rem_bits"] = float(pkt["size_bits"])
         pkt["s2u_receiver"] = None
+        pkt["sr_first_hop_link_type"] = None
+        pkt["sr_first_hop_receiver"] = None
         pkt["s2u_service_start_time"] = None
         pkt["s2u_queue_delay_s"] = 0.0
         pkt["_s2u_service_terms"] = []
@@ -2888,6 +3011,83 @@ class PacketEngine:
         self.enqueue_packet(pkt, receiver, completion_time)
         self.s2u_completed_packets += 1
         result["s2u_arrivals"].append(pkt)
+
+    def _event_complete_s2g(self, pkt, sr_id, receiver, completion_time, result):
+        """Complete one physical direct SR-to-GS upload without UAV routing."""
+
+        queue = self.sr_queues[int(sr_id)]
+        if not queue or queue[0] is not pkt:
+            raise AssertionError("completed S2G packet was not SR FIFO HOL")
+        if int(receiver) != int(self.num_UAV):
+            raise AssertionError("S2G receiver must be the ground station")
+        queue.popleft()
+        self._mark_queue_topology_changed(sr_id=sr_id)
+        pkt["_queued_sr"] = None
+        pkt["s2g_completion_time"] = float(completion_time)
+        service_start = float(
+            pkt.get("s2u_service_start_time", completion_time)
+        )
+        queue_delay = float(pkt.get("s2u_queue_delay_s", 0.0))
+        pkt.setdefault("per_hop", []).append(
+            {
+                "from": f"SR:{int(sr_id)}",
+                "to": int(receiver),
+                "queue_s": queue_delay,
+                "tx_s": max(float(completion_time) - service_start, 0.0),
+                "actual_tx_s": float(pkt.get("s2u_actual_tx_seconds", 0.0)),
+                "delay_ms": max(
+                    float(completion_time) - float(pkt["generation_time"]),
+                    0.0,
+                )
+                * 1e3,
+                "link_type": "S2G",
+            }
+        )
+        pkt["path"].append(int(receiver))
+        pkt["e2e_delay_ms"] = max(
+            float(completion_time) - float(pkt["generation_time"]), 0.0
+        ) * 1e3
+        timely = self._delivery_is_timely(
+            completion_time, float(pkt.get("deadline_abs", float("inf")))
+        )
+        if not timely:
+            if self.allow_late_delivery:
+                self._count_complete_gs_delivery(pkt, result, timely=False)
+            violation = self._mark_deadline_violation(
+                pkt,
+                completion_time,
+                sender=-(int(sr_id) + 1),
+                remove_from_queue=False,
+                reason="late_delivered",
+            )
+            if violation is not None:
+                result["outcomes"].append(
+                    self._outcome_from_violation(violation)
+                )
+            self.s2g_completed_packets += 1
+            return
+
+        self._count_complete_gs_delivery(pkt, result, timely=True)
+        self.total_delivered += 1
+        self.com_delivered += 1
+        self.mark_packet_done(
+            pkt,
+            current_time=completion_time,
+            reason="delivered",
+            remove_from_queue=False,
+        )
+        result["outcomes"].append(
+            {
+                "attributed_sender": -(int(sr_id) + 1),
+                "routing_transition_id": None,
+                "task_type": "COM",
+                "packet_id": int(pkt["id"]),
+                "violated": False,
+                "packet": pkt,
+                "delivery_path": "S2G",
+            }
+        )
+        self.s2g_completed_packets += 1
 
     def _record_completed_uav_hop_reward(
         self,
@@ -3283,6 +3483,7 @@ class PacketEngine:
         active_cache_revision = None
         cached_active_uav_links = None
         cached_active_s2u_links = None
+        cached_active_s2g_links = None
 
         def refresh_uav_link(sender, uav_links):
             sender = int(sender)
@@ -3301,22 +3502,26 @@ class PacketEngine:
             if env.is_routing_link_in_range(sender, receiver):
                 uav_links[sender] = receiver
 
-        def refresh_s2u_link(sr_id, s2u_links):
+        def refresh_sr_link(sr_id, s2u_links, s2g_links):
             sr_id = int(sr_id)
             s2u_links.pop(sr_id, None)
+            s2g_links.pop(sr_id, None)
             hol = self.get_sr_hol_packet(sr_id)
             observe_s2u_hol(sr_id, hol)
             if hol is None or self.s2u_backlog_bits[sr_id] <= PACKET_EPS:
                 return
-            receiver = hol.get("s2u_receiver")
-            if receiver is None:
-                receiver = assigned_com_receiver(sr_id)
-            if receiver is not None:
+            link_type, receiver = self.synchronize_sr_first_hop(
+                env, sr_id, hol
+            )
+            if link_type == "S2G":
+                s2g_links[sr_id] = int(receiver)
+            elif link_type == "S2U" and receiver is not None:
                 s2u_links[sr_id] = int(receiver)
 
         def active_links():
             nonlocal active_cache_revision
             nonlocal cached_active_uav_links, cached_active_s2u_links
+            nonlocal cached_active_s2g_links
             self._event_service_counters["active_link_queries"] += 1
             if (
                 self._event_service_cache_enabled
@@ -3327,6 +3532,7 @@ class PacketEngine:
                 return (
                     cached_active_uav_links,
                     cached_active_s2u_links,
+                    cached_active_s2g_links,
                     False,
                 )
 
@@ -3363,11 +3569,16 @@ class PacketEngine:
                 for sender in changed_uavs:
                     refresh_uav_link(sender, cached_active_uav_links)
                 for sr_id in changed_srs:
-                    refresh_s2u_link(sr_id, cached_active_s2u_links)
+                    refresh_sr_link(
+                        sr_id,
+                        cached_active_s2u_links,
+                        cached_active_s2g_links,
+                    )
                 active_cache_revision = self._queue_topology_revision
                 return (
                     cached_active_uav_links,
                     cached_active_s2u_links,
+                    cached_active_s2g_links,
                     True,
                 )
 
@@ -3390,18 +3601,25 @@ class PacketEngine:
                     uav_links[sender] = receiver
                 for sr_id in sorted(self.sr_queues):
                     observe_s2u_hol(sr_id, self.get_sr_hol_packet(sr_id))
-                return uav_links, self.active_s2u_links(env), True
+                return (
+                    uav_links,
+                    self.active_s2u_links(env),
+                    self.active_s2g_links(env),
+                    True,
+                )
 
             for sender in actions:
                 refresh_uav_link(sender, uav_links)
             s2u_links = {}
+            s2g_links = {}
             for sr_id in sorted(self.sr_queues):
-                refresh_s2u_link(sr_id, s2u_links)
+                refresh_sr_link(sr_id, s2u_links, s2g_links)
             self._queue_topology_events.clear()
             active_cache_revision = self._queue_topology_revision
             cached_active_uav_links = uav_links
             cached_active_s2u_links = s2u_links
-            return uav_links, s2u_links, True
+            cached_active_s2g_links = s2g_links
+            return uav_links, s2u_links, s2g_links, True
 
         # The slot-start allocation seeds the event cache.  Frozen HOL and
         # backlog snapshots remain available for cost attribution and
@@ -3415,11 +3633,21 @@ class PacketEngine:
                     dict(bandwidths),
                     dict(env.active_link_capacity_profiles_mbps),
                     dict(env.active_s2u_capacity_profiles_mbps),
+                    dict(
+                        getattr(
+                            env,
+                            "active_s2g_capacity_profiles_mbps",
+                            {},
+                        )
+                    ),
                     None,
                 )
 
             uav_profiles = env.active_link_capacity_profiles_mbps
             s2u_profiles = env.active_s2u_capacity_profiles_mbps
+            s2g_profiles = getattr(
+                env, "active_s2g_capacity_profiles_mbps", {}
+            )
             bandwidth_diagnostic = {
                 str(key): float(value)
                 for key, value in sorted(
@@ -3434,22 +3662,42 @@ class PacketEngine:
                 bandwidths,
                 uav_profiles,
                 s2u_profiles,
+                s2g_profiles,
                 bandwidth_diagnostic,
             )
 
-        initial_uav_links, initial_s2u_links, _ = active_links()
-        initial_capacities, initial_bandwidths = env.allocate_active_link_capacities(
-            initial_uav_links, s2u_links=initial_s2u_links
+        initial_uav_links, initial_s2u_links, initial_s2g_links, _ = active_links()
+        def allocate_links(uav_links, s2u_links, s2g_links):
+            if s2g_links:
+                return env.allocate_active_link_capacities(
+                    uav_links,
+                    s2u_links=s2u_links,
+                    s2g_links=s2g_links,
+                )
+            # Preserve the established test/custom environment protocol when
+            # no direct SR link is active.  The production Simulator accepts
+            # both forms and S2G can never be silently omitted when present.
+            return env.allocate_active_link_capacities(
+                uav_links,
+                s2u_links=s2u_links,
+            )
+
+        initial_capacities, initial_bandwidths = allocate_links(
+            initial_uav_links,
+            initial_s2u_links,
+            initial_s2g_links,
         )
         allocation_key = (
             tuple(sorted(initial_uav_links.items())),
             tuple(sorted(initial_s2u_links.items())),
+            tuple(sorted(initial_s2g_links.items())),
         )
         (
             cached_capacities,
             cached_bandwidths,
             cached_uav_profiles,
             cached_s2u_profiles,
+            cached_s2g_profiles,
             cached_bandwidth_diagnostic,
         ) = prepare_allocation_view(initial_capacities, initial_bandwidths)
         def settle_s2u_no_service(packet_id):
@@ -3585,14 +3833,17 @@ class PacketEngine:
             iteration_count += 1
             env.current_time = t
             event_clock[0] = t
-            uav_links, s2u_links, topology_scanned = active_links()
+            uav_links, s2u_links, s2g_links, topology_scanned = active_links()
             current_allocation_key = (
                 tuple(sorted(uav_links.items())),
                 tuple(sorted(s2u_links.items())),
+                tuple(sorted(s2g_links.items())),
             )
             if current_allocation_key != allocation_key:
-                capacities, bandwidths = env.allocate_active_link_capacities(
-                    uav_links, s2u_links=s2u_links
+                capacities, bandwidths = allocate_links(
+                    uav_links,
+                    s2u_links,
+                    s2g_links,
                 )
                 allocation_key = current_allocation_key
                 (
@@ -3600,12 +3851,14 @@ class PacketEngine:
                     cached_bandwidths,
                     cached_uav_profiles,
                     cached_s2u_profiles,
+                    cached_s2g_profiles,
                     cached_bandwidth_diagnostic,
                 ) = prepare_allocation_view(capacities, bandwidths)
             capacities = cached_capacities
             bandwidths = cached_bandwidths
             uav_profiles = cached_uav_profiles
             s2u_profiles = cached_s2u_profiles
+            s2g_profiles = cached_s2g_profiles
             # The allocator is authoritative: it may remove a candidate whose
             # physical range ceased to be serviceable.  Only returned profiles
             # consume FDMA or enter service, while diagnostics still classify
@@ -3650,6 +3903,13 @@ class PacketEngine:
                 rate = float(profile[block_index]) * 1e6
                 if rate > PACKET_EPS:
                     link = ("S2U", sr_id, receiver)
+                    rates_bps[link] = rate
+                    packets_by_link[link] = self.get_sr_hol_packet(sr_id)
+            for (sr_id, receiver), cached_profile in s2g_profiles.items():
+                profile = np.asarray(cached_profile, dtype=np.float64)
+                rate = float(profile[block_index]) * 1e6
+                if rate > PACKET_EPS:
+                    link = ("S2G", sr_id, receiver)
                     rates_bps[link] = rate
                     packets_by_link[link] = self.get_sr_hol_packet(sr_id)
             ordered_rate_links = tuple(sorted(rates_bps, key=str))
@@ -3782,9 +4042,9 @@ class PacketEngine:
                 # completion and eventually trip the zero-time loop guard.
                 if bits <= 0.0:
                     continue
-                if link[0] == "S2U":
+                if link[0] in {"S2U", "S2G"}:
                     _, sr_id, receiver = link
-                    if pkt.get("s2u_receiver") is None:
+                    if link[0] == "S2U" and pkt.get("s2u_receiver") is None:
                         pkt["s2u_receiver"] = int(receiver)
                     if float(pkt.get("s2u_bits_sent", 0.0)) <= PACKET_EPS:
                         pkt["s2u_service_start_time"] = t
@@ -3829,7 +4089,7 @@ class PacketEngine:
                         # backlog even if a numerical packet residual remains.
                         self._mark_queue_topology_changed(sr_id=sr_id)
                     result["transmitted_bits_by_link"][link] += bits
-                    active_key = (int(sr_id), int(receiver), "S2U")
+                    active_key = (int(sr_id), int(receiver), str(link[0]))
                 else:
                     sender, receiver = link
                     hop_started = pkt.get("hop_receiver") is None
@@ -3913,6 +4173,11 @@ class PacketEngine:
                     self._event_complete_s2u(
                         pkt, sr_id, receiver, t, result
                     )
+                elif link[0] == "S2G":
+                    _, sr_id, receiver = link
+                    self._event_complete_s2g(
+                        pkt, sr_id, receiver, t, result
+                    )
                 else:
                     sender, receiver = link
                     self._event_complete_uav_hop(
@@ -3960,6 +4225,12 @@ class PacketEngine:
                 settle_s2u_no_service(packet_id)
         result["transmitted_bits_by_link"] = dict(
             result["transmitted_bits_by_link"]
+        )
+        result["delivery_path_packet_counts"] = dict(
+            result["delivery_path_packet_counts"]
+        )
+        result["delivery_path_useful_bits"] = dict(
+            result["delivery_path_useful_bits"]
         )
         result["active_links"] = [
             {
@@ -4100,16 +4371,12 @@ class PacketEngine:
                 sr_id,
                 {"session_active": False, "activation_time_seconds": None},
             )
-            assigned_uav = self.assigned_com_uav(env, sr_id)
-            if (
-                not session["session_active"]
-                and assigned_uav is not None
-                and env.is_s2u_in_range(sr_id, assigned_uav)
-            ):
-                session["session_active"] = True
-                session["activation_time_seconds"] = float(current_time)
             if not session["session_active"]:
-                continue
+                assignment_time = getattr(env, "sr_movement_events", {}).get(
+                    sr_id, {}
+                ).get("assignment_time_seconds", current_time)
+                session["session_active"] = True
+                session["activation_time_seconds"] = float(assignment_time)
             key = f"SR_{sr_id}_COM"
             self.inject_buffer[key] += base_ctrl_rate * step_time
             num_packets = int(self.inject_buffer[key])
@@ -4202,6 +4469,25 @@ class PacketEngine:
             ),
             "com_timely_delivered_bits": float(self.com_timely_delivered_bits),
             "total_timely_useful_bits": float(self.total_timely_useful_bits),
+            "s2g_completed_packets": int(self.s2g_completed_packets),
+            "sr_first_hop_switch_count": int(
+                self.sr_first_hop_switch_count
+            ),
+            "sr_first_hop_retransmitted_bits": float(
+                self.sr_first_hop_retransmitted_bits
+            ),
+            "delivery_path_packet_counts": {
+                key: int(value)
+                for key, value in sorted(
+                    self.delivery_path_packet_counts.items()
+                )
+            },
+            "delivery_path_useful_bits": {
+                key: float(value)
+                for key, value in sorted(
+                    self.delivery_path_useful_bits.items()
+                )
+            },
             "system_eligible_packets": int(
                 sum(self.eligible_packet_counts.values())
             ),
@@ -4362,6 +4648,7 @@ class PacketEngine:
         diagnostic_hops = []
         completed_uav_hops = []
         s2u_hops = []
+        s2g_hops = []
         for hop in raw_hops:
             link_type = hop.get("link_type")
             if link_type is None:
@@ -4381,7 +4668,9 @@ class PacketEngine:
             diagnostic_hops.append(compact_hop)
             if compact_hop["link_type"] == "S2U":
                 s2u_hops.append(compact_hop)
-            else:
+            elif compact_hop["link_type"] == "S2G":
+                s2g_hops.append(compact_hop)
+            elif compact_hop["link_type"] in {"U2U", "U2G"}:
                 completed_uav_hops.append(compact_hop)
 
         if delivered_to_gs:
@@ -4418,11 +4707,42 @@ class PacketEngine:
         )
         return {
             "s2u_completed": (
-                bool(s2u_completion_time is not None) if s2u_applicable else None
+                bool(s2u_completion_time is not None)
+                if s2u_applicable
+                else None
             ),
+            "s2g_completed": (
+                bool(pkt.get("s2g_completion_time") is not None)
+                if s2u_applicable
+                else None
+            ),
+            "sr_first_hop_link_type": (
+                next(
+                    (
+                        hop["link_type"]
+                        for hop in diagnostic_hops
+                        if hop["link_type"] in {"S2G", "S2U"}
+                    ),
+                    pkt.get("sr_first_hop_link_type"),
+                )
+                if s2u_applicable
+                else None
+            ),
+            "sr_first_hop_switch_count": int(
+                pkt.get("sr_first_hop_switch_count", 0)
+            ),
+            "sr_first_hop_retransmitted_bits": float(
+                pkt.get("sr_first_hop_retransmitted_bits", 0.0)
+            ),
+            "delivery_path": pkt.get("delivery_path"),
             "s2u_completion_time_seconds": (
                 float(s2u_completion_time)
                 if s2u_completion_time is not None
+                else None
+            ),
+            "s2g_completion_time_seconds": (
+                float(pkt["s2g_completion_time"])
+                if pkt.get("s2g_completion_time") is not None
                 else None
             ),
             "routing_eligible_time_seconds": (
@@ -4585,6 +4905,13 @@ class PacketEngine:
                 "delivered_to_gs": delivered_to_gs,
                 "qos_eligible": bool(pkt.get("qos_eligible", False)),
                 "routing_eligible": bool(pkt.get("routing_eligible", False)),
+                "delivery_path": pkt.get("delivery_path"),
+                "sr_first_hop_switch_count": int(
+                    pkt.get("sr_first_hop_switch_count", 0)
+                ),
+                "sr_first_hop_retransmitted_bits": float(
+                    pkt.get("sr_first_hop_retransmitted_bits", 0.0)
+                ),
                 "sr_waiting_seconds": pkt.get("sr_waiting_seconds"),
                 "remaining_bits_at_drop": pkt.get(
                     "sr_admission_remaining_bits"
@@ -4719,6 +5046,54 @@ class PacketEngine:
                     self.com_timely_delivered_bits
                     + self.com_late_delivered_bits
                 )
+            path_rows = [
+                row for row in rows if bool(row.get("delivered_to_gs", False))
+            ]
+            result[task_type]["delivery_paths"] = {
+                path: {
+                    "delivered_packets": int(
+                        sum(row.get("delivery_path") == path for row in path_rows)
+                    ),
+                    "timely_delivered_packets": int(
+                        sum(
+                            row.get("delivery_path") == path
+                            and row.get("outcome") == "on_time_delivered"
+                            for row in path_rows
+                        )
+                    ),
+                    "late_delivered_packets": int(
+                        sum(
+                            row.get("delivery_path") == path
+                            and row.get("outcome") == "late_delivered"
+                            for row in path_rows
+                        )
+                    ),
+                    "delivered_e2e_delay_sum_seconds": float(
+                        sum(
+                            float(row["e2e_delay_seconds"])
+                            for row in path_rows
+                            if row.get("delivery_path") == path
+                        )
+                    ),
+                }
+                for path in ("S2G", "S2U_UAV", "UAV")
+            }
+        result["delivery_path_packet_counts"] = {
+            key: int(value)
+            for key, value in sorted(self.delivery_path_packet_counts.items())
+        }
+        result["delivery_path_useful_bits"] = {
+            key: float(value)
+            for key, value in sorted(self.delivery_path_useful_bits.items())
+        }
+        result["sr_first_hop"] = {
+            "s2u_completed_packets": int(self.s2u_completed_packets),
+            "s2g_completed_packets": int(self.s2g_completed_packets),
+            "endpoint_switch_count": int(self.sr_first_hop_switch_count),
+            "retransmitted_bits": float(
+                self.sr_first_hop_retransmitted_bits
+            ),
+        }
         return result
 
 
@@ -4841,6 +5216,9 @@ class PacketEngine:
         self.s2u_backlog_bits = defaultdict(float)
         self.s2u_partial_transmissions = 0
         self.s2u_completed_packets = 0
+        self.s2g_completed_packets = 0
+        self.sr_first_hop_switch_count = 0
+        self.sr_first_hop_retransmitted_bits = 0.0
         # 其他快取
         self.buffer_info = {}
         self.actual_backlog = {}
@@ -4867,6 +5245,8 @@ class PacketEngine:
         self.com_late_delivered_bits = 0.0
         self.total_late_useful_bits = 0.0
         self.total_all_useful_bits = 0.0
+        self.delivery_path_packet_counts = defaultdict(int)
+        self.delivery_path_useful_bits = defaultdict(float)
         self.routing_progress_reward_total = 0.0
         self.routing_positive_progress_reward_total = 0.0
         self.routing_negative_progress_reward_total = 0.0

@@ -14,6 +14,7 @@ import numpy as np
 
 from experiment_config import (
     COM_PACKET_SIZE_BITS,
+    PRODUCTION_EPISODE_HORIZON_SECONDS,
     REFERENCE_COM_BANDWIDTH_HZ,
     TOTAL_COMMUNICATION_BANDWIDTH_HZ,
 )
@@ -47,9 +48,13 @@ from llm_explorer_state_rule import (
 
 LLM_STATE_RULE_METHOD_ID = "td3_dinkelbach_llm_explorer_state_rule"
 LLM_STATE_RULE_VERSION = "uav-hrl-llm-state-rule-explorer-v2"
-LLM_STATE_RULE_PROMPT_VERSION = "uav-hrl-llm-state-rule-prompts-v5-runtime-routing-policy"
+LLM_STATE_RULE_PROMPT_VERSION = (
+    "uav-hrl-llm-state-rule-prompts-v6-mission-s2g-runtime-policy"
+)
 LLM_STATE_RULE_SUMMARY_VERSION = "state-rule-observed-service-summary-v3"
-LLM_STATE_RULE_CACHE_VERSION = "state-rule-complete-input-cache-v4-runtime-policy"
+LLM_STATE_RULE_CACHE_VERSION = (
+    "state-rule-complete-input-cache-v5-mission-s2g-runtime-policy"
+)
 LLM_STATE_RULE_ANALYSIS_OUTPUT_TOKENS = 4096
 LLM_STATE_RULE_RULE_OUTPUT_TOKENS = 4096
 
@@ -60,7 +65,7 @@ class LLMStateRuleConfig(LLMExplorerConfig):
     call_schedule_version: str = LLM_EXPLORER_LEGACY_CALL_SCHEDULE_VERSION
     analysis_max_output_tokens: int = LLM_STATE_RULE_ANALYSIS_OUTPUT_TOKENS
     guidance_max_output_tokens: int = LLM_STATE_RULE_RULE_OUTPUT_TOKENS
-    episode_joint_transitions: int = 60
+    episode_joint_transitions: int = PRODUCTION_EPISODE_HORIZON_SECONDS
 
     def __post_init__(self) -> None:
         super().__post_init__()

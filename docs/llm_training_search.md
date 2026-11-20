@@ -15,7 +15,7 @@ improvement gate.
 
 The fixed search contract is four candidates per round, 800 training episodes,
 training seed 20260817, episode-800 checkpoints, and 100 shared evaluation
-episodes at 8 RoIs, 1000 x 1000 m, and 60 seconds. Candidate ranking is the
+episodes at 8 RoIs, 1000 x 1000 m, and 500 seconds. Candidate ranking is the
 arithmetic mean of the 100 per-episode EE values. The baseline evaluation must
 be explicitly named and pass the same checkpoint, manifest hash and order,
 scenario, environment, and completed-output checks before model work begins.

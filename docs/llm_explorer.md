@@ -79,7 +79,7 @@ packet model, and update schedules. Its only training interventions are:
 
 The first guided episode begins only after 10,000 joint movement transitions
 have already completed and a previous episode is available. With the standard
-60-transition horizon this is episode 168. The implementation checks the
+500-transition horizon this is episode 21. The implementation checks the
 transition count rather than the episode number. Each guided episode normally
 makes one analysis request and one numerical request to `gpt-4o-mini`. The two
 requests use independent system and user prompts. The numerical request carries

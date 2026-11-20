@@ -30,7 +30,7 @@ SUPPORTED_OBS_INTERFACE_VERSIONS = (
     LEGACY_OBS_INTERFACE_VERSION,
     OBS_INTERFACE_VERSION,
 )
-PROMPT_VERSION = "uav-hrl-llm-design-prompt-v11-complete-ee-no-c10"
+PROMPT_VERSION = "uav-hrl-llm-design-prompt-v12-mission-s2g"
 DESIGN_RUN_SCHEMA_VERSION = "uav-hrl-llm-design-run-v4"
 APPROVED_ARTIFACT_SCHEMA_VERSION = "uav-hrl-approved-shared-feature-design-v2"
 ROOT = Path(__file__).resolve().parent
@@ -415,7 +415,7 @@ def build_constants(fixed_metadata: dict[str, Any]) -> dict[str, Any]:
             ),
             "dtype": "float",
             "unit": "m",
-            "meaning": "inclusive S2U/U2U/U2G 3-D range",
+            "meaning": "inclusive S2G/S2U/U2U/U2G 3-D range",
             "source": "fixed sample checkpoint communication contract",
         },
         "ground_station_position_m": {
@@ -864,7 +864,9 @@ def packet_lifecycle_and_observation_timing() -> str:
         "Movement observations precede TD3 and later packet events. Each 0.25 s slot, "
         "all UAVs, including empty ones, preselect and hold one legal next hop. Activated "
         "COM and valid VS sources generate at fixed-rate event times; future events are "
-        "unobservable. Full-packet store-and-forward S2U/U2U/U2G may multi-hop within "
+        "unobservable. COM begins one full period after immutable SR mission "
+        "assignment, independent of UAV support or connectivity. Full-packet "
+        "store-and-forward S2G/S2U/U2U/U2G may multi-hop within "
         "the slot. Only serviceable links share equal FDMA; arrival or completion "
         "reallocates future bandwidth without resampling current 5 ms fading. Passing a "
         "deadline does not drop or reprioritize a packet: it may continue until complete "
@@ -901,15 +903,19 @@ def visual_sensing_spec(constants_metadata: dict[str, Any]) -> str:
 def communication_spec(constants_metadata: dict[str, Any]) -> str:
     distance = constants_metadata["communication_range_m"]["value"]
     return (
-        f"S2U, U2U, and U2G links use inclusive finite 3-D distance <= {distance:g} m. "
-        "A2G (S2U/U2G) path loss is free-space loss plus the currently sampled LoS or "
+        f"S2G, S2U, U2U, and U2G links use inclusive finite 3-D distance <= {distance:g} m. "
+        "An SR in range of the GS uses S2G with 2 GHz free-space-only loss, 23 dBm, "
+        "and no fading; otherwise it uses its assigned COM UAV over S2U. An incomplete "
+        "SR first hop restarts from the full packet if its endpoint changes. A2G "
+        "(S2U/U2G) path loss is free-space loss plus the currently sampled LoS or "
         "NLoS excess loss; U2U uses the directed altitude-dependent A2A loss. Expected "
         "capacities are E[B*log2(1+SNR*G)]/1e6 Mbit/s, with Rician fading for LoS/U2U "
         "and Rayleigh fading for NLoS. Runtime service uses 50 fading blocks per 0.25 s "
-        "slot and equal FDMA across active S2U/U2U/U2G links in one shared 10 MHz pool. "
+        "slot and equal FDMA across serviceable active S2G/S2U/U2U/U2G links in one "
+        "shared 10 MHz pool. Each SR has exactly one S2G-or-S2U uplink. "
         "The obs reference capacities are current expected physical capacities at their "
         "documented reference bandwidth; they are not the allocated-bandwidth block "
-        "service or delivered bits. COM range penalty is mean(1-clip(R_com/(d_3D+epsilon),"
+        "service or delivered bits. COM range penalty is mean(1-clip(380/(d_3D+epsilon),"
         "0,1)) over every assigned COM UAV-SR pair, whether or not upload traffic is active."
     )
 

@@ -80,7 +80,7 @@ class PaperMethodRegistryTest(unittest.TestCase):
             spec = MethodSpec.parse(method_id)
             resolved = comparison_method_configuration(spec)
             self.assertEqual(resolved["routing_mask_scope"], "every_slot")
-            self.assertEqual(resolved["packet_injection_cutoff_seconds"], 59.985)
+            self.assertEqual(resolved["packet_injection_cutoff_seconds"], 499.985)
             self.assertEqual(resolved["resolved_fov_deadline_seconds"], 0.015)
             self.assertEqual(resolved["resolved_com_deadline_seconds"], 0.010)
             if spec.routing == "safe_ddqn":
@@ -183,13 +183,13 @@ class PaperSweepContractTest(unittest.TestCase):
             DEADLINE_SWEEP_DISPLAY_MILLISECONDS,
             (5.0, 10.0, 15.0, 20.0, 25.0, 30.0),
         )
-        self.assertEqual(DEADLINE_SWEEP_INJECTION_CUTOFF_SECONDS, 59.97)
+        self.assertEqual(DEADLINE_SWEEP_INJECTION_CUTOFF_SECONDS, 499.97)
         self.assertEqual(
             {
                 point["overrides"]["packet_injection_cutoff_seconds"]
                 for point in points
             },
-            {59.97},
+            {499.97},
         )
         com = [point for point in points if point["swept_task"] == "COM"]
         fov = [point for point in points if point["swept_task"] == "FOV"]

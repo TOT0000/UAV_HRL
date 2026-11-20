@@ -97,9 +97,9 @@ class PaperPacketMetricTest(unittest.TestCase):
         deadline_sweep = PacketEngine(
             num_uav=1, injection_cutoff_seconds=57.0
         )
-        self.assertEqual(production.injection_cutoff_seconds, 59.985)
+        self.assertEqual(production.injection_cutoff_seconds, 499.985)
         self.assertEqual(deadline_sweep.injection_cutoff_seconds, 57.0)
-        self.assertEqual(EPISODE_INJECTION_CUTOFF_SECONDS, 59.985)
+        self.assertEqual(EPISODE_INJECTION_CUTOFF_SECONDS, 499.985)
 
 
 if __name__ == "__main__":

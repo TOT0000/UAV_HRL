@@ -7,10 +7,13 @@ from Simulator import Simulator
 from centralized_movement import fov_task_geometry, movement_constraint_penalties
 from experiment_config import (
     METHOD_REGISTRY,
+    COM_PENALTY_REFERENCE_DISTANCE_M,
+    MOVEMENT_CONSTRAINT_WEIGHT_COM,
     S2U_COMMUNICATION_RANGE_M,
     MethodSpec,
     comparison_method_configuration,
 )
+from utils_update_v2 import ReplayBufferJoint
 from visual_sensing import VS_CAMERA, vs_c10_edge_distances
 
 
@@ -89,8 +92,11 @@ class MovementConstraintPenaltyTest(unittest.TestCase):
             }]
         result = movement_constraint_penalties(self.env)
         self.assertEqual(result["com_range_sample_count"], 2)
-        self.assertAlmostEqual(result["com_range_penalty_sum"], 0.5)
-        self.assertAlmostEqual(result["com_range_penalty_mean"], 0.25)
+        self.assertAlmostEqual(result["com_range_penalty_sum"], 0.525)
+        self.assertAlmostEqual(result["com_range_penalty_mean"], 0.2625)
+        self.assertAlmostEqual(
+            result["com_range_weighted_penalty"], 0.525
+        )
         self.assertEqual(result["com_in_range_pair_count"], 1)
         self.assertEqual(result["com_out_of_range_pair_count"], 1)
 
@@ -99,7 +105,15 @@ class MovementConstraintPenaltyTest(unittest.TestCase):
             1, sr.x + S2U_COMMUNICATION_RANGE_M, sr.y, sr.z
         )
         boundary = movement_constraint_penalties(self.env)
-        self.assertAlmostEqual(boundary["com_range_penalty_mean"], 0.25)
+        self.assertAlmostEqual(boundary["com_range_penalty_mean"], 0.2875)
+
+        self._uav_position(
+            1, sr.x + COM_PENALTY_REFERENCE_DISTANCE_M, sr.y, sr.z
+        )
+        penalty_boundary = movement_constraint_penalties(self.env)
+        self.assertAlmostEqual(
+            penalty_boundary["com_range_penalty_mean"], 0.2625
+        )
 
     def test_fov_com_pair_contributes_to_both_penalty_types(self):
         sr = self.env.SR_teams[0]
@@ -141,8 +155,58 @@ class MovementConstraintPenaltyTest(unittest.TestCase):
             5.0, 2.0, 1.0, penalties,
             reward_mode="dinkelbach", task_potential_enabled=False,
         )
-        self.assertAlmostEqual(enabled, 2.6)
+        self.assertAlmostEqual(enabled, 2.3)
         self.assertAlmostEqual(disabled, 3.0)
+
+    def test_online_and_replay_reward_apply_com_weight_once_with_c10_switch(self):
+        penalties = {
+            "c9_penalty_mean": 0.1,
+            "c10_penalty_mean": 0.2,
+            "com_range_penalty_mean": 0.3,
+        }
+        replay = ReplayBufferJoint(state_dim=1, action_dim=1, max_size=1)
+        replay.delivered_mbits[0, 0] = 5.0
+        replay.total_mobility_energy[0, 0] = 2.0
+        replay.c9_penalty[0, 0] = penalties["c9_penalty_mean"]
+        replay.c10_penalty[0, 0] = penalties["c10_penalty_mean"]
+        replay.com_range_penalty[0, 0] = penalties["com_range_penalty_mean"]
+        for c10_enabled in (False, True):
+            with self.subTest(c10_enabled=c10_enabled):
+                online = _interval_reward(
+                    5.0,
+                    2.0,
+                    1.0,
+                    penalties,
+                    reward_mode="dinkelbach",
+                    task_potential_enabled=True,
+                    c10_penalty_enabled=c10_enabled,
+                )
+                rebuilt = replay._reward_numpy(
+                    np.asarray([0]),
+                    current_lambda=1.0,
+                    gamma=0.99,
+                    c10_penalty_enabled=c10_enabled,
+                )
+                self.assertAlmostEqual(float(rebuilt[0, 0]), online, places=6)
+
+        disabled_online = _interval_reward(
+            5.0,
+            2.0,
+            1.0,
+            penalties,
+            task_potential_enabled=False,
+            c10_penalty_enabled=True,
+        )
+        disabled_replay = replay._reward_numpy(
+            np.asarray([0]),
+            current_lambda=1.0,
+            gamma=0.99,
+            task_potential_enabled=False,
+            c10_penalty_enabled=True,
+        )
+        self.assertAlmostEqual(
+            float(disabled_replay[0, 0]), disabled_online, places=6
+        )
 
     def test_all_methods_publish_fixed_penalty_weights(self):
         for method_id in METHOD_REGISTRY:
@@ -155,11 +219,15 @@ class MovementConstraintPenaltyTest(unittest.TestCase):
                     if method.task_potential_enabled and method.c10_penalty_enabled
                     else 0.0
                 ),
-                "com_range": 1.0 if method.task_potential_enabled else 0.0,
+                "com_range": (
+                    MOVEMENT_CONSTRAINT_WEIGHT_COM
+                    if method.task_potential_enabled
+                    else 0.0
+                ),
             }
             self.assertEqual(
                 set(config["movement_constraint_penalty_weights"].values()),
-                {1.0},
+                {1.0, MOVEMENT_CONSTRAINT_WEIGHT_COM},
             )
             self.assertEqual(
                 config["effective_movement_constraint_penalty_weights"],

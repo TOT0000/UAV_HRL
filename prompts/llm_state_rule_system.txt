@@ -18,7 +18,7 @@ EE is measured in bit/J. Incomplete or undelivered packets contribute zero. Late
 
 ## 3. Space, timing, and movement
 
-There are 16 UAVs in x,y within [0,1000] m and altitude within [50,150] m. The GS is at (0,0,0) m. Production episodes last 60 s. TD3 decides every 1 s; each action spans four 0.25 s movement/routing substeps. Small-scale fading blocks are 5 ms. Positions and link conditions update through the existing simulation flow before slot service. SRs can move. UAV 0 is the permanent GS gateway and is controlled by Search/Hover movement under its existing 400 m 3-D GS constraint. Boundaries and projection can make realized displacement differ from a requested action. Energy uses actual displacement.
+There are 16 UAVs in x,y within [0,1000] m and altitude within [50,150] m. The GS is at (0,0,0) m. Production episodes last 500 s. TD3 decides every 1 s; each action spans four 0.25 s movement/routing substeps. Small-scale fading blocks are 5 ms. SRs start 350 m from GS on a deterministic equiangular quarter arc and move at the effective runtime speed (normally 1.5 m/s). Positions and link conditions update through the existing simulation flow before slot service. UAV 0 is the permanent GS gateway and is controlled by Search/Hover movement under its existing 400 m 3-D GS constraint. Boundaries and projection can make realized displacement differ from a requested action. Energy uses actual displacement.
 
 Resolved settings:
 
@@ -50,7 +50,7 @@ Actual capture validity instead comes from the projected oblique camera footprin
 
 ## 7. Communication, capacity, and within-slot service
 
-S2U, U2U, and U2G eligibility use inclusive 3-D distance <=400 m. Serviceable active links share 10 MHz equally at each event-time allocation. With N_active serviceable links, B_link=10^7/N_active Hz. Link capacity is C=B*log2(1+P*10^(-PL/10)*G/(N0*B)) bit/s. S2U transmit power is 23 dBm, U2U/U2G transmit power is 30 dBm, and noise PSD is -169 dBm/Hz.
+S2G, S2U, U2U, and U2G eligibility use inclusive 3-D distance <=400 m. An SR in range selects S2G; otherwise it selects S2U to its assigned COM UAV. S2G uses 2 GHz free-space-only loss, 23 dBm, and no fading. Serviceable active links share 10 MHz equally at each event-time allocation. With N_active serviceable links, B_link=10^7/N_active Hz. Other link capacity is C=B*log2(1+P*10^(-PL/10)*G/(N0*B)) bit/s. S2U transmit power is 23 dBm, U2U/U2G transmit power is 30 dBm, and noise PSD is -169 dBm/Hz.
 
 For air-to-ground links, p_LoS=1/(1+11.95*exp[-0.136*(elevation_degrees-11.95)]). Large-scale path loss is 20*log10(d_3D)+20*log10(2.0)+32.44+eta dB, with eta=2 dB for LoS and eta=20 dB for NLoS. For a U2U sender at altitude z_i, path loss is max(23.9-1.8*log10(z_i),20)*log10(max(d_3D,1))+20*log10(40*pi*2.4/3) dB. LoS and U2U fading is Rician with linear K=10; NLoS fading is Rayleigh. Air-to-ground LoS/NLoS state follows the existing one-second update flow and small-scale fading blocks are 5 ms.
 
@@ -71,7 +71,7 @@ Total power is n_r*(P_profile+P_induced+P_climb+P_parasite), and substep energy 
 
 ## 9. Existing learning signals and metrics
 
-TD3 movement reward per one-second interval is r_move=B_complete_Mbit-lambda_EE_Mbit_per_J*E_move_J-P_C9-P_COM. B_complete includes timely and late complete GS delivery. P_C9 is mean(1-G) over assigned FOV pairs. C10 geometry remains computed and reported but P_C10 is disabled. P_COM is mean(1-clip(400/(d_3D+epsilon),0,1)) over assigned COM pairs. Each active penalty has unit weight and is averaged over its own applicable current pair population; an empty population contributes zero. A dual-role UAV can enter both populations.
+TD3 movement reward per one-second interval is r_move=B_complete_Mbit-lambda_EE_Mbit_per_J*E_move_J-P_C9-P_COM. B_complete includes timely and late complete GS delivery through S2G or UAV forwarding. P_C9 is mean(1-G) over assigned FOV pairs with unit weight. C10 geometry remains computed and reported but P_C10 is disabled. P_COM is 2*mean(max(0,1-380/(d_3D+epsilon))) over assigned COM pairs; direct S2G SRs are absent from this population. Each active penalty is averaged over its own applicable current pair population; an empty population contributes zero. A dual-role UAV can enter both populations.
 
 Routing reward per sender and slot is the shared timely useful bits delivered to the GS divided by 10,000, plus that sender's fully completed U2U/U2G hop useful bits times signed three-dimensional GS-distance progress divided by 400 and 10,000. Completion positions are authoritative; late packets still earn hop progress, while S2U and partial hops earn none. Episode routing reward counts the shared delivery quantity once per slot plus every sender-local progress event. Safe-DDQN retains its binary packet-decision-chain cost and original epsilon-greedy selection; the system violation target is 5% and the lambda_cost update coefficient is 0.05. The injected runtime definitions are authoritative for effective SR speed and routing-guard mode. Routing reward, routing cost, system violation rate, and EE have different scopes and denominators.
 

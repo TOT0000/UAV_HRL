@@ -163,25 +163,25 @@ class ScenarioManifestTest(unittest.TestCase):
             ],
             [
                 (
-                    "test:uav-hrl-scenario-v8:mixed-2-8:20260927:000000",
-                    13365926783996891901,
-                    4,
+                    "test:uav-hrl-scenario-v11:mixed-2-8:20260927:000000",
+                    953043997277681710,
+                    2,
                 ),
                 (
-                    "test:uav-hrl-scenario-v8:mixed-2-8:20260927:000001",
-                    12912678206454183004,
-                    4,
+                    "test:uav-hrl-scenario-v11:mixed-2-8:20260927:000001",
+                    2781075027988015013,
+                    8,
                 ),
                 (
-                    "test:uav-hrl-scenario-v8:mixed-2-8:20260927:000002",
-                    8448027389647038549,
-                    3,
+                    "test:uav-hrl-scenario-v11:mixed-2-8:20260927:000002",
+                    5787626342504439188,
+                    4,
                 ),
             ],
         )
         self.assertEqual(
             random_manifest.content_hash,
-            "0400bf5fd45e340d559be6d240dc23f29df9480f5bf9e1e8786da6561a1b18ef",
+            "76714122ebd38f61cf392bd736467c95650d7787647330fee7e6e9cafd4e9481",
         )
         self.assertEqual(balanced.to_dict(), repeated.to_dict())
         self.assertEqual(
@@ -297,6 +297,16 @@ class ScenarioManifestTest(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "legacy 10-UAV.*16-UAV v8"):
             ScenarioManifest.from_dict(data)
+
+    def test_pre_mission_s2g_manifests_are_explicitly_obsolete(self):
+        for schema_version in ("uav-hrl-scenario-v8", "uav-hrl-scenario-v10"):
+            with self.subTest(schema_version=schema_version):
+                data = generate_manifest("test", 912, 1).to_dict()
+                data["schema_version"] = schema_version
+                with self.assertRaisesRegex(
+                    ValueError, "quarter-arc, 1.5 m/s, mission-clock S2G"
+                ):
+                    ScenarioManifest.from_dict(data)
 
     def test_training_manifest_extension_preserves_exact_canonical_prefix(self):
         previous = generate_manifest("train", 913, 3, num_gt=4)

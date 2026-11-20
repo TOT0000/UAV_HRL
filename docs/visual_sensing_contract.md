@@ -28,7 +28,8 @@ constraint. Resolution remains an input to the existing VS utility and
 packet-size calculations.
 
 All methods whose existing task-potential flag is enabled now use post-action
-C9, C10, and assigned COM-range penalties with unit weights. Each task type is
+C9 and C10 retain unit coefficients; the assigned COM-range raw mean uses
+weight two. Each task type is
 averaged over its assigned pairs and is not normalized by episode length.
 `no_task_potential` applies none of these penalties. Training, evaluation and
 checkpoint validation use the same resolved configuration. The current

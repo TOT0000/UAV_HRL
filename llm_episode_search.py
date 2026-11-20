@@ -21,6 +21,7 @@ from typing import Any, Callable, Iterable
 
 import numpy as np
 
+from experiment_config import PRODUCTION_EPISODE_HORIZON_SECONDS
 from llm_baseline import FIXED_ARRAY_FIELDS, BaselineDataError, load_sampling_source
 from llm_candidate import (
     CandidateError,
@@ -76,7 +77,7 @@ from training_history import read_committed_training_history, training_history_i
 
 
 SEARCH_RUN_SCHEMA_VERSION = "uav-hrl-llm-episode-search-run-v1"
-SEARCH_PROMPT_VERSION = "uav-hrl-llm-episode-search-prompt-v3-complete-ee-no-c10"
+SEARCH_PROMPT_VERSION = "uav-hrl-llm-episode-search-prompt-v4-mission-s2g"
 SEARCH_METHOD_ID = "td3_dinkelbach_llm_search"
 DEFAULT_OUTPUT_ROOT = Path("results") / "llm_episode_searches"
 DEFAULT_MAX_SEARCH_ROUNDS = 5
@@ -2064,7 +2065,7 @@ def revalidate_episode_search(
         episodes=int(settings.get("evaluation_episodes", 0)),
         roi_count=int(settings.get("evaluation_roi_count", 0)),
         environment_size_m=tuple(settings.get("evaluation_area_m") or ()),
-        episode_seconds=60,
+        episode_seconds=PRODUCTION_EPISODE_HORIZON_SECONDS,
     )
     baseline_preflight = _reconcile_saved_baseline_preflight(
         output=output,
@@ -2510,7 +2511,7 @@ def run_episode_search(
                 episodes=evaluation_episodes,
                 roi_count=8,
                 environment_size_m=(1000.0, 1000.0),
-                episode_seconds=60,
+                episode_seconds=PRODUCTION_EPISODE_HORIZON_SECONDS,
             )
         except Exception as exc:
             failure = {

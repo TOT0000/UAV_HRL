@@ -86,7 +86,7 @@ class EnvironmentSizeSelectionTest(unittest.TestCase):
             evaluation_sweep_points("environment_size", roi_counts=(4, 8))
 
     def test_horizon_selectors_are_strict_and_cartesian(self):
-        self.assertEqual(resolve_episode_horizons_s(), (60,))
+        self.assertEqual(resolve_episode_horizons_s(), (500,))
         self.assertEqual(
             resolve_episode_horizons_s(episode_horizons_s=(120, 60, 120)),
             (120, 60),
@@ -107,8 +107,8 @@ class EnvironmentSizeSelectionTest(unittest.TestCase):
         self.assertEqual(
             [point["point_id"] for point in points],
             [
-                "map_750m", "map_750m_t120s", "map_750m_t600s",
-                "map_1000m", "map_1000m_t120s", "map_1000m_t600s",
+                "map_750m_t60s", "map_750m_t120s", "map_750m_t600s",
+                "map_1000m_t60s", "map_1000m_t120s", "map_1000m_t600s",
             ],
         )
         self.assertEqual(
@@ -165,7 +165,7 @@ class EnvironmentSizeSelectionTest(unittest.TestCase):
             )
         self.assertEqual(runner.call_args.kwargs["environment_sizes_m"], (2000, 750))
         self.assertEqual(runner.call_args.kwargs["roi_counts"], (6,))
-        self.assertEqual(runner.call_args.kwargs["episode_horizons_s"], (60,))
+        self.assertEqual(runner.call_args.kwargs["episode_horizons_s"], (500,))
         with mock.patch(
             "run_paper_evaluation.run_paper_evaluation", return_value={}
         ) as horizon_runner:
@@ -213,7 +213,7 @@ class EnvironmentSizeSelectionTest(unittest.TestCase):
 
 
 class EnvironmentSizeManifestAndSimulatorTest(unittest.TestCase):
-    def test_fixed_roi_v8_identity_path_is_unchanged(self):
+    def test_fixed_roi_v11_identity_uses_current_mission_s2g_contract(self):
         manifest = generate_manifest("test", 20260817, 1, num_gt=8)
         self.assertEqual(manifest.schema_version, SCENARIO_SCHEMA_VERSION)
         self.assertEqual(manifest.environment_width_m, 1000)
@@ -221,11 +221,11 @@ class EnvironmentSizeManifestAndSimulatorTest(unittest.TestCase):
         self.assertNotIn("environment_size_m", manifest.to_dict())
         self.assertEqual(
             manifest.episodes[0]["scenario_id"],
-            "test:uav-hrl-scenario-v8:fixed-8:20260817:000000",
+            "test:uav-hrl-scenario-v11:fixed-8:20260817:000000",
         )
         self.assertEqual(
             manifest.content_hash,
-            "35bab1957e80164439cbcc36b8cdf676b005435a9f2702cc11d1a7a345ba7f0d",
+            "0e66048355078b529ee669f94dc3ea98b6ba3bb5b20f2740180e4ebbafe599f3",
         )
 
     def test_size_manifests_are_deterministic_distinct_and_in_bounds(self):
@@ -251,15 +251,16 @@ class EnvironmentSizeManifestAndSimulatorTest(unittest.TestCase):
                 loaded = ScenarioManifest.from_dict(manifest.to_dict())
                 self.assertEqual(loaded.environment_size_m, size)
                 entry = manifest.episodes[0]
-                expected_boundary = {
-                    0: (0.0, size / 2.0),
-                    1: (float(size), size / 2.0),
-                    2: (size / 2.0, 0.0),
-                    3: (size / 2.0, float(size)),
-                }
                 for sr in entry["sr_teams"]:
+                    theta = (sr["sr_id"] + 1) * math.pi / (
+                        2.0 * (len(entry["sr_teams"]) + 1)
+                    )
                     self.assertEqual(
-                        tuple(sr["position"][:2]), expected_boundary[sr["sr_id"] % 4]
+                        tuple(sr["position"][:2]),
+                        (
+                            350.0 * math.cos(theta),
+                            350.0 * math.sin(theta),
+                        ),
                     )
                 for gt in entry["ground_targets"]:
                     x, y, _ = gt["position"]
@@ -714,7 +715,7 @@ class EnvironmentSizeSmokeTest(unittest.TestCase):
                     ],
                     "scaled_canonical_connectivity_preserving",
                 )
-                self.assertEqual(metadata["points"][0]["training_episode_horizon_s"], 60)
+                self.assertEqual(metadata["points"][0]["training_episode_horizon_s"], 500)
                 self.assertEqual(metadata["points"][0]["evaluation_episode_horizon_s"], 3)
                 self.assertEqual(
                     metadata["points"][0]["remaining_time_normalization"],

@@ -16,6 +16,7 @@ from typing import Any
 
 import numpy as np
 
+from experiment_config import PRODUCTION_EPISODE_HORIZON_SECONDS
 from llm_explorer import (
     ExplorerValidationError,
     LLMExplorerConfig,
@@ -49,7 +50,7 @@ from llm_explorer_v3 import (
 LLM_EXPLORER_TD3_ONLY_METHOD_ID = "td3_dinkelbach_llm_explorer_td3_only"
 LLM_EXPLORER_TD3_ONLY_VERSION = "uav-hrl-llm-explorer-td3-only-v1"
 LLM_EXPLORER_TD3_ONLY_PROMPT_VERSION = (
-    "uav-hrl-llm-explorer-td3-only-prompts-v5-runtime-routing-policy"
+    "uav-hrl-llm-explorer-td3-only-prompts-v6-mission-s2g-runtime-policy"
 )
 LLM_EXPLORER_TD3_ONLY_SUMMARY_VERSION = (
     "shared-goodput-movement-communication-summary-v3"
@@ -73,7 +74,7 @@ class LLMExplorerTD3OnlyConfig(LLMExplorerConfig):
     call_schedule_version: str = LLM_EXPLORER_LEGACY_CALL_SCHEDULE_VERSION
     input_hard_limit_tokens: int = LLM_EXPLORER_TD3_ONLY_MAX_INPUT_TOKENS
     annealing_end_episode: int = LLM_EXPLORER_TD3_ONLY_ANNEAL_END_EPISODE
-    episode_joint_transitions: int = 60
+    episode_joint_transitions: int = PRODUCTION_EPISODE_HORIZON_SECONDS
 
     def __post_init__(self) -> None:
         super().__post_init__()

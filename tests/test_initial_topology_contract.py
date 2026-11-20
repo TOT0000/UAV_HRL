@@ -212,7 +212,7 @@ class InitialTopologyGeometryTest(unittest.TestCase):
                 )
 
     def test_schema_15_checkpoint_is_rejected_for_old_initial_geometry(self):
-        self.assertEqual(CHECKPOINT_SCHEMA_VERSION, 37)
+        self.assertEqual(CHECKPOINT_SCHEMA_VERSION, 38)
         with self.assertRaisesRegex(
             RuntimeError, "GS-reachable initial topology.*must be retrained"
         ):
@@ -301,6 +301,7 @@ class InitialTopologyDeliveryTest(unittest.TestCase):
         seed = 20260817
         config = formal_training_config(
             20,
+            episode_seconds=1,
             random_seed=seed,
             enable_model_checkpoints=False,
             enable_full_resume=False,
@@ -321,9 +322,14 @@ class InitialTopologyDeliveryTest(unittest.TestCase):
             float(row["timely_goodput_mbits"]) * 1e6
             for row in result["episode_metrics"]
         )
+        direct_s2g_bits = sum(
+            float(row["delivery_path_useful_bits"].get("S2G", 0.0))
+            for row in result["episode_metrics"]
+        )
         self.assertEqual(len(result["episode_metrics"]), 20)
         self.assertEqual(config.warmup_joint_transitions, 10_000)
-        self.assertGreater(raw_final_hop_bits, 0.0)
+        self.assertEqual(raw_final_hop_bits, 0.0)
+        self.assertGreater(direct_s2g_bits, 0.0)
         self.assertGreater(timely_goodput_bits, 0.0)
 
 

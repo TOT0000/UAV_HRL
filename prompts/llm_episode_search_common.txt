@@ -17,7 +17,7 @@ The system has three control functions:
 - TD3 controls movement for UAVs identified by movement_mask. Each controlled UAV has speed, horizontal-heading, and vertical-speed action components. Existing controllers handle search and hovering.
 - After movement updates positions and links, the routing controller selects packet next hops during communication slots.
 
-A movement decision occurs every 1 s. Each interval contains four communication slots of 0.25 s. An episode lasts 60 s.
+A movement decision occurs every 1 s. Each interval contains four communication slots of 0.25 s. A production episode lasts 500 s.
 
 The sequence is:
 current observations and task assignments
@@ -37,7 +37,7 @@ Packet deadlines are measured from generation until GS delivery:
 - VS: 0.015 s (15 ms).
 - COM: 0.010 s (10 ms).
 
-Every UAV preselects one physically legal next hop at each 0.25 s routing-slot start and holds it for the slot, even if its queue is empty. Fixed-interval source events remain invisible until generation. Complete packets may continue over multiple S2U/U2U/U2G hops in the same slot using actual event time. Only currently serviceable links share equal-FDMA bandwidth; a preselected empty link reserves none. Fading changes every 5 ms, but a hop may complete and the next hop may begin between fading boundaries.
+Every UAV preselects one physically legal next hop at each 0.25 s routing-slot start and holds it for the slot, even if its queue is empty. COM generation begins at SR mission assignment and is independent of connectivity. Complete packets may continue over S2G/S2U/U2U/U2G service in the same slot using actual event time. Only currently serviceable links share equal-FDMA bandwidth; S2G has no fading and a preselected empty link reserves none. Other fading changes every 5 ms, but a hop may complete and the next hop may begin between fading boundaries.
 
 Moving a packet to another UAV does not restart its deadline.
 

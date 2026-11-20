@@ -105,7 +105,7 @@ class Uav16ConfigurationContractTest(unittest.TestCase):
         data["schema_version"] = "uav-hrl-scenario-v2"
         with self.assertRaisesRegex(ValueError, "16-UAV.*incompatible"):
             ScenarioManifest.from_dict(data)
-        self.assertEqual(CHECKPOINT_SCHEMA_VERSION, 37)
+        self.assertEqual(CHECKPOINT_SCHEMA_VERSION, 38)
         with self.assertRaisesRegex(RuntimeError, "must be retrained"):
             _validate_checkpoint_schema({"checkpoint_schema_version": 24})
 
@@ -403,6 +403,9 @@ class ChannelAndPacketContractTest(unittest.TestCase):
             task_deadlines_seconds={"FOV": 1.0, "COM": 1.0},
         )
         sr = self.env.SR_teams[0]
+        sr.x = 500.0
+        sr.y = 500.0
+        sr.z = 0.0
         sr.assigned_gt_id = 0
         receiver = 1
         self.env.multi_tasks[receiver] = [
@@ -431,8 +434,10 @@ class ChannelAndPacketContractTest(unittest.TestCase):
                 "target_pos": sr.get_position(),
             }
         ]
-        self.assertEqual(engine.active_s2u_links(self.env), {0: receiver})
-        self.env.active_s2u_capacities = {(0, receiver): 0.001024}
+        self.assertEqual(engine.active_s2u_links(self.env), {0: 2})
+        self.assertEqual(packet["rem_bits"], packet["size_bits"])
+        self.assertEqual(packet["sr_first_hop_switch_count"], 1)
+        self.env.active_s2u_capacities = {(0, 2): 0.001024}
         arrival_slot = engine.serve_active_links(
             self.env, {}, {}, current_time=0.25
         )
@@ -440,8 +445,8 @@ class ChannelAndPacketContractTest(unittest.TestCase):
         self.assertEqual(next_packet["rem_bits"], 256.0)
         self.assertIsNone(next_packet["s2u_receiver"])
         self.assertEqual(engine.active_s2u_links(self.env), {0: 2})
-        self.assertIs(engine.get_hol_packet(receiver), packet)
-        self.assertAlmostEqual(packet["routing_eligible_time"], 0.375)
+        self.assertIs(engine.get_hol_packet(2), packet)
+        self.assertAlmostEqual(packet["routing_eligible_time"], 0.5)
         self.assertEqual(packet["generation_time"], 0.0)
         self.assertIsNone(packet["_queued_sr"])
         self.assertIsNone(packet["last_routing_sender"])
@@ -450,8 +455,8 @@ class ChannelAndPacketContractTest(unittest.TestCase):
 
         engine.serve_active_links(
             self.env,
-            {receiver: self.env.GS_ID},
-            {(receiver, self.env.GS_ID): 1.0},
+            {2: self.env.GS_ID},
+            {(2, self.env.GS_ID): 1.0},
             current_time=0.5,
         )
         self.assertTrue(packet["done"])

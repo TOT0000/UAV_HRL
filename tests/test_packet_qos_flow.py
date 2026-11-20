@@ -1,7 +1,7 @@
 import unittest
 from types import SimpleNamespace
 
-from Packet_scheduler_v1 import PacketEngine
+from Packet_scheduler_v1 import EPISODE_INJECTION_CUTOFF_SECONDS, PacketEngine
 
 
 class DummyUav:
@@ -151,17 +151,21 @@ class PacketQosFlowTest(unittest.TestCase):
             is_s2u_in_range=lambda sr_id, uav_id: True,
         )
         engine = PacketEngine(num_uav=1, step_time=0.25)
+        first_slot_start = EPISODE_INJECTION_CUTOFF_SECONDS - 0.485
         first = engine.schedule_generation_events(
             env,
-            current_time=59.5,
+            current_time=first_slot_start,
             step_time=0.25,
             base_ctrl_rate=4,
         )
-        self.assertEqual([event["time_seconds"] for event in first], [59.75])
+        self.assertEqual(
+            [event["time_seconds"] for event in first],
+            [first_slot_start + 0.25],
+        )
         engine.materialize_generation_event(env, first[0])
         after_cutoff = engine.schedule_generation_events(
             env,
-            current_time=59.75,
+            current_time=first_slot_start + 0.25,
             step_time=0.25,
             base_ctrl_rate=4,
         )

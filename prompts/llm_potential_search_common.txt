@@ -18,7 +18,7 @@ Task allocation assigns roles and service targets according to existing update r
 
 After movement updates positions and link conditions, the routing controller selects packet next hops.
 
-A movement decision occurs every 1 s. Each interval contains four communication slots of 0.25 s. An episode lasts 60 s.
+A movement decision occurs every 1 s. Each interval contains four communication slots of 0.25 s. A production episode lasts 500 s.
 
 The execution sequence is:
 
@@ -41,7 +41,7 @@ Packet deadlines are measured from generation until GS delivery:
 - VS: 0.015 s (15 ms).
 - COM: 0.010 s (10 ms).
 
-All UAVs preselect one physically legal next hop per 0.25 s routing slot and hold it for that slot. Fixed-interval traffic events are invisible before generation. Event-time, full-packet store-and-forward permits same-slot multi-hop S2U/U2U/U2G service. Dynamic equal FDMA includes only currently serviceable links, and 5 ms fading blocks do not impose a minimum hop time.
+All UAVs preselect one physically legal next hop per 0.25 s routing slot and hold it for that slot. COM starts at SR mission assignment independently of connectivity. Event-time, full-packet store-and-forward permits same-slot S2G/S2U/U2U/U2G service. Dynamic equal FDMA includes only currently serviceable links. S2G has no fading; other 5 ms fading blocks do not impose a minimum hop time.
 
 Changing a packet's current node does not restart its deadline.
 

@@ -2138,7 +2138,9 @@ def test_baseline_preflight_binds_run_checkpoint_manifest_and_episode_rows(tmp_p
         "fixed_num_gt": 8,
         "evaluation_environment_width_m": 1000.0,
         "evaluation_environment_height_m": 1000.0,
-        "evaluation_episode_horizon_s": 60,
+        "evaluation_episode_horizon_s": int(
+            episode_training.PRODUCTION_EPISODE_HORIZON_SECONDS
+        ),
         "scenario_manifest_hash": manifest.content_hash,
         "scenario_ids": scenario_ids,
         "evaluation_runtime_provenance": {

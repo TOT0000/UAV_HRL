@@ -341,11 +341,20 @@ def test_v3_calls_twice_and_exposes_raw_and_once_scaled_bias(tmp_path):
     )
     controller.previous_episode_feedback = _feedback()
     guidance = _begin(controller, 384, 20_000)
+    expected_weight = llm_guidance_weight(
+        384,
+        start_episode=first_eligible_episode(
+            controller.config.warmup_joint_transitions,
+            controller.config.episode_joint_transitions,
+        ),
+    )
     assert len(client.calls) == 2
-    assert guidance["annealing_weight"] == 0.5
-    assert guidance["routing_alpha"] == 0.4
+    assert guidance["annealing_weight"] == pytest.approx(expected_weight)
+    assert guidance["routing_alpha"] == pytest.approx(0.8 * expected_weight)
     np.testing.assert_allclose(guidance["td3_bias_raw"][:, 0], 0.2)
-    np.testing.assert_allclose(guidance["td3_bias_effective"][:, 0], 0.1)
+    np.testing.assert_allclose(
+        guidance["td3_bias_effective"][:, 0], 0.2 * expected_weight
+    )
     assert guidance["routing_prior_named"]["UAV_0"]["WAIT"] == pytest.approx(1 / 17)
     assert all("{{" not in call["prompt"] for call in client.calls)
     assert all("{{" not in call["system_prompt"] for call in client.calls)
@@ -380,7 +389,9 @@ def test_v3_calls_twice_and_exposes_raw_and_once_scaled_bias(tmp_path):
     replay.previous_episode_feedback = _feedback()
     restored = _begin(replay, 384, 20_000)
     assert restored["reused"] and replay_client.calls == []
-    np.testing.assert_allclose(restored["td3_bias_effective"][:, 0], 0.1)
+    np.testing.assert_allclose(
+        restored["td3_bias_effective"][:, 0], 0.2 * expected_weight
+    )
 
 
 def test_guidance_stage_receives_self_contained_previous_raw_bias(tmp_path):

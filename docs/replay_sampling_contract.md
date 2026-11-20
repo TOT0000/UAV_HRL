@@ -51,8 +51,8 @@ capture reads absent SR queues without inserting keys into the queue mapping.
 At 50,000 transitions, the auxiliary fields require approximately 557 MiB of
 uncompressed RAM (11,679 bytes per transition). The fixed-shape fields use
 `float32`, `int32`/`int16`/`int8`, and Boolean arrays; fixed configuration is
-stored once in metadata. NPZ output uses compression. A normal 100-by-60-second
-sampling run preallocates 6,000 transitions, or about 66.8 MiB of auxiliary RAM.
+stored once in metadata. NPZ output uses compression. A normal 100-by-500-second
+sampling run preallocates 50,000 transitions, or about 557 MiB of auxiliary RAM.
 
 ## Independent sampling CLI
 

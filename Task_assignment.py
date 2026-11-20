@@ -19,6 +19,7 @@ from experiment_config import (
     RESERVED_SEARCH_UAV_IDS,
     SEARCH_COVERAGE_THRESHOLD,
 )
+from communication_contract import is_within_communication_range
 SERVICE_TASK_TYPES = ("FOV", "COM")
 FOV_COM_TASK_TYPES = ("FOV", "COM")
 
@@ -291,8 +292,15 @@ class UAVAssigner:
                     sr = self.env.SR_teams[int(task.target_obj_id)]
                     if sr.assigned_gt_id is None:
                         continue
-                    raw = self.env.get_sr_uav_capacity_mbps(
-                        uav_id, int(task.target_obj_id)
+                    sr_id = int(task.target_obj_id)
+                    uav_position = self.env.uav_dict[int(uav_id)].get_position()
+                    sr_position = sr.get_position()
+                    raw = (
+                        self.env.get_sr_uav_capacity_mbps(uav_id, sr_id)
+                        if is_within_communication_range(
+                            uav_position, sr_position
+                        )
+                        else 0.0
                     )
                     if math.isfinite(raw):
                         raw_com[row, column] = raw

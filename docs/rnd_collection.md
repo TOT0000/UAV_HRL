@@ -126,6 +126,6 @@ masks, and stable trace IDs. Sampling bonuses are explicitly labeled
 `checkpoint_frozen_diagnostic_not_applied_to_actions`; they are not confused
 with online training-time bonuses.
 
-The defaults represent 100 complete 60-step episodes per checkpoint (600
-episodes, normally about 36,000 transitions). The collector records the actual
+The defaults represent 100 complete 500-step episodes per checkpoint (600
+episodes, normally about 300,000 transitions). The collector records the actual
 transition count and does not pad a shortened environment trajectory.

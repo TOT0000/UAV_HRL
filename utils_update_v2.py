@@ -9,6 +9,9 @@ from centralized_movement import (
     validate_movement_mask,
 )
 from experiment_config import (
+    MOVEMENT_CONSTRAINT_WEIGHT_C9,
+    MOVEMENT_CONSTRAINT_WEIGHT_C10,
+    MOVEMENT_CONSTRAINT_WEIGHT_COM,
     TASK_POTENTIAL_BETA_COM,
     TASK_POTENTIAL_BETA_SEARCH,
     TASK_POTENTIAL_BETA_VS,
@@ -389,13 +392,23 @@ class ReplayBufferJoint:
             objective[~np.isfinite(objective)] = 0.0
         else:
             raise ValueError(f"unsupported reward mode: {reward_mode}")
-        del not_done, gamma, beta_search, beta_vs, beta_com
+        del not_done, gamma, beta_search, beta_vs
         penalty_scale = 1.0 if task_potential_enabled else 0.0
+        if not np.isclose(
+            float(beta_com), MOVEMENT_CONSTRAINT_WEIGHT_COM,
+            rtol=0.0,
+            atol=0.0,
+        ):
+            raise ValueError("beta_com must equal the authoritative COM weight")
         constraint_penalty = (
-            self.c9_penalty[indices] + self.com_range_penalty[indices]
+            MOVEMENT_CONSTRAINT_WEIGHT_C9 * self.c9_penalty[indices]
+            + float(beta_com) * self.com_range_penalty[indices]
         )
         if c10_penalty_enabled:
-            constraint_penalty = constraint_penalty + self.c10_penalty[indices]
+            constraint_penalty = (
+                constraint_penalty
+                + MOVEMENT_CONSTRAINT_WEIGHT_C10 * self.c10_penalty[indices]
+            )
         reward = objective - penalty_scale * constraint_penalty
         beta = float(llm_reward_beta)
         if beta != 0.0:

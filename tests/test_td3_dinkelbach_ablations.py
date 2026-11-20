@@ -79,7 +79,7 @@ class AblationRegistryAndConfigurationTest(unittest.TestCase):
         self.assertFalse(no_c10["c10_penalty_enabled"])
         self.assertEqual(
             no_c10["effective_movement_constraint_penalty_weights"],
-            {"c9": 1.0, "c10": 0.0, "com_range": 1.0},
+            {"c9": 1.0, "c10": 0.0, "com_range": 2.0},
         )
         self.assertEqual(interval_200["dinkelbach_update_interval_episodes"], 200)
         self.assertEqual(
@@ -133,8 +133,8 @@ class C10PenaltyAblationRewardTest(unittest.TestCase):
     def test_live_and_replay_rewards_remove_only_nonzero_c10_penalty(self):
         baseline_live = self._live_reward(True)
         no_c10_live = self._live_reward(False)
-        self.assertAlmostEqual(baseline_live, 3.5)
-        self.assertAlmostEqual(no_c10_live, 4.25)
+        self.assertAlmostEqual(baseline_live, 3.0)
+        self.assertAlmostEqual(no_c10_live, 3.75)
         self.assertAlmostEqual(no_c10_live - baseline_live, 0.75)
 
         replay = ReplayBufferJoint(1, 1, max_size=2)

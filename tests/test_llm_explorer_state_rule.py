@@ -98,8 +98,10 @@ class OneUavEventEnvironment:
         self.B_tot = 10e6
         self.current_time = 0.0
         self.source_uavs = {0}
-        self.multi_tasks = {0: []}
-        self.SR_teams = []
+        self.multi_tasks = {
+            0: [{"task_type": "COM", "target_obj_id": 0, "target_id": 0}]
+        }
+        self.SR_teams = [SimpleNamespace(id=0, assigned_gt_id=0)]
         self.active_link_capacity_profiles_mbps = {}
         self.active_s2u_capacity_profiles_mbps = {}
         self.active_s2u_capacities = {}
@@ -112,6 +114,10 @@ class OneUavEventEnvironment:
     def is_s2u_in_range(self, sr_id, receiver):
         del sr_id, receiver
         return True
+
+    def is_s2g_in_range(self, sr_id):
+        del sr_id
+        return False
 
     def allocate_active_link_capacities(self, proposed_links, s2u_links=None):
         links = {
@@ -154,6 +160,9 @@ class SixteenUavEventEnvironment(OneUavEventEnvironment):
         }
         self.source_uavs = set(range(16))
         self.multi_tasks = {uav_id: [] for uav_id in range(16)}
+        self.multi_tasks[0] = [
+            {"task_type": "COM", "target_obj_id": 0, "target_id": 0}
+        ]
 
 
 def runtime_fixture():

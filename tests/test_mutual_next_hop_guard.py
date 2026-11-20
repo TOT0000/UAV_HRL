@@ -348,13 +348,15 @@ def test_off_path_preserves_fixed_order_and_masks():
 
 
 def test_training_uses_shared_guard_strategy():
-    result = train(config=smoke_training_config(), mutual_next_hop_guard=True)
+    config = smoke_training_config()
+    config.episode_seconds = 1
+    result = train(config=config, mutual_next_hop_guard=True)
     assert result["run_metadata"]["mutual_next_hop_guard_enabled"] is True
     assert (
         result["run_metadata"]["evaluation_routing_strategy_scope"]
         == "training_and_evaluation"
     )
-    assert result["run_metadata"]["effective_sr_speed_mps"] == 5.0
+    assert result["run_metadata"]["effective_sr_speed_mps"] == 1.5
     formal_config = result["run_metadata"]["formal_config"]
     routing_config = formal_config[
         "routing_agent_configuration"

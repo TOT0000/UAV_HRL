@@ -10,7 +10,7 @@ Search behavior discovers regions of interest, RoIs. After discovery, the existi
 
 A UAV may serve both FOV and COM. Roles and service targets may change within an episode.
 
-FOV packets originate at the sensing UAV. COM packets originate at an SR, first access its serving UAV through S2U, and then reach GS directly or through UAV relays and a final U2G hop.
+FOV packets originate at the sensing UAV. COM packets originate at an SR after its rescue mission is assigned. An SR within the inclusive 400 m 3-D GS range transmits directly through S2G; otherwise it uses its serving UAV through S2U and then UAV forwarding.
 
 The primary objective is the energy efficiency of complete useful delivery:
 
@@ -25,7 +25,7 @@ UAV 0 is reserved as a GS gateway and is excluded from FOV/COM assignment. Its S
 [Time, transmission, and deadlines]
 
 Standard settings are:
-- Episode duration: 60 s.
+- Episode duration: 500 s.
 - Movement decision interval: 1 s.
 - Routing slot: 0.25 s.
 - Fading block: 5 ms.
@@ -38,7 +38,7 @@ At each routing-slot start, every UAV preselects one next hop and holds it until
 
 Transmission uses full-packet store-and-forward. After completing a hop, a packet may continue through another hop in the same slot when the receiving UAV's preselected action and link are serviceable. A link may serve multiple packets sequentially within a slot.
 
-Standard COM traffic is 50 packets/s, 256 bits/packet, with a 10 ms end-to-end deadline. Sessions activate under the existing assignment and first-access conditions.
+Standard COM traffic is 50 packets/s, 256 bits/packet, with a 10 ms end-to-end deadline. A session activates at SR mission assignment, with its first packet one full 0.02 s period later, independently of UAV assignment or connectivity.
 
 The standard FOV generation rate is 5 packets/s with a 15 ms end-to-end deadline. Actual generation depends on valid sensing.
 
@@ -46,7 +46,7 @@ Deadlines start at source generation and include SR access, waiting, queueing, a
 
 A routing slot lasts 250 ms, much longer than the 10/15 ms deadlines. Same-slot forwarding therefore matters. If a packet is already waiting at slot start, selecting WAIT prevents that UAV from forwarding it during its remaining deadline.
 
-The standard S2U, U2U, and U2G communication limit is a 3D distance of 400 m. Currently serviceable links dynamically share the standard total bandwidth of 10 MHz equally. Empty preselected links reserve no bandwidth.
+The standard S2G, S2U, U2U, and U2G communication limit is an inclusive 3D distance of 400 m. S2G uses deterministic free-space-only 2 GHz loss with no fading. Currently serviceable links dynamically share the standard total bandwidth of 10 MHz equally. Each SR has only one S2G-or-S2U uplink, and empty preselected links reserve no bandwidth.
 
 Geometry and channel conditions affect capacity. Realized transmission also depends on bandwidth sharing and queues. Remaining deadline indicates whether completion can still be timely, but crossing it does not stop or reprioritize service. A legal individual hop does not establish that an entire route can deliver on time.
 
@@ -103,7 +103,7 @@ The original TD3 reward is:
 
 r_move = B_complete,Mbit - lambda_EE*E_move,J - P_C9 - P_COM.
 
-lambda_EE uses Mbit/J. B_complete includes timely and late complete GS delivery; partial or unfinished packets contribute zero. P_C9 and P_COM retain their definitions. C10 geometry is still supplied for diagnostics but P_C10 is disabled. Each active penalty is averaged over its own applicable service-pair population; an empty population contributes zero.
+lambda_EE uses Mbit/J. B_complete includes timely and late complete GS delivery, including S2G; partial or unfinished packets contribute zero. P_C9 has unit weight. P_COM is twice the mean of max(0,1-380/(d_3D+epsilon)) over currently assigned COM UAV-SR pairs. C10 geometry is still supplied for diagnostics but P_C10 is disabled. Each active penalty is averaged over its own applicable service-pair population; an empty population contributes zero.
 
 The Safe-DDQN reward for each routing slot is:
 

@@ -63,13 +63,13 @@ from llm_episode_search import (
     validate_search_candidate,
 )
 from llm_numeric_operations import NUMERIC_OPERATION_RULES_VERSION
-from experiment_config import DEFAULT_TRAINING_SEED
+from experiment_config import DEFAULT_TRAINING_SEED, PRODUCTION_EPISODE_HORIZON_SECONDS
 from llm_episode_training import WINDOWS_PORTABLE_PATH_LIMIT
 from scenario_manifest import ScenarioManifest
 
 
 SEARCH_RUN_SCHEMA_VERSION = "uav-hrl-llm-training-search-run-v1"
-SEARCH_PROMPT_VERSION = "uav-hrl-llm-training-search-prompt-v4-complete-ee-no-c10"
+SEARCH_PROMPT_VERSION = "uav-hrl-llm-training-search-prompt-v5-mission-s2g"
 LEGACY_PROMPT_VERSION = "uav-hrl-llm-training-search-prompt-v1"
 PROMPT_MIGRATION_ID = "compact-training-feedback-v2"
 SEARCH_METHOD_ID = "td3_dinkelbach_llm_train_search"
@@ -80,7 +80,7 @@ DEFAULT_REPAIRS_PER_CANDIDATE = 5
 DEFAULT_TRAIN_EPISODES = 800
 DEFAULT_EVALUATION_EPISODES = 100
 DEFAULT_EVALUATION_ROI_COUNT = 8
-DEFAULT_EPISODE_SECONDS = 60
+DEFAULT_EPISODE_SECONDS = PRODUCTION_EPISODE_HORIZON_SECONDS
 DEFAULT_VALIDATION_EPISODES = 4
 ROUND_DIRECTIONS = ("add", "remove", "reweight", "redesign")
 
