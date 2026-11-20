@@ -222,6 +222,7 @@ from llm_state_rule_explorer import (
 )
 
 
+REWARD_STEP_RECORD_SCHEMA_VERSION = "uav-hrl-movement-reward-step-v1"
 MOVEMENT_CONTROL_INTERVAL = int(round(MOVEMENT_INTERVAL_SECONDS / ROUTING_SLOT_SECONDS))
 if not np.isclose(
     MOVEMENT_CONTROL_INTERVAL * ROUTING_SLOT_SECONDS,
@@ -2554,6 +2555,7 @@ def train(
     llm_explorer_log_mode=None,
     routing_loop_diagnostics=None,
     mutual_next_hop_guard=None,
+    reward_step_record_sink=None,
 ):
     if config is None:
         raise ValueError(
@@ -2723,6 +2725,10 @@ def train(
                 "routing-loop diagnostics collector is missing methods: "
                 + ", ".join(missing)
             )
+    if reward_step_record_sink is not None and not callable(
+        reward_step_record_sink
+    ):
+        raise TypeError("reward_step_record_sink must be callable")
     collect_sr_speed_diagnostics = bool(collect_sr_speed_diagnostics)
     if collect_sr_speed_diagnostics and not evaluation:
         raise ValueError("SR-speed diagnostics are available only during evaluation")
@@ -4576,6 +4582,124 @@ def train(
                 c10_penalty_enabled=method_spec.c10_penalty_enabled,
             )
             base_movement_reward = interval_reward + applied_penalty
+            if reward_step_record_sink is not None:
+                reward_step_record_sink(
+                    {
+                        "schema_version": REWARD_STEP_RECORD_SCHEMA_VERSION,
+                        "episode": int(episode),
+                        "episode_index": int(episode),
+                        "scenario_id": str(scenario_id),
+                        "movement_step": int(interval),
+                        "movement_interval_index": int(interval),
+                        "simulation_time_seconds": float(interval + 1),
+                        "time_seconds": float(interval + 1),
+                        "method_id": method_spec.method_id,
+                        "evaluation": bool(evaluation),
+                        "delivered_complete_useful_mbits": float(
+                            interval_delivered_mbits
+                        ),
+                        "delivered_complete_useful_bits": float(
+                            interval_delivered_mbits * 1e6
+                        ),
+                        "B_Mbit": float(interval_delivered_mbits),
+                        "E_move_J": float(interval_energy),
+                        "movement_energy_j": float(interval_energy),
+                        "lambda_EE": float(episode_lambda),
+                        "dinkelbach_lambda_used": float(episode_lambda),
+                        "lambda_EE_times_E_move": float(
+                            episode_lambda * interval_energy
+                        ),
+                        "ee_objective_term": float(
+                            interval_delivered_mbits
+                            - episode_lambda * interval_energy
+                        ),
+                        "ratio_objective_reward": float(ratio_objective_reward),
+                        "reward_before_constraint_penalties": float(
+                            base_movement_reward
+                        ),
+                        "c9_raw_mean": float(
+                            constraint_penalties["c9_penalty_mean"]
+                        ),
+                        "c10_raw_mean": float(
+                            constraint_penalties["c10_penalty_mean"]
+                        ),
+                        "com_raw_mean": float(
+                            constraint_penalties["com_range_penalty_mean"]
+                        ),
+                        "com_weighted_penalty": float(
+                            constraint_penalties["com_range_weighted_penalty"]
+                        ),
+                        "com_assigned_pair_count": int(
+                            constraint_penalties["com_range_sample_count"]
+                        ),
+                        "com_distance_min_m": constraint_penalties[
+                            "com_distance_min_m"
+                        ],
+                        "com_distance_mean_m": constraint_penalties[
+                            "com_distance_mean_m"
+                        ],
+                        "com_distance_max_m": constraint_penalties[
+                            "com_distance_max_m"
+                        ],
+                        "penalties": {
+                            "c9": {
+                                "raw": float(constraint_penalties["c9_penalty_mean"]),
+                                "configured_weight": float(MOVEMENT_CONSTRAINT_WEIGHT_C9),
+                                "enabled": bool(method_spec.task_potential_enabled),
+                                "deduction": float(
+                                    MOVEMENT_CONSTRAINT_WEIGHT_C9
+                                    * constraint_penalties["c9_penalty_mean"]
+                                    if method_spec.task_potential_enabled
+                                    else 0.0
+                                ),
+                            },
+                            "c10": {
+                                "raw": float(constraint_penalties["c10_penalty_mean"]),
+                                "configured_weight": float(MOVEMENT_CONSTRAINT_WEIGHT_C10),
+                                "enabled": bool(
+                                    method_spec.task_potential_enabled
+                                    and method_spec.c10_penalty_enabled
+                                ),
+                                "deduction": float(
+                                    MOVEMENT_CONSTRAINT_WEIGHT_C10
+                                    * constraint_penalties["c10_penalty_mean"]
+                                    if method_spec.task_potential_enabled
+                                    and method_spec.c10_penalty_enabled
+                                    else 0.0
+                                ),
+                            },
+                            "com": {
+                                "raw": float(constraint_penalties["com_range_penalty_mean"]),
+                                "configured_weight": float(MOVEMENT_CONSTRAINT_WEIGHT_COM),
+                                "enabled": bool(method_spec.task_potential_enabled),
+                                "deduction": float(
+                                    MOVEMENT_CONSTRAINT_WEIGHT_COM
+                                    * constraint_penalties["com_range_penalty_mean"]
+                                    if method_spec.task_potential_enabled
+                                    else 0.0
+                                ),
+                            },
+                        },
+                        "applied_constraint_penalty": float(applied_penalty),
+                        "movement_reward_after_constraints": float(
+                            interval_reward
+                        ),
+                        "llm_extra_reward": float(llm_extra_reward),
+                        "potential_shaping": float(potential_shaping),
+                        "rnd_weighted_bonus": float(
+                            0.0
+                            if rnd_record is None
+                            else rnd_record["weighted_bonus"]
+                        ),
+                        "final_training_reward": float(
+                            combined_movement_reward
+                        ),
+                        "final_replay_reward": float(
+                            combined_movement_reward
+                        ),
+                        "terminal": bool(done),
+                    }
+                )
             episode_reward += combined_movement_reward
             episode_existing_movement_reward += interval_reward
             episode_llm_extra_reward += llm_extra_reward
@@ -6609,6 +6733,12 @@ def train(
                 "fdma_policy": "equal-across-active-S2G-S2U-U2U-U2G",
             },
             "evaluation": bool(evaluation),
+            "reward_step_records_enabled": bool(
+                reward_step_record_sink is not None
+            ),
+            "reward_step_record_schema_version": (
+                REWARD_STEP_RECORD_SCHEMA_VERSION
+            ),
             "checkpoint_required": checkpoint_required,
             "packet_outcome_streamed_episode_count": (
                 packet_outcome_streamed_episode_count

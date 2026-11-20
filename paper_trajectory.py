@@ -13,7 +13,7 @@ from training_checkpoint import (
 )
 
 
-STANDALONE_TRAJECTORY_SCHEMA_VERSION = "uav-hrl-standalone-trajectory-v1"
+STANDALONE_TRAJECTORY_SCHEMA_VERSION = "uav-hrl-standalone-trajectory-v2-s2g"
 
 
 def _time(value, field):
@@ -198,7 +198,7 @@ def validate_standalone_trajectory_source(source):
             raise ValueError(
                 f"standalone trajectory active link lacks fields: {missing}"
             )
-        if str(link["link_type"]) not in {"S2U", "U2U", "U2G"}:
+        if str(link["link_type"]) not in {"S2G", "S2U", "U2U", "U2G"}:
             raise ValueError("standalone trajectory active link type is invalid")
         for field in ("capacity_bits_per_second", "transmitted_bits", "active_seconds"):
             if link.get(field) is not None and (

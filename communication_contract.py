@@ -7,6 +7,8 @@ import math
 
 MAX_3D_COMMUNICATION_DISTANCE_M = 400.0
 COMMUNICATION_RANGE_BOUNDARY_RULE = "euclidean_3d_distance_le_400m"
+S2G_MAX_3D_COMMUNICATION_DISTANCE_M = 100.0
+S2G_COMMUNICATION_RANGE_BOUNDARY_RULE = "euclidean_3d_distance_le_100m"
 COMMUNICATION_LINK_TYPES = ("S2G", "S2U", "U2G", "U2U")
 
 
@@ -25,6 +27,22 @@ def is_within_communication_range(first_position, second_position):
         32.0 * math.ulp(max(abs(distance), MAX_3D_COMMUNICATION_DISTANCE_M, 1.0)),
     )
     return distance <= MAX_3D_COMMUNICATION_DISTANCE_M + tolerance
+
+
+def is_within_s2g_range(first_position, second_position):
+    """Return the independent inclusive 3-D 100 m S2G decision."""
+
+    first = _finite_point_3d(first_position, "first_position")
+    second = _finite_point_3d(second_position, "second_position")
+    distance = math.dist(first, second)
+    tolerance = max(
+        1e-12,
+        32.0
+        * math.ulp(
+            max(abs(distance), S2G_MAX_3D_COMMUNICATION_DISTANCE_M, 1.0)
+        ),
+    )
+    return distance <= S2G_MAX_3D_COMMUNICATION_DISTANCE_M + tolerance
 
 
 def _finite_point_3d(position, name):

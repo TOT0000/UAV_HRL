@@ -158,7 +158,7 @@ class ControlledMethodRegistryTest(unittest.TestCase):
                     method_spec=spec,
                 )
                 self.assertEqual(result["movement_agent_kind"], spec.agent)
-                self.assertEqual(result["movement_state_dim"], 531)
+                self.assertEqual(result["movement_state_dim"], 619)
                 self.assertEqual(result["joint_action_dim"], 48)
                 self.assertEqual(result["proposal_batches"], 8 if rnd_method else 4)
                 self.assertIsNone(result["packet_outcome_artifacts"])

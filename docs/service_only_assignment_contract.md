@@ -19,13 +19,18 @@ and a FOV UAV may be reused for COM. `assignment_rounds<=0` runs neither,
 It does not construct or inspect utility values. Search and Hovering remain
 fallback roles and do not enter an assignment task set.
 
-Movement observation schema 7 has 531 fields: 17 fields for each of 16 UAVs,
-the 16 by 16 visited bitmap, total mobility energy and the previous executed
-action's three aggregate components. The task one-hot contains Search, FOV, COM
-and Hovering. Movement PBRS contains Search, VS and COM only, each with the
-formal default coefficient 3.0.
+Movement observation schema 8 has 619 fields: 17 fields for each of 16 UAVs,
+eleven fields for each of eight stable SR-ID slots, the 16 by 16 visited bitmap,
+and three global fields. An SR slot becomes valid only after its RoI mission is
+known, so dormant manifest SRs cannot reveal future RoIs. Each valid slot holds
+current and known-target xyz, direct/support/waiting one-hot state, and
+log-normalized FIFO backlog. The task one-hot contains Search, FOV, COM and
+Hovering. Movement PBRS contains Search, VS and COM only, each with the formal
+default coefficient 3.0. Task-aware ablations mask the complete SR block.
 
-Checkpoint schema 31 records this service-only contract. Schema 30 used
+Checkpoint schema 39 records the current service-only, SR-aware observation and
+100 m ground-Rayleigh S2G contract. Schema 38 has the older 531-D observation
+and is rejected before weights or replay are loaded. Schema 30 used
 ROI-center Search discovery, excluded gateway Search contribution and used
 mixed Random rounds, so it is rejected before weights or replay load. Schema 29 contains the
 retired explicit Relay task, its 595-D movement state and replay fields, and is

@@ -8,9 +8,11 @@ import math
 from pathlib import Path
 
 
-PACKET_OUTCOME_ARTIFACT_SCHEMA_VERSION = "uav-hrl-packet-outcomes-jsonl-v8-s2g"
+PACKET_OUTCOME_ARTIFACT_SCHEMA_VERSION = (
+    "uav-hrl-packet-outcomes-jsonl-v9-s2g-attempt-airtime"
+)
 PACKET_ROUTING_DIAGNOSTIC_CONTRACT_VERSION = (
-    "uav-hrl-packet-routing-diagnostics-v7-s2g"
+    "uav-hrl-packet-routing-diagnostics-v8-s2g-attempt-airtime"
 )
 PACKET_ROUTING_DIAGNOSTIC_DEFINITIONS = {
     "routing_wait_definition": (
@@ -87,10 +89,12 @@ PACKET_ROUTING_DIAGNOSTIC_DEFINITIONS = {
         "for COM, queue delay ends at first actual first-hop service or terminal "
         "finish_time if service never starts, and S2U tx delay is actual "
         "positive-capacity block airtime including incomplete S2U service; both "
-        "fields are null for FOV"
+        "fields are null for FOV; cumulative and per-hop actual_tx_s include "
+        "discarded attempts, while successful_attempt_actual_tx_s and "
+        "retransmitted_actual_tx_s keep the mutually exclusive decomposition"
     ),
     "sr_first_hop_definition": (
-        "S2G is selected at inclusive SR-GS 3-D distance <=400 m and otherwise "
+        "S2G is selected at inclusive SR-GS 3-D distance <=100 m and otherwise "
         "S2U uses the assigned COM UAV. S2G and S2U completion flags/times are "
         "separate; delivery_path is S2G, S2U_UAV, or UAV. Endpoint changes "
         "restart incomplete SR service from the full packet and retain identity, "
@@ -131,6 +135,8 @@ PACKET_OUTCOME_REQUIRED_FIELDS = frozenset(
         "sr_first_hop_link_type",
         "sr_first_hop_switch_count",
         "sr_first_hop_retransmitted_bits",
+        "sr_first_hop_attempt_actual_tx_seconds",
+        "sr_first_hop_cumulative_actual_tx_seconds",
         "delivery_path",
         "s2u_completion_time_seconds",
         "s2g_completion_time_seconds",
@@ -269,6 +275,19 @@ def validate_packet_outcome(row):
     ):
         raise ValueError("sr_first_hop_switch_count must be a non-negative integer")
     _validate_nonnegative_number(row, "sr_first_hop_retransmitted_bits")
+    _validate_nonnegative_number(
+        row, "sr_first_hop_attempt_actual_tx_seconds"
+    )
+    _validate_nonnegative_number(
+        row, "sr_first_hop_cumulative_actual_tx_seconds"
+    )
+    if (
+        float(row["sr_first_hop_attempt_actual_tx_seconds"])
+        > float(row["sr_first_hop_cumulative_actual_tx_seconds"]) + 1e-12
+    ):
+        raise ValueError(
+            "successful first-hop attempt airtime cannot exceed cumulative airtime"
+        )
     delivery_path = row["delivery_path"]
     if delivery_path not in {None, "S2G", "S2U_UAV", "UAV"}:
         raise ValueError("packet outcome delivery_path is invalid")

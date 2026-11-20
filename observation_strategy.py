@@ -81,7 +81,8 @@ def _movement_task_indices():
     return tuple(
         item["index"]
         for item in schema["features"]
-        if item["name"].rsplit(".", 1)[-1] in _MOVEMENT_TASK_SUFFIXES
+        if item["name"].startswith("sr_")
+        or item["name"].rsplit(".", 1)[-1] in _MOVEMENT_TASK_SUFFIXES
     )
 
 

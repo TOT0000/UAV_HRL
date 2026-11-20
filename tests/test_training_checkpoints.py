@@ -49,6 +49,7 @@ from training_checkpoint import (
     CHECKPOINT_SCHEMA_VERSION,
     FULL_CHECKPOINT_TYPE,
     FULL_RESUME_LOGGING_SCHEMA_VERSION,
+    PRE_S2G_GROUND_RAYLEIGH_SR_OBSERVATION_CHECKPOINT_SCHEMA_VERSION,
     PRE_SHARED_GOODPUT_REWARD_CHECKPOINT_SCHEMA_VERSION,
     PRE_SERVICE_ONLY_CHECKPOINT_SCHEMA_VERSION,
     PRE_CONTINUOUS_GATEWAY_PROJECTION_CHECKPOINT_SCHEMA_VERSION,
@@ -1429,6 +1430,19 @@ class FullResumeCheckpointTest(unittest.TestCase):
                     load_model_checkpoint(checkpoint_dir, td3, ddqn)
                 load_networks.assert_not_called()
 
+    def test_schema_38_sr_unaware_model_is_rejected_before_network_restore(self):
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "531-D movement observation.*619-D SR-aware movement state",
+        ):
+            _validate_checkpoint_schema(
+                {
+                    "checkpoint_schema_version": (
+                        PRE_S2G_GROUND_RAYLEIGH_SR_OBSERVATION_CHECKPOINT_SCHEMA_VERSION
+                    )
+                }
+            )
+
     def test_explicit_relay_schema_29_model_is_rejected_before_network_restore(self):
         td3, ddqn, _joint, _routing = self._components()
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1823,7 +1837,7 @@ class TrainingCliTest(unittest.TestCase):
         )
 
     def test_checkpoint_schema_is_explicit(self):
-        self.assertEqual(CHECKPOINT_SCHEMA_VERSION, 38)
+        self.assertEqual(CHECKPOINT_SCHEMA_VERSION, 39)
 
 
 if __name__ == "__main__":

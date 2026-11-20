@@ -1681,10 +1681,14 @@ def render_standalone_trajectory_source(source):
         )
     for link in source["active_links"]:
         link_type = str(link["link_type"])
-        if link_type == "S2U":
+        if link_type in {"S2G", "S2U"}:
             sender = sr_teams[int(link["sender_id"])]
-            receiver = uavs[int(link["receiver_id"])]
-            color = "#243BFF"
+            receiver = (
+                ground_station
+                if link_type == "S2G"
+                else uavs[int(link["receiver_id"])]
+            )
+            color = "#00A6A6" if link_type == "S2G" else "#243BFF"
         else:
             sender = uavs[int(link["sender_id"])]
             receiver = (
@@ -1728,6 +1732,8 @@ def render_standalone_trajectory_source(source):
         Line2D([0], [0], marker="o", markerfacecolor="none", markeredgecolor="gray", color="none", label="Other RoIs"),
         Line2D([0], [0], color="red", linestyle="--", label="U2U Link"),
         Line2D([0], [0], color="purple", linestyle="--", label="U2G Link"),
+        Line2D([0], [0], color="#243BFF", linestyle="--", label="S2U Link"),
+        Line2D([0], [0], color="#00A6A6", linestyle="--", label="S2G Link"),
         Patch(facecolor="#E8B95A", alpha=0.25, label="Sensing coverage"),
     ]
     axis.legend(handles=handles, fontsize=7, ncol=2, loc="upper right")

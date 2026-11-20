@@ -45,12 +45,12 @@ class CentralizedTrainingFlowTest(unittest.TestCase):
 
     def test_production_defaults_and_state_separation(self):
         defaults = formal_training_config(total_episodes=10)
-        self.assertEqual(defaults.episode_seconds, 60)
+        self.assertEqual(defaults.episode_seconds, 500)
         self.assertEqual(defaults.warmup_joint_transitions, PRODUCTION_WARMUP_TRANSITIONS)
         self.assertEqual(defaults.batch_size, PRODUCTION_BATCH_SIZE)
         self.assertEqual(defaults.policy_delay, PRODUCTION_POLICY_DELAY)
         self.assertEqual(ROUTING_STATE_DIM, 143)
-        self.assertEqual(self.result["movement_state_dim"], 531)
+        self.assertEqual(self.result["movement_state_dim"], 619)
         self.assertEqual(self.result["routing_state_dim"], 143)
         self.assertEqual(self.result["joint_action_dim"], 48)
         self.assertEqual(self.result["centralized_td3_gamma"], 1.0)
@@ -60,7 +60,7 @@ class CentralizedTrainingFlowTest(unittest.TestCase):
         smoke = smoke_training_config()
         self.assertEqual(smoke.mode, "smoke")
         self.assertEqual(smoke.total_episodes, 1)
-        self.assertEqual(smoke.episode_seconds, 60)
+        self.assertEqual(smoke.episode_seconds, 500)
         self.assertEqual(smoke.warmup_joint_transitions, 0)
         self.assertEqual(smoke.batch_size, 1)
         self.assertEqual(smoke.random_seed, 20260817)
@@ -79,7 +79,7 @@ class CentralizedTrainingFlowTest(unittest.TestCase):
         self.assertEqual(formal.dinkelbach_update_interval_episodes, 50)
         self.assertEqual(formal.dinkelbach_update_rule, "ratio_of_block_sums")
         self.assertEqual(
-            formal.dinkelbach_numerator_unit, "timely_useful_mbits"
+            formal.dinkelbach_numerator_unit, "complete_useful_mbits"
         )
         self.assertEqual(
             formal.dinkelbach_denominator_unit, "mobility_energy_joules"
@@ -214,7 +214,7 @@ class CentralizedTrainingFlowTest(unittest.TestCase):
                 "com_range_penalty_mean": 0.3,
             },
         )
-        self.assertAlmostEqual(reward, -0.6)
+        self.assertAlmostEqual(reward, -0.7)
 
     def test_normal_training_end_writes_episode_boundary_full_checkpoint(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -253,7 +253,7 @@ class CentralizedTrainingFlowTest(unittest.TestCase):
         self.assertEqual(metadata["checkpoint_type"], "full-resume")
         self.assertEqual(state["completed_episode_index"], 0)
         self.assertEqual(state["next_episode_index"], 1)
-        self.assertEqual(state["full_resume_logging_schema_version"], 2)
+        self.assertEqual(state["full_resume_logging_schema_version"], 3)
         self.assertIn("channel_lifecycle_state", state)
         self.assertNotIn("relay_episode_diagnostics", state)
         self.assertNotIn("relay_diagnostics", result)

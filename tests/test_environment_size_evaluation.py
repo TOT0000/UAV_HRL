@@ -504,7 +504,7 @@ class EnvironmentSizeRuntimeContractTest(unittest.TestCase):
                 compressed = aggregate_coverage_map(env.visited_bitmap)
                 self.assertEqual(compressed.shape, (256,))
                 self.assertTrue(np.isfinite(compressed).all())
-                self.assertEqual(MOVEMENT_STATE_DIM, 531)
+                self.assertEqual(MOVEMENT_STATE_DIM, 619)
                 self.assertEqual(ROUTING_STATE_DIM, 143)
 
     def test_runtime_override_is_evaluation_only_and_normalized_by_current_map(self):

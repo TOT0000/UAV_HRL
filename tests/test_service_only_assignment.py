@@ -56,10 +56,10 @@ def test_every_assignment_strategy_materializes_only_service_or_fallback_roles(
 def test_service_only_observation_potential_and_checkpoint_contracts():
     schema = movement_state_feature_schema()
     names = [feature["name"] for feature in schema["features"]]
-    assert MOVEMENT_STATE_DIM == 531
+    assert MOVEMENT_STATE_DIM == 619
     assert len(names) == MOVEMENT_STATE_DIM
     assert not any("relay" in name.lower() for name in names)
-    assert CHECKPOINT_SCHEMA_VERSION == 38
+    assert CHECKPOINT_SCHEMA_VERSION == 39
     assert "service-only" in ASSIGNMENT_CONTRACT_VERSION
 
     env = Simulator(16)

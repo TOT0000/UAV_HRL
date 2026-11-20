@@ -34,6 +34,7 @@ from experiment_config import (
 )
 from experiment_paths import run_state_for_exception, write_run_status
 from HRL_task_aware import (
+    REWARD_STEP_RECORD_SCHEMA_VERSION,
     ROUTING_STATE_DIM,
     TrainingConfig,
     formal_training_config,
@@ -514,6 +515,30 @@ def create_unique_run_directory(output_root, method_key, seed, git_sha=None):
     return _create_unique_leaf(parent, f"run-seed{int(seed)}-{sha}")
 
 
+def _reward_step_jsonl_sink(path):
+    """Return a streaming JSONL sink; the caller owns the unique output path."""
+
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    def write(row):
+        with path.open("a", encoding="utf-8", newline="\n") as handle:
+            handle.write(
+                json.dumps(row, ensure_ascii=False, allow_nan=False) + "\n"
+            )
+
+    return write
+
+
+def _reward_step_record_metadata(enabled, path):
+    return {
+        "enabled": bool(enabled),
+        "schema_version": REWARD_STEP_RECORD_SCHEMA_VERSION,
+        "format": "jsonl",
+        "path": str(Path(path).resolve()) if enabled else None,
+    }
+
+
 def _roi_count(value):
     value = int(value)
     if not ROI_COUNT_MIN <= value <= ROI_COUNT_MAX:
@@ -530,6 +555,11 @@ def _add_training_options(parser):
     parser.add_argument("--roi-count", type=_roi_count)
     parser.add_argument("--output-root")
     parser.add_argument("--checkpoint-interval", type=int)
+    parser.add_argument(
+        "--record-reward-steps",
+        action="store_true",
+        help="stream one reconstructable movement-reward row per one-second step",
+    )
     parser.add_argument(
         "--mutual-next-hop-guard", choices=("on", "off"), default="on",
         help="shared sequential two-node mutual-next-hop guard (default: on)",
@@ -636,6 +666,7 @@ def build_parser():
         type=int,
         help="explicitly extend the planned training horizon before exact resume",
     )
+    resume.add_argument("--record-reward-steps", action="store_true")
     resume.add_argument(
         "--mutual-next-hop-guard",
         choices=("on", "off"),
@@ -666,6 +697,7 @@ def build_parser():
     evaluate.add_argument(
         "--mutual-next-hop-guard", choices=("on", "off"), default="on"
     )
+    evaluate.add_argument("--record-reward-steps", action="store_true")
     evaluate.add_argument(
         "--smoke",
         action="store_true",
@@ -1164,6 +1196,10 @@ def run(args):
                     "legal_uniform_on_whole_row_or_masked_legal_zero_weight"
                 ),
             )
+    reward_step_path = run_dir / "reward_step_records.jsonl"
+    resolved["reward_step_records"] = _reward_step_record_metadata(
+        getattr(args, "record_reward_steps", False), reward_step_path
+    )
     _write_json_atomic(run_dir / "resolved_config.json", resolved)
     write_run_status(run_dir, "RUNNING")
     try:
@@ -1191,6 +1227,11 @@ def run(args):
                 resolved.get("llm_explorer") or {}
             ).get("log_mode", method.default_llm_explorer_log_mode),
             mutual_next_hop_guard=args.mutual_next_hop_guard,
+            reward_step_record_sink=(
+                _reward_step_jsonl_sink(reward_step_path)
+                if getattr(args, "record_reward_steps", False)
+                else None
+            ),
         )
         resolved.update(
             status="COMPLETED",
@@ -1590,6 +1631,10 @@ def run_resume(args):
             horizon_extension_provenance=extension_provenance,
             horizon_extension_history=history,
         )
+    reward_step_path = run_dir / "reward_step_records.jsonl"
+    resolved["reward_step_records"] = _reward_step_record_metadata(
+        getattr(args, "record_reward_steps", False), reward_step_path
+    )
     _write_json_atomic(run_dir / "resolved_config.json", resolved)
     if method.llm_explorer_enabled:
         try:
@@ -1636,6 +1681,11 @@ def run_resume(args):
                 "log_mode", method.default_llm_explorer_log_mode
             ),
             mutual_next_hop_guard=saved_guard_enabled,
+            reward_step_record_sink=(
+                _reward_step_jsonl_sink(reward_step_path)
+                if getattr(args, "record_reward_steps", False)
+                else None
+            ),
         )
         resolved.update(
             status="COMPLETED",
@@ -1795,6 +1845,10 @@ def run_evaluate(args):
         / (f"ep_{checkpoint_episode}" if checkpoint_required else "no_checkpoint"),
         "eval",
     )
+    reward_step_path = output_dir / "reward_step_records.jsonl"
+    reward_step_records = _reward_step_record_metadata(
+        getattr(args, "record_reward_steps", False), reward_step_path
+    )
     manifest.save(output_dir / "scenario_manifest.json")
     config = TrainingConfig(
         total_episodes=evaluation_episodes,
@@ -1846,6 +1900,11 @@ def run_evaluate(args):
             "log_mode", method.default_llm_explorer_log_mode
         ),
         mutual_next_hop_guard=args.mutual_next_hop_guard,
+        reward_step_record_sink=(
+            _reward_step_jsonl_sink(reward_step_path)
+            if getattr(args, "record_reward_steps", False)
+            else None
+        ),
     )
     formal_evaluation = bool(
         not args.smoke
@@ -1873,6 +1932,7 @@ def run_evaluate(args):
         "evaluation_run_directory": str(output_dir),
         "formal_evaluation": formal_evaluation,
         "smoke_evaluation": bool(args.smoke),
+        "reward_step_records": reward_step_records,
         "evaluation_purpose": (
             "formal_checkpoint_evaluation"
             if formal_evaluation and checkpoint_required

@@ -93,6 +93,16 @@ class IncrementalBacklogTest(unittest.TestCase):
         self.assertEqual(engine.backlog_bits[0], 0.0)
         self.assert_backlog_invariant(engine, 0)
 
+    def test_empty_fifo_clears_accumulated_floating_point_cache_residual(self):
+        engine = PacketEngine(num_uav=3)
+        packet = engine.create_packet(0, "COM", 100.0, 0.0)
+        engine.backlog_bits[0] += 1e-7
+
+        engine.mark_packet_done(packet, current_time=0.5, reason="deadline")
+
+        self.assertEqual(engine.backlog_bits[0], 0.0)
+        self.assert_backlog_invariant(engine, 0)
+
     def test_multiple_non_hol_expirations_filter_queue_once(self):
         engine = PacketEngine(num_uav=3)
         survivor = engine.create_packet(0, "FOV", 100.0, 0.75)

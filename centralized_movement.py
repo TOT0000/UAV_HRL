@@ -29,12 +29,18 @@ from movement_feature_schema import (
     LOCAL_MOVEMENT_DIM,
     LOCAL_MOVEMENT_FEATURES,
     MOVEMENT_FEATURE_SCHEMA_VERSION,
+    SR_MOVEMENT_DIM,
+    SR_MOVEMENT_FEATURES,
     TASK_TYPES,
 )
 COVERAGE_GRID_SIZE = 16
 GLOBAL_MOVEMENT_DIM = 3
+MAX_SR_SLOTS = ROI_COUNT_MAX
 MOVEMENT_STATE_DIM = (
-    NUM_UAV * LOCAL_MOVEMENT_DIM + COVERAGE_GRID_SIZE**2 + GLOBAL_MOVEMENT_DIM
+    NUM_UAV * LOCAL_MOVEMENT_DIM
+    + MAX_SR_SLOTS * SR_MOVEMENT_DIM
+    + COVERAGE_GRID_SIZE**2
+    + GLOBAL_MOVEMENT_DIM
 )
 JOINT_ACTION_DIM = NUM_UAV * 3
 BACKLOG_NORM_REF_BITS = 5e7
@@ -61,7 +67,23 @@ def movement_state_feature_schema():
                     "normalization": normalization,
                 }
             )
-    coverage_base = NUM_UAV * LOCAL_MOVEMENT_DIM
+    sr_base = NUM_UAV * LOCAL_MOVEMENT_DIM
+    for sr_id in range(MAX_SR_SLOTS):
+        base = sr_base + sr_id * SR_MOVEMENT_DIM
+        for offset, (name, kind, minimum, maximum, normalization) in enumerate(
+            SR_MOVEMENT_FEATURES
+        ):
+            features.append(
+                {
+                    "index": base + offset,
+                    "name": f"sr_{sr_id}.{name}",
+                    "kind": kind,
+                    "minimum": minimum,
+                    "maximum": maximum,
+                    "normalization": normalization,
+                }
+            )
+    coverage_base = sr_base + MAX_SR_SLOTS * SR_MOVEMENT_DIM
     for row in range(COVERAGE_GRID_SIZE):
         for column in range(COVERAGE_GRID_SIZE):
             features.append(
@@ -102,6 +124,7 @@ def movement_state_feature_schema():
         "dimension": MOVEMENT_STATE_DIM,
         "ordering": (
             f"{NUM_UAV} UAV blocks x {LOCAL_MOVEMENT_DIM}, "
+            f"{MAX_SR_SLOTS} stable SR-id blocks x {SR_MOVEMENT_DIM}, "
             f"{COVERAGE_GRID_SIZE}x{COVERAGE_GRID_SIZE} coverage macro map "
             f"row-major, {GLOBAL_MOVEMENT_DIM} globals"
         ),
@@ -387,6 +410,65 @@ def get_global_movement_state(
             )
         local_features.append(uav_features)
 
+    sr_features = []
+    sr_by_id = {int(sr.id): sr for sr in env.SR_teams}
+    if any(sr_id < 0 or sr_id >= MAX_SR_SLOTS for sr_id in sr_by_id):
+        raise ValueError("SR id exceeds the fixed movement-observation slots")
+    sr_backlog = getattr(packet_engine, "s2u_backlog_bits", {})
+    for sr_id in range(MAX_SR_SLOTS):
+        sr = sr_by_id.get(sr_id)
+        if sr is None:
+            sr_features.append(np.zeros(SR_MOVEMENT_DIM, dtype=np.float32))
+            continue
+        assigned_gt_id = getattr(sr, "assigned_gt_id", None)
+        # Scenario manifests contain one dormant SR per eventual RoI.  A
+        # pre-discovery SR is not observable: exposing even its valid bit or
+        # current position would reveal the true RoI count before discovery.
+        if assigned_gt_id is None:
+            sr_features.append(np.zeros(SR_MOVEMENT_DIM, dtype=np.float32))
+            continue
+        x, y, z = map(float, sr.get_position())
+        target = [0.0, 0.0, 0.0]
+        gt = env.gts[int(assigned_gt_id)]
+        tx, ty, tz = map(float, gt.get_position())
+        target = [
+            float(np.clip(tx / float(env.env_width), 0.0, 1.0)),
+            float(np.clip(ty / float(env.env_height), 0.0, 1.0)),
+            float(np.clip(tz / max(UAV_MAX_ALTITUDE_M, 1e-9), 0.0, 1.0)),
+        ]
+        direct = bool(env.is_s2g_in_range(sr_id))
+        assigned_uav = packet_engine.assigned_com_uav(env, sr_id)
+        support = bool(
+            not direct
+            and assigned_uav is not None
+            and env.is_s2u_in_range(sr_id, assigned_uav)
+        )
+        waiting = bool(not direct and not support)
+        backlog = max(float(sr_backlog.get(sr_id, 0.0)), 0.0)
+        values = np.asarray(
+            [
+                1.0,
+                float(np.clip(x / float(env.env_width), 0.0, 1.0)),
+                float(np.clip(y / float(env.env_height), 0.0, 1.0)),
+                float(np.clip(z / max(UAV_MAX_ALTITUDE_M, 1e-9), 0.0, 1.0)),
+                *target,
+                float(direct),
+                float(support),
+                float(waiting),
+                float(
+                    np.clip(
+                        np.log1p(backlog) / np.log1p(BACKLOG_NORM_REF_BITS),
+                        0.0,
+                        1.0,
+                    )
+                ),
+            ],
+            dtype=np.float32,
+        )
+        if values.shape != (SR_MOVEMENT_DIM,):
+            raise AssertionError("SR movement feature shape is invalid")
+        sr_features.append(values)
+
     compressed_map = aggregate_coverage_map(env.visited_bitmap)
     found_count = int(env.count_found_targets())
     remaining_time = float(remaining_time)
@@ -403,7 +485,9 @@ def get_global_movement_state(
         dtype=np.float32,
     )
 
-    global_state = np.concatenate(local_features + [compressed_map, global_scalars]).astype(
+    global_state = np.concatenate(
+        local_features + sr_features + [compressed_map, global_scalars]
+    ).astype(
         np.float32, copy=False
     )
     if global_state.shape != (MOVEMENT_STATE_DIM,):
@@ -613,6 +697,7 @@ def movement_constraint_penalties(env):
     c9_values = []
     c10_values = []
     com_values = []
+    com_distances_m = []
     c9_satisfied = c9_violated = 0
     c10_satisfied = c10_violated = 0
     com_in_range = com_out_of_range = 0
@@ -674,6 +759,7 @@ def movement_constraint_penalties(env):
                 )
             )
             com_values.append(min(raw_penalty, 1.0))
+            com_distances_m.append(distance)
             if distance <= S2U_COMMUNICATION_RANGE_M + 1e-9:
                 com_in_range += 1
             else:
@@ -702,6 +788,13 @@ def movement_constraint_penalties(env):
         "com_range_penalty_weight": MOVEMENT_CONSTRAINT_WEIGHT_COM,
         "com_penalty_reference_distance_m": COM_PENALTY_REFERENCE_DISTANCE_M,
         "com_range_sample_count": com_count,
+        "com_distance_min_m": min(com_distances_m) if com_distances_m else None,
+        "com_distance_mean_m": (
+            math.fsum(com_distances_m) / len(com_distances_m)
+            if com_distances_m
+            else None
+        ),
+        "com_distance_max_m": max(com_distances_m) if com_distances_m else None,
         "c9_satisfied_pair_count": c9_satisfied,
         "c9_violated_pair_count": c9_violated,
         "c10_satisfied_pair_count": c10_satisfied,

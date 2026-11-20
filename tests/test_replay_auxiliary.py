@@ -65,18 +65,18 @@ def test_snapshot_preserves_fifo_raw_values_deadlines_tasks_and_visibility():
     assert snapshot["uav_vs_backlog_bits"][1] == 40.0
     assert snapshot["uav_com_backlog_bits"][1] == 125.0
     assert snapshot["uav_hol_type"][1] == 1
-    assert snapshot["uav_hol_remaining_deadline_s"][1] == (
+    assert snapshot["uav_hol_remaining_deadline_s"][1] == pytest.approx(
         TASK_DEADLINE_SECONDS["FOV"] - 1.0
     )
-    assert snapshot["uav_vs_min_remaining_deadline_s"][1] == (
+    assert snapshot["uav_vs_min_remaining_deadline_s"][1] == pytest.approx(
         TASK_DEADLINE_SECONDS["FOV"] - 1.0
     )
-    assert snapshot["uav_com_min_remaining_deadline_s"][1] == (
+    assert snapshot["uav_com_min_remaining_deadline_s"][1] == pytest.approx(
         TASK_DEADLINE_SECONDS["COM"] - 0.75
     )
     assert snapshot["sr_observable"][sr.id]
     assert snapshot["sr_packet_count"][sr.id] == 1
-    assert snapshot["sr_hol_remaining_deadline_s"][sr.id] == (
+    assert snapshot["sr_hol_remaining_deadline_s"][sr.id] == pytest.approx(
         TASK_DEADLINE_SECONDS["COM"] - 0.5
     )
     assert snapshot["roi_observable"].sum() == 1

@@ -72,7 +72,7 @@ compute_extra_state(obs, constants)
 fixed artifact's authoritative movement-state feature schema, the current
 movement mask, named deterministic views of the original state, and the named
 current auxiliary snapshot fields. For the current formal contract the original
-state and movement mask are 531 and 16 dimensions, respectively. The v2 named
+state and movement mask are 619 and 16 dimensions, respectively. The v2 named
 views include per-UAV task flags, normalized horizontal position and altitude,
 remaining-energy fraction, normalized backlog and service targets, VS image
 error, COM reference-capacity fraction, the coverage macro grid, global

@@ -1,7 +1,7 @@
 """Authoritative local feature ordering for centralized UAV movement."""
 
 
-MOVEMENT_FEATURE_SCHEMA_VERSION = 7
+MOVEMENT_FEATURE_SCHEMA_VERSION = 8
 
 TASK_TYPES = ("Search", "FOV", "COM", "Hovering")
 # Only service roles are owned by the learned/random movement policy. Search is
@@ -53,3 +53,18 @@ LOCAL_MOVEMENT_FEATURES = (
 )
 
 LOCAL_MOVEMENT_DIM = len(LOCAL_MOVEMENT_FEATURES)
+
+SR_MOVEMENT_FEATURES = (
+    ("valid", "binary", 0.0, 1.0, "one when this stable SR-id slot is populated"),
+    ("position_x", "continuous", 0.0, 1.0, "SR x / environment width"),
+    ("position_y", "continuous", 0.0, 1.0, "SR y / environment height"),
+    ("position_z", "continuous", 0.0, 1.0, "SR z / UAV max AGL"),
+    ("target_x", "continuous", 0.0, 1.0, "known assigned RoI x / environment width"),
+    ("target_y", "continuous", 0.0, 1.0, "known assigned RoI y / environment height"),
+    ("target_z", "continuous", 0.0, 1.0, "known assigned RoI z / UAV max AGL"),
+    ("mode_direct", "binary", 0.0, 1.0, "S2G range is currently satisfied"),
+    ("mode_support", "binary", 0.0, 1.0, "outside S2G with assigned in-range COM UAV"),
+    ("mode_waiting", "binary", 0.0, 1.0, "outside S2G without usable S2U"),
+    ("fifo_backlog", "continuous", 0.0, 1.0, "log1p(SR FIFO bits) / log1p(5e7)"),
+)
+SR_MOVEMENT_DIM = len(SR_MOVEMENT_FEATURES)

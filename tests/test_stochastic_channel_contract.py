@@ -194,6 +194,9 @@ class ChannelLifecycleTest(unittest.TestCase):
             small_scale_rng=streams.numpy(
                 f"{prefix}channel_small_scale_fading"
             ),
+            s2g_small_scale_rng=streams.numpy(
+                f"{prefix}s2g_small_scale_fading"
+            ),
             namespace=namespace,
         )
         geometry = channel_geometry()
@@ -244,6 +247,10 @@ class ChannelLifecycleTest(unittest.TestCase):
         second.prepare_routing_slot(0)
         self.assertEqual(first.potential_link_keys(), second.potential_link_keys())
         np.testing.assert_array_equal(first._gain_matrix, second._gain_matrix)
+        np.testing.assert_array_equal(
+            first._s2g_gain_matrix, second._s2g_gain_matrix
+        )
+        self.assertEqual(first._s2g_gain_matrix.shape, (2, 50))
         before = first.small_scale_normal_draw_count
         self.assertFalse(first.prepare_routing_slot(0))
         self.assertEqual(first.small_scale_normal_draw_count, before)
@@ -253,6 +260,25 @@ class ChannelLifecycleTest(unittest.TestCase):
         first.prepare_routing_slot(1)
         second.prepare_routing_slot(1)
         np.testing.assert_array_equal(first._gain_matrix, second._gain_matrix)
+
+    def test_s2g_rayleigh_power_gain_is_mean_one_and_uses_independent_stream(self):
+        _, lifecycle, _ = self._lifecycle(311)
+        values = []
+        for slot in range(1000):
+            lifecycle.prepare_routing_slot(slot)
+            values.append(lifecycle._s2g_gain_matrix.copy())
+        gains = np.concatenate(values, axis=None)
+        self.assertAlmostEqual(float(gains.mean()), 1.0, delta=0.015)
+        self.assertTrue(np.all(gains >= 0.0))
+        self.assertEqual(lifecycle.s2g_exponential_draw_count, 1000 * 2 * 50)
+
+        baseline = NamedRNGStreams(312)
+        perturbed = NamedRNGStreams(312)
+        perturbed.numpy("s2g_small_scale_fading").exponential(size=10000)
+        np.testing.assert_array_equal(
+            baseline.numpy("channel_small_scale_fading").standard_normal(100),
+            perturbed.numpy("channel_small_scale_fading").standard_normal(100),
+        )
 
     def test_episode_reset_clears_expired_slot_profile_and_initializes_a2g_state(self):
         _, lifecycle, geometry = self._lifecycle(32)
@@ -284,6 +310,7 @@ class ChannelLifecycleTest(unittest.TestCase):
         expected_u2g = lifecycle.u2g_los_state.copy()
         expected_s2u = lifecycle.s2u_los_state.copy()
         expected_gains = lifecycle._gain_matrix.copy()
+        expected_s2g_gains = lifecycle._s2g_gain_matrix.copy()
 
         restored_streams = NamedRNGStreams(44)
         restored_streams.load_state_dict(saved_rng)
@@ -292,6 +319,7 @@ class ChannelLifecycleTest(unittest.TestCase):
             3,
             large_scale_rng=restored_streams.numpy("channel_large_scale_state"),
             small_scale_rng=restored_streams.numpy("channel_small_scale_fading"),
+            s2g_small_scale_rng=restored_streams.numpy("s2g_small_scale_fading"),
             namespace="training",
         )
         restored.load_state_dict(saved_channel)
@@ -305,6 +333,9 @@ class ChannelLifecycleTest(unittest.TestCase):
         np.testing.assert_array_equal(restored.u2g_los_state, expected_u2g)
         np.testing.assert_array_equal(restored.s2u_los_state, expected_s2u)
         np.testing.assert_array_equal(restored._gain_matrix, expected_gains)
+        np.testing.assert_array_equal(
+            restored._s2g_gain_matrix, expected_s2g_gains
+        )
 
     def test_training_and_evaluation_channel_streams_are_isolated(self):
         baseline = NamedRNGStreams(55)
@@ -324,6 +355,8 @@ class ChannelLifecycleTest(unittest.TestCase):
             "channel_small_scale_fading",
             "evaluation_channel_large_scale_state",
             "evaluation_channel_small_scale_fading",
+            "s2g_small_scale_fading",
+            "evaluation_s2g_small_scale_fading",
         ):
             self.assertIn(name, RNG_STREAM_IDS)
 
@@ -334,6 +367,7 @@ class ChannelLifecycleTest(unittest.TestCase):
             10,
             large_scale_rng=streams.numpy("channel_large_scale_state"),
             small_scale_rng=streams.numpy("channel_small_scale_fading"),
+            s2g_small_scale_rng=streams.numpy("s2g_small_scale_fading"),
         )
         geometry = channel_geometry(10, 8)
         lifecycle.reset_episode(
@@ -343,6 +377,7 @@ class ChannelLifecycleTest(unittest.TestCase):
         )
         lifecycle.prepare_routing_slot(0)
         self.assertEqual(lifecycle._gain_matrix.shape, (180, 50))
+        self.assertEqual(lifecycle._s2g_gain_matrix.shape, (8, 50))
         self.assertLess(lifecycle.last_profile_generation_seconds, 1.0)
 
 

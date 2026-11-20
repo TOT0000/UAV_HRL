@@ -163,25 +163,25 @@ class ScenarioManifestTest(unittest.TestCase):
             ],
             [
                 (
-                    "test:uav-hrl-scenario-v11:mixed-2-8:20260927:000000",
-                    953043997277681710,
-                    2,
-                ),
-                (
-                    "test:uav-hrl-scenario-v11:mixed-2-8:20260927:000001",
-                    2781075027988015013,
+                    "test:uav-hrl-scenario-v13:mixed-2-8:20260927:000000",
+                    14230081942981180918,
                     8,
                 ),
                 (
-                    "test:uav-hrl-scenario-v11:mixed-2-8:20260927:000002",
-                    5787626342504439188,
-                    4,
+                    "test:uav-hrl-scenario-v13:mixed-2-8:20260927:000001",
+                    16317388654402691987,
+                    7,
+                ),
+                (
+                    "test:uav-hrl-scenario-v13:mixed-2-8:20260927:000002",
+                    8257509549100560785,
+                    8,
                 ),
             ],
         )
         self.assertEqual(
             random_manifest.content_hash,
-            "76714122ebd38f61cf392bd736467c95650d7787647330fee7e6e9cafd4e9481",
+            "18cd3f04e2cc15ada632bbede5fa9cece087ea95c7f2c53a8a5e2fdcce090891",
         )
         self.assertEqual(balanced.to_dict(), repeated.to_dict())
         self.assertEqual(
@@ -304,7 +304,17 @@ class ScenarioManifestTest(unittest.TestCase):
                 data = generate_manifest("test", 912, 1).to_dict()
                 data["schema_version"] = schema_version
                 with self.assertRaisesRegex(
-                    ValueError, "quarter-arc, 1.5 m/s, mission-clock S2G"
+                    ValueError, "quarter-arc, 1.5 m/s, 100 m ground-S2G"
+                ):
+                    ScenarioManifest.from_dict(data)
+
+    def test_pre_ground_rayleigh_s2g_manifests_are_explicitly_obsolete(self):
+        for schema_version in ("uav-hrl-scenario-v11", "uav-hrl-scenario-v12"):
+            with self.subTest(schema_version=schema_version):
+                data = generate_manifest("test", 913, 1).to_dict()
+                data["schema_version"] = schema_version
+                with self.assertRaisesRegex(
+                    ValueError, "350 m SR / 400 m no-fading S2G"
                 ):
                     ScenarioManifest.from_dict(data)
 

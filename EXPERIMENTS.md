@@ -24,7 +24,7 @@ networks or statistics. All other methods share
 energy/delivery accounting, evaluation, and logging.
 
 The added baselines are orthogonal configurations of that shared flow. The
-`wo_ta` method keeps the 531-D/143-D layouts but zeros named task-assignment
+`wo_ta` method keeps the 619-D/143-D layouts but zeros named task-assignment
 observation fields. The controlled DQN method replaces safe-DDQN with a masked
 standard DQN. `td3_dinkelbach_ddqn` keeps that method's full configuration but
 uses masked online-network action selection with target-network evaluation for
@@ -131,7 +131,7 @@ and PowerShell examples are documented in
 artifact produced by `run_llm_design.py` or `run_llm_review_design.py`. It
 copies the complete artifact into
 the new run, records its content hash and beta, appends the artifact-defined
-features to the unchanged 531-dimensional state, and stores the current-only
+features to the unchanged 619-dimensional state, and stores the current-only
 extra reward separately in replay. The existing reward is reconstructed at the
 current Dinkelbach lambda and `beta * r_extra` is added exactly once for TD3
 learning. Task metrics and the Dinkelbach update do not include this extra
@@ -272,7 +272,7 @@ Relay diagnostics artifact.
   bitmap fallback is permitted. Routing state
   getters are pure reads. Full checkpoints persist EMA values, initialization,
   previous footprints, footprint/EMA markers, and EMA update count.
-  SRs start 350 m from GS on a reproducible equiangular quarter arc and use a
+  SRs start 80 m from GS on a reproducible equiangular quarter arc and use a
   default speed of 1.5 m/s. SR routes omit the duplicated start point, include
   the exact target, and mark
   arrival on the update that consumes the final waypoint. The only mutable SR
@@ -409,15 +409,15 @@ COM UAV or usable first hop exists; the VS QoS denominator includes only
 captures generated during valid sensing.
 
 Enriched movement replay fields and the checkpoint-driven, no-training sampling
-mode are specified in `docs/replay_sampling_contract.md`. They are auxiliary
-data only and do not change movement observations, actions, rewards, batches, or
-formal evaluation exploration.
+mode are specified in `docs/replay_sampling_contract.md`. The auxiliary fields
+remain non-learning diagnostics; the authoritative actor/critic observation now
+separately includes the fixed SR blocks described below.
 
 For every assigned COM UAV-SR pair, the raw range penalty is
 `max(0,1-380/(d_3D+epsilon))`; its mean is multiplied exactly once by two in
 online and replay reward. The physical S2U range remains the separate inclusive
-400 m boundary. Direct-S2G SRs have no UAV COM task and therefore do not enter
-this population. No duplicate C8
+400 m boundary. A direct-S2G SR retains its assigned UAV COM task and therefore
+still enters this readiness population. No duplicate C8
 penalty is applied to routing links already governed by their action masks.
 
 Each episode publishes `movement_reward_decomposition` with the delivered
@@ -425,20 +425,20 @@ Mbit, movement energy, Dinkelbach energy term, base objective, raw and applied
 C9/C10/COM terms, final reward, COM pair samples, and out-of-range COM samples.
 The applied episode penalty is the sum of the weighted per-step means; the
 separate pooled-pair diagnostic is not multiplied by the step count. The
-existing transition observer remains the opt-in step-level record and exposes
-the same raw-versus-applied distinction.
+optional `--record-reward-steps` JSONL stream exposes the same
+raw-versus-applied distinction during either training or evaluation without
+changing simulation RNG or learning.
 
 The movement auxiliary-reward contract is
 `post-action-vs-com-mean-constraint-penalties-v16-com380-weight2`. TD3 and DDPG
 consume the same constraint definitions, random-movement methods publish the
 same environment/reward contract, and `*_no_task_potential` methods set all
-C9/C10/COM penalty weights to zero. Existing observations already contain UAV
-and assigned-task positions plus COM capacity. SR FIFO service is an environment
-process: a direct S2G SR needs no UAV action, while an out-of-range SR waiting
-for support is represented by its assigned COM task before its FIFO reaches a
-UAV. The movement state therefore needs no new model input and the movement
-state and joint action dimensions remain 531 and 48; routing state is 143-D
-after adding the 17 action-wise GS-progress features in
+C9/C10/COM penalty weights to zero. In addition to UAV task/capacity fields, the
+movement observation contains eight stable SR-ID slots. Each discovered mission
+exposes current and known-target position, direct/support/waiting mode and
+normalized SR FIFO backlog; dormant undiscovered SRs and padding remain all
+zero. The movement state and joint action dimensions are 619 and 48; routing
+state remains 143-D with the 17 action-wise GS-progress features in
 UAV-0-through-UAV-15-then-GS order.
 
 ## Stochastic channel contract
@@ -681,7 +681,7 @@ uses the ordinary deterministic evaluation dataflow with no exploration or
 action perturbation and never updates learning or Dinkelbach state. Its atomic
 artifacts are `design_transitions.npz`, `design_dataset_metadata.json`, and a
 design-local `per_episode.csv`/`per_episode.jsonl`. The NPZ stores each complete
-531-D state, projected 48-D raw actor action, 531-D next state, terminal flags,
+619-D state, projected 48-D raw actor action, 619-D next state, terminal flags,
 delivery/energy and potential reward components, checkpoint lambda, and
 episode/step/scenario identity. Metadata records the authoritative state/action
 schema from `centralized_movement.py`; it deliberately does not select
@@ -749,26 +749,26 @@ python -X utf8 comparison_experiment.py aggregate --input-dir runs/comparison/ev
 
 Exact-resume checkpoints validate the method fingerprint, training-manifest
 relationship, training seed, the complete Dinkelbach block state, and its configuration.
-Checkpoint schema v33 retains the service-only 531-D contract and requires the
+Checkpoint schema v39 carries the service-only 619-D SR-aware contract and requires the
 deterministic external region/frontier Search controller, zero Search shaping,
 single-footprint complete-RoI inclusive-10% discovery, passive COM-only/Hover
 coverage contribution, typed feasibility-only Random rounds, packet-path cost
-linkage, direct 1% system-DVP dual updates, post-action movement constraints,
-and task-type maximum-normalized assignment. Schema v32 and older are rejected
+linkage, direct 5% system-DVP dual updates, post-action movement constraints,
+and task-type maximum-normalized assignment. Schema v38 and older are rejected
 before weights or replay are loaded. Schema v29 removed the explicit
 Relay task, its movement observation fields, potential, replay fields,
 checkpoint metadata and diagnostics. The current schema requires
 valid-sensing VS generation and assignment-local
 rate credit in the canonical visual-sensing contract, alongside the 16-UAV action-wise-GS-progress,
 continuous-hard-only-gateway,
-unified-400-m communication, permanent-gateway, coverage-weighted useful
+independent 100 m S2G / 400 m S2U-U2G-U2U communication, permanent-gateway, coverage-weighted useful
 goodput, boundary-aligned stochastic-channel,
 movement/routing replay, utility/QoS, routing-ID causality/credit,
 post-action VS/COM constraints plus soft-GS-progress
 reward, GS-reachable initial topology, immediate VS/COM constraint penalties,
 hard-range/COM-session, atomic-FOV, seed-ratio
 aggregation, propulsion, and four-slot/fifty-block movement-channel contract.
-Schema v32 and every older schema is rejected before weights or replay state are
+Schema v38 and every older schema is rejected before weights or replay state are
 restored and must be retrained; v29 receives an explicit retired-Relay-schema
 error and no legacy checkpoint migration is attempted.
 Model-only evaluation checkpoints also validate the visual version and complete
@@ -779,11 +779,12 @@ aliases of `Simulator`; all 16 registered methods share the same sensing APIs.
 `Fov_model_phase.FovModel` remains a delegating compatibility facade used for
 movement footprint dimensions, with no independent camera or VS formula.
 The current schema
-stores the 531/48/143 dimensions and service-only movement feature schema,
+stores the 619/48/143 dimensions and service-only movement feature schema,
 direct-ratio bit/J
 objective, shared gateway/channel/packet contracts, active FOV capture-coverage
 snapshots, raw/useful counters, inject buffers, adaptive routing lifecycle, and
-FOV-EMA state. The scenario schema is v8. Schema-19 checkpoints use the
+FOV-EMA state. Canonical and environment-size scenario schemas are v13 and v14.
+Schema-19 checkpoints use the
 discontinuous 360-400 m soft
 compression and must be retrained under the hard-only projection dynamics.
 Schema-18 checkpoints use the previous split 200 m A2G / 400 m
@@ -802,7 +803,7 @@ block never triggers a forced update. Full-resume logging schema v2 separately
 persists `lambda_used_log` and `lambda_after_episode_log`; a legacy ambiguous
 single-lambda log is rejected for exact resume without changing model-only
 checkpoint compatibility. Formal evaluation validates model-only type, schema,
-531/48/143 dimensions, movement-agent/DDQN gamma, COM normalization, method/seed,
+619/48/143 dimensions, movement-agent/DDQN gamma, COM normalization, method/seed,
 the formal core configuration before loading weights. The checkpoint's own
 planned horizon may be smaller than the current run horizon only when
 `total_episodes` is the sole formal-config difference, the checkpoint episode is

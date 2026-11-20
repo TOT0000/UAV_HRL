@@ -569,6 +569,7 @@ class SyntheticFigureBuildTest(unittest.TestCase):
                 "active_links": [
                     {"sender_id": 0, "receiver_id": 1, "link_type": "U2U", "bandwidth_hz": 5e6, "capacity_bits_per_second": 1e6},
                     {"sender_id": 0, "receiver_id": 2, "link_type": "S2U", "bandwidth_hz": 5e6, "capacity_bits_per_second": 0.5e6},
+                    {"sender_id": 1, "receiver_id": 16, "link_type": "S2G", "bandwidth_hz": 5e6, "capacity_bits_per_second": 0.4e6},
                 ],
                 "sensing_coverage": [{"uav_id": 0, "geometry": "axis_aligned_ground_rectangle", "center_x": 100 + time, "center_y": 100, "ground_z": 0, "width_m": 200, "height_m": 200, "clipped_bounds": {"x_min": 0, "x_max": 200 + time, "y_min": 0, "y_max": 200}, "model": visual_sensing_metadata()["camera"]}],
             })

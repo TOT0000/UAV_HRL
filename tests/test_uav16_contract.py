@@ -33,6 +33,7 @@ from centralized_movement import (
     calculate_movement_potentials,
     get_global_movement_state,
     movement_mask_from_state,
+    movement_state_feature_schema,
 )
 from experiment_config import (
     MethodSpec,
@@ -54,7 +55,7 @@ from training_checkpoint import (
 class Uav16ConfigurationContractTest(unittest.TestCase):
     def test_dimensions_and_manifest_layout_are_authoritative(self):
         self.assertEqual(NUM_UAV, 16)
-        self.assertEqual(MOVEMENT_STATE_DIM, 531)
+        self.assertEqual(MOVEMENT_STATE_DIM, 619)
         self.assertEqual(JOINT_ACTION_DIM, 48)
         self.assertEqual(ROUTING_STATE_DIM, 143)
         self.assertEqual(ROUTING_ACTION_DIM, 17)
@@ -105,7 +106,7 @@ class Uav16ConfigurationContractTest(unittest.TestCase):
         data["schema_version"] = "uav-hrl-scenario-v2"
         with self.assertRaisesRegex(ValueError, "16-UAV.*incompatible"):
             ScenarioManifest.from_dict(data)
-        self.assertEqual(CHECKPOINT_SCHEMA_VERSION, 38)
+        self.assertEqual(CHECKPOINT_SCHEMA_VERSION, 39)
         with self.assertRaisesRegex(RuntimeError, "must be retrained"):
             _validate_checkpoint_schema({"checkpoint_schema_version": 24})
 
@@ -155,9 +156,15 @@ class StateAndAssignmentContractTest(unittest.TestCase):
 
         self.env.gts[0].is_found = True
         discovered = self.movement_state()
-        global_base = NUM_UAV * 17 + 16 * 16
-        self.assertAlmostEqual(discovered[global_base + 1], 1.0 / 8.0)
-        self.assertEqual(discovered.shape, (531,))
+        names = [
+            feature["name"]
+            for feature in movement_state_feature_schema()["features"]
+        ]
+        self.assertAlmostEqual(
+            discovered[names.index("found_gt_ratio")],
+            1.0 / 8.0,
+        )
+        self.assertEqual(discovered.shape, (MOVEMENT_STATE_DIM,))
 
     def test_reserved_search_is_outside_solver_and_release_preserves_service(self):
         gt = self.env.gts[0]

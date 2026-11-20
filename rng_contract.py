@@ -10,7 +10,7 @@ import numpy as np
 import torch
 
 
-RNG_CONTRACT_VERSION = "named-subsystem-streams-v2-channel-fading"
+RNG_CONTRACT_VERSION = "named-subsystem-streams-v3-independent-s2g-rayleigh"
 
 # These identifiers are persistent compatibility data.  Never renumber an
 # existing stream: append a new identifier when a new stochastic subsystem is
@@ -43,6 +43,8 @@ RNG_STREAM_IDS = MappingProxyType(
         "channel_small_scale_fading": 61,
         "evaluation_channel_large_scale_state": 62,
         "evaluation_channel_small_scale_fading": 63,
+        "s2g_small_scale_fading": 64,
+        "evaluation_s2g_small_scale_fading": 65,
     }
 )
 
@@ -51,6 +53,8 @@ CHANNEL_RNG_STREAMS = (
     "channel_small_scale_fading",
     "evaluation_channel_large_scale_state",
     "evaluation_channel_small_scale_fading",
+    "s2g_small_scale_fading",
+    "evaluation_s2g_small_scale_fading",
 )
 
 
@@ -170,6 +174,10 @@ class NamedRNGStreams:
                 "channel_small_scale_fading": [
                     "channel_small_scale_fading",
                     "evaluation_channel_small_scale_fading",
+                ],
+                "s2g_small_scale_fading": [
+                    "s2g_small_scale_fading",
+                    "evaluation_s2g_small_scale_fading",
                 ],
             },
             "global_rng_policy": "not used by formal executable operations",

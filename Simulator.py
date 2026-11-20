@@ -27,7 +27,7 @@ from Channel_model import (
     u2u_path_loss_db,
     normalized_s2u_capacity_utility,
     reference_s2u_max_capacity_mbps,
-    s2g_free_space_path_loss_db,
+    s2g_ground_path_loss_db,
     shannon_capacity_mbps,
     validate_bandwidth_hz,
     validate_transmit_power_dbm,
@@ -72,11 +72,12 @@ from experiment_config import (
     ROI_COUNT_MAX,
     ROI_COUNT_MIN,
     SR_ROUTE_LIFECYCLE_VERSION,
+    SR_INITIAL_RADIUS_M,
     SEARCH_COVERAGE_THRESHOLD,
     TOTAL_COMMUNICATION_BANDWIDTH_HZ,
     TASK_COMPATIBILITY_POLICY,
 )
-from communication_contract import is_within_communication_range
+from communication_contract import is_within_s2g_range
 
 
 @dataclass(frozen=True)
@@ -149,6 +150,11 @@ class Simulator:
             if evaluation
             else "channel_small_scale_fading"
         )
+        s2g_small_scale_stream = (
+            "evaluation_s2g_small_scale_fading"
+            if evaluation
+            else "s2g_small_scale_fading"
+        )
         self.channel_large_scale_rng = (
             rng_streams.numpy(channel_large_scale_stream)
             if rng_streams is not None
@@ -158,6 +164,11 @@ class Simulator:
             rng_streams.numpy(channel_small_scale_stream)
             if rng_streams is not None
             else np.random.default_rng(61)
+        )
+        self.s2g_small_scale_rng = (
+            rng_streams.numpy(s2g_small_scale_stream)
+            if rng_streams is not None
+            else np.random.default_rng(64)
         )
         self.channel_namespace = "evaluation" if evaluation else "training"
         self.sr_update_interval = int(1.0 / self.dt)
@@ -234,6 +245,7 @@ class Simulator:
             self.GS_ID,
             large_scale_rng=self.channel_large_scale_rng,
             small_scale_rng=self.channel_small_scale_rng,
+            s2g_small_scale_rng=self.s2g_small_scale_rng,
             namespace=self.channel_namespace,
         )
         self.defer_initial_channel_boundary = False
@@ -425,13 +437,12 @@ class Simulator:
                                     target_obj = gt,
                                     target_obj_id = gt.id)
                                     )
-                if not self.is_s2g_in_range(sr.id):
-                    self.task_list.append(Task(
-                                        task_id= len(self.task_list),
-                                        task_type="COM",
-                                        target_obj=sr,
-                                        target_obj_id = sr.id)
-                                        )
+                self.task_list.append(Task(
+                                    task_id= len(self.task_list),
+                                    task_type="COM",
+                                    target_obj=sr,
+                                    target_obj_id = sr.id)
+                                    )
                 self.need_reassign = True
 
     def fov_footprint_indices(self, uav_id, *, footprint=None):
@@ -701,8 +712,10 @@ class Simulator:
             "fov_quality_transform": FOV_QUALITY_TRANSFORM,
             "discovered_roi_count": int(self.count_found_targets()),
             "sr_uplink_selection": (
-                "s2g_if_inclusive_3d_distance_le_400m_else_s2u"
+                "s2g_if_inclusive_3d_distance_le_100m_else_assigned_s2u"
             ),
+            "sr_direct_state_change_reassigns_tasks": False,
+            "com_task_persists_during_direct_s2g": True,
             "sr_direct_to_gs": {
                 str(sr_id): bool(value)
                 for sr_id, value in sorted(self.sr_direct_to_gs.items())
@@ -861,43 +874,8 @@ class Simulator:
             if not self.sr_trajectory[sr.id] or self.sr_trajectory[sr.id][-1] != point:
                 self.sr_trajectory[sr.id].append(point)
 
-    def _has_com_support_task(self, sr_id):
-        return any(
-            task.task_type == "COM" and int(task.target_obj_id) == int(sr_id)
-            for task in self.task_list
-        )
-
-    def _set_com_support_task(self, sr_id, required):
-        """Synchronize only UAV support demand; the SR mission is untouched."""
-
-        sr_id = int(sr_id)
-        present = self._has_com_support_task(sr_id)
-        if bool(required) == present:
-            return False
-        if required:
-            self.task_list.append(
-                Task(
-                    task_id=len(self.task_list),
-                    task_type="COM",
-                    target_obj=self.SR_teams[sr_id],
-                    target_obj_id=sr_id,
-                )
-            )
-        else:
-            self.task_list = [
-                task
-                for task in self.task_list
-                if not (
-                    task.task_type == "COM"
-                    and int(task.target_obj_id) == sr_id
-                )
-            ]
-        for index, task in enumerate(self.task_list):
-            task.task_id = int(index)
-        return True
-
     def update_sr_direct_states(self, observation_time_seconds=None):
-        """Commit S2G state changes and coalesce them into one reassignment."""
+        """Record S2G route-mode changes without changing COM assignment."""
 
         event_time = float(
             self.current_time
@@ -912,30 +890,18 @@ class Simulator:
             self.sr_direct_to_gs[sr_id] = direct
             if previous is None or previous == direct:
                 continue
-            support_changed = False
-            if sr.assigned_gt_id is not None:
-                support_changed = self._set_com_support_task(sr_id, not direct)
             changes.append(
                 {
                     "time_seconds": event_time,
                     "sr_id": sr_id,
                     "direct_to_gs_before": bool(previous),
                     "direct_to_gs_after": direct,
-                    "uav_support_task_changed": bool(support_changed),
+                    "uav_support_task_changed": False,
                     "assigned_roi_id": sr.assigned_gt_id,
                 }
             )
         if changes:
-            self.pending_assignment_events.append(
-                {
-                    "reason": "sr_direct_state_change",
-                    "time_seconds": event_time,
-                    "changes": copy.deepcopy(changes),
-                }
-            )
             self.sr_direct_state_history.extend(changes)
-            if any(row["uav_support_task_changed"] for row in changes):
-                self.need_reassign = True
         return tuple(changes)
 
     def sr_route_state(self):
@@ -1413,7 +1379,7 @@ class Simulator:
     def is_s2g_in_range(self, sr_id):
         if not self.SR_teams:
             return False
-        return is_within_communication_range(
+        return is_within_s2g_range(
             self.SR_teams[int(sr_id)].get_position(), self.GS_pos
         )
 
@@ -1436,6 +1402,7 @@ class Simulator:
             self.channel.movement_interval_index,
             self.channel.routing_slot_index,
             id(self.channel._gain_matrix),
+            id(self.channel._s2g_gain_matrix),
         )
         if scope != self._active_link_capacity_cache_scope:
             self._active_link_capacity_cache.clear()
@@ -1650,19 +1617,17 @@ class Simulator:
         for sr_id in sorted(s2g_links):
             sr_position = self.SR_teams[int(sr_id)].get_position()
             path_loss = float(
-                s2g_free_space_path_loss_db(sr_position, self.GS_pos)
+                s2g_ground_path_loss_db(sr_position, self.GS_pos)
             )
-            capacity = float(
-                shannon_capacity_mbps(
-                    path_loss,
-                    shared_bandwidth,
-                    self.s2u_tx_power_dbm,
-                )
-            )
-            profile = np.full(
-                FADING_BLOCKS_PER_ROUTING_SLOT,
-                capacity,
-                dtype=np.float64,
+            gains = self.channel.gain_profile("S2G", sr_id, self.GS_ID)
+            profile, capacity, service_bits = self._active_link_capacity_profile(
+                "S2G",
+                sr_id,
+                self.GS_ID,
+                path_loss,
+                shared_bandwidth,
+                self.s2u_tx_power_dbm,
+                gains,
             )
             key = ("S2G", int(sr_id), int(self.GS_ID))
             bandwidths[key] = float(shared_bandwidth)
@@ -1676,9 +1641,9 @@ class Simulator:
                     "bandwidth_hz": float(shared_bandwidth),
                     "capacity_mbps": capacity,
                     "fading_blocks": FADING_BLOCKS_PER_ROUTING_SLOT,
-                    "slot_service_bits": float(slot_service_bits(profile)),
-                    "gain_profile_reused": False,
-                    "fading": "none",
+                    "slot_service_bits": service_bits,
+                    "gain_profile_reused": True,
+                    "fading": "rayleigh_power_gain_exp_mean_1",
                     "range_eligible": True,
                     "distance_3d_m": self.distance_3d(
                         sr_position, self.GS_pos
@@ -2007,10 +1972,10 @@ class Simulator:
                 {
                     "sr_id": index,
                     "position": [
-                        350.0 * math.cos(
+                        float(self.GS_pos[0]) + SR_INITIAL_RADIUS_M * math.cos(
                             (index + 1) * math.pi / (2.0 * (self.num_GT + 1))
                         ),
-                        350.0 * math.sin(
+                        float(self.GS_pos[1]) + SR_INITIAL_RADIUS_M * math.sin(
                             (index + 1) * math.pi / (2.0 * (self.num_GT + 1))
                         ),
                         0.0,

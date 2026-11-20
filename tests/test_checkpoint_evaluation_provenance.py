@@ -70,7 +70,7 @@ class CheckpointEvaluationProvenanceTest(unittest.TestCase):
             "visual_sensing_configuration": visual_sensing_metadata(),
             "checkpoint_type": MODEL_CHECKPOINT_TYPE,
             "episode": 1499,
-            "movement_state_dim": 531,
+            "movement_state_dim": 619,
             "joint_action_dim": 48,
             "routing_state_dim": 143,
             "movement_agent_kind": method.agent,

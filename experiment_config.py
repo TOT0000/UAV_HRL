@@ -19,6 +19,8 @@ from visual_sensing import (
 from communication_contract import (
     COMMUNICATION_RANGE_BOUNDARY_RULE,
     MAX_3D_COMMUNICATION_DISTANCE_M,
+    S2G_COMMUNICATION_RANGE_BOUNDARY_RULE,
+    S2G_MAX_3D_COMMUNICATION_DISTANCE_M,
     validate_communication_range_aliases,
 )
 from Channel_model import (
@@ -81,6 +83,7 @@ ROI_COUNT_MIN = 2
 ROI_COUNT_MAX = 8
 RESERVED_SEARCH_UAV_IDS = (0, NUM_UAV - 1)
 GROUND_STATION_POSITION_M = (0.0, 0.0, 0.0)
+SR_INITIAL_RADIUS_M = 80.0
 PERMANENT_GS_GATEWAY_UAV_ID = 0
 GS_GATEWAY_SOFT_RADIUS_M = 360.0
 GS_GATEWAY_SOFT_RADIUS_OPERATIONAL = False
@@ -177,13 +180,14 @@ COMMUNICATION_RANGE_M = MAX_3D_COMMUNICATION_DISTANCE_M
 A2G_COMMUNICATION_RANGE_M = COMMUNICATION_RANGE_M
 A2A_COMMUNICATION_RANGE_M = COMMUNICATION_RANGE_M
 S2U_COMMUNICATION_RANGE_M = COMMUNICATION_RANGE_M
+S2G_COMMUNICATION_RANGE_M = S2G_MAX_3D_COMMUNICATION_DISTANCE_M
 U2G_COMMUNICATION_RANGE_M = COMMUNICATION_RANGE_M
 U2U_COMMUNICATION_RANGE_M = COMMUNICATION_RANGE_M
 COMMUNICATION_RANGE_CONTRACT_VERSION = (
-    "slot-start-3d-inclusive-s2g-s2u-u2g-u2u-400m-v3"
+    "slot-start-3d-inclusive-s2g100-s2u-u2g-u2u400-v4"
 )
 COM_SESSION_LIFECYCLE_VERSION = (
-    "mission-activated-fixed-interval-event-generation-persistent-v5"
+    "mission-activated-fixed-interval-persistent-direct-keeps-com-v6"
 )
 validate_communication_range_aliases(
     A2G_COMMUNICATION_RANGE_M,
@@ -235,7 +239,7 @@ ROUTING_OPTIMIZER_UPDATE_SCOPE = "every_4_routing_slots"
 FOV_EMA_LIFECYCLE_VERSION = "nadir-contributor-footprints-empty-fov-samples-v7"
 SR_ROUTE_LIFECYCLE_VERSION = "assigned-and-arrived-derived-state-v2"
 PACKET_QOS_CONTRACT_VERSION = (
-    "e2e-event-time-com10ms-vs15ms-scale-tolerant-terminal-outcome-v10"
+    "e2e-event-time-com10ms-vs15ms-first-hop-attempt-airtime-v11"
 )
 FOV_PACKET_GENERATION_CONTRACT_VERSION = (
     "assigned-valid-sensing-fixed-interval-event-capture-v4"
@@ -250,7 +254,7 @@ ROUTING_COST_ATTRIBUTION_CONTRACT_VERSION = (
     "multi-packet-per-decision-path-terminal-outcome-v5"
 )
 PACKET_SERVICE_CONTRACT_VERSION = (
-    "event-time-s2g-store-forward-dynamic-fdma-fixed-fading-v5"
+    "event-time-s2g100-ground-rayleigh-dynamic-fdma-fixed-block-v6"
 )
 QOS_AGGREGATE_CONTRACT_VERSION = (
     "canonical-single-result-seed-ratio-of-sums-student-t-v3"
@@ -280,7 +284,7 @@ PRE_POLICY_COMMAND_MOVEMENT_REPLAY_CONTRACT_VERSION = (
     "boundary-aligned-next-state-post-action-constraint-penalties-executed-action-hover-mask-capacity-50000-v10"
 )
 MOVEMENT_REPLAY_CONTRACT_VERSION = (
-    "boundary-aligned-next-state-post-action-weighted-constraint-penalties-final-policy-command-hover-mask-capacity-50000-v12"
+    "boundary-aligned-sr-aware-next-state-weighted-constraints-policy-command-v13"
 )
 MOVEMENT_WARMUP_CONTRACT_VERSION = "global-joint-transition-boundary-10000-v1"
 PROPULSION_PARAMETERS = MappingProxyType(
@@ -1333,6 +1337,9 @@ def comparison_method_configuration(method_spec: MethodSpec) -> dict:
             ROUTING_REPLAY_MASK_CONTRACT_VERSION
         ),
         "default_sr_speed_mps": DEFAULT_SR_SPEED_MPS,
+        "sr_initial_radius_m": SR_INITIAL_RADIUS_M,
+        "sr_initial_layout": "gs-centered-quarter-arc-stable-sr-id-v2",
+        "sr_direct_range_transition_reassigns_com": False,
         "fov_ema_lifecycle_version": FOV_EMA_LIFECYCLE_VERSION,
         "sr_route_lifecycle_version": SR_ROUTE_LIFECYCLE_VERSION,
         "packet_qos_contract_version": PACKET_QOS_CONTRACT_VERSION,
@@ -1362,7 +1369,10 @@ def comparison_method_configuration(method_spec: MethodSpec) -> dict:
             MAX_3D_COMMUNICATION_DISTANCE_M
         ),
         "s2u_communication_range_m": S2U_COMMUNICATION_RANGE_M,
-        "s2g_communication_range_m": S2U_COMMUNICATION_RANGE_M,
+        "s2g_communication_range_m": S2G_COMMUNICATION_RANGE_M,
+        "s2g_communication_range_boundary_rule": (
+            S2G_COMMUNICATION_RANGE_BOUNDARY_RULE
+        ),
         "u2g_communication_range_m": U2G_COMMUNICATION_RANGE_M,
         "u2u_communication_range_m": U2U_COMMUNICATION_RANGE_M,
         "a2g_communication_range_m": A2G_COMMUNICATION_RANGE_M,
@@ -1378,9 +1388,11 @@ def comparison_method_configuration(method_spec: MethodSpec) -> dict:
             "mission_assignment_fixed_interval_event_time"
         ),
         "sr_uplink_selection": (
-            "s2g_if_inclusive_3d_distance_le_400m_else_s2u"
+            "s2g_if_inclusive_3d_distance_le_100m_else_assigned_s2u"
         ),
-        "s2g_channel_model": "free-space-only-2GHz-23dBm-no-fading",
+        "s2g_channel_model": (
+            "ground-38.46-plus-40log10-distance-rayleigh-5ms-23dBm"
+        ),
         "routing_decision_scope": "all_uavs_once_per_250ms_slot",
         "routing_action_hold": "fixed_for_entire_slot",
         "packet_forwarding_model": "full_packet_store_and_forward_same_slot_multihop",

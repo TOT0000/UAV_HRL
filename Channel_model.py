@@ -15,15 +15,19 @@ import numpy as np
 from communication_contract import (
     COMMUNICATION_RANGE_BOUNDARY_RULE,
     MAX_3D_COMMUNICATION_DISTANCE_M,
+    S2G_COMMUNICATION_RANGE_BOUNDARY_RULE,
+    S2G_MAX_3D_COMMUNICATION_DISTANCE_M,
 )
 
 
-CHANNEL_MODEL_VERSION = "sampled-a2g-conditional-5ms-block-fading-v1"
+CHANNEL_MODEL_VERSION = "sampled-a2g-plus-ground-s2g-rayleigh-5ms-v2"
 CHANNEL_ENVIRONMENT_CONTRACT_VERSION = (
-    "boundary-aligned-unified-400m-slot-range-masked-fifty-block-service-v4"
+    "boundary-aligned-s2g100-other400-fifty-block-service-v5"
 )
-CHANNEL_FAIRNESS_CONTRACT_VERSION = "all-potential-links-fixed-order-crn-v1"
-CHANNEL_NORMALIZATION_VERSION = "link-type-fading-aware-physical-reference-v1"
+CHANNEL_FAIRNESS_CONTRACT_VERSION = (
+    "all-potential-aerial-fixed-order-plus-independent-s2g-crn-v2"
+)
+CHANNEL_NORMALIZATION_VERSION = "link-type-fading-aware-s2g-ground-reference-v2"
 ROUTING_CSI_CONTRACT = "deterministic-distributional-expected-capacity-v1"
 ACTUAL_TRANSMISSION_CONTRACT = (
     "event-time-store-forward-dynamic-fdma-fixed-5ms-fading-v2"
@@ -56,6 +60,19 @@ CHANNEL_TIME_SLOT_REFERENCE = {
     ),
     "doi": "10.1109/TCOMM.2025.3650376",
     "scope": "5 ms block duration only",
+}
+S2G_GROUND_CHANNEL_REFERENCE = {
+    "citation": (
+        "System-Level Security Solution for Hybrid D2D Communication in "
+        "Heterogeneous D2D-Underlaid Cellular Network, IEEE Transactions on "
+        "Wireless Communications, 2024"
+    ),
+    "doi": "10.1109/TWC.2024.3423351",
+    "borrowed_scope": "microwave path-loss exponent 4 and Rayleigh fading",
+    "project_specific": (
+        "2 GHz 1 m reference loss 38.46 dB, 100 m service cutoff, "
+        "and shared equal-FDMA scheduling"
+    ),
 }
 
 
@@ -189,17 +206,19 @@ def a2g_free_space_path_loss_db(aerial_position, ground_position):
     )
 
 
-def s2g_free_space_path_loss_db(sr_position, ground_station_position):
-    """Free-space-only S2G loss at 2 GHz with the canonical distance floor."""
+def s2g_ground_path_loss_db(sr_position, ground_station_position):
+    """Ground S2G reference loss: 38.46 + 40 log10(max(d, 1 m))."""
 
     source = np.asarray(sr_position, dtype=np.float64)
     station = np.asarray(ground_station_position, dtype=np.float64)
-    distance = np.maximum(np.linalg.norm(source - station, axis=-1), 1e-3)
-    return (
-        32.44
-        + 20.0 * np.log10(distance)
-        + 20.0 * np.log10(A2G_CARRIER_GHZ)
-    )
+    distance = np.maximum(np.linalg.norm(source - station, axis=-1), 1.0)
+    return 38.46 + 40.0 * np.log10(distance)
+
+
+def s2g_free_space_path_loss_db(sr_position, ground_station_position):
+    """Backward-compatible name for the authoritative ground S2G loss."""
+
+    return s2g_ground_path_loss_db(sr_position, ground_station_position)
 
 
 def s2g_capacity_mbps(
@@ -208,10 +227,10 @@ def s2g_capacity_mbps(
     bandwidth_hz,
     transmit_power_dbm=S2U_TX_POWER_DBM,
 ):
-    """Deterministic S2G Shannon capacity without excess loss or fading."""
+    """No-fading S2G reference; actual service uses Rayleigh block gains."""
 
     return shannon_capacity_mbps(
-        s2g_free_space_path_loss_db(sr_position, ground_station_position),
+        s2g_ground_path_loss_db(sr_position, ground_station_position),
         bandwidth_hz,
         transmit_power_dbm,
     )
@@ -506,7 +525,10 @@ def channel_configuration_metadata():
             "bootstrap next_state finalized at the next start-of-slot decision observation"
         ),
         "a2g_path_loss_mode": "conditional-after-sampled-state",
-        "s2g_path_loss_mode": "free-space-only-2GHz-no-fading",
+        "s2g_path_loss_mode": "ground-38.46-plus-40log10-max-distance-1m",
+        "s2g_reference_loss_db_at_1m": 38.46,
+        "s2g_path_loss_exponent": 4.0,
+        "s2g_small_scale_fading": "Rayleigh-power-gain-Exp-mean-1-per-5ms-block",
         "s2g_transmit_power_dbm": S2U_TX_POWER_DBM,
         "fading_block_seconds": FADING_BLOCK_SECONDS,
         "routing_slot_seconds": ROUTING_SLOT_SECONDS,
@@ -524,12 +546,14 @@ def channel_configuration_metadata():
         "communication_range_cutoff": {
             "maximum_3d_distance_m": MAX_3D_COMMUNICATION_DISTANCE_M,
             "S2U_m": MAX_3D_COMMUNICATION_DISTANCE_M,
-            "S2G_m": MAX_3D_COMMUNICATION_DISTANCE_M,
+            "S2G_m": S2G_MAX_3D_COMMUNICATION_DISTANCE_M,
             "U2G_m": MAX_3D_COMMUNICATION_DISTANCE_M,
             "U2U_m": MAX_3D_COMMUNICATION_DISTANCE_M,
             "A2G_m": MAX_3D_COMMUNICATION_DISTANCE_M,
             "A2A_m": MAX_3D_COMMUNICATION_DISTANCE_M,
             "boundary_rule": COMMUNICATION_RANGE_BOUNDARY_RULE,
+            "s2g_maximum_3d_distance_m": S2G_MAX_3D_COMMUNICATION_DISTANCE_M,
+            "s2g_boundary_rule": S2G_COMMUNICATION_RANGE_BOUNDARY_RULE,
             "geometry": "slot-start-3d-euclidean-inclusive",
             "profile_rng": "generated-for-all-potential-links-before-range-mask",
         },
@@ -539,6 +563,7 @@ def channel_configuration_metadata():
         "normalization_contract": CHANNEL_NORMALIZATION_VERSION,
         "bandwidth_allocation": "equal-FDMA-over-one-shared-10MHz-pool",
         "time_slot_reference": dict(CHANNEL_TIME_SLOT_REFERENCE),
+        "s2g_ground_channel_reference": dict(S2G_GROUND_CHANNEL_REFERENCE),
     }
 
 
@@ -576,6 +601,12 @@ def validate_channel_lifecycle_state(state, *, num_uav=None):
         FADING_BLOCKS_PER_ROUTING_SLOT,
     ):
         raise RuntimeError("checkpoint channel gain profile shape is invalid")
+    s2g_gains = state.get("s2g_gain_matrix")
+    if s2g_gains is not None and np.asarray(s2g_gains).shape != (
+        resolved_num_sr,
+        FADING_BLOCKS_PER_ROUTING_SLOT,
+    ):
+        raise RuntimeError("checkpoint channel S2G gain profile shape is invalid")
     return copy.deepcopy(state)
 
 
@@ -589,16 +620,20 @@ class ChannelLifecycle:
         *,
         large_scale_rng,
         small_scale_rng,
+        s2g_small_scale_rng,
         namespace="training",
     ):
         if not isinstance(large_scale_rng, np.random.Generator):
             raise TypeError("large-scale channel RNG must be a local Generator")
         if not isinstance(small_scale_rng, np.random.Generator):
             raise TypeError("small-scale channel RNG must be a local Generator")
+        if not isinstance(s2g_small_scale_rng, np.random.Generator):
+            raise TypeError("S2G small-scale channel RNG must be a local Generator")
         self.num_uav = int(num_uav)
         self.gs_id = int(gs_id)
         self.large_scale_rng = large_scale_rng
         self.small_scale_rng = small_scale_rng
+        self.s2g_small_scale_rng = s2g_small_scale_rng
         self.namespace = str(namespace)
         self.episode_identity = None
         self.num_sr = 0
@@ -611,8 +646,10 @@ class ChannelLifecycle:
         self._profile_keys = ()
         self._profile_index = {}
         self._gain_matrix = None
+        self._s2g_gain_matrix = None
         self.large_scale_draw_count = 0
         self.small_scale_normal_draw_count = 0
+        self.s2g_exponential_draw_count = 0
         self.profile_generation_count = 0
         self.last_profile_generation_seconds = None
 
@@ -636,6 +673,7 @@ class ChannelLifecycle:
         self._profile_keys = ()
         self._profile_index = {}
         self._gain_matrix = None
+        self._s2g_gain_matrix = None
         self.last_profile_generation_seconds = None
 
     def reset_episode(
@@ -709,6 +747,7 @@ class ChannelLifecycle:
         self._profile_keys = ()
         self._profile_index = {}
         self._gain_matrix = None
+        self._s2g_gain_matrix = None
         return True
 
     def potential_link_keys(self):
@@ -733,6 +772,7 @@ class ChannelLifecycle:
         if (
             self.routing_slot_index == routing_slot_index
             and self._gain_matrix is not None
+            and self._s2g_gain_matrix is not None
         ):
             return False
         started = time.perf_counter()
@@ -749,10 +789,15 @@ class ChannelLifecycle:
             else:
                 rician_mask[index] = bool(self.s2u_los_state[sender, receiver])
         self._gain_matrix = fading_power_gains_from_normals(normals, rician_mask)
+        self._s2g_gain_matrix = self.s2g_small_scale_rng.exponential(
+            scale=1.0,
+            size=(self.num_sr, FADING_BLOCKS_PER_ROUTING_SLOT),
+        )
         self._profile_keys = keys
         self._profile_index = {key: index for index, key in enumerate(keys)}
         self.routing_slot_index = routing_slot_index
         self.small_scale_normal_draw_count += int(normals.size)
+        self.s2g_exponential_draw_count += int(self._s2g_gain_matrix.size)
         self.profile_generation_count += 1
         self.last_profile_generation_seconds = time.perf_counter() - started
         return True
@@ -760,6 +805,10 @@ class ChannelLifecycle:
     def gain_profile(self, link_type, sender_id, receiver_id):
         if self._gain_matrix is None:
             raise RuntimeError("routing-slot fading profiles are not prepared")
+        if str(link_type) == "S2G":
+            if int(receiver_id) != self.gs_id:
+                raise KeyError("S2G receiver must be the ground station")
+            return self._s2g_gain_matrix[int(sender_id)]
         key = (str(link_type), int(sender_id), int(receiver_id))
         try:
             index = self._profile_index[key]
@@ -796,10 +845,12 @@ class ChannelLifecycle:
             "s2u_los_probability": copy.deepcopy(self.s2u_los_probability),
             "profile_keys": list(self._profile_keys),
             "gain_matrix": copy.deepcopy(self._gain_matrix),
+            "s2g_gain_matrix": copy.deepcopy(self._s2g_gain_matrix),
             "large_scale_draw_count": int(self.large_scale_draw_count),
             "small_scale_normal_draw_count": int(
                 self.small_scale_normal_draw_count
             ),
+            "s2g_exponential_draw_count": int(self.s2g_exponential_draw_count),
             "profile_generation_count": int(self.profile_generation_count),
             "checkpoint_scope": "current-channel-lifecycle-snapshot",
         }
@@ -845,6 +896,17 @@ class ChannelLifecycle:
         self._gain_matrix = (
             None if gain_matrix is None else np.asarray(gain_matrix, dtype=np.float64).copy()
         )
+        s2g_gain_matrix = state.get("s2g_gain_matrix")
+        self._s2g_gain_matrix = (
+            None
+            if s2g_gain_matrix is None
+            else np.asarray(s2g_gain_matrix, dtype=np.float64).copy()
+        )
+        if self._s2g_gain_matrix is not None and self._s2g_gain_matrix.shape != (
+            self.num_sr,
+            FADING_BLOCKS_PER_ROUTING_SLOT,
+        ):
+            raise RuntimeError("channel S2G fading profile shape is incompatible")
         if self._gain_matrix is not None and self._gain_matrix.shape != (
             len(self._profile_keys),
             FADING_BLOCKS_PER_ROUTING_SLOT,
@@ -853,6 +915,9 @@ class ChannelLifecycle:
         self.large_scale_draw_count = int(state["large_scale_draw_count"])
         self.small_scale_normal_draw_count = int(
             state["small_scale_normal_draw_count"]
+        )
+        self.s2g_exponential_draw_count = int(
+            state.get("s2g_exponential_draw_count", 0)
         )
         self.profile_generation_count = int(state["profile_generation_count"])
         self.last_profile_generation_seconds = None

@@ -38,7 +38,7 @@ import numpy as np
 
 
 PACKET_ENGINE_CHECKPOINT_SCHEMA_VERSION = (
-    "event-time-s2g-delivery-plus-completed-hop-progress-reward-v9"
+    "event-time-s2g-attempt-airtime-plus-completed-hop-progress-reward-v10"
 )
 
 
@@ -980,6 +980,12 @@ class PacketEngine:
                 self.uav_queues[node_id] = filtered
         if removed:
             self._decrease_backlog(node_id, pkt.get("rem_bits", 0.0))
+            # Repeated floating-point partial-service decrements can leave a
+            # sub-bit residual in the incremental cache.  Once the owning
+            # FIFO is empty, zero is authoritative rather than an approximate
+            # subtraction result.
+            if not self.uav_queues[node_id]:
+                self.backlog_bits[node_id] = 0.0
             pkt["_queued_uav"] = None
             self._mark_queue_topology_changed(uav_id=node_id)
         return removed
@@ -1109,6 +1115,8 @@ class PacketEngine:
             "sr_first_hop_receiver": None,
             "sr_first_hop_switch_count": 0,
             "sr_first_hop_retransmitted_bits": 0.0,
+            "sr_first_hop_attempt_actual_tx_seconds": 0.0,
+            "sr_first_hop_cumulative_actual_tx_seconds": 0.0,
             "routing_eligible_time": None,
             # Diagnostic only; Safe-DDQN cost never follows this field into
             # future slots or packet locations.
@@ -1290,6 +1298,7 @@ class PacketEngine:
         pkt["_s2u_service_terms"] = []
         pkt["s2u_service_start_time"] = None
         pkt["s2u_queue_delay_s"] = 0.0
+        pkt["sr_first_hop_attempt_actual_tx_seconds"] = 0.0
         pkt["sr_first_hop_link_type"] = desired_type
         pkt["sr_first_hop_receiver"] = desired_receiver
         pkt["s2u_receiver"] = (
@@ -1581,6 +1590,8 @@ class PacketEngine:
         if not queue or queue[0] is not pkt:
             raise AssertionError("completed packet was not in the sender FIFO")
         queue.popleft()
+        if not queue:
+            self.backlog_bits[sender] = 0.0
         self._mark_queue_topology_changed(uav_id=sender)
         pkt["_queued_uav"] = None
         pkt["hops"] = int(pkt.get("hops", 0)) + 1
@@ -2041,6 +2052,12 @@ class PacketEngine:
                     pkt["s2u_actual_tx_seconds"] = float(
                         pkt.get("s2u_actual_tx_seconds", 0.0)
                     ) + actual_tx_seconds
+                    pkt["sr_first_hop_attempt_actual_tx_seconds"] = float(
+                        pkt.get("sr_first_hop_attempt_actual_tx_seconds", 0.0)
+                    ) + actual_tx_seconds
+                    pkt["sr_first_hop_cumulative_actual_tx_seconds"] = float(
+                        pkt.get("sr_first_hop_cumulative_actual_tx_seconds", 0.0)
+                    ) + actual_tx_seconds
                     if (
                         actual_tx_seconds > PACKET_EPS
                         and int(pkt["id"])
@@ -2069,7 +2086,18 @@ class PacketEngine:
                 service_start = float(
                     pkt.get("s2u_service_start_time", completion_time)
                 )
-                queue_delay_s = float(pkt.get("s2u_queue_delay_s", 0.0))
+                cumulative_airtime = float(
+                    pkt.get("sr_first_hop_cumulative_actual_tx_seconds", 0.0)
+                )
+                attempt_airtime = float(
+                    pkt.get("sr_first_hop_attempt_actual_tx_seconds", 0.0)
+                )
+                queue_delay_s = max(
+                    float(completion_time)
+                    - float(pkt["generation_time"])
+                    - cumulative_airtime,
+                    0.0,
+                )
                 tx_elapsed_s = max(completion_time - service_start, 0.0)
                 pkt.setdefault("per_hop", []).append(
                     {
@@ -2077,8 +2105,10 @@ class PacketEngine:
                         "to": receiver,
                         "queue_s": queue_delay_s,
                         "tx_s": tx_elapsed_s,
-                        "actual_tx_s": float(
-                            pkt.get("s2u_actual_tx_seconds", 0.0)
+                        "actual_tx_s": cumulative_airtime,
+                        "successful_attempt_actual_tx_s": attempt_airtime,
+                        "retransmitted_actual_tx_s": max(
+                            cumulative_airtime - attempt_airtime, 0.0
                         ),
                         "delay_ms": max(
                             completion_time - float(pkt["generation_time"]), 0.0
@@ -2984,14 +3014,29 @@ class PacketEngine:
         service_start = float(
             pkt.get("s2u_service_start_time", completion_time)
         )
-        queue_delay = float(pkt.get("s2u_queue_delay_s", 0.0))
+        cumulative_airtime = float(
+            pkt.get("sr_first_hop_cumulative_actual_tx_seconds", 0.0)
+        )
+        attempt_airtime = float(
+            pkt.get("sr_first_hop_attempt_actual_tx_seconds", 0.0)
+        )
+        queue_delay = max(
+            float(completion_time)
+            - float(pkt["generation_time"])
+            - cumulative_airtime,
+            0.0,
+        )
         pkt.setdefault("per_hop", []).append(
             {
                 "from": f"SR:{int(sr_id)}",
                 "to": int(receiver),
                 "queue_s": queue_delay,
                 "tx_s": max(float(completion_time) - service_start, 0.0),
-                "actual_tx_s": float(pkt.get("s2u_actual_tx_seconds", 0.0)),
+                "actual_tx_s": cumulative_airtime,
+                "successful_attempt_actual_tx_s": attempt_airtime,
+                "retransmitted_actual_tx_s": max(
+                    cumulative_airtime - attempt_airtime, 0.0
+                ),
                 "delay_ms": max(
                     float(completion_time) - float(pkt["generation_time"]), 0.0
                 )
@@ -3027,14 +3072,29 @@ class PacketEngine:
         service_start = float(
             pkt.get("s2u_service_start_time", completion_time)
         )
-        queue_delay = float(pkt.get("s2u_queue_delay_s", 0.0))
+        cumulative_airtime = float(
+            pkt.get("sr_first_hop_cumulative_actual_tx_seconds", 0.0)
+        )
+        attempt_airtime = float(
+            pkt.get("sr_first_hop_attempt_actual_tx_seconds", 0.0)
+        )
+        queue_delay = max(
+            float(completion_time)
+            - float(pkt["generation_time"])
+            - cumulative_airtime,
+            0.0,
+        )
         pkt.setdefault("per_hop", []).append(
             {
                 "from": f"SR:{int(sr_id)}",
                 "to": int(receiver),
                 "queue_s": queue_delay,
                 "tx_s": max(float(completion_time) - service_start, 0.0),
-                "actual_tx_s": float(pkt.get("s2u_actual_tx_seconds", 0.0)),
+                "actual_tx_s": cumulative_airtime,
+                "successful_attempt_actual_tx_s": attempt_airtime,
+                "retransmitted_actual_tx_s": max(
+                    cumulative_airtime - attempt_airtime, 0.0
+                ),
                 "delay_ms": max(
                     float(completion_time) - float(pkt["generation_time"]),
                     0.0,
@@ -4060,6 +4120,12 @@ class PacketEngine:
                     pkt["s2u_actual_tx_seconds"] = float(
                         pkt.get("s2u_actual_tx_seconds", 0.0)
                     ) + duration
+                    pkt["sr_first_hop_attempt_actual_tx_seconds"] = float(
+                        pkt.get("sr_first_hop_attempt_actual_tx_seconds", 0.0)
+                    ) + duration
+                    pkt["sr_first_hop_cumulative_actual_tx_seconds"] = float(
+                        pkt.get("sr_first_hop_cumulative_actual_tx_seconds", 0.0)
+                    ) + duration
                     packet_id = int(pkt["id"])
                     if (
                         self.enable_packet_diagnostic_artifacts
@@ -4611,15 +4677,15 @@ class PacketEngine:
             return float(max(pkt.get("s2u_queue_delay_s", 0.0), 0.0))
         terminal_time = float(terminal_time)
         generation_time = float(pkt.get("generation_time", terminal_time))
-        service_start_time = pkt.get("s2u_service_start_time")
-        service_started = (
-            float(pkt.get("s2u_bits_sent", 0.0)) > PACKET_EPS
-            and service_start_time is not None
+        cumulative_airtime = float(
+            pkt.get(
+                "sr_first_hop_cumulative_actual_tx_seconds",
+                pkt.get("s2u_actual_tx_seconds", 0.0),
+            )
         )
-        queue_end_time = (
-            float(service_start_time) if service_started else terminal_time
+        return float(
+            max(terminal_time - generation_time - cumulative_airtime, 0.0)
         )
-        return float(max(queue_end_time - generation_time, 0.0))
 
     def _packet_terminal_diagnostics(self, pkt, delivered_to_gs):
         source_kind = str(pkt.get("source_kind", "UAV"))
@@ -4665,6 +4731,16 @@ class PacketEngine:
                 "tx_s": float(hop.get("tx_s", 0.0)),
                 "actual_tx_s": float(hop.get("actual_tx_s", 0.0)),
             }
+            if str(link_type) in {"S2G", "S2U"}:
+                compact_hop["successful_attempt_actual_tx_s"] = float(
+                    hop.get(
+                        "successful_attempt_actual_tx_s",
+                        hop.get("actual_tx_s", 0.0),
+                    )
+                )
+                compact_hop["retransmitted_actual_tx_s"] = float(
+                    hop.get("retransmitted_actual_tx_s", 0.0)
+                )
             diagnostic_hops.append(compact_hop)
             if compact_hop["link_type"] == "S2U":
                 s2u_hops.append(compact_hop)
@@ -4734,6 +4810,12 @@ class PacketEngine:
             "sr_first_hop_retransmitted_bits": float(
                 pkt.get("sr_first_hop_retransmitted_bits", 0.0)
             ),
+            "sr_first_hop_attempt_actual_tx_seconds": float(
+                pkt.get("sr_first_hop_attempt_actual_tx_seconds", 0.0)
+            ),
+            "sr_first_hop_cumulative_actual_tx_seconds": float(
+                pkt.get("sr_first_hop_cumulative_actual_tx_seconds", 0.0)
+            ),
             "delivery_path": pkt.get("delivery_path"),
             "s2u_completion_time_seconds": (
                 float(s2u_completion_time)
@@ -4794,7 +4876,12 @@ class PacketEngine:
             ),
             "s2u_queue_delay_seconds": s2u_queue_elapsed,
             "s2u_tx_delay_seconds": (
-                float(pkt.get("s2u_actual_tx_seconds", 0.0))
+                float(
+                    pkt.get(
+                        "sr_first_hop_cumulative_actual_tx_seconds",
+                        pkt.get("s2u_actual_tx_seconds", 0.0),
+                    )
+                )
                 if s2u_applicable
                 else None
             ),

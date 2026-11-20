@@ -87,7 +87,7 @@ The episode counts and checkpoint episodes are not fixed by the program.
 ## Fixed offline baseline and empirical Lipschitz estimate
 
 `run_llm_baseline.py` reads completed independent-sampling directories. It
-validates the replay/auxiliary schemas, 531-D movement-state contract,
+validates the replay/auxiliary schemas, 619-D movement-state contract,
 environment contract, manifest identities, monotonic replay order, finite
 numeric fields, and current-snapshot validity before selecting any row. Legal
 empty queues, undiscovered RoIs, and an all-false movement mask remain valid.

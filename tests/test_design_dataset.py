@@ -51,8 +51,8 @@ class DesignSchemaTest(unittest.TestCase):
         continuous = set(state["continuous_indices"])
         discrete = set(state["discrete_indices"])
         self.assertFalse(continuous.intersection(discrete))
-        self.assertEqual(continuous | discrete, set(range(531)))
-        self.assertEqual([item["index"] for item in state["features"]], list(range(531)))
+        self.assertEqual(continuous | discrete, set(range(619)))
+        self.assertEqual([item["index"] for item in state["features"]], list(range(619)))
         self.assertEqual(len(action["features"]), 48)
         self.assertEqual(
             {item["index"] for item in action["features"]}, set(range(48))
@@ -87,7 +87,7 @@ class DesignDatasetIntegrationTest(unittest.TestCase):
             episode=1499,
             td3=td3,
             ddqn=ddqn,
-            movement_state_dim=531,
+            movement_state_dim=619,
             joint_action_dim=48,
             routing_state_dim=143,
             calibration=calibration,
@@ -214,9 +214,9 @@ class DesignDatasetIntegrationTest(unittest.TestCase):
         ):
             self.assertEqual(self.metadata_one[key], self.formal_config[key])
         self.assertEqual(set(arrays), set(ARRAY_NAMES))
-        self.assertEqual(arrays["state"].shape, (120, 531))
+        self.assertEqual(arrays["state"].shape, (120, 619))
         self.assertEqual(arrays["projected_joint_action"].shape, (120, 48))
-        self.assertEqual(arrays["next_state"].shape, (120, 531))
+        self.assertEqual(arrays["next_state"].shape, (120, 619))
         self.assertEqual(int(arrays["done"].sum()), 2)
         self.assertEqual(self.metadata_one["centralized_actor_calls"], 120)
         np.testing.assert_array_equal(arrays["global_transition_index"], np.arange(120))

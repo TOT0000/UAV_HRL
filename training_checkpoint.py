@@ -116,7 +116,8 @@ from dinkelbach_blocks import (
     dinkelbach_config_metadata,
 )
 
-CHECKPOINT_SCHEMA_VERSION = 38
+CHECKPOINT_SCHEMA_VERSION = 39
+PRE_S2G_GROUND_RAYLEIGH_SR_OBSERVATION_CHECKPOINT_SCHEMA_VERSION = 38
 PRE_S2G_MISSION_TRAFFIC_CHECKPOINT_SCHEMA_VERSION = 37
 PRE_COMPLETED_HOP_PROGRESS_REWARD_CHECKPOINT_SCHEMA_VERSION = 36
 PRE_UNIFIED_COMPLETE_GOODPUT_CHECKPOINT_SCHEMA_VERSION = 35
@@ -1597,6 +1598,14 @@ def _checkpoint_uses_dinkelbach(metadata):
 def _validate_checkpoint_schema(metadata):
     schema = metadata.get("checkpoint_schema_version")
     if schema != CHECKPOINT_SCHEMA_VERSION:
+        if schema == PRE_S2G_GROUND_RAYLEIGH_SR_OBSERVATION_CHECKPOINT_SCHEMA_VERSION:
+            raise RuntimeError(
+                "checkpoint schema v38 used a 531-D movement observation without "
+                "fixed SR slots, 400 m no-fading free-space S2G, and route-mode "
+                "changes that altered COM assignment. The 619-D SR-aware movement "
+                "state and independent 100 m ground-Rayleigh S2G contract require "
+                "retraining"
+            )
         if schema == PRE_S2G_MISSION_TRAFFIC_CHECKPOINT_SCHEMA_VERSION:
             raise RuntimeError(
                 "checkpoint schema v37 was trained with boundary-midpoint "
@@ -1661,7 +1670,7 @@ def _validate_checkpoint_schema(metadata):
             raise RuntimeError(
                 "checkpoint schema v29 contains the retired explicit Relay task, "
                 "595-D Relay movement observation, and Relay shaping replay fields; "
-                "the current service-only schema uses a 531-D Search/FOV/COM "
+                "the current service-only schema uses a 619-D SR-aware Search/FOV/COM "
                 "movement state and must be retrained: "
                 f"checkpoint={schema}, expected={CHECKPOINT_SCHEMA_VERSION}"
             )
@@ -1673,11 +1682,13 @@ def _validate_checkpoint_schema(metadata):
             "GS-reachable initial topology, immediate VS/COM constraints, "
             "permanent GS gateway, capture-weighted timely useful goodput, "
             "continuous hard-only 400 m UAV 0 gateway projection, "
-            "unified inclusive 400 m S2U/U2G/U2U communication range, "
-            "143-D action-wise GS-progress routing state and completed-hop "
+            "independent inclusive 100 m S2G and unified inclusive 400 m "
+            "S2U/U2G/U2U ranges, "
+            "619-D SR-aware movement state, 143-D action-wise GS-progress routing "
+            "state and completed-hop "
             "progress routing reward, "
             "15 ms FOV / 10 ms COM QoS deadlines and event-time service, "
-            "531-D Search/FOV/COM movement state, named-RNG, projected-action "
+            "619-D SR-aware Search/FOV/COM movement state, named-RNG, projected-action "
             "and service-only replay contract, and must be retrained: "
             f"checkpoint={schema}, expected={CHECKPOINT_SCHEMA_VERSION}"
         )
