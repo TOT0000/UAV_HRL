@@ -1,4 +1,6 @@
 import json
+from collections import deque
+from contextlib import nullcontext
 from pathlib import Path
 import tempfile
 import unittest
@@ -7,8 +9,63 @@ from unittest import mock
 import numpy as np
 import torch
 
-from Packet_scheduler_v1 import PacketEngine
+from Packet_scheduler_v1 import MAX_PACKET_HOPS, PacketEngine
 from run_experiment import main as run_experiment
+
+
+def _legacy_drop_expired_packets(engine, current_time):
+    """Pre-routing-index implementation retained only as an exact oracle."""
+
+    violations = []
+    queued_indices = set()
+    for uav_id in range(engine.num_UAV):
+        kept = deque()
+        dropped_bits = 0.0
+        for packet in engine.uav_queues[uav_id]:
+            if packet is None:
+                continue
+            pool_idx = int(packet.get("_pool_idx", -1))
+            if pool_idx >= 0:
+                queued_indices.add(pool_idx)
+            if packet.get("done", False):
+                packet["_queued_uav"] = None
+                dropped_bits += max(float(packet.get("rem_bits", 0.0)), 0.0)
+                continue
+            if int(packet.get("hops", 0)) >= MAX_PACKET_HOPS:
+                dropped_bits += max(float(packet.get("rem_bits", 0.0)), 0.0)
+                event = engine._mark_deadline_violation(
+                    packet,
+                    current_time,
+                    sender=uav_id,
+                    reason="max_hops",
+                    remove_from_queue=False,
+                )
+                packet["_queued_uav"] = None
+                if event is not None:
+                    violations.append(event)
+            else:
+                kept.append(packet)
+        engine.uav_queues[uav_id] = kept
+        engine._decrease_backlog(uav_id, dropped_bits)
+
+    detached_indices = set(engine._active_idx).difference(queued_indices)
+    for pool_idx in sorted(detached_indices):
+        if not (0 <= pool_idx < len(engine.packet_pool)):
+            engine._active_idx.discard(pool_idx)
+            continue
+        packet = engine.packet_pool[pool_idx]
+        if packet is not None and int(packet.get("hops", 0)) >= MAX_PACKET_HOPS:
+            if not bool(packet.get("routing_eligible", False)):
+                raise AssertionError("detached non-eligible packet reached max hops")
+            event = engine._mark_deadline_violation(
+                packet,
+                current_time,
+                reason="max_hops",
+                remove_from_queue=False,
+            )
+            if event is not None:
+                violations.append(event)
+    return violations
 
 
 class DeadlineIndexTrainingEquivalenceTest(unittest.TestCase):
@@ -49,7 +106,15 @@ class DeadlineIndexTrainingEquivalenceTest(unittest.TestCase):
         else:
             self.assertEqual(first, second)
 
-    def _run(self, root, *, index_enabled, episode_seconds, resume=False):
+    def _run(
+        self,
+        root,
+        *,
+        index_enabled,
+        episode_seconds,
+        resume=False,
+        drop_expired_impl=None,
+    ):
         command = [
             "td3_dinkelbach",
             "--episodes",
@@ -66,9 +131,18 @@ class DeadlineIndexTrainingEquivalenceTest(unittest.TestCase):
             str(root),
             "--routing-training-diagnostics",
         ]
+        drop_context = (
+            mock.patch.object(
+                PacketEngine,
+                "drop_expired_packets",
+                drop_expired_impl,
+            )
+            if drop_expired_impl is not None
+            else nullcontext()
+        )
         with mock.patch.object(
             PacketEngine, "_DEADLINE_INDEX_ENABLED", bool(index_enabled)
-        ):
+        ), drop_context:
             self.assertEqual(run_experiment(command), 0)
             run_dir = next((Path(root) / "td3_dinkelbach").iterdir())
             if resume:
@@ -202,6 +276,31 @@ class DeadlineIndexTrainingEquivalenceTest(unittest.TestCase):
                 .splitlines()
             ]
             self.assertEqual([row["episode"] for row in rows], [1, 2])
+
+    def test_routing_active_index_preserves_training_and_replay_exactly(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            legacy = self._run(
+                root / "legacy",
+                index_enabled=True,
+                episode_seconds=2,
+                drop_expired_impl=_legacy_drop_expired_packets,
+            )
+            optimized = self._run(
+                root / "optimized",
+                index_enabled=True,
+                episode_seconds=2,
+            )
+
+            self._assert_jsonl_equal(legacy, optimized)
+            self._assert_checkpoint_equal(legacy, optimized, 1)
+            row = json.loads(
+                (optimized / "training_history.jsonl")
+                .read_text(encoding="utf-8")
+                .splitlines()[0]
+            )
+            self.assertGreater(row["system_eligible_packets"], 0)
+            self.assertGreater(row["routing_completed_uav_hop_count"], 0)
 
 
 if __name__ == "__main__":

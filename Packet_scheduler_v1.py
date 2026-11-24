@@ -336,6 +336,11 @@ class PacketEngine:
             raise ValueError("packet injection cutoff must be finite and non-negative")
         self._next_pkt_id = 0
         self._active_idx = set()
+        # Pool indices for live packets that have crossed the SR/UAV boundary
+        # into UAV routing.  Unlike _active_idx, this intentionally excludes
+        # SR FIFO packets and direct S2G traffic so max-hop cleanup never has
+        # to copy or sort the (potentially very large) source backlog.
+        self._routing_active_idx = set()
         self._deadline_index_enabled = bool(self._DEADLINE_INDEX_ENABLED)
         self._reset_deadline_index()
         self._event_service_cache_enabled = bool(
@@ -1017,13 +1022,28 @@ class PacketEngine:
     def _mark_routing_stage_eligible(self, pkt, eligible_time):
         """Mark first routing-stage entry at its physical boundary time."""
 
+        pool_idx = int(pkt.get("_pool_idx", -1))
+        if (
+            not 0 <= pool_idx < len(self.packet_pool)
+            or self.packet_pool[pool_idx] is not pkt
+            or pool_idx not in self._active_idx
+            or pkt.get("done", False)
+        ):
+            raise AssertionError(
+                "routing-stage packet must occupy its live packet-pool slot"
+            )
         if bool(pkt.get("routing_eligible", False)):
+            # Keep manually reconstructed/test packets and future compatible
+            # restore paths synchronized without changing the one-time QoS
+            # counters below.
+            self._routing_active_idx.add(pool_idx)
             return False
         if not bool(pkt.get("qos_eligible", False)):
             raise AssertionError("non-QoS packet cannot enter the routing stage")
         task_type = self._task_norm(pkt.get("task_type", "COM"))
         pkt["routing_eligible"] = True
         pkt["routing_eligible_time"] = float(eligible_time)
+        self._routing_active_idx.add(pool_idx)
         self.routing_stage_eligible_packet_counts[task_type] += 1
         return True
 
@@ -1817,9 +1837,14 @@ class PacketEngine:
             self._deadline_index_counters["detached_entries_visited"] += 1
             if not (0 <= pool_idx < len(self.packet_pool)):
                 self._active_idx.discard(pool_idx)
+                self._routing_active_idx.discard(pool_idx)
                 continue
             pkt = self.packet_pool[pool_idx]
-            if pkt is not None and not pkt.get("done", False) and is_expired(pkt):
+            if pkt is None or pkt.get("done", False):
+                self._active_idx.discard(pool_idx)
+                self._routing_active_idx.discard(pool_idx)
+                continue
+            if is_expired(pkt):
                 if bool(pkt.get("qos_eligible", False)):
                     event = self._mark_deadline_violation(
                         pkt, current_time, remove_from_queue=False
@@ -4356,6 +4381,21 @@ class PacketEngine:
             self.packet_pool = []
         if not hasattr(self, "_active_idx"):
             self._active_idx = set()
+        if not hasattr(self, "_routing_active_idx"):
+            # One-time compatibility path for an older in-memory engine.  A
+            # formal checkpoint cannot contain active packets, but if such an
+            # object is restored by external code the derived index is rebuilt
+            # once here rather than on every routing slot.
+            self._routing_active_idx = {
+                pool_idx
+                for pool_idx in self._active_idx
+                if 0 <= pool_idx < len(self.packet_pool)
+                and self.packet_pool[pool_idx] is not None
+                and not self.packet_pool[pool_idx].get("done", False)
+                and bool(
+                    self.packet_pool[pool_idx].get("routing_eligible", False)
+                )
+            }
         # if len(self.packet_pool) >= getattr(self, "max_packets", 3000):
         #     # print(f"超過3000")
         #     return
@@ -4471,6 +4511,9 @@ class PacketEngine:
     def checkpoint_state(self):
         """Serialize packet/session/reference state for exact resume."""
 
+        # Both active-index sets are derived runtime accelerators.  Formal
+        # checkpoints remain episode-boundary terminal snapshots, so neither
+        # set is serialized and legacy checkpoints require no migration.
         active_packets = sorted(
             (deepcopy(pkt) for pkt in self.get_active_packets()),
             key=lambda pkt: int(pkt["id"]),
@@ -4597,7 +4640,7 @@ class PacketEngine:
         Behavior:
         1) mark pkt done + reason + finish_time
         2) cleanup backlog_bits at current node using rem_bits (safe clamp)
-        3) remove pool_idx from _active_idx
+        3) remove pool_idx from active lifecycle indices
         4) set packet_pool[pool_idx] = None
         """
         if pkt is None:
@@ -4637,6 +4680,7 @@ class PacketEngine:
             return
 
         self._active_idx.discard(pi)
+        self._routing_active_idx.discard(pi)
         self._discard_packet_deadline(pkt)
 
         # 4) clear pool slot
@@ -5189,16 +5233,12 @@ class PacketEngine:
         """Drop max-hop packets with one filtering pass per UAV queue."""
 
         violations = []
-        queued_indices = set()
         for uav_id in range(self.num_UAV):
             kept = deque()
             dropped_bits = 0.0
             for pkt in self.uav_queues[uav_id]:
                 if pkt is None:
                     continue
-                pool_idx = int(pkt.get("_pool_idx", -1))
-                if pool_idx >= 0:
-                    queued_indices.add(pool_idx)
                 if pkt.get("done", False):
                     pkt["_queued_uav"] = None
                     dropped_bits += max(float(pkt.get("rem_bits", 0.0)), 0.0)
@@ -5220,15 +5260,39 @@ class PacketEngine:
             self.uav_queues[uav_id] = kept
             self._decrease_backlog(uav_id, dropped_bits)
 
-        detached_indices = set(self._active_idx).difference(queued_indices)
-        for pool_idx in sorted(detached_indices):
+        # A relay completion can be detached from its sender FIFO before it is
+        # appended to the receiver FIFO.  Preserve the historical pool-index
+        # order for those candidates, but inspect only live routing packets.
+        # Source-side SR packets never enter this index.
+        detached_indices = []
+        stale_indices = []
+        for pool_idx in self._routing_active_idx:
+            if not (0 <= pool_idx < len(self.packet_pool)):
+                stale_indices.append(pool_idx)
+                continue
+            pkt = self.packet_pool[pool_idx]
+            if (
+                pkt is None
+                or pkt.get("done", False)
+                or pool_idx not in self._active_idx
+                or not bool(pkt.get("routing_eligible", False))
+            ):
+                stale_indices.append(pool_idx)
+                continue
+            if pkt.get("_queued_uav") is None:
+                detached_indices.append(pool_idx)
+        for pool_idx in stale_indices:
+            self._routing_active_idx.discard(pool_idx)
             if not (0 <= pool_idx < len(self.packet_pool)):
                 self._active_idx.discard(pool_idx)
                 continue
+            stale_packet = self.packet_pool[pool_idx]
+            if stale_packet is None or stale_packet.get("done", False):
+                self._active_idx.discard(pool_idx)
+
+        for pool_idx in sorted(detached_indices):
             pkt = self.packet_pool[pool_idx]
-            if pkt is not None and int(pkt.get("hops", 0)) >= MAX_PACKET_HOPS:
-                if not bool(pkt.get("routing_eligible", False)):
-                    raise AssertionError("detached non-eligible packet reached max hops")
+            if int(pkt.get("hops", 0)) >= MAX_PACKET_HOPS:
                 event = self._mark_deadline_violation(
                     pkt,
                     current_time,
@@ -5268,6 +5332,14 @@ class PacketEngine:
         # 若出現壞索引，順手同步修正 _active_idx
         if safe_idxs != self._active_idx:
             self._active_idx = safe_idxs
+        safe_routing_idxs = {
+            i
+            for i in self._routing_active_idx
+            if i in safe_idxs
+            and bool(pool[i].get("routing_eligible", False))
+        }
+        if safe_routing_idxs != self._routing_active_idx:
+            self._routing_active_idx = safe_routing_idxs
         # 過濾 done
         return [pool[i] for i in sorted(safe_idxs)]
 
@@ -5276,6 +5348,7 @@ class PacketEngine:
         self.packet_pool = []
         # 活躍索引
         self._active_idx = set()
+        self._routing_active_idx = set()
         self._reset_deadline_index()
         self._queue_topology_revision += 1
         self._queue_topology_events = [("all", None)]
